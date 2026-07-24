@@ -3,6 +3,7 @@
 const API_BASE = "http://127.0.0.1:8000/api/v1";
 
 const state = {
+  market: null,
   positions: [],
   watchlists: [],
   strategies: [],
@@ -40,11 +41,6 @@ async function api(path, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
-}
-
-function expectedDateQuery() {
-  const value = byId("expected-date").value;
-  return value ? `?expected_date=${encodeURIComponent(value)}` : "";
 }
 
 const STATUS_TEXT = {
@@ -85,19 +81,99 @@ function changePresentation(value) {
   return { className: "market-flat", text: `平盘 ${formatNumber(number)}%` };
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgNode(tag, attributes = {}, text) {
+  const element = document.createElementNS(SVG_NS, tag);
+  Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, String(value)));
+  if (text !== undefined) element.textContent = String(text);
+  return element;
+}
+
+function renderBreadthChart(identifier, breadth, status) {
+  const chart = byId(identifier);
+  clear(chart);
+  const values = [
+    { label: "上涨", value: breadth.advancing, className: "bar-up" },
+    { label: "下跌", value: breadth.declining, className: "bar-down" },
+    { label: "平盘", value: breadth.unchanged, className: "bar-flat" },
+    { label: "停牌", value: breadth.suspended, className: "bar-suspended" },
+  ];
+  const maximum = Math.max(...values.map((item) => Number(item.value) || 0));
+  if (status === "empty" || status === "error" || maximum === 0) {
+    const message = status === "error"
+      ? "最近一次行情处理失败，未绘制市场结构"
+      : "尚无可绘制的真实市场宽度";
+    chart.append(node("p", message, "empty-chart-copy"));
+    return;
+  }
+  const svg = svgNode("svg", {
+    viewBox: "0 0 800 360",
+    class: "breadth-svg",
+    role: "img",
+    "aria-label": values.map((item) => `${item.label} ${item.value} 家`).join("，"),
+  });
+  svg.append(svgNode("line", { x1: 62, y1: 298, x2: 760, y2: 298, class: "chart-axis" }));
+  values.forEach((item, index) => {
+    const height = Math.max(2, Math.round((Number(item.value) / maximum) * 224));
+    const x = 96 + index * 172;
+    const y = 298 - height;
+    svg.append(
+      svgNode("rect", { x, y, width: 92, height, class: item.className }),
+      svgNode("text", { x: x + 46, y: y - 14, class: "chart-value", "text-anchor": "middle" }, item.value),
+      svgNode("text", { x: x + 46, y: 330, class: "chart-label", "text-anchor": "middle" }, item.label)
+    );
+  });
+  chart.append(svg);
+}
+
+function renderMarketDetails(data) {
+  state.market = data;
+  const hasData = !["empty", "error"].includes(data.status);
+  renderBreadthChart("market-primary-chart", data.breadth, data.status);
+  renderBreadthChart("market-structure-chart", data.breadth, data.status);
+  byId("market-structure-status").textContent = hasData
+    ? `${data.breadth.eligible} 家有效交易`
+    : STATUS_TEXT[data.status];
+  const turnover = byId("turnover-summary");
+  clear(turnover);
+  turnover.append(
+    node("strong", data.turnover.amount === null ? "—" : `${formatNumber(data.turnover.amount / 100000000)} 亿`),
+    node("span", data.turnover.coverage ? `成交覆盖 ${data.turnover.coverage} 家` : "等待真实成交额与覆盖数")
+  );
+  const quality = byId("market-quality");
+  clear(quality);
+  const qualityRows = [
+    ["来源", data.source || "未提供"],
+    ["实际数据日", data.as_of || "无"],
+    ["证券覆盖", `${data.completeness.loaded}/${data.completeness.requested}`],
+    ["质量状态", STATUS_TEXT[data.status] || data.status],
+  ];
+  qualityRows.forEach(([label, value]) => {
+    const row = node("div", null, "quality-item");
+    row.append(node("span", label), node("strong", value, "mono"));
+    quality.append(row);
+  });
+}
+
 async function loadMarket() {
   setBadge(byId("market-status"), "loading");
   clear(byId("market-breadth"));
   clear(byId("market-indexes"));
+  clear(byId("structure-indexes"));
   byId("market-message").textContent = "";
   try {
-    const data = await api(`/market/summary${expectedDateQuery()}`);
+    const data = await api("/market/summary");
     setBadge(byId("market-status"), data.status);
     byId("market-meta").textContent = data.as_of
       ? `数据日期 ${data.as_of} · 来源 ${data.source} · 覆盖 ${data.completeness.loaded}/${data.completeness.requested}`
       : "本地尚无行情刷新记录";
+    byId("data-status-primary").textContent = data.as_of
+      ? `实际数据日 ${data.as_of} · ${STATUS_TEXT[data.status] || data.status}`
+      : "尚无已完成的行情数据";
+    renderMarketDetails(data);
     if (data.status === "empty") {
-      byId("market-message").textContent = "暂无市场数据。请先通过后端显式刷新已完成交易日。";
+      byId("market-message").textContent = "暂无市场数据。工作台只显示后端已有结果，不从前端指定交易日。";
       return;
     }
     if (data.status === "error") {
@@ -119,14 +195,20 @@ async function loadMarket() {
       const value = node("span", `${formatNumber(item.close)} · ${change.text}`, `mono ${change.className}`);
       row.append(label, value);
       byId("market-indexes").append(row);
+      byId("structure-indexes").append(row.cloneNode(true));
     });
+    byId("index-empty").hidden = data.indexes.length > 0;
+    byId("structure-indexes-empty").hidden = data.indexes.length > 0;
     if (data.status !== "ready") {
       byId("market-message").textContent = `当前状态为${STATUS_TEXT[data.status]}，请结合数据日期和覆盖率阅读。`;
     }
   } catch (error) {
     setBadge(byId("market-status"), "error");
     byId("market-meta").textContent = "市场 API 不可用";
+    byId("data-status-primary").textContent = "本地行情状态不可用";
     byId("market-message").textContent = safeMessage(error);
+    renderBreadthChart("market-primary-chart", {}, "error");
+    renderBreadthChart("market-structure-chart", {}, "error");
   }
 }
 
@@ -209,6 +291,11 @@ function renderValuation(data) {
     : issues.length
       ? `${issues.join("；")}。缺失项未计入汇总。`
       : data.valuation_basis;
+  byId("portfolio-summary").textContent = data.status === "empty"
+    ? "尚未录入手动持仓"
+    : data.data_date
+      ? `估值日 ${data.data_date} · 覆盖 ${data.coverage.covered}/${data.coverage.total}`
+      : `持仓 ${data.coverage.total} 项 · 暂无有效估值`;
 }
 
 async function loadPortfolio() {
@@ -216,7 +303,7 @@ async function loadPortfolio() {
   try {
     const [positions, valuation] = await Promise.all([
       api("/portfolio/positions"),
-      api(`/portfolio/valuation${expectedDateQuery()}`),
+      api("/portfolio/valuation"),
     ]);
     state.positions = positions;
     renderPositions();
@@ -489,6 +576,9 @@ function renderAlertEvents(payload) {
   byId("alert-unacknowledged").className = `status-badge ${
     payload.unacknowledged ? "status-partial" : "status-empty"
   }`;
+  byId("alert-overview").textContent = payload.items.length
+    ? `${payload.unacknowledged} 条未确认 · 共 ${payload.items.length} 条历史`
+    : "暂无本地预警评估记录";
   byId("alert-empty").textContent = payload.items.length
     ? ""
     : "暂无预警。创建规则后，对明确的已收盘交易日执行评估。";
@@ -556,16 +646,52 @@ async function loadAlerts() {
   }
 }
 
-async function refreshAll(event) {
-  if (event) event.preventDefault();
-  byId("global-status").textContent = "正在刷新本地数据视图…";
+async function loadWorkspace() {
+  byId("global-status").textContent = "正在读取本地数据视图…";
   await Promise.all([loadMarket(), loadPortfolio(), loadWatchlists(), loadStrategies()]);
   await loadAlerts();
-  byId("global-status").textContent = `刷新完成 · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+  byId("global-status").textContent = "本地数据视图读取完成。";
+}
+
+const VIEW_TITLES = {
+  overview: "收盘总览",
+  "market-structure": "市场结构",
+  sectors: "板块与成交",
+  portfolio: "持仓",
+  strategies: "策略",
+  watchlists: "自选预警",
+};
+
+function activateView(identifier, updateHash = true) {
+  const target = VIEW_TITLES[identifier] ? identifier : "overview";
+  document.querySelectorAll("[data-view]").forEach((view) => {
+    const active = view.dataset.view === target;
+    view.hidden = !active;
+    view.classList.toggle("is-active", active);
+  });
+  document.querySelectorAll(".primary-nav [data-view-target]").forEach((link) => {
+    if (link.dataset.viewTarget === target) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
+  byId("view-title").textContent = VIEW_TITLES[target];
+  document.title = `${VIEW_TITLES[target]} · Stock EVA`;
+  if (updateHash && window.location.hash !== `#${target}`) {
+    window.history.pushState(null, "", `#${target}`);
+  }
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
+  });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  byId("refresh-form").addEventListener("submit", refreshAll);
+  document.querySelectorAll("[data-view-target]").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      activateView(link.dataset.viewTarget);
+    });
+  });
+  window.addEventListener("popstate", () => activateView(window.location.hash.slice(1), false));
+  activateView(window.location.hash.slice(1), false);
   byId("position-form").addEventListener("submit", submitPosition);
   byId("position-cancel").addEventListener("click", resetPositionForm);
   byId("watchlist-select").addEventListener("change", (event) => {
@@ -687,5 +813,5 @@ document.addEventListener("DOMContentLoaded", () => {
       submit.disabled = !state.alertRules.length;
     }
   });
-  refreshAll();
+  loadWorkspace();
 });

@@ -39,7 +39,6 @@ def test_root_entry_separates_workspace_from_learning_dashboard() -> None:
 def test_workspace_has_accessible_landmarks_labels_and_live_status() -> None:
     parser = parse(ROOT / "workspace" / "index.html")
     required_ids = {
-        "expected-date",
         "position-symbol",
         "position-quantity",
         "position-avg-cost",
@@ -58,6 +57,63 @@ def test_workspace_has_accessible_landmarks_labels_and_live_status() -> None:
     assert any(tag == "nav" for tag, _ in parser.tags)
     assert any(attrs.get("aria-live") == "polite" for _, attrs in parser.tags)
     assert any(href == "#main" for href in parser.links)
+
+
+def test_workspace_uses_fixed_task_navigation_and_separate_views() -> None:
+    html = (ROOT / "workspace" / "index.html").read_text()
+    parser = parse(ROOT / "workspace" / "index.html")
+
+    for view_id in (
+        "overview",
+        "market-structure",
+        "sectors",
+        "portfolio",
+        "strategies",
+        "watchlists",
+    ):
+        assert view_id in parser.ids
+        assert f'data-view="{view_id}"' in html
+
+    for label in (
+        "收盘总览",
+        "市场结构",
+        "板块与成交",
+        "持仓",
+        "策略",
+        "自选预警",
+        "知识库",
+    ):
+        assert label in html
+
+
+def test_workspace_has_no_expected_date_or_routine_refresh_control() -> None:
+    html = (ROOT / "workspace" / "index.html").read_text()
+    script = (ROOT / "workspace" / "app.js").read_text()
+
+    assert 'id="expected-date"' not in html
+    assert 'id="refresh-form"' not in html
+    assert "期望交易日" not in html
+    assert "刷新工作台" not in html
+    assert "expectedDateQuery" not in script
+    assert "expected_date=" not in script
+
+
+def test_workspace_preserves_large_empty_chart_frames_and_390px_layout() -> None:
+    html = (ROOT / "workspace" / "index.html").read_text()
+    styles = (ROOT / "workspace" / "style.css").read_text()
+
+    for identifier in (
+        "market-primary-chart",
+        "market-structure-chart",
+        "sector-map",
+        "sector-detail-chart",
+        "portfolio-chart",
+    ):
+        assert f'id="{identifier}"' in html
+
+    assert "--chart-primary-height: 420px" in styles
+    assert "--chart-secondary-height: 280px" in styles
+    assert "@media (max-width: 390px)" in styles
 
 
 def test_workspace_uses_native_controls_and_has_no_inline_event_handlers() -> None:
