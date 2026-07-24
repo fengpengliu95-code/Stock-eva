@@ -15,6 +15,8 @@ from backend.app.market.automation import (
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
+from backend.app.storage.preflight import StoragePreflight
 from backend.app.user.store import UserStore
 
 settings = get_settings()
@@ -25,11 +27,18 @@ async def lifespan(_: FastAPI):
     if not settings.auto_refresh_enabled:
         yield
         return
+    readiness = StoragePreflight(settings).inspect()
+    if not readiness.market_data_available:
+        yield
+        return
+    layout = StorageLayout(settings)
+    layout.ensure_local_runtime_dirs()
     market_store = MarketStore(
-        settings.market_data_dir / settings.market_database_name
+        layout.local_paths.market_database,
+        temp_directory=layout.duckdb_temporary,
     )
     user_store = UserStore(
-        settings.user_data_dir / settings.user_database_name
+        layout.local_paths.user_database
     )
     service = MarketAutomationService(
         market_store,
@@ -40,7 +49,7 @@ async def lifespan(_: FastAPI):
         ),
         get_trading_calendar(),
         required_symbols=lambda: collect_required_symbols(user_store),
-        lock_path=settings.market_data_dir / ".refresh.lock",
+        lock_path=layout.market_refresh_lock,
     )
     stop = asyncio.Event()
     task = asyncio.create_task(

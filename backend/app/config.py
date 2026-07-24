@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     market_database_name: str = "stock_eva.duckdb"
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
+    local_control_dir: Path = Path("var/control")
+    local_staging_dir: Path = Path("var/staging")
+    local_lock_dir: Path = Path("var/locks")
+    local_temp_dir: Path = Path("var/tmp")
+    nas_market_dataset_root: Path | None = None
     auto_refresh_enabled: bool = False
     auto_refresh_min_request_interval_seconds: float = Field(
         default=0.5,

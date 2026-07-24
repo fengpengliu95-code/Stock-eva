@@ -31,6 +31,7 @@ python3 -m http.server 8080
 可用端点：
 
 - `GET http://127.0.0.1:8000/api/v1/health`
+- `GET http://127.0.0.1:8000/api/v1/storage/readiness`
 - `GET http://127.0.0.1:8000/api/v1/market/status`
 - `GET http://127.0.0.1:8000/api/v1/market/summary`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/positions`
@@ -144,7 +145,8 @@ uv run --extra dev ruff check backend tests
 [阶段 3 策略 DSL](docs/strategy-dsl.md)，工作台交互与状态边界见
 [阶段 4 工作台说明](docs/workspace.md)，收盘后预警状态机见
 [阶段 4 预警说明](docs/alerts.md)，真实数据回填、每日运行和验收边界见
-[第一版真实数据就绪](docs/real-data-readiness.md)。
+[第一版真实数据就绪](docs/real-data-readiness.md)，可选 NAS 的本地状态隔离、只读
+preflight、安全降级和未来发布协议见 [NAS 市场数据集准备](docs/nas-storage.md)。
 
 ---
 

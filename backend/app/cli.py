@@ -23,6 +23,8 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
+from backend.app.storage.preflight import StoragePreflight
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.store import UserStore
 
@@ -125,9 +127,33 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     settings = get_settings()
-    store = MarketStore(settings.market_data_dir / settings.market_database_name)
+    readiness = StoragePreflight(settings).inspect()
+    if (
+        settings.nas_market_dataset_root is not None
+        and not readiness.market_data_available
+        and args.command in {"refresh", "backfill", "auto-refresh-once", "export"}
+    ):
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "quality_issues": ["market_storage_unavailable"],
+                    "storage_status": readiness.status,
+                    "reason_code": readiness.reason_code,
+                    "writes_market_data": False,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1
+    layout = StorageLayout(settings)
+    layout.ensure_local_runtime_dirs()
+    store = MarketStore(
+        layout.local_paths.market_database,
+        temp_directory=layout.duckdb_temporary,
+    )
     if args.command == "export":
-        output = store.export_date(args.trade_date, settings.market_data_dir / "exports")
+        output = store.export_date(args.trade_date, layout.local_paths.staging / "exports")
         print(json.dumps({"status": "ready", "path": str(output)}, ensure_ascii=False))
         return 0
     if args.command == "refresh-runs":
@@ -149,14 +175,14 @@ def main() -> int:
             )
         )
         user_store = UserStore(
-            settings.user_data_dir / settings.user_database_name
+            layout.local_paths.user_database
         )
         service = MarketAutomationService(
             store,
             provider,
             calendar,
             required_symbols=lambda: collect_required_symbols(user_store),
-            lock_path=settings.market_data_dir / ".refresh.lock",
+            lock_path=layout.market_refresh_lock,
         )
         now = get_market_clock()()
         if not args.execute:
@@ -271,7 +297,7 @@ def main() -> int:
         required_history = None
         if args.strategy_id is not None:
             strategy_store = StrategyStore(
-                settings.user_data_dir / settings.user_database_name
+                layout.local_paths.user_database
             )
             version = strategy_store.get_version(
                 args.strategy_id,
@@ -448,7 +474,7 @@ def main() -> int:
             )
             return 1
         try:
-            with RefreshRunLock(settings.market_data_dir / ".refresh.lock"):
+            with RefreshRunLock(layout.market_refresh_lock):
                 provider = BaoStockProvider(
                     min_request_interval_seconds=(
                         settings.auto_refresh_min_request_interval_seconds
@@ -459,7 +485,7 @@ def main() -> int:
                 ]:
                     raise ValueError("calendar conflict")
                 user_store = UserStore(
-                    settings.user_data_dir / settings.user_database_name
+                    layout.local_paths.user_database
                 )
                 result = run_publication_refresh(
                     store,

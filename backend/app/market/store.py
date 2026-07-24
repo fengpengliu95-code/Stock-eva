@@ -9,12 +9,15 @@ MAX_SYMBOL_RANGE_QUERY = 200
 
 
 class MarketStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, temp_directory: Path | None = None) -> None:
         self.path = path
+        self.temp_directory = temp_directory or path.parent / ".duckdb-tmp"
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.temp_directory.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect(str(self.path))
+        connection.execute("SET temp_directory = ?", [str(self.temp_directory)])
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_bars (

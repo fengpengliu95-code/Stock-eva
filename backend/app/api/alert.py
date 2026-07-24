@@ -21,6 +21,7 @@ from backend.app.api.strategy import get_strategy_store
 from backend.app.api.user import get_user_store
 from backend.app.config import Settings, get_settings
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
 from backend.app.strategy.store import StrategyNotFoundError, StrategyStore
 from backend.app.user.store import NotFoundError, UserStore
 
@@ -43,7 +44,15 @@ class AlertEvaluationCreate(BaseModel):
 def get_alert_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> AlertStore:
-    return AlertStore(settings.user_data_dir / settings.user_database_name)
+    return AlertStore(StorageLayout(settings).local_paths.user_database)
+
+
+def get_alert_configuration_service(
+    alert_store: Annotated[AlertStore, Depends(get_alert_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    strategy_store: Annotated[StrategyStore, Depends(get_strategy_store)],
+) -> AlertService:
+    return AlertService(alert_store, user_store, strategy_store, None)
 
 
 def get_alert_service(
@@ -70,7 +79,7 @@ def _alert_error(exc: Exception) -> HTTPException:
 )
 def create_alert_rule(
     payload: AlertRuleCreate,
-    service: Annotated[AlertService, Depends(get_alert_service)],
+    service: Annotated[AlertService, Depends(get_alert_configuration_service)],
 ) -> AlertRuleRecord:
     try:
         return service.create_rule(**payload.model_dump())
@@ -102,7 +111,7 @@ def evaluate_alert_rule(
 
 @router.get("/events", response_model=AlertEventListResponse)
 def list_alert_events(
-    service: Annotated[AlertService, Depends(get_alert_service)],
+    service: Annotated[AlertService, Depends(get_alert_configuration_service)],
 ) -> AlertEventListResponse:
     return service.list_events()
 

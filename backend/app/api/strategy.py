@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from backend.app.api.market import get_market_store
 from backend.app.config import Settings, get_settings
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
 from backend.app.strategy.dsl import RuleValidationError, validate_rule
 from backend.app.strategy.models import (
     StrategyRecord,
@@ -61,7 +62,7 @@ class StrategyRunCreate(BaseModel):
 def get_strategy_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> StrategyStore:
-    return StrategyStore(settings.user_data_dir / settings.user_database_name)
+    return StrategyStore(StorageLayout(settings).local_paths.user_database)
 
 
 def _validated(rule: dict[str, object]):

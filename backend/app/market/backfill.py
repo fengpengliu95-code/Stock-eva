@@ -105,11 +105,18 @@ def _chunks(values: list, size: int) -> list[list]:
 
 
 class BackfillAuditStore:
-    def __init__(self, path) -> None:
+    def __init__(self, path, *, temp_directory=None) -> None:
         self.path = path
+        self.temp_directory = temp_directory
 
     def _connect(self):
         connection = duckdb.connect(str(self.path))
+        if self.temp_directory is not None:
+            self.temp_directory.mkdir(parents=True, exist_ok=True)
+            connection.execute(
+                "SET temp_directory = ?",
+                [str(self.temp_directory)],
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS backfill_runs (
@@ -308,7 +315,10 @@ class BackfillService:
         self.store = store
         self.provider = provider
         self.sleep_fn = sleep_fn
-        self.audit = BackfillAuditStore(store.path)
+        self.audit = BackfillAuditStore(
+            store.path,
+            temp_directory=store.temp_directory,
+        )
 
     def plan(
         self,

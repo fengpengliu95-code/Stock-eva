@@ -113,7 +113,7 @@ partial/error 运行不会覆盖上一完整快照。`GET /api/v1/market/status`
 - `GET /api/v1/market/history/{symbol}` 以单一 `source=baostock` 读取未复权或
   前复权序列，不跨来源填洞。
 - `python -m backend.app.cli export --date YYYY-MM-DD` 使用 DuckDB 原生 `COPY`
-  输出 `var/market/exports/date=YYYY-MM-DD/bars.parquet`。
+  输出本机 `var/staging/exports/date=YYYY-MM-DD/bars.parquet`。
 
 单证券历史读取由 DuckDB 一次参数化查询完成，将 `symbol`、`source` 和日期区间
 全部下推到 SQL；不会先加载每个交易日的全市场行再由 Python 过滤。API、策略回放和

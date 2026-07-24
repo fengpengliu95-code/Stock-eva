@@ -20,7 +20,7 @@ class AlertService:
         alert_store: AlertStore,
         user_store: UserStore,
         strategy_store: StrategyStore,
-        market_store: MarketStore,
+        market_store: MarketStore | None,
     ) -> None:
         self.alert_store = alert_store
         self.user_store = user_store
@@ -52,6 +52,8 @@ class AlertService:
         *,
         signal_date: date,
     ) -> AlertEvaluationResponse:
+        if self.market_store is None:
+            raise RuntimeError("market storage is unavailable")
         if signal_date > date.today():
             raise ValueError("future signal dates are not allowed")
         rule = self.alert_store.get_rule(rule_id)

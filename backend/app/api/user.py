@@ -9,6 +9,7 @@ from backend.app.config import Settings, get_settings
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
 from backend.app.user.models import (
     PortfolioValuation,
     Position,
@@ -32,7 +33,8 @@ watchlist_router = APIRouter(prefix="/watchlists", tags=["watchlists"])
 
 
 def get_user_store(settings: Annotated[Settings, Depends(get_settings)]) -> UserStore:
-    return UserStore(settings.user_data_dir / settings.user_database_name)
+    layout = StorageLayout(settings)
+    return UserStore(layout.local_paths.user_database)
 
 
 def _http_error(exc: Exception) -> HTTPException:

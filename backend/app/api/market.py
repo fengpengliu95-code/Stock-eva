@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from backend.app.api.storage import get_storage_readiness
 from backend.app.config import Settings, get_settings
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
@@ -11,12 +12,31 @@ from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeri
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
+from backend.app.storage.layout import StorageLayout
+from backend.app.storage.models import StorageReadiness
 
 router = APIRouter(prefix="/market", tags=["market"])
 
 
-def get_market_store(settings: Annotated[Settings, Depends(get_settings)]) -> MarketStore:
-    return MarketStore(settings.market_data_dir / settings.market_database_name)
+def get_market_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+    readiness: Annotated[StorageReadiness, Depends(get_storage_readiness)],
+) -> MarketStore:
+    if not readiness.market_data_available:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "market_storage_unavailable",
+                "storage_status": readiness.status,
+                "reason_code": readiness.reason_code,
+            },
+        )
+    layout = StorageLayout(settings)
+    layout.ensure_local_runtime_dirs()
+    return MarketStore(
+        layout.local_paths.market_database,
+        temp_directory=layout.duckdb_temporary,
+    )
 
 
 @router.get("/summary", response_model=MarketSummary)

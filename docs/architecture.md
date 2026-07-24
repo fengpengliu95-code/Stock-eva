@@ -17,6 +17,10 @@ backend/app/          FastAPI 窄后端
 tests/                后端契约测试
 var/market/           未来 DuckDB/Parquet 行情数据，内容不进入 Git
 var/user/             本地 SQLite 用户数据，内容不进入 Git
+var/control/          本机控制状态
+var/staging/          本机发布 staging 与显式导出
+var/locks/            本机跨进程锁
+var/tmp/              本机 DuckDB spill 与临时文件
 docs/                 学习资料与工程架构说明
 ```
 
@@ -105,6 +109,12 @@ docs/                 学习资料与工程架构说明
 过滤，不在 Python 中物化无关行。canonical 写入在既有发布事务内使用单条集合化
 `INSERT OR REPLACE ... SELECT unnest(...)`，保留主键幂等与原子 published pointer。
 当前仍是单表本地 DuckDB 模型；NAS、跨文件目录和全市场多年真实负载验证尚未实施。
+
+可选 NAS 准备层将市场 dataset 根与全部本机可变状态分开。只读 preflight 验证绝对
+路径、SMB 挂载、哨兵和 manifest；不会创建 NAS 目录。配置 NAS 后若数据读取器未
+就绪或挂载不可用，行情依赖返回明确 503，而用户 SQLite API 继续工作。未来发布固定
+使用本机 staging、NAS partial 上传、readback/hash、同共享原子 rename、最后发布
+manifest 的顺序；详见 [NAS 市场数据集准备](nas-storage.md)。
 
 ## 安全边界
 
