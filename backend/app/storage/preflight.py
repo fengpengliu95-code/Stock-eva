@@ -150,9 +150,8 @@ class StoragePreflight:
         return StorageReadiness(
             mode="nas",
             status="ready",
-            market_data_available=False,
-            serving_source="none",
-            reason_code="nas_dataset_reader_not_implemented",
+            market_data_available=True,
+            serving_source="nas",
             mount_type=mount.filesystem_type,
             sentinel_status="ready",
             manifest_status="ready",

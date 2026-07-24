@@ -16,6 +16,7 @@ from backend.app.market.supplemental import (
     SupplementalMarketResponse,
     empty_supplemental_response,
 )
+from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
 
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/market", tags=["market"])
 def get_market_store(
     settings: Annotated[Settings, Depends(get_settings)],
     readiness: Annotated[StorageReadiness, Depends(get_storage_readiness)],
-) -> MarketStore:
+) -> MarketStore | NasMarketStore:
     if not readiness.market_data_available:
         raise HTTPException(
             status_code=503,
@@ -37,19 +38,37 @@ def get_market_store(
         )
     layout = StorageLayout(settings)
     layout.ensure_local_runtime_dirs()
-    return MarketStore(
+    control = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
     )
+    if readiness.mode == "nas":
+        assert settings.nas_market_dataset_root is not None
+        store = NasMarketStore(
+            control,
+            settings.nas_market_dataset_root,
+            layout.local_paths.staging,
+        )
+        try:
+            store.validate_readiness()
+        except (DatasetError, OSError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "market_storage_unavailable",
+                    "storage_status": "unavailable",
+                    "reason_code": "nas_dataset_read_failed",
+                },
+            ) from exc
+        return store
+    return control
 
 
 @router.get("/supplemental", response_model=SupplementalMarketResponse)
 def market_supplemental(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> SupplementalMarketResponse:
-    return empty_supplemental_response(
-        enabled=settings.akshare_supplemental_enabled
-    )
+    return empty_supplemental_response(enabled=settings.akshare_supplemental_enabled)
 
 
 @router.get("/summary", response_model=MarketSummary)
@@ -82,25 +101,21 @@ def market_status(
     calendar_status = (
         scheduler.calendar_status
         if scheduler is not None and scheduler.calendar_status != "confirmed"
-        else (
-            "confirmed"
-            if calendar.session_status(now.date()) != "unknown"
-            else "unavailable"
-        )
+        else ("confirmed" if calendar.session_status(now.date()) != "unknown" else "unavailable")
     )
     refresh_state = (
         scheduler.refresh_state
         if settings.auto_refresh_enabled and scheduler is not None
-        else "idle" if settings.auto_refresh_enabled else "disabled"
+        else "idle"
+        if settings.auto_refresh_enabled
+        else "disabled"
     )
     phase = calendar.market_phase(now)
     if phase == "after_close_waiting":
         if refresh_state == "running":
             phase = "refreshing"
         elif (
-            expected is not None
-            and published is not None
-            and published.requested_date >= expected
+            expected is not None and published is not None and published.requested_date >= expected
         ):
             phase = "complete"
         elif refresh_state in {"delayed", "error"}:
@@ -114,13 +129,12 @@ def market_status(
         last_success_at=(
             scheduler.last_success_at
             if scheduler is not None and scheduler.last_success_at is not None
-            else published.completed_at if published else None
+            else published.completed_at
+            if published
+            else None
         ),
         next_retry_at=scheduler.next_retry_at if scheduler else None,
-        calendar_sources=[
-            item.model_dump()
-            for item in calendar.sources_for(now.year)
-        ],
+        calendar_sources=[item.model_dump() for item in calendar.sources_for(now.year)],
     )
 
 

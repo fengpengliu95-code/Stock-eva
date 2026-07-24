@@ -23,6 +23,7 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
+from backend.app.storage.dataset import NasMarketStore
 from backend.app.storage.initialize import (
     DatasetInitializationError,
     EmptyDatasetInitializer,
@@ -201,9 +202,18 @@ def main() -> int:
         return 1
     layout = StorageLayout(settings)
     layout.ensure_local_runtime_dirs()
-    store = MarketStore(
+    control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
+    )
+    store = (
+        NasMarketStore(
+            control_store,
+            settings.nas_market_dataset_root,
+            layout.local_paths.staging,
+        )
+        if readiness.mode == "nas"
+        else control_store
     )
     if args.command == "export":
         output = store.export_date(args.trade_date, layout.local_paths.staging / "exports")
@@ -212,10 +222,7 @@ def main() -> int:
     if args.command == "refresh-runs":
         print(
             json.dumps(
-                [
-                    item.model_dump(mode="json")
-                    for item in store.list_refreshes()
-                ],
+                [item.model_dump(mode="json") for item in store.list_refreshes()],
                 ensure_ascii=False,
             )
         )
@@ -223,13 +230,9 @@ def main() -> int:
     if args.command == "auto-refresh-once":
         calendar = get_trading_calendar()
         provider = BaoStockProvider(
-            min_request_interval_seconds=(
-                settings.auto_refresh_min_request_interval_seconds
-            )
+            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds)
         )
-        user_store = UserStore(
-            layout.local_paths.user_database
-        )
+        user_store = UserStore(layout.local_paths.user_database)
         service = MarketAutomationService(
             store,
             provider,
@@ -242,9 +245,7 @@ def main() -> int:
             published = store.published_refresh()
             decision = service.policy.decide(
                 now,
-                published_as_of=(
-                    published.requested_date if published is not None else None
-                ),
+                published_as_of=(published.requested_date if published is not None else None),
                 state=store.scheduler_state(),
             )
             print(
@@ -272,12 +273,7 @@ def main() -> int:
             return 0
         outcome = service.run_due_once(now)
         print(json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False))
-        return (
-            1
-            if outcome.state.refresh_state
-            in {"retry_wait", "delayed", "error"}
-            else 0
-        )
+        return 1 if outcome.state.refresh_state in {"retry_wait", "delayed", "error"} else 0
     if args.command == "backfill":
         if (args.start is None) == (args.effective_days is None):
             print(
@@ -349,9 +345,7 @@ def main() -> int:
             return 1
         required_history = None
         if args.strategy_id is not None:
-            strategy_store = StrategyStore(
-                layout.local_paths.user_database
-            )
+            strategy_store = StrategyStore(layout.local_paths.user_database)
             version = strategy_store.get_version(
                 args.strategy_id,
                 args.strategy_version,
@@ -398,9 +392,7 @@ def main() -> int:
                     json.dumps(
                         {
                             "status": "error",
-                            "quality_issues": [
-                                "official_calendar_not_confirmed_open"
-                            ],
+                            "quality_issues": ["official_calendar_not_confirmed_open"],
                         },
                         ensure_ascii=False,
                     )
@@ -426,15 +418,11 @@ def main() -> int:
                 return 1
             elapsed = round(perf_counter() - started, 3)
         estimated_requests = (
-            inspection.metadata_provider_requests + 5
-            if inspection is not None
-            else 7
+            inspection.metadata_provider_requests + 5 if inspection is not None else 7
         )
         estimated_seconds_lower_bound = (
             round(
-                elapsed
-                / inspection.metadata_provider_requests
-                * estimated_requests,
+                elapsed / inspection.metadata_provider_requests * estimated_requests,
                 1,
             )
             if inspection is not None
@@ -451,43 +439,29 @@ def main() -> int:
                     "batch_cap": 1,
                     "request_batches": 1,
                     "requested_count": (
-                        inspection.total_expected_count
-                        if inspection is not None
-                        else None
+                        inspection.total_expected_count if inspection is not None else None
                     ),
                     "main_board_count": (
-                        inspection.main_board_count
-                        if inspection is not None
-                        else None
+                        inspection.main_board_count if inspection is not None else None
                     ),
                     "shanghai_count": (
-                        inspection.shanghai_count
-                        if inspection is not None
-                        else None
+                        inspection.shanghai_count if inspection is not None else None
                     ),
                     "shenzhen_count": (
-                        inspection.shenzhen_count
-                        if inspection is not None
-                        else None
+                        inspection.shenzhen_count if inspection is not None else None
                     ),
                     "metadata_provider_requests": (
-                        inspection.metadata_provider_requests
-                        if inspection is not None
-                        else 0
+                        inspection.metadata_provider_requests if inspection is not None else 0
                     ),
                     "metadata_probe_elapsed_seconds": elapsed,
                     "estimated_provider_requests": estimated_requests,
-                    "provider_requests_with_retries_upper_bound": (
-                        estimated_requests * 2
-                    ),
+                    "provider_requests_with_retries_upper_bound": (estimated_requests * 2),
                     "min_request_interval_seconds": 0.5,
                     "minimum_throttle_elapsed_seconds": round(
                         (estimated_requests - 1) * 0.5,
                         1,
                     ),
-                    "estimated_execution_seconds_lower_bound": (
-                        estimated_seconds_lower_bound
-                    ),
+                    "estimated_execution_seconds_lower_bound": (estimated_seconds_lower_bound),
                     "recommended_resource_window_seconds": 900,
                     "writes_market_data": False,
                     "execute_requires": "--execute-all-main-board",
@@ -533,13 +507,9 @@ def main() -> int:
                         settings.auto_refresh_min_request_interval_seconds
                     )
                 )
-                if provider.trading_dates(args.trade_date, args.trade_date) != [
-                    args.trade_date
-                ]:
+                if provider.trading_dates(args.trade_date, args.trade_date) != [args.trade_date]:
                     raise ValueError("calendar conflict")
-                user_store = UserStore(
-                    layout.local_paths.user_database
-                )
+                user_store = UserStore(layout.local_paths.user_database)
                 result = run_publication_refresh(
                     store,
                     provider,
