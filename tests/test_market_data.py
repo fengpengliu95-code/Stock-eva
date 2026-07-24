@@ -7,6 +7,8 @@ import httpx
 
 from backend.app.api.market import get_market_store
 from backend.app.main import app
+from backend.app.market.automation import get_market_clock
+from backend.app.market.calendar import SHANGHAI
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.service import MarketSummaryService
@@ -116,6 +118,9 @@ def test_market_summary_api_exposes_partial_semantics(tmp_path: Path) -> None:
     )
     store.save_refresh(rows, result)
     app.dependency_overrides[get_market_store] = lambda: store
+    app.dependency_overrides[get_market_clock] = lambda: (
+        lambda: datetime(2026, 7, 24, 10, tzinfo=SHANGHAI)
+    )
 
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)

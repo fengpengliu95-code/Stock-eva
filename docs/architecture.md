@@ -99,6 +99,11 @@ docs/                 学习资料与工程架构说明
 控制。`auto-refresh-once` 使用后端时钟和持久化状态，不接受交易日参数，因此系统
 自动化也不能把日期决定权重新交给脚本或前端。
 
+单证券历史详情使用一次 DuckDB 参数化范围查询，过滤条件为
+`symbol + source + trade_date BETWEEN start/end`。PriceSeriesService、history API
+和策略引擎共享这一读取边界，不在 Python 中物化无关证券。当前仍是单表本地 DuckDB
+模型；NAS、跨文件目录、全市场多年批量策略读取及批量 upsert 不在本次优化范围。
+
 ## 安全边界
 
 - `.env`、数据库、Parquet、DuckDB、生成文件和临时目录不会进入 Git。

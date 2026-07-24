@@ -478,44 +478,59 @@ class MarketStore:
             ).fetchall()
         finally:
             connection.close()
-        return [
-            DailyBar(
-                trade_date=row[0],
-                symbol=row[1],
-                security_type=row[2],
-                exchange=row[3],
-                board=row[4],
-                open=row[5],
-                high=row[6],
-                low=row[7],
-                close=row[8],
-                preclose=row[9],
-                volume=row[10],
-                amount=row[11],
-                turnover_rate=row[12],
-                pct_change=row[13],
-                adjust_factor=row[14],
-                price_adjustment=row[15],
-                is_trading=row[16],
-                is_suspended=row[17],
-                is_st=row[18],
-                source=row[19],
-                source_record_id=row[20],
-                ingested_at=row[21],
-                quality_status=row[22],
-                quality_issues=json.loads(row[23]),
-            )
-            for row in rows
-        ]
+        return [self._daily_bar_from_row(row) for row in rows]
 
     def symbol_bars(self, symbol, start, end, source: str = "baostock") -> list[DailyBar]:
-        return [
-            bar
-            for trade_date in self.available_dates(source)
-            if start <= trade_date <= end
-            for bar in self.canonical_bars(trade_date, source)
-            if bar.symbol == symbol
-        ]
+        if start > end or not self.exists():
+            return []
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
+                       close, preclose, volume, amount, turnover_rate, pct_change,
+                       adjust_factor, price_adjustment, is_trading, is_suspended, is_st,
+                       source, source_record_id, ingested_at, quality_status, quality_issues
+                FROM daily_bars
+                WHERE symbol = ?
+                  AND trade_date BETWEEN ? AND ?
+                  AND source = ?
+                ORDER BY trade_date
+                """,
+                [symbol, start, end, source],
+            ).fetchall()
+        finally:
+            connection.close()
+        return [self._daily_bar_from_row(row) for row in rows]
+
+    @staticmethod
+    def _daily_bar_from_row(row) -> DailyBar:
+        return DailyBar(
+            trade_date=row[0],
+            symbol=row[1],
+            security_type=row[2],
+            exchange=row[3],
+            board=row[4],
+            open=row[5],
+            high=row[6],
+            low=row[7],
+            close=row[8],
+            preclose=row[9],
+            volume=row[10],
+            amount=row[11],
+            turnover_rate=row[12],
+            pct_change=row[13],
+            adjust_factor=row[14],
+            price_adjustment=row[15],
+            is_trading=row[16],
+            is_suspended=row[17],
+            is_st=row[18],
+            source=row[19],
+            source_record_id=row[20],
+            ingested_at=row[21],
+            quality_status=row[22],
+            quality_issues=json.loads(row[23]),
+        )
 
     def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
         output = output_root / f"date={trade_date.isoformat()}" / "bars.parquet"

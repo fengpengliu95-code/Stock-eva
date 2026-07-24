@@ -115,6 +115,11 @@ partial/error 运行不会覆盖上一完整快照。`GET /api/v1/market/status`
 - `python -m backend.app.cli export --date YYYY-MM-DD` 使用 DuckDB 原生 `COPY`
   输出 `var/market/exports/date=YYYY-MM-DD/bars.parquet`。
 
+单证券历史读取由 DuckDB 一次参数化查询完成，将 `symbol`、`source` 和日期区间
+全部下推到 SQL；不会先加载每个交易日的全市场行再由 Python 过滤。API、策略回放和
+未来股票详情都复用该查询。停牌排除、缺失复权因子报错、canonical 质量字段及前复权
+计算仍由既有服务契约控制。
+
 Parquet 是单日、可重建的交换分区；DuckDB 仍是本地查询真值。当前规模不引入额外
 数据湖目录、清单服务或分区协调器，避免为阶段 2 的手动持仓功能增加无关复杂性。
 
@@ -126,3 +131,6 @@ Parquet 是单日、可重建的交换分区；DuckDB 仍是本地查询真值�
 - Parquet 目前只做显式单日导出，不自动维护全量镜像。
 - 尚未实现 AKShare 补充字段和跨源对账。
 - 尚未计算技术指标；后续如计算，只能用前复权序列。
+- 当前优化针对单证券区间详情；大规模多证券策略仍是一只证券一次范围查询。进入
+  全市场多年回放前，还需评估批量多证券接口、symbol/date 索引或 Parquet 分区。
+- canonical 写入仍按证券逐行 upsert；数据规模继续扩大时需单独优化批量摄取。
