@@ -23,6 +23,10 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
+from backend.app.storage.initialize import (
+    DatasetInitializationError,
+    EmptyDatasetInitializer,
+)
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight
 from backend.app.strategy.store import StrategyStore
@@ -119,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="perform a due refresh; omitted means a network-free plan",
     )
+    storage_init = subparsers.add_parser(
+        "storage-init",
+        help="initialize a new empty NAS market dataset",
+    )
+    storage_init.add_argument(
+        "--initialize-empty-nas-dataset",
+        action="store_true",
+        help="required acknowledgement; refuses an existing path or share root",
+    )
     export = subparsers.add_parser("export", help="export one stored date to Parquet")
     export.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
     return parser
@@ -127,6 +140,46 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     settings = get_settings()
+    if args.command == "storage-init":
+        if not args.initialize_empty_nas_dataset:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "reason_code": "explicit_initialization_required",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        try:
+            root = EmptyDatasetInitializer(settings).initialize()
+        except DatasetInitializationError as error:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "reason_code": str(error),
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        readiness = StoragePreflight(settings).inspect()
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "dataset_root": str(root),
+                    "storage": readiness.model_dump(mode="json"),
+                    "writes_market_data": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     readiness = StoragePreflight(settings).inspect()
     if (
         settings.nas_market_dataset_root is not None

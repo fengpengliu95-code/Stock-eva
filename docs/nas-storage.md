@@ -6,8 +6,8 @@ Stock EVA 将两类数据明确分开：
   DuckDB spill 和临时文件。
 - 可选 NAS 市场数据集：一次完整回填与校验后的历史分区，以及之后的每日增量分区。
 
-本轮只实现配置边界、只读 preflight、失败降级和未来发布接口；不会连接 NAS、创建
-共享目录、保存 SMB 凭据、读取真实数据集或执行全市场抓取。
+本轮实现配置边界、只读 preflight、失败降级和未来发布接口。NAS 数据集的首次
+初始化必须由显式命令确认；不会保存 SMB 凭据、读取真实行情或执行全市场抓取。
 
 ## 配置
 
@@ -50,14 +50,29 @@ NAS 根不能与 `market_data_dir`、`user_data_dir` 或任何本地 runtime 目
 `mount` 输出通常只能确认 `smbfs`，不能证明实际协商版本；SMB3 仍需在系统挂载配置
 或 NAS 管理界面确认。
 
+## 首次初始化
+
+先把 NAS 共享盘通过 SMB3 挂载到操作系统，并把根配置为共享盘内一个**尚不存在的
+子目录**，不能使用共享盘根目录。首次创建需要显式确认：
+
+```bash
+STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
+  uv run python -m backend.app.cli storage-init --initialize-empty-nas-dataset
+```
+
+命令拒绝已存在的路径、非 SMB/CIFS 挂载和共享盘根目录。它只创建空数据集的哨兵、
+空 manifest 与 `bars`、`manifests/history`、`checksums`、`_staging`、`quarantine`
+目录；不会请求行情。随后可调用 `GET /api/v1/storage/readiness` 核验。
+
 ## 失败语义
 
 - 未配置 NAS：`mode=local`、`status=ready`，继续读取本地开发 DuckDB。
 - NAS 路径、挂载类型、哨兵或 manifest 无效：`market_data_available=false`。
-- NAS 元数据检查通过：`status=ready`，但本轮仍返回
-  `reason_code=nas_dataset_reader_not_implemented`，不会假装已经读取 NAS。
+- NAS 元数据检查通过：`status=ready`、`serving_source=nas`；应用只从当前
+  manifest 明确列出的已发布 Parquet 分区读取。空 manifest 返回安全空态，不会补读
+  staging 或 quarantine 文件。
 
-NAS 模式下，只要行情读取能力未就绪，summary、history、组合估值、策略运行和预警
+NAS 挂载、哨兵或 manifest 不可用时，summary、history、组合估值、策略运行和预警
 评估返回明确的 `503 market_storage_unavailable`。健康检查、持仓、自选、策略定义、
 预警规则/历史和手动状态转换继续使用本机 SQLite，不受 NAS 中断影响。
 

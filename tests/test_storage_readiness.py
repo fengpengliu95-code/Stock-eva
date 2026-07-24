@@ -7,6 +7,10 @@ import pytest
 from backend.app import cli
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
+from backend.app.storage.initialize import (
+    DatasetInitializationError,
+    EmptyDatasetInitializer,
+)
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import (
     MountInfo,
@@ -156,8 +160,9 @@ def test_nas_preflight_validates_smb_mount_sentinel_and_manifest(
     assert result.sentinel_status == "ready"
     assert result.manifest_status == "ready"
     assert result.dataset_generation == "generation-20260724"
-    assert result.market_data_available is False
-    assert result.reason_code == "nas_dataset_reader_not_implemented"
+    assert result.market_data_available is True
+    assert result.serving_source == "nas"
+    assert result.reason_code is None
 
 
 @pytest.mark.parametrize("filesystem_type", ["apfs", "nfs", "ext4"])
@@ -238,6 +243,79 @@ def test_cli_fails_closed_before_creating_local_market_fallback(
     assert payload["writes_market_data"] is False
     assert settings.market_data_dir.exists() is False
     assert settings.nas_market_dataset_root.exists() is False
+
+
+def test_empty_nas_dataset_initializer_creates_only_a_new_child_dataset(
+    tmp_path: Path,
+) -> None:
+    share_root = tmp_path / "Stock"
+    share_root.mkdir()
+    nas_root = share_root / "stock-eva-market"
+    settings = settings_for(tmp_path, nas_root=nas_root)
+    inspector = FakeMountInspector(MountInfo(share_root, "smbfs", ("nodev", "nosuid")))
+
+    result = EmptyDatasetInitializer(
+        settings,
+        mount_inspector=inspector,
+    ).initialize()
+
+    assert result == nas_root
+    assert json.loads((nas_root / ".stock-eva-dataset.json").read_text()) == {
+        "dataset": "stock-eva-market",
+        "schema_version": 1,
+    }
+    manifest = json.loads((nas_root / "manifest.json").read_text())
+    assert manifest["files"] == []
+    assert manifest["generation"].startswith("generation-")
+    assert all(
+        (nas_root / path).is_dir()
+        for path in (
+            "bars/source=baostock",
+            "manifests/history",
+            "checksums",
+            "_staging",
+            "quarantine",
+        )
+    )
+
+
+def test_empty_nas_dataset_initializer_refuses_share_root_or_existing_target(
+    tmp_path: Path,
+) -> None:
+    share_root = tmp_path / "Stock"
+    share_root.mkdir()
+    inspector = FakeMountInspector(MountInfo(share_root, "smbfs", ()))
+    root_settings = settings_for(tmp_path, nas_root=share_root)
+
+    with pytest.raises(DatasetInitializationError, match="dataset_root_already_exists"):
+        EmptyDatasetInitializer(
+            root_settings,
+            mount_inspector=inspector,
+        ).initialize()
+
+    existing_target = share_root / "stock-eva-market"
+    existing_target.mkdir()
+    child_settings = settings_for(tmp_path, nas_root=existing_target)
+    with pytest.raises(DatasetInitializationError, match="dataset_root_already_exists"):
+        EmptyDatasetInitializer(
+            child_settings,
+            mount_inspector=inspector,
+        ).initialize()
+
+
+def test_storage_init_cli_requires_explicit_acknowledgement(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = settings_for(tmp_path, nas_root=tmp_path / "nas" / "market")
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr("sys.argv", ["stock-eva", "storage-init"])
+
+    assert cli.main() == 1
+    assert json.loads(capsys.readouterr().out)["reason_code"] == (
+        "explicit_initialization_required"
+    )
 
 
 @pytest.mark.anyio
