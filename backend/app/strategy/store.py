@@ -11,6 +11,7 @@ from backend.app.strategy.models import (
     StrategyRunRecord,
     StrategyVersionRecord,
 )
+from backend.app.user.database import user_database_initialization
 
 
 class StrategyStoreError(RuntimeError):
@@ -30,46 +31,47 @@ class StrategyStore:
         self.path = path
 
     def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS strategies (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                current_version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+        with user_database_initialization(self.path):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self.path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS strategies (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    current_version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS strategy_versions (
-                id TEXT PRIMARY KEY,
-                strategy_id TEXT NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
-                version INTEGER NOT NULL,
-                rule_ast TEXT NOT NULL,
-                rule_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE (strategy_id, version)
-            );
+                CREATE TABLE IF NOT EXISTS strategy_versions (
+                    id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    rule_ast TEXT NOT NULL,
+                    rule_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (strategy_id, version)
+                );
 
-            CREATE TABLE IF NOT EXISTS strategy_runs (
-                id TEXT PRIMARY KEY,
-                strategy_id TEXT NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
-                strategy_version INTEGER NOT NULL,
-                as_of_date TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rule_hash TEXT NOT NULL,
-                data_fingerprint TEXT NOT NULL,
-                symbols TEXT NOT NULL,
-                results TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
+                CREATE TABLE IF NOT EXISTS strategy_runs (
+                    id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
+                    strategy_version INTEGER NOT NULL,
+                    as_of_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    rule_hash TEXT NOT NULL,
+                    data_fingerprint TEXT NOT NULL,
+                    symbols TEXT NOT NULL,
+                    results TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
         return connection
 
     @staticmethod

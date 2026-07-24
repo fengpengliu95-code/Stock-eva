@@ -9,6 +9,7 @@ from backend.app.alert.models import (
     AlertRuleRecord,
     AlertTransitionRecord,
 )
+from backend.app.user.database import user_database_initialization
 
 
 class AlertStoreError(RuntimeError):
@@ -39,55 +40,56 @@ class AlertStore:
         self.path = path
 
     def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS alert_rules (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                watchlist_id TEXT NOT NULL,
-                strategy_id TEXT NOT NULL,
-                strategy_version INTEGER NOT NULL,
-                strategy_version_id TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+        with user_database_initialization(self.path):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self.path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS alert_rules (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    watchlist_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    strategy_version INTEGER NOT NULL,
+                    strategy_version_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS alert_events (
-                id TEXT PRIMARY KEY,
-                alert_rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
-                strategy_id TEXT NOT NULL,
-                strategy_version INTEGER NOT NULL,
-                strategy_version_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                signal_date TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL,
-                source TEXT,
-                quality_status TEXT NOT NULL,
-                quality_issues TEXT NOT NULL,
-                explanation TEXT NOT NULL,
-                data_fingerprint TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE (strategy_version_id, symbol, signal_date)
-            );
+                CREATE TABLE IF NOT EXISTS alert_events (
+                    id TEXT PRIMARY KEY,
+                    alert_rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+                    strategy_id TEXT NOT NULL,
+                    strategy_version INTEGER NOT NULL,
+                    strategy_version_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    signal_date TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    source TEXT,
+                    quality_status TEXT NOT NULL,
+                    quality_issues TEXT NOT NULL,
+                    explanation TEXT NOT NULL,
+                    data_fingerprint TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (strategy_version_id, symbol, signal_date)
+                );
 
-            CREATE TABLE IF NOT EXISTS alert_transitions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                alert_event_id TEXT NOT NULL REFERENCES alert_events(id) ON DELETE CASCADE,
-                from_state TEXT,
-                to_state TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        connection.execute("PRAGMA foreign_keys = ON")
+                CREATE TABLE IF NOT EXISTS alert_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_event_id TEXT NOT NULL REFERENCES alert_events(id) ON DELETE CASCADE,
+                    from_state TEXT,
+                    to_state TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     @staticmethod

@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from backend.app.user.database import user_database_initialization
 from backend.app.user.models import (
     Position,
     PositionCreate,
@@ -34,43 +35,44 @@ class UserStore:
         self.path = path
 
     def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS positions (
-                id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL UNIQUE,
-                quantity TEXT NOT NULL,
-                avg_cost TEXT NOT NULL,
-                as_of_date TEXT NOT NULL,
-                today_buy_qty TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+        with user_database_initialization(self.path):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self.path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS positions (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL UNIQUE,
+                    quantity TEXT NOT NULL,
+                    avg_cost TEXT NOT NULL,
+                    as_of_date TEXT NOT NULL,
+                    today_buy_qty TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS watchlists (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS watchlists (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS watchlist_items (
-                id TEXT PRIMARY KEY,
-                watchlist_id TEXT NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
-                symbol TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE (watchlist_id, symbol)
-            );
-            """
-        )
+                CREATE TABLE IF NOT EXISTS watchlist_items (
+                    id TEXT PRIMARY KEY,
+                    watchlist_id TEXT NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+                    symbol TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (watchlist_id, symbol)
+                );
+                """
+            )
         return connection
 
     @staticmethod
