@@ -5,6 +5,8 @@ import duckdb
 
 from backend.app.market.models import DailyBar, RefreshResult
 
+MAX_SYMBOL_RANGE_QUERY = 200
+
 
 class MarketStore:
     def __init__(self, path: Path) -> None:
@@ -170,44 +172,53 @@ class MarketStore:
         connection: duckdb.DuckDBPyConnection,
         bars: list[DailyBar],
     ) -> None:
-        for bar in bars:
-            connection.execute(
-                "DELETE FROM daily_bars WHERE trade_date = ? AND symbol = ? AND source = ?",
-                [bar.trade_date, bar.symbol, bar.source],
-            )
-            connection.execute(
-                """
-                INSERT INTO daily_bars VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
-                [
-                    bar.trade_date,
-                    bar.symbol,
-                    bar.security_type,
-                    bar.exchange,
-                    bar.board,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.preclose,
-                    bar.volume,
-                    bar.amount,
-                    bar.turnover_rate,
-                    bar.pct_change,
-                    bar.adjust_factor,
-                    bar.price_adjustment,
-                    bar.is_trading,
-                    bar.is_suspended,
-                    bar.is_st,
-                    bar.source,
-                    bar.source_record_id,
-                    bar.ingested_at,
-                    bar.quality_status,
-                    json.dumps(bar.quality_issues, ensure_ascii=False),
-                ],
-            )
+        if not bars:
+            return
+        deduplicated = {
+            (bar.trade_date, bar.symbol, bar.source): bar
+            for bar in bars
+        }
+        rows = [
+            [
+                bar.trade_date,
+                bar.symbol,
+                bar.security_type,
+                bar.exchange,
+                bar.board,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.preclose,
+                bar.volume,
+                bar.amount,
+                bar.turnover_rate,
+                bar.pct_change,
+                bar.adjust_factor,
+                bar.price_adjustment,
+                bar.is_trading,
+                bar.is_suspended,
+                bar.is_st,
+                bar.source,
+                bar.source_record_id,
+                bar.ingested_at,
+                bar.quality_status,
+                json.dumps(bar.quality_issues, ensure_ascii=False),
+            ]
+            for bar in deduplicated.values()
+        ]
+        columns = [list(column) for column in zip(*rows, strict=True)]
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO daily_bars
+            SELECT
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?)
+            """,
+            columns,
+        )
 
     def upsert_bars(self, bars: list[DailyBar]) -> None:
         connection = self._connect()
@@ -234,19 +245,15 @@ class MarketStore:
             rows = connection.execute(
                 """
                 SELECT trade_date, symbol FROM daily_bars
-                WHERE trade_date BETWEEN ? AND ? AND source = ?
+                WHERE trade_date = ANY(?)
+                  AND symbol = ANY(?)
+                  AND source = ?
                 """,
-                [min(trading_dates), max(trading_dates), source],
+                [list(dict.fromkeys(trading_dates)), sorted(set(symbols)), source],
             ).fetchall()
         finally:
             connection.close()
-        allowed_dates = set(trading_dates)
-        allowed_symbols = set(symbols)
-        return {
-            (trade_date, symbol)
-            for trade_date, symbol in rows
-            if trade_date in allowed_dates and symbol in allowed_symbols
-        }
+        return set(rows)
 
     def count_bars(self) -> int:
         connection = self._connect()
@@ -502,6 +509,45 @@ class MarketStore:
         finally:
             connection.close()
         return [self._daily_bar_from_row(row) for row in rows]
+
+    def symbols_bars(
+        self,
+        symbols: list[str],
+        start,
+        end,
+        source: str = "baostock",
+    ) -> dict[str, list[DailyBar]]:
+        normalized = sorted(set(symbols))
+        if len(normalized) > MAX_SYMBOL_RANGE_QUERY:
+            raise ValueError(
+                f"a symbol range query accepts at most {MAX_SYMBOL_RANGE_QUERY} symbols"
+            )
+        grouped: dict[str, list[DailyBar]] = {
+            symbol: [] for symbol in normalized
+        }
+        if not normalized or start > end or not self.exists():
+            return grouped
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
+                       close, preclose, volume, amount, turnover_rate, pct_change,
+                       adjust_factor, price_adjustment, is_trading, is_suspended, is_st,
+                       source, source_record_id, ingested_at, quality_status, quality_issues
+                FROM daily_bars
+                WHERE symbol = ANY(?)
+                  AND trade_date BETWEEN ? AND ?
+                  AND source = ?
+                ORDER BY symbol, trade_date
+                """,
+                [normalized, start, end, source],
+            ).fetchall()
+        finally:
+            connection.close()
+        for row in rows:
+            grouped[row[1]].append(self._daily_bar_from_row(row))
+        return grouped
 
     @staticmethod
     def _daily_bar_from_row(row) -> DailyBar:

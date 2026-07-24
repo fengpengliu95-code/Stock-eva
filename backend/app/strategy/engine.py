@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any
 
 from backend.app.market.models import DailyBar
-from backend.app.market.store import MarketStore
+from backend.app.market.store import MAX_SYMBOL_RANGE_QUERY, MarketStore
 from backend.app.strategy.dsl import ValidatedRule
 from backend.app.strategy.models import SignalResult, StrategyEvaluation
 
@@ -32,18 +32,21 @@ class StrategyEngine:
             for item in self.market_store.available_dates(source="baostock")
             if item <= as_of_date
         ]
+        grouped_bars = {symbol: [] for symbol in unique_symbols}
+        if available_dates:
+            for offset in range(0, len(unique_symbols), MAX_SYMBOL_RANGE_QUERY):
+                symbol_batch = unique_symbols[offset : offset + MAX_SYMBOL_RANGE_QUERY]
+                grouped_bars.update(
+                    self.market_store.symbols_bars(
+                        symbol_batch,
+                        min(available_dates),
+                        as_of_date,
+                        source="baostock",
+                    )
+                )
 
         for symbol in unique_symbols:
-            bars = (
-                self.market_store.symbol_bars(
-                    symbol,
-                    min(available_dates),
-                    as_of_date,
-                    source="baostock",
-                )
-                if available_dates
-                else []
-            )
+            bars = grouped_bars[symbol]
             fingerprint_rows.extend(self._fingerprint_rows(bars))
             results.append(self._evaluate_symbol(rule, symbol, bars, as_of_date))
 
