@@ -59,6 +59,13 @@ uv run python -m backend.app.cli refresh \
 uv run python -m backend.app.cli refresh \
   --date 2026-07-23 \
   --all-main-board \
+  --inspect-universe
+
+# 证券池探测仍不抓取行情或写数据库，并有 30 秒硬超时
+
+uv run python -m backend.app.cli refresh \
+  --date 2026-07-23 \
+  --all-main-board \
   --execute-all-main-board
 
 # 将本地已有的一个交易日导出为独立 Parquet 分区
@@ -100,12 +107,23 @@ BaoStock `query_trade_dates` 机器校验；缺少已确认年度配置的工作
 
 ```text
 STOCK_EVA_AUTO_REFRESH_ENABLED=true
+STOCK_EVA_AUTO_REFRESH_MIN_REQUEST_INTERVAL_SECONDS=0.5
 ```
 
 应用运行时会在 18:10 首次尝试，有限重试至 21:00，并在次日 07:15 校正；进程关闭
 或电脑休眠期间不会运行，重新启动或唤醒后会立即补跑到当前应有状态。GET 请求和打开
 页面永不触发抓取。只有全覆盖、摘要指数、本地持仓/自选证券、质量和非停牌股票复权
 因子全部通过，才移动 published pointer；partial/error 保留上一完整快照。
+
+若应用并非持续运行，可先用后端时钟生成一次无网络计划：
+
+```bash
+uv run python -m backend.app.cli auto-refresh-once
+```
+
+增加 `--execute` 后，它只在后端调度判定 due 时执行，并复用同一幂等状态与跨进程
+锁。系统级周期任务必须由受控的自动化平台调用该命令；项目不会自行写入 launchd、
+cron 或其他系统定时配置。
 
 历史日期和前复权序列端点：
 

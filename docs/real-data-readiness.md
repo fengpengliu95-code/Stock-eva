@@ -8,6 +8,9 @@
 - BaoStock 请求有最小间隔和有限重试，不进行长时间不可控循环；
 - 全市场每日刷新默认只输出网络零写入计划，必须增加
   `--execute-all-main-board` 才执行；
+- `--inspect-universe` 只查询交易日与证券池元数据，30 秒硬超时，不请求 OHLCV；
+- 所有 provider 操作与分页统一限流，正常最小间隔 0.5 秒、最多 2 次尝试；
+- 后台与 CLI 共享非阻塞跨进程锁，禁止两个全市场刷新重叠；
 - 行情、运行记录和用户状态只写本地 `var/`，均被 `.gitignore` 排除。
 
 ## 历史窗口
@@ -72,10 +75,68 @@ uv run python -m backend.app.cli refresh-runs
 ```bash
 uv run python -m backend.app.cli refresh \
   --date 2026-07-23 \
-  --all-main-board
+  --all-main-board \
+  --inspect-universe
 ```
 
-该命令默认只输出 dry-run、批次上限和预计请求上限。本轮验收没有执行全市场刷新。
+不加 `--inspect-universe` 时 dry-run 完全无网络；增加后只读取 BaoStock 交易日和
+主板证券池，不请求日线、因子或指数行情，也不写 DuckDB/SQLite。2026-07-24 对
+2026-07-23 的受控测量结果：
+
+- 主板股票 3,191 只（上海 1,698、深圳 1,493），加 2 个摘要指数，共 3,193 个目标；
+- 证券池分页后实际元数据请求 5 次，耗时 23.373 秒；
+- 推算完整执行正常约 10 次 provider 请求，2 次有限尝试的理论上限 20 次；
+- 按元数据速度外推的执行时间下限约 46.7 秒；大批日线与因子响应尚未测量，因此
+  预留 15 分钟受控资源窗口，不把该下限当作 SLA。
+
+本轮仍未执行全市场行情刷新。首次执行必须人工监督：
+
+```bash
+uv run python -m backend.app.cli refresh \
+  --date 2026-07-23 \
+  --all-main-board \
+  --execute-all-main-board
+```
+
+执行前确认没有其他刷新进程；执行中可中断进程，未通过完整门槛的批次不会移动
+published pointer。结束后检查 `/api/v1/market/status`、`refresh-runs`、覆盖率、
+两指数和复权因子门槛，再决定是否启用长期自动化。
+
+## 自动运行与运维
+
+### 应用持续运行
+
+设置 `STOCK_EVA_AUTO_REFRESH_ENABLED=true` 后，FastAPI 启动即检查 catch-up，进程
+运行期间按 18:10、有限退避至 21:00、次日 07:15 的后端计划执行。电脑休眠或应用
+退出期间没有本地执行保证；唤醒或重启后的下一次轮询会补跑。
+
+### 应用不持续运行
+
+一次性入口默认只输出后端计划、零网络：
+
+```bash
+uv run python -m backend.app.cli auto-refresh-once
+```
+
+系统自动化获授权后可在既定时点调用：
+
+```bash
+uv run python -m backend.app.cli auto-refresh-once --execute
+```
+
+该入口不接受交易日，复用后端日历、发布指针、重试状态、幂等门槛和刷新锁。项目
+当前没有创建 launchd、cron 或平台周期任务；这类系统变更必须由协调任务通过平台
+automation 工具另行授权和创建。
+
+### 日志与故障处理
+
+- 进程 stderr 输出 `market_refresh_decision`、`market_publication_started`、
+  `market_publication_finished`、`market_publication_failed` 和锁冲突事件；
+- 日志仅含运行 ID、交易日、状态、覆盖数量和安全错误码，不含 provider 原始内容或
+  用户证券集合；
+- DuckDB `refresh_runs`、调度状态和 published pointer 是可读回的审计真值；
+- unexpected loop failure 会记录安全错误并在下一轮继续，不会让后台任务永久退出；
+- `partial/error` 只保留运行审计，不写 canonical、不覆盖最后完整发布。
 
 ## 2026-07-24 本地真实小样本验收
 
@@ -99,6 +160,6 @@ uv run python -m backend.app.cli refresh \
 - 当日日线通常在约 17:30 后、复权因子约 18:00 后可用，建议 18:10 后显式刷新；
 - 停牌行保留为占位并从指标排除；缺复权因子或质量异常会降级；
 - 退市、长期停牌和证券代码生命周期仍需更完整的证券主数据验证；
-- 当前没有后台调度、失败告警、外部通知、跨设备同步或运维监控；
-- 全市场真实日终覆盖尚未执行，仍需先选择一个交易日进行人工监督的单次验收；
+- 当前已有本地后台调度和安全日志，但没有外部失败通知、跨设备同步或集中监控；
+- 全市场真实日终覆盖尚未执行，仍需对一个已完成交易日进行人工监督的单次验收；
 - 长期生产使用仍需定期备份 DuckDB/SQLite，并制定免费源不可用时的受控替代方案。

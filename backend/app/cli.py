@@ -1,10 +1,17 @@
 import argparse
 import json
+import signal
+from contextlib import contextmanager
 from datetime import date
+from time import perf_counter
 
 from backend.app.config import get_settings
 from backend.app.market.automation import (
+    MarketAutomationService,
+    RefreshAlreadyRunning,
+    RefreshRunLock,
     collect_required_symbols,
+    get_market_clock,
     run_publication_refresh,
 )
 from backend.app.market.backfill import (
@@ -18,6 +25,27 @@ from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.store import UserStore
+
+
+def _probe_timeout_value(value: str) -> int:
+    seconds = int(value)
+    if not 1 <= seconds <= 60:
+        raise argparse.ArgumentTypeError("probe timeout must be between 1 and 60 seconds")
+    return seconds
+
+
+@contextmanager
+def _probe_timeout(seconds: int):
+    def raise_timeout(_signum, _frame):
+        raise TimeoutError("metadata probe timed out")
+
+    previous = signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="required confirmation for a real all-main-board refresh",
     )
+    refresh.add_argument(
+        "--inspect-universe",
+        action="store_true",
+        help="dry-run metadata probe: calendar and main-board universe only",
+    )
+    refresh.add_argument(
+        "--probe-timeout-seconds",
+        type=_probe_timeout_value,
+        default=30,
+        help="hard timeout for the optional metadata probe (1-60 seconds)",
+    )
     backfill = subparsers.add_parser(
         "backfill",
         help="plan or execute a resumable explicit-symbol historical backfill",
@@ -68,6 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "refresh-runs",
         help="list auditable daily refresh run records",
+    )
+    automation_once = subparsers.add_parser(
+        "auto-refresh-once",
+        help="evaluate the backend schedule once without a client-provided date",
+    )
+    automation_once.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform a due refresh; omitted means a network-free plan",
     )
     export = subparsers.add_parser("export", help="export one stored date to Parquet")
     export.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
@@ -93,6 +141,64 @@ def main() -> int:
             )
         )
         return 0
+    if args.command == "auto-refresh-once":
+        calendar = get_trading_calendar()
+        provider = BaoStockProvider(
+            min_request_interval_seconds=(
+                settings.auto_refresh_min_request_interval_seconds
+            )
+        )
+        user_store = UserStore(
+            settings.user_data_dir / settings.user_database_name
+        )
+        service = MarketAutomationService(
+            store,
+            provider,
+            calendar,
+            required_symbols=lambda: collect_required_symbols(user_store),
+            lock_path=settings.market_data_dir / ".refresh.lock",
+        )
+        now = get_market_clock()()
+        if not args.execute:
+            published = store.published_refresh()
+            decision = service.policy.decide(
+                now,
+                published_as_of=(
+                    published.requested_date if published is not None else None
+                ),
+                state=store.scheduler_state(),
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "dry-run",
+                        "action": decision.action,
+                        "target_session": (
+                            decision.target_session.isoformat()
+                            if decision.target_session is not None
+                            else None
+                        ),
+                        "refresh_state": decision.refresh_state,
+                        "next_run_at": (
+                            decision.next_run_at.isoformat()
+                            if decision.next_run_at is not None
+                            else None
+                        ),
+                        "writes_market_data": False,
+                        "execute_requires": "--execute",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        outcome = service.run_due_once(now)
+        print(json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False))
+        return (
+            1
+            if outcome.state.refresh_state
+            in {"retry_wait", "delayed", "error"}
+            else 0
+        )
     if args.command == "backfill":
         if (args.start is None) == (args.effective_days is None):
             print(
@@ -204,6 +310,59 @@ def main() -> int:
         print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
         return 0 if result.status in {"ready", "partial"} else 1
     if args.all_main_board and (args.dry_run or not args.execute_all_main_board):
+        inspection = None
+        elapsed = None
+        if args.inspect_universe:
+            calendar = get_trading_calendar()
+            if calendar.session_status(args.trade_date) != "open":
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "quality_issues": [
+                                "official_calendar_not_confirmed_open"
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            provider = BaoStockProvider(min_request_interval_seconds=0.5)
+            started = perf_counter()
+            try:
+                with _probe_timeout(args.probe_timeout_seconds):
+                    inspection = provider.inspect_main_board(args.trade_date)
+            except Exception:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "quality_issues": ["universe_inspection_failed"],
+                            "probe_timeout_seconds": args.probe_timeout_seconds,
+                            "writes_market_data": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            elapsed = round(perf_counter() - started, 3)
+        estimated_requests = (
+            inspection.metadata_provider_requests + 5
+            if inspection is not None
+            else 7
+        )
+        estimated_seconds_lower_bound = (
+            round(
+                elapsed
+                / inspection.metadata_provider_requests
+                * estimated_requests,
+                1,
+            )
+            if inspection is not None
+            and elapsed is not None
+            and inspection.metadata_provider_requests
+            else None
+        )
         print(
             json.dumps(
                 {
@@ -211,7 +370,47 @@ def main() -> int:
                     "scope": "all-main-board",
                     "trade_date": args.trade_date.isoformat(),
                     "batch_cap": 1,
-                    "estimated_provider_requests_upper_bound": 6,
+                    "request_batches": 1,
+                    "requested_count": (
+                        inspection.total_expected_count
+                        if inspection is not None
+                        else None
+                    ),
+                    "main_board_count": (
+                        inspection.main_board_count
+                        if inspection is not None
+                        else None
+                    ),
+                    "shanghai_count": (
+                        inspection.shanghai_count
+                        if inspection is not None
+                        else None
+                    ),
+                    "shenzhen_count": (
+                        inspection.shenzhen_count
+                        if inspection is not None
+                        else None
+                    ),
+                    "metadata_provider_requests": (
+                        inspection.metadata_provider_requests
+                        if inspection is not None
+                        else 0
+                    ),
+                    "metadata_probe_elapsed_seconds": elapsed,
+                    "estimated_provider_requests": estimated_requests,
+                    "provider_requests_with_retries_upper_bound": (
+                        estimated_requests * 2
+                    ),
+                    "min_request_interval_seconds": 0.5,
+                    "minimum_throttle_elapsed_seconds": round(
+                        (estimated_requests - 1) * 0.5,
+                        1,
+                    ),
+                    "estimated_execution_seconds_lower_bound": (
+                        estimated_seconds_lower_bound
+                    ),
+                    "recommended_resource_window_seconds": 900,
+                    "writes_market_data": False,
                     "execute_requires": "--execute-all-main-board",
                 },
                 ensure_ascii=False,
@@ -248,12 +447,37 @@ def main() -> int:
                 )
             )
             return 1
-        provider = BaoStockProvider()
         try:
-            if provider.trading_dates(args.trade_date, args.trade_date) != [
-                args.trade_date
-            ]:
-                raise ValueError("calendar conflict")
+            with RefreshRunLock(settings.market_data_dir / ".refresh.lock"):
+                provider = BaoStockProvider(
+                    min_request_interval_seconds=(
+                        settings.auto_refresh_min_request_interval_seconds
+                    )
+                )
+                if provider.trading_dates(args.trade_date, args.trade_date) != [
+                    args.trade_date
+                ]:
+                    raise ValueError("calendar conflict")
+                user_store = UserStore(
+                    settings.user_data_dir / settings.user_database_name
+                )
+                result = run_publication_refresh(
+                    store,
+                    provider,
+                    trade_date=args.trade_date,
+                    required_symbols=collect_required_symbols(user_store),
+                )
+        except RefreshAlreadyRunning:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["refresh_already_running"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         except Exception:
             print(
                 json.dumps(
@@ -265,15 +489,6 @@ def main() -> int:
                 )
             )
             return 1
-        user_store = UserStore(
-            settings.user_data_dir / settings.user_database_name
-        )
-        result = run_publication_refresh(
-            store,
-            provider,
-            trade_date=args.trade_date,
-            required_symbols=collect_required_symbols(user_store),
-        )
     else:
         result = MarketRefreshService(store).refresh(
             args.trade_date,

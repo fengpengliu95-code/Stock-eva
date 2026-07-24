@@ -1,10 +1,16 @@
 """Deterministic after-close publication and scheduling policy."""
 
 import asyncio
+import fcntl
 import hashlib
+import json
+import logging
+import os
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
@@ -13,6 +19,18 @@ from backend.app.market.baostock import INDEX_SYMBOLS
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
+
+logger = logging.getLogger("stock_eva.market.automation")
+
+
+def _log_event(level: int, event: str, **fields) -> None:
+    logger.log(
+        level,
+        "%s %s",
+        event,
+        json.dumps(fields, default=str, sort_keys=True),
+    )
+
 
 RefreshState = Literal[
     "disabled",
@@ -24,6 +42,36 @@ RefreshState = Literal[
     "delayed",
     "error",
 ]
+
+
+class RefreshAlreadyRunning(RuntimeError):
+    pass
+
+
+class RefreshRunLock:
+    """Non-blocking cross-process lease for the single daily refresh."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "RefreshRunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RefreshAlreadyRunning("market refresh already running") from exc
+        self._descriptor = descriptor
+        return self
+
+    def __exit__(self, *_args) -> None:
+        if self._descriptor is None:
+            return
+        fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+        os.close(self._descriptor)
+        self._descriptor = None
 
 
 class SchedulerState(BaseModel):
@@ -174,6 +222,12 @@ def run_publication_refresh(
     request_key = f"daily:baostock:{trade_date.isoformat()}:all-main-board"
     request_prefix = hashlib.sha256(request_key.encode()).hexdigest()[:12]
     run_id = f"{request_prefix}-{uuid.uuid4().hex[:12]}"
+    _log_event(
+        logging.INFO,
+        "market_publication_started",
+        run_id=run_id,
+        trade_date=trade_date,
+    )
     try:
         batch = provider.fetch(trade_date, symbols=None)
         loaded = {bar.symbol for bar in batch.bars}
@@ -207,6 +261,15 @@ def run_publication_refresh(
             result,
             publish=status == "ready",
         )
+        _log_event(
+            logging.INFO if status == "ready" else logging.WARNING,
+            "market_publication_finished",
+            run_id=run_id,
+            status=status,
+            requested_count=requested_count,
+            succeeded_count=succeeded_count,
+            coverage_ratio=coverage,
+        )
         return result
     except Exception:
         result = RefreshResult(
@@ -224,6 +287,12 @@ def run_publication_refresh(
             completed_at=datetime.now(UTC),
         )
         store.save_refresh([], result, publish=False)
+        _log_event(
+            logging.ERROR,
+            "market_publication_failed",
+            run_id=run_id,
+            error_code="provider_error",
+        )
         return result
 
 
@@ -235,11 +304,13 @@ class MarketAutomationService:
         calendar: TradingCalendar,
         *,
         required_symbols: Callable[[], set[str]],
+        lock_path: Path | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
         self.calendar = calendar
         self.required_symbols = required_symbols
+        self.lock_path = lock_path
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -251,6 +322,14 @@ class MarketAutomationService:
             published_as_of=published.requested_date if published else None,
             state=current,
         )
+        _log_event(
+            logging.INFO,
+            "market_refresh_decision",
+            action=decision.action,
+            refresh_state=decision.refresh_state,
+            target_session=decision.target_session,
+            next_run_at=decision.next_run_at,
+        )
         if decision.action != "run":
             state = current or SchedulerState(
                 target_session=decision.target_session,
@@ -261,6 +340,46 @@ class MarketAutomationService:
                 self.store.save_scheduler_state(state)
             return AutomationOutcome(decision=decision, state=state)
 
+        lease = (
+            RefreshRunLock(self.lock_path)
+            if self.lock_path is not None
+            else nullcontext()
+        )
+        try:
+            with lease:
+                return self._execute_due(decision, current, local)
+        except RefreshAlreadyRunning:
+            target = decision.target_session
+            next_retry = (
+                self.policy.next_retry_after(target, local)
+                if target is not None
+                else None
+            )
+            state = SchedulerState(
+                target_session=target,
+                refresh_state="retry_wait" if next_retry else "delayed",
+                attempt_count=current.attempt_count if current else 0,
+                last_attempt_at=current.last_attempt_at if current else None,
+                last_success_at=current.last_success_at if current else None,
+                next_retry_at=next_retry,
+                calendar_status="confirmed",
+                error_code="refresh_already_running",
+            )
+            self.store.save_scheduler_state(state)
+            _log_event(
+                logging.WARNING,
+                "market_refresh_lock_busy",
+                target_session=target,
+                next_retry_at=next_retry,
+            )
+            return AutomationOutcome(decision=decision, state=state)
+
+    def _execute_due(
+        self,
+        decision: ScheduleDecision,
+        current: SchedulerState | None,
+        local: datetime,
+    ) -> AutomationOutcome:
         target = decision.target_session
         if target is None:
             state = SchedulerState(
@@ -375,7 +494,14 @@ async def run_automation_loop(
 ) -> None:
     """Re-check regularly so process start and wake both perform catch-up."""
     while not stop.is_set():
-        await asyncio.to_thread(service.run_due_once, clock())
+        try:
+            await asyncio.to_thread(service.run_due_once, clock())
+        except Exception:
+            _log_event(
+                logging.ERROR,
+                "market_refresh_iteration_failed",
+                error_code="unexpected_iteration_failure",
+            )
         if stop.is_set():
             break
         try:

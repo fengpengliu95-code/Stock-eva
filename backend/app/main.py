@@ -33,9 +33,14 @@ async def lifespan(_: FastAPI):
     )
     service = MarketAutomationService(
         market_store,
-        BaoStockProvider(min_request_interval_seconds=0.5),
+        BaoStockProvider(
+            min_request_interval_seconds=(
+                settings.auto_refresh_min_request_interval_seconds
+            )
+        ),
         get_trading_calendar(),
         required_symbols=lambda: collect_required_symbols(user_store),
+        lock_path=settings.market_data_dir / ".refresh.lock",
     )
     stop = asyncio.Event()
     task = asyncio.create_task(

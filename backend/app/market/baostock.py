@@ -1,7 +1,7 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 
 from backend.app.market.models import DailyBar
@@ -31,16 +31,45 @@ class ProviderRangeBatch:
     failed_symbols: list[str]
 
 
+@dataclass(frozen=True)
+class MainBoardInspection:
+    trade_date: date
+    main_board_count: int
+    shanghai_count: int
+    shenzhen_count: int
+    total_expected_count: int
+    metadata_provider_requests: int
+
+
 class BaoStockError(RuntimeError):
     pass
 
 
-def _read_result(result: Any) -> tuple[list[str], list[list[str]]]:
+def _read_result(
+    result: Any,
+    *,
+    before_page_request: Callable[[], None] | None = None,
+) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
         raise BaoStockError(result.error_msg or f"BaoStock error {result.error_code}")
     rows: list[list[str]] = []
-    while result.next():
+    while True:
+        if (
+            before_page_request is not None
+            and hasattr(result, "data")
+            and hasattr(result, "cur_row_num")
+            and hasattr(result, "per_page_count")
+            and result.cur_row_num >= len(result.data)
+            and len(result.data) == int(result.per_page_count)
+        ):
+            before_page_request()
+        if not result.next():
+            break
         rows.append(result.get_row_data())
+    if result.error_code != "0":
+        raise BaoStockError(
+            result.error_msg or f"BaoStock pagination error {result.error_code}"
+        )
     return list(result.fields), rows
 
 
@@ -56,6 +85,8 @@ class BaoStockProvider:
         max_explicit_symbols: int = 20,
         max_attempts: int = 2,
         min_request_interval_seconds: float | None = None,
+        monotonic_fn=monotonic,
+        sleep_fn=sleep,
     ) -> None:
         is_real_client = client is None
         if client is None:
@@ -66,8 +97,12 @@ class BaoStockProvider:
         self.max_explicit_symbols = max_explicit_symbols
         self.max_attempts = max_attempts
         self.min_request_interval_seconds = (
-            0.2 if min_request_interval_seconds is None and is_real_client else 0.0
-        )
+            0.2 if is_real_client else 0.0
+        ) if min_request_interval_seconds is None else min_request_interval_seconds
+        self._monotonic = monotonic_fn
+        self._sleep = sleep_fn
+        self._last_request_at: float | None = None
+        self._provider_request_count = 0
 
     def _login(self) -> None:
         result = self.client.login()
@@ -94,6 +129,36 @@ class BaoStockProvider:
         self._login()
         try:
             return self._trading_dates(start_date, end_date)
+        finally:
+            self.client.logout()
+
+    def inspect_main_board(self, trade_date: date) -> MainBoardInspection:
+        """Read only the calendar and security universe; never request OHLCV."""
+        initial_request_count = self._provider_request_count
+        self._login()
+        try:
+            self._ensure_trading_day(trade_date)
+            fields, rows = self._read(
+                lambda: self.client.query_all_stock(day=trade_date.isoformat())
+            )
+            code_index = fields.index("code")
+            symbols = {
+                row[code_index]
+                for row in rows
+                if _is_main_board(row[code_index])
+            }
+            shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
+            shenzhen = sum(symbol.startswith("sz.") for symbol in symbols)
+            return MainBoardInspection(
+                trade_date=trade_date,
+                main_board_count=len(symbols),
+                shanghai_count=shanghai,
+                shenzhen_count=shenzhen,
+                total_expected_count=len(symbols) + len(INDEX_SYMBOLS),
+                metadata_provider_requests=(
+                    self._provider_request_count - initial_request_count
+                ),
+            )
         finally:
             self.client.logout()
 
@@ -136,9 +201,7 @@ class BaoStockProvider:
             factor_fields: list[str] = []
             factor_rows: list[list[str]] = []
             failed: list[str] = []
-            for index, symbol in enumerate(expected_symbols):
-                if index:
-                    sleep(self.min_request_interval_seconds)
+            for symbol in expected_symbols:
                 try:
                     fields, rows = self._read(
                         lambda symbol=symbol: self.client.query_history_k_data_plus(
@@ -183,14 +246,29 @@ class BaoStockProvider:
 
     def _read(self, operation) -> tuple[list[str], list[list[str]]]:
         last_error: BaoStockError | None = None
-        for attempt in range(self.max_attempts):
+        for _attempt in range(self.max_attempts):
+            self._pace_request()
             try:
-                return _read_result(operation())
+                return _read_result(
+                    operation(),
+                    before_page_request=self._pace_request,
+                )
             except BaoStockError as exc:
                 last_error = exc
-                if attempt + 1 < self.max_attempts:
-                    sleep(self.min_request_interval_seconds)
         raise last_error or BaoStockError("BaoStock request failed")
+
+    def _pace_request(self) -> None:
+        now = self._monotonic()
+        if self._last_request_at is not None:
+            remaining = (
+                self.min_request_interval_seconds
+                - (now - self._last_request_at)
+            )
+            if remaining > 0:
+                self._sleep(remaining)
+                now = self._monotonic()
+        self._last_request_at = now
+        self._provider_request_count += 1
 
     def _ensure_trading_day(self, trade_date: date) -> None:
         fields, rows = self._read(
@@ -212,9 +290,7 @@ class BaoStockProvider:
         iso_date = trade_date.isoformat()
 
         expected_symbols = list(dict.fromkeys(symbols))
-        for index, symbol in enumerate(expected_symbols):
-            if index:
-                sleep(self.min_request_interval_seconds)
+        for symbol in expected_symbols:
             try:
                 fields, rows = self._read(
                     lambda symbol=symbol: self.client.query_history_k_data_plus(

@@ -1,5 +1,7 @@
 import asyncio
 import importlib
+import json
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -7,6 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+import backend.app.cli as cli
 from backend.app.api.market import get_market_store
 from backend.app.main import app
 from backend.app.market.baostock import ProviderBatch
@@ -429,6 +432,91 @@ def test_automation_loop_checks_immediately_for_startup_catch_up() -> None:
     )
 
     assert service.calls == 1
+
+
+def test_automation_loop_survives_one_unexpected_iteration_failure() -> None:
+    module = load_module("backend.app.market.automation")
+    stop = asyncio.Event()
+
+    class Service:
+        calls = 0
+
+        def run_due_once(self, now):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic iteration failure")
+            stop.set()
+
+    service = Service()
+    asyncio.run(
+        module.run_automation_loop(
+            service,
+            stop,
+            clock=lambda: datetime(2026, 7, 23, 19, tzinfo=SHANGHAI),
+            poll_seconds=0.01,
+        )
+    )
+
+    assert service.calls == 2
+
+
+def test_refresh_lock_rejects_a_second_process(tmp_path: Path) -> None:
+    module = load_module("backend.app.market.automation")
+    lock_path = tmp_path / ".refresh.lock"
+
+    with module.RefreshRunLock(lock_path):
+        with pytest.raises(module.RefreshAlreadyRunning):
+            with module.RefreshRunLock(lock_path):
+                pass
+
+
+def test_automation_defers_without_fetching_when_refresh_lock_is_busy(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    lock_path = tmp_path / ".refresh.lock"
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        lock_path=lock_path,
+    )
+
+    with module.RefreshRunLock(lock_path):
+        outcome = service.run_due_once(
+            datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+        )
+
+    assert outcome.state.error_code == "refresh_already_running"
+    assert outcome.state.refresh_state == "retry_wait"
+    assert provider.calendar_calls == 0
+    assert provider.fetch_calls == 0
+
+
+def test_auto_refresh_once_defaults_to_network_free_plan(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once"])
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("one-shot automation needs explicit --execute")
+
+    monkeypatch.setattr(
+        cli.MarketAutomationService,
+        "run_due_once",
+        unexpected_run,
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry-run"
+    assert payload["writes_market_data"] is False
+    assert payload["execute_requires"] == "--execute"
+    assert "target_session" in payload
 
 
 def test_market_status_api_is_read_only_and_reports_capability(

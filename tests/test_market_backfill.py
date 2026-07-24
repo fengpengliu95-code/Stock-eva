@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -224,6 +225,51 @@ def test_all_main_board_refresh_defaults_to_network_free_dry_run(
     output = capsys.readouterr().out
     assert '"status": "dry-run"' in output
     assert '"scope": "all-main-board"' in output
+
+
+def test_all_main_board_inspection_reports_measured_bounded_plan(
+    monkeypatch,
+    capsys,
+) -> None:
+    class Inspection:
+        main_board_count = 3200
+        shanghai_count = 1700
+        shenzhen_count = 1500
+        total_expected_count = 3202
+        metadata_provider_requests = 2
+
+    class InspectionProvider:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["min_request_interval_seconds"] == 0.5
+
+        def inspect_main_board(self, trade_date):
+            assert trade_date == date(2026, 7, 23)
+            return Inspection()
+
+    monkeypatch.setattr(cli, "BaoStockProvider", InspectionProvider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "refresh",
+            "--date",
+            "2026-07-23",
+            "--all-main-board",
+            "--inspect-universe",
+        ],
+    )
+
+    assert cli.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "dry-run"
+    assert output["requested_count"] == 3202
+    assert output["request_batches"] == 1
+    assert output["metadata_provider_requests"] == 2
+    assert output["estimated_provider_requests"] == 7
+    assert output["provider_requests_with_retries_upper_bound"] == 14
+    assert output["min_request_interval_seconds"] == 0.5
+    assert output["writes_market_data"] is False
 
 
 def test_backfill_calendar_failure_returns_safe_cli_error(

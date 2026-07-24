@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
     auto_refresh_enabled: bool = False
+    auto_refresh_min_request_interval_seconds: float = Field(
+        default=0.5,
+        ge=0.2,
+    )
 
 
 @lru_cache

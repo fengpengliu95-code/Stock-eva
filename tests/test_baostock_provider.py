@@ -92,3 +92,51 @@ def test_provider_bulk_slice_filters_main_board_and_adds_indexes() -> None:
         "sh.000001",
         "sz.399001",
     ]
+
+
+def test_universe_inspection_reads_metadata_without_fetching_market_rows() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class MetadataOnlyClient(FakeBaoStock):
+        def query_daily_history_k_AStock(self, **kwargs):
+            raise AssertionError("universe inspection must not fetch daily rows")
+
+        def query_daily_adjust_factor(self, **kwargs):
+            raise AssertionError("universe inspection must not fetch factors")
+
+        def query_history_k_data_plus(self, *args, **kwargs):
+            raise AssertionError("universe inspection must not fetch indexes")
+
+    provider = BaoStockProvider(client=MetadataOnlyClient(payload))
+
+    inspection = provider.inspect_main_board(date(2026, 7, 23))
+
+    assert inspection.main_board_count == 3
+    assert inspection.shanghai_count == 2
+    assert inspection.shenzhen_count == 1
+    assert inspection.total_expected_count == 5
+    assert inspection.metadata_provider_requests == 2
+
+
+def test_provider_applies_minimum_interval_to_every_operation() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return clock[0]
+
+    def sleeper(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    provider = BaoStockProvider(
+        client=FakeBaoStock(payload),
+        min_request_interval_seconds=0.5,
+        monotonic_fn=monotonic,
+        sleep_fn=sleeper,
+    )
+
+    provider.inspect_main_board(date(2026, 7, 23))
+
+    assert sleeps == [0.5]
