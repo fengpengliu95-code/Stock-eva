@@ -466,4 +466,5 @@ class BackfillService:
                     started_at=now,
                     completed_at=datetime.now(UTC),
                 ),
+                publish=False,
             )

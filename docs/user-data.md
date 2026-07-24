@@ -37,8 +37,8 @@
 - 部分覆盖时，只返回明确命名的 `covered_*` 汇总及 N/M 覆盖，不把缺失项当作零。
 
 所有估值响应固定声明：`按用户成本与当日收盘估算、未计交易费用`。它是记录和复盘
-工具，不是账户对账、税务计算、投资建议或可交易报价。调用方应传入确认完成的
-`expected_date`；否则新鲜度未验证，状态不会是 `ready`。
+工具，不是账户对账、税务计算、投资建议或可交易报价。估值只读取最新 published
+完整快照，并由后端交易日历判断新鲜度；调用方不能输入或覆盖期望交易日。
 
 ## API
 
@@ -49,7 +49,7 @@
 - `GET /api/v1/portfolio/positions/{id}`
 - `PUT /api/v1/portfolio/positions/{id}`
 - `DELETE /api/v1/portfolio/positions/{id}?expected_version=N`
-- `GET /api/v1/portfolio/valuation?expected_date=YYYY-MM-DD`
+- `GET /api/v1/portfolio/valuation`
 
 ### 自选
 

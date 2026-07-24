@@ -19,7 +19,10 @@ class MarketRefreshService:
         try:
             batch = self.provider.fetch(trade_date, symbols=symbols)
             missing_factors = [
-                bar.symbol for bar in batch.bars if "missing_adjust_factor" in bar.quality_issues
+                bar.symbol
+                for bar in batch.bars
+                if not bar.is_suspended
+                and "missing_adjust_factor" in bar.quality_issues
             ]
             loaded_symbols = {bar.symbol for bar in batch.bars}
             expected_symbols = set(batch.expected_symbols)
@@ -47,7 +50,7 @@ class MarketRefreshService:
                 started_at=started_at,
                 completed_at=datetime.now(UTC),
             )
-            self.store.save_refresh(batch.bars, result)
+            self.store.save_refresh(batch.bars, result, publish=False)
             return result
         except Exception as exc:
             result = RefreshResult(
@@ -65,5 +68,5 @@ class MarketRefreshService:
                 started_at=started_at,
                 completed_at=datetime.now(UTC),
             )
-            self.store.save_refresh([], result)
+            self.store.save_refresh([], result, publish=False)
             return result

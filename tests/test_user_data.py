@@ -10,6 +10,8 @@ import pytest
 from backend.app.api.market import get_market_store
 from backend.app.api.user import get_user_store
 from backend.app.main import app
+from backend.app.market.automation import get_market_clock
+from backend.app.market.calendar import SHANGHAI
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore
@@ -126,7 +128,7 @@ def test_portfolio_valuation_is_partial_for_suspended_and_missing_prices(
     market_store = ready_market_store(tmp_path / "market.duckdb")
 
     valuation = PortfolioValuationService(user_store, market_store).latest(
-        expected_date=date(2026, 7, 23)
+        expected_session=date(2026, 7, 23)
     )
 
     assert valuation.status == "partial"
@@ -149,14 +151,14 @@ def test_empty_portfolio_and_market_error_are_distinct(tmp_path: Path) -> None:
     empty = PortfolioValuationService(
         user_store,
         MarketStore(tmp_path / "missing.duckdb"),
-    ).latest(expected_date=date(2026, 7, 23))
+    ).latest(expected_session=date(2026, 7, 23))
     assert empty.status == "empty"
 
     user_store.create_position(position())
     error = PortfolioValuationService(
         user_store,
         MarketStore(tmp_path / "missing.duckdb"),
-    ).latest(expected_date=date(2026, 7, 23))
+    ).latest(expected_session=date(2026, 7, 23))
     assert error.status == "error"
     assert error.coverage.covered == 0
     assert error.covered_unrealized_pnl is None
@@ -167,6 +169,9 @@ def test_user_api_exposes_crud_conflict_and_portfolio_coverage(tmp_path: Path) -
     market_store = ready_market_store(tmp_path / "market.duckdb")
     app.dependency_overrides[get_user_store] = lambda: user_store
     app.dependency_overrides[get_market_store] = lambda: market_store
+    app.dependency_overrides[get_market_clock] = lambda: (
+        lambda: datetime(2026, 7, 24, 10, tzinfo=SHANGHAI)
+    )
 
     async def request(method: str, path: str, **kwargs) -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
@@ -204,7 +209,7 @@ def test_user_api_exposes_crud_conflict_and_portfolio_coverage(tmp_path: Path) -
         valuation = asyncio.run(
             request(
                 "GET",
-                "/api/v1/portfolio/valuation?expected_date=2026-07-23",
+                "/api/v1/portfolio/valuation",
             )
         )
     finally:

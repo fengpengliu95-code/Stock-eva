@@ -1,10 +1,13 @@
-from datetime import date
+from collections.abc import Callable
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from backend.app.api.market import get_market_store
 from backend.app.config import Settings, get_settings
+from backend.app.market.automation import get_market_clock
+from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.store import MarketStore
 from backend.app.user.models import (
     PortfolioValuation,
@@ -103,11 +106,20 @@ def delete_position(
 
 @portfolio_router.get("/valuation", response_model=PortfolioValuation)
 def portfolio_valuation(
+    request: Request,
     user_store: Annotated[UserStore, Depends(get_user_store)],
     market_store: Annotated[MarketStore, Depends(get_market_store)],
-    expected_date: date | None = None,
+    calendar: Annotated[TradingCalendar, Depends(get_trading_calendar)],
+    clock: Annotated[Callable[[], datetime], Depends(get_market_clock)],
 ) -> PortfolioValuation:
-    return PortfolioValuationService(user_store, market_store).latest(expected_date)
+    if request.query_params:
+        raise HTTPException(
+            status_code=422,
+            detail="portfolio valuation does not accept client freshness parameters",
+        )
+    return PortfolioValuationService(user_store, market_store).latest(
+        calendar.latest_expected_session(clock())
+    )
 
 
 @watchlist_router.post(

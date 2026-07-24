@@ -65,6 +65,33 @@ class MarketStore:
             """
         )
         connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS published_snapshots (
+                singleton INTEGER PRIMARY KEY,
+                run_id VARCHAR NOT NULL,
+                trade_date DATE NOT NULL,
+                published_at TIMESTAMPTZ NOT NULL,
+                CHECK (singleton = 1)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_automation_state (
+                singleton INTEGER PRIMARY KEY,
+                target_session DATE,
+                refresh_state VARCHAR NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                last_attempt_at TIMESTAMPTZ,
+                last_success_at TIMESTAMPTZ,
+                next_retry_at TIMESTAMPTZ,
+                calendar_status VARCHAR NOT NULL,
+                error_code VARCHAR,
+                CHECK (singleton = 1)
+            )
+            """
+        )
+        connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS coverage_ratio DOUBLE"
         )
         connection.execute(
@@ -81,7 +108,16 @@ class MarketStore:
     def exists(self) -> bool:
         return self.path.is_file()
 
-    def save_refresh(self, bars: list[DailyBar], result: RefreshResult) -> None:
+    def save_refresh(
+        self,
+        bars: list[DailyBar],
+        result: RefreshResult,
+        *,
+        publish: bool | None = None,
+    ) -> None:
+        publish = result.status == "ready" if publish is None else publish
+        if publish and result.status != "ready":
+            raise ValueError("only ready refreshes can be published")
         connection = self._connect()
         try:
             connection.begin()
@@ -112,6 +148,16 @@ class MarketStore:
                     result.completed_at,
                 ],
             )
+            if publish:
+                connection.execute("DELETE FROM published_snapshots WHERE singleton = 1")
+                connection.execute(
+                    """
+                    INSERT INTO published_snapshots (
+                        singleton, run_id, trade_date, published_at
+                    ) VALUES (1, ?, ?, ?)
+                    """,
+                    [result.run_id, result.requested_date, result.completed_at],
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -241,6 +287,100 @@ class MarketStore:
             completed_at=row[11],
             request_key=row[12],
             run_kind=row[13],
+        )
+
+    def published_refresh(self) -> RefreshResult | None:
+        if not self.exists():
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT r.run_id, r.requested_date, r.source, r.status,
+                       r.requested_count, r.succeeded_count, r.coverage_ratio,
+                       r.failed_symbols, r.quality_issues, r.error_message,
+                       r.started_at, r.completed_at, r.request_key, r.run_kind
+                FROM published_snapshots p
+                JOIN refresh_runs r ON r.run_id = p.run_id
+                WHERE p.singleton = 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return RefreshResult(
+            run_id=row[0],
+            requested_date=row[1],
+            source=row[2],
+            status=row[3],
+            requested_count=row[4],
+            succeeded_count=row[5],
+            coverage_ratio=row[6],
+            failed_symbols=json.loads(row[7]),
+            quality_issues=json.loads(row[8]),
+            error_message=row[9],
+            started_at=row[10],
+            completed_at=row[11],
+            request_key=row[12],
+            run_kind=row[13],
+        )
+
+    def save_scheduler_state(self, state) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM market_automation_state WHERE singleton = 1")
+            connection.execute(
+                """
+                INSERT INTO market_automation_state (
+                    singleton, target_session, refresh_state, attempt_count,
+                    last_attempt_at, last_success_at, next_retry_at,
+                    calendar_status, error_code
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    state.target_session,
+                    state.refresh_state,
+                    state.attempt_count,
+                    state.last_attempt_at,
+                    state.last_success_at,
+                    state.next_retry_at,
+                    state.calendar_status,
+                    state.error_code,
+                ],
+            )
+        finally:
+            connection.close()
+
+    def scheduler_state(self):
+        if not self.exists():
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT target_session, refresh_state, attempt_count,
+                       last_attempt_at, last_success_at, next_retry_at,
+                       calendar_status, error_code
+                FROM market_automation_state
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        from backend.app.market.automation import SchedulerState
+
+        return SchedulerState(
+            target_session=row[0],
+            refresh_state=row[1],
+            attempt_count=row[2],
+            last_attempt_at=row[3],
+            last_success_at=row[4],
+            next_retry_at=row[5],
+            calendar_status=row[6],
+            error_code=row[7],
         )
 
     def list_refreshes(self, limit: int = 100) -> list[RefreshResult]:

@@ -1,10 +1,13 @@
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.app.config import Settings, get_settings
-from backend.app.market.models import MarketSummary, PriceSeriesPoint
+from backend.app.market.automation import get_market_clock
+from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
+from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
@@ -18,10 +21,74 @@ def get_market_store(settings: Annotated[Settings, Depends(get_settings)]) -> Ma
 
 @router.get("/summary", response_model=MarketSummary)
 def market_summary(
+    request: Request,
     store: Annotated[MarketStore, Depends(get_market_store)],
-    expected_date: date | None = None,
+    calendar: Annotated[TradingCalendar, Depends(get_trading_calendar)],
+    clock: Annotated[Callable[[], datetime], Depends(get_market_clock)],
 ) -> MarketSummary:
-    return MarketSummaryService(store).latest(expected_date=expected_date)
+    if request.query_params:
+        raise HTTPException(
+            status_code=422,
+            detail="market summary does not accept client freshness parameters",
+        )
+    expected_session = calendar.latest_expected_session(clock())
+    return MarketSummaryService(store).latest(expected_session=expected_session)
+
+
+@router.get("/status", response_model=MarketDataStatus)
+def market_status(
+    store: Annotated[MarketStore, Depends(get_market_store)],
+    calendar: Annotated[TradingCalendar, Depends(get_trading_calendar)],
+    clock: Annotated[Callable[[], datetime], Depends(get_market_clock)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> MarketDataStatus:
+    now = clock().astimezone(SHANGHAI)
+    expected = calendar.latest_expected_session(now)
+    published = store.published_refresh()
+    scheduler = store.scheduler_state()
+    calendar_status = (
+        scheduler.calendar_status
+        if scheduler is not None and scheduler.calendar_status != "confirmed"
+        else (
+            "confirmed"
+            if calendar.session_status(now.date()) != "unknown"
+            else "unavailable"
+        )
+    )
+    refresh_state = (
+        scheduler.refresh_state
+        if settings.auto_refresh_enabled and scheduler is not None
+        else "idle" if settings.auto_refresh_enabled else "disabled"
+    )
+    phase = calendar.market_phase(now)
+    if phase == "after_close_waiting":
+        if refresh_state == "running":
+            phase = "refreshing"
+        elif (
+            expected is not None
+            and published is not None
+            and published.requested_date >= expected
+        ):
+            phase = "complete"
+        elif refresh_state in {"delayed", "error"}:
+            phase = "delayed"
+    return MarketDataStatus(
+        market_phase=phase,
+        calendar_status=calendar_status,
+        latest_expected_session=expected,
+        published_as_of=published.requested_date if published else None,
+        refresh_state=refresh_state,
+        last_success_at=(
+            scheduler.last_success_at
+            if scheduler is not None and scheduler.last_success_at is not None
+            else published.completed_at if published else None
+        ),
+        next_retry_at=scheduler.next_retry_at if scheduler else None,
+        calendar_sources=[
+            item.model_dump()
+            for item in calendar.sources_for(now.year)
+        ],
+    )
 
 
 @router.get("/history/dates", response_model=list[date])

@@ -52,9 +52,74 @@ const STATUS_TEXT = {
   loading: "加载中",
 };
 
+const MARKET_PHASE_VIEW = {
+  pre_market: {
+    label: "盘前 · 展示最近完整收盘数据",
+    badge: "盘前",
+    badgeStatus: "empty",
+  },
+  market_open: {
+    label: "盘中 · 本产品不提供实时行情",
+    badge: "盘中",
+    badgeStatus: "empty",
+  },
+  after_close_waiting: {
+    label: "已收盘 · 等待免费日线数据就绪",
+    badge: "待数据",
+    badgeStatus: "partial",
+  },
+  refreshing: {
+    label: "收盘数据更新中 · 完成前保留上一完整快照",
+    badge: "更新中",
+    badgeStatus: "loading",
+  },
+  complete: {
+    label: "日终数据已通过发布门槛",
+    badge: "已发布",
+    badgeStatus: "ready",
+  },
+  delayed: {
+    label: "日终数据延迟 · 当前仍展示上一完整快照",
+    badge: "延迟",
+    badgeStatus: "stale",
+  },
+  closed: {
+    label: "今日休市 · 展示最近完整交易日",
+    badge: "休市",
+    badgeStatus: "empty",
+  },
+  calendar_unavailable: {
+    label: "交易日历未确认 · 已停止自动判断",
+    badge: "日历待确认",
+    badgeStatus: "error",
+  },
+};
+
 function setBadge(element, status) {
   element.className = `status-badge status-${status}`;
   element.textContent = STATUS_TEXT[status] || status;
+}
+
+async function loadMarketStatus() {
+  try {
+    const data = await api("/market/status");
+    const view = MARKET_PHASE_VIEW[data.market_phase] || MARKET_PHASE_VIEW.calendar_unavailable;
+    setBadge(byId("market-status"), view.badgeStatus);
+    byId("market-status").textContent = view.badge;
+    byId("data-status-primary").textContent = view.label;
+    const details = [
+      `日历 ${data.calendar_status}`,
+      `刷新 ${data.refresh_state}`,
+      `应完成 ${data.latest_expected_session || "未确认"}`,
+      `已发布 ${data.published_as_of || "无"}`,
+    ];
+    if (data.next_retry_at) details.push(`下次校正 ${data.next_retry_at}`);
+    byId("market-meta").textContent = details.join(" · ");
+  } catch (error) {
+    setBadge(byId("market-status"), "error");
+    byId("data-status-primary").textContent = "只读数据状态暂不可用";
+    byId("market-meta").textContent = safeMessage(error);
+  }
 }
 
 function formatNumber(value, digits = 2) {
@@ -650,6 +715,7 @@ async function loadWorkspace() {
   byId("global-status").textContent = "正在读取本地数据视图…";
   await Promise.all([loadMarket(), loadPortfolio(), loadWatchlists(), loadStrategies()]);
   await loadAlerts();
+  await loadMarketStatus();
   byId("global-status").textContent = "本地数据视图读取完成。";
 }
 

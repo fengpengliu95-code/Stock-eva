@@ -100,6 +100,58 @@ class MarketSummary(BaseModel):
     quality_issues: list[str] = Field(default_factory=list)
 
 
+class MarketCapability(BaseModel):
+    mode: Literal["end_of_day"] = "end_of_day"
+    realtime: Literal[False] = False
+    automatic_when_running: Literal[True] = True
+    sleep_catch_up: Literal[True] = True
+
+
+class CalendarSourceMetadata(BaseModel):
+    exchange: Literal["SSE", "SZSE"]
+    title: str
+    url: str
+
+
+class MarketDataStatus(BaseModel):
+    market_phase: Literal[
+        "pre_market",
+        "market_open",
+        "after_close_waiting",
+        "refreshing",
+        "complete",
+        "delayed",
+        "closed",
+        "calendar_unavailable",
+    ]
+    calendar_status: Literal["confirmed", "conflict", "unavailable"]
+    latest_expected_session: date | None
+    published_as_of: date | None
+    refresh_state: Literal[
+        "disabled",
+        "idle",
+        "scheduled",
+        "running",
+        "retry_wait",
+        "success",
+        "delayed",
+        "error",
+    ]
+    last_success_at: datetime | None
+    next_retry_at: datetime | None
+    capability: MarketCapability = Field(default_factory=MarketCapability)
+    calendar_sources: list[CalendarSourceMetadata] = Field(default_factory=list)
+    publication_gates: list[str] = Field(
+        default_factory=lambda: [
+            "full_expected_universe",
+            "required_indexes",
+            "user_symbols_present",
+            "valid_canonical_quality",
+            "adjust_factors_for_eligible_stocks",
+        ]
+    )
+
+
 class PriceSeriesPoint(BaseModel):
     trade_date: date
     symbol: str

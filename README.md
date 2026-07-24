@@ -31,9 +31,10 @@ python3 -m http.server 8080
 可用端点：
 
 - `GET http://127.0.0.1:8000/api/v1/health`
+- `GET http://127.0.0.1:8000/api/v1/market/status`
 - `GET http://127.0.0.1:8000/api/v1/market/summary`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/positions`
-- `GET http://127.0.0.1:8000/api/v1/portfolio/valuation?expected_date=YYYY-MM-DD`
+- `GET http://127.0.0.1:8000/api/v1/portfolio/valuation`
 - `GET http://127.0.0.1:8000/api/v1/watchlists`
 - `POST http://127.0.0.1:8000/api/v1/strategies/validate`
 - `GET http://127.0.0.1:8000/api/v1/strategies`
@@ -89,18 +90,24 @@ uv run python -m backend.app.cli backfill \
 uv run python -m backend.app.cli refresh-runs
 ```
 
-BaoStock 官方说明当日日线约在 17:30 后可用、复权因子约在 18:00 后可用。
-建议在 18:10 后显式执行，并传入已经收盘且确认是交易日的日期。CLI 不会后台
-自动循环，也不会把失败刷新伪装为成功数据。
+交易日和期望完成日由后端统一确定，前端与 API 调用方不能传入
+`expected_date`。内置年度配置以交易所休市公告为权威来源，运行刷新前再用
+BaoStock `query_trade_dates` 机器校验；缺少已确认年度配置的工作日会 fail closed。
+`GET /api/v1/market/status` 只读返回市场阶段、日历状态、期望交易日、已发布日期、
+刷新状态和日终非实时能力声明。
 
-严格判断新鲜度时，由调用方传入期望的已完成交易日：
+本地自动刷新是显式 opt-in。审阅配置和数据规模后，在 `.env` 设置：
 
 ```text
-GET /api/v1/market/summary?expected_date=2026-07-23
+STOCK_EVA_AUTO_REFRESH_ENABLED=true
 ```
 
-不传 `expected_date` 时 API 不会自行猜测节假日，摘要最多返回 `partial` 并标记
-`freshness_not_evaluated`。历史日期和前复权序列端点：
+应用运行时会在 18:10 首次尝试，有限重试至 21:00，并在次日 07:15 校正；进程关闭
+或电脑休眠期间不会运行，重新启动或唤醒后会立即补跑到当前应有状态。GET 请求和打开
+页面永不触发抓取。只有全覆盖、摘要指数、本地持仓/自选证券、质量和非停牌股票复权
+因子全部通过，才移动 published pointer；partial/error 保留上一完整快照。
+
+历史日期和前复权序列端点：
 
 - `GET /api/v1/market/history/dates`
 - `GET /api/v1/market/history/sh.600000?start=2026-07-01&end=2026-07-23&adjustment=qfq`

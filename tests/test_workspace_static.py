@@ -130,6 +130,7 @@ def test_workspace_script_uses_real_api_without_browser_storage_or_fake_market_d
     script = (ROOT / "workspace" / "app.js").read_text()
 
     for endpoint in (
+        "/market/status",
         "/market/summary",
         "/portfolio/positions",
         "/portfolio/valuation",
@@ -143,6 +144,25 @@ def test_workspace_script_uses_real_api_without_browser_storage_or_fake_market_d
     assert "eval(" not in script
     assert "event.currentTarget.reset()" not in script
     assert "value === null || value === undefined" in script
+
+
+def test_workspace_maps_backend_market_phases_without_refresh_controls() -> None:
+    script = (ROOT / "workspace" / "app.js").read_text()
+
+    for phase in (
+        "pre_market",
+        "market_open",
+        "after_close_waiting",
+        "refreshing",
+        "complete",
+        "delayed",
+        "closed",
+        "calendar_unavailable",
+    ):
+        assert phase in script
+    assert "next_retry_at" in script
+    assert "expected-date" not in script
+    assert "refresh-form" not in script
 
 
 def test_workspace_styles_include_focus_mobile_and_reduced_motion_rules() -> None:

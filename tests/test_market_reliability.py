@@ -228,7 +228,7 @@ def test_refresh_coverage_uses_expected_universe_and_is_strict(tmp_path: Path) -
     assert result.requested_count == 3
     assert result.succeeded_count == 2
     assert result.coverage_ratio == pytest.approx(2 / 3)
-    summary = MarketSummaryService(store).latest(expected_date=date(2026, 7, 23))
+    summary = MarketSummaryService(store).latest(expected_session=date(2026, 7, 23))
     assert summary.completeness.is_complete is False
     assert summary.completeness.coverage_ratio == pytest.approx(2 / 3)
 
@@ -358,13 +358,13 @@ def test_history_api_exposes_dates_and_deterministic_qfq_series(tmp_path: Path) 
     assert series.json()[0]["price_adjustment"] == "qfq"
 
 
-def test_freshness_is_not_claimed_without_expected_trading_date(tmp_path: Path) -> None:
+def test_freshness_is_not_claimed_without_backend_expected_session(tmp_path: Path) -> None:
     store = MarketStore(tmp_path / "market.duckdb")
     bars = fixture_bars()
     save_fixture(store, bars, "freshness-fixture", date(2026, 7, 23))
 
     unevaluated = MarketSummaryService(store).latest()
-    fresh = MarketSummaryService(store).latest(expected_date=date(2026, 7, 23))
+    fresh = MarketSummaryService(store).latest(expected_session=date(2026, 7, 23))
 
     assert unevaluated.status == "partial"
     assert unevaluated.freshness.evaluated is False

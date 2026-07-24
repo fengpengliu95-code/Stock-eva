@@ -3,15 +3,21 @@ import json
 from datetime import date
 
 from backend.app.config import get_settings
+from backend.app.market.automation import (
+    collect_required_symbols,
+    run_publication_refresh,
+)
 from backend.app.market.backfill import (
     BackfillService,
     minimum_effective_days,
     resolve_effective_window,
 )
 from backend.app.market.baostock import BaoStockProvider
+from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.strategy.store import StrategyStore
+from backend.app.user.store import UserStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,10 +235,50 @@ def main() -> int:
             )
         )
         return 0
-    result = MarketRefreshService(store).refresh(
-        args.trade_date,
-        symbols=None if args.all_main_board else args.symbols,
-    )
+    if args.all_main_board:
+        calendar = get_trading_calendar()
+        if calendar.session_status(args.trade_date) != "open":
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["official_calendar_not_confirmed_open"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        provider = BaoStockProvider()
+        try:
+            if provider.trading_dates(args.trade_date, args.trade_date) != [
+                args.trade_date
+            ]:
+                raise ValueError("calendar conflict")
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["calendar_provider_conflict"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        user_store = UserStore(
+            settings.user_data_dir / settings.user_database_name
+        )
+        result = run_publication_refresh(
+            store,
+            provider,
+            trade_date=args.trade_date,
+            required_symbols=collect_required_symbols(user_store),
+        )
+    else:
+        result = MarketRefreshService(store).refresh(
+            args.trade_date,
+            symbols=args.symbols,
+        )
     print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
     return 0 if result.status in {"ready", "partial"} else 1
 

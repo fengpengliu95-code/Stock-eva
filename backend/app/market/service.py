@@ -15,10 +15,11 @@ class MarketSummaryService:
     def __init__(self, store: MarketStore) -> None:
         self.store = store
 
-    def latest(self, expected_date: date | None = None) -> MarketSummary:
+    def latest(self, expected_session: date | None = None) -> MarketSummary:
         if not self.store.exists():
             return self._empty()
-        refresh = self.store.latest_refresh()
+        published = self.store.published_refresh()
+        refresh = published or self.store.latest_refresh()
         if refresh is None:
             return self._empty()
 
@@ -45,17 +46,18 @@ class MarketSummaryService:
         bars = self.store.bars_for(refresh.requested_date, refresh.source)
         status = refresh.status
         issues = list(refresh.quality_issues)
-        if expected_date is None:
+        if expected_session is None:
             freshness = Freshness()
             issues.append("freshness_not_evaluated")
+            issues.append("calendar_unavailable")
             if status == "ready":
                 status = "partial"
         else:
-            lag = max((expected_date - refresh.requested_date).days, 0)
-            is_fresh = refresh.requested_date >= expected_date
+            lag = max((expected_session - refresh.requested_date).days, 0)
+            is_fresh = refresh.requested_date >= expected_session
             freshness = Freshness(
                 evaluated=True,
-                expected_as_of=expected_date,
+                expected_as_of=expected_session,
                 is_fresh=is_fresh,
                 lag_calendar_days=lag,
             )

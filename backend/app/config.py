@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     market_database_name: str = "stock_eva.duckdb"
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
+    auto_refresh_enabled: bool = False
 
 
 @lru_cache

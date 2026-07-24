@@ -143,7 +143,7 @@ def test_empty_market_store_is_explicit(tmp_path: Path) -> None:
     assert summary.indexes == []
 
 
-def test_stale_and_failed_refresh_states_are_not_reported_as_ready(tmp_path: Path) -> None:
+def test_failed_attempt_does_not_replace_last_published_snapshot(tmp_path: Path) -> None:
     store = MarketStore(tmp_path / "market.duckdb")
     rows = canonical_fixture()
     ready = RefreshResult(
@@ -158,7 +158,7 @@ def test_stale_and_failed_refresh_states_are_not_reported_as_ready(tmp_path: Pat
     )
     store.save_refresh(rows, ready)
 
-    stale = MarketSummaryService(store).latest(expected_date=date(2026, 7, 24))
+    stale = MarketSummaryService(store).latest(expected_session=date(2026, 7, 24))
 
     assert stale.status == "stale"
     assert "data_older_than_expected" in stale.quality_issues
@@ -174,9 +174,10 @@ def test_stale_and_failed_refresh_states_are_not_reported_as_ready(tmp_path: Pat
     )
     store.save_refresh([], failed)
 
-    error = MarketSummaryService(store).latest()
+    preserved = MarketSummaryService(store).latest()
 
-    assert error.status == "error"
-    assert error.completeness.loaded == 0
-    assert error.indexes == []
-    assert "refresh_error" in error.quality_issues
+    assert preserved.as_of == date(2026, 7, 23)
+    assert preserved.completeness.loaded == len(rows)
+    assert len(preserved.indexes) == 2
+    assert store.latest_refresh().status == "error"
+    assert store.published_refresh().run_id == "stale-fixture"

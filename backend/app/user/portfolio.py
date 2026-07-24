@@ -22,13 +22,16 @@ class PortfolioValuationService:
         self.user_store = user_store
         self.market_store = market_store
 
-    def latest(self, expected_date: date | None = None) -> PortfolioValuation:
+    def latest(self, expected_session: date | None = None) -> PortfolioValuation:
         positions = self.user_store.list_positions()
         if not positions:
             return self._empty()
         if not self.market_store.exists():
             return self._market_error(positions, "market_data_missing")
-        refresh = self.market_store.latest_refresh()
+        refresh = (
+            self.market_store.published_refresh()
+            or self.market_store.latest_refresh()
+        )
         if refresh is None or refresh.status == "error":
             return self._market_error(positions, "market_refresh_error")
 
@@ -92,10 +95,10 @@ class PortfolioValuationService:
             issues.append("position_after_market_date")
         if missing or suspended or refresh.status == "partial":
             status = "partial"
-        if expected_date is None:
-            issues.append("freshness_not_evaluated")
+        if expected_session is None:
+            issues.append("calendar_unavailable")
             status = "partial"
-        elif refresh.requested_date < expected_date:
+        elif refresh.requested_date < expected_session:
             issues.append("data_older_than_expected")
             status = "stale"
 
