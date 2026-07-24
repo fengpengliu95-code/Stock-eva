@@ -6,13 +6,16 @@ from pathlib import Path
 import httpx
 import pytest
 
+from backend.app import cli
 from backend.app.api.market import get_market_store
+from backend.app.config import Settings
 from backend.app.main import app
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
-from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.dataset import DatasetError, NasMarketStore, _ManifestLock, _sha256
+from backend.app.storage.models import StorageReadiness
 
 
 def _bars() -> list:
@@ -246,3 +249,155 @@ def test_api_maps_tampered_nas_dataset_to_safe_503(tmp_path: Path) -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "market_storage_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda item: item.pop("sha256"), "checksum metadata"),
+        (lambda item: item.update({"row_count": 999}), "row count mismatch"),
+        (
+            lambda item: item.update({"path": "bars/_staging/untrusted.parquet"}),
+            "non-published",
+        ),
+        (
+            lambda item: item.update({"path": "bars/year=2026/quarantine/untrusted.parquet"}),
+            "non-published",
+        ),
+    ],
+)
+def test_reader_rejects_required_manifest_integrity_metadata(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    mutation(manifest["files"][0])
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(DatasetError, match=message):
+        store.validate_readiness()
+
+
+def test_reader_rejects_schema_mismatch_and_export_revalidates(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    bad_file = root / "bars" / "bad.parquet"
+    bad_file.parent.mkdir(parents=True, exist_ok=True)
+    import duckdb
+
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("COPY (SELECT 1 AS wrong_column) TO ? (FORMAT PARQUET)", [str(bad_file)])
+    finally:
+        connection.close()
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files"] = [
+        {
+            "path": "bars/bad.parquet",
+            "sha256": _sha256(bad_file),
+            "trade_date": "2026-07-23",
+            "source": "baostock",
+            "row_count": 1,
+        }
+    ]
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(DatasetError, match="incompatible schema"):
+        store.export_date(date(2026, 7, 23), tmp_path / "export")
+
+
+def test_manifest_lock_and_generation_cas_prevent_lost_updates(tmp_path: Path, monkeypatch) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    with _ManifestLock(store.manifest_lock_path):
+        with pytest.raises(DatasetError, match="already running"):
+            store.upsert_bars([_bars()[0]])
+
+    original_readback = store.publisher.readback_and_verify
+
+    def change_generation(*args, **kwargs):
+        original_readback(*args, **kwargs)
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        manifest["generation"] = "generation-interloper"
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(store.publisher, "readback_and_verify", change_generation)
+    with pytest.raises(DatasetError, match="changed during staging"):
+        store.upsert_bars([_bars()[0]])
+    assert json.loads((root / "manifest.json").read_text(encoding="utf-8"))["generation"] == (
+        "generation-interloper"
+    )
+
+
+def test_cli_rejects_invalid_nas_dataset_without_traceback(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _root(tmp_path)
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 1,
+                "generation": "invalid",
+                "files": [
+                    {
+                        "path": "bars/missing.parquet",
+                        "trade_date": "2026-07-23",
+                        "source": "baostock",
+                        "row_count": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        nas_market_dataset_root=root,
+    )
+
+    class ReadyPreflight:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def inspect(self) -> StorageReadiness:
+            return StorageReadiness(
+                mode="nas",
+                status="ready",
+                market_data_available=True,
+                serving_source="nas",
+                sentinel_status="ready",
+                manifest_status="ready",
+            )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr("sys.argv", ["stock-eva", "refresh-runs"])
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quality_issues"] == ["market_storage_unavailable"]
+    assert payload["writes_market_data"] is False

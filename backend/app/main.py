@@ -48,6 +48,12 @@ async def lifespan(_: FastAPI):
         if readiness.mode == "nas"
         else control_store
     )
+    if isinstance(market_store, NasMarketStore):
+        try:
+            market_store.validate_readiness()
+        except DatasetError:
+            yield
+            return
     user_store = UserStore(layout.local_paths.user_database)
     service = MarketAutomationService(
         market_store,

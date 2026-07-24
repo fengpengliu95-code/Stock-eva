@@ -23,7 +23,7 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
-from backend.app.storage.dataset import NasMarketStore
+from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.initialize import (
     DatasetInitializationError,
     EmptyDatasetInitializer,
@@ -215,8 +215,38 @@ def main() -> int:
         if readiness.mode == "nas"
         else control_store
     )
+    if isinstance(store, NasMarketStore):
+        try:
+            store.validate_readiness()
+        except DatasetError:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["market_storage_unavailable"],
+                        "reason_code": "nas_dataset_read_failed",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
     if args.command == "export":
-        output = store.export_date(args.trade_date, layout.local_paths.staging / "exports")
+        try:
+            output = store.export_date(args.trade_date, layout.local_paths.staging / "exports")
+        except DatasetError:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["market_storage_unavailable"],
+                        "reason_code": "nas_dataset_read_failed",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         print(json.dumps({"status": "ready", "path": str(output)}, ensure_ascii=False))
         return 0
     if args.command == "refresh-runs":

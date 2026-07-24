@@ -5,6 +5,7 @@ control database remains local; only checksum-verified Parquet objects and a
 small published manifest live under the configured dataset root.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -55,6 +56,35 @@ _EXPECTED_PARQUET_TYPES = {
 
 class DatasetError(ValueError):
     pass
+
+
+class DatasetPublicationBusy(DatasetError):
+    pass
+
+
+class _ManifestLock:
+    """Local cross-process lease, matching the refresh lock's nonblocking semantics."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.descriptor: int | None = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise DatasetPublicationBusy("NAS manifest publication already running") from exc
+        self.descriptor = descriptor
+        return self
+
+    def __exit__(self, *_args) -> None:
+        if self.descriptor is not None:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            os.close(self.descriptor)
+            self.descriptor = None
 
 
 def _sha256(path: Path) -> str:
@@ -142,10 +172,18 @@ class DatasetPublication:
 class NasMarketStore:
     """Read market bars from the current manifest while retaining local audit state."""
 
-    def __init__(self, control: MarketStore, root: Path, staging_root: Path) -> None:
+    def __init__(
+        self,
+        control: MarketStore,
+        root: Path,
+        staging_root: Path,
+        *,
+        manifest_lock_path: Path | None = None,
+    ) -> None:
         self.control = control
         self.root = root
         self.staging_root = staging_root
+        self.manifest_lock_path = manifest_lock_path or staging_root / "nas-manifest.lock"
         self.publisher = DatasetPublication()
 
     @property
@@ -357,6 +395,16 @@ class NasMarketStore:
         by_date: dict[tuple[date, str], list[DailyBar]] = defaultdict(list)
         for bar in bars:
             by_date[(bar.trade_date, bar.source)].append(bar)
+        with _ManifestLock(self.manifest_lock_path):
+            baseline = self._manifest()
+            baseline_generation = baseline["generation"]
+            self._publish_locked(by_date, baseline_generation)
+
+    def _publish_locked(
+        self,
+        by_date: dict[tuple[date, str], list[DailyBar]],
+        baseline_generation: object,
+    ) -> None:
         staged_entries: list[tuple[Path, Path, Path, dict[str, object]]] = []
         scratch_paths: list[Path] = []
         try:
@@ -409,6 +457,8 @@ class NasMarketStore:
             for _staged, partial, final, _entry in staged_entries:
                 self.publisher.publish_by_atomic_rename(partial, final, self.root)
             manifest = self._manifest()
+            if manifest["generation"] != baseline_generation:
+                raise DatasetError("published manifest changed during staging")
             replaced = {
                 (entry["trade_date"], entry["source"])
                 for _staged, _partial, _final, entry in staged_entries
@@ -451,6 +501,9 @@ class NasMarketStore:
 
     def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
         """Export a published partition locally without modifying the NAS dataset."""
+        # Export has the same trust boundary as read APIs: never copy a file
+        # merely because its path appears in a manifest.
+        self._paths()
         manifest = self._manifest()
         matches = [
             item
