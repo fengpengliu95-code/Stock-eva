@@ -12,6 +12,10 @@ from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeri
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
+from backend.app.market.supplemental import (
+    SupplementalMarketResponse,
+    empty_supplemental_response,
+)
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
 
@@ -36,6 +40,15 @@ def get_market_store(
     return MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
+    )
+
+
+@router.get("/supplemental", response_model=SupplementalMarketResponse)
+def market_supplemental(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SupplementalMarketResponse:
+    return empty_supplemental_response(
+        enabled=settings.akshare_supplemental_enabled
     )
 
 

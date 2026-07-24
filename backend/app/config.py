@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
     nas_market_dataset_root: Path | None = None
+    akshare_supplemental_enabled: bool = False
     auto_refresh_enabled: bool = False
     auto_refresh_min_request_interval_seconds: float = Field(
         default=0.5,
