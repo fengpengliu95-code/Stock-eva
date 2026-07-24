@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Python
+.python-version.local
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime market and user data
+var/*
+!var/market/
+!var/user/
+var/market/*
+var/user/*
+!var/market/.gitkeep
+!var/user/.gitkeep
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated artifacts and scratch space
+output/
+tmp/

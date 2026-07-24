@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="量化操盘手修炼之路 - 从零基础到稳定盈利的系统化学习平台，涵盖股票市场基础、技术分析、量化交易策略等核心知识模块。">
+    <meta name="keywords" content="量化交易, 股票学习, 技术分析, 量化策略, 交易心理, 风险管理">
+    <meta name="author" content="量化操盘手修炼平台">
+    <title>📈 量化操盘手修炼之路 | 系统化股票学习平台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=2">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <!-- ===== NAVIGATION ===== -->
+    <nav id="navbar" class="navbar">
+        <div class="nav-container">
+            <a href="#hero" class="nav-logo">
+                <span class="logo-icon">📈</span>
+                <span class="logo-text">量化修炼</span>
+            </a>
+            <ul class="nav-links" id="navLinks">
+                <li><a href="#hero" class="nav-link active" data-section="hero">首页</a></li>
+                <li><a href="#roadmap" class="nav-link" data-section="roadmap">学习路线</a></li>
+                <li><a href="#modules" class="nav-link" data-section="modules">知识模块</a></li>
+                <li><a href="#flashcards" class="nav-link" data-section="flashcards">核心概念</a></li>
+                <li><a href="#calculator" class="nav-link" data-section="calculator">指标计算</a></li>
+                <li><a href="#formulas" class="nav-link" data-section="formulas">公式速查</a></li>
+            </ul>
+            <button class="hamburger" id="hamburger" aria-label="切换菜单">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </button>
+        </div>
+    </nav>
+
+    <!-- ===== HERO SECTION ===== -->
+    <section id="hero" class="hero-section">
+        <canvas id="particleCanvas" class="particle-canvas"></canvas>
+        <div class="hero-content">
+            <div class="hero-badge">🚀 系统化 · 实战导向 · 持续进化</div>
+            <h1 class="hero-title">
+                <span class="title-icon">📈</span>
+                量化操盘手修炼之路
+            </h1>
+            <p class="hero-subtitle">从零基础到稳定盈利的系统化学习平台</p>
+            <p class="hero-description">掌握金融逻辑、数学统计与编程实现的完美结合，构建属于你的量化交易体系</p>
+            <div class="hero-stats">
+                <div class="stat-card">
+                    <div class="stat-number" data-count="6">0</div>
+                    <div class="stat-label">核心模块</div>
+                    <div class="stat-icon">📦</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" data-count="16">0</div>
+                    <div class="stat-label">知识文档</div>
+                    <div class="stat-icon">📄</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" data-count="50">0</div>
+                    <div class="stat-label">核心概念</div>
+                    <div class="stat-icon">💡</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" data-count="4">0</div>
+                    <div class="stat-label">学习阶段</div>
+                    <div class="stat-icon">🎯</div>
+                </div>
+            </div>
+            <a href="#roadmap" class="hero-cta">
+                开始学习之旅
+                <span class="cta-arrow">→</span>
+            </a>
+        </div>
+        <div class="hero-scroll-indicator">
+            <div class="scroll-mouse">
+                <div class="scroll-dot"></div>
+            </div>
+            <span>向下滚动探索</span>
+        </div>
+    </section>
+
+    <!-- ===== LEARNING ROADMAP ===== -->
+    <section id="roadmap" class="section roadmap-section">
+        <div class="container">
+            <div class="section-header">
+                <span class="section-tag">学习路线</span>
+                <h2 class="section-title">🗺️ 修炼路线图</h2>
+                <p class="section-desc">四个阶段，从入门到实战，循序渐进构建你的量化交易体系</p>
+            </div>
+            <div class="timeline">
+                <!-- Phase 1 -->
+                <div class="timeline-item left" data-animate="fade-right">
+                    <div class="timeline-marker">
+                        <span class="marker-number">01</span>
+                    </div>
+                    <div class="timeline-card phase-1">
+                        <div class="phase-header">
+                            <span class="phase-icon">🏗️</span>
+                            <div>
+                                <h3 class="phase-title">筑基阶段</h3>
+                                <span class="phase-duration">第 1-2 个月</span>
+                            </div>
+                        </div>
+                        <p class="phase-focus">市场基础与基本面分析</p>
+                        <p class="phase-desc">建立扎实的金融市场认知，理解股票运作机制，学会阅读财务报表和基本面数据。</p>
+                        <ul class="phase-milestones">
+                            <li>理解股票市场运作机制与交易制度</li>
+                            <li>掌握K线、成交量等基础图表语言</li>
+                            <li>学会阅读三大财务报表</li>
+                            <li>熟练运用PE、PB、ROE等估值指标</li>
+                        </ul>
+                    </div>
+                </div>
+                <!-- Phase 2 -->
+                <div class="timeline-item right" data-animate="fade-left">
+                    <div class="timeline-marker">
+                        <span class="marker-number">02</span>
+                    </div>
+                    <div class="timeline-card phase-2">
+                        <div class="phase-header">
+                            <span class="phase-icon">📊</span>
+                            <div>
+                                <h3 class="phase-title">进阶阶段</h3>
+                                <span class="phase-duration">第 3-4 个月</span>
+                            </div>
+                        </div>
+                        <p class="phase-focus">技术分析与模拟交易</p>
+                        <p class="phase-desc">深入学习技术分析方法，掌握主流技术指标，通过模拟交易实践验证所学知识。</p>
+                        <ul class="phase-milestones">
+                            <li>掌握MACD、RSI、布林带等技术指标</li>
+                            <li>理解趋势分析与形态识别</li>
+                            <li>开始模拟交易并记录交易日志</li>
+                            <li>建立初步的交易系统框架</li>
+                        </ul>
+                    </div>
+                </div>
+                <!-- Phase 3 -->
+                <div class="timeline-item left" data-animate="fade-right">
+                    <div class="timeline-marker">
+                        <span class="marker-number">03</span>
+                    </div>
+                    <div class="timeline-card phase-3">
+                        <div class="phase-header">
+                            <span class="phase-icon">🤖</span>
+                            <div>
+                                <h3 class="phase-title">量化入门</h3>
+                                <span class="phase-duration">第 5-8 个月</span>
+                            </div>
+                        </div>
+                        <p class="phase-focus">Python编程与策略开发</p>
+                        <p class="phase-desc">学习Python编程与数据分析，将交易策略转化为可执行的量化模型，进行回测验证。</p>
+                        <ul class="phase-milestones">
+                            <li>掌握Python及Pandas、NumPy核心库</li>
+                            <li>学会获取和处理金融数据</li>
+                            <li>开发均值回归、动量等基础策略</li>
+                            <li>搭建回测框架并评估策略表现</li>
+                        </ul>
+                    </div>
+                </div>
+                <!-- Phase 4 -->
+                <div class="timeline-item right" data-animate="fade-left">
+                    <div class="timeline-marker">
+                        <span class="marker-number">04</span>
+                    </div>
+                    <div class="timeline-card phase-4">
+                        <div class="phase-header">
+                            <span class="phase-icon">⚔️</span>
+                            <div>
+                                <h3 class="phase-title">实战阶段</h3>
+                                <span class="phase-duration">第 9-12+ 个月</span>
+                            </div>
+                        </div>
+                        <p class="phase-focus">实盘交易与持续迭代</p>
+                        <p class="phase-desc">将量化策略应用于实盘交易，建立完整的风控体系，持续优化策略并控制情绪。</p>
+                        <ul class="phase-milestones">
+                            <li>小资金实盘验证策略有效性</li>
+                            <li>建立严格的风险管理与仓位控制体系</li>
+                            <li>克服交易心理障碍，保持纪律</li>
+                            <li>持续迭代优化，追求稳定盈利</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== KNOWLEDGE MODULES ===== -->
+    <section id="modules" class="section modules-section">
+        <div class="container">
+            <div class="section-header">
+                <span class="section-tag">知识体系</span>
+                <h2 class="section-title">📚 核心知识模块</h2>
+                <p class="section-desc">六大模块覆盖量化交易全链路知识，点击模块查看详细内容并跟踪学习进度</p>
+            </div>
+            <div class="modules-grid">
+                <!-- Module 1 -->
+                <div class="module-card" data-module="market-basics" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">🏛️</span></div>
+                    <h3 class="module-title">股票市场基础</h3>
+                    <p class="module-desc">理解市场运作机制，掌握交易规则与基础概念</p>
+                    <div class="module-meta">
+                        <span class="topic-count">4 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-market-basics">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="market-basics-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/01-股票市场基础/01-什么是股票.md" class="topic-link">股票基本概念与术语 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="market-basics-2">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/01-股票市场基础/03-交易规则与术语.md" class="topic-link">交易制度与规则（T+1、涨跌幅、集合竞价） 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="market-basics-3">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/01-股票市场基础/02-股票市场运作机制.md" class="topic-link">市场参与者与资金流向 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="market-basics-4">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/01-股票市场基础/04-中国A股市场特点.md" class="topic-link">指数与板块分类 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+                <!-- Module 2 -->
+                <div class="module-card" data-module="fundamental" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">📊</span></div>
+                    <h3 class="module-title">基本面分析</h3>
+                    <p class="module-desc">深入财务报表分析，掌握企业价值评估方法</p>
+                    <div class="module-meta">
+                        <span class="topic-count">3 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-fundamental">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="fundamental-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/02-基本面分析/01-财务报表阅读.md" class="topic-link">三大财务报表解读 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="fundamental-2">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/02-基本面分析/02-估值方法.md" class="topic-link">估值方法（PE、PB、DCF） 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="fundamental-3">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/02-基本面分析/03-行业分析框架.md" class="topic-link">行业分析与公司研究框架 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+                <!-- Module 3 -->
+                <div class="module-card" data-module="technical" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">📈</span></div>
+                    <h3 class="module-title">技术分析</h3>
+                    <p class="module-desc">掌握图表分析与技术指标，识别趋势与交易信号</p>
+                    <div class="module-meta">
+                        <span class="topic-count">3 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-technical">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="technical-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/03-技术分析/01-K线与形态学.md" class="topic-link">K线形态与趋势分析 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="technical-2">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/03-技术分析/02-技术指标详解.md" class="topic-link">主流技术指标（MACD、RSI、布林带） 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="technical-3">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/03-技术分析/03-趋势与量价分析.md" class="topic-link">量价关系与成交量分析 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+                <!-- Module 4 -->
+                <div class="module-card" data-module="quant" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">🤖</span></div>
+                    <h3 class="module-title">量化交易入门</h3>
+                    <p class="module-desc">学习量化思维与编程，开发属于自己的交易策略</p>
+                    <div class="module-meta">
+                        <span class="topic-count">3 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-quant">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="quant-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/04-量化交易入门/02-Python量化工具链.md" class="topic-link">Python金融数据分析（Pandas/NumPy） 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="quant-2">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/04-量化交易入门/03-经典量化策略.md" class="topic-link">经典量化策略（均值回归/动量/多因子） 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="quant-3">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/04-量化交易入门/01-量化交易概述.md" class="topic-link">回测框架与策略评估 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+                <!-- Module 5 -->
+                <div class="module-card" data-module="risk" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">🛡️</span></div>
+                    <h3 class="module-title">风险管理</h3>
+                    <p class="module-desc">建立完善的风控体系，保护你的交易资金安全</p>
+                    <div class="module-meta">
+                        <span class="topic-count">2 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-risk">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="risk-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/05-风险管理/01-仓位管理.md" class="topic-link">仓位管理方法与模型 📖</a>
+                        </div>
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="risk-2">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/05-风险管理/02-止盈止损策略.md" class="topic-link">止盈止损策略与风险控制 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+                <!-- Module 6 -->
+                <div class="module-card" data-module="psychology" data-animate="fade-up">
+                    <div class="module-icon-wrap"><span class="module-icon">🧠</span></div>
+                    <h3 class="module-title">交易心理学</h3>
+                    <p class="module-desc">克服人性弱点，培养职业交易者的心理素质</p>
+                    <div class="module-meta">
+                        <span class="topic-count">1 个专题</span>
+                        <span class="module-status">未开始</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" data-progress="0"></div></div>
+                    <div class="module-topics" id="topics-psychology">
+                        <div class="topic-item">
+                            <label class="topic-checkbox">
+                                <input type="checkbox" data-topic="psychology-1">
+                                <span class="checkmark"></span>
+                            </label>
+                            <a href="../docs/06-交易心理学/01-交易纪律与心态.md" class="topic-link">交易心理与情绪管理 📖</a>
+                        </div>
+                    </div>
+                    <button class="module-expand-btn" aria-label="展开模块">
+                        <span class="expand-text">查看详情</span>
+                        <span class="expand-arrow">▾</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== FLASHCARDS ===== -->
+    <section id="flashcards" class="section flashcards-section">
+        <div class="container">
+            <div class="section-header">
+                <span class="section-tag">核心概念</span>
+                <h2 class="section-title">🃏 概念闪卡</h2>
+                <p class="section-desc">点击卡片翻转查看定义，掌握量化交易核心术语</p>
+            </div>
+            <div class="flashcard-controls">
+                <button class="fc-btn" id="fcPrev" aria-label="上一张">
+                    <span>←</span> 上一张
+                </button>
+                <span class="fc-counter" id="fcCounter">1 / 20</span>
+                <button class="fc-btn" id="fcNext" aria-label="下一张">
+                    下一张 <span>→</span>
+                </button>
+                <button class="fc-btn fc-shuffle" id="fcShuffle" aria-label="随机排列">
+                    🔀 随机排列
+                </button>
+            </div>
+            <div class="flashcard-stage" id="flashcardStage">
+                <!-- Flashcards will be rendered by JS -->
+            </div>
+            <div class="fc-dots" id="fcDots">
+                <!-- Dot indicators rendered by JS -->
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== TECHNICAL CALCULATOR ===== -->
+    <section id="calculator" class="section calculator-section">
+        <div class="container">
+            <div class="section-header">
+                <span class="section-tag">实用工具</span>
+                <h2 class="section-title">🧮 技术指标计算器</h2>
+                <p class="section-desc">输入价格数据，实时计算常用技术指标并可视化</p>
+            </div>
+            <div class="calc-layout">
+                <div class="calc-input-panel glass-card">
+                    <h3 class="calc-panel-title">📥 数据输入</h3>
+                    <div class="input-group">
+                        <label for="priceInput">价格序列（逗号分隔）</label>
+                        <textarea id="priceInput" rows="4" placeholder="例如: 25.5, 26.1, 25.8, 26.5, 27.0, 26.8, 27.3, 28.1, 27.5, 28.0, 28.8, 29.2, 28.5, 29.0, 30.1, 29.5, 30.2, 31.0, 30.5, 31.5">25.5, 26.1, 25.8, 26.5, 27.0, 26.8, 27.3, 28.1, 27.5, 28.0, 28.8, 29.2, 28.5, 29.0, 30.1, 29.5, 30.2, 31.0, 30.5, 31.5</textarea>
+                    </div>
+                    <div class="input-row">
+                        <div class="input-group">
+                            <label for="smaPeriod">SMA 周期</label>
+                            <input type="number" id="smaPeriod" value="5" min="2" max="100">
+                        </div>
+                        <div class="input-group">
+                            <label for="emaPeriod">EMA 周期</label>
+                            <input type="number" id="emaPeriod" value="5" min="2" max="100">
+                        </div>
+                        <div class="input-group">
+                            <label for="rsiPeriod">RSI 周期</label>
+                            <input type="number" id="rsiPeriod" value="14" min="2" max="100">
+                        </div>
+                        <div class="input-group">
+                            <label for="bbPeriod">布林带 周期</label>
+                            <input type="number" id="bbPeriod" value="5" min="2" max="100">
+                        </div>
+                    </div>
+                    <button class="calc-btn" id="calcBtn">
+                        <span class="calc-btn-icon">⚡</span> 计算指标
+                    </button>
+                </div>
+                <div class="calc-results-panel">
+                    <div class="calc-chart-wrap glass-card">
+                        <h3 class="calc-panel-title">📉 价格与指标图表</h3>
+                        <canvas id="calcChart" width="700" height="350"></canvas>
+                    </div>
+                    <div class="calc-table-wrap glass-card">
+                        <h3 class="calc-panel-title">📋 计算结果</h3>
+                        <div class="table-scroll">
+                            <table class="calc-table" id="calcTable">
+                                <thead>
+                                    <tr>
+                                        <th>指标</th>
+                                        <th>最新值</th>
+                                        <th>信号</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="calcTableBody">
+                                    <tr class="placeholder-row">
+                                        <td colspan="3">请输入价格数据并点击"计算指标"</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== FORMULAS ===== -->
+    <section id="formulas" class="section formulas-section">
+        <div class="container">
+            <div class="section-header">
+                <span class="section-tag">速查手册</span>
+                <h2 class="section-title">📐 关键公式速查</h2>
+                <p class="section-desc">量化交易必备公式一览，点击卡片查看详细说明</p>
+            </div>
+            <div class="formulas-grid">
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">估值指标</div>
+                    <div class="formula-name">市盈率 (PE)</div>
+                    <div class="formula-expr">PE = 股价 / 每股收益(EPS)</div>
+                    <div class="formula-note">衡量投资者为每单位盈利支付的价格，PE越低可能越便宜，但需结合行业平均与增长率判断。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">估值指标</div>
+                    <div class="formula-name">市净率 (PB)</div>
+                    <div class="formula-expr">PB = 股价 / 每股净资产</div>
+                    <div class="formula-note">衡量股价相对于账面价值的溢价程度。PB < 1 可能表示股价低于清算价值。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">盈利能力</div>
+                    <div class="formula-name">净资产收益率 (ROE)</div>
+                    <div class="formula-expr">ROE = 净利润 / 股东权益</div>
+                    <div class="formula-note">巴菲特最看重的指标之一，反映公司用股东资本创造利润的效率。ROE > 15% 通常被视为优秀。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">风险评估</div>
+                    <div class="formula-name">夏普比率 (Sharpe Ratio)</div>
+                    <div class="formula-expr">Sharpe = (Rp - Rf) / σp</div>
+                    <div class="formula-note">衡量每承受一单位风险所获得的超额回报。Sharpe > 1 为良好，> 2 为优秀。Rp=组合收益率, Rf=无风险利率, σp=收益标准差。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">仓位管理</div>
+                    <div class="formula-name">凯利公式 (Kelly Criterion)</div>
+                    <div class="formula-expr">f* = (b·p - q) / b</div>
+                    <div class="formula-note">确定最优投注比例。b=赔率, p=获胜概率, q=失败概率(1-p)。实战中常用半凯利(f*/2)以降低风险。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">技术指标</div>
+                    <div class="formula-name">相对强弱指数 (RSI)</div>
+                    <div class="formula-expr">RSI = 100 - 100 / (1 + RS)</div>
+                    <div class="formula-note">RS = 平均上涨幅度 / 平均下跌幅度。RSI > 70 为超买（可能回调），RSI < 30 为超卖（可能反弹）。</div>
+                </div>
+                <div class="formula-card" data-animate="fade-up">
+                    <div class="formula-category">技术指标</div>
+                    <div class="formula-name">MACD</div>
+                    <div class="formula-expr">MACD = EMA(12) - EMA(26)</div>
+                    <div class="formula-note">信号线 = MACD的9日EMA。MACD上穿信号线为金叉（买入信号），下穿为死叉（卖出信号）。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== FOOTER ===== -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-brand">
+                    <span class="footer-logo">📈 量化操盘手修炼之路</span>
+                    <p class="footer-tagline">系统化学习，科学化交易</p>
+                </div>
+                <div class="footer-links">
+                    <h4>知识文档</h4>
+                    <ul>
+                        <li><a href="#">股票市场基础入门指南</a></li>
+                        <li><a href="#">基本面分析完整手册</a></li>
+                        <li><a href="#">技术分析实战教程</a></li>
+                        <li><a href="#">量化交易策略开发</a></li>
+                    </ul>
+                </div>
+                <div class="footer-links">
+                    <h4>学习资源</h4>
+                    <ul>
+                        <li><a href="#">风险管理最佳实践</a></li>
+                        <li><a href="#">交易心理学修炼</a></li>
+                        <li><a href="#">Python量化编程入门</a></li>
+                        <li><a href="#">回测框架搭建指南</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-disclaimer">
+                <div class="disclaimer-icon">⚠️</div>
+                <p><strong>风险提示：</strong>本平台仅用于学习交流目的，所有内容不构成任何投资建议。股市有风险，投资需谨慎。过往表现不代表未来收益，请根据自身风险承受能力谨慎决策。</p>
+            </div>
+            <div class="footer-bottom">
+                <p>© 2026 量化操盘手修炼之路 · 最后更新：2026年7月14日</p>
+            </div>
+        </div>
+    </footer>
+
+
+
+    <!-- Markdown Viewer Modal -->
+    <div id="md-modal" class="md-modal">
+        <div class="md-modal-overlay"></div>
+        <div class="md-modal-content">
+            <div class="md-modal-header">
+                <h3 class="md-modal-title">文档阅读</h3>
+                <button class="md-modal-close" aria-label="关闭">&times;</button>
+            </div>
+            <div class="md-modal-body" id="md-content">
+                <div class="md-loading">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js?v=2"></script>
+</body>
+</html>

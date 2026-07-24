@@ -1,0 +1,398 @@
+import json
+from pathlib import Path
+
+import duckdb
+
+from backend.app.market.models import DailyBar, RefreshResult
+
+
+class MarketStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = duckdb.connect(str(self.path))
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                trade_date DATE NOT NULL,
+                symbol VARCHAR NOT NULL,
+                security_type VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                board VARCHAR NOT NULL,
+                open DOUBLE NOT NULL,
+                high DOUBLE NOT NULL,
+                low DOUBLE NOT NULL,
+                close DOUBLE NOT NULL,
+                preclose DOUBLE NOT NULL,
+                volume DOUBLE NOT NULL,
+                amount DOUBLE NOT NULL,
+                turnover_rate DOUBLE,
+                pct_change DOUBLE,
+                adjust_factor DOUBLE,
+                price_adjustment VARCHAR NOT NULL,
+                is_trading BOOLEAN NOT NULL,
+                is_suspended BOOLEAN NOT NULL,
+                is_st BOOLEAN NOT NULL,
+                source VARCHAR NOT NULL,
+                source_record_id VARCHAR NOT NULL,
+                ingested_at TIMESTAMPTZ NOT NULL,
+                quality_status VARCHAR NOT NULL,
+                quality_issues JSON NOT NULL,
+                PRIMARY KEY (trade_date, symbol, source)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_runs (
+                run_id VARCHAR PRIMARY KEY,
+                request_key VARCHAR,
+                run_kind VARCHAR NOT NULL DEFAULT 'daily',
+                requested_date DATE NOT NULL,
+                source VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                requested_count INTEGER NOT NULL,
+                succeeded_count INTEGER NOT NULL,
+                coverage_ratio DOUBLE,
+                failed_symbols JSON NOT NULL,
+                quality_issues JSON NOT NULL,
+                error_message VARCHAR,
+                started_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS coverage_ratio DOUBLE"
+        )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS request_key VARCHAR"
+        )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS run_kind VARCHAR DEFAULT 'daily'"
+        )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS quality_issues JSON DEFAULT '[]'"
+        )
+        return connection
+
+    def exists(self) -> bool:
+        return self.path.is_file()
+
+    def save_refresh(self, bars: list[DailyBar], result: RefreshResult) -> None:
+        connection = self._connect()
+        try:
+            connection.begin()
+            self._upsert_bars(connection, bars)
+            connection.execute("DELETE FROM refresh_runs WHERE run_id = ?", [result.run_id])
+            connection.execute(
+                """
+                INSERT INTO refresh_runs (
+                    run_id, request_key, run_kind, requested_date, source, status, requested_count,
+                    succeeded_count, coverage_ratio, failed_symbols, quality_issues,
+                    error_message, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    result.run_id,
+                    result.request_key,
+                    result.run_kind,
+                    result.requested_date,
+                    result.source,
+                    result.status,
+                    result.requested_count,
+                    result.succeeded_count,
+                    result.coverage_ratio,
+                    json.dumps(result.failed_symbols, ensure_ascii=False),
+                    json.dumps(result.quality_issues, ensure_ascii=False),
+                    result.error_message,
+                    result.started_at,
+                    result.completed_at,
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _upsert_bars(
+        connection: duckdb.DuckDBPyConnection,
+        bars: list[DailyBar],
+    ) -> None:
+        for bar in bars:
+            connection.execute(
+                "DELETE FROM daily_bars WHERE trade_date = ? AND symbol = ? AND source = ?",
+                [bar.trade_date, bar.symbol, bar.source],
+            )
+            connection.execute(
+                """
+                INSERT INTO daily_bars VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                [
+                    bar.trade_date,
+                    bar.symbol,
+                    bar.security_type,
+                    bar.exchange,
+                    bar.board,
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.preclose,
+                    bar.volume,
+                    bar.amount,
+                    bar.turnover_rate,
+                    bar.pct_change,
+                    bar.adjust_factor,
+                    bar.price_adjustment,
+                    bar.is_trading,
+                    bar.is_suspended,
+                    bar.is_st,
+                    bar.source,
+                    bar.source_record_id,
+                    bar.ingested_at,
+                    bar.quality_status,
+                    json.dumps(bar.quality_issues, ensure_ascii=False),
+                ],
+            )
+
+    def upsert_bars(self, bars: list[DailyBar]) -> None:
+        connection = self._connect()
+        try:
+            connection.begin()
+            self._upsert_bars(connection, bars)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def present_points(
+        self,
+        trading_dates: list,
+        symbols: list[str],
+        source: str = "baostock",
+    ) -> set[tuple]:
+        if not trading_dates or not symbols or not self.exists():
+            return set()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT trade_date, symbol FROM daily_bars
+                WHERE trade_date BETWEEN ? AND ? AND source = ?
+                """,
+                [min(trading_dates), max(trading_dates), source],
+            ).fetchall()
+        finally:
+            connection.close()
+        allowed_dates = set(trading_dates)
+        allowed_symbols = set(symbols)
+        return {
+            (trade_date, symbol)
+            for trade_date, symbol in rows
+            if trade_date in allowed_dates and symbol in allowed_symbols
+        }
+
+    def count_bars(self) -> int:
+        connection = self._connect()
+        try:
+            return connection.execute("SELECT count(*) FROM daily_bars").fetchone()[0]
+        finally:
+            connection.close()
+
+    def latest_refresh(self) -> RefreshResult | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT run_id, requested_date, source, status, requested_count,
+                       succeeded_count, coverage_ratio, failed_symbols, quality_issues,
+                       error_message, started_at, completed_at, request_key, run_kind
+                FROM refresh_runs
+                ORDER BY completed_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return RefreshResult(
+            run_id=row[0],
+            requested_date=row[1],
+            source=row[2],
+            status=row[3],
+            requested_count=row[4],
+            succeeded_count=row[5],
+            coverage_ratio=row[6],
+            failed_symbols=json.loads(row[7]),
+            quality_issues=json.loads(row[8]),
+            error_message=row[9],
+            started_at=row[10],
+            completed_at=row[11],
+            request_key=row[12],
+            run_kind=row[13],
+        )
+
+    def list_refreshes(self, limit: int = 100) -> list[RefreshResult]:
+        if not self.exists():
+            return []
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT run_id, requested_date, source, status, requested_count,
+                       succeeded_count, coverage_ratio, failed_symbols, quality_issues,
+                       error_message, started_at, completed_at, request_key, run_kind
+                FROM refresh_runs
+                ORDER BY completed_at DESC, run_id
+                LIMIT ?
+                """,
+                [limit],
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            RefreshResult(
+                run_id=row[0],
+                requested_date=row[1],
+                source=row[2],
+                status=row[3],
+                requested_count=row[4],
+                succeeded_count=row[5],
+                coverage_ratio=row[6],
+                failed_symbols=json.loads(row[7]),
+                quality_issues=json.loads(row[8]),
+                error_message=row[9],
+                started_at=row[10],
+                completed_at=row[11],
+                request_key=row[12],
+                run_kind=row[13],
+            )
+            for row in rows
+        ]
+
+    def bars_for(self, trade_date, source: str) -> list[dict[str, object]]:
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                SELECT symbol, security_type, close, pct_change, amount, is_suspended,
+                       quality_status, quality_issues
+                FROM daily_bars
+                WHERE trade_date = ? AND source = ?
+                ORDER BY symbol
+                """,
+                [trade_date, source],
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+        finally:
+            connection.close()
+
+    def available_dates(self, source: str = "baostock") -> list:
+        if not self.exists():
+            return []
+        connection = self._connect()
+        try:
+            return [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM daily_bars
+                    WHERE source = ?
+                    ORDER BY trade_date
+                    """,
+                    [source],
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+    def canonical_bars(self, trade_date, source: str = "baostock") -> list[DailyBar]:
+        if not self.exists():
+            return []
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
+                       close, preclose, volume, amount, turnover_rate, pct_change,
+                       adjust_factor, price_adjustment, is_trading, is_suspended, is_st,
+                       source, source_record_id, ingested_at, quality_status, quality_issues
+                FROM daily_bars
+                WHERE trade_date = ? AND source = ?
+                ORDER BY symbol
+                """,
+                [trade_date, source],
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            DailyBar(
+                trade_date=row[0],
+                symbol=row[1],
+                security_type=row[2],
+                exchange=row[3],
+                board=row[4],
+                open=row[5],
+                high=row[6],
+                low=row[7],
+                close=row[8],
+                preclose=row[9],
+                volume=row[10],
+                amount=row[11],
+                turnover_rate=row[12],
+                pct_change=row[13],
+                adjust_factor=row[14],
+                price_adjustment=row[15],
+                is_trading=row[16],
+                is_suspended=row[17],
+                is_st=row[18],
+                source=row[19],
+                source_record_id=row[20],
+                ingested_at=row[21],
+                quality_status=row[22],
+                quality_issues=json.loads(row[23]),
+            )
+            for row in rows
+        ]
+
+    def symbol_bars(self, symbol, start, end, source: str = "baostock") -> list[DailyBar]:
+        return [
+            bar
+            for trade_date in self.available_dates(source)
+            if start <= trade_date <= end
+            for bar in self.canonical_bars(trade_date, source)
+            if bar.symbol == symbol
+        ]
+
+    def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
+        output = output_root / f"date={trade_date.isoformat()}" / "bars.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        escaped_output = str(output).replace("'", "''")
+        connection = self._connect()
+        try:
+            connection.execute(
+                f"""
+                COPY (
+                    SELECT * FROM daily_bars
+                    WHERE trade_date = ? AND source = ?
+                    ORDER BY symbol
+                ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """,
+                [trade_date, source],
+            )
+        finally:
+            connection.close()
+        return output

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src 'self' http://127.0.0.1:8000; style-src 'self'; script-src 'self'; img-src 'self' data:">
+  <title>Stock EVA 复盘工作台</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main" aria-label="Skip to main content">跳到主要内容</a>
+  <header class="topbar">
+    <a class="brand" href="../" aria-label="返回 Stock EVA 入口">
+      <span class="brand-mark" aria-hidden="true">SE</span>
+      <span><strong>Stock EVA</strong><small>收盘复盘工作台</small></span>
+    </a>
+    <nav aria-label="工作台导航">
+      <a href="#market">市场</a>
+      <a href="#portfolio">持仓</a>
+      <a href="#watchlists">自选</a>
+      <a href="#strategies">策略</a>
+      <a href="#alerts">预警</a>
+      <a class="knowledge-link" href="../dashboard/">学习知识库 ↗</a>
+    </nav>
+  </header>
+
+  <main id="main" class="shell">
+    <section class="command-bar" aria-labelledby="workspace-title">
+      <div>
+        <p class="eyebrow">AFTER-CLOSE · LOCAL DATA ONLY</p>
+        <h1 id="workspace-title">今日复盘，一屏看清</h1>
+        <p class="lede">市场状态、手动持仓与已运行策略结果。没有数据时保持为空，不生成行情结论。</p>
+      </div>
+      <form id="refresh-form" class="refresh-form">
+        <label for="expected-date">期望交易日</label>
+        <div class="field-row">
+          <input id="expected-date" name="expected_date" type="date">
+          <button type="submit">刷新工作台</button>
+        </div>
+        <small>留空时不判断新鲜度；中国节假日不会由前端猜测。</small>
+      </form>
+    </section>
+
+    <div id="global-status" class="global-status" role="status" aria-live="polite">正在连接本地 API…</div>
+
+    <section id="market" class="overview-grid" aria-label="复盘总览">
+      <article class="panel hero-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">MARKET / 市场</p>
+            <h2>收盘概览</h2>
+          </div>
+          <span id="market-status" class="status-badge status-loading">加载中</span>
+        </div>
+        <p id="market-meta" class="meta-line">等待行情状态</p>
+        <div id="market-breadth" class="metric-grid" aria-label="市场宽度"></div>
+        <div id="market-indexes" class="index-list"></div>
+        <p id="market-message" class="state-message"></p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">PORTFOLIO / 持仓</p>
+            <h2>手动组合估值</h2>
+          </div>
+          <span id="portfolio-status" class="status-badge status-loading">加载中</span>
+        </div>
+        <p id="portfolio-meta" class="meta-line">等待持仓与行情覆盖</p>
+        <div id="portfolio-metrics" class="metric-grid"></div>
+        <p id="portfolio-message" class="state-message"></p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">SIGNALS / 策略</p>
+            <h2>最近运行结果</h2>
+          </div>
+          <span id="strategy-status" class="status-badge status-loading">加载中</span>
+        </div>
+        <p id="strategy-meta" class="meta-line">只展示已保存策略的本地运行记录</p>
+        <div id="strategy-candidates" class="candidate-list"></div>
+        <p id="strategy-message" class="state-message"></p>
+      </article>
+    </section>
+
+    <section id="portfolio" class="section-block" aria-labelledby="positions-title">
+      <div class="section-heading">
+        <div>
+          <p class="panel-kicker">LOCAL PORTFOLIO</p>
+          <h2 id="positions-title">手动持仓</h2>
+          <p>本地记录，不连接券商。估值按用户成本与当日收盘估算，未计交易费用。</p>
+        </div>
+      </div>
+      <div class="two-column">
+        <article class="panel table-panel">
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">手动持仓列表</caption>
+              <thead>
+                <tr>
+                  <th scope="col">证券</th>
+                  <th scope="col">数量</th>
+                  <th scope="col">平均成本</th>
+                  <th scope="col">记录日期</th>
+                  <th scope="col">版本</th>
+                  <th scope="col">操作</th>
+                </tr>
+              </thead>
+              <tbody id="positions-body"></tbody>
+            </table>
+          </div>
+          <p id="positions-empty" class="state-message"></p>
+        </article>
+
+        <article class="panel form-panel">
+          <h3 id="position-form-title">新增持仓</h3>
+          <form id="position-form">
+            <input id="position-id" name="position_id" type="hidden">
+            <input id="position-version" name="position_version" type="hidden">
+            <label for="position-symbol">证券代码</label>
+            <input id="position-symbol" name="symbol" required pattern="(sh|sz)\.[0-9]{6}" placeholder="sh.600000">
+            <div class="form-grid">
+              <div>
+                <label for="position-quantity">持仓数量</label>
+                <input id="position-quantity" name="quantity" type="number" min="0.0001" step="0.0001" required>
+              </div>
+              <div>
+                <label for="position-avg-cost">平均成本</label>
+                <input id="position-avg-cost" name="avg_cost" type="number" min="0" step="0.0001" required>
+              </div>
+              <div>
+                <label for="position-as-of">记录日期</label>
+                <input id="position-as-of" name="as_of_date" type="date" required>
+              </div>
+              <div>
+                <label for="position-today-buy">今日买入数量</label>
+                <input id="position-today-buy" name="today_buy_qty" type="number" min="0" step="0.0001" value="0" required>
+              </div>
+            </div>
+            <div class="form-actions">
+              <button type="submit">保存持仓</button>
+              <button id="position-cancel" class="button-secondary" type="button" hidden>取消编辑</button>
+            </div>
+            <p id="position-form-status" class="form-status" role="status" aria-live="polite"></p>
+          </form>
+        </article>
+      </div>
+    </section>
+
+    <section id="watchlists" class="section-block" aria-labelledby="watchlists-title">
+      <div class="section-heading">
+        <div>
+          <p class="panel-kicker">WATCHLISTS</p>
+          <h2 id="watchlists-title">自选列表</h2>
+          <p>重复添加不会产生重复项目；删除操作只影响本地 SQLite。</p>
+        </div>
+      </div>
+      <div class="two-column">
+        <article class="panel form-panel">
+          <h3>列表管理</h3>
+          <form id="watchlist-form">
+            <label for="watchlist-name">新列表名称</label>
+            <div class="field-row">
+              <input id="watchlist-name" name="name" maxlength="80" required placeholder="例如：财报观察">
+              <button type="submit">创建</button>
+            </div>
+          </form>
+          <label for="watchlist-select">当前列表</label>
+          <select id="watchlist-select" name="watchlist"></select>
+          <button id="watchlist-delete" class="button-danger" type="button" disabled>删除当前列表</button>
+          <p id="watchlist-status" class="form-status" role="status" aria-live="polite"></p>
+        </article>
+        <article class="panel form-panel">
+          <h3>列表项目</h3>
+          <form id="watchlist-item-form">
+            <label for="watchlist-symbol">证券代码</label>
+            <div class="field-row">
+              <input id="watchlist-symbol" name="symbol" required pattern="(sh|sz)\.[0-9]{6}" placeholder="sz.000001">
+              <button type="submit" disabled>加入自选</button>
+            </div>
+          </form>
+          <ul id="watchlist-items" class="item-list" aria-label="当前自选项目"></ul>
+          <p id="watchlist-empty" class="state-message"></p>
+        </article>
+      </div>
+    </section>
+
+    <section id="strategies" class="section-block" aria-labelledby="strategies-title">
+      <div class="section-heading">
+        <div>
+          <p class="panel-kicker">DETERMINISTIC REPLAY</p>
+          <h2 id="strategies-title">策略运行</h2>
+          <p>仅运行已保存版本与显式证券列表；结果是规则匹配记录，不是买卖建议。</p>
+        </div>
+      </div>
+      <article class="panel form-panel strategy-runner">
+        <form id="strategy-run-form">
+          <div class="form-grid strategy-grid">
+            <div>
+              <label for="strategy-select">策略版本</label>
+              <select id="strategy-select" name="strategy" required></select>
+            </div>
+            <div>
+              <label for="strategy-date">回放交易日</label>
+              <input id="strategy-date" name="as_of_date" type="date" required>
+            </div>
+          </div>
+          <label for="strategy-symbols">证券代码（逗号分隔，最多 20 个）</label>
+          <input id="strategy-symbols" name="symbols" required placeholder="sh.600000, sz.000001">
+          <button type="submit" disabled>运行确定性回放</button>
+          <p id="strategy-run-status" class="form-status" role="status" aria-live="polite"></p>
+        </form>
+        <div>
+          <h3>运行结果</h3>
+          <ul id="strategy-results" class="item-list"></ul>
+          <p id="strategy-results-empty" class="state-message"></p>
+        </div>
+      </article>
+    </section>
+
+    <section id="alerts" class="section-block" aria-labelledby="alerts-title">
+      <div class="section-heading">
+        <div>
+          <p class="panel-kicker">AFTER-CLOSE ALERTS</p>
+          <h2 id="alerts-title">收盘后预警</h2>
+          <p>只评估本地自选与不可变策略版本。预警是规则匹配记录，不是买卖建议；不发送外部通知。</p>
+        </div>
+        <span id="alert-status" class="status-badge status-loading">加载中</span>
+      </div>
+      <div class="alert-layout">
+        <article class="panel form-panel">
+          <h3>创建预警规则</h3>
+          <form id="alert-rule-form">
+            <label for="alert-rule-name">规则名称</label>
+            <input id="alert-rule-name" name="name" maxlength="120" required placeholder="例如：核心自选均线交叉">
+            <label for="alert-watchlist">自选列表</label>
+            <select id="alert-watchlist" name="watchlist" required disabled></select>
+            <label for="alert-strategy">策略版本</label>
+            <select id="alert-strategy" name="strategy" required disabled></select>
+            <button type="submit" disabled>保存预警规则</button>
+          </form>
+          <p id="alert-rule-status" class="form-status" role="status" aria-live="polite"></p>
+        </article>
+
+        <article class="panel form-panel">
+          <h3>显式收盘评估</h3>
+          <form id="alert-evaluate-form">
+            <label for="alert-rule-select">预警规则</label>
+            <select id="alert-rule-select" name="alert_rule" required disabled></select>
+            <label for="alert-signal-date">信号交易日</label>
+            <input id="alert-signal-date" name="signal_date" type="date" required>
+            <button id="alert-evaluate" type="submit" disabled>评估自选</button>
+          </form>
+          <p id="alert-evaluate-status" class="form-status" role="status" aria-live="polite"></p>
+          <p class="state-message">只有该日 canonical 收盘数据质量合格时，eligible 才能转为 triggered。</p>
+        </article>
+      </div>
+
+      <article class="panel alert-history-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>预警历史</h3>
+            <p id="alert-meta" class="meta-line">等待本地预警状态</p>
+          </div>
+          <span id="alert-unacknowledged" class="status-badge status-empty">未确认 0</span>
+        </div>
+        <ul id="alert-history" class="alert-history" aria-label="收盘后预警历史"></ul>
+        <p id="alert-empty" class="state-message"></p>
+        <p id="alert-action-status" class="form-status" role="status" aria-live="polite"></p>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <p>Stock EVA · 本地收盘复盘工具 · 不提供实时行情、下单或投资建议</p>
+  </footer>
+</body>
+</html>
