@@ -1,6 +1,7 @@
 """Persistent, point-in-time-safe BaoStock adjustment-factor cache."""
 
 import hashlib
+import math
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -110,8 +111,8 @@ class AdjustmentFactorCache:
             if effective_date > through_date:
                 raise FactorCacheError("BaoStock factor response contains future data")
             factor = float(row[positions["foreAdjustFactor"]])
-            if factor <= 0:
-                raise FactorCacheError("BaoStock factor must be positive")
+            if not math.isfinite(factor) or factor <= 0:
+                raise FactorCacheError("BaoStock factor must be finite and positive")
             parsed.append((symbol, effective_date, factor, AdjustmentFactorCache._row_hash(row)))
         return parsed
 

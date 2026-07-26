@@ -1,7 +1,10 @@
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from backend.app.market.baostock import DAILY_FIELDS, BaoStockProvider
+from backend.app.market.factor_cache import AdjustmentFactorCache, FactorCacheError
 
 FACTOR_FIELDS = [
     "code",
@@ -252,3 +255,41 @@ def test_empty_authoritative_factor_stays_missing_instead_of_guessing_one(
     assert missing.adjust_factor is None
     assert missing.quality_status == "partial"
     assert "missing_adjust_factor" in missing.quality_issues
+
+
+@pytest.mark.parametrize("invalid_factor", ["nan", "inf", "-inf"])
+def test_bootstrap_rejects_every_non_finite_factor(
+    tmp_path: Path,
+    invalid_factor: str,
+) -> None:
+    cache = AdjustmentFactorCache(tmp_path / "factors.sqlite3")
+
+    with pytest.raises(FactorCacheError, match="finite and positive"):
+        cache.record_bootstrap(
+            "sh.600000",
+            date(2026, 7, 23),
+            FACTOR_FIELDS,
+            [["sh.600000", "2020-01-01", invalid_factor, "1", "1"]],
+        )
+
+    assert cache.exact_snapshots(["sh.600000"], date(2026, 7, 23)) == {}
+
+
+@pytest.mark.parametrize("invalid_factor", ["nan", "inf", "-inf"])
+def test_daily_event_rejects_every_non_finite_factor_without_advancing_stream(
+    tmp_path: Path,
+    invalid_factor: str,
+) -> None:
+    cache = AdjustmentFactorCache(tmp_path / "factors.sqlite3")
+    target = date(2026, 7, 23)
+
+    with pytest.raises(FactorCacheError, match="finite and positive"):
+        cache.record_daily_events(
+            target,
+            FACTOR_FIELDS,
+            [["sh.600000", target.isoformat(), invalid_factor, "1", "1"]],
+            advance_stream=True,
+        )
+
+    assert cache.stream_through() is None
+    assert cache.exact_snapshots(["sh.600000"], target) == {}
