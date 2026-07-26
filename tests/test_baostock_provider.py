@@ -170,6 +170,52 @@ class FakeSocket:
         self.closed = True
 
 
+class EofSocket(FakeSocket):
+    def recv(self, _size) -> bytes:
+        return b""
+
+
+class EofThenRecoverClient(FakeBaoStock):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.context = SimpleNamespace(default_socket=None)
+        self.sockets: list[EofSocket] = []
+        self.login_calls = 0
+        self.history_calls = 0
+
+    def login(self):
+        self.login_calls += 1
+        connection = EofSocket()
+        self.sockets.append(connection)
+        self.context.default_socket = connection
+        return FakeResult([], [])
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.history_calls += 1
+        if self.history_calls == 1:
+            self.context.default_socket.recv(8192)
+        return super().query_history_k_data_plus(code, fields, **kwargs)
+
+
+def test_peer_eof_is_converted_to_retryable_transport_failure() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = EofThenRecoverClient(payload)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=11,
+    )
+
+    batch = provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert batch.failed_symbols == []
+    assert client.login_calls == 2
+    assert client.history_calls == 2
+    assert [item.timeout for item in client.sockets] == [11, 11]
+    assert all(item.closed for item in client.sockets)
+
+
 class RecoveringSocketClient(FakeBaoStock):
     def __init__(self, payload) -> None:
         super().__init__(payload)

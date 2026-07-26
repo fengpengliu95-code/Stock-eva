@@ -21,6 +21,22 @@ logger = logging.getLogger("stock_eva.market.baostock")
 _LOGIN_SOCKET_TIMEOUT_LOCK = threading.Lock()
 
 
+class _EofAwareSocket:
+    """Turn BaoStock's otherwise-unbounded peer EOF into a transport error."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def recv(self, *args: Any, **kwargs: Any) -> bytes:
+        payload = self._connection.recv(*args, **kwargs)
+        if payload == b"":
+            raise ConnectionResetError("BaoStock closed the connection before the response ended")
+        return payload
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 @dataclass(frozen=True)
 class ProviderBatch:
     bars: list[DailyBar]
@@ -171,6 +187,8 @@ class BaoStockProvider:
         connection = getattr(context, "default_socket", None)
         if connection is not None:
             connection.settimeout(self.socket_timeout_seconds)
+            if hasattr(connection, "recv") and not isinstance(connection, _EofAwareSocket):
+                context.default_socket = _EofAwareSocket(connection)
 
     def _discard_session(self) -> None:
         context = self._client_context()
