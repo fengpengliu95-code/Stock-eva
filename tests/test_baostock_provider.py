@@ -1,6 +1,9 @@
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from backend.app.market.baostock import BaoStockProvider
 
@@ -148,3 +151,128 @@ def test_provider_applies_minimum_interval_to_every_operation() -> None:
     provider.inspect_main_board(date(2026, 7, 23))
 
     assert sleeps == [0.5]
+
+
+class FakeSocket:
+    def __init__(self) -> None:
+        self.timeout = None
+        self.shutdown_calls = 0
+        self.closed = False
+
+    def settimeout(self, seconds) -> None:
+        self.timeout = seconds
+
+    def shutdown(self, _how) -> None:
+        self.shutdown_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RecoveringSocketClient(FakeBaoStock):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.context = SimpleNamespace(default_socket=None)
+        self.sockets: list[FakeSocket] = []
+        self.login_calls = 0
+        self.history_calls: dict[str, int] = {}
+        self.fail_once = {"sh.600000"}
+
+    def login(self):
+        self.login_calls += 1
+        connection = FakeSocket()
+        self.sockets.append(connection)
+        self.context.default_socket = connection
+        return FakeResult([], [])
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.history_calls[code] = self.history_calls.get(code, 0) + 1
+        if code in self.fail_once:
+            self.fail_once.remove(code)
+            raise TimeoutError("synthetic socket timeout")
+        return super().query_history_k_data_plus(code, fields, **kwargs)
+
+
+def test_timeout_closes_socket_relogs_and_retries_with_same_bound() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = RecoveringSocketClient(payload)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=17,
+    )
+
+    batch = provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert batch.failed_symbols == []
+    assert client.history_calls == {"sh.600000": 2}
+    assert client.login_calls == 2
+    assert [item.timeout for item in client.sockets] == [17, 17]
+    assert all(item.closed for item in client.sockets)
+    assert client.sockets[0].shutdown_calls == 1
+
+
+class ContinueAfterFailureClient(RecoveringSocketClient):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.fail_once.clear()
+        self.logout_calls = 0
+
+    def logout(self):
+        self.logout_calls += 1
+        return FakeResult([], [])
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.history_calls[code] = self.history_calls.get(code, 0) + 1
+        if code == "sh.600000":
+            raise OSError("synthetic broken connection")
+        return FakeBaoStock.query_history_k_data_plus(self, code, fields, **kwargs)
+
+
+def test_exhausted_symbol_is_missing_and_next_symbol_uses_fresh_session() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = ContinueAfterFailureClient(payload)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=9,
+    )
+
+    batch = provider.fetch(
+        date(2026, 7, 23),
+        symbols=["sh.600000", "sz.000001"],
+    )
+
+    assert client.history_calls == {"sh.600000": 2, "sz.000001": 1}
+    assert client.login_calls == 3
+    assert batch.failed_symbols == ["sh.600000"]
+    assert [bar.symbol for bar in batch.bars] == ["sz.000001"]
+    assert all(item.timeout == 9 for item in client.sockets)
+    assert all(item.closed for item in client.sockets)
+    assert client.logout_calls == 1
+
+
+class InterruptingClient(RecoveringSocketClient):
+    interrupt_type = KeyboardInterrupt
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        raise self.interrupt_type
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_process_interrupt_is_not_converted_into_a_retry(interrupt_type) -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = InterruptingClient(payload)
+    client.interrupt_type = interrupt_type
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(interrupt_type):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert client.login_calls == 1

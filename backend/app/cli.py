@@ -42,6 +42,13 @@ def _probe_timeout_value(value: str) -> int:
     return seconds
 
 
+def _socket_timeout_value(value: str) -> float:
+    seconds = float(value)
+    if not 1 <= seconds <= 120:
+        raise argparse.ArgumentTypeError("socket timeout must be between 1 and 120 seconds")
+    return seconds
+
+
 @contextmanager
 def _probe_timeout(seconds: int):
     def raise_timeout(_signum, _frame):
@@ -93,6 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="hard timeout for the optional metadata probe (1-60 seconds)",
     )
+    refresh.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
+    )
     backfill = subparsers.add_parser(
         "backfill",
         help="plan or execute a resumable explicit-symbol historical backfill",
@@ -107,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--date-batch-size", type=int, default=60)
     backfill.add_argument("--max-batches", type=int, default=20)
     backfill.add_argument("--min-request-interval", type=float, default=0.5)
+    backfill.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
+    )
     backfill.add_argument(
         "--execute",
         action="store_true",
@@ -124,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="perform a due refresh; omitted means a network-free plan",
+    )
+    automation_once.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
     )
     storage_init = subparsers.add_parser(
         "storage-init",
@@ -203,6 +225,10 @@ def main() -> int:
         return 1
     layout = StorageLayout(settings)
     layout.ensure_local_runtime_dirs()
+    socket_timeout_seconds = (
+        getattr(args, "socket_timeout_seconds", None)
+        or settings.baostock_socket_timeout_seconds
+    )
     control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
@@ -263,6 +289,7 @@ def main() -> int:
         provider = BaoStockProvider(
             min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
             factor_cache_path=str(layout.local_paths.factor_cache_database),
+            socket_timeout_seconds=socket_timeout_seconds,
         )
         user_store = UserStore(layout.local_paths.user_database)
         service = MarketAutomationService(
@@ -330,7 +357,8 @@ def main() -> int:
             )
             return 2
         provider = BaoStockProvider(
-            min_request_interval_seconds=max(args.min_request_interval, 0.2)
+            min_request_interval_seconds=max(args.min_request_interval, 0.2),
+            socket_timeout_seconds=socket_timeout_seconds,
         )
         selected_dates = None
         start_date = args.start
@@ -430,7 +458,10 @@ def main() -> int:
                     )
                 )
                 return 1
-            provider = BaoStockProvider(min_request_interval_seconds=0.5)
+            provider = BaoStockProvider(
+                min_request_interval_seconds=0.5,
+                socket_timeout_seconds=socket_timeout_seconds,
+            )
             started = perf_counter()
             try:
                 with _probe_timeout(args.probe_timeout_seconds):
@@ -571,6 +602,7 @@ def main() -> int:
                         settings.auto_refresh_min_request_interval_seconds
                     ),
                     factor_cache_path=str(layout.local_paths.factor_cache_database),
+                    socket_timeout_seconds=socket_timeout_seconds,
                 )
                 if provider.trading_dates(args.trade_date, args.trade_date) != [args.trade_date]:
                     raise ValueError("calendar conflict")
@@ -604,10 +636,10 @@ def main() -> int:
             )
             return 1
     else:
-        result = MarketRefreshService(store).refresh(
-            args.trade_date,
-            symbols=args.symbols,
-        )
+        result = MarketRefreshService(
+            store,
+            BaoStockProvider(socket_timeout_seconds=socket_timeout_seconds),
+        ).refresh(args.trade_date, symbols=args.symbols)
     print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
     return 0 if result.status in {"ready", "partial"} else 1
 

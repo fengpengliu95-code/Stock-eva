@@ -100,7 +100,12 @@ BaoStock 官方说明当日日线约 17:30 后、复权因子约 18:00 后更新
 任务。不会改用实时、分钟或其他 OHLCV 源。
 
 每次 BaoStock 操作（含证券池分页）都应用统一最小间隔，默认 0.5 秒；单个操作最多
-2 次尝试。全市场 CLI 和后台调度共享 `var/locks/market-refresh.lock` 非阻塞文件锁，
+2 次尝试。连接成功后每个 socket 默认设置 30 秒读写超时，可通过
+`STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS` 或 CLI 的
+`--socket-timeout-seconds` 在 1–120 秒内调整。超时或普通网络异常会直接关闭损坏
+socket、重新登录后再做有限重试；最终失败的证券保持缺失并继续处理下一只，已落盘
+的因子引导进度不会回滚。进程中断和退出信号不会被重试逻辑吞掉。全市场 CLI 和
+后台调度共享 `var/locks/market-refresh.lock` 非阻塞文件锁，
 第二个进程只得到 `refresh_already_running`，不会并发访问数据源或 DuckDB。
 进程日志只记录事件名、交易日、运行 ID、状态、覆盖数量和安全错误码，不记录持仓、
 自选内容或 provider 原始响应；完整运行审计继续保存在 DuckDB。

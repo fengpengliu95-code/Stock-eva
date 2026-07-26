@@ -37,6 +37,11 @@ class Settings(BaseSettings):
         default=0.5,
         ge=0.2,
     )
+    baostock_socket_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=120.0,
+    )
 
 
 @lru_cache

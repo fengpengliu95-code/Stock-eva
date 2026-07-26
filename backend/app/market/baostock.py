@@ -1,4 +1,5 @@
 import logging
+import socket
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -91,6 +92,7 @@ class BaoStockProvider:
         min_request_interval_seconds: float | None = None,
         factor_cache_path: str | None = None,
         factor_cache: AdjustmentFactorCache | None = None,
+        socket_timeout_seconds: float = 30.0,
         monotonic_fn=monotonic,
         sleep_fn=sleep,
     ) -> None:
@@ -110,11 +112,73 @@ class BaoStockProvider:
         self._last_request_at: float | None = None
         self._provider_request_count = 0
         self.factor_cache = factor_cache or AdjustmentFactorCache(factor_cache_path)
+        if socket_timeout_seconds <= 0:
+            raise ValueError("socket timeout must be positive")
+        self.socket_timeout_seconds = socket_timeout_seconds
+        self._session_usable = False
 
     def _login(self) -> None:
-        result = self.client.login()
+        try:
+            result = self.client.login()
+        except Exception as exc:
+            self._discard_session()
+            raise BaoStockError("BaoStock login failed") from exc
         if result.error_code != "0":
+            self._discard_session()
             raise BaoStockError(result.error_msg or "BaoStock login failed")
+        try:
+            self._configure_socket_timeout()
+        except Exception as exc:
+            self._discard_session()
+            raise BaoStockError("BaoStock socket timeout configuration failed") from exc
+        self._session_usable = True
+
+    def _client_context(self):
+        context = getattr(self.client, "context", None)
+        if context is not None:
+            return context
+        login = getattr(self.client, "login", None)
+        globals_ = getattr(login, "__globals__", {})
+        return globals_.get("conx")
+
+    def _configure_socket_timeout(self) -> None:
+        context = self._client_context()
+        connection = getattr(context, "default_socket", None)
+        if connection is not None:
+            connection.settimeout(self.socket_timeout_seconds)
+
+    def _discard_session(self) -> None:
+        context = self._client_context()
+        connection = getattr(context, "default_socket", None)
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                connection.close()
+            except Exception:
+                pass
+            try:
+                context.default_socket = None
+            except Exception:
+                pass
+        self._session_usable = False
+
+    def _logout(self) -> None:
+        if not self._session_usable:
+            self._discard_session()
+            return
+        try:
+            self.client.logout()
+        except Exception:
+            pass
+        finally:
+            self._discard_session()
+
+    def _ensure_session(self) -> None:
+        if not self._session_usable:
+            self._login()
 
     def fetch(self, trade_date: date, symbols: Sequence[str] | None = None) -> ProviderBatch:
         if symbols is not None and len(set(symbols)) > self.max_explicit_symbols:
@@ -128,7 +192,7 @@ class BaoStockProvider:
                 return self._fetch_main_board(trade_date)
             return self._fetch_symbols(trade_date, symbols)
         finally:
-            self.client.logout()
+            self._logout()
 
     def trading_dates(self, start_date: date, end_date: date) -> list[date]:
         if start_date > end_date:
@@ -137,7 +201,7 @@ class BaoStockProvider:
         try:
             return self._trading_dates(start_date, end_date)
         finally:
-            self.client.logout()
+            self._logout()
 
     def inspect_main_board(self, trade_date: date) -> MainBoardInspection:
         """Read only the calendar and security universe; never request OHLCV."""
@@ -168,7 +232,7 @@ class BaoStockProvider:
                 main_board_symbols=tuple(sorted(symbols)),
             )
         finally:
-            self.client.logout()
+            self._logout()
 
     def _trading_dates(self, start_date: date, end_date: date) -> list[date]:
         fields, rows = self._read(
@@ -250,19 +314,25 @@ class BaoStockProvider:
                 failed_symbols=failed,
             )
         finally:
-            self.client.logout()
+            self._logout()
 
     def _read(self, operation) -> tuple[list[str], list[list[str]]]:
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             self._pace_request()
             try:
+                self._ensure_session()
                 return _read_result(
                     operation(),
                     before_page_request=self._pace_request,
                 )
-            except BaoStockError as exc:
-                last_error = exc
+            except Exception as exc:
+                last_error = (
+                    exc
+                    if isinstance(exc, BaoStockError)
+                    else BaoStockError("BaoStock operation failed")
+                )
+                self._discard_session()
         raise last_error or BaoStockError("BaoStock request failed")
 
     def _pace_request(self) -> None:

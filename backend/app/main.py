@@ -60,6 +60,7 @@ async def lifespan(_: FastAPI):
         BaoStockProvider(
             min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
             factor_cache_path=str(layout.local_paths.factor_cache_database),
+            socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
         ),
         get_trading_calendar(),
         required_symbols=lambda: collect_required_symbols(user_store),
