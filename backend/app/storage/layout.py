@@ -22,6 +22,10 @@ class StorageLayout:
             user_database=(
                 self.settings.user_data_dir / self.settings.user_database_name
             ),
+            factor_cache_database=(
+                self.settings.local_control_dir
+                / self.settings.factor_cache_database_name
+            ),
         )
 
     @property

@@ -1,9 +1,11 @@
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic, sleep
 from typing import Any
 
+from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
 
@@ -14,6 +16,7 @@ DAILY_FIELDS = (
 INDEX_SYMBOLS = ("sh.000001", "sz.399001")
 SH_MAIN_PREFIXES = ("sh.600", "sh.601", "sh.603", "sh.605")
 SZ_MAIN_PREFIXES = ("sz.000", "sz.001", "sz.002", "sz.003")
+logger = logging.getLogger("stock_eva.market.baostock")
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class MainBoardInspection:
     shenzhen_count: int
     total_expected_count: int
     metadata_provider_requests: int
+    main_board_symbols: tuple[str, ...] = ()
 
 
 class BaoStockError(RuntimeError):
@@ -85,6 +89,8 @@ class BaoStockProvider:
         max_explicit_symbols: int = 20,
         max_attempts: int = 2,
         min_request_interval_seconds: float | None = None,
+        factor_cache_path: str | None = None,
+        factor_cache: AdjustmentFactorCache | None = None,
         monotonic_fn=monotonic,
         sleep_fn=sleep,
     ) -> None:
@@ -103,6 +109,7 @@ class BaoStockProvider:
         self._sleep = sleep_fn
         self._last_request_at: float | None = None
         self._provider_request_count = 0
+        self.factor_cache = factor_cache or AdjustmentFactorCache(factor_cache_path)
 
     def _login(self) -> None:
         result = self.client.login()
@@ -158,6 +165,7 @@ class BaoStockProvider:
                 metadata_provider_requests=(
                     self._provider_request_count - initial_request_count
                 ),
+                main_board_symbols=tuple(sorted(symbols)),
             )
         finally:
             self.client.logout()
@@ -348,12 +356,15 @@ class BaoStockProvider:
         daily_rows = [
             row for row in daily_rows if row[daily_fields.index("code")] in main_symbols
         ]
-        factor_fields, factor_rows = self._read(
-            lambda: self.client.query_daily_adjust_factor(date=iso_date)
+        active_symbols = sorted(
+            row[daily_fields.index("code")]
+            for row in daily_rows
+            if row[daily_fields.index("tradestatus")] == "1"
         )
-        factor_rows = [
-            row for row in factor_rows if row[factor_fields.index("code")] in main_symbols
-        ]
+        factor_fields, factor_rows = self._main_board_factor_snapshot(
+            trade_date,
+            active_symbols,
+        )
         explicit_indexes = self._fetch_symbols(trade_date, INDEX_SYMBOLS)
         bars = normalize_baostock_rows(
             fields=daily_fields,
@@ -369,3 +380,70 @@ class BaoStockProvider:
                 | set(explicit_indexes.failed_symbols)
             ),
         )
+
+    def _main_board_factor_snapshot(
+        self,
+        trade_date: date,
+        main_symbols: Sequence[str],
+    ) -> tuple[list[str], list[list[str]]]:
+        """Resolve an exact factor for every stock without guessing a default.
+
+        The BaoStock daily endpoint is an event feed, not a full-universe
+        snapshot.  A persistent per-symbol bootstrap establishes the baseline;
+        later sessions advance it from the daily event stream.
+        """
+        stream_through = self.factor_cache.stream_through()
+        if stream_through is None or trade_date <= stream_through:
+            sessions = [trade_date]
+        else:
+            sessions = self._trading_dates(
+                stream_through + date.resolution,
+                trade_date,
+            )
+        for session in sessions:
+            fields, rows = self._read(
+                lambda session=session: self.client.query_daily_adjust_factor(
+                    date=session.isoformat()
+                )
+            )
+            self.factor_cache.record_daily_events(
+                session,
+                fields,
+                rows,
+                advance_stream=(
+                    stream_through is None
+                    or (stream_through is not None and session > stream_through)
+                ),
+            )
+
+        self.factor_cache.materialize_from_stream(main_symbols, trade_date)
+        resolved = self.factor_cache.exact_snapshots(main_symbols, trade_date)
+        missing = [symbol for symbol in main_symbols if symbol not in resolved]
+        for position, symbol in enumerate(missing, start=1):
+            try:
+                fields, rows = self._read(
+                    lambda symbol=symbol: self.client.query_adjust_factor(
+                        symbol,
+                        start_date="1990-01-01",
+                        end_date=trade_date.isoformat(),
+                    )
+                )
+                factor = self.factor_cache.record_bootstrap(
+                    symbol,
+                    trade_date,
+                    fields,
+                    rows,
+                )
+                if factor is not None:
+                    resolved[symbol] = factor
+            except (BaoStockError, ValueError):
+                # The quality gate below remains authoritative.  A single
+                # failed bootstrap must not discard already persisted progress.
+                continue
+            if position % 100 == 0 or position == len(missing):
+                logger.info(
+                    "factor_bootstrap_progress completed=%d total=%d",
+                    position,
+                    len(missing),
+                )
+        return self.factor_cache.normalized_rows(main_symbols, trade_date)

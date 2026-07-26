@@ -58,7 +58,8 @@ async def lifespan(_: FastAPI):
     service = MarketAutomationService(
         market_store,
         BaoStockProvider(
-            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds)
+            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+            factor_cache_path=str(layout.local_paths.factor_cache_database),
         ),
         get_trading_calendar(),
         required_symbols=lambda: collect_required_symbols(user_store),

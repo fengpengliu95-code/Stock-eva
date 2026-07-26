@@ -52,7 +52,10 @@ class FakeBaoStock:
         return FakeResult(self.payload["daily_fields"], self.payload["daily_rows"])
 
     def query_daily_adjust_factor(self, **kwargs):
-        return FakeResult(self.payload["factor_fields"], self.payload["factor_rows"])
+        target = kwargs["date"]
+        date_index = self.payload["factor_fields"].index("dividOperateDate")
+        rows = [row for row in self.payload["factor_rows"] if row[date_index] == target]
+        return FakeResult(self.payload["factor_fields"], rows)
 
     def query_trade_dates(self, **kwargs):
         return FakeResult(
@@ -116,6 +119,11 @@ def test_universe_inspection_reads_metadata_without_fetching_market_rows() -> No
     assert inspection.shenzhen_count == 1
     assert inspection.total_expected_count == 5
     assert inspection.metadata_provider_requests == 2
+    assert inspection.main_board_symbols == (
+        "sh.600000",
+        "sh.600001",
+        "sz.000001",
+    )
 
 
 def test_provider_applies_minimum_interval_to_every_operation() -> None:

@@ -237,6 +237,7 @@ def test_all_main_board_inspection_reports_measured_bounded_plan(
         shenzhen_count = 1500
         total_expected_count = 3202
         metadata_provider_requests = 2
+        main_board_symbols = tuple(f"sh.{index:06d}" for index in range(3200))
 
     class InspectionProvider:
         def __init__(self, **kwargs) -> None:
@@ -247,6 +248,17 @@ def test_all_main_board_inspection_reports_measured_bounded_plan(
             return Inspection()
 
     monkeypatch.setattr(cli, "BaoStockProvider", InspectionProvider)
+
+    class EmptyFactorCache:
+        def __init__(self, _path) -> None:
+            pass
+
+        def exact_snapshots(self, symbols, trade_date):
+            assert len(symbols) == 3200
+            assert trade_date == date(2026, 7, 23)
+            return {}
+
+    monkeypatch.setattr(cli, "AdjustmentFactorCache", EmptyFactorCache)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -266,9 +278,12 @@ def test_all_main_board_inspection_reports_measured_bounded_plan(
     assert output["requested_count"] == 3202
     assert output["request_batches"] == 1
     assert output["metadata_provider_requests"] == 2
-    assert output["estimated_provider_requests"] == 7
-    assert output["provider_requests_with_retries_upper_bound"] == 14
+    assert output["cached_factor_count"] == 0
+    assert output["factor_bootstrap_remaining"] == 3200
+    assert output["estimated_provider_requests"] == 3207
+    assert output["provider_requests_with_retries_upper_bound"] == 6414
     assert output["min_request_interval_seconds"] == 0.5
+    assert output["recommended_resource_window_seconds"] == 3600
     assert output["writes_market_data"] is False
 
 

@@ -126,6 +126,9 @@ def test_local_runtime_layout_never_creates_the_configured_nas_root(
     assert layout.duckdb_temporary == tmp_path / "tmp" / "duckdb"
     assert layout.local_paths.market_database.parent == tmp_path / "market"
     assert layout.local_paths.user_database.parent == tmp_path / "user"
+    assert layout.local_paths.factor_cache_database == (
+        tmp_path / "control" / "baostock_factor_cache.sqlite3"
+    )
     assert all(
         path.is_dir()
         for path in (

@@ -21,6 +21,7 @@ from backend.app.market.backfill import (
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
+from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import DatasetError, NasMarketStore
@@ -260,7 +261,8 @@ def main() -> int:
     if args.command == "auto-refresh-once":
         calendar = get_trading_calendar()
         provider = BaoStockProvider(
-            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds)
+            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+            factor_cache_path=str(layout.local_paths.factor_cache_database),
         )
         user_store = UserStore(layout.local_paths.user_database)
         service = MarketAutomationService(
@@ -447,12 +449,40 @@ def main() -> int:
                 )
                 return 1
             elapsed = round(perf_counter() - started, 3)
-        estimated_requests = (
+        base_estimated_requests = (
             inspection.metadata_provider_requests + 5 if inspection is not None else 7
+        )
+        factor_cache_path = layout.local_paths.factor_cache_database
+        cached_factor_count = (
+            (
+                len(
+                    AdjustmentFactorCache(factor_cache_path).exact_snapshots(
+                        inspection.main_board_symbols,
+                        args.trade_date,
+                    )
+                )
+                if factor_cache_path.exists()
+                else 0
+            )
+            if inspection is not None
+            else None
+        )
+        factor_bootstrap_remaining = (
+            inspection.main_board_count - cached_factor_count
+            if inspection is not None and cached_factor_count is not None
+            else None
+        )
+        estimated_requests = (
+            base_estimated_requests + factor_bootstrap_remaining
+            if factor_bootstrap_remaining is not None
+            else base_estimated_requests
         )
         estimated_seconds_lower_bound = (
             round(
-                elapsed / inspection.metadata_provider_requests * estimated_requests,
+                elapsed
+                / inspection.metadata_provider_requests
+                * base_estimated_requests
+                + (factor_bootstrap_remaining or 0) * 0.5,
                 1,
             )
             if inspection is not None
@@ -484,6 +514,8 @@ def main() -> int:
                         inspection.metadata_provider_requests if inspection is not None else 0
                     ),
                     "metadata_probe_elapsed_seconds": elapsed,
+                    "cached_factor_count": cached_factor_count,
+                    "factor_bootstrap_remaining": factor_bootstrap_remaining,
                     "estimated_provider_requests": estimated_requests,
                     "provider_requests_with_retries_upper_bound": (estimated_requests * 2),
                     "min_request_interval_seconds": 0.5,
@@ -492,7 +524,9 @@ def main() -> int:
                         1,
                     ),
                     "estimated_execution_seconds_lower_bound": (estimated_seconds_lower_bound),
-                    "recommended_resource_window_seconds": 900,
+                    "recommended_resource_window_seconds": (
+                        3600 if factor_bootstrap_remaining else 900
+                    ),
                     "writes_market_data": False,
                     "execute_requires": "--execute-all-main-board",
                 },
@@ -535,7 +569,8 @@ def main() -> int:
                 provider = BaoStockProvider(
                     min_request_interval_seconds=(
                         settings.auto_refresh_min_request_interval_seconds
-                    )
+                    ),
+                    factor_cache_path=str(layout.local_paths.factor_cache_database),
                 )
                 if provider.trading_dates(args.trade_date, args.trade_date) != [args.trade_date]:
                     raise ValueError("calendar conflict")
