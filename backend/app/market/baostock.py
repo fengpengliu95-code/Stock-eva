@@ -1,5 +1,6 @@
 import logging
 import socket
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -18,6 +19,7 @@ INDEX_SYMBOLS = ("sh.000001", "sz.399001")
 SH_MAIN_PREFIXES = ("sh.600", "sh.601", "sh.603", "sh.605")
 SZ_MAIN_PREFIXES = ("sz.000", "sz.001", "sz.002", "sz.003")
 logger = logging.getLogger("stock_eva.market.baostock")
+_LOGIN_SOCKET_TIMEOUT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -118,20 +120,44 @@ class BaoStockProvider:
         self._session_usable = False
 
     def _login(self) -> None:
-        try:
-            result = self.client.login()
-        except Exception as exc:
-            self._discard_session()
-            raise BaoStockError("BaoStock login failed") from exc
-        if result.error_code != "0":
-            self._discard_session()
-            raise BaoStockError(result.error_msg or "BaoStock login failed")
-        try:
-            self._configure_socket_timeout()
-        except Exception as exc:
-            self._discard_session()
-            raise BaoStockError("BaoStock socket timeout configuration failed") from exc
-        self._session_usable = True
+        last_error: BaoStockError | None = None
+        for _attempt in range(self.max_attempts):
+            try:
+                result = self._call_login()
+            except (TimeoutError, OSError):
+                last_error = BaoStockError("BaoStock login transport failed")
+                self._discard_session()
+                continue
+            if result.error_code != "0":
+                last_error = BaoStockError(result.error_msg or "BaoStock login failed")
+                self._discard_session()
+                continue
+            try:
+                self._configure_socket_timeout()
+            except (TimeoutError, OSError):
+                last_error = BaoStockError("BaoStock socket timeout configuration failed")
+                self._discard_session()
+                continue
+            self._session_usable = True
+            return
+        raise last_error or BaoStockError("BaoStock login failed")
+
+    def _call_login(self):
+        """Bound the socket from connect through the initial login response."""
+        if not self._uses_real_baostock_socket():
+            return self.client.login()
+        with _LOGIN_SOCKET_TIMEOUT_LOCK:
+            previous = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(self.socket_timeout_seconds)
+            try:
+                return self.client.login()
+            finally:
+                socket.setdefaulttimeout(previous)
+
+    def _uses_real_baostock_socket(self) -> bool:
+        login = getattr(self.client, "login", None)
+        globals_ = getattr(login, "__globals__", {})
+        return "conx" in globals_ and "sock" in globals_
 
     def _client_context(self):
         context = getattr(self.client, "context", None)
@@ -320,17 +346,17 @@ class BaoStockProvider:
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             self._pace_request()
+            self._ensure_session()
             try:
-                self._ensure_session()
                 return _read_result(
                     operation(),
                     before_page_request=self._pace_request,
                 )
-            except Exception as exc:
+            except (BaoStockError, TimeoutError, OSError) as exc:
                 last_error = (
                     exc
                     if isinstance(exc, BaoStockError)
-                    else BaoStockError("BaoStock operation failed")
+                    else BaoStockError("BaoStock transport failed")
                 )
                 self._discard_session()
         raise last_error or BaoStockError("BaoStock request failed")

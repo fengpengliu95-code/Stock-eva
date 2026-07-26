@@ -1,4 +1,5 @@
 import json
+import socket
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -275,4 +276,114 @@ def test_process_interrupt_is_not_converted_into_a_retry(interrupt_type) -> None
     with pytest.raises(interrupt_type):
         provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
 
+    assert client.login_calls == 1
+
+
+class LoginRecoveryClient(FakeBaoStock):
+    def __init__(self, payload, outcomes) -> None:
+        super().__init__(payload)
+        self.context = SimpleNamespace(default_socket=None)
+        self.outcomes = iter(outcomes)
+        self.login_calls = 0
+        self.login_default_timeouts = []
+        self.sockets: list[FakeSocket] = []
+
+    def login(self):
+        self.login_calls += 1
+        self.login_default_timeouts.append(socket.getdefaulttimeout())
+        connection = FakeSocket()
+        self.sockets.append(connection)
+        self.context.default_socket = connection
+        outcome = next(self.outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def test_initial_login_connect_and_recv_timeout_are_bounded_and_retried(
+    monkeypatch,
+) -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = LoginRecoveryClient(
+        payload,
+        [TimeoutError("synthetic login recv timeout"), FakeResult([], [])],
+    )
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=13,
+    )
+    monkeypatch.setattr(provider, "_uses_real_baostock_socket", lambda: True)
+    previous = socket.getdefaulttimeout()
+
+    batch = provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert batch.failed_symbols == []
+    assert client.login_calls == 2
+    assert client.login_default_timeouts == [13, 13]
+    assert socket.getdefaulttimeout() == previous
+    assert all(item.closed for item in client.sockets)
+
+
+def test_provider_error_during_initial_login_is_retried_with_bound() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = LoginRecoveryClient(
+        payload,
+        [
+            FakeResult([], [], error_code="100", error_msg="source unavailable"),
+            FakeResult([], []),
+        ],
+    )
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    batch = provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert batch.failed_symbols == []
+    assert client.login_calls == 2
+    assert client.sockets[0].closed is True
+
+
+def test_login_retries_stop_at_configured_attempt_limit() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = LoginRecoveryClient(
+        payload,
+        [TimeoutError("one"), TimeoutError("two"), FakeResult([], [])],
+    )
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="login transport failed"):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert client.login_calls == 2
+    assert all(item.closed for item in client.sockets)
+
+
+class ProgrammingErrorClient(RecoveringSocketClient):
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.history_calls[code] = self.history_calls.get(code, 0) + 1
+        raise AssertionError("provider contract bug")
+
+
+def test_programming_error_fails_fast_without_retry_or_relogin() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = ProgrammingErrorClient(payload)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(AssertionError, match="provider contract bug"):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert client.history_calls == {"sh.600000": 1}
     assert client.login_calls == 1
