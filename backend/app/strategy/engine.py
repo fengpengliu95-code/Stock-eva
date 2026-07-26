@@ -109,6 +109,15 @@ class StrategyEngine:
             and bar.adjust_factor is not None
             and bar.quality_status == "ready"
         ]
+        target_back_factor = float(signal_bar.adjust_factor)
+        effective = [
+            bar.model_copy(
+                update={
+                    "adjust_factor": float(bar.adjust_factor) / target_back_factor,
+                }
+            )
+            for bar in effective
+        ]
         try:
             matched, explanation = self._evaluate_node(rule.ast, effective, len(effective) - 1)
         except InsufficientData as exc:
@@ -304,8 +313,12 @@ class StrategyEngine:
             ]
             gains = sum(max(change, 0) for change in changes) / period
             losses = sum(max(-change, 0) for change in changes) / period
-            value = 50.0 if gains == losses == 0 else 100.0 if losses == 0 else 100 - 100 / (
-                1 + gains / losses
+            value = (
+                50.0
+                if gains == losses == 0
+                else 100.0
+                if losses == 0
+                else 100 - 100 / (1 + gains / losses)
             )
             start_index = index - period
         return {

@@ -45,14 +45,14 @@ def settings_for(tmp_path: Path, *, nas_root: Path | None = None) -> Settings:
 def write_dataset_markers(root: Path) -> None:
     root.mkdir()
     (root / ".stock-eva-dataset.json").write_text(
-        json.dumps({"dataset": "stock-eva-market", "schema_version": 1}),
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
         encoding="utf-8",
     )
     (root / "manifest.json").write_text(
         json.dumps(
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": "generation-20260724",
                 "files": [],
             }
@@ -127,7 +127,7 @@ def test_local_runtime_layout_never_creates_the_configured_nas_root(
     assert layout.local_paths.market_database.parent == tmp_path / "market"
     assert layout.local_paths.user_database.parent == tmp_path / "user"
     assert layout.local_paths.factor_cache_database == (
-        tmp_path / "control" / "baostock_factor_cache.sqlite3"
+        tmp_path / "control" / "baostock_back_factor_cache.sqlite3"
     )
     assert all(
         path.is_dir()
@@ -265,7 +265,7 @@ def test_empty_nas_dataset_initializer_creates_only_a_new_child_dataset(
     assert result == nas_root
     assert json.loads((nas_root / ".stock-eva-dataset.json").read_text()) == {
         "dataset": "stock-eva-market",
-        "schema_version": 1,
+        "schema_version": 2,
     }
     manifest = json.loads((nas_root / "manifest.json").read_text())
     assert manifest["files"] == []

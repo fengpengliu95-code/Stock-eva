@@ -214,9 +214,7 @@ class PartialProvider:
 
 
 def test_refresh_coverage_uses_expected_universe_and_is_strict(tmp_path: Path) -> None:
-    bars = [
-        bar for bar in fixture_bars() if bar.symbol in {"sh.600000", "sz.000001"}
-    ]
+    bars = [bar for bar in fixture_bars() if bar.symbol in {"sh.600000", "sz.000001"}]
     store = MarketStore(tmp_path / "market.duckdb")
 
     result = MarketRefreshService(store, PartialProvider(bars)).refresh(
@@ -234,9 +232,7 @@ def test_refresh_coverage_uses_expected_universe_and_is_strict(tmp_path: Path) -
 
 
 def test_daily_refresh_run_id_is_idempotent_for_same_target(tmp_path: Path) -> None:
-    bars = [
-        bar for bar in fixture_bars() if bar.symbol in {"sh.600000", "sz.000001"}
-    ]
+    bars = [bar for bar in fixture_bars() if bar.symbol in {"sh.600000", "sz.000001"}]
     store = MarketStore(tmp_path / "market.duckdb")
     service = MarketRefreshService(store, PartialProvider(bars))
 
@@ -293,6 +289,7 @@ def test_qfq_series_multiplies_prices_and_excludes_suspensions(tmp_path: Path) -
             "trade_date": date(2026, 7, 24),
             "is_trading": False,
             "is_suspended": True,
+            "adjust_factor": 1.0,
             "quality_status": "partial",
             "quality_issues": ["suspended_placeholder"],
         }
@@ -308,7 +305,36 @@ def test_qfq_series_multiplies_prices_and_excludes_suspensions(tmp_path: Path) -
     )
 
     assert len(series) == 1
-    assert series[0].close == pytest.approx(10.5 * 1.25)
+    assert series[0].close == pytest.approx(10.5 * 0.8)
+
+
+def test_qfq_series_normalizes_cumulative_back_factor_to_requested_end(
+    tmp_path: Path,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    first = next(bar for bar in fixture_bars() if bar.symbol == "sh.600000").model_copy(
+        update={"adjust_factor": 1.0}
+    )
+    second = first.model_copy(
+        update={
+            "trade_date": date(2026, 7, 24),
+            "close": 12.0,
+            "preclose": 10.0,
+            "adjust_factor": 1.2,
+        }
+    )
+    save_fixture(store, [first], "back-factor-one", first.trade_date)
+    save_fixture(store, [second], "back-factor-two", second.trade_date)
+
+    series = PriceSeriesService(store).read(
+        "sh.600000",
+        start=first.trade_date,
+        end=second.trade_date,
+        adjustment="qfq",
+    )
+
+    assert [point.adjust_factor for point in series] == pytest.approx([1 / 1.2, 1])
+    assert [point.close for point in series] == pytest.approx([10.5 / 1.2, 12])
     assert series[0].volume == 1000
     assert series[0].price_adjustment == "qfq"
     assert series[0].source == "baostock"
@@ -343,10 +369,7 @@ def test_history_api_exposes_dates_and_deterministic_qfq_series(tmp_path: Path) 
     try:
         dates = asyncio.run(send("/api/v1/market/history/dates"))
         series = asyncio.run(
-            send(
-                "/api/v1/market/history/sh.600000"
-                "?start=2026-07-23&end=2026-07-23&adjustment=qfq"
-            )
+            send("/api/v1/market/history/sh.600000?start=2026-07-23&end=2026-07-23&adjustment=qfq")
         )
     finally:
         app.dependency_overrides.clear()
@@ -354,7 +377,7 @@ def test_history_api_exposes_dates_and_deterministic_qfq_series(tmp_path: Path) 
     assert dates.status_code == 200
     assert dates.json() == ["2026-07-23"]
     assert series.status_code == 200
-    assert series.json()[0]["close"] == pytest.approx(13.125)
+    assert series.json()[0]["close"] == pytest.approx(10.5)
     assert series.json()[0]["price_adjustment"] == "qfq"
 
 

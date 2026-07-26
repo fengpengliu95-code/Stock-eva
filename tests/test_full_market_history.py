@@ -20,14 +20,14 @@ def nas_root(tmp_path: Path) -> Path:
     root = tmp_path / "nas"
     root.mkdir()
     (root / ".stock-eva-dataset.json").write_text(
-        json.dumps({"dataset": "stock-eva-market", "schema_version": 1}),
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
         encoding="utf-8",
     )
     (root / "manifest.json").write_text(
         json.dumps(
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": "empty",
                 "files": [],
             }

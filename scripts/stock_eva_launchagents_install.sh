@@ -28,7 +28,11 @@ while (($#)); do
   shift
 done
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
+SYSTEM_NAME="${STOCK_EVA_UNAME:-$(uname -s)}"
+LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
+LSOF="${STOCK_EVA_LSOF:-/usr/sbin/lsof}"
+
+if [[ "$SYSTEM_NAME" != "Darwin" ]]; then
   echo "error: LaunchAgents are supported only on macOS" >&2
   exit 1
 fi
@@ -77,6 +81,18 @@ if ! /usr/bin/grep -Eq '^STOCK_EVA_AUTO_REFRESH_ENABLED=false$' "$ENV_FILE"; the
   echo "the LaunchAgent one-shot schedule owns refresh execution" >&2
   exit 1
 fi
+if /usr/bin/grep -q '^STOCK_EVA_USER_DATA_DIR=' "$ENV_FILE" \
+  && ! /usr/bin/grep -Eq '^STOCK_EVA_USER_DATA_DIR=var/user/?$' "$ENV_FILE"; then
+  echo "error: LaunchAgent backup requires STOCK_EVA_USER_DATA_DIR=var/user" >&2
+  exit 1
+fi
+if /usr/bin/grep -q '^STOCK_EVA_USER_DATABASE_NAME=' "$ENV_FILE" \
+  && ! /usr/bin/grep -Eq \
+    '^STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3$' \
+    "$ENV_FILE"; then
+  echo "error: LaunchAgent backup requires STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3" >&2
+  exit 1
+fi
 
 TEMP_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/stock-eva-launchd.XXXXXX")"
 cleanup() {
@@ -113,6 +129,34 @@ for label in "${LABELS[@]}"; do
   fi
 done
 
+PREVIOUS_ROOT="$TEMP_ROOT/previous"
+/bin/mkdir -p "$PREVIOUS_ROOT"
+for label in "${LABELS[@]}"; do
+  installed="$LAUNCH_AGENT_ROOT/$label.plist"
+  if [[ -f "$installed" ]]; then
+    /bin/cp "$installed" "$PREVIOUS_ROOT/$label.plist"
+    /usr/bin/touch "$PREVIOUS_ROOT/existed.$label"
+  fi
+  if "$LAUNCHCTL" print "$DOMAIN/$label" >/dev/null 2>&1; then
+    /usr/bin/touch "$PREVIOUS_ROOT/loaded.$label"
+  fi
+done
+
+port_is_listening() {
+  "$LSOF" -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+if port_is_listening 8000 \
+  && [[ ! -f "$PREVIOUS_ROOT/loaded.com.finlay.stock-eva.api" ]]; then
+  echo "error: port 8000 is already in use by a non-Stock-EVA LaunchAgent process" >&2
+  exit 1
+fi
+if port_is_listening 8080 \
+  && [[ ! -f "$PREVIOUS_ROOT/loaded.com.finlay.stock-eva.web" ]]; then
+  echo "error: port 8080 is already in use by a non-Stock-EVA LaunchAgent process" >&2
+  exit 1
+fi
+
 if [[ "$MODE" == "check" ]]; then
   echo "ready: 5 LaunchAgent templates rendered and validated"
   echo "project=$PROJECT_ROOT"
@@ -122,16 +166,82 @@ if [[ "$MODE" == "check" ]]; then
   exit 0
 fi
 
+MUTATION_STARTED=0
+rollback() {
+  status=$?
+  trap - ERR
+  set +e
+  if [[ "$MUTATION_STARTED" == "1" ]]; then
+    for label in "${LABELS[@]}"; do
+      "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
+    done
+    for label in "${LABELS[@]}"; do
+      installed="$LAUNCH_AGENT_ROOT/$label.plist"
+      if [[ -f "$PREVIOUS_ROOT/existed.$label" ]]; then
+        /bin/cp "$PREVIOUS_ROOT/$label.plist" "$installed"
+      else
+        /bin/rm -f "$installed"
+      fi
+    done
+    for label in "${LABELS[@]}"; do
+      if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
+        "$LAUNCHCTL" bootstrap \
+          "$DOMAIN" \
+          "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1 || true
+      fi
+    done
+    echo "rollback: restored previous LaunchAgent state" >&2
+  fi
+  exit "$status"
+}
+trap rollback ERR
+
+MUTATION_STARTED=1
 /bin/mkdir -p "$LAUNCH_AGENT_ROOT" "$LOG_ROOT" "$BACKUP_ROOT"
+/bin/chmod 0700 "$LOG_ROOT" "$BACKUP_ROOT"
+LOG_FILES=(
+  api.log api-error.log
+  web.log web-error.log
+  refresh.log refresh-error.log
+  calendar.log calendar-error.log
+  backup.log backup-error.log
+)
+for log_name in "${LOG_FILES[@]}"; do
+  /usr/bin/touch "$LOG_ROOT/$log_name"
+  /bin/chmod 0600 "$LOG_ROOT/$log_name"
+done
+
 for label in "${LABELS[@]}"; do
-  /bin/launchctl bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
+  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
+    "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
+  fi
+done
+
+for port in 8000 8080; do
+  for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ! port_is_listening "$port"; then
+      break
+    fi
+    /bin/sleep 0.1
+  done
+  if port_is_listening "$port"; then
+    echo "error: port $port remained occupied after previous agents stopped" >&2
+    false
+  fi
+done
+
+for label in "${LABELS[@]}"; do
   /usr/bin/install -m 0644 \
     "$TEMP_ROOT/$label.plist" \
     "$LAUNCH_AGENT_ROOT/$label.plist"
-  /bin/launchctl bootstrap \
+done
+for label in "${LABELS[@]}"; do
+  "$LAUNCHCTL" bootstrap \
     "$DOMAIN" \
     "$LAUNCH_AGENT_ROOT/$label.plist"
 done
 
+MUTATION_STARTED=0
+trap - ERR
 echo "installed: 5 Stock EVA LaunchAgents"
 echo "status: $PROJECT_ROOT/scripts/stock_eva_launchagents_status.sh"

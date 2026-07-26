@@ -14,6 +14,11 @@ from backend.app.market.store import MarketStore
 from tests.test_strategy_engine import bar, combined_rule
 
 
+def use_local_storage_settings(monkeypatch) -> None:
+    settings = cli.get_settings().model_copy(update={"nas_market_dataset_root": None})
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+
 def test_cli_exposes_safe_backfill_and_daily_audit_commands() -> None:
     help_text = build_parser().format_help()
 
@@ -51,9 +56,7 @@ class RangeProvider:
         if self.fail_once_for in symbols and self.failures == 0:
             self.failures += 1
             raise RuntimeError("controlled provider failure")
-        selected_dates = [
-            item for item in self.dates if start_date <= item <= end_date
-        ]
+        selected_dates = [item for item in self.dates if start_date <= item <= end_date]
         bars = []
         for trade_date in selected_dates:
             for symbol in symbols:
@@ -204,6 +207,7 @@ def test_all_main_board_refresh_defaults_to_network_free_dry_run(
     monkeypatch,
     capsys,
 ) -> None:
+    use_local_storage_settings(monkeypatch)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -231,6 +235,8 @@ def test_all_main_board_inspection_reports_measured_bounded_plan(
     monkeypatch,
     capsys,
 ) -> None:
+    use_local_storage_settings(monkeypatch)
+
     class Inspection:
         main_board_count = 3200
         shanghai_count = 1700
@@ -291,6 +297,8 @@ def test_backfill_calendar_failure_returns_safe_cli_error(
     monkeypatch,
     capsys,
 ) -> None:
+    use_local_storage_settings(monkeypatch)
+
     class CalendarFailure:
         def __init__(self, **kwargs) -> None:
             pass

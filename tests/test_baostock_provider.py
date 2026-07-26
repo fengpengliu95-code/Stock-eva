@@ -84,7 +84,7 @@ def test_provider_logs_out_and_returns_canonical_explicit_slice() -> None:
 
     assert [bar.symbol for bar in batch.bars] == ["sh.600000", "sh.000001"]
     assert batch.failed_symbols == []
-    assert batch.bars[0].adjust_factor == 1.25
+    assert batch.bars[0].adjust_factor == 0.8
     assert client.logged_out is True
 
 

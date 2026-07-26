@@ -20,14 +20,14 @@ class StorageReadiness(BaseModel):
 
 class DatasetManifest(BaseModel):
     dataset: Literal["stock-eva-market"]
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     generation: str = Field(min_length=1, max_length=128)
     files: list[dict[str, object]]
 
 
 class DatasetSentinel(BaseModel):
     dataset: Literal["stock-eva-market"]
-    schema_version: Literal[1]
+    schema_version: Literal[2]
 
 
 class LocalStoragePaths(BaseModel):

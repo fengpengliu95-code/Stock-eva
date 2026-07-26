@@ -21,6 +21,11 @@ from tests.test_market_data import fixture_payload
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def use_local_storage_settings(monkeypatch) -> None:
+    settings = cli.get_settings().model_copy(update={"nas_market_dataset_root": None})
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+
 def load_module(name: str):
     try:
         return importlib.import_module(name)
@@ -92,15 +97,15 @@ def test_calendar_fails_closed_outside_confirmed_year() -> None:
 def test_latest_expected_session_waits_until_1810_and_respects_holiday() -> None:
     calendar = synthetic_calendar()
 
-    assert calendar.latest_expected_session(
-        datetime(2026, 7, 24, 18, 9, tzinfo=SHANGHAI)
-    ) == date(2026, 7, 23)
-    assert calendar.latest_expected_session(
-        datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI)
-    ) == date(2026, 7, 24)
-    assert calendar.latest_expected_session(
-        datetime(2026, 2, 17, 20, 0, tzinfo=SHANGHAI)
-    ) == date(2026, 2, 13)
+    assert calendar.latest_expected_session(datetime(2026, 7, 24, 18, 9, tzinfo=SHANGHAI)) == date(
+        2026, 7, 23
+    )
+    assert calendar.latest_expected_session(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI)) == date(
+        2026, 7, 24
+    )
+    assert calendar.latest_expected_session(datetime(2026, 2, 17, 20, 0, tzinfo=SHANGHAI)) == date(
+        2026, 2, 13
+    )
 
 
 def test_market_phase_is_deterministic_for_open_and_closed_sessions() -> None:
@@ -109,13 +114,11 @@ def test_market_phase_is_deterministic_for_open_and_closed_sessions() -> None:
     assert calendar.market_phase(datetime(2026, 7, 24, 8, tzinfo=SHANGHAI)) == "pre_market"
     assert calendar.market_phase(datetime(2026, 7, 24, 10, tzinfo=SHANGHAI)) == "market_open"
     assert (
-        calendar.market_phase(datetime(2026, 7, 24, 16, tzinfo=SHANGHAI))
-        == "after_close_waiting"
+        calendar.market_phase(datetime(2026, 7, 24, 16, tzinfo=SHANGHAI)) == "after_close_waiting"
     )
     assert calendar.market_phase(datetime(2026, 7, 25, 10, tzinfo=SHANGHAI)) == "closed"
     assert (
-        calendar.market_phase(datetime(2027, 1, 4, 10, tzinfo=SHANGHAI))
-        == "calendar_unavailable"
+        calendar.market_phase(datetime(2027, 1, 4, 10, tzinfo=SHANGHAI)) == "calendar_unavailable"
     )
 
 
@@ -210,11 +213,7 @@ def test_publication_gates_keep_last_complete_snapshot_on_partial_attempt(
     module = load_module("backend.app.market.automation")
     store = MarketStore(tmp_path / "market.duckdb")
     save_published(store, date(2026, 7, 23))
-    incomplete = [
-        bar
-        for bar in fixture_bars(date(2026, 7, 24))
-        if bar.symbol != "sz.399001"
-    ]
+    incomplete = [bar for bar in fixture_bars(date(2026, 7, 24)) if bar.symbol != "sz.399001"]
     provider = CompleteProvider(incomplete)
 
     result = module.run_publication_refresh(
@@ -244,9 +243,7 @@ def test_partial_retry_cannot_mutate_published_bars_for_same_session(
     )
     assert first.status == "ready"
     published_run_id = store.published_refresh().run_id
-    original = {
-        bar["symbol"]: bar["close"] for bar in store.bars_for(session, "baostock")
-    }
+    original = {bar["symbol"]: bar["close"] for bar in store.bars_for(session, "baostock")}
     incomplete = [
         bar.model_copy(update={"close": bar.close + 999})
         for bar in fixture_bars(session)
@@ -261,9 +258,7 @@ def test_partial_retry_cannot_mutate_published_bars_for_same_session(
     )
 
     assert result.status == "partial"
-    assert {
-        bar["symbol"]: bar["close"] for bar in store.bars_for(session, "baostock")
-    } == original
+    assert {bar["symbol"]: bar["close"] for bar in store.bars_for(session, "baostock")} == original
     assert store.published_refresh().run_id == published_run_id
     assert store.published_refresh().status == "ready"
 
@@ -307,9 +302,7 @@ def test_automation_machine_validates_calendar_before_fetch(tmp_path: Path) -> N
         required_symbols=lambda: {"sh.600000"},
     )
 
-    outcome = service.run_due_once(
-        datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
-    )
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
 
     assert outcome.state.calendar_status == "conflict"
     assert outcome.state.refresh_state == "error"
@@ -355,26 +348,16 @@ def test_partial_attempt_waits_then_catches_up_at_retry_slot(
         required_symbols=lambda: {"sh.600000"},
     )
 
-    first = service.run_due_once(
-        datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
-    )
-    waiting = service.run_due_once(
-        datetime(2026, 7, 23, 18, 30, tzinfo=SHANGHAI)
-    )
-    retried = service.run_due_once(
-        datetime(2026, 7, 23, 18, 45, tzinfo=SHANGHAI)
-    )
+    first = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    waiting = service.run_due_once(datetime(2026, 7, 23, 18, 30, tzinfo=SHANGHAI))
+    retried = service.run_due_once(datetime(2026, 7, 23, 18, 45, tzinfo=SHANGHAI))
 
     assert first.state.refresh_state == "retry_wait"
-    assert first.state.next_retry_at == datetime(
-        2026, 7, 23, 18, 40, tzinfo=SHANGHAI
-    )
+    assert first.state.next_retry_at == datetime(2026, 7, 23, 18, 40, tzinfo=SHANGHAI)
     assert waiting.decision.action == "wait"
     assert retried.decision.action == "run"
     assert retried.state.attempt_count == 2
-    assert retried.state.next_retry_at == datetime(
-        2026, 7, 23, 19, 20, tzinfo=SHANGHAI
-    )
+    assert retried.state.next_retry_at == datetime(2026, 7, 23, 19, 20, tzinfo=SHANGHAI)
     assert provider.fetch_calls == 2
 
 
@@ -486,9 +469,7 @@ def test_automation_defers_without_fetching_when_refresh_lock_is_busy(
     )
 
     with module.RefreshRunLock(lock_path):
-        outcome = service.run_due_once(
-            datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
-        )
+        outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
 
     assert outcome.state.error_code == "refresh_already_running"
     assert outcome.state.refresh_state == "retry_wait"
@@ -500,6 +481,7 @@ def test_auto_refresh_once_defaults_to_network_free_plan(
     monkeypatch,
     capsys,
 ) -> None:
+    use_local_storage_settings(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once"])
 
     def unexpected_run(*args, **kwargs):
@@ -582,9 +564,7 @@ def test_portfolio_valuation_rejects_expected_date_query_parameter(
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.get(
-                "/api/v1/portfolio/valuation?expected_date=2026-07-23"
-            )
+            return await client.get("/api/v1/portfolio/valuation?expected_date=2026-07-23")
 
     try:
         response = asyncio.run(send())

@@ -1,5 +1,16 @@
 import plistlib
+import shutil
+import stat
+import subprocess
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from backend.app.config import Settings
+from backend.app.market.calendar_sync import CalendarSyncPolicy
+from backend.app.user.backup import PrivateBackupError, PrivateBackupService
 
 ROOT = Path(__file__).parents[1]
 LAUNCHD = ROOT / "launchd"
@@ -81,6 +92,8 @@ def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
         "--execute",
     ]
     assert backup["StartCalendarInterval"] == {"Hour": 2, "Minute": 30}
+    assert backup.get("RunAtLoad") is None
+    assert backup.get("KeepAlive") is None
     assert backup["ProgramArguments"][-8:] == [
         "--source",
         str(ROOT / "var/user/stock_eva_user.sqlite3"),
@@ -91,6 +104,48 @@ def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
         "--keep-weekly",
         "4",
     ]
+    assert Settings.model_config["env_file"] == ".env"
+
+
+def test_calendar_1630_schedule_wins_over_run_at_load_startup_flag() -> None:
+    decision = CalendarSyncPolicy().decide(
+        datetime(2026, 7, 27, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        state=None,
+        startup=True,
+    )
+
+    assert decision.action == "light"
+    assert decision.reason == "daily_1630_check"
+
+
+def test_settings_reads_dotenv_from_launchagent_working_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / ".env").write_text(
+        "STOCK_EVA_AUTO_REFRESH_ENABLED=true\n"
+        "STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/synthetic\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings()
+
+    assert settings.auto_refresh_enabled is True
+    assert settings.nas_market_dataset_root == Path("/Volumes/Stock/synthetic")
+
+
+def test_missing_private_database_fails_once_without_creating_backup(
+    tmp_path: Path,
+) -> None:
+    backup_root = tmp_path / "backups"
+
+    with pytest.raises(PrivateBackupError, match="source is unavailable"):
+        PrivateBackupService(
+            tmp_path / "missing.sqlite3",
+            backup_root,
+        ).run(datetime.now(ZoneInfo("Asia/Shanghai")))
+
+    assert not backup_root.exists()
 
 
 def test_launchagent_assets_never_embed_credentials_or_remote_mount_actions() -> None:
@@ -118,5 +173,231 @@ def test_management_scripts_require_explicit_mutation_flags() -> None:
     assert "--uninstall" in uninstaller
     assert "MODE=check" in uninstaller
     assert "launchctl print" in status
-    assert "launchctl bootstrap" in installer
-    assert "launchctl bootout" in uninstaller
+    assert '"$LAUNCHCTL" bootstrap' in installer
+    assert '"$LAUNCHCTL" bootout' in uninstaller
+
+
+def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
+    project = tmp_path / "Stock EVA Synthetic"
+    shutil.copytree(LAUNCHD, project / "launchd")
+    python = project / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    (project / ".env").write_text(
+        "\n".join(
+            [
+                "STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market",
+                "STOCK_EVA_AUTO_REFRESH_ENABLED=false",
+                f"STOCK_EVA_USER_DATA_DIR={user_dir}",
+                "STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3",
+            ]
+        )
+        + "\n"
+    )
+    return project
+
+
+def fake_launchctl(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-launchctl"
+    executable.write_text(
+        """#!/bin/bash
+echo "$*" >> "$CALL_LOG"
+if [[ "$1" == "print" ]]; then
+  [[ "${LOADED_LABEL:-}" != "" && "$2" == *"/$LOADED_LABEL" ]]
+  exit
+fi
+if [[ "$1" == "bootstrap" && "${FAIL_LABEL:-}" != "" && "$*" == *"$FAIL_LABEL"* ]]; then
+  exit 9
+fi
+exit 0
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def fake_lsof(tmp_path: Path, *, occupied: bool) -> Path:
+    executable = tmp_path / "fake-lsof"
+    executable.write_text(f"#!/bin/sh\nexit {0 if occupied else 1}\n")
+    executable.chmod(0o755)
+    return executable
+
+
+def install_environment(
+    tmp_path: Path,
+    *,
+    launchctl: Path,
+    lsof: Path,
+) -> dict[str, str]:
+    home = tmp_path / "home"
+    home.mkdir()
+    return {
+        "HOME": str(home),
+        "CALL_LOG": str(tmp_path / "launchctl.log"),
+        "STOCK_EVA_LAUNCHCTL": str(launchctl),
+        "STOCK_EVA_LSOF": str(lsof),
+        "STOCK_EVA_UNAME": "Darwin",
+    }
+
+
+def run_installer(
+    project: Path,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(SCRIPTS / "stock_eva_launchagents_install.sh"),
+            "--install",
+            "--project-root",
+            str(project),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    launchctl = fake_launchctl(tmp_path)
+    lsof = fake_lsof(tmp_path, occupied=False)
+    environment = install_environment(
+        tmp_path,
+        launchctl=launchctl,
+        lsof=lsof,
+    )
+
+    result = run_installer(project, environment)
+
+    assert result.returncode == 0, result.stderr
+    home = Path(environment["HOME"])
+    installed = sorted((home / "Library/LaunchAgents").glob("*.plist"))
+    assert len(installed) == 5
+    log_root = home / "Library/Logs/Stock EVA"
+    backup_root = home / "Library/Application Support/Stock EVA/backups"
+    assert stat.S_IMODE(log_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in log_root.iterdir())
+
+
+def test_installer_rejects_manual_port_conflict_before_writing_plists(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=True),
+    )
+
+    result = run_installer(project, environment)
+
+    assert result.returncode != 0
+    assert "port 8000" in result.stderr
+    assert not (Path(environment["HOME"]) / "Library/LaunchAgents").exists()
+
+
+def test_installer_rolls_back_partial_bootstrap_failure(tmp_path: Path) -> None:
+    project = synthetic_project(tmp_path)
+    launchctl = fake_launchctl(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=launchctl,
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+    environment["FAIL_LABEL"] = "com.finlay.stock-eva.calendar"
+
+    result = run_installer(project, environment)
+
+    assert result.returncode != 0
+    agent_root = Path(environment["HOME"]) / "Library/LaunchAgents"
+    assert list(agent_root.glob("com.finlay.stock-eva.*.plist")) == []
+    assert "rollback: restored previous LaunchAgent state" in result.stderr
+
+
+def test_installer_rollback_restores_preexisting_loaded_agent(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    launchctl = fake_launchctl(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=launchctl,
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+    environment["LOADED_LABEL"] = "com.finlay.stock-eva.api"
+    environment["FAIL_LABEL"] = "com.finlay.stock-eva.calendar"
+    agent_root = Path(environment["HOME"]) / "Library/LaunchAgents"
+    agent_root.mkdir(parents=True)
+    previous = agent_root / "com.finlay.stock-eva.api.plist"
+    previous.write_text("previous-api-plist")
+
+    result = run_installer(project, environment)
+
+    assert result.returncode != 0
+    assert previous.read_text() == "previous-api-plist"
+    assert sorted(path.name for path in agent_root.glob("*.plist")) == [
+        "com.finlay.stock-eva.api.plist"
+    ]
+
+
+def test_installer_rejects_backup_path_override_it_cannot_honor(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path, user_dir="custom/user")
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+
+    result = run_installer(project, environment)
+
+    assert result.returncode != 0
+    assert "STOCK_EVA_USER_DATA_DIR=var/user" in result.stderr
+
+
+def test_uninstaller_removes_only_named_agents_and_preserves_data(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    agent_root = home / "Library/LaunchAgents"
+    logs = home / "Library/Logs/Stock EVA"
+    backups = home / "Library/Application Support/Stock EVA/backups"
+    agent_root.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    backups.mkdir(parents=True)
+    for template in LAUNCHD.glob("*.plist.in"):
+        (agent_root / template.name.removesuffix(".in")).write_text("managed")
+    unrelated = agent_root / "com.example.unrelated.plist"
+    unrelated.write_text("preserve")
+    (logs / "api.log").write_text("preserve")
+    (backups / "snapshot.sqlite3").write_text("preserve")
+    environment = {
+        "HOME": str(home),
+        "CALL_LOG": str(tmp_path / "launchctl.log"),
+        "STOCK_EVA_LAUNCHCTL": str(fake_launchctl(tmp_path)),
+    }
+
+    result = subprocess.run(
+        [
+            str(SCRIPTS / "stock_eva_launchagents_uninstall.sh"),
+            "--uninstall",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert unrelated.read_text() == "preserve"
+    assert sorted(agent_root.glob("com.finlay.stock-eva.*.plist")) == []
+    assert (logs / "api.log").read_text() == "preserve"
+    assert (backups / "snapshot.sqlite3").read_text() == "preserve"

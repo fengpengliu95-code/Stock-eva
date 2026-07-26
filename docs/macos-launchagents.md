@@ -27,6 +27,9 @@ Stock EVA 使用 5 个当前用户级 LaunchAgent，不需要管理员权限，�
 
    自动刷新必须为 `false`，因为 LaunchAgent 的幂等 one-shot 命令是唯一调度
    所有者，避免 API 内置循环重复运行。
+   私有备份当前固定读取 `var/user/stock_eva_user.sqlite3`；如果 `.env` 显式
+   改写 `STOCK_EVA_USER_DATA_DIR` 或 `STOCK_EVA_USER_DATABASE_NAME`，安装器
+   会 fail closed，而不会静默备份错误文件。
 3. `.venv/bin/python` 已存在且依赖完整。
 4. 停止目前手动启动、占用 8000/8080 端口的验收进程。
 
@@ -53,6 +56,10 @@ LaunchAgent 不会主动挂载 SMB，也不包含网络凭据。
 - `~/Library/LaunchAgents/com.finlay.stock-eva.*.plist`
 - `~/Library/Logs/Stock EVA/`
 - `~/Library/Application Support/Stock EVA/backups/`
+
+安装器会先检查 8000/8080 端口。非 Stock EVA LaunchAgent 占用端口时会在写入
+plist 前退出；升级期间如果任一 plist 安装或 bootstrap 失败，会恢复原 plist
+及原加载状态。日志和私有备份目录权限为 `0700`，日志文件权限为 `0600`。
 
 `RunAtLoad` 会在安装时启动 API、工作台和一次日历检查，因此应在真实历史回填
 结束、手动服务停止后执行。

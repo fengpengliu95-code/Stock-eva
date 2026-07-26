@@ -11,6 +11,7 @@ LABELS=(
 )
 LAUNCH_AGENT_ROOT="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$UID"
+LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
 
 case "${1:---check}" in
   --check)
@@ -34,7 +35,7 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 for label in "${LABELS[@]}"; do
-  /bin/launchctl bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
+  "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
   /bin/rm -f "$LAUNCH_AGENT_ROOT/$label.plist"
 done
 

@@ -333,6 +333,7 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync"])
     settings = Settings(
+        _env_file=None,
         market_data_dir=tmp_path / "market",
         user_data_dir=tmp_path / "user",
         local_control_dir=tmp_path / "control",

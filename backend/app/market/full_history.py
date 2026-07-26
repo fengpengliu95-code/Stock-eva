@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from backend.app.market.automation import run_publication_refresh
 from backend.app.market.models import RefreshResult
+from backend.app.storage.dataset import SCHEMA_VERSION
 
 
 class FullMarketHistoryPlan(BaseModel):
@@ -70,7 +71,7 @@ class FullMarketHistoryService:
         pending = [item for item in trading_dates if item not in published]
         request_key = (
             f"full-market-history:baostock:{trading_dates[0].isoformat()}:"
-            f"{trading_dates[-1].isoformat()}:schema-v1"
+            f"{trading_dates[-1].isoformat()}:schema-v{SCHEMA_VERSION}"
         )
         return FullMarketHistoryPlan(
             run_id=hashlib.sha256(request_key.encode()).hexdigest()[:24],

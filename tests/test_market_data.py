@@ -40,7 +40,7 @@ def test_baostock_normalization_preserves_raw_prices_and_marks_suspension() -> N
 
     assert normal.close == 10.5
     assert normal.price_adjustment == "none"
-    assert normal.adjust_factor == 1.25
+    assert normal.adjust_factor == 0.8
     assert normal.source == "baostock"
     assert normal.is_suspended is False
 

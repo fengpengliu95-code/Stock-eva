@@ -34,7 +34,7 @@ def _factor_lookup(
         result.setdefault(record["code"], []).append(
             (
                 date.fromisoformat(record["dividOperateDate"]),
-                float(record["foreAdjustFactor"]),
+                float(record["backAdjustFactor"]),
             )
         )
     return result

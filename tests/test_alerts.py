@@ -25,6 +25,7 @@ def request(method: str, path: str, **kwargs) -> httpx.Response:
 @pytest.fixture
 def alert_environment(tmp_path: Path):
     settings = Settings(
+        _env_file=None,
         market_data_dir=tmp_path / "market",
         user_data_dir=tmp_path / "user",
     )

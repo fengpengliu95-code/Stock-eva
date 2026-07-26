@@ -24,7 +24,7 @@ from backend.app.market.store import MarketStore
 SENTINEL_NAME = ".stock-eva-dataset.json"
 MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EXPECTED_PARQUET_TYPES = {
     "trade_date": "DATE",

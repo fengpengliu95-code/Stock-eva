@@ -152,11 +152,15 @@ def test_signal_date_suspension_factor_and_quality_exclude_symbol(
     )
     save_history(store, history)
 
-    result = StrategyEngine(store).evaluate(
-        combined_rule(),
-        symbols=[SYMBOL],
-        as_of_date=last.trade_date,
-    ).results[0]
+    result = (
+        StrategyEngine(store)
+        .evaluate(
+            combined_rule(),
+            symbols=[SYMBOL],
+            as_of_date=last.trade_date,
+        )
+        .results[0]
+    )
 
     assert result.status == "excluded"
     assert result.matched is None
@@ -176,6 +180,44 @@ def test_future_rows_do_not_change_as_of_result_or_fingerprint(tmp_path: Path) -
 
     assert before.data_fingerprint == after.data_fingerprint
     assert before.results == after.results
+
+
+def test_strategy_normalizes_cumulative_back_factors_to_signal_date(
+    tmp_path: Path,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    start = date(2026, 1, 1)
+    history = [
+        bar(start, 10, factor=1.0),
+        bar(start + timedelta(days=1), 10, factor=2.0),
+    ]
+    save_history(store, history)
+    rule = validate_rule(
+        {
+            "op": "compare",
+            "left": {
+                "type": "indicator",
+                "name": "SMA",
+                "field": "close",
+                "period": 2,
+            },
+            "operator": "<",
+            "right": {"type": "constant", "value": 8},
+        }
+    )
+
+    result = (
+        StrategyEngine(store)
+        .evaluate(
+            rule,
+            symbols=[SYMBOL],
+            as_of_date=history[-1].trade_date,
+        )
+        .results[0]
+    )
+
+    assert result.status == "matched"
+    assert result.explanation["left"]["value"] == pytest.approx(7.5)
 
 
 def test_repeated_evaluation_is_reproducible(tmp_path: Path) -> None:
@@ -222,11 +264,15 @@ def test_crosses_below_uses_previous_greater_or_equal_boundary(tmp_path: Path) -
         }
     )
 
-    result = StrategyEngine(store).evaluate(
-        rule,
-        symbols=[SYMBOL],
-        as_of_date=history[-1].trade_date,
-    ).results[0]
+    result = (
+        StrategyEngine(store)
+        .evaluate(
+            rule,
+            symbols=[SYMBOL],
+            as_of_date=history[-1].trade_date,
+        )
+        .results[0]
+    )
 
     assert result.status == "matched"
     assert result.explanation["previous"]["left"] == pytest.approx(10)
@@ -236,10 +282,7 @@ def test_crosses_below_uses_previous_greater_or_equal_boundary(tmp_path: Path) -
 def test_ema_and_rsi_have_deterministic_effective_day_windows(tmp_path: Path) -> None:
     store = MarketStore(tmp_path / "market.duckdb")
     start = date(2026, 1, 1)
-    history = [
-        bar(start + timedelta(days=index), 10 + index)
-        for index in range(16)
-    ]
+    history = [bar(start + timedelta(days=index), 10 + index) for index in range(16)]
     save_history(store, history)
     rule = validate_rule(
         {
@@ -271,11 +314,15 @@ def test_ema_and_rsi_have_deterministic_effective_day_windows(tmp_path: Path) ->
         }
     )
 
-    result = StrategyEngine(store).evaluate(
-        rule,
-        symbols=[SYMBOL],
-        as_of_date=history[-1].trade_date,
-    ).results[0]
+    result = (
+        StrategyEngine(store)
+        .evaluate(
+            rule,
+            symbols=[SYMBOL],
+            as_of_date=history[-1].trade_date,
+        )
+        .results[0]
+    )
 
     assert result.status == "matched"
     ema, rsi = result.explanation["children"]

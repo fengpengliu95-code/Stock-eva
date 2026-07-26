@@ -7,13 +7,12 @@ from datetime import date
 from time import monotonic, sleep
 from typing import Any
 
-from backend.app.market.factor_cache import AdjustmentFactorCache
+from backend.app.market.factor_cache import AdjustmentFactorCache, FactorCacheError
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
 
 DAILY_FIELDS = (
-    "date,code,open,high,low,close,preclose,volume,amount,"
-    "adjustflag,turn,tradestatus,pctChg,isST"
+    "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
 )
 INDEX_SYMBOLS = ("sh.000001", "sz.399001")
 SH_MAIN_PREFIXES = ("sh.600", "sh.601", "sh.603", "sh.605")
@@ -74,9 +73,7 @@ def _read_result(
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
-        raise BaoStockError(
-            result.error_msg or f"BaoStock pagination error {result.error_code}"
-        )
+        raise BaoStockError(result.error_msg or f"BaoStock pagination error {result.error_code}")
     return list(result.fields), rows
 
 
@@ -107,8 +104,10 @@ class BaoStockProvider:
         self.max_explicit_symbols = max_explicit_symbols
         self.max_attempts = max_attempts
         self.min_request_interval_seconds = (
-            0.2 if is_real_client else 0.0
-        ) if min_request_interval_seconds is None else min_request_interval_seconds
+            (0.2 if is_real_client else 0.0)
+            if min_request_interval_seconds is None
+            else min_request_interval_seconds
+        )
         self._monotonic = monotonic_fn
         self._sleep = sleep_fn
         self._last_request_at: float | None = None
@@ -239,11 +238,7 @@ class BaoStockProvider:
                 lambda: self.client.query_all_stock(day=trade_date.isoformat())
             )
             code_index = fields.index("code")
-            symbols = {
-                row[code_index]
-                for row in rows
-                if _is_main_board(row[code_index])
-            }
+            symbols = {row[code_index] for row in rows if _is_main_board(row[code_index])}
             shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
             shenzhen = sum(symbol.startswith("sz.") for symbol in symbols)
             return MainBoardInspection(
@@ -252,9 +247,7 @@ class BaoStockProvider:
                 shanghai_count=shanghai,
                 shenzhen_count=shenzhen,
                 total_expected_count=len(symbols) + len(INDEX_SYMBOLS),
-                metadata_provider_requests=(
-                    self._provider_request_count - initial_request_count
-                ),
+                metadata_provider_requests=(self._provider_request_count - initial_request_count),
                 main_board_symbols=tuple(sorted(symbols)),
             )
         finally:
@@ -269,11 +262,7 @@ class BaoStockProvider:
         )
         date_index = fields.index("calendar_date")
         trading_index = fields.index("is_trading_day")
-        return [
-            date.fromisoformat(row[date_index])
-            for row in rows
-            if row[trading_index] == "1"
-        ]
+        return [date.fromisoformat(row[date_index]) for row in rows if row[trading_index] == "1"]
 
     def fetch_range(
         self,
@@ -364,10 +353,7 @@ class BaoStockProvider:
     def _pace_request(self) -> None:
         now = self._monotonic()
         if self._last_request_at is not None:
-            remaining = (
-                self.min_request_interval_seconds
-                - (now - self._last_request_at)
-            )
+            remaining = self.min_request_interval_seconds - (now - self._last_request_at)
             if remaining > 0:
                 self._sleep(remaining)
                 now = self._monotonic()
@@ -449,9 +435,7 @@ class BaoStockProvider:
         daily_fields, daily_rows = self._read(
             lambda: self.client.query_daily_history_k_AStock(date=iso_date)
         )
-        daily_rows = [
-            row for row in daily_rows if row[daily_fields.index("code")] in main_symbols
-        ]
+        daily_rows = [row for row in daily_rows if row[daily_fields.index("code")] in main_symbols]
         active_symbols = sorted(
             row[daily_fields.index("code")]
             for row in daily_rows
@@ -472,8 +456,7 @@ class BaoStockProvider:
             bars=bars + explicit_indexes.bars,
             expected_symbols=sorted(main_symbols) + list(INDEX_SYMBOLS),
             failed_symbols=sorted(
-                (main_symbols - {bar.symbol for bar in bars})
-                | set(explicit_indexes.failed_symbols)
+                (main_symbols - {bar.symbol for bar in bars}) | set(explicit_indexes.failed_symbols)
             ),
         )
 
@@ -529,10 +512,11 @@ class BaoStockProvider:
                     trade_date,
                     fields,
                     rows,
+                    allow_empty_history=True,
                 )
                 if factor is not None:
                     resolved[symbol] = factor
-            except (BaoStockError, ValueError):
+            except (BaoStockError, FactorCacheError, ValueError):
                 # The quality gate below remains authoritative.  A single
                 # failed bootstrap must not discard already persisted progress.
                 continue

@@ -102,14 +102,14 @@ def _root(tmp_path: Path) -> Path:
     root = (tmp_path / "nas-dataset").resolve()
     root.mkdir()
     (root / ".stock-eva-dataset.json").write_text(
-        json.dumps({"dataset": "stock-eva-market", "schema_version": 1}),
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
         encoding="utf-8",
     )
     (root / "manifest.json").write_text(
         json.dumps(
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": "generation-empty",
                 "files": [],
             }
@@ -182,7 +182,7 @@ def test_reader_rejects_partial_or_unsafe_manifest_without_local_fallback(tmp_pa
         json.dumps(
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": "bad",
                 "files": [{"path": "_staging/untrusted.parquet"}],
             }
@@ -319,6 +319,21 @@ def test_reader_rejects_schema_mismatch_and_export_revalidates(tmp_path: Path) -
         store.export_date(date(2026, 7, 23), tmp_path / "export")
 
 
+def test_reader_rejects_legacy_fore_factor_manifest_v1(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["schema_version"] = 1
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+
+    with pytest.raises(DatasetError, match="unsupported schema"):
+        store.validate_readiness()
+
+
 def test_manifest_lock_and_generation_cas_prevent_lost_updates(tmp_path: Path, monkeypatch) -> None:
     root = _root(tmp_path)
     store = NasMarketStore(
@@ -354,7 +369,7 @@ def test_cli_rejects_invalid_nas_dataset_without_traceback(
         json.dumps(
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": "invalid",
                 "files": [
                     {

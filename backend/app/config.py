@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
     local_control_dir: Path = Path("var/control")
-    factor_cache_database_name: str = "baostock_factor_cache.sqlite3"
+    factor_cache_database_name: str = "baostock_back_factor_cache.sqlite3"
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")

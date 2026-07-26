@@ -33,7 +33,7 @@ NAS 根不能与 `market_data_dir`、`user_data_dir` 或任何本地 runtime 目
 3. `.stock-eva-dataset.json` 可读、少于 1 MiB 且内容为：
 
    ```json
-   {"dataset":"stock-eva-market","schema_version":1}
+   {"dataset":"stock-eva-market","schema_version":2}
    ```
 
 4. `manifest.json` 可读、少于 1 MiB，且至少满足：
@@ -41,7 +41,7 @@ NAS 根不能与 `market_data_dir`、`user_data_dir` 或任何本地 runtime 目
    ```json
    {
      "dataset": "stock-eva-market",
-     "schema_version": 1,
+     "schema_version": 2,
      "generation": "generation-YYYYMMDD-HHMMSS",
      "files": []
    }
@@ -60,6 +60,10 @@ NAS 根不能与 `market_data_dir`、`user_data_dir` 或任何本地 runtime 目
 STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
   uv run python -m backend.app.cli storage-init --initialize-empty-nas-dataset
 ```
+
+市场数据 schema v2 将 canonical `adjust_factor` 定义为累计后复权因子，并由查询
+截止日动态归一化前复权序列。旧 schema v1 保存的是会被后续事件重标的前复权值，
+新代码必须拒绝读取；升级时应归档旧数据集并重新初始化、回填，不能原地混合分区。
 
 命令拒绝已存在的路径、非 SMB/CIFS 挂载和共享盘根目录。它只创建空数据集的哨兵、
 空 manifest 与 `bars`、`manifests/history`、`checksums`、`_staging`、`quarantine`

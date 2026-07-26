@@ -69,13 +69,13 @@ class EmptyDatasetInitializer:
         generation = self.now.strftime("generation-%Y%m%d-%H%M%S")
         self._write_json_exclusive(
             root / _SENTINEL_NAME,
-            {"dataset": "stock-eva-market", "schema_version": 1},
+            {"dataset": "stock-eva-market", "schema_version": 2},
         )
         self._write_json_exclusive(
             root / _MANIFEST_NAME,
             {
                 "dataset": "stock-eva-market",
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": generation,
                 "files": [],
             },

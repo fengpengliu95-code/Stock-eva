@@ -1,10 +1,11 @@
-# 阶段 1 行情数据契约
+# 行情数据契约与运行状态
 
 ## 范围
 
-阶段 1 只处理上交所、深交所 A 股主板的公开免费收盘后日线。BaoStock 是唯一
-OHLCV 主源；AKShare 尚未接入，未来只能作为有来源标记的受控补充，不能与
-BaoStock 的同一根 K 线拼接、平均或静默回填。
+核心行情只处理上交所、深交所 A 股主板的公开免费收盘后日线。BaoStock 是唯一
+OHLCV 主源。AKShare 补充数据使用独立数据集、独立 manifest 和独立来源字段，
+不能与 BaoStock 的同一根 K 线拼接、平均或静默回填。AKShare 数据集已初始化；
+最近一次真实 canary 因上游不可用没有发布记录，因此其 published manifest 仍为空。
 
 市场摘要目前包含：
 
@@ -21,8 +22,11 @@ BaoStock 的同一根 K 线拼接、平均或静默回填。
 
 ## Canonical 日线
 
-主键是 `trade_date + symbol + source`，天然按交易日可查询。重复刷新先替换
-同一主键，再在同一 DuckDB 事务内登记刷新结果，因此不会累积重复行。
+逻辑主键是 `trade_date + symbol + source`，天然按交易日可查询。正式 NAS 数据集
+按交易日发布不可变 Parquet 分区，只有 manifest 引用的文件才是可见行情真值；同一
+交易日修订会生成新 hash 文件并原子切换 manifest，不覆盖已发布文件。DuckDB 保存
+刷新审计、调度状态和 published pointer 等本机控制状态；本地开发模式仍可使用
+DuckDB canonical 表验证相同主键的幂等覆盖。
 
 关键字段：
 
@@ -34,19 +38,23 @@ BaoStock 的同一根 K 线拼接、平均或静默回填。
 | 血缘 | `source`、`source_record_id`、`ingested_at` |
 | 质量 | `quality_status`、`quality_issues` |
 
-`adjust_factor` 对应 BaoStock 的前复权因子。前复权读取严格使用
-`前复权价格 = 未复权价格 × adjust_factor`，成交量和成交额不缩放。指数不适用时为 `null`；股票因子
-缺失时也为 `null`，并把刷新降级为 `partial`，不会用 `1.0` 猜测。停牌日即使
+`adjust_factor` 保存 BaoStock 的累计后复权因子，不保存会被未来公司行动重标的
+`foreAdjustFactor`。以请求截止日 `T` 读取前复权序列时严格使用
+`前复权价格(d,T) = 未复权价格(d) × backFactor(d) / backFactor(T)`，成交量和
+成交额不缩放。指数不适用时为 `null`；股票因子缺失时也为 `null`，并把刷新降级为
+`partial`。停牌日即使
 BaoStock 返回前收盘价和零成交，也会标为停牌占位，不进入可交易宽度和成交额。
 面向指标的前复权序列读取会直接排除停牌行；任何股票行缺少因子会返回数据质量错误，
 不会生成部分复权序列。
 
-### 全市场复权因子引导
+### 全市场累计后复权因子引导
 
 BaoStock 的 `query_daily_adjust_factor(date=T)` 是 T 日公司行动事件流，不是
 全市场 T 日因子快照。第一次全市场刷新会对没有可信基线的正常交易股票逐一调用
-`query_adjust_factor(..., end_date=T)`，并把每个成功结果立即写入本机
-`var/control/baostock_factor_cache.sqlite3`。因此首次运行可以中断并安全续跑：
+`query_adjust_factor(..., end_date=T)`，并把每个成功结果的 `backAdjustFactor`
+立即写入本机 `var/control/baostock_back_factor_cache.sqlite3`。成功且字段完整的
+空历史响应是“截至 T 没有公司行动”的可审计证据，累计后复权因子为恒等值 `1`；
+网络错误、字段错误或非有限值不能生成该证据，仍保持 `partial`。因此首次运行可以中断并安全续跑：
 再次执行时只查询仍缺失的股票，不会从头开始，也不会把空结果替换成 `1`。
 
 基线建立后，每个交易日只读取日事件流。未发生公司行动的股票沿用已验证的上一
@@ -61,7 +69,9 @@ BaoStock 的 `query_daily_adjust_factor(date=T)` 是 T 日公司行动事件流�
 “该日已完整观察”的证据，没有这条证据就禁止跨日沿用。快照同时保存因子的
 `evidence_effective_date` 与 `evidence_observed_on`；事件必须满足
 `effective_date <= 目标日` 且 `observed_on <= 目标日`。因此 2026 年才观察到的因子
-值不能直接回填 2025 年，禁止用后来信息替代当时可得证据。
+值不能直接回填 2025 年，禁止用后来信息替代当时可得证据。BaoStock
+`foreAdjustFactor` 会被后续事件重新归一化，不能仅靠 `observed_on` 修复，因此
+canonical 和策略计算完全不使用该值。
 
 因子缓存属于可重建的本机控制数据，不写入 NAS，也不进入 Git。需要从零重新引导
 时，应先停止刷新进程，再删除该 SQLite 文件；下一次全市场刷新会重新逐证券获取。
@@ -133,7 +143,7 @@ staging 验证；partial/error 只写运行审计，不写 canonical 行。只�
 - 期望主板证券覆盖率为 100%，无失败证券；
 - 上证综指和深证成指均存在；
 - 所有本地持仓和全部自选列表证券均有当日合格数据；
-- 非停牌股票前复权因子完整，质量状态无 error；
+- 非停牌股票累计后复权因子完整，质量状态无 error；
 - 策略只读取已经发布且因子完备的前复权序列。
 
 partial/error 运行不会覆盖上一完整快照。`GET /api/v1/market/status` 返回
@@ -146,12 +156,13 @@ partial/error 运行不会覆盖上一完整快照。`GET /api/v1/market/status`
 - `GET /api/v1/market/history/dates` 返回本地已有交易日。
 - `GET /api/v1/market/history/{symbol}` 以单一 `source=baostock` 读取未复权或
   前复权序列，不跨来源填洞。
-- `python -m backend.app.cli export --date YYYY-MM-DD` 使用 DuckDB 原生 `COPY`
-  输出本机 `var/staging/exports/date=YYYY-MM-DD/bars.parquet`。
+- `python -m backend.app.cli export --date YYYY-MM-DD` 从已发布数据生成只读交换导出，
+  输出到本机 `var/staging/exports/date=YYYY-MM-DD/bars.parquet`；它不会修改 NAS
+  manifest。正式 NAS 分区由发布流程自动维护。
 
 单证券历史读取由 DuckDB 一次参数化查询完成，将 `symbol`、`source` 和日期区间
 全部下推到 SQL；不会先加载每个交易日的全市场行再由 Python 过滤。API、策略回放和
-未来股票详情都复用该查询。停牌排除、缺失复权因子报错、canonical 质量字段及前复权
+股票详情都复用该查询。停牌排除、缺失复权因子报错、canonical 质量字段及前复权
 计算仍由既有服务契约控制。
 
 多证券策略/预警历史读取按最多 200 只证券为一批，使用 `symbol = ANY(?)`、
@@ -169,19 +180,30 @@ canonical 日线写入使用单个事务内的一条集合化 `INSERT OR REPLACE
 幂等写入由 4,000 条语句降为 1 条，耗时由 0.5639 秒降为 0.0492 秒。时间仅用于
 本机回归比较，连接、查询、语句和返回行计数是测试中的稳定约束。
 
-Parquet 是单日、可重建的交换分区；DuckDB 仍是本地查询真值。当前规模不引入额外
-数据湖目录、清单服务或分区协调器，避免为阶段 2 的手动持仓功能增加无关复杂性。
+正式运行时，NAS 上由 published manifest 引用的不可变 Parquet 分区是市场数据
+真值；本机 DuckDB 是可重建的控制、审计和调度状态，不保存 NAS 历史行情的权威副本。
+读取必须遵循 manifest，不能用目录 glob 把 partial、quarantine 或旧修订混入结果。
+当前按交易日发布一个分区，后续只有真实扫描性能证明需要时才做离线月度合并。
+
+2026-07-26 前已完成一个交易日的 BaoStock 全主板真实抓取、完整性门槛校验和 NAS
+发布。覆盖约 3,190 只主板股票与 2 个摘要指数，复权因子也通过发布门槛。当前正在
+执行约 260 个有效交易日的全主板历史回填；最终完成日期数、行数和容量以主任务结束
+后读取 NAS manifest 的结果为准，文档不预填估算值。
+
+策略指标已由严格 JSON AST 执行器实现，包括 SMA、EMA、RSI、`volume_ratio_5d`
+以及上穿/下穿。指标只读取截止信号日的前复权有效交易日，不读取未来数据；停牌、
+缺因子或质量异常的证券会被排除而不是生成部分可信信号。
 
 ## 已知限制
 
 - BaoStock 是免费公共服务，没有项目可控制的可用性承诺。
 - 年度日历配置需要随交易所下一年度休市公告更新；缺年配置会 fail closed。
 - BaoStock 是机器校验和行情源，不替代交易所公告的权威性。
-- Parquet 目前只做显式单日导出，不自动维护全量镜像。
-- 尚未实现 AKShare 补充字段和跨源对账。
-- AKShare 板块分类与资金流只完成离线契约和空态 API；可接受/拒绝能力、许可证和
-  日期边界见 [AKShare 补充数据审查](akshare-supplemental.md)。
-- 尚未计算技术指标；后续如计算，只能用前复权序列。
-- 当前是面向本机的单表 DuckDB 模型；批量读取与写入前置已具备，但迁移 NAS 前仍需
-  在目标文件系统上验证单写者锁、真实全市场多年扫描、批次内存上限、备份恢复和
-  DuckDB/Parquet 分区边界。没有在合成基准不足以证明收益时增加索引。
+- NAS 历史回填仍在运行；完整的约 260 个交易日数据量、耗时和最终校验结果必须由
+  manifest 与验收命令读回，不能从单日样本外推为已完成事实。
+- AKShare 板块分类与资金流已具备独立数据集、离线契约和空态 API，但真实 canary
+  上游不可用，published manifest 仍为空；可接受/拒绝能力、许可证和日期边界见
+  [AKShare 补充数据审查](akshare-supplemental.md)。
+- 免费数据源没有 SLA；补充源不可用不会阻断 BaoStock OHLCV 核心链路，也不能用
+  OHLCV 推断资金净流入。
+- 当前不提供实时/分钟行情、券商连接、自动交易或收益保证。

@@ -60,6 +60,7 @@ class AdjustmentFactorCache:
                     symbol TEXT NOT NULL,
                     trade_date TEXT NOT NULL,
                     fore_adjust_factor REAL NOT NULL,
+                    back_adjust_factor REAL,
                     evidence_kind TEXT NOT NULL,
                     evidence_effective_date TEXT NOT NULL,
                     evidence_observed_on TEXT,
@@ -72,6 +73,7 @@ class AdjustmentFactorCache:
                     effective_date TEXT NOT NULL,
                     observed_on TEXT NOT NULL,
                     fore_adjust_factor REAL NOT NULL,
+                    back_adjust_factor REAL,
                     source_row_hash TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, effective_date, observed_on)
@@ -96,6 +98,16 @@ class AdjustmentFactorCache:
                 connection.execute(
                     "ALTER TABLE factor_snapshots ADD COLUMN evidence_observed_on TEXT"
                 )
+            if "back_adjust_factor" not in snapshot_columns:
+                connection.execute(
+                    "ALTER TABLE factor_snapshots ADD COLUMN back_adjust_factor REAL"
+                )
+            event_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(factor_events)").fetchall()
+            }
+            if "back_adjust_factor" not in event_columns:
+                connection.execute("ALTER TABLE factor_events ADD COLUMN back_adjust_factor REAL")
             connection.execute(
                 """
                 UPDATE factor_snapshots AS snapshots
@@ -129,12 +141,17 @@ class AdjustmentFactorCache:
         rows: Sequence[Sequence[str]],
         *,
         through_date: date,
-    ) -> list[tuple[str, date, float, str]]:
-        required = {"code", "dividOperateDate", "foreAdjustFactor"}
+    ) -> list[tuple[str, date, float, float, str]]:
+        required = {
+            "code",
+            "dividOperateDate",
+            "foreAdjustFactor",
+            "backAdjustFactor",
+        }
         if not required.issubset(fields):
             raise FactorCacheError("BaoStock factor response has unsupported fields")
         positions = {field: fields.index(field) for field in required}
-        parsed: list[tuple[str, date, float, str]] = []
+        parsed: list[tuple[str, date, float, float, str]] = []
         for row in rows:
             if len(row) != len(fields):
                 raise FactorCacheError("BaoStock factor field and row lengths differ")
@@ -143,9 +160,23 @@ class AdjustmentFactorCache:
             if effective_date > through_date:
                 raise FactorCacheError("BaoStock factor response contains future data")
             factor = float(row[positions["foreAdjustFactor"]])
-            if not math.isfinite(factor) or factor <= 0:
+            back_factor = float(row[positions["backAdjustFactor"]])
+            if (
+                not math.isfinite(factor)
+                or factor <= 0
+                or not math.isfinite(back_factor)
+                or back_factor <= 0
+            ):
                 raise FactorCacheError("BaoStock factor must be finite and positive")
-            parsed.append((symbol, effective_date, factor, AdjustmentFactorCache._row_hash(row)))
+            parsed.append(
+                (
+                    symbol,
+                    effective_date,
+                    factor,
+                    back_factor,
+                    AdjustmentFactorCache._row_hash(row),
+                )
+            )
         return parsed
 
     def exact_snapshots(
@@ -161,9 +192,10 @@ class AdjustmentFactorCache:
         try:
             rows = connection.execute(
                 f"""
-                SELECT symbol, fore_adjust_factor
+                SELECT symbol, back_adjust_factor
                 FROM factor_snapshots
                 WHERE trade_date = ? AND symbol IN ({placeholders})
+                  AND back_adjust_factor IS NOT NULL
                 """,
                 [trade_date.isoformat(), *unique],
             ).fetchall()
@@ -177,6 +209,8 @@ class AdjustmentFactorCache:
         trade_date: date,
         fields: Sequence[str],
         rows: Sequence[Sequence[str]],
+        *,
+        allow_empty_history: bool = False,
     ) -> float | None:
         """Persist one completed per-symbol query immediately for resume."""
         symbol = symbol.lower()
@@ -190,7 +224,43 @@ class AdjustmentFactorCache:
             if item[0] == symbol
         ]
         if not parsed:
-            return None
+            if not allow_empty_history:
+                return None
+            now = datetime.now(UTC).isoformat()
+            response_hash = hashlib.sha256(
+                (
+                    "\x1f".join(fields)
+                    + "\x1e"
+                    + symbol
+                    + "\x1e"
+                    + trade_date.isoformat()
+                    + "\x1eEMPTY"
+                ).encode()
+            ).hexdigest()
+            connection = self._connect()
+            try:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO factor_snapshots (
+                            symbol, trade_date, fore_adjust_factor,
+                            back_adjust_factor, evidence_kind,
+                            evidence_effective_date, evidence_observed_on,
+                            source_row_hash, observed_at
+                        ) VALUES (?, ?, 1, 1, 'bootstrap_no_events', ?, ?, ?, ?)
+                        """,
+                        (
+                            symbol,
+                            trade_date.isoformat(),
+                            trade_date.isoformat(),
+                            trade_date.isoformat(),
+                            response_hash,
+                            now,
+                        ),
+                    )
+            finally:
+                self._close(connection)
+            return 1.0
         latest = max(parsed, key=lambda item: item[1])
         now = datetime.now(UTC).isoformat()
         connection = self._connect()
@@ -200,42 +270,51 @@ class AdjustmentFactorCache:
                     """
                     INSERT OR REPLACE INTO factor_events (
                         symbol, effective_date, observed_on, fore_adjust_factor,
-                        source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        back_adjust_factor, source_row_hash, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             item_symbol,
                             effective.isoformat(),
                             trade_date.isoformat(),
-                            factor,
+                            fore_factor,
+                            back_factor,
                             row_hash,
                             now,
                         )
-                        for item_symbol, effective, factor, row_hash in parsed
+                        for (
+                            item_symbol,
+                            effective,
+                            fore_factor,
+                            back_factor,
+                            row_hash,
+                        ) in parsed
                     ],
                 )
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO factor_snapshots (
                         symbol, trade_date, fore_adjust_factor, evidence_kind,
+                        back_adjust_factor,
                         evidence_effective_date, evidence_observed_on,
                         source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, 'bootstrap', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'bootstrap', ?, ?, ?, ?, ?)
                     """,
                     (
                         symbol,
                         trade_date.isoformat(),
                         latest[2],
+                        latest[3],
                         latest[1].isoformat(),
                         trade_date.isoformat(),
-                        latest[3],
+                        latest[4],
                         now,
                     ),
                 )
         finally:
             self._close(connection)
-        return latest[2]
+        return latest[3]
 
     def stream_through(self) -> date | None:
         connection = self._connect()
@@ -261,7 +340,7 @@ class AdjustmentFactorCache:
     ) -> None:
         """Atomically record a complete daily event response and its watermark."""
         parsed = self._parse_factor_rows(fields, rows, through_date=trade_date)
-        if any(effective != trade_date for _, effective, _, _ in parsed):
+        if any(effective != trade_date for _, effective, _, _, _ in parsed):
             raise FactorCacheError("daily factor response contains another effective date")
         now = datetime.now(UTC).isoformat()
         connection = self._connect()
@@ -271,40 +350,43 @@ class AdjustmentFactorCache:
                     """
                     INSERT OR REPLACE INTO factor_events (
                         symbol, effective_date, observed_on, fore_adjust_factor,
-                        source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        back_adjust_factor, source_row_hash, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             symbol,
                             effective.isoformat(),
                             trade_date.isoformat(),
-                            factor,
+                            fore_factor,
+                            back_factor,
                             row_hash,
                             now,
                         )
-                        for symbol, effective, factor, row_hash in parsed
+                        for symbol, effective, fore_factor, back_factor, row_hash in parsed
                     ],
                 )
                 connection.executemany(
                     """
                     INSERT OR REPLACE INTO factor_snapshots (
                         symbol, trade_date, fore_adjust_factor, evidence_kind,
+                        back_adjust_factor,
                         evidence_effective_date, evidence_observed_on,
                         source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, 'daily_event', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'daily_event', ?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             symbol,
                             trade_date.isoformat(),
-                            factor,
+                            fore_factor,
+                            back_factor,
                             effective.isoformat(),
                             trade_date.isoformat(),
                             row_hash,
                             now,
                         )
-                        for symbol, effective, factor, row_hash in parsed
+                        for symbol, effective, fore_factor, back_factor, row_hash in parsed
                     ],
                 )
                 connection.execute(
@@ -376,9 +458,10 @@ class AdjustmentFactorCache:
                 for symbol in unique:
                     exact = connection.execute(
                         """
-                        SELECT fore_adjust_factor
+                        SELECT back_adjust_factor
                         FROM factor_snapshots
                         WHERE symbol = ? AND trade_date = ?
+                          AND back_adjust_factor IS NOT NULL
                         """,
                         (symbol, trade_date.isoformat()),
                     ).fetchone()
@@ -387,11 +470,12 @@ class AdjustmentFactorCache:
                         continue
                     baseline = connection.execute(
                         """
-                        SELECT trade_date, fore_adjust_factor,
+                        SELECT trade_date, fore_adjust_factor, back_adjust_factor,
                                evidence_effective_date, evidence_observed_on,
                                source_row_hash
                         FROM factor_snapshots
                         WHERE symbol = ? AND trade_date < ?
+                          AND back_adjust_factor IS NOT NULL
                         ORDER BY trade_date DESC
                         LIMIT 1
                         """,
@@ -404,13 +488,14 @@ class AdjustmentFactorCache:
                         continue
                     event = connection.execute(
                         """
-                        SELECT effective_date, fore_adjust_factor,
+                        SELECT effective_date, fore_adjust_factor, back_adjust_factor,
                                observed_on, source_row_hash
                         FROM factor_events
                         WHERE symbol = ?
                           AND effective_date > ?
                           AND effective_date <= ?
                           AND observed_on <= ?
+                          AND back_adjust_factor IS NOT NULL
                         ORDER BY effective_date DESC, observed_on DESC
                         LIMIT 1
                         """,
@@ -422,37 +507,41 @@ class AdjustmentFactorCache:
                         ),
                     ).fetchone()
                     if event is None:
-                        factor = float(baseline[1])
-                        effective = str(baseline[2])
-                        observed_on = str(baseline[3])
-                        row_hash = str(baseline[4])
+                        fore_factor = float(baseline[1])
+                        back_factor = float(baseline[2])
+                        effective = str(baseline[3])
+                        observed_on = str(baseline[4])
+                        row_hash = str(baseline[5])
                         kind = "daily_carry"
                     else:
                         effective = str(event[0])
-                        factor = float(event[1])
-                        observed_on = str(event[2])
-                        row_hash = str(event[3])
+                        fore_factor = float(event[1])
+                        back_factor = float(event[2])
+                        observed_on = str(event[3])
+                        row_hash = str(event[4])
                         kind = "daily_event"
                     connection.execute(
                         """
                         INSERT INTO factor_snapshots (
                             symbol, trade_date, fore_adjust_factor, evidence_kind,
+                            back_adjust_factor,
                             evidence_effective_date, evidence_observed_on,
                             source_row_hash, observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             symbol,
                             trade_date.isoformat(),
-                            factor,
+                            fore_factor,
                             kind,
+                            back_factor,
                             effective,
                             observed_on,
                             row_hash,
                             now,
                         ),
                     )
-                    resolved[symbol] = factor
+                    resolved[symbol] = back_factor
             return resolved
         finally:
             self._close(connection)
@@ -468,7 +557,7 @@ class AdjustmentFactorCache:
                 symbol,
                 trade_date.isoformat(),
                 format(factor, ".17g"),
-                "",
+                format(factor, ".17g"),
                 "",
             ]
             for symbol, factor in sorted(snapshots.items())

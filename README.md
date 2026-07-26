@@ -1,13 +1,16 @@
 # Stock EVA
 
-Stock EVA 正在从 A 股量化学习仪表盘渐进演进为轻量的收盘后研究工作台。
-第一版面向上交所、深交所 A 股主板，规划市场复盘、可组合策略选股、
-手动持仓、自选和收盘后预警。
+Stock EVA 是面向上交所、深交所 A 股主板的轻量收盘后研究工作台，覆盖市场复盘、
+手动持仓与自选、可组合策略选股、全市场规则扫描和收盘后预警。现有 `dashboard/`
+学习页面保持独立。当前版本不连接券商，不包含实时行情、外部通知、自动交易、盘中
+实时扫描或投资建议。
 
-阶段 4 已在本地持仓与行情底座上增加独立的收盘复盘工作台，以及基于自选和不可变
-策略版本的收盘后预警状态机；严格 JSON 策略 DSL 和确定性信号回放均通过现有 API
-接入。现有 `dashboard/` 学习页面保持独立。当前版本不连接券商，不包含实时行情、
-外部通知、自动交易、盘中实时扫描或投资建议。
+五阶段代码链路均已建立。BaoStock 全市场单日已通过真实完整性门槛并发布到 NAS；
+260 个交易日的全主板历史回填正在执行，最终完成数以回填 manifest 为准。市场行情
+真值是 NAS 上由 manifest 明确引用的不可变 Parquet 分区；本机 DuckDB 只保存刷新、
+调度和 published pointer 等控制状态，本机 SQLite 保存用户私有数据。阶段 3/4 的
+真实 E2E 验收工具已实现，待历史窗口达到 21 个有效交易日后执行。详细状态见
+[五阶段交付与验收状态](docs/five-stage-status.md)。
 
 ## 工程快速开始
 
@@ -70,7 +73,7 @@ uv run python -m backend.app.cli refresh \
   --all-main-board \
   --execute-all-main-board
 
-# 将本地已有的一个交易日导出为独立 Parquet 分区
+# 从当前已发布数据集导出一个交易日，不修改 NAS manifest
 uv run python -m backend.app.cli export --date 2026-07-23
 ```
 
@@ -99,6 +102,22 @@ uv run python -m backend.app.cli backfill \
 uv run python -m backend.app.cli refresh-runs
 ```
 
+NAS 全主板历史回填使用逐交易日不可变分区和 manifest 断点，默认只生成计划：
+
+```bash
+STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
+  uv run python -m backend.app.cli full-market-backfill \
+  --start 2025-07-01 \
+  --end 2026-07-24
+
+# 真实执行还必须显式确认；重复执行跳过 manifest 已完成日期
+STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
+  uv run python -m backend.app.cli full-market-backfill \
+  --start 2025-07-01 \
+  --end 2026-07-24 \
+  --execute-all-main-board-history
+```
+
 交易日和期望完成日由后端统一确定，前端与 API 调用方不能传入
 `expected_date`。内置年度配置以交易所休市公告为权威来源，运行刷新前再用
 BaoStock `query_trade_dates` 机器校验；缺少已确认年度配置的工作日会 fail closed。
@@ -124,8 +143,9 @@ uv run python -m backend.app.cli auto-refresh-once
 ```
 
 增加 `--execute` 后，它只在后端调度判定 due 时执行，并复用同一幂等状态与跨进程
-锁。系统级周期任务必须由受控的自动化平台调用该命令；项目不会自行写入 launchd、
-cron 或其他系统定时配置。
+锁。项目已经提供 5 个用户级 LaunchAgent 模板及安装、状态、卸载脚本，覆盖 API、
+网页、日终刷新、日历同步和私有库备份；资产已通过测试，但在 260 日历史回填完成前
+不正式加载。见 [macOS LaunchAgents](docs/macos-launchagents.md)。
 
 当某个新交易日通过完整性门槛并成功移动 published pointer 后，后端会按固定顺序
 幂等运行已保存策略的全市场主板扫描，再按每条预警规则绑定的自选范围做收盘评估。
@@ -145,6 +165,16 @@ uv run python -m backend.app.cli backup-private-data
 - `GET /api/v1/market/history/dates`
 - `GET /api/v1/market/history/sh.600000?start=2026-07-01&end=2026-07-23&adjustment=qfq`
 
+历史窗口就绪且没有回填/刷新持锁时，可运行真实行情与临时用户数据 E2E 验收：
+
+```bash
+uv run python -m backend.app.acceptance \
+  --nas-root /Volumes/Stock/stock-eva-market
+```
+
+验收只读 NAS；示例持仓、自选、策略和预警全部写入自动销毁的临时 SQLite，正式用户库
+不会被打开。结果统一称为“规则候选”，不构成投资建议。
+
 运行验证：
 
 ```bash
@@ -159,12 +189,14 @@ uv run --extra dev ruff check backend tests
 [阶段 3 策略 DSL](docs/strategy-dsl.md)，工作台交互与状态边界见
 [阶段 4 工作台说明](docs/workspace.md)，收盘后预警状态机见
 [阶段 4 预警说明](docs/alerts.md)，真实数据回填、每日运行和验收边界见
-[第一版真实数据就绪](docs/real-data-readiness.md)，可选 NAS 的本地状态隔离、只读
-preflight、安全降级和未来发布协议见 [NAS 市场数据集准备](docs/nas-storage.md)。
-AKShare 板块分类/资金流的可接受字段、拒绝项和离线契约见
+[第一版真实数据就绪](docs/real-data-readiness.md)，NAS 的本地状态隔离、只读
+preflight、安全降级和不可变发布协议见 [NAS 市场数据集准备](docs/nas-storage.md)。
+AKShare 独立补充数据集已初始化；真实 canary 因上游当前不可用而保持空 manifest，
+不会伪造或回退数据。字段、拒绝项和离线契约见
 [AKShare 补充数据审查](docs/akshare-supplemental.md)。新交易日成功发布后的全市场
 策略、预警闭环和本地私有库备份见
-[阶段 5 收盘后自动闭环](docs/after-close-automation.md)。
+[阶段 5 收盘后自动闭环](docs/after-close-automation.md)，真实临时用户验收见
+[E2E 验收](docs/acceptance-e2e.md)。
 
 ---
 
