@@ -130,16 +130,16 @@ class CalendarSyncPolicy:
                 reason="monthly_reconciliation",
                 next_sync_at=local,
             )
-        if startup and state.last_startup_slot_date != current:
-            return CalendarSyncDecision(
-                action="light",
-                reason="startup_check",
-                next_sync_at=local,
-            )
         if local.time() >= self.DAILY_AT and state.last_light_slot_date != current:
             return CalendarSyncDecision(
                 action="light",
                 reason="daily_1630_check",
+                next_sync_at=local,
+            )
+        if startup and state.last_startup_slot_date != current:
+            return CalendarSyncDecision(
+                action="light",
+                reason="startup_check",
                 next_sync_at=local,
             )
         return CalendarSyncDecision(

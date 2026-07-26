@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from backend.app.market.akshare_supplemental import (
     AKShareSupplementalProvider,
     SupplementalDataError,
+    SupplementalSourceUnavailableError,
 )
 from backend.app.market.supplemental import (
     IndustryClassificationRecord,
@@ -808,6 +809,13 @@ class SupplementalIngestionService:
                 run,
                 status="error",
                 error_code="SUPPLEMENTAL_SOURCE_INVALID",
+            )
+            raise
+        except SupplementalSourceUnavailableError:
+            self.store.finish(
+                run,
+                status="error",
+                error_code="SUPPLEMENTAL_SOURCE_UNAVAILABLE",
             )
             raise
         except Exception:

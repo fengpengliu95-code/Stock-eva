@@ -12,6 +12,7 @@ from backend.app.market import supplement_cli
 from backend.app.market.akshare_supplemental import (
     AKShareSupplementalProvider,
     SupplementalDataError,
+    SupplementalSourceUnavailableError,
 )
 from backend.app.market.supplement_ingestion import (
     SupplementalDatasetInitializer,
@@ -256,6 +257,38 @@ class MissingDateClient(FakeAKShareClient):
     def stock_market_fund_flow(self):
         self.calls.append("stock_market_fund_flow")
         return [{"日期": None, "主力净流入-净额": 1}]
+
+
+class UnavailableClient(FakeAKShareClient):
+    def stock_market_fund_flow(self):
+        self.calls.append("stock_market_fund_flow")
+        raise ConnectionError("upstream detail must not enter audit")
+
+
+def test_provider_failure_keeps_manifest_and_uses_safe_unavailable_code(
+    tmp_path: Path,
+) -> None:
+    store = initialized_store(tmp_path)
+    service = SupplementalIngestionService(
+        store,
+        provider(UnavailableClient()),
+    )
+    market_only = request().model_copy(
+        update={
+            "include_classification": False,
+            "sector_names": [],
+        }
+    )
+    before = (store.root / "manifest.json").read_bytes()
+
+    with pytest.raises(SupplementalSourceUnavailableError):
+        service.execute(market_only)
+
+    assert (store.root / "manifest.json").read_bytes() == before
+    latest = store.list_runs(limit=1)[0]
+    assert latest.status == "error"
+    assert latest.error_code == "SUPPLEMENTAL_SOURCE_UNAVAILABLE"
+    assert "upstream detail" not in latest.model_dump_json()
 
 
 def test_failed_batch_keeps_previous_manifest_and_records_safe_error(

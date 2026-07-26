@@ -10,6 +10,7 @@ from backend.app.config import Settings
 from backend.app.market.akshare_supplemental import (
     AKShareSupplementalProvider,
     SupplementalDataError,
+    SupplementalSourceUnavailableError,
 )
 from backend.app.market.supplement_ingestion import (
     SupplementalDatasetError,
@@ -182,6 +183,13 @@ def run(argv: list[str] | None = None, *, settings: Settings | None = None) -> i
     try:
         service = _service(active_settings)
         result = service.execute(request)
+    except SupplementalSourceUnavailableError:
+        payload = {
+            "status": "error",
+            "error_code": "SUPPLEMENTAL_SOURCE_UNAVAILABLE",
+        }
+        print(json.dumps(payload, separators=(",", ":")))
+        return 5
     except SupplementalDataError:
         payload = {"status": "error", "error_code": "SUPPLEMENTAL_SOURCE_INVALID"}
         print(json.dumps(payload, separators=(",", ":")))

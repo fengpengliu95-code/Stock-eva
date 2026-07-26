@@ -18,6 +18,10 @@ class SupplementalDataError(ValueError):
     pass
 
 
+class SupplementalSourceUnavailableError(RuntimeError):
+    pass
+
+
 class AKShareSupplementalProvider:
     """Optional normalizer. Construction and API GETs never perform network calls."""
 
@@ -47,7 +51,8 @@ class AKShareSupplementalProvider:
     ) -> list[IndustryClassificationRecord]:
         observed_at = self._clock()
         records = []
-        for row in _rows(self.client.stock_industry_clf_hist_sw()):
+        table = self._source_call(self.client.stock_industry_clf_hist_sw)
+        for row in _rows(table):
             effective_from = _explicit_date(row.get("start_date"))
             updated_on = _explicit_date(row.get("update_time"))
             if effective_from > through_date or updated_on > through_date:
@@ -82,7 +87,7 @@ class AKShareSupplementalProvider:
         through_date: date,
     ) -> list[ReportedFundFlowPoint]:
         return self._fund_flow_records(
-            self.client.stock_market_fund_flow(),
+            self._source_call(self.client.stock_market_fund_flow),
             scope="market",
             scope_name="沪深市场",
             through_date=through_date,
@@ -99,12 +104,27 @@ class AKShareSupplementalProvider:
         if not normalized_name:
             raise SupplementalDataError("sector name is required")
         return self._fund_flow_records(
-            self.client.stock_sector_fund_flow_hist(symbol=normalized_name),
+            self._source_call(
+                lambda: self.client.stock_sector_fund_flow_hist(
+                    symbol=normalized_name
+                )
+            ),
             scope="industry",
             scope_name=normalized_name,
             through_date=through_date,
             source_endpoint=_SECTOR_FLOW_ENDPOINT,
         )
+
+    @staticmethod
+    def _source_call(call):
+        try:
+            return call()
+        except SupplementalDataError:
+            raise
+        except Exception as exc:
+            raise SupplementalSourceUnavailableError(
+                "supplemental source request unavailable"
+            ) from exc
 
     def _fund_flow_records(
         self,
