@@ -16,6 +16,14 @@ def _number(value: str) -> float | None:
     return None if value == "" else float(value)
 
 
+def _required_activity_number(value: str, *, suspended: bool, field: str) -> float:
+    if value != "":
+        return float(value)
+    if suspended:
+        return 0.0
+    raise ValueError(f"BaoStock active daily bar has empty {field}")
+
+
 def _factor_lookup(
     fields: Sequence[str],
     rows: Sequence[Sequence[str]],
@@ -82,8 +90,16 @@ def normalize_baostock_rows(
                 low=float(record["low"]),
                 close=float(record["close"]),
                 preclose=float(record["preclose"]),
-                volume=float(record["volume"]),
-                amount=float(record["amount"]),
+                volume=_required_activity_number(
+                    record["volume"],
+                    suspended=suspended,
+                    field="volume",
+                ),
+                amount=_required_activity_number(
+                    record["amount"],
+                    suspended=suspended,
+                    field="amount",
+                ),
                 turnover_rate=_number(record["turn"]),
                 pct_change=_number(record["pctChg"]),
                 adjust_factor=factor,

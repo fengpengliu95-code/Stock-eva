@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 
 from backend.app.api.market import get_market_store
 from backend.app.main import app
@@ -47,6 +48,44 @@ def test_baostock_normalization_preserves_raw_prices_and_marks_suspension() -> N
     assert suspended.is_trading is False
     assert suspended.quality_status == "partial"
     assert "suspended_placeholder" in suspended.quality_issues
+
+
+def test_baostock_suspended_placeholder_accepts_blank_activity_fields() -> None:
+    payload = fixture_payload()
+    fields = payload["daily_fields"]
+    row = list(payload["daily_rows"][1])
+    row[fields.index("volume")] = ""
+    row[fields.index("amount")] = ""
+    row[fields.index("turn")] = ""
+    row[fields.index("pctChg")] = ""
+
+    result = normalize_baostock_rows(
+        fields=fields,
+        rows=[row],
+        factor_fields=payload["factor_fields"],
+        factor_rows=payload["factor_rows"],
+    )
+
+    assert result[0].is_suspended is True
+    assert result[0].volume == 0
+    assert result[0].amount == 0
+    assert result[0].turnover_rate is None
+    assert result[0].pct_change is None
+
+
+def test_baostock_active_bar_rejects_blank_activity_fields() -> None:
+    payload = fixture_payload()
+    fields = payload["daily_fields"]
+    row = list(payload["daily_rows"][0])
+    row[fields.index("volume")] = ""
+
+    with pytest.raises(ValueError, match="active daily bar has empty volume"):
+        normalize_baostock_rows(
+            fields=fields,
+            rows=[row],
+            factor_fields=payload["factor_fields"],
+            factor_rows=payload["factor_rows"],
+        )
 
 
 def test_duckdb_upsert_is_idempotent(tmp_path: Path) -> None:

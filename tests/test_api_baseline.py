@@ -1,7 +1,11 @@
 import asyncio
 import importlib.util
+from pathlib import Path
 
 import httpx
+
+from backend.app.api.market import get_market_store
+from backend.app.market.store import MarketStore
 
 
 def api_app():
@@ -37,8 +41,15 @@ def test_health_reports_service_identity() -> None:
     }
 
 
-def test_market_summary_is_safe_before_data_is_loaded() -> None:
-    response = request("GET", "/api/v1/market/summary")
+def test_market_summary_is_safe_before_data_is_loaded(tmp_path: Path) -> None:
+    app = api_app()
+    app.dependency_overrides[get_market_store] = lambda: MarketStore(
+        tmp_path / "empty-market.duckdb"
+    )
+    try:
+        response = request("GET", "/api/v1/market/summary")
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert response.json() == {
@@ -104,7 +115,5 @@ def test_development_frontend_can_preflight_local_crud() -> None:
         )
 
         assert response.status_code == 200
-        assert response.headers["access-control-allow-origin"] == (
-            "http://127.0.0.1:8080"
-        )
+        assert response.headers["access-control-allow-origin"] == ("http://127.0.0.1:8080")
         assert method in response.headers["access-control-allow-methods"]
