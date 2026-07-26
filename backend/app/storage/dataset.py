@@ -12,7 +12,7 @@ import os
 import re
 import shutil
 from collections import defaultdict
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -324,6 +324,51 @@ class NasMarketStore:
             [source],
         )
         return [row[0] for row in rows]
+
+    def manifest_dates(self, source: str = "baostock") -> list[date]:
+        """Read immutable resume checkpoints without scanning every Parquet file."""
+        return sorted(
+            date.fromisoformat(item["trade_date"])
+            for item in self._manifest()["files"]
+            if item["source"] == source
+        )
+
+    def reconcile_control_pointer(self, source: str = "baostock") -> RefreshResult | None:
+        """Repair a local pointer after a manifest-first publication crash."""
+        manifest = self._manifest()
+        entries = [item for item in manifest["files"] if item["source"] == source]
+        if not entries:
+            return None
+        latest = max(entries, key=lambda item: item["trade_date"])
+        trade_date = date.fromisoformat(latest["trade_date"])
+        current = self.control.published_refresh()
+        if current is not None and current.requested_date >= trade_date:
+            return current
+
+        # Trust only the immutable object that the manifest points to. A local
+        # pointer must never be reconstructed from metadata alone.
+        path = self.root / _safe_relative(latest["path"])
+        if not path.is_file() or _sha256(path) != latest["sha256"]:
+            raise DatasetError("published parquet checksum mismatch during reconciliation")
+        self._validate_parquet(path, latest["row_count"])
+
+        request_key = f"nas-manifest-reconcile:{source}:{trade_date.isoformat()}:{latest['sha256']}"
+        now = datetime.now(UTC)
+        result = RefreshResult(
+            run_id=hashlib.sha256(request_key.encode()).hexdigest()[:24],
+            request_key=request_key,
+            run_kind="backfill",
+            requested_date=trade_date,
+            source=source,
+            status="ready",
+            requested_count=latest["row_count"],
+            succeeded_count=latest["row_count"],
+            coverage_ratio=1,
+            started_at=now,
+            completed_at=now,
+        )
+        self.control.save_refresh([], result, publish=True)
+        return result
 
     def canonical_bars(self, trade_date, source: str = "baostock") -> list[DailyBar]:
         rows, _ = self._query(

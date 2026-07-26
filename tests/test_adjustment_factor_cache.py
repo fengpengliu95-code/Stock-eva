@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import date
 from pathlib import Path
 
@@ -213,6 +214,82 @@ def test_forward_gap_queries_each_missing_trading_session_before_carry(
     assert client.daily_factor_calls == [middle_date, target]
     assert client.adjust_calls == []
     assert stock_factors(batch) == {"sh.600000": 1.2, "sz.000001": 1.1}
+    assert AdjustmentFactorCache(cache).stream_through() == target
+
+
+def test_historical_backfill_bootstraps_once_then_uses_point_in_time_daily_events(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "factors.sqlite3"
+    cache = AdjustmentFactorCache(cache_path)
+    observed_on = date(2026, 7, 24)
+    cache.record_bootstrap(
+        "sh.600000",
+        observed_on,
+        FACTOR_FIELDS,
+        [
+            ["sh.600000", "2020-01-01", "99.0", "1", "1"],
+        ],
+    )
+    cache.record_bootstrap(
+        "sz.000001",
+        observed_on,
+        FACTOR_FIELDS,
+        [["sz.000001", "2020-01-01", "99.0", "1", "1"]],
+    )
+    cache.record_daily_events(observed_on, FACTOR_FIELDS, [], advance_stream=True)
+    first = date(2025, 7, 1)
+    second = date(2025, 7, 2)
+    client = FactorClient(
+        second,
+        bootstrap_factors={"sh.600000": 1.0, "sz.000001": 1.1},
+        daily_events={second: {"sh.600000": 1.2}},
+        trading_dates=[first, second],
+    )
+    historical_provider = provider(client, cache_path)
+
+    first_batch = historical_provider.fetch(first)
+    second_batch = historical_provider.fetch(second)
+
+    assert stock_factors(first_batch) == {"sh.600000": 1.0, "sz.000001": 1.1}
+    assert stock_factors(second_batch) == {"sh.600000": 1.2, "sz.000001": 1.1}
+    assert client.daily_factor_calls == [first, second]
+    assert client.adjust_calls == [
+        ("sh.600000", first.isoformat()),
+        ("sz.000001", first.isoformat()),
+    ]
+    with sqlite3.connect(cache_path) as connection:
+        evidence = connection.execute(
+            """
+            SELECT evidence_kind, evidence_effective_date, evidence_observed_on
+            FROM factor_snapshots
+            WHERE symbol = 'sh.600000' AND trade_date = ?
+            """,
+            (second.isoformat(),),
+        ).fetchone()
+    assert evidence == ("daily_event", second.isoformat(), second.isoformat())
+
+
+def test_historical_carry_requires_a_complete_daily_event_observation(
+    tmp_path: Path,
+) -> None:
+    cache = AdjustmentFactorCache(tmp_path / "factors.sqlite3")
+    first = date(2025, 7, 1)
+    second = date(2025, 7, 2)
+    stream_start = date(2026, 7, 24)
+    cache.record_bootstrap(
+        "sh.600000",
+        first,
+        FACTOR_FIELDS,
+        [["sh.600000", "2020-01-01", "1.0", "1", "1"]],
+    )
+    cache.record_daily_events(stream_start, FACTOR_FIELDS, [], advance_stream=True)
+
+    assert cache.materialize_from_stream(["sh.600000"], second) == {}
+
+    cache.record_daily_events(second, FACTOR_FIELDS, [], advance_stream=False)
+
+    assert cache.materialize_from_stream(["sh.600000"], second) == {"sh.600000": 1.0}
 
 
 def test_newer_cache_is_never_reused_for_an_older_target(tmp_path: Path) -> None:

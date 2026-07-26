@@ -111,10 +111,7 @@ class SchedulePolicy:
 
     def next_retry_after(self, session: date, after: datetime) -> datetime | None:
         local = after.astimezone(SHANGHAI)
-        slots = [
-            datetime.combine(session, item, tzinfo=SHANGHAI)
-            for item in self.RETRY_TIMES
-        ]
+        slots = [datetime.combine(session, item, tzinfo=SHANGHAI) for item in self.RETRY_TIMES]
         slots.append(
             datetime.combine(
                 session + timedelta(days=1),
@@ -187,25 +184,18 @@ def _publication_issues(batch, required_symbols: set[str]) -> list[str]:
         for symbol in sorted((expected - loaded) | set(batch.failed_symbols))
     ]
     issues.extend(
-        f"required_index_missing:{symbol}"
-        for symbol in INDEX_SYMBOLS
-        if symbol not in loaded
+        f"required_index_missing:{symbol}" for symbol in INDEX_SYMBOLS if symbol not in loaded
     )
     issues.extend(
-        f"required_symbol_missing:{symbol}"
-        for symbol in sorted(required_symbols - loaded)
+        f"required_symbol_missing:{symbol}" for symbol in sorted(required_symbols - loaded)
     )
     issues.extend(
         f"missing_adjust_factor:{bar.symbol}"
         for bar in batch.bars
-        if bar.security_type == "stock"
-        and not bar.is_suspended
-        and bar.adjust_factor is None
+        if bar.security_type == "stock" and not bar.is_suspended and bar.adjust_factor is None
     )
     issues.extend(
-        f"quality_error:{bar.symbol}"
-        for bar in batch.bars
-        if bar.quality_status == "error"
+        f"quality_error:{bar.symbol}" for bar in batch.bars if bar.quality_status == "error"
     )
     return list(dict.fromkeys(issues))
 
@@ -216,12 +206,15 @@ def run_publication_refresh(
     *,
     trade_date: date,
     required_symbols: set[str],
+    request_key: str | None = None,
+    run_id: str | None = None,
+    run_kind: Literal["daily", "backfill"] = "daily",
 ) -> RefreshResult:
     """Fetch to canonical staging, validate all gates, then move the pointer."""
     started_at = datetime.now(UTC)
-    request_key = f"daily:baostock:{trade_date.isoformat()}:all-main-board"
+    request_key = request_key or (f"daily:baostock:{trade_date.isoformat()}:all-main-board")
     request_prefix = hashlib.sha256(request_key.encode()).hexdigest()[:12]
-    run_id = f"{request_prefix}-{uuid.uuid4().hex[:12]}"
+    run_id = run_id or f"{request_prefix}-{uuid.uuid4().hex[:12]}"
     _log_event(
         logging.INFO,
         "market_publication_started",
@@ -243,6 +236,7 @@ def run_publication_refresh(
         result = RefreshResult(
             run_id=run_id,
             request_key=request_key,
+            run_kind=run_kind,
             requested_date=trade_date,
             source="baostock",
             status=status,
@@ -275,6 +269,7 @@ def run_publication_refresh(
         result = RefreshResult(
             run_id=run_id,
             request_key=request_key,
+            run_kind=run_kind,
             requested_date=trade_date,
             source="baostock",
             status="error",
@@ -305,12 +300,14 @@ class MarketAutomationService:
         *,
         required_symbols: Callable[[], set[str]],
         lock_path: Path | None = None,
+        post_publish=None,
     ) -> None:
         self.store = store
         self.provider = provider
         self.calendar = calendar
         self.required_symbols = required_symbols
         self.lock_path = lock_path
+        self.post_publish = post_publish
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -338,23 +335,21 @@ class MarketAutomationService:
             )
             if decision.action == "wait" and current is None:
                 self.store.save_scheduler_state(state)
+            if (
+                decision.refresh_state == "success"
+                and published is not None
+                and published.status == "ready"
+            ):
+                self._run_post_publish(published)
             return AutomationOutcome(decision=decision, state=state)
 
-        lease = (
-            RefreshRunLock(self.lock_path)
-            if self.lock_path is not None
-            else nullcontext()
-        )
+        lease = RefreshRunLock(self.lock_path) if self.lock_path is not None else nullcontext()
         try:
             with lease:
                 return self._execute_due(decision, current, local)
         except RefreshAlreadyRunning:
             target = decision.target_session
-            next_retry = (
-                self.policy.next_retry_after(target, local)
-                if target is not None
-                else None
-            )
+            next_retry = self.policy.next_retry_after(target, local) if target is not None else None
             state = SchedulerState(
                 target_session=target,
                 refresh_state="retry_wait" if next_retry else "delayed",
@@ -442,19 +437,32 @@ class MarketAutomationService:
                     "error_code": None,
                 }
             )
+            self._run_post_publish(result)
         else:
             state = self._failed_state(
                 running,
                 local,
                 error_code=(
-                    "publication_incomplete"
-                    if result.status == "partial"
-                    else "provider_error"
+                    "publication_incomplete" if result.status == "partial" else "provider_error"
                 ),
                 calendar_status="confirmed",
             )
         self.store.save_scheduler_state(state)
         return AutomationOutcome(decision=decision, state=state, result=result)
+
+    def _run_post_publish(self, result: RefreshResult) -> None:
+        if self.post_publish is None:
+            return
+        try:
+            self.post_publish.run_after_publication(result)
+        except Exception:
+            _log_event(
+                logging.ERROR,
+                "after_close_pipeline_failed",
+                publication_run_id=result.run_id,
+                trade_date=result.requested_date,
+                error_code="after_close_pipeline_failed",
+            )
 
     def _failed_state(
         self,
@@ -478,10 +486,7 @@ class MarketAutomationService:
 def collect_required_symbols(user_store) -> set[str]:
     symbols = {item.symbol for item in user_store.list_positions()}
     for watchlist in user_store.list_watchlists():
-        symbols.update(
-            item.symbol
-            for item in user_store.list_watchlist_items(watchlist.id)
-        )
+        symbols.update(item.symbol for item in user_store.list_watchlist_items(watchlist.id))
     return symbols
 
 

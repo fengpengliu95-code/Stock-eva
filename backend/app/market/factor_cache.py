@@ -18,8 +18,9 @@ class AdjustmentFactorCache:
 
     Bootstrap snapshots are keyed by their target date.  Consequently a cache
     populated for a newer date is never reused for an older refresh.  Once a
-    baseline exists, BaoStock's daily corporate-action feed can advance it
-    without repeating one request per security.
+    baseline exists, a complete BaoStock daily corporate-action observation can
+    advance it without repeating one request per security. Historical dates
+    outside the forward stream require their own completed daily observation.
     """
 
     FACTOR_FIELDS = (
@@ -61,6 +62,7 @@ class AdjustmentFactorCache:
                     fore_adjust_factor REAL NOT NULL,
                     evidence_kind TEXT NOT NULL,
                     evidence_effective_date TEXT NOT NULL,
+                    evidence_observed_on TEXT,
                     source_row_hash TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, trade_date)
@@ -80,6 +82,36 @@ class AdjustmentFactorCache:
                     through_date TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS daily_event_observations (
+                    trade_date TEXT PRIMARY KEY,
+                    observed_at TEXT NOT NULL
+                );
+                """
+            )
+            snapshot_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(factor_snapshots)").fetchall()
+            }
+            if "evidence_observed_on" not in snapshot_columns:
+                connection.execute(
+                    "ALTER TABLE factor_snapshots ADD COLUMN evidence_observed_on TEXT"
+                )
+            connection.execute(
+                """
+                UPDATE factor_snapshots AS snapshots
+                SET evidence_observed_on = COALESCE(
+                    (
+                        SELECT MAX(events.observed_on)
+                        FROM factor_events AS events
+                        WHERE events.symbol = snapshots.symbol
+                          AND events.effective_date =
+                              snapshots.evidence_effective_date
+                          AND events.source_row_hash =
+                              snapshots.source_row_hash
+                    ),
+                    snapshots.trade_date
+                )
+                WHERE evidence_observed_on IS NULL
                 """
             )
             connection.commit()
@@ -187,14 +219,16 @@ class AdjustmentFactorCache:
                     """
                     INSERT OR REPLACE INTO factor_snapshots (
                         symbol, trade_date, fore_adjust_factor, evidence_kind,
-                        evidence_effective_date, source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, 'bootstrap', ?, ?, ?)
+                        evidence_effective_date, evidence_observed_on,
+                        source_row_hash, observed_at
+                    ) VALUES (?, ?, ?, 'bootstrap', ?, ?, ?, ?)
                     """,
                     (
                         symbol,
                         trade_date.isoformat(),
                         latest[2],
                         latest[1].isoformat(),
+                        trade_date.isoformat(),
                         latest[3],
                         now,
                     ),
@@ -256,8 +290,9 @@ class AdjustmentFactorCache:
                     """
                     INSERT OR REPLACE INTO factor_snapshots (
                         symbol, trade_date, fore_adjust_factor, evidence_kind,
-                        evidence_effective_date, source_row_hash, observed_at
-                    ) VALUES (?, ?, ?, 'daily_event', ?, ?, ?)
+                        evidence_effective_date, evidence_observed_on,
+                        source_row_hash, observed_at
+                    ) VALUES (?, ?, ?, 'daily_event', ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -265,11 +300,20 @@ class AdjustmentFactorCache:
                             trade_date.isoformat(),
                             factor,
                             effective.isoformat(),
+                            trade_date.isoformat(),
                             row_hash,
                             now,
                         )
                         for symbol, effective, factor, row_hash in parsed
                     ],
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO daily_event_observations (
+                        trade_date, observed_at
+                    ) VALUES (?, ?)
+                    """,
+                    (trade_date.isoformat(), now),
                 )
                 if advance_stream:
                     current = connection.execute(
@@ -299,7 +343,7 @@ class AdjustmentFactorCache:
         symbols: Sequence[str],
         trade_date: date,
     ) -> dict[str, float]:
-        """Carry prior snapshots through an unbroken, cached daily event stream."""
+        """Materialize from a prior baseline plus point-in-time event evidence."""
         unique = list(dict.fromkeys(symbol.lower() for symbol in symbols))
         if not unique:
             return {}
@@ -312,11 +356,19 @@ class AdjustmentFactorCache:
                 WHERE source = 'baostock'
                 """
             ).fetchone()
-            if state is None:
-                return {}
-            stream_start = date.fromisoformat(state[0])
-            stream_through = date.fromisoformat(state[1])
-            if not stream_start <= trade_date <= stream_through:
+            in_stream = False
+            if state is not None:
+                stream_start = date.fromisoformat(state[0])
+                stream_through = date.fromisoformat(state[1])
+                in_stream = stream_start <= trade_date <= stream_through
+            observed = connection.execute(
+                """
+                SELECT 1 FROM daily_event_observations
+                WHERE trade_date = ?
+                """,
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if not in_stream and observed is None:
                 return {}
             now = datetime.now(UTC).isoformat()
             resolved: dict[str, float] = {}
@@ -336,23 +388,24 @@ class AdjustmentFactorCache:
                     baseline = connection.execute(
                         """
                         SELECT trade_date, fore_adjust_factor,
-                               evidence_effective_date, source_row_hash
+                               evidence_effective_date, evidence_observed_on,
+                               source_row_hash
                         FROM factor_snapshots
-                        WHERE symbol = ? AND trade_date < ? AND trade_date >= ?
+                        WHERE symbol = ? AND trade_date < ?
                         ORDER BY trade_date DESC
                         LIMIT 1
                         """,
                         (
                             symbol,
                             trade_date.isoformat(),
-                            stream_start.isoformat(),
                         ),
                     ).fetchone()
                     if baseline is None:
                         continue
                     event = connection.execute(
                         """
-                        SELECT effective_date, fore_adjust_factor, source_row_hash
+                        SELECT effective_date, fore_adjust_factor,
+                               observed_on, source_row_hash
                         FROM factor_events
                         WHERE symbol = ?
                           AND effective_date > ?
@@ -371,19 +424,22 @@ class AdjustmentFactorCache:
                     if event is None:
                         factor = float(baseline[1])
                         effective = str(baseline[2])
-                        row_hash = str(baseline[3])
+                        observed_on = str(baseline[3])
+                        row_hash = str(baseline[4])
                         kind = "daily_carry"
                     else:
                         effective = str(event[0])
                         factor = float(event[1])
-                        row_hash = str(event[2])
+                        observed_on = str(event[2])
+                        row_hash = str(event[3])
                         kind = "daily_event"
                     connection.execute(
                         """
                         INSERT INTO factor_snapshots (
                             symbol, trade_date, fore_adjust_factor, evidence_kind,
-                            evidence_effective_date, source_row_hash, observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            evidence_effective_date, evidence_observed_on,
+                            source_row_hash, observed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             symbol,
@@ -391,6 +447,7 @@ class AdjustmentFactorCache:
                             factor,
                             kind,
                             effective,
+                            observed_on,
                             row_hash,
                             now,
                         ),

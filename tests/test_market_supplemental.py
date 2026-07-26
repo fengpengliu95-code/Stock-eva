@@ -104,9 +104,7 @@ def test_classification_history_preserves_source_dates_without_inventing_end_dat
 
 
 def test_market_fund_flow_uses_explicit_dates_and_never_exposes_ohlcv() -> None:
-    records = provider().market_fund_flow_history(
-        through_date=date(2026, 7, 23)
-    )
+    records = provider().market_fund_flow_history(through_date=date(2026, 7, 23))
 
     assert len(records) == 1
     point = records[0]
@@ -140,9 +138,7 @@ class MissingDateClient(FakeAKShareClient):
 
 def test_missing_source_date_is_rejected_instead_of_using_observation_date() -> None:
     with pytest.raises(SupplementalDataError, match="explicit source date"):
-        provider(MissingDateClient()).market_fund_flow_history(
-            through_date=date(2026, 7, 24)
-        )
+        provider(MissingDateClient()).market_fund_flow_history(through_date=date(2026, 7, 24))
 
 
 def api_settings(tmp_path: Path, *, enabled: bool) -> Settings:
@@ -163,7 +159,7 @@ def api_settings(tmp_path: Path, *, enabled: bool) -> Settings:
     ("enabled", "expected_status", "expected_issue"),
     [
         (False, "not_configured", "akshare_supplemental_disabled"),
-        (True, "empty", "supplemental_ingestion_not_implemented"),
+        (True, "empty", "supplemental_not_published"),
     ],
 )
 async def test_supplemental_api_never_fetches_on_get_and_is_explicitly_empty(
@@ -193,9 +189,7 @@ async def test_supplemental_api_never_fetches_on_get_and_is_explicitly_empty(
     assert payload["market_flow"] is None
     assert payload["sector_flows"] == []
     capabilities = {item["name"]: item for item in payload["capabilities"]}
-    assert capabilities["market_fund_flow_history"]["date_semantics"] == (
-        "explicit_trade_date"
-    )
+    assert capabilities["market_fund_flow_history"]["date_semantics"] == ("explicit_trade_date")
     assert capabilities["sector_fund_flow_rank"]["status"] == "rejected"
 
 

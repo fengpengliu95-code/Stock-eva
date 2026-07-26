@@ -2,7 +2,8 @@ import argparse
 import json
 import signal
 from contextlib import contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
+from pathlib import Path
 from time import perf_counter
 
 from backend.app.config import get_settings
@@ -21,9 +22,12 @@ from backend.app.market.backfill import (
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
+from backend.app.market.calendar_sync import CalendarSyncService, CalendarSyncStore
 from backend.app.market.factor_cache import AdjustmentFactorCache
+from backend.app.market.full_history import FullMarketHistoryService
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
+from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.initialize import (
     DatasetInitializationError,
@@ -32,6 +36,7 @@ from backend.app.storage.initialize import (
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight
 from backend.app.strategy.store import StrategyStore
+from backend.app.user.backup import PrivateBackupError, PrivateBackupService
 from backend.app.user.store import UserStore
 
 
@@ -129,6 +134,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="perform network requests; omitted means dry-run",
     )
+    full_history = subparsers.add_parser(
+        "full-market-backfill",
+        help="plan or execute resumable full-main-board history into NAS",
+    )
+    full_history.add_argument("--start", required=True, type=date.fromisoformat)
+    full_history.add_argument("--end", required=True, type=date.fromisoformat)
+    full_history.add_argument("--max-sessions", type=int, default=3000)
+    full_history.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
+    )
+    full_history.add_argument(
+        "--execute-all-main-board-history",
+        action="store_true",
+        help="required confirmation for real full-market historical publication",
+    )
     subparsers.add_parser(
         "refresh-runs",
         help="list auditable daily refresh run records",
@@ -147,6 +169,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=_socket_timeout_value,
         help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
     )
+    calendar_sync = subparsers.add_parser(
+        "calendar-sync",
+        help="plan or execute versioned BaoStock checks of the official calendar",
+    )
+    calendar_sync.add_argument(
+        "--mode",
+        choices=("auto", "full", "light"),
+        default="auto",
+        help="auto follows monthly/startup/daily policy",
+    )
+    calendar_sync.add_argument("--start", type=date.fromisoformat)
+    calendar_sync.add_argument("--end", type=date.fromisoformat)
+    calendar_sync.add_argument(
+        "--startup",
+        action="store_true",
+        help="evaluate the startup light-check slot when mode is auto",
+    )
+    calendar_sync.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform the BaoStock observation and persist audit state",
+    )
+    calendar_sync.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
+    )
     storage_init = subparsers.add_parser(
         "storage-init",
         help="initialize a new empty NAS market dataset",
@@ -158,12 +207,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export = subparsers.add_parser("export", help="export one stored date to Parquet")
     export.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
+    private_backup = subparsers.add_parser(
+        "backup-private-data",
+        help="create a consistent local SQLite snapshot with bounded retention",
+    )
+    private_backup.add_argument(
+        "--backup-root",
+        type=Path,
+        default=(Path.home() / "Library/Application Support/Stock EVA/backups"),
+    )
+    private_backup.add_argument("--keep-daily", type=int, default=7)
+    private_backup.add_argument("--keep-weekly", type=int, default=4)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     settings = get_settings()
+    if args.command == "backup-private-data":
+        try:
+            outcome = PrivateBackupService(
+                settings.user_data_dir / settings.user_database_name,
+                args.backup_root,
+                keep_daily=args.keep_daily,
+                keep_weekly=args.keep_weekly,
+            ).run(datetime.now(UTC))
+        except (PrivateBackupError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "private_backup_failed",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": outcome.status,
+                    "integrity_check": outcome.integrity_check,
+                    "completed_at": outcome.completed_at.isoformat(),
+                    "daily_snapshot": outcome.daily_backup.name,
+                    "weekly_snapshot": outcome.weekly_backup.name,
+                    "writes_market_data": False,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     if args.command == "storage-init":
         if not args.initialize_empty_nas_dataset:
             print(
@@ -208,7 +302,14 @@ def main() -> int:
     if (
         settings.nas_market_dataset_root is not None
         and not readiness.market_data_available
-        and args.command in {"refresh", "backfill", "auto-refresh-once", "export"}
+        and args.command
+        in {
+            "refresh",
+            "backfill",
+            "full-market-backfill",
+            "auto-refresh-once",
+            "export",
+        }
     ):
         print(
             json.dumps(
@@ -226,9 +327,119 @@ def main() -> int:
     layout = StorageLayout(settings)
     layout.ensure_local_runtime_dirs()
     socket_timeout_seconds = (
-        getattr(args, "socket_timeout_seconds", None)
-        or settings.baostock_socket_timeout_seconds
+        getattr(args, "socket_timeout_seconds", None) or settings.baostock_socket_timeout_seconds
     )
+    if args.command == "calendar-sync":
+        if (args.start is None) != (args.end is None):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "message": "--start and --end must be used together",
+                        "writes_calendar_state": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        calendar_store = CalendarSyncStore(
+            layout.local_paths.control / settings.calendar_sync_database_name,
+            initialize=args.execute,
+        )
+        now = get_market_clock()()
+        planning_service = CalendarSyncService(
+            calendar_store,
+            get_trading_calendar(),
+            None,
+        )
+        plan = planning_service.plan(
+            now=now,
+            mode=args.mode,
+            startup=args.startup,
+            start_date=args.start,
+            end_date=args.end,
+        )
+        if not args.execute:
+            decision = planning_service.policy.decide(
+                now,
+                state=calendar_store.state(),
+                startup=args.startup,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "dry-run",
+                        "action": plan.mode if plan is not None else "none",
+                        "plan": (plan.model_dump(mode="json") if plan is not None else None),
+                        "next_sync_at": (
+                            decision.next_sync_at.isoformat()
+                            if decision.next_sync_at is not None
+                            else None
+                        ),
+                        "network_requests": 0,
+                        "writes_calendar_state": False,
+                        "execute_requires": "--execute",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if plan is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "not-due",
+                        "writes_calendar_state": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        provider = BaoStockProvider(
+            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+            socket_timeout_seconds=socket_timeout_seconds,
+        )
+        try:
+            with RefreshRunLock(layout.market_refresh_lock):
+                result = CalendarSyncService(
+                    calendar_store,
+                    get_trading_calendar(),
+                    provider,
+                ).execute(plan)
+        except RefreshAlreadyRunning:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["refresh_already_running"],
+                        "writes_calendar_state": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["calendar_sync_failed"],
+                        "writes_calendar_state": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    **result.model_dump(mode="json"),
+                    "writes_calendar_state": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1 if result.status == "quarantined" else 0
     control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
@@ -258,6 +469,102 @@ def main() -> int:
                 )
             )
             return 1
+    if args.command == "full-market-backfill":
+        if not isinstance(store, NasMarketStore):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["nas_market_dataset_required"],
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        provider = BaoStockProvider(
+            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+            factor_cache_path=str(layout.local_paths.factor_cache_database),
+            socket_timeout_seconds=socket_timeout_seconds,
+        )
+        service = FullMarketHistoryService(store, provider)
+        if not args.execute_all_main_board_history:
+            try:
+                plan = service.plan(
+                    start_date=args.start,
+                    end_date=args.end,
+                    max_sessions=args.max_sessions,
+                )
+            except Exception:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "quality_issues": ["calendar_or_plan_error"],
+                            "writes_market_data": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            payload = plan.model_dump(mode="json")
+            payload.update(
+                {
+                    "status": "dry-run",
+                    "scope": "all-main-board-history",
+                    "writes_market_data": False,
+                    "network_note": ("one BaoStock calendar query was used to build this plan"),
+                    "execute_requires": "--execute-all-main-board-history",
+                }
+            )
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        try:
+            with RefreshRunLock(layout.market_refresh_lock):
+                plan = service.plan(
+                    start_date=args.start,
+                    end_date=args.end,
+                    max_sessions=args.max_sessions,
+                )
+                result = service.execute(plan)
+        except RefreshAlreadyRunning:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["refresh_already_running"],
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        except DatasetError:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["nas_dataset_operation_failed"],
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "quality_issues": ["history_execution_failed"],
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
+        return 0 if result.status == "ready" else 1
     if args.command == "export":
         try:
             output = store.export_date(args.trade_date, layout.local_paths.staging / "exports")
@@ -298,6 +605,10 @@ def main() -> int:
             calendar,
             required_symbols=lambda: collect_required_symbols(user_store),
             lock_path=layout.market_refresh_lock,
+            post_publish=build_after_close_pipeline(
+                layout.local_paths.user_database,
+                store,
+            ),
         )
         now = get_market_clock()()
         if not args.execute:
@@ -510,9 +821,7 @@ def main() -> int:
         )
         estimated_seconds_lower_bound = (
             round(
-                elapsed
-                / inspection.metadata_provider_requests
-                * base_estimated_requests
+                elapsed / inspection.metadata_provider_requests * base_estimated_requests
                 + (factor_bootstrap_remaining or 0) * 0.5,
                 1,
             )

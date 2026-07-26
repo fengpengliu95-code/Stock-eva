@@ -7,7 +7,7 @@ Stock EVA 正在从 A 股量化学习仪表盘渐进演进为轻量的收盘后�
 阶段 4 已在本地持仓与行情底座上增加独立的收盘复盘工作台，以及基于自选和不可变
 策略版本的收盘后预警状态机；严格 JSON 策略 DSL 和确定性信号回放均通过现有 API
 接入。现有 `dashboard/` 学习页面保持独立。当前版本不连接券商，不包含实时行情、
-外部通知、自动交易、全市场实时扫描或投资建议。
+外部通知、自动交易、盘中实时扫描或投资建议。
 
 ## 工程快速开始
 
@@ -127,6 +127,19 @@ uv run python -m backend.app.cli auto-refresh-once
 锁。系统级周期任务必须由受控的自动化平台调用该命令；项目不会自行写入 launchd、
 cron 或其他系统定时配置。
 
+当某个新交易日通过完整性门槛并成功移动 published pointer 后，后端会按固定顺序
+幂等运行已保存策略的全市场主板扫描，再按每条预警规则绑定的自选范围做收盘评估。
+单项失败只写本地审计，不回滚行情发布或阻断其他任务；重启会安全补跑未完成项。
+
+私有 SQLite 一致性备份：
+
+```bash
+uv run python -m backend.app.cli backup-private-data
+```
+
+该命令使用 SQLite Backup API 和完整性检查，默认只在 Mac 本地保留 7 个日快照与
+4 个周快照，不写市场 NAS。
+
 历史日期和前复权序列端点：
 
 - `GET /api/v1/market/history/dates`
@@ -149,7 +162,9 @@ uv run --extra dev ruff check backend tests
 [第一版真实数据就绪](docs/real-data-readiness.md)，可选 NAS 的本地状态隔离、只读
 preflight、安全降级和未来发布协议见 [NAS 市场数据集准备](docs/nas-storage.md)。
 AKShare 板块分类/资金流的可接受字段、拒绝项和离线契约见
-[AKShare 补充数据审查](docs/akshare-supplemental.md)。
+[AKShare 补充数据审查](docs/akshare-supplemental.md)。新交易日成功发布后的全市场
+策略、预警闭环和本地私有库备份见
+[阶段 5 收盘后自动闭环](docs/after-close-automation.md)。
 
 ---
 

@@ -106,7 +106,7 @@ def test_alert_evaluation_is_post_close_idempotent_and_audited(
     assert first_event["source"] == "baostock"
     assert first_event["quality_status"] == "ready"
     assert first_event["signal_date"] == signal_date.isoformat()
-    assert first_event["idempotency_key"] == f"{version_id}:{SYMBOL}:{signal_date}"
+    assert first_event["idempotency_key"] == (f"{rule_id}:{version_id}:{SYMBOL}:{signal_date}")
     assert first_event["id"] == second_event["id"]
     assert [item["to_state"] for item in first_event["transitions"]] == [
         "pending",
@@ -119,9 +119,7 @@ def test_alert_evaluation_is_post_close_idempotent_and_audited(
     assert listing.status_code == 200
     assert listing.json()["status"] == "ready"
     assert listing.json()["unacknowledged"] == 1
-    assert listing.json()["items"][0]["explanation"]["data_date"] == (
-        signal_date.isoformat()
-    )
+    assert listing.json()["items"][0]["explanation"]["data_date"] == (signal_date.isoformat())
 
 
 def test_alert_manual_acknowledge_suppress_restore_and_re_evaluate(
@@ -160,10 +158,7 @@ def test_alert_manual_acknowledge_suppress_restore_and_re_evaluate(
     assert suppressed.json()["state"] == "suppressed"
     assert restored.json()["state"] == "eligible"
     assert re_evaluated.json()["events"][0]["state"] == "triggered"
-    states = [
-        item["to_state"]
-        for item in re_evaluated.json()["events"][0]["transitions"]
-    ]
+    states = [item["to_state"] for item in re_evaluated.json()["events"][0]["transitions"]]
     assert states == [
         "pending",
         "eligible",
@@ -211,9 +206,7 @@ def test_alert_suppresses_suspension_and_bad_quality(
     event = response.json()["events"][0]
     assert event["state"] == "suppressed"
     assert expected_issue in event["quality_issues"]
-    assert "triggered" not in [
-        item["to_state"] for item in event["transitions"]
-    ]
+    assert "triggered" not in [item["to_state"] for item in event["transitions"]]
 
 
 def test_alert_rejects_future_signal_date_without_creating_event(

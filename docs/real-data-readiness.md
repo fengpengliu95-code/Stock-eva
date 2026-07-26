@@ -2,7 +2,7 @@
 
 ## 安全原则
 
-- 历史回填只接受显式证券集合，最多 20 只；
+- 普通历史回填只接受显式证券集合，最多 20 只；
 - 默认是 dry-run，只有 `--execute` 才抓取历史行情；
 - 证券与交易日分别分块，计划超过 `--max-batches` 时在网络请求前拒绝；
 - BaoStock 请求有最小间隔和有限重试，不进行长时间不可控循环；
@@ -11,6 +11,8 @@
 - `--inspect-universe` 只查询交易日与证券池元数据，30 秒硬超时，不请求 OHLCV；
 - 所有 provider 操作与分页统一限流，正常最小间隔 0.5 秒、最多 2 次尝试；
 - 后台与 CLI 共享非阻塞跨进程锁，禁止两个全市场刷新重叠；
+- NAS 全主板历史回填默认只生成计划，必须增加
+  `--execute-all-main-board-history` 才按交易日逐分区发布；
 - 行情、运行记录和用户状态只写本地 `var/`，均被 `.gitignore` 排除。
 
 ## 历史窗口
@@ -49,6 +51,38 @@ error 或 partial 批次会在下次同参数执行时重试。每个批次保�
 
 可用 `--strategy-id` 与 `--strategy-version` 绑定已有策略版本。CLI 会比较计划的
 有效交易日数量与 AST 的最小窗口，不足时在行情请求前拒绝。
+
+## NAS 全主板历史回填
+
+该入口只适用于已经初始化且通过 readiness 校验的 NAS 数据集。先生成计划：
+
+```bash
+STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
+  uv run python -m backend.app.cli full-market-backfill \
+  --start 2024-01-01 \
+  --end 2026-07-23
+```
+
+默认 dry-run 只请求一次 BaoStock 交易日历，不请求证券池、日线、复权因子或指数行情，
+不写行情分区或 NAS manifest；CLI 仍可能初始化本机 runtime 目录与控制库 schema。
+输出包含确定性 request/run ID、有效交易日、已发布/待发布数量及 provider 请求次数
+下界。`--max-sessions` 默认 3,000，是交易日数量的网络前硬上限；扩大范围必须显式
+提高该值。
+
+真实执行还必须增加 `--execute-all-main-board-history`。服务按交易日从旧到新执行，
+每个交易日独立使用全主板证券池、两个摘要指数、质量和复权因子硬门槛。只有 ready
+日期才通过同共享原子 rename 和 manifest 切换发布；partial/error 只留本机审计，
+不会产生可见 NAS 分区。每轮开始前重新读取 manifest，已经发布的不可变日期会跳过，
+因此中断后以相同参数重启不会重复抓取或覆盖完成分区。
+
+整个执行持有现有全局刷新锁，不得与每日刷新并行。第一次最旧日期可能触发全量复权
+因子 bootstrap，耗时显著高于后续日增量；计划中的请求数仅为不含该 bootstrap 的
+下界，不是完成时间承诺。历史修复旧日期不会把当前 published pointer 倒退到过去。
+以约 3,190 只股票、260 个历史交易日为例，严格 point-in-time 因子路径约为最早日
+3,190 次逐股 baseline 请求，加后续每个历史日一次 daily event 请求；不会退化为
+260 × 3,190 次逐日逐股请求。
+若进程在 NAS manifest 发布后、本机 pointer 写入前中断，续跑会先校验最新不可变
+Parquet 的 hash/schema/行数，再从 manifest 重建本机 ready 审计和 pointer。
 
 ## 每日收盘刷新
 

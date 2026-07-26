@@ -57,10 +57,7 @@ class AlertService:
         if signal_date > date.today():
             raise ValueError("future signal dates are not allowed")
         rule = self.alert_store.get_rule(rule_id)
-        symbols = [
-            item.symbol
-            for item in self.user_store.list_watchlist_items(rule.watchlist_id)
-        ]
+        symbols = [item.symbol for item in self.user_store.list_watchlist_items(rule.watchlist_id)]
         if not symbols:
             return AlertEvaluationResponse(
                 status="empty",
@@ -79,10 +76,7 @@ class AlertService:
                 as_of_date=signal_date,
             )
         except Exception:
-            events = [
-                self._record_error(rule, symbol, signal_date)
-                for symbol in symbols
-            ]
+            events = [self._record_error(rule, symbol, signal_date) for symbol in symbols]
             return AlertEvaluationResponse(
                 status="error",
                 signal_date=signal_date,
@@ -97,13 +91,7 @@ class AlertService:
             )
             for result in evaluation.results
         ]
-        issues = sorted(
-            {
-                issue
-                for event in events
-                for issue in event.quality_issues
-            }
-        )
+        issues = sorted({issue for event in events for issue in event.quality_issues})
         if all(event.state == "error" for event in events):
             status = "error"
         elif any(event.state in {"suppressed", "error"} for event in events):
@@ -123,7 +111,7 @@ class AlertService:
         symbol: str,
         signal_date: date,
     ) -> AlertEventRecord:
-        key = f"{rule.strategy_version_id}:{symbol}:{signal_date}"
+        key = self.alert_store.event_idempotency_key(rule, symbol, signal_date)
         existing = self.alert_store.get_event_by_key(key)
         if existing is not None:
             return existing
@@ -154,7 +142,11 @@ class AlertService:
         result,
         data_fingerprint: str,
     ) -> AlertEventRecord:
-        key = f"{rule.strategy_version_id}:{result.symbol}:{result.signal_date}"
+        key = self.alert_store.event_idempotency_key(
+            rule,
+            result.symbol,
+            result.signal_date,
+        )
         existing = self.alert_store.get_event_by_key(key)
         if existing is not None and existing.state != "eligible":
             return existing
@@ -213,9 +205,11 @@ class AlertService:
                 for issue in event.quality_issues
             }
         )
-        status = "partial" if any(
-            event.state in {"suppressed", "error"} for event in events
-        ) else "ready"
+        status = (
+            "partial"
+            if any(event.state in {"suppressed", "error"} for event in events)
+            else "ready"
+        )
         return AlertEventListResponse(
             status=status,
             unacknowledged=sum(event.state == "triggered" for event in events),

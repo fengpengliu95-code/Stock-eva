@@ -75,7 +75,7 @@ class AlertStore:
                     data_fingerprint TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (strategy_version_id, symbol, signal_date)
+                    UNIQUE (alert_rule_id, strategy_version_id, symbol, signal_date)
                 );
 
                 CREATE TABLE IF NOT EXISTS alert_transitions (
@@ -89,8 +89,63 @@ class AlertStore:
                 );
                 """
             )
+            self._migrate_alert_event_identity(connection)
             connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    @staticmethod
+    def _migrate_alert_event_identity(connection: sqlite3.Connection) -> None:
+        schema = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'alert_events'
+            """
+        ).fetchone()
+        if schema is None or (
+            "UNIQUE (strategy_version_id, symbol, signal_date)" not in schema["sql"]
+        ):
+            return
+        connection.executescript(
+            """
+            CREATE TABLE alert_events_v2 (
+                id TEXT PRIMARY KEY,
+                alert_rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+                strategy_id TEXT NOT NULL,
+                strategy_version INTEGER NOT NULL,
+                strategy_version_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                signal_date TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                source TEXT,
+                quality_status TEXT NOT NULL,
+                quality_issues TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                data_fingerprint TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (alert_rule_id, strategy_version_id, symbol, signal_date)
+            );
+
+            INSERT INTO alert_events_v2 (
+                id, alert_rule_id, strategy_id, strategy_version,
+                strategy_version_id, symbol, signal_date, idempotency_key,
+                state, source, quality_status, quality_issues, explanation,
+                data_fingerprint, created_at, updated_at
+            )
+            SELECT
+                id, alert_rule_id, strategy_id, strategy_version,
+                strategy_version_id, symbol, signal_date,
+                alert_rule_id || ':' || strategy_version_id || ':' ||
+                    symbol || ':' || signal_date,
+                state, source, quality_status, quality_issues, explanation,
+                data_fingerprint, created_at, updated_at
+            FROM alert_events;
+
+            DROP TABLE alert_events;
+            ALTER TABLE alert_events_v2 RENAME TO alert_events;
+            """
+        )
 
     @staticmethod
     def _rule(row: sqlite3.Row) -> AlertRuleRecord:
@@ -126,9 +181,7 @@ class AlertStore:
             )
             connection.commit()
         except sqlite3.IntegrityError as exc:
-            raise AlertConflictError(
-                f"alert rule already exists: {normalized_name}"
-            ) from exc
+            raise AlertConflictError(f"alert rule already exists: {normalized_name}") from exc
         finally:
             connection.close()
         return self.get_rule(identifier)
@@ -149,9 +202,7 @@ class AlertStore:
     def list_rules(self) -> list[AlertRuleRecord]:
         connection = self._connect()
         try:
-            rows = connection.execute(
-                "SELECT * FROM alert_rules ORDER BY name, id"
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM alert_rules ORDER BY name, id").fetchall()
         finally:
             connection.close()
         return [self._rule(row) for row in rows]
@@ -249,7 +300,7 @@ class AlertStore:
         explanation: dict[str, object],
         data_fingerprint: str | None,
     ) -> AlertEventRecord:
-        idempotency_key = f"{rule.strategy_version_id}:{symbol}:{signal_date}"
+        idempotency_key = self.event_idempotency_key(rule, symbol, signal_date)
         existing = self.get_event_by_key(idempotency_key)
         if existing is not None:
             return existing
@@ -301,6 +352,14 @@ class AlertStore:
             connection.close()
         return self.get_event(identifier)
 
+    @staticmethod
+    def event_idempotency_key(
+        rule: AlertRuleRecord,
+        symbol: str,
+        signal_date: date,
+    ) -> str:
+        return f"{rule.id}:{rule.strategy_version_id}:{symbol}:{signal_date}"
+
     def transition(
         self,
         identifier: str,
@@ -320,13 +379,9 @@ class AlertStore:
                 raise AlertNotFoundError("alert event not found")
             current = row["state"]
             if to_state not in ALLOWED_TRANSITIONS[current]:
-                raise AlertConflictError(
-                    f"invalid alert transition: {current} -> {to_state}"
-                )
+                raise AlertConflictError(f"invalid alert transition: {current} -> {to_state}")
             if to_state == "triggered" and actor != "system":
-                raise AlertConflictError(
-                    "triggered state requires system post-close evaluation"
-                )
+                raise AlertConflictError("triggered state requires system post-close evaluation")
             now = datetime.now(UTC).isoformat()
             connection.execute(
                 "UPDATE alert_events SET state = ?, updated_at = ? WHERE id = ?",

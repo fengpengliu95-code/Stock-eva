@@ -111,6 +111,7 @@ class CalendarSourceMetadata(BaseModel):
     exchange: Literal["SSE", "SZSE"]
     title: str
     url: str
+    notice_no: str | None = None
 
 
 class MarketDataStatus(BaseModel):
@@ -139,6 +140,11 @@ class MarketDataStatus(BaseModel):
     ]
     last_success_at: datetime | None
     next_retry_at: datetime | None
+    calendar_last_sync_at: datetime | None = None
+    calendar_last_success_at: datetime | None = None
+    calendar_conflict_detected: bool = False
+    calendar_conflict_at: datetime | None = None
+    calendar_next_sync_at: datetime | None = None
     capability: MarketCapability = Field(default_factory=MarketCapability)
     calendar_sources: list[CalendarSourceMetadata] = Field(default_factory=list)
     publication_gates: list[str] = Field(

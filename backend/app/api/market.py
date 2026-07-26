@@ -8,19 +8,31 @@ from backend.app.api.storage import get_storage_readiness
 from backend.app.config import Settings, get_settings
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
+from backend.app.market.calendar_sync import CalendarSyncPolicy, CalendarSyncStore
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
+from backend.app.market.supplement_ingestion import (
+    SupplementalStore,
+    supplemental_dataset_root,
+)
 from backend.app.market.supplemental import (
     SupplementalMarketResponse,
-    empty_supplemental_response,
+    supplemental_capabilities,
 )
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
+from backend.app.storage.preflight import StoragePreflight
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+def get_calendar_sync_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CalendarSyncStore:
+    return CalendarSyncStore(settings.local_control_dir / settings.calendar_sync_database_name)
 
 
 def get_market_store(
@@ -68,7 +80,26 @@ def get_market_store(
 def market_supplemental(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> SupplementalMarketResponse:
-    return empty_supplemental_response(enabled=settings.akshare_supplemental_enabled)
+    if (
+        settings.nas_market_dataset_root is not None
+        and not StoragePreflight(settings).inspect().market_data_available
+    ):
+        return SupplementalMarketResponse(
+            status="error",
+            provider="akshare",
+            as_of=None,
+            market_flow=None,
+            sector_flows=[],
+            industry_classifications=[],
+            capabilities=supplemental_capabilities(),
+            quality_issues=["market_storage_unavailable"],
+        )
+    return SupplementalStore(
+        supplemental_dataset_root(settings),
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental-ingestion.lock",
+    ).read_response(enabled=settings.akshare_supplemental_enabled)
 
 
 @router.get("/summary", response_model=MarketSummary)
@@ -93,13 +124,24 @@ def market_status(
     calendar: Annotated[TradingCalendar, Depends(get_trading_calendar)],
     clock: Annotated[Callable[[], datetime], Depends(get_market_clock)],
     settings: Annotated[Settings, Depends(get_settings)],
+    calendar_sync: Annotated[
+        CalendarSyncStore,
+        Depends(get_calendar_sync_store),
+    ],
 ) -> MarketDataStatus:
     now = clock().astimezone(SHANGHAI)
     expected = calendar.latest_expected_session(now)
     published = store.published_refresh()
     scheduler = store.scheduler_state()
+    calendar_maintenance = calendar_sync.state()
+    calendar_decision = CalendarSyncPolicy().decide(
+        now,
+        state=calendar_maintenance,
+    )
     calendar_status = (
-        scheduler.calendar_status
+        "conflict"
+        if calendar_maintenance.conflict_detected
+        else scheduler.calendar_status
         if scheduler is not None and scheduler.calendar_status != "confirmed"
         else ("confirmed" if calendar.session_status(now.date()) != "unknown" else "unavailable")
     )
@@ -134,6 +176,11 @@ def market_status(
             else None
         ),
         next_retry_at=scheduler.next_retry_at if scheduler else None,
+        calendar_last_sync_at=calendar_maintenance.last_attempt_at,
+        calendar_last_success_at=calendar_maintenance.last_success_at,
+        calendar_conflict_detected=calendar_maintenance.conflict_detected,
+        calendar_conflict_at=calendar_maintenance.conflict_at,
+        calendar_next_sync_at=(calendar_decision.next_sync_at or calendar_maintenance.next_sync_at),
         calendar_sources=[item.model_dump() for item in calendar.sources_for(now.year)],
     )
 

@@ -28,6 +28,7 @@ class CalendarSource(BaseModel):
     exchange: Literal["SSE", "SZSE"]
     title: str
     url: str
+    notice_no: str | None = None
 
 
 class CalendarConfig(BaseModel):
@@ -113,8 +114,14 @@ class TradingCalendar:
 
 
 CALENDAR_PATH = Path(__file__).with_name("calendars") / "cn_a_share_2026.json"
+CALENDAR_DIRECTORY = CALENDAR_PATH.parent
 
 
 @lru_cache
 def get_trading_calendar() -> TradingCalendar:
-    return TradingCalendar.from_path(CALENDAR_PATH)
+    configs: list[CalendarConfig] = []
+    for path in sorted(CALENDAR_DIRECTORY.glob("cn_a_share_*.json")):
+        payload = json.loads(path.read_text())
+        raw_configs = payload if isinstance(payload, list) else [payload]
+        configs.extend(CalendarConfig.model_validate(item) for item in raw_configs)
+    return TradingCalendar(configs)

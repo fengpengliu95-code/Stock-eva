@@ -6,7 +6,8 @@ Stock EVA 将两类数据明确分开：
   DuckDB spill 和临时文件。
 - 可选 NAS 市场数据集：一次完整回填与校验后的历史分区，以及之后的每日增量分区。
 
-本轮实现配置边界、只读 preflight、失败降级和未来发布接口。NAS 数据集的首次
+当前实现包含配置边界、只读 preflight、失败降级、不可变分区发布和可恢复的全主板
+历史回填。NAS 数据集的首次
 初始化必须由显式命令确认；不会保存 SMB 凭据、读取真实行情或执行全市场抓取。
 
 ## 配置
@@ -78,7 +79,7 @@ NAS 挂载、哨兵或 manifest 不可用时，summary、history、组合估值�
 
 ## 两阶段发布接口
 
-`backend.app.storage.publication.DatasetPublication` 固定未来实现的五个阶段：
+`backend.app.storage.publication.DatasetPublication` 固定实现以下五个阶段：
 
 1. `stage_and_validate`：在本机 staging 生成分区、canonical 校验结果、manifest 和
    SHA-256；不得在 NAS 上直接生成可见数据。
@@ -90,8 +91,13 @@ NAS 挂载、哨兵或 manifest 不可用时，summary、history、组合估值�
    移动 published pointer。
 
 任一验证、上传或 readback 失败，旧 manifest 保持不变；partial 只保留审计/清理，
-不能被 summary、history、估值、策略或预警读取。未来每日增量与首次全量回填使用同一
+不能被 summary、history、估值、策略或预警读取。每日增量与首次全量回填使用同一
 发布协议，不另开弱一致性路径。
+
+首次全量回填使用 `full-market-backfill`。它默认 dry-run，只有显式增加
+`--execute-all-main-board-history` 才抓取并发布；每个交易日都是独立的严格校验和
+manifest 检查点。已发布日期不会被覆盖，中断后可安全重启。具体命令、硬上限和请求
+边界见 [第一版真实数据就绪](real-data-readiness.md#nas-全主板历史回填)。
 
 ## 实际接入前的最少输入
 

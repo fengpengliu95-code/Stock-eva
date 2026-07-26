@@ -99,9 +99,7 @@ class MarketStore:
         connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS coverage_ratio DOUBLE"
         )
-        connection.execute(
-            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS request_key VARCHAR"
-        )
+        connection.execute("ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS request_key VARCHAR")
         connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS run_kind VARCHAR DEFAULT 'daily'"
         )
@@ -154,15 +152,22 @@ class MarketStore:
                 ],
             )
             if publish:
-                connection.execute("DELETE FROM published_snapshots WHERE singleton = 1")
-                connection.execute(
+                current = connection.execute(
                     """
-                    INSERT INTO published_snapshots (
-                        singleton, run_id, trade_date, published_at
-                    ) VALUES (1, ?, ?, ?)
-                    """,
-                    [result.run_id, result.requested_date, result.completed_at],
-                )
+                    SELECT trade_date FROM published_snapshots
+                    WHERE singleton = 1
+                    """
+                ).fetchone()
+                if current is None or current[0] <= result.requested_date:
+                    connection.execute("DELETE FROM published_snapshots WHERE singleton = 1")
+                    connection.execute(
+                        """
+                        INSERT INTO published_snapshots (
+                            singleton, run_id, trade_date, published_at
+                        ) VALUES (1, ?, ?, ?)
+                        """,
+                        [result.run_id, result.requested_date, result.completed_at],
+                    )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -177,10 +182,7 @@ class MarketStore:
     ) -> None:
         if not bars:
             return
-        deduplicated = {
-            (bar.trade_date, bar.symbol, bar.source): bar
-            for bar in bars
-        }
+        deduplicated = {(bar.trade_date, bar.symbol, bar.source): bar for bar in bars}
         rows = [
             [
                 bar.trade_date,
@@ -525,9 +527,7 @@ class MarketStore:
             raise ValueError(
                 f"a symbol range query accepts at most {MAX_SYMBOL_RANGE_QUERY} symbols"
             )
-        grouped: dict[str, list[DailyBar]] = {
-            symbol: [] for symbol in normalized
-        }
+        grouped: dict[str, list[DailyBar]] = {symbol: [] for symbol in normalized}
         if not normalized or start > end or not self.exists():
             return grouped
         connection = self._connect()

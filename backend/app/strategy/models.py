@@ -38,6 +38,20 @@ class StrategyVersionRecord(BaseModel):
     created_at: datetime
 
 
+class StrategyRunBatchRecord(BaseModel):
+    index: int = Field(ge=1)
+    status: Literal["completed", "error"]
+    symbol_count: int = Field(ge=1)
+    first_symbol: str
+    last_symbol: str
+    matched_count: int = Field(default=0, ge=0)
+    not_matched_count: int = Field(default=0, ge=0)
+    excluded_count: int = Field(default=0, ge=0)
+    insufficient_count: int = Field(default=0, ge=0)
+    data_fingerprint: str | None = None
+    error_code: Literal["batch_evaluation_failed"] | None = None
+
+
 class StrategyRunRecord(BaseModel):
     id: str
     strategy_id: str
@@ -49,3 +63,12 @@ class StrategyRunRecord(BaseModel):
     symbols: list[str]
     results: list[SignalResult]
     created_at: datetime
+    scope: Literal["explicit", "all_main_board"] = "explicit"
+    total_symbols: int = Field(default=0, ge=0)
+    batch_size: int = Field(default=0, ge=0, le=200)
+    total_batches: int = Field(default=0, ge=0)
+    completed_batches: int = Field(default=0, ge=0)
+    failed_batches: int = Field(default=0, ge=0)
+    failed_symbols: list[str] = Field(default_factory=list)
+    batches: list[StrategyRunBatchRecord] = Field(default_factory=list)
+    idempotency_key: str | None = None

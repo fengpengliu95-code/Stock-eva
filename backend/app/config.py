@@ -27,10 +27,13 @@ class Settings(BaseSettings):
     user_database_name: str = "stock_eva_user.sqlite3"
     local_control_dir: Path = Path("var/control")
     factor_cache_database_name: str = "baostock_factor_cache.sqlite3"
+    calendar_sync_database_name: str = "calendar_sync.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
     nas_market_dataset_root: Path | None = None
+    supplemental_data_dir: Path | None = None
+    supplemental_audit_database_name: str = "supplemental_ingestion.sqlite3"
     akshare_supplemental_enabled: bool = False
     auto_refresh_enabled: bool = False
     auto_refresh_min_request_interval_seconds: float = Field(

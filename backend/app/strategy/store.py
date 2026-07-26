@@ -8,6 +8,7 @@ from backend.app.strategy.dsl import ValidatedRule
 from backend.app.strategy.models import (
     SignalResult,
     StrategyRecord,
+    StrategyRunBatchRecord,
     StrategyRunRecord,
     StrategyVersionRecord,
 )
@@ -70,6 +71,35 @@ class StrategyStore:
                     results TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS strategy_run_metadata (
+                    run_id TEXT PRIMARY KEY
+                        REFERENCES strategy_runs(id) ON DELETE CASCADE,
+                    scope TEXT NOT NULL,
+                    total_symbols INTEGER NOT NULL,
+                    batch_size INTEGER NOT NULL,
+                    total_batches INTEGER NOT NULL,
+                    completed_batches INTEGER NOT NULL,
+                    failed_batches INTEGER NOT NULL,
+                    failed_symbols TEXT NOT NULL,
+                    batches TEXT NOT NULL,
+                    idempotency_key TEXT
+                );
+                """
+            )
+            metadata_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(strategy_run_metadata)").fetchall()
+            }
+            if "idempotency_key" not in metadata_columns:
+                connection.execute(
+                    "ALTER TABLE strategy_run_metadata ADD COLUMN idempotency_key TEXT"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS strategy_run_idempotency_key
+                ON strategy_run_metadata(idempotency_key)
+                WHERE idempotency_key IS NOT NULL
                 """
             )
         return connection
@@ -141,9 +171,7 @@ class StrategyStore:
     def list_strategies(self) -> list[StrategyRecord]:
         connection = self._connect()
         try:
-            rows = connection.execute(
-                "SELECT * FROM strategies ORDER BY name, id"
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM strategies ORDER BY name, id").fetchall()
         finally:
             connection.close()
         return [self._strategy(row) for row in rows]
@@ -225,14 +253,38 @@ class StrategyStore:
         data_fingerprint: str,
         symbols: list[str],
         results: list[SignalResult],
+        scope: str = "explicit",
+        batch_size: int | None = None,
+        batches: list[StrategyRunBatchRecord] | None = None,
+        failed_symbols: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> StrategyRunRecord:
         identifier = str(uuid4())
         created_at = datetime.now(UTC).isoformat()
+        persisted_batches = batches or [
+            StrategyRunBatchRecord(
+                index=1,
+                status="completed",
+                symbol_count=len(symbols),
+                first_symbol=symbols[0],
+                last_symbol=symbols[-1],
+                matched_count=sum(result.status == "matched" for result in results),
+                not_matched_count=sum(result.status == "not_matched" for result in results),
+                excluded_count=sum(result.status == "excluded" for result in results),
+                insufficient_count=sum(result.status == "insufficient_data" for result in results),
+                data_fingerprint=data_fingerprint,
+            )
+        ]
+        failed = failed_symbols or []
         connection = self._connect()
+        idempotency_conflict = False
         try:
             connection.execute(
                 """
-                INSERT INTO strategy_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO strategy_runs (
+                    id, strategy_id, strategy_version, as_of_date, status,
+                    rule_hash, data_fingerprint, symbols, results, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     identifier,
@@ -251,9 +303,44 @@ class StrategyStore:
                     created_at,
                 ],
             )
+            connection.execute(
+                """
+                INSERT INTO strategy_run_metadata (
+                    run_id, scope, total_symbols, batch_size, total_batches,
+                    completed_batches, failed_batches, failed_symbols, batches,
+                    idempotency_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    identifier,
+                    scope,
+                    len(symbols),
+                    batch_size if batch_size is not None else len(symbols),
+                    len(persisted_batches),
+                    sum(batch.status == "completed" for batch in persisted_batches),
+                    sum(batch.status == "error" for batch in persisted_batches),
+                    json.dumps(failed, ensure_ascii=False),
+                    json.dumps(
+                        [batch.model_dump(mode="json") for batch in persisted_batches],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    idempotency_key,
+                ],
+            )
             connection.commit()
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            if idempotency_key is None:
+                raise
+            idempotency_conflict = True
         finally:
             connection.close()
+        if idempotency_conflict:
+            existing = self.find_run_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return existing
+            raise StrategyConflictError("strategy run idempotency conflict")
         return self.get_run(identifier)
 
     @staticmethod
@@ -267,18 +354,75 @@ class StrategyStore:
             rule_hash=row["rule_hash"],
             data_fingerprint=row["data_fingerprint"],
             symbols=json.loads(row["symbols"]),
-            results=[
-                SignalResult.model_validate(result)
-                for result in json.loads(row["results"])
-            ],
+            results=[SignalResult.model_validate(result) for result in json.loads(row["results"])],
             created_at=row["created_at"],
+            scope=row["scan_scope"] or "explicit",
+            total_symbols=(
+                row["scan_total_symbols"]
+                if row["scan_total_symbols"] is not None
+                else len(json.loads(row["symbols"]))
+            ),
+            batch_size=row["scan_batch_size"] or len(json.loads(row["symbols"])),
+            total_batches=row["scan_total_batches"] or 1,
+            completed_batches=(
+                row["scan_completed_batches"] if row["scan_completed_batches"] is not None else 1
+            ),
+            failed_batches=(
+                row["scan_failed_batches"] if row["scan_failed_batches"] is not None else 0
+            ),
+            failed_symbols=(
+                json.loads(row["scan_failed_symbols"])
+                if row["scan_failed_symbols"] is not None
+                else []
+            ),
+            batches=(
+                [
+                    StrategyRunBatchRecord.model_validate(batch)
+                    for batch in json.loads(row["scan_batches"])
+                ]
+                if row["scan_batches"] is not None
+                else []
+            ),
+            idempotency_key=row["scan_idempotency_key"],
         )
+
+    def find_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> StrategyRunRecord | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT run_id
+                FROM strategy_run_metadata
+                WHERE idempotency_key = ?
+                """,
+                [idempotency_key],
+            ).fetchone()
+        finally:
+            connection.close()
+        return self.get_run(row["run_id"]) if row is not None else None
 
     def get_run(self, run_id: str) -> StrategyRunRecord:
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT * FROM strategy_runs WHERE id = ?",
+                """
+                SELECT r.*,
+                       m.scope AS scan_scope,
+                       m.total_symbols AS scan_total_symbols,
+                       m.batch_size AS scan_batch_size,
+                       m.total_batches AS scan_total_batches,
+                       m.completed_batches AS scan_completed_batches,
+                       m.failed_batches AS scan_failed_batches,
+                       m.failed_symbols AS scan_failed_symbols,
+                       m.batches AS scan_batches,
+                       m.idempotency_key AS scan_idempotency_key
+                FROM strategy_runs r
+                LEFT JOIN strategy_run_metadata m ON m.run_id = r.id
+                WHERE r.id = ?
+                """,
                 [run_id],
             ).fetchone()
         finally:
@@ -293,9 +437,20 @@ class StrategyStore:
         try:
             rows = connection.execute(
                 """
-                SELECT * FROM strategy_runs
-                WHERE strategy_id = ?
-                ORDER BY created_at, id
+                SELECT r.*,
+                       m.scope AS scan_scope,
+                       m.total_symbols AS scan_total_symbols,
+                       m.batch_size AS scan_batch_size,
+                       m.total_batches AS scan_total_batches,
+                       m.completed_batches AS scan_completed_batches,
+                       m.failed_batches AS scan_failed_batches,
+                       m.failed_symbols AS scan_failed_symbols,
+                       m.batches AS scan_batches,
+                       m.idempotency_key AS scan_idempotency_key
+                FROM strategy_runs r
+                LEFT JOIN strategy_run_metadata m ON m.run_id = r.id
+                WHERE r.strategy_id = ?
+                ORDER BY r.created_at, r.id
                 """,
                 [strategy_id],
             ).fetchall()

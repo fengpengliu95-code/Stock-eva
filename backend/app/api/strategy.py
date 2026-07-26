@@ -51,12 +51,19 @@ class StrategyRunCreate(BaseModel):
         for value in values:
             symbol = value.strip().lower()
             parts = symbol.split(".")
-            if len(parts) != 2 or parts[0] not in {"sh", "sz"} or not (
-                len(parts[1]) == 6 and parts[1].isdigit()
+            if (
+                len(parts) != 2
+                or parts[0] not in {"sh", "sz"}
+                or not (len(parts[1]) == 6 and parts[1].isdigit())
             ):
                 raise ValueError("symbols must look like sh.600000 or sz.000001")
             normalized.append(symbol)
         return normalized
+
+
+class StrategyMarketScanCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int = Field(ge=1)
 
 
 def get_strategy_store(
@@ -163,6 +170,26 @@ def run_strategy(
             version=payload.version,
             symbols=payload.symbols,
             as_of_date=payload.as_of_date,
+        )
+    except (StrategyNotFoundError, ValueError) as exc:
+        raise _store_error(exc) from exc
+
+
+@router.post(
+    "/{strategy_id}/runs/all-main-board",
+    response_model=StrategyRunRecord,
+    status_code=status.HTTP_201_CREATED,
+)
+def run_all_main_board_strategy(
+    strategy_id: str,
+    payload: StrategyMarketScanCreate,
+    strategy_store: Annotated[StrategyStore, Depends(get_strategy_store)],
+    market_store: Annotated[MarketStore, Depends(get_market_store)],
+) -> StrategyRunRecord:
+    try:
+        return StrategyRunService(strategy_store, market_store).run_all_main_board(
+            strategy_id,
+            version=payload.version,
         )
     except (StrategyNotFoundError, ValueError) as exc:
         raise _store_error(exc) from exc

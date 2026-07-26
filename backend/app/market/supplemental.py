@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class IndustryClassificationRecord(BaseModel):
@@ -56,6 +56,7 @@ class SupplementalMarketResponse(BaseModel):
     as_of: date | None
     market_flow: ReportedFundFlowPoint | None
     sector_flows: list[ReportedFundFlowPoint]
+    industry_classifications: list[IndustryClassificationRecord] = Field(default_factory=list)
     capabilities: list[SupplementalCapability]
     quality_issues: list[str]
     interpretation: Literal["upstream_reported_not_ohlcv_inferred"] = (
@@ -110,6 +111,7 @@ def empty_supplemental_response(*, enabled: bool) -> SupplementalMarketResponse:
         as_of=None,
         market_flow=None,
         sector_flows=[],
+        industry_classifications=[],
         capabilities=supplemental_capabilities(),
         quality_issues=[
             (

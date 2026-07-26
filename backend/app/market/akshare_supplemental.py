@@ -8,8 +8,7 @@ from backend.app.market.supplemental import (
 )
 
 _CLASSIFICATION_ENDPOINT = (
-    "https://www.swsresearch.com/swindex/pdf/SwClass2021/"
-    "StockClassifyUse_stock.xls"
+    "https://www.swsresearch.com/swindex/pdf/SwClass2021/StockClassifyUse_stock.xls"
 )
 _MARKET_FLOW_ENDPOINT = "https://data.eastmoney.com/zjlx/dpzjlx.html"
 _SECTOR_FLOW_ENDPOINT = "https://data.eastmoney.com/bkzj/"
@@ -37,9 +36,7 @@ class AKShareSupplementalProvider:
             try:
                 import akshare
             except ImportError as exc:
-                raise SupplementalDataError(
-                    "AKShare optional dependency is not installed"
-                ) from exc
+                raise SupplementalDataError("AKShare optional dependency is not installed") from exc
             self._client = akshare
         return self._client
 
@@ -63,9 +60,7 @@ class AKShareSupplementalProvider:
                 IndustryClassificationRecord(
                     source_symbol=symbol,
                     industry_code=industry_code,
-                    industry_name=_optional_text(
-                        row.get("industry_name") or row.get("行业名称")
-                    ),
+                    industry_name=_optional_text(row.get("industry_name") or row.get("行业名称")),
                     effective_from=effective_from,
                     source_updated_on=updated_on,
                     source_endpoint=_CLASSIFICATION_ENDPOINT,
@@ -131,36 +126,18 @@ class AKShareSupplementalProvider:
                     trade_date=trade_date,
                     scope=scope,
                     scope_name=scope_name,
-                    reported_main_net_inflow=_required_float(
-                        row.get("主力净流入-净额")
-                    ),
-                    reported_main_net_inflow_ratio=_optional_float(
-                        row.get("主力净流入-净占比")
-                    ),
-                    reported_super_large_net_inflow=_optional_float(
-                        row.get("超大单净流入-净额")
-                    ),
+                    reported_main_net_inflow=_required_float(row.get("主力净流入-净额")),
+                    reported_main_net_inflow_ratio=_optional_float(row.get("主力净流入-净占比")),
+                    reported_super_large_net_inflow=_optional_float(row.get("超大单净流入-净额")),
                     reported_super_large_net_inflow_ratio=_optional_float(
                         row.get("超大单净流入-净占比")
                     ),
-                    reported_large_net_inflow=_optional_float(
-                        row.get("大单净流入-净额")
-                    ),
-                    reported_large_net_inflow_ratio=_optional_float(
-                        row.get("大单净流入-净占比")
-                    ),
-                    reported_medium_net_inflow=_optional_float(
-                        row.get("中单净流入-净额")
-                    ),
-                    reported_medium_net_inflow_ratio=_optional_float(
-                        row.get("中单净流入-净占比")
-                    ),
-                    reported_small_net_inflow=_optional_float(
-                        row.get("小单净流入-净额")
-                    ),
-                    reported_small_net_inflow_ratio=_optional_float(
-                        row.get("小单净流入-净占比")
-                    ),
+                    reported_large_net_inflow=_optional_float(row.get("大单净流入-净额")),
+                    reported_large_net_inflow_ratio=_optional_float(row.get("大单净流入-净占比")),
+                    reported_medium_net_inflow=_optional_float(row.get("中单净流入-净额")),
+                    reported_medium_net_inflow_ratio=_optional_float(row.get("中单净流入-净占比")),
+                    reported_small_net_inflow=_optional_float(row.get("小单净流入-净额")),
+                    reported_small_net_inflow_ratio=_optional_float(row.get("小单净流入-净占比")),
                     source_endpoint=source_endpoint,
                     observed_at=observed_at,
                 )
@@ -203,7 +180,11 @@ def _optional_float(value) -> float | None:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise SupplementalDataError("invalid reported fund-flow value") from exc
-    return None if math.isnan(result) else result
+    if math.isnan(result):
+        return None
+    if not math.isfinite(result):
+        raise SupplementalDataError("invalid reported fund-flow value")
+    return result
 
 
 def _optional_text(value) -> str | None:
