@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import DatasetError, NasMarketStore, _ManifestLock, _sha256
+from backend.app.storage.mirror import MarketDatasetMirror
 from backend.app.storage.models import StorageReadiness
 
 
@@ -132,6 +134,148 @@ def _ready_result() -> RefreshResult:
         started_at=datetime(2026, 7, 24, tzinfo=UTC),
         completed_at=datetime(2026, 7, 24, 1, tzinfo=UTC),
     )
+
+
+def _bars_on(trade_date: date) -> list:
+    return [bar.model_copy(update={"trade_date": trade_date}) for bar in _bars()]
+
+
+def _ready_result_on(trade_date: date) -> RefreshResult:
+    return _ready_result().model_copy(
+        update={
+            "run_id": f"nas-ready-{trade_date.isoformat()}",
+            "request_key": f"daily:baostock:{trade_date.isoformat()}:all-main-board",
+            "requested_date": trade_date,
+        }
+    )
+
+
+def test_verified_local_mirror_is_idempotent_and_manifest_readable(tmp_path: Path) -> None:
+    source = _root(tmp_path)
+    source_store = NasMarketStore(
+        MarketStore(tmp_path / "source-control.duckdb"),
+        source,
+        tmp_path / "source-staging",
+    )
+    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    destination = tmp_path / "local-mirror"
+
+    first = MarketDatasetMirror(source, destination).sync()
+    second = MarketDatasetMirror(source, destination).sync()
+
+    assert first.status == "copied"
+    assert first.file_count == 1
+    assert first.row_count == 3
+    assert first.copied_bytes > 0
+    assert second.status == "reused"
+    assert second.copied_bytes == 0
+    mirrored = NasMarketStore(
+        MarketStore(tmp_path / "mirror-control.duckdb"),
+        destination,
+        tmp_path / "mirror-staging",
+    )
+    mirrored.validate_readiness()
+    assert mirrored.manifest_dates() == [date(2026, 7, 23)]
+    mirrored.reconcile_control_pointer()
+    summary = MarketSummaryService(mirrored).latest(expected_session=date(2026, 7, 23))
+    assert summary.status == "ready"
+    assert summary.as_of == date(2026, 7, 23)
+
+
+def test_older_archive_never_replaces_a_newer_local_dataset(tmp_path: Path) -> None:
+    source = _root(tmp_path)
+    source_store = NasMarketStore(
+        MarketStore(tmp_path / "source-control.duckdb"),
+        source,
+        tmp_path / "source-staging",
+    )
+    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    destination = tmp_path / "local-mirror"
+    MarketDatasetMirror(source, destination).sync()
+    destination_store = NasMarketStore(
+        MarketStore(tmp_path / "destination-control.duckdb"),
+        destination,
+        tmp_path / "destination-staging",
+    )
+    destination_store.save_refresh(
+        _bars_on(date(2026, 7, 24)),
+        _ready_result_on(date(2026, 7, 24)),
+        publish=True,
+    )
+
+    result = MarketDatasetMirror(source, destination).sync()
+
+    assert result.status == "destination_newer"
+    assert destination_store.manifest_dates() == [
+        date(2026, 7, 23),
+        date(2026, 7, 24),
+    ]
+
+
+def test_interrupted_mirror_keeps_the_previous_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _root(tmp_path)
+    source_store = NasMarketStore(
+        MarketStore(tmp_path / "source-control.duckdb"),
+        source,
+        tmp_path / "source-staging",
+    )
+    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    destination = tmp_path / "local-mirror"
+    MarketDatasetMirror(source, destination).sync()
+    original_manifest = (destination / "manifest.json").read_bytes()
+    source_store.save_refresh(
+        _bars_on(date(2026, 7, 24)),
+        _ready_result_on(date(2026, 7, 24)),
+        publish=True,
+    )
+    real_replace = os.replace
+
+    def interrupt_manifest(source_path, destination_path) -> None:
+        if Path(destination_path).name == "manifest.json":
+            raise OSError("simulated interruption before manifest publication")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr("backend.app.storage.mirror.os.replace", interrupt_manifest)
+
+    with pytest.raises(OSError, match="simulated interruption"):
+        MarketDatasetMirror(source, destination).sync()
+
+    assert (destination / "manifest.json").read_bytes() == original_manifest
+    unchanged = NasMarketStore(
+        MarketStore(tmp_path / "unchanged-control.duckdb"),
+        destination,
+        tmp_path / "unchanged-staging",
+    )
+    unchanged.validate_readiness()
+    assert unchanged.manifest_dates() == [date(2026, 7, 23)]
+
+
+def test_invalid_source_never_replaces_a_valid_local_mirror(tmp_path: Path) -> None:
+    source = _root(tmp_path)
+    source_store = NasMarketStore(
+        MarketStore(tmp_path / "source-control.duckdb"),
+        source,
+        tmp_path / "source-staging",
+    )
+    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    destination = tmp_path / "local-mirror"
+    MarketDatasetMirror(source, destination).sync()
+    original = (destination / "manifest.json").read_bytes()
+    source_file = next((source / "bars").rglob("*.parquet"))
+    source_file.write_bytes(b"corrupt")
+
+    with pytest.raises(DatasetError):
+        MarketDatasetMirror(source, destination).sync()
+
+    assert (destination / "manifest.json").read_bytes() == original
+    NasMarketStore(
+        MarketStore(tmp_path / "mirror-control.duckdb"),
+        destination,
+        tmp_path / "mirror-staging",
+    ).validate_readiness()
 
 
 def test_nas_manifest_publication_is_readable_and_control_pointer_is_local(tmp_path: Path) -> None:

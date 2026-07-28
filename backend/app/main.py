@@ -26,7 +26,7 @@ from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
-from backend.app.storage.preflight import StoragePreflight
+from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.user.store import UserStore
 
 settings = get_settings()
@@ -47,18 +47,20 @@ async def lifespan(_: FastAPI):
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
     )
+    dataset_root = configured_market_dataset_root(settings)
     market_store = (
         NasMarketStore(
             control_store,
-            settings.nas_market_dataset_root,
+            dataset_root,
             layout.local_paths.staging,
         )
-        if readiness.mode == "nas"
+        if readiness.mode in {"nas", "local_dataset"} and dataset_root is not None
         else control_store
     )
     if isinstance(market_store, NasMarketStore):
         try:
             market_store.validate_readiness()
+            market_store.reconcile_control_pointer()
         except DatasetError:
             yield
             return

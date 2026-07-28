@@ -24,7 +24,7 @@ from backend.app.market.supplemental import (
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
-from backend.app.storage.preflight import StoragePreflight
+from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -54,15 +54,17 @@ def get_market_store(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
     )
-    if readiness.mode == "nas":
-        assert settings.nas_market_dataset_root is not None
+    if readiness.mode in {"nas", "local_dataset"}:
+        dataset_root = configured_market_dataset_root(settings)
+        assert dataset_root is not None
         store = NasMarketStore(
             control,
-            settings.nas_market_dataset_root,
+            dataset_root,
             layout.local_paths.staging,
         )
         try:
             store.validate_readiness()
+            store.reconcile_control_pointer()
         except (DatasetError, OSError) as exc:
             raise HTTPException(
                 status_code=503,
@@ -81,7 +83,7 @@ def market_supplemental(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> SupplementalMarketResponse:
     if (
-        settings.nas_market_dataset_root is not None
+        configured_market_dataset_root(settings) is not None
         and not StoragePreflight(settings).inspect().market_data_available
     ):
         return SupplementalMarketResponse(

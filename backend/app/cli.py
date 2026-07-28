@@ -34,7 +34,7 @@ from backend.app.storage.initialize import (
     EmptyDatasetInitializer,
 )
 from backend.app.storage.layout import StorageLayout
-from backend.app.storage.preflight import StoragePreflight
+from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupService
 from backend.app.user.store import UserStore
@@ -444,18 +444,20 @@ def main() -> int:
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
     )
+    dataset_root = configured_market_dataset_root(settings)
     store = (
         NasMarketStore(
             control_store,
-            settings.nas_market_dataset_root,
+            dataset_root,
             layout.local_paths.staging,
         )
-        if readiness.mode == "nas"
+        if readiness.mode in {"nas", "local_dataset"} and dataset_root is not None
         else control_store
     )
     if isinstance(store, NasMarketStore):
         try:
             store.validate_readiness()
+            store.reconcile_control_pointer()
         except DatasetError:
             print(
                 json.dumps(

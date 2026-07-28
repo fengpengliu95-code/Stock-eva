@@ -13,9 +13,10 @@
 - 后台与 CLI 共享非阻塞跨进程锁，禁止两个全市场刷新重叠；
 - NAS 全主板历史回填默认只生成计划，必须增加
   `--execute-all-main-board-history` 才按交易日逐分区发布；
-- 行情分区发布到已验证的 NAS 数据集；运行记录、控制状态和用户状态只写本机
-  `var/`，均被 `.gitignore` 排除。NAS 不可用时 fail closed，不会在同名本地目录
-  创建伪数据集。
+- 历史回填分区发布到已验证的 NAS 归档；macOS 后台从 manifest/hash 校验后原子建立
+  的 `Application Support` 本机镜像读取和发布日增量；
+- 运行记录、控制状态和用户状态只写本机可变目录，均被 `.gitignore` 排除。本机镜像
+  不可用时 fail closed，不会静默回退 NAS 或创建伪数据集。
 
 ## 历史窗口
 
@@ -86,6 +87,18 @@ STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
 若进程在 NAS manifest 发布后、本机 pointer 写入前中断，续跑会先校验最新不可变
 Parquet 的 hash/schema/行数，再从 manifest 重建本机 ready 审计和 pointer。
 
+本轮历史回填已经完成。2026-07-28 对 NAS published manifest 和引用对象的真实读回
+结果为：
+
+- 260 个有效交易日；
+- 829,494 行 canonical 日线；
+- 最新交易日 2026-07-24；
+- NAS 占用约 38 MB；
+- manifest、SHA-256、Parquet schema 和逐文件行数校验通过。
+
+NAS 现作为这一批已验证历史的归档源；以上数字不含本机用户 SQLite、刷新审计、
+策略、预警或备份。
+
 ## 每日收盘刷新
 
 小范围每日刷新：
@@ -140,9 +153,9 @@ uv run python -m backend.app.cli refresh \
 不会移动 published pointer。结束后仍需检查 `/api/v1/market/status`、
 `refresh-runs`、覆盖率、两指数和复权因子门槛。
 
-当前正在从旧到新执行约 260 个有效交易日的全主板历史回填。作业以 NAS manifest
-为断点，已发布日期幂等跳过；最终完成数量、总行数、占用空间和校验摘要由主任务在
-作业结束后从 manifest 读回，本文不提前猜测。
+260 日历史窗口已经满足 MA5/MA20、量比等第一版策略的真实扫描数据门槛。每日刷新
+继续使用同一完整性规则；在 LaunchAgent 生产配置中，发布目标是本机 immutable
+dataset 镜像，而不是由后台进程直接写 NAS。
 
 ## 自动运行与运维
 
@@ -169,9 +182,17 @@ uv run python -m backend.app.cli auto-refresh-once --execute
 该入口不接受交易日，复用后端日历、发布指针、重试状态、幂等门槛和刷新锁。
 
 项目已实现 5 个 macOS LaunchAgent 模板及安装、状态和卸载脚本，覆盖 API、Web、
-日终刷新、交易日历同步和私有 SQLite 备份；资产与测试已经就绪。为避免历史回填与
-日常刷新争用全局锁，这些任务要等约 260 个交易日回填完成并通过验收后才正式安装、
-加载和读回状态。操作边界见 [macOS LaunchAgents](macos-launchagents.md)。
+日终刷新、交易日历同步和私有 SQLite 备份。真实验证发现 macOS TCC 拒绝 launchd
+后台进程访问 `/Volumes/Stock`，因此安装器会：
+
+1. 从 Git tracked 文件构建 `Application Support` 下的隔离生产运行时；
+2. 交互式校验 NAS manifest/hash/schema/行数；
+3. 在本机 staging 复制并复核，逐个发布不可变分区，最后原子切换 manifest；
+4. 让 5 个 LaunchAgent 只引用本机运行时、配置、数据和镜像路径。
+
+镜像和运行时实现已完成；正式安装后的端口、storage readiness、浏览器和下一次日终
+任务仍待主任务最终读回。在该验收完成前不宣称部署已上线。操作边界见
+[macOS LaunchAgents](macos-launchagents.md)。
 
 ### 日志与故障处理
 
@@ -201,17 +222,18 @@ uv run python -m backend.app.cli auto-refresh-once --execute
 
 ## 全阶段真实验收
 
-历史回填完成后，使用只读验收 CLI 检查 NAS manifest、不可变 Parquet、历史窗口、
-持仓估值、全市场策略扫描和预警幂等性：
+交互式验收 CLI 可直接检查 NAS 归档的 manifest、不可变 Parquet、历史窗口、持仓
+估值、全市场策略扫描和预警幂等性：
 
 ```bash
 STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
   uv run python -m backend.app.acceptance
 ```
 
-验收过程只读 NAS 行情，在临时 SQLite 中建立合成持仓、自选、策略和预警，结束后
-删除临时用户库；不会读取或修改真实持仓。策略输出统一标为“规则候选”，不构成投资
-建议。完整口径见 [端到端真实验收](acceptance-e2e.md)。
+验收过程由交互式用户只读 NAS 行情，在临时 SQLite 中建立合成持仓、自选、策略和
+预警，结束后删除临时用户库；不会读取或修改真实持仓。LaunchAgent 的最终验收则应
+确认 `mode=local_dataset`、`serving_source=local`。策略输出统一标为“规则候选”，
+不构成投资建议。完整口径见 [端到端真实验收](acceptance-e2e.md)。
 
 ## 免费数据源限制与生产化缺口
 
@@ -220,8 +242,8 @@ STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
 - 停牌行保留为占位并从指标排除；缺复权因子或质量异常会降级；
 - 退市、长期停牌和证券代码生命周期仍需更完整的证券主数据验证；
 - 当前已有本地后台调度和安全日志，但没有外部失败通知、跨设备同步或集中监控；
-- 一个交易日的全市场真实日终覆盖已通过；约 260 个交易日历史回填及其最终端到端
-  验收仍在进行；
-- LaunchAgent 资产已实现，但要等历史回填验收完成后才正式加载；
-- NAS 市场数据可从免费源重建，不做复杂多副本；本机私有 SQLite 使用一致性快照
-  备份。免费源不可用时保留最后完整发布，不混用不完整行情。
+- 260 个交易日、829,494 行、约 38 MB 的 NAS 历史归档已经完成并校验；
+- LaunchAgent 隔离运行时和本机镜像已实现，但正式安装/状态读回仍待主任务完成；
+- 下一次真实交易日的 18:10 自动刷新仍是上线后的时间性观察项；
+- NAS 归档和本机镜像都可从免费源重建，不做复杂多副本；本机私有 SQLite 使用一致性
+  快照备份。免费源不可用时保留最后完整发布，不混用不完整行情。

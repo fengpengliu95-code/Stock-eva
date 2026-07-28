@@ -29,7 +29,12 @@ class FakeMountInspector:
         return self.mount
 
 
-def settings_for(tmp_path: Path, *, nas_root: Path | None = None) -> Settings:
+def settings_for(
+    tmp_path: Path,
+    *,
+    nas_root: Path | None = None,
+    local_dataset_root: Path | None = None,
+) -> Settings:
     return Settings(
         _env_file=None,
         market_data_dir=tmp_path / "market",
@@ -39,6 +44,7 @@ def settings_for(tmp_path: Path, *, nas_root: Path | None = None) -> Settings:
         local_lock_dir=tmp_path / "locks",
         local_temp_dir=tmp_path / "tmp",
         nas_market_dataset_root=nas_root,
+        local_market_dataset_root=local_dataset_root,
     )
 
 
@@ -166,6 +172,49 @@ def test_nas_preflight_validates_smb_mount_sentinel_and_manifest(
     assert result.market_data_available is True
     assert result.serving_source == "nas"
     assert result.reason_code is None
+
+
+def test_local_dataset_mirror_needs_no_mount_and_wins_over_nas(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "published-market-mirror"
+    write_dataset_markers(local_root)
+    settings = settings_for(
+        tmp_path,
+        nas_root=Path("/Volumes/Stock/stock-eva-market"),
+        local_dataset_root=local_root,
+    )
+    inspector = FakeMountInspector(None)
+
+    result = StoragePreflight(settings, mount_inspector=inspector).inspect()
+
+    assert result.mode == "local_dataset"
+    assert result.status == "ready"
+    assert result.market_data_available is True
+    assert result.serving_source == "local"
+    assert result.mount_type == "local"
+    assert result.dataset_generation == "generation-20260724"
+    assert inspector.calls == 0
+
+
+def test_missing_local_dataset_mirror_fails_closed_without_touching_nas(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "missing-local-mirror"
+    settings = settings_for(
+        tmp_path,
+        nas_root=Path("/Volumes/Stock/stock-eva-market"),
+        local_dataset_root=local_root,
+    )
+    inspector = FakeMountInspector(None)
+
+    result = StoragePreflight(settings, mount_inspector=inspector).inspect()
+
+    assert result.mode == "local_dataset"
+    assert result.status == "unavailable"
+    assert result.reason_code == "dataset_root_missing"
+    assert inspector.calls == 0
+    assert not local_root.exists()
 
 
 @pytest.mark.parametrize("filesystem_type", ["apfs", "nfs", "ext4"])
@@ -366,3 +415,30 @@ async def test_unavailable_nas_keeps_private_api_but_blocks_market_consumers(
             "storage_status": "unavailable",
             "reason_code": "dataset_root_missing",
         }
+
+
+@pytest.mark.anyio
+async def test_market_api_reads_a_local_manifest_dataset_without_touching_nas(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "market-mirror"
+    write_dataset_markers(local_root)
+    settings = settings_for(
+        tmp_path,
+        nas_root=Path("/Volumes/Stock/stock-eva-market"),
+        local_dataset_root=local_root,
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            readiness = await client.get("/api/v1/storage/readiness")
+            summary = await client.get("/api/v1/market/summary")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert readiness.status_code == 200
+    assert readiness.json()["mode"] == "local_dataset"
+    assert readiness.json()["serving_source"] == "local"
+    assert summary.status_code == 200
+    assert summary.json()["status"] == "empty"

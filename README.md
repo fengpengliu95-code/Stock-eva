@@ -5,11 +5,14 @@ Stock EVA 是面向上交所、深交所 A 股主板的轻量收盘后研究工�
 学习页面保持独立。当前版本不连接券商，不包含实时行情、外部通知、自动交易、盘中
 实时扫描或投资建议。
 
-五阶段代码链路均已建立。BaoStock 全市场单日已通过真实完整性门槛并发布到 NAS；
-260 个交易日的全主板历史回填正在执行，最终完成数以回填 manifest 为准。市场行情
-真值是 NAS 上由 manifest 明确引用的不可变 Parquet 分区；本机 DuckDB 只保存刷新、
-调度和 published pointer 等控制状态，本机 SQLite 保存用户私有数据。阶段 3/4 的
-真实 E2E 验收工具已实现，待历史窗口达到 21 个有效交易日后执行。详细状态见
+五阶段代码链路均已建立。BaoStock 全主板历史归档已完成：260 个交易日、829,494 行、
+约 38 MB，最新日期 2026-07-24；NAS manifest、SHA-256、Parquet schema 和行数已经
+真实校验。由于 macOS TCC 拒绝 LaunchAgent 直接访问 `/Volumes/Stock`，正式后台服务
+不从 NAS 或 `Documents` 开发仓库运行，而是读取
+`~/Library/Application Support/Stock EVA/data/market-dataset` 的已验证本机镜像。
+NAS 保留为归档源，本机 DuckDB/SQLite 保存控制状态和用户私有数据。隔离运行时、本机
+镜像和 LaunchAgent 部署实现已完成，正式安装后的端口、readiness、浏览器及下一次
+日终任务仍待主任务最终验证。详细状态见
 [五阶段交付与验收状态](docs/five-stage-status.md)。
 
 ## 工程快速开始
@@ -102,7 +105,8 @@ uv run python -m backend.app.cli backfill \
 uv run python -m backend.app.cli refresh-runs
 ```
 
-NAS 全主板历史回填使用逐交易日不可变分区和 manifest 断点，默认只生成计划：
+NAS 全主板历史回填使用逐交易日不可变分区和 manifest 断点。以下命令保留为可恢复的
+归档重建入口；当前 260 日归档已经完成，不需要为日常启动重复执行：
 
 ```bash
 STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
@@ -110,7 +114,7 @@ STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
   --start 2025-07-01 \
   --end 2026-07-24
 
-# 真实执行还必须显式确认；重复执行跳过 manifest 已完成日期
+# 恢复执行仍必须显式确认；重复执行跳过 manifest 已完成日期
 STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
   uv run python -m backend.app.cli full-market-backfill \
   --start 2025-07-01 \
@@ -144,8 +148,11 @@ uv run python -m backend.app.cli auto-refresh-once
 
 增加 `--execute` 后，它只在后端调度判定 due 时执行，并复用同一幂等状态与跨进程
 锁。项目已经提供 5 个用户级 LaunchAgent 模板及安装、状态、卸载脚本，覆盖 API、
-网页、日终刷新、日历同步和私有库备份；资产已通过测试，但在 260 日历史回填完成前
-不正式加载。见 [macOS LaunchAgents](docs/macos-launchagents.md)。
+网页、日终刷新、日历同步和私有库备份。安装器从 Git tracked 文件构建
+`Application Support` 隔离运行时，先按 manifest/hash 完整验证 NAS 归档，再原子
+建立本机行情镜像；后台 plist 不包含 `Documents` 或 `/Volumes/Stock` 运行路径。
+当前部署完成状态保持“待主任务最终验证”。见
+[macOS LaunchAgents](docs/macos-launchagents.md)。
 
 当某个新交易日通过完整性门槛并成功移动 published pointer 后，后端会按固定顺序
 幂等运行已保存策略的全市场主板扫描，再按每条预警规则绑定的自选范围做收盘评估。
@@ -172,8 +179,10 @@ uv run python -m backend.app.acceptance \
   --nas-root /Volumes/Stock/stock-eva-market
 ```
 
-验收只读 NAS；示例持仓、自选、策略和预警全部写入自动销毁的临时 SQLite，正式用户库
-不会被打开。结果统一称为“规则候选”，不构成投资建议。
+该命令由交互式用户只读 NAS 归档；示例持仓、自选、策略和预警全部写入自动销毁的
+临时 SQLite，正式用户库不会被打开。生产后台的 storage readiness 应显示
+`mode=local_dataset`、`serving_source=local`。结果统一称为“规则候选”，不构成
+投资建议。
 
 运行验证：
 

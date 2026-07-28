@@ -337,6 +337,8 @@ DATA_ROOT_ESCAPED="$(escape_sed "$DATA_ROOT")"
   -e "s|^STOCK_EVA_LOCAL_STAGING_DIR=.*$|STOCK_EVA_LOCAL_STAGING_DIR=$DATA_ROOT_ESCAPED/staging|" \
   -e "s|^STOCK_EVA_LOCAL_LOCK_DIR=.*$|STOCK_EVA_LOCAL_LOCK_DIR=$DATA_ROOT_ESCAPED/locks|" \
   -e "s|^STOCK_EVA_LOCAL_TEMP_DIR=.*$|STOCK_EVA_LOCAL_TEMP_DIR=$DATA_ROOT_ESCAPED/tmp|" \
+  -e "s|^STOCK_EVA_LOCAL_MARKET_DATASET_ROOT=.*$|STOCK_EVA_LOCAL_MARKET_DATASET_ROOT=$DATA_ROOT_ESCAPED/market-dataset|" \
+  -e "s|^STOCK_EVA_AKSHARE_SUPPLEMENTAL_ENABLED=.*$|STOCK_EVA_AKSHARE_SUPPLEMENTAL_ENABLED=false|" \
   "$ENV_FILE" >"$CONFIG_ROOT/.env.next"
 while IFS='|' read -r key value; do
   if ! /usr/bin/grep -q "^$key=" "$CONFIG_ROOT/.env.next"; then
@@ -349,6 +351,8 @@ STOCK_EVA_LOCAL_CONTROL_DIR|$DATA_ROOT/control
 STOCK_EVA_LOCAL_STAGING_DIR|$DATA_ROOT/staging
 STOCK_EVA_LOCAL_LOCK_DIR|$DATA_ROOT/locks
 STOCK_EVA_LOCAL_TEMP_DIR|$DATA_ROOT/tmp
+STOCK_EVA_LOCAL_MARKET_DATASET_ROOT|$DATA_ROOT/market-dataset
+STOCK_EVA_AKSHARE_SUPPLEMENTAL_ENABLED|false
 EOF
 /bin/chmod 0600 "$CONFIG_ROOT/.env.next"
 if [[ -f "$CONFIG_ROOT/.env" ]]; then
@@ -369,6 +373,12 @@ for name in market user control staging locks tmp; do
   fi
 done
 /bin/chmod 0700 "$DATA_ROOT"
+
+"$RELEASE_ROOT/.venv/bin/python" \
+  -m backend.app.storage.mirror \
+  --source /Volumes/Stock/stock-eva-market \
+  --destination "$DATA_ROOT/market-dataset" \
+  --execute
 
 if [[ -L "$RUNTIME_CURRENT" ]]; then
   PREVIOUS_CURRENT_TARGET="$(/usr/bin/readlink "$RUNTIME_CURRENT")"

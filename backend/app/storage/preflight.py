@@ -21,6 +21,10 @@ _SENTINEL_NAME = ".stock-eva-dataset.json"
 _MANIFEST_NAME = "manifest.json"
 
 
+def configured_market_dataset_root(settings: Settings) -> Path | None:
+    return settings.local_market_dataset_root or settings.nas_market_dataset_root
+
+
 @dataclass(frozen=True)
 class MountInfo:
     mount_point: Path
@@ -95,7 +99,9 @@ class StoragePreflight:
         self.mount_inspector = mount_inspector or SystemMountInspector()
 
     def inspect(self) -> StorageReadiness:
-        root = self.settings.nas_market_dataset_root
+        local_dataset = self.settings.local_market_dataset_root
+        root = configured_market_dataset_root(self.settings)
+        mode = "local_dataset" if local_dataset is not None else "nas"
         if root is None:
             return StorageReadiness(
                 mode="local",
@@ -106,23 +112,43 @@ class StoragePreflight:
                 manifest_status="not_required",
             )
         if not root.is_absolute():
-            return self._unavailable("misconfigured", "dataset_root_not_absolute")
+            return self._unavailable(
+                "misconfigured",
+                "dataset_root_not_absolute",
+                mode=mode,
+            )
         if self._overlaps_local_storage(root):
-            return self._unavailable("misconfigured", "dataset_root_overlaps_local")
+            return self._unavailable(
+                "misconfigured",
+                "dataset_root_overlaps_local",
+                mode=mode,
+            )
         if not root.exists():
-            return self._unavailable("unavailable", "dataset_root_missing")
-        if not root.is_dir():
-            return self._unavailable("misconfigured", "dataset_root_not_directory")
-
-        mount = self.mount_inspector.find_mount(root)
-        if mount is None:
-            return self._unavailable("unavailable", "mount_not_detected")
-        if mount.filesystem_type.lower() not in _SMB_FILESYSTEMS:
             return self._unavailable(
                 "unavailable",
-                "unexpected_mount_type",
-                mount_type=mount.filesystem_type,
+                "dataset_root_missing",
+                mode=mode,
             )
+        if not root.is_dir():
+            return self._unavailable(
+                "misconfigured",
+                "dataset_root_not_directory",
+                mode=mode,
+            )
+
+        if local_dataset is not None:
+            mount_type = "local"
+        else:
+            mount = self.mount_inspector.find_mount(root)
+            if mount is None:
+                return self._unavailable("unavailable", "mount_not_detected")
+            if mount.filesystem_type.lower() not in _SMB_FILESYSTEMS:
+                return self._unavailable(
+                    "unavailable",
+                    "unexpected_mount_type",
+                    mount_type=mount.filesystem_type,
+                )
+            mount_type = mount.filesystem_type
 
         sentinel_status, _ = self._read_metadata(
             root / _SENTINEL_NAME,
@@ -132,7 +158,8 @@ class StoragePreflight:
             return self._unavailable(
                 "unavailable",
                 f"sentinel_{sentinel_status}",
-                mount_type=mount.filesystem_type,
+                mode=mode,
+                mount_type=mount_type,
                 sentinel_status=sentinel_status,
             )
         manifest_status, manifest = self._read_metadata(
@@ -143,16 +170,17 @@ class StoragePreflight:
             return self._unavailable(
                 "unavailable",
                 f"manifest_{manifest_status}",
-                mount_type=mount.filesystem_type,
+                mode=mode,
+                mount_type=mount_type,
                 sentinel_status="ready",
                 manifest_status=manifest_status,
             )
         return StorageReadiness(
-            mode="nas",
+            mode=mode,
             status="ready",
             market_data_available=True,
-            serving_source="nas",
-            mount_type=mount.filesystem_type,
+            serving_source="local" if mode == "local_dataset" else "nas",
+            mount_type=mount_type,
             sentinel_status="ready",
             manifest_status="ready",
             dataset_generation=manifest.generation,
@@ -192,12 +220,13 @@ class StoragePreflight:
         status: str,
         reason_code: str,
         *,
+        mode: str = "nas",
         mount_type: str | None = None,
         sentinel_status: str = "missing",
         manifest_status: str = "missing",
     ) -> StorageReadiness:
         return StorageReadiness(
-            mode="nas",
+            mode=mode,
             status=status,
             market_data_available=False,
             serving_source="none",

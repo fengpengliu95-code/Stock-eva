@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
     nas_market_dataset_root: Path | None = None
+    local_market_dataset_root: Path | None = None
     supplemental_data_dir: Path | None = None
     supplemental_audit_database_name: str = "supplemental_ingestion.sqlite3"
     akshare_supplemental_enabled: bool = False

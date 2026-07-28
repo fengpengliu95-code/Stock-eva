@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class StorageReadiness(BaseModel):
-    mode: Literal["local", "nas"]
+    mode: Literal["local", "local_dataset", "nas"]
     status: Literal["ready", "unavailable", "misconfigured"]
     market_data_available: bool
     serving_source: Literal["local", "nas", "none"]

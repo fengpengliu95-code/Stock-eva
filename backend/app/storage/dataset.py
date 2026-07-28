@@ -342,7 +342,7 @@ class NasMarketStore:
         latest = max(entries, key=lambda item: item["trade_date"])
         trade_date = date.fromisoformat(latest["trade_date"])
         current = self.control.published_refresh()
-        if current is not None and current.requested_date >= trade_date:
+        if current is not None and current.requested_date == trade_date:
             return current
 
         # Trust only the immutable object that the manifest points to. A local
