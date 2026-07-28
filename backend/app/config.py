@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     supplemental_audit_database_name: str = "supplemental_ingestion.sqlite3"
     akshare_supplemental_enabled: bool = False
     auto_refresh_enabled: bool = False
+    scheduled_refresh_enabled: bool = False
     auto_refresh_min_request_interval_seconds: float = Field(
         default=0.5,
         ge=0.2,

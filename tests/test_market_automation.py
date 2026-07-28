@@ -11,6 +11,7 @@ import pytest
 
 import backend.app.cli as cli
 from backend.app.api.market import get_market_store
+from backend.app.config import get_settings
 from backend.app.main import app
 from backend.app.market.baostock import ProviderBatch
 from backend.app.market.models import RefreshResult
@@ -536,6 +537,45 @@ def test_market_status_api_is_read_only_and_reports_capability(
         "automatic_when_running": True,
         "sleep_catch_up": True,
     }
+
+
+def test_market_status_reports_external_scheduler_state(tmp_path: Path) -> None:
+    module = load_module("backend.app.market.automation")
+    calendar_module = load_module("backend.app.market.calendar")
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 23))
+    store.save_scheduler_state(
+        module.SchedulerState(
+            target_session=date(2026, 7, 23),
+            refresh_state="success",
+            last_success_at=datetime(2026, 7, 23, 18, 20, tzinfo=SHANGHAI),
+        )
+    )
+    settings = get_settings().model_copy(
+        update={
+            "auto_refresh_enabled": False,
+            "scheduled_refresh_enabled": True,
+        }
+    )
+    app.dependency_overrides[get_market_store] = lambda: store
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[calendar_module.get_trading_calendar] = synthetic_calendar
+    app.dependency_overrides[module.get_market_clock] = lambda: (
+        lambda: datetime(2026, 7, 24, 10, tzinfo=SHANGHAI)
+    )
+
+    async def send() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/api/v1/market/status")
+
+    try:
+        response = asyncio.run(send())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["refresh_state"] == "success"
 
 
 def test_market_summary_rejects_expected_date_query_parameter(tmp_path: Path) -> None:

@@ -55,6 +55,7 @@ API、日历、日终刷新、策略和预警随后只读写本机镜像，不�
    ```dotenv
    STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market
    STOCK_EVA_AUTO_REFRESH_ENABLED=false
+   STOCK_EVA_SCHEDULED_REFRESH_ENABLED=true
    ```
 
    自动刷新必须为 `false`，因为 LaunchAgent 的幂等 one-shot 命令是唯一调度

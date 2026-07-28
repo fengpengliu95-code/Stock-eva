@@ -339,6 +339,7 @@ def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
     assert f"STOCK_EVA_LOCAL_CONTROL_DIR={data / 'control'}" in runtime_env
     assert f"STOCK_EVA_LOCAL_MARKET_DATASET_ROOT={data / 'market-dataset'}" in runtime_env
     assert "STOCK_EVA_AKSHARE_SUPPLEMENTAL_ENABLED=false" in runtime_env
+    assert "STOCK_EVA_SCHEDULED_REFRESH_ENABLED=true" in runtime_env
     assert (data / "control/control.sentinel").read_text() == "control"
     assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
     assert stat.S_IMODE(config.stat().st_mode) == 0o700

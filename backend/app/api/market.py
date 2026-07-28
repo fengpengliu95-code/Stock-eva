@@ -147,11 +147,12 @@ def market_status(
         if scheduler is not None and scheduler.calendar_status != "confirmed"
         else ("confirmed" if calendar.session_status(now.date()) != "unknown" else "unavailable")
     )
+    refresh_enabled = settings.auto_refresh_enabled or settings.scheduled_refresh_enabled
     refresh_state = (
         scheduler.refresh_state
-        if settings.auto_refresh_enabled and scheduler is not None
+        if refresh_enabled and scheduler is not None
         else "idle"
-        if settings.auto_refresh_enabled
+        if refresh_enabled
         else "disabled"
     )
     phase = calendar.market_phase(now)
