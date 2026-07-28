@@ -5,14 +5,15 @@ Stock EVA 是面向上交所、深交所 A 股主板的轻量收盘后研究工�
 学习页面保持独立。当前版本不连接券商，不包含实时行情、外部通知、自动交易、盘中
 实时扫描或投资建议。
 
-五阶段代码链路均已建立。BaoStock 全主板历史归档已完成：260 个交易日、829,494 行、
-约 38 MB，最新日期 2026-07-24；NAS manifest、SHA-256、Parquet schema 和行数已经
-真实校验。由于 macOS TCC 拒绝 LaunchAgent 直接访问 `/Volumes/Stock`，正式后台服务
-不从 NAS 或 `Documents` 开发仓库运行，而是读取
+五阶段第一版已经完成并通过本机真实验收。BaoStock 全主板 NAS 历史归档包含
+260 个交易日、829,494 行、约 38 MB，最新日期 2026-07-24；manifest、SHA-256、
+Parquet schema 和行数已经真实校验。本机日终增量已更新到 2026-07-27，已验证镜像
+包含 261 个交易日、832,687 行。由于 macOS TCC 拒绝 LaunchAgent 直接访问
+`/Volumes/Stock`，正式后台服务不从 NAS 或 `Documents` 开发仓库运行，而是读取
 `~/Library/Application Support/Stock EVA/data/market-dataset` 的已验证本机镜像。
-NAS 保留为归档源，本机 DuckDB/SQLite 保存控制状态和用户私有数据。隔离运行时、本机
-镜像和 LaunchAgent 部署实现已完成，正式安装后的端口、readiness、浏览器及下一次
-日终任务仍待主任务最终验证。详细状态见
+NAS 保留为历史归档源，本机 DuckDB/SQLite 保存控制状态和用户私有数据。5 个
+LaunchAgent、端口、storage readiness、日历、日终刷新、私有库备份以及桌面/移动
+浏览器均已读回验收。详细状态见
 [五阶段交付与验收状态](docs/five-stage-status.md)。
 
 ## 工程快速开始
@@ -151,7 +152,7 @@ uv run python -m backend.app.cli auto-refresh-once
 网页、日终刷新、日历同步和私有库备份。安装器从 Git tracked 文件构建
 `Application Support` 隔离运行时，先按 manifest/hash 完整验证 NAS 归档，再原子
 建立本机行情镜像；后台 plist 不包含 `Documents` 或 `/Volumes/Stock` 运行路径。
-当前部署完成状态保持“待主任务最终验证”。见
+当前部署已完成并在本机运行。见
 [macOS LaunchAgents](docs/macos-launchagents.md)。
 
 当某个新交易日通过完整性门槛并成功移动 published pointer 后，后端会按固定顺序
@@ -176,10 +177,11 @@ uv run python -m backend.app.cli backup-private-data
 
 ```bash
 uv run python -m backend.app.acceptance \
-  --nas-root /Volumes/Stock/stock-eva-market
+  --local-dataset-root \
+  "$HOME/Library/Application Support/Stock EVA/data/market-dataset"
 ```
 
-该命令由交互式用户只读 NAS 归档；示例持仓、自选、策略和预警全部写入自动销毁的
+该命令由交互式用户只读本机发布镜像；示例持仓、自选、策略和预警全部写入自动销毁的
 临时 SQLite，正式用户库不会被打开。生产后台的 storage readiness 应显示
 `mode=local_dataset`、`serving_source=local`。结果统一称为“规则候选”，不构成
 投资建议。

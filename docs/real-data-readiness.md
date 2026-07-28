@@ -190,8 +190,9 @@ uv run python -m backend.app.cli auto-refresh-once --execute
 3. 在本机 staging 复制并复核，逐个发布不可变分区，最后原子切换 manifest；
 4. 让 5 个 LaunchAgent 只引用本机运行时、配置、数据和镜像路径。
 
-镜像和运行时实现已完成；正式安装后的端口、storage readiness、浏览器和下一次日终
-任务仍待主任务最终读回。在该验收完成前不宣称部署已上线。操作边界见
+镜像和运行时已经正式安装并完成读回：5 个 LaunchAgent 已加载，API/Web 正常，
+storage readiness 为 `local_dataset/ready/local`，日历、日终刷新和私有备份最近
+执行均成功。操作边界见
 [macOS LaunchAgents](macos-launchagents.md)。
 
 ### 日志与故障处理
@@ -222,15 +223,16 @@ uv run python -m backend.app.cli auto-refresh-once --execute
 
 ## 全阶段真实验收
 
-交互式验收 CLI 可直接检查 NAS 归档的 manifest、不可变 Parquet、历史窗口、持仓
-估值、全市场策略扫描和预警幂等性：
+交互式验收 CLI 可直接检查 NAS 归档或本机发布镜像的 manifest、不可变 Parquet、
+历史窗口、持仓估值、全市场策略扫描和预警幂等性：
 
 ```bash
-STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
-  uv run python -m backend.app.acceptance
+uv run python -m backend.app.acceptance \
+  --local-dataset-root \
+  "$HOME/Library/Application Support/Stock EVA/data/market-dataset"
 ```
 
-验收过程由交互式用户只读 NAS 行情，在临时 SQLite 中建立合成持仓、自选、策略和
+验收过程只读指定的已验证行情镜像，在临时 SQLite 中建立合成持仓、自选、策略和
 预警，结束后删除临时用户库；不会读取或修改真实持仓。LaunchAgent 的最终验收则应
 确认 `mode=local_dataset`、`serving_source=local`。策略输出统一标为“规则候选”，
 不构成投资建议。完整口径见 [端到端真实验收](acceptance-e2e.md)。
@@ -243,7 +245,8 @@ STOCK_EVA_NAS_MARKET_DATASET_ROOT=/Volumes/Stock/stock-eva-market \
 - 退市、长期停牌和证券代码生命周期仍需更完整的证券主数据验证；
 - 当前已有本地后台调度和安全日志，但没有外部失败通知、跨设备同步或集中监控；
 - 260 个交易日、829,494 行、约 38 MB 的 NAS 历史归档已经完成并校验；
-- LaunchAgent 隔离运行时和本机镜像已实现，但正式安装/状态读回仍待主任务完成；
-- 下一次真实交易日的 18:10 自动刷新仍是上线后的时间性观察项；
+- 本机发布镜像已通过 2026-07-27 全市场日终刷新增量到 261 个交易日、832,687 行；
+- LaunchAgent 隔离运行时和本机镜像已正式安装，5 个 agent 与端口/readiness 已读回；
+- 2026-07-27 日终刷新 3,193/3,193、覆盖率 100%，重复调度为幂等 no-op；
 - NAS 归档和本机镜像都可从免费源重建，不做复杂多副本；本机私有 SQLite 使用一致性
   快照备份。免费源不可用时保留最后完整发布，不混用不完整行情。
