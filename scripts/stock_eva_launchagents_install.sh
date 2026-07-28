@@ -403,7 +403,8 @@ fi
 NEXT_CURRENT="$RUNTIME_ROOT/.current.$$"
 /bin/rm -f "$NEXT_CURRENT"
 /bin/ln -s "releases/$RELEASE_ID" "$NEXT_CURRENT"
-/bin/mv -f "$NEXT_CURRENT" "$RUNTIME_CURRENT"
+# BSD mv follows a destination symlink to a directory unless -h is explicit.
+/bin/mv -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"
 CURRENT_SWAPPED=1
 
 LOG_FILES=(

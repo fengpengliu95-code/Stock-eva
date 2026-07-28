@@ -181,6 +181,7 @@ def test_management_scripts_require_explicit_mutation_flags() -> None:
     assert "launchctl print" in status
     assert '"$LAUNCHCTL" bootstrap' in installer
     assert '"$LAUNCHCTL" bootout' in uninstaller
+    assert '/bin/mv -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"' in installer
 
 
 def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
@@ -343,6 +344,30 @@ def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
     assert stat.S_IMODE(config.stat().st_mode) == 0o700
     assert stat.S_IMODE((config / ".env").stat().st_mode) == 0o600
     assert stat.S_IMODE(data.stat().st_mode) == 0o700
+
+
+def test_installer_atomically_replaces_an_existing_runtime_symlink(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["HOME"]) / "Library/Application Support/Stock EVA/runtime/current"
+    first_target = current.readlink()
+
+    (project / "uv.lock").write_text("synthetic lock v2")
+    (project / "backend/sentinel.txt").write_text("backend-v2")
+    second = run_installer(project, environment)
+
+    assert second.returncode == 0, second.stderr
+    assert current.is_symlink()
+    assert current.readlink() != first_target
+    assert (current / "backend/sentinel.txt").read_text() == "backend-v2"
 
 
 def test_installer_rejects_manual_port_conflict_before_writing_plists(
