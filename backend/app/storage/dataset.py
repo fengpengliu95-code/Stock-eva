@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from collections import defaultdict
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -26,6 +27,8 @@ MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
 SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_VALIDATED_DATASETS: set[tuple[str, str]] = set()
+_VALIDATION_LOCK = threading.Lock()
 _EXPECTED_PARQUET_TYPES = {
     "trade_date": "DATE",
     "symbol": "VARCHAR",
@@ -247,24 +250,41 @@ class NasMarketStore:
         if rows != expected_rows:
             raise DatasetError("published parquet row count mismatch")
 
-    def _paths(self) -> list[Path]:
+    def _paths(self, *, force_validation: bool = False) -> list[Path]:
         try:
+            manifest = self._manifest()
             paths: list[Path] = []
-            for item in self._manifest()["files"]:
+            items: list[dict[str, object]] = manifest["files"]
+            for item in items:
                 relative = _safe_relative(item["path"])
                 path = self.root / relative
                 if not path.is_file():
                     raise DatasetError("published manifest references a missing parquet file")
-                if _sha256(path) != item["sha256"]:
-                    raise DatasetError("published parquet checksum mismatch")
-                self._validate_parquet(path, item["row_count"])
                 paths.append(path)
+            key = (str(self.root.resolve()), str(manifest["generation"]))
+            with _VALIDATION_LOCK:
+                if force_validation or key not in _VALIDATED_DATASETS:
+                    for item, path in zip(items, paths, strict=True):
+                        if _sha256(path) != item["sha256"]:
+                            raise DatasetError("published parquet checksum mismatch")
+                        self._validate_parquet(path, item["row_count"])
+                    stale = {
+                        existing
+                        for existing in _VALIDATED_DATASETS
+                        if existing[0] == key[0]
+                    }
+                    _VALIDATED_DATASETS.difference_update(stale)
+                    _VALIDATED_DATASETS.add(key)
             return paths
         except OSError as exc:
             raise DatasetError("published NAS dataset is unavailable") from exc
 
     def validate_readiness(self) -> None:
         """Force manifest/hash/schema validation before exposing a NAS reader."""
+        self._paths(force_validation=True)
+
+    def ensure_readiness(self) -> None:
+        """Validate a dataset generation once per process, then reuse that proof."""
         self._paths()
 
     def _query(self, sql: str, parameters: list[object] | None = None):

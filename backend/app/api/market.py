@@ -63,7 +63,7 @@ def get_market_store(
             layout.local_paths.staging,
         )
         try:
-            store.validate_readiness()
+            store.ensure_readiness()
             store.reconcile_control_pointer()
         except (DatasetError, OSError) as exc:
             raise HTTPException(

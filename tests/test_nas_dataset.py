@@ -300,6 +300,40 @@ def test_nas_manifest_publication_is_readable_and_control_pointer_is_local(tmp_p
     assert [item.symbol for item in summary.indexes] == ["sh.000001", "sz.399001"]
 
 
+def test_reader_reuses_a_validated_generation_across_requests(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    original = NasMarketStore._validate_parquet
+    calls = 0
+
+    def counted(path: Path, expected_rows: int) -> None:
+        nonlocal calls
+        calls += 1
+        original(path, expected_rows)
+
+    monkeypatch.setattr(NasMarketStore, "_validate_parquet", staticmethod(counted))
+    first = store.bars_for(date(2026, 7, 23), "baostock")
+    second_store = NasMarketStore(
+        MarketStore(tmp_path / "second-control.duckdb"),
+        root,
+        tmp_path / "second-staging",
+    )
+    second = second_store.bars_for(date(2026, 7, 23), "baostock")
+
+    assert len(first) == len(second) == 3
+    assert calls == 1
+    second_store.validate_readiness()
+    assert calls == 2
+
+
 def test_failed_readback_never_moves_manifest_or_published_pointer(
     tmp_path: Path, monkeypatch
 ) -> None:
