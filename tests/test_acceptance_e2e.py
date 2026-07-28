@@ -2,6 +2,8 @@ import importlib.util
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
 
@@ -116,3 +118,22 @@ def test_acceptance_uses_temporary_user_data_and_replays_idempotently(
     assert "投资建议" in report.disclaimer
     assert real_user_database.read_bytes() == b"do-not-touch"
     assert list(tmp_path.glob("stock-eva-real-e2e-*")) == []
+
+
+def test_acceptance_cli_accepts_exactly_one_dataset_root() -> None:
+    from backend.app.acceptance import build_parser
+
+    local = build_parser().parse_args(["--local-dataset-root", "/tmp/stock-eva-market"])
+    assert local.local_dataset_root == Path("/tmp/stock-eva-market")
+    assert local.nas_root is None
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "--nas-root",
+                "/Volumes/Stock/stock-eva-market",
+                "--local-dataset-root",
+                "/tmp/stock-eva-market",
+            ]
+        )

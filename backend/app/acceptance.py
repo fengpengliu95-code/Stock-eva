@@ -202,9 +202,11 @@ def run_real_e2e_acceptance(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run read-only NAS market / temporary-user-data E2E acceptance"
+        description="Run read-only market dataset / temporary-user-data E2E acceptance"
     )
-    parser.add_argument("--nas-root", required=True, type=Path)
+    dataset = parser.add_mutually_exclusive_group(required=True)
+    dataset.add_argument("--nas-root", type=Path)
+    dataset.add_argument("--local-dataset-root", type=Path)
     parser.add_argument(
         "--refresh-lock",
         type=Path,
@@ -219,6 +221,7 @@ def main() -> int:
         with RefreshRunLock(args.refresh_lock):
             with TemporaryDirectory(prefix="stock-eva-real-e2e-control-") as raw:
                 workspace = Path(raw)
+                dataset_root = args.local_dataset_root or args.nas_root
                 settings = Settings(
                     _env_file=None,
                     market_data_dir=workspace / "market",
@@ -228,17 +231,18 @@ def main() -> int:
                     local_lock_dir=workspace / "locks",
                     local_temp_dir=workspace / "tmp",
                     nas_market_dataset_root=args.nas_root,
+                    local_market_dataset_root=args.local_dataset_root,
                 )
                 readiness = StoragePreflight(settings).inspect()
                 if not readiness.market_data_available:
-                    raise AcceptanceError("nas_market_storage_not_ready")
+                    raise AcceptanceError("market_storage_not_ready")
                 control = MarketStore(
                     workspace / "control" / "market.duckdb",
                     temp_directory=workspace / "tmp" / "duckdb",
                 )
                 market = NasMarketStore(
                     control,
-                    args.nas_root,
+                    dataset_root,
                     workspace / "staging",
                 )
                 market.validate_readiness()
