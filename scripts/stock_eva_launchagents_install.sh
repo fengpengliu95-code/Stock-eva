@@ -183,6 +183,17 @@ port_is_listening() {
   "$LSOF" -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
 }
 
+wait_for_unloaded() {
+  local label="$1"
+  for _attempt in {1..50}; do
+    if ! "$LAUNCHCTL" print "$DOMAIN/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
 if port_is_listening 8000 \
   && [[ ! -f "$PREVIOUS_ROOT/loaded.com.finlay.stock-eva.api" ]]; then
   echo "error: port 8000 is already in use by a non-Stock-EVA LaunchAgent process" >&2
@@ -221,18 +232,14 @@ rollback() {
       "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
     done
     for label in "${LABELS[@]}"; do
+      wait_for_unloaded "$label" || true
+    done
+    for label in "${LABELS[@]}"; do
       installed="$LAUNCH_AGENT_ROOT/$label.plist"
       if [[ -f "$PREVIOUS_ROOT/existed.$label" ]]; then
         /bin/cp "$PREVIOUS_ROOT/$label.plist" "$installed"
       else
         /bin/rm -f "$installed"
-      fi
-    done
-    for label in "${LABELS[@]}"; do
-      if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
-        "$LAUNCHCTL" bootstrap \
-          "$DOMAIN" \
-          "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1 || true
       fi
     done
     if [[ "$CURRENT_SWAPPED" == "1" ]]; then
@@ -252,6 +259,13 @@ rollback() {
         /bin/rm -f "$CONFIG_ROOT/.env"
       fi
     fi
+    for label in "${LABELS[@]}"; do
+      if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
+        "$LAUNCHCTL" bootstrap \
+          "$DOMAIN" \
+          "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1 || true
+      fi
+    done
     echo "rollback: restored previous LaunchAgent state" >&2
   fi
   exit "$status"
@@ -407,6 +421,12 @@ done
 for label in "${LABELS[@]}"; do
   if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
     "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
+  fi
+done
+for label in "${LABELS[@]}"; do
+  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]] && ! wait_for_unloaded "$label"; then
+    echo "error: $label remained loaded after bootout" >&2
+    false
   fi
 done
 
