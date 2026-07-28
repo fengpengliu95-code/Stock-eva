@@ -11,7 +11,7 @@
     <string>-m</string>
     <string>backend.app.user.backup_cli</string>
     <string>--source</string>
-    <string>__PROJECT_ROOT__/var/user/stock_eva_user.sqlite3</string>
+    <string>__DATA_ROOT__/user/stock_eva_user.sqlite3</string>
     <string>--backup-root</string>
     <string>__BACKUP_ROOT__</string>
     <string>--keep-daily</string>
@@ -20,7 +20,7 @@
     <string>4</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>__PROJECT_ROOT__</string>
+  <string>__CONFIG_ROOT__</string>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>2</integer>

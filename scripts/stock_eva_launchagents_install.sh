@@ -31,6 +31,7 @@ done
 SYSTEM_NAME="${STOCK_EVA_UNAME:-$(uname -s)}"
 LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
 LSOF="${STOCK_EVA_LSOF:-/usr/sbin/lsof}"
+UV="${STOCK_EVA_UV:-$(command -v uv || true)}"
 
 if [[ "$SYSTEM_NAME" != "Darwin" ]]; then
   echo "error: LaunchAgents are supported only on macOS" >&2
@@ -47,11 +48,19 @@ else
 fi
 
 TEMPLATE_ROOT="$PROJECT_ROOT/launchd"
-PYTHON="$PROJECT_ROOT/.venv/bin/python"
+SOURCE_PYTHON="$PROJECT_ROOT/.venv/bin/python"
 ENV_FILE="$PROJECT_ROOT/.env"
 LAUNCH_AGENT_ROOT="$HOME/Library/LaunchAgents"
 LOG_ROOT="$HOME/Library/Logs/Stock EVA"
-BACKUP_ROOT="$HOME/Library/Application Support/Stock EVA/backups"
+APP_SUPPORT_ROOT="$HOME/Library/Application Support/Stock EVA"
+RUNTIME_ROOT="$APP_SUPPORT_ROOT/runtime"
+RELEASES_ROOT="$RUNTIME_ROOT/releases"
+RUNTIME_CURRENT="$RUNTIME_ROOT/current"
+CONFIG_ROOT="$APP_SUPPORT_ROOT/config"
+DATA_ROOT="$APP_SUPPORT_ROOT/data"
+PYTHON="$RUNTIME_CURRENT/.venv/bin/python"
+PUBLIC_ROOT="$RUNTIME_CURRENT/public"
+BACKUP_ROOT="$APP_SUPPORT_ROOT/backups"
 DOMAIN="gui/$UID"
 LABELS=(
   com.finlay.stock-eva.api
@@ -61,8 +70,12 @@ LABELS=(
   com.finlay.stock-eva.backup
 )
 
-if [[ ! -x "$PYTHON" ]]; then
-  echo "error: missing project Python at $PYTHON; run 'uv sync --extra dev' first" >&2
+if [[ ! -x "$SOURCE_PYTHON" ]]; then
+  echo "error: missing project Python at $SOURCE_PYTHON; run 'uv sync --extra dev' first" >&2
+  exit 1
+fi
+if [[ -z "$UV" || ! -x "$UV" ]]; then
+  echo "error: uv executable is required to build an isolated runtime" >&2
   exit 1
 fi
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -94,9 +107,29 @@ if /usr/bin/grep -q '^STOCK_EVA_USER_DATABASE_NAME=' "$ENV_FILE" \
   exit 1
 fi
 
+RUNTIME_ASSETS=(backend workspace dashboard docs index.html pyproject.toml uv.lock README.md)
+for relative in "${RUNTIME_ASSETS[@]}"; do
+  if [[ ! -e "$PROJECT_ROOT/$relative" ]]; then
+    echo "error: missing runtime asset $PROJECT_ROOT/$relative" >&2
+    exit 1
+  fi
+done
+if /usr/bin/git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  RELEASE_ID="$(/usr/bin/git -C "$PROJECT_ROOT" rev-parse HEAD)"
+  RELEASE_FROM_GIT=1
+else
+  RELEASE_ID="synthetic-$(/usr/bin/shasum -a 256 "$PROJECT_ROOT/uv.lock" | /usr/bin/awk '{print substr($1,1,16)}')"
+  RELEASE_FROM_GIT=0
+fi
+RELEASE_ROOT="$RELEASES_ROOT/$RELEASE_ID"
+
 TEMP_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/stock-eva-launchd.XXXXXX")"
+RUNTIME_STAGE=""
 cleanup() {
   /bin/rm -rf "$TEMP_ROOT"
+  if [[ -n "$RUNTIME_STAGE" && -e "$RUNTIME_STAGE" ]]; then
+    /bin/rm -rf "$RUNTIME_STAGE"
+  fi
 }
 trap cleanup EXIT
 
@@ -104,7 +137,9 @@ escape_sed() {
   /usr/bin/sed 's/[&|]/\\&/g' <<<"$1"
 }
 
-PROJECT_ESCAPED="$(escape_sed "$PROJECT_ROOT")"
+CONFIG_ESCAPED="$(escape_sed "$CONFIG_ROOT")"
+PUBLIC_ESCAPED="$(escape_sed "$PUBLIC_ROOT")"
+DATA_ESCAPED="$(escape_sed "$DATA_ROOT")"
 PYTHON_ESCAPED="$(escape_sed "$PYTHON")"
 LOG_ESCAPED="$(escape_sed "$LOG_ROOT")"
 BACKUP_ESCAPED="$(escape_sed "$BACKUP_ROOT")"
@@ -117,7 +152,9 @@ for label in "${LABELS[@]}"; do
     exit 1
   fi
   /usr/bin/sed \
-    -e "s|__PROJECT_ROOT__|$PROJECT_ESCAPED|g" \
+    -e "s|__CONFIG_ROOT__|$CONFIG_ESCAPED|g" \
+    -e "s|__PUBLIC_ROOT__|$PUBLIC_ESCAPED|g" \
+    -e "s|__DATA_ROOT__|$DATA_ESCAPED|g" \
     -e "s|__PYTHON__|$PYTHON_ESCAPED|g" \
     -e "s|__LOG_DIR__|$LOG_ESCAPED|g" \
     -e "s|__BACKUP_ROOT__|$BACKUP_ESCAPED|g" \
@@ -160,6 +197,10 @@ fi
 if [[ "$MODE" == "check" ]]; then
   echo "ready: 5 LaunchAgent templates rendered and validated"
   echo "project=$PROJECT_ROOT"
+  echo "runtime=$RUNTIME_CURRENT"
+  echo "release=$RELEASE_ID"
+  echo "config=$CONFIG_ROOT"
+  echo "data=$DATA_ROOT"
   echo "env=$ENV_FILE"
   echo "mutation=false"
   echo "install with: $0 --install"
@@ -167,6 +208,10 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 MUTATION_STARTED=0
+CURRENT_SWAPPED=0
+PREVIOUS_CURRENT_TARGET=""
+RELEASE_CREATED=0
+CONFIG_CHANGED=0
 rollback() {
   status=$?
   trap - ERR
@@ -190,6 +235,23 @@ rollback() {
           "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1 || true
       fi
     done
+    if [[ "$CURRENT_SWAPPED" == "1" ]]; then
+      /bin/rm -f "$RUNTIME_CURRENT"
+      if [[ -n "$PREVIOUS_CURRENT_TARGET" ]]; then
+        /bin/ln -s "$PREVIOUS_CURRENT_TARGET" "$RUNTIME_CURRENT"
+      fi
+    fi
+    if [[ "$RELEASE_CREATED" == "1" && -d "$RELEASE_ROOT" ]]; then
+      /bin/rm -rf "$RELEASE_ROOT"
+    fi
+    if [[ "$CONFIG_CHANGED" == "1" ]]; then
+      if [[ -f "$CONFIG_ROOT/.env.previous" ]]; then
+        /bin/cp "$CONFIG_ROOT/.env.previous" "$CONFIG_ROOT/.env"
+        /bin/chmod 0600 "$CONFIG_ROOT/.env"
+      else
+        /bin/rm -f "$CONFIG_ROOT/.env"
+      fi
+    fi
     echo "rollback: restored previous LaunchAgent state" >&2
   fi
   exit "$status"
@@ -197,8 +259,129 @@ rollback() {
 trap rollback ERR
 
 MUTATION_STARTED=1
-/bin/mkdir -p "$LAUNCH_AGENT_ROOT" "$LOG_ROOT" "$BACKUP_ROOT"
-/bin/chmod 0700 "$LOG_ROOT" "$BACKUP_ROOT"
+/bin/mkdir -p \
+  "$LAUNCH_AGENT_ROOT" \
+  "$LOG_ROOT" \
+  "$BACKUP_ROOT" \
+  "$APP_SUPPORT_ROOT" \
+  "$RUNTIME_ROOT" \
+  "$RELEASES_ROOT" \
+  "$CONFIG_ROOT" \
+  "$DATA_ROOT"
+/bin/chmod 0700 \
+  "$LOG_ROOT" \
+  "$BACKUP_ROOT" \
+  "$APP_SUPPORT_ROOT" \
+  "$RUNTIME_ROOT" \
+  "$RELEASES_ROOT" \
+  "$CONFIG_ROOT" \
+  "$DATA_ROOT"
+
+if [[ ! -f "$RELEASE_ROOT/.ready" ]]; then
+  /bin/rm -rf "$RELEASE_ROOT"
+  RUNTIME_STAGE="$RUNTIME_ROOT/.release-stage.$$"
+  /bin/rm -rf "$RUNTIME_STAGE"
+  /bin/mkdir -p "$RUNTIME_STAGE"
+  if [[ "$RELEASE_FROM_GIT" == "1" ]]; then
+    /usr/bin/git -C "$PROJECT_ROOT" archive \
+      --format=tar \
+      "$RELEASE_ID" \
+      -- "${RUNTIME_ASSETS[@]}" \
+      | /usr/bin/tar -xf - -C "$RUNTIME_STAGE"
+  else
+    for relative in "${RUNTIME_ASSETS[@]}"; do
+      /usr/bin/ditto "$PROJECT_ROOT/$relative" "$RUNTIME_STAGE/$relative"
+    done
+  fi
+  /bin/mkdir -p "$RUNTIME_STAGE/public"
+  for relative in index.html workspace dashboard docs; do
+    /bin/mv "$RUNTIME_STAGE/$relative" "$RUNTIME_STAGE/public/$relative"
+  done
+  UV_PROJECT_ENVIRONMENT="$RUNTIME_STAGE/.venv" \
+    "$UV" sync \
+      --project "$RUNTIME_STAGE" \
+      --frozen \
+      --no-dev \
+      --no-editable \
+      --compile-bytecode
+  if /usr/bin/find "$RUNTIME_STAGE/.venv" -name '*.pth' -type f -exec \
+    /usr/bin/grep -IlF "$PROJECT_ROOT" {} + | /usr/bin/grep -q .; then
+    echo "error: production runtime still references the development project" >&2
+    false
+  fi
+  (
+    cd "$TEMP_ROOT"
+    "$RUNTIME_STAGE/.venv/bin/python" -c \
+      "import backend, duckdb, fastapi, uvicorn"
+  )
+  LOCK_SHA="$(/usr/bin/shasum -a 256 "$RUNTIME_STAGE/uv.lock" | /usr/bin/awk '{print $1}')"
+  BUILT_AT="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  /usr/bin/printf \
+    '{"git_sha":"%s","uv_lock_sha256":"%s","built_at":"%s","version":"0.1.0"}\n' \
+    "$RELEASE_ID" \
+    "$LOCK_SHA" \
+    "$BUILT_AT" \
+    >"$RUNTIME_STAGE/RELEASE.json"
+  /usr/bin/touch "$RUNTIME_STAGE/.ready"
+  /bin/chmod 0700 "$RUNTIME_STAGE"
+  /bin/mv "$RUNTIME_STAGE" "$RELEASE_ROOT"
+  RUNTIME_STAGE=""
+  RELEASE_CREATED=1
+fi
+
+DATA_ROOT_ESCAPED="$(escape_sed "$DATA_ROOT")"
+/usr/bin/sed \
+  -e "s|^STOCK_EVA_MARKET_DATA_DIR=.*$|STOCK_EVA_MARKET_DATA_DIR=$DATA_ROOT_ESCAPED/market|" \
+  -e "s|^STOCK_EVA_USER_DATA_DIR=.*$|STOCK_EVA_USER_DATA_DIR=$DATA_ROOT_ESCAPED/user|" \
+  -e "s|^STOCK_EVA_LOCAL_CONTROL_DIR=.*$|STOCK_EVA_LOCAL_CONTROL_DIR=$DATA_ROOT_ESCAPED/control|" \
+  -e "s|^STOCK_EVA_LOCAL_STAGING_DIR=.*$|STOCK_EVA_LOCAL_STAGING_DIR=$DATA_ROOT_ESCAPED/staging|" \
+  -e "s|^STOCK_EVA_LOCAL_LOCK_DIR=.*$|STOCK_EVA_LOCAL_LOCK_DIR=$DATA_ROOT_ESCAPED/locks|" \
+  -e "s|^STOCK_EVA_LOCAL_TEMP_DIR=.*$|STOCK_EVA_LOCAL_TEMP_DIR=$DATA_ROOT_ESCAPED/tmp|" \
+  "$ENV_FILE" >"$CONFIG_ROOT/.env.next"
+while IFS='|' read -r key value; do
+  if ! /usr/bin/grep -q "^$key=" "$CONFIG_ROOT/.env.next"; then
+    echo "$key=$value" >>"$CONFIG_ROOT/.env.next"
+  fi
+done <<EOF
+STOCK_EVA_MARKET_DATA_DIR|$DATA_ROOT/market
+STOCK_EVA_USER_DATA_DIR|$DATA_ROOT/user
+STOCK_EVA_LOCAL_CONTROL_DIR|$DATA_ROOT/control
+STOCK_EVA_LOCAL_STAGING_DIR|$DATA_ROOT/staging
+STOCK_EVA_LOCAL_LOCK_DIR|$DATA_ROOT/locks
+STOCK_EVA_LOCAL_TEMP_DIR|$DATA_ROOT/tmp
+EOF
+/bin/chmod 0600 "$CONFIG_ROOT/.env.next"
+if [[ -f "$CONFIG_ROOT/.env" ]]; then
+  /bin/cp "$CONFIG_ROOT/.env" "$CONFIG_ROOT/.env.previous"
+  /bin/chmod 0600 "$CONFIG_ROOT/.env.previous"
+fi
+/bin/mv -f "$CONFIG_ROOT/.env.next" "$CONFIG_ROOT/.env"
+CONFIG_CHANGED=1
+
+for name in market user control staging locks tmp; do
+  destination="$DATA_ROOT/$name"
+  /bin/mkdir -p "$destination"
+  /bin/chmod 0700 "$destination"
+  source="$PROJECT_ROOT/var/$name"
+  if [[ -d "$source" ]] \
+    && [[ -z "$(/usr/bin/find "$destination" -mindepth 1 -print -quit)" ]]; then
+    /usr/bin/ditto "$source" "$destination"
+  fi
+done
+/bin/chmod 0700 "$DATA_ROOT"
+
+if [[ -L "$RUNTIME_CURRENT" ]]; then
+  PREVIOUS_CURRENT_TARGET="$(/usr/bin/readlink "$RUNTIME_CURRENT")"
+elif [[ -e "$RUNTIME_CURRENT" ]]; then
+  echo "error: runtime current pointer is not a symbolic link" >&2
+  false
+fi
+NEXT_CURRENT="$RUNTIME_ROOT/.current.$$"
+/bin/rm -f "$NEXT_CURRENT"
+/bin/ln -s "releases/$RELEASE_ID" "$NEXT_CURRENT"
+/bin/mv -f "$NEXT_CURRENT" "$RUNTIME_CURRENT"
+CURRENT_SWAPPED=1
+
 LOG_FILES=(
   api.log api-error.log
   web.log web-error.log
@@ -242,6 +425,27 @@ for label in "${LABELS[@]}"; do
 done
 
 MUTATION_STARTED=0
+CURRENT_SWAPPED=0
+RELEASE_CREATED=0
+CONFIG_CHANGED=0
+for legacy in .venv backend workspace dashboard docs index.html pyproject.toml uv.lock README.md .env; do
+  legacy_path="$RUNTIME_ROOT/$legacy"
+  if [[ -e "$legacy_path" && "$legacy_path" != "$RUNTIME_CURRENT" ]]; then
+    /bin/rm -rf "$legacy_path"
+  fi
+done
+for release in "$RELEASES_ROOT"/*; do
+  [[ -d "$release" ]] || continue
+  relative="releases/$(basename "$release")"
+  if [[ "$relative" != "releases/$RELEASE_ID" \
+    && "$relative" != "$PREVIOUS_CURRENT_TARGET" ]]; then
+    /bin/rm -rf "$release"
+  fi
+done
 trap - ERR
 echo "installed: 5 Stock EVA LaunchAgents"
+echo "runtime: $RUNTIME_CURRENT"
+echo "release: $RELEASE_ID"
+echo "config: $CONFIG_ROOT"
+echo "data: $DATA_ROOT"
 echo "status: $PROJECT_ROOT/scripts/stock_eva_launchagents_status.sh"

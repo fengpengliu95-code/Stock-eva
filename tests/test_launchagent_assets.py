@@ -15,13 +15,19 @@ from backend.app.user.backup import PrivateBackupError, PrivateBackupService
 ROOT = Path(__file__).parents[1]
 LAUNCHD = ROOT / "launchd"
 SCRIPTS = ROOT / "scripts"
+RUNTIME_ROOT = Path("/Users/test/Library/Application Support/Stock EVA/runtime")
+RUNTIME_CURRENT = RUNTIME_ROOT / "current"
+CONFIG_ROOT = Path("/Users/test/Library/Application Support/Stock EVA/config")
+DATA_ROOT = Path("/Users/test/Library/Application Support/Stock EVA/data")
 
 
 def rendered_plist(name: str) -> dict:
     payload = (LAUNCHD / name).read_text()
     replacements = {
-        "__PROJECT_ROOT__": str(ROOT),
-        "__PYTHON__": str(ROOT / ".venv/bin/python"),
+        "__CONFIG_ROOT__": str(CONFIG_ROOT),
+        "__PUBLIC_ROOT__": str(RUNTIME_CURRENT / "public"),
+        "__PYTHON__": str(RUNTIME_CURRENT / ".venv/bin/python"),
+        "__DATA_ROOT__": str(DATA_ROOT),
         "__LOG_DIR__": "/Users/test/Library/Logs/Stock EVA",
         "__BACKUP_ROOT__": "/Users/test/Library/Application Support/Stock EVA/backups",
     }
@@ -37,7 +43,7 @@ def test_api_and_workspace_agents_are_local_only_and_recoverable() -> None:
 
     assert api["RunAtLoad"] is True
     assert api["KeepAlive"] is True
-    assert api["WorkingDirectory"] == str(ROOT)
+    assert api["WorkingDirectory"] == str(CONFIG_ROOT)
     assert api["ProgramArguments"][-4:] == [
         "--host",
         "127.0.0.1",
@@ -50,7 +56,7 @@ def test_api_and_workspace_agents_are_local_only_and_recoverable() -> None:
         "--bind",
         "127.0.0.1",
         "--directory",
-        str(ROOT),
+        str(RUNTIME_CURRENT / "public"),
     ]
 
 
@@ -63,7 +69,7 @@ def test_after_close_agent_uses_idempotent_backend_schedule() -> None:
         "auto-refresh-once",
         "--execute",
     ]
-    assert refresh["WorkingDirectory"] == str(ROOT)
+    assert refresh["WorkingDirectory"] == str(CONFIG_ROOT)
     assert refresh["StartCalendarInterval"] == [
         {"Hour": 18, "Minute": 10},
         {"Hour": 18, "Minute": 40},
@@ -96,7 +102,7 @@ def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
     assert backup.get("KeepAlive") is None
     assert backup["ProgramArguments"][-8:] == [
         "--source",
-        str(ROOT / "var/user/stock_eva_user.sqlite3"),
+        str(DATA_ROOT / "user/stock_eva_user.sqlite3"),
         "--backup-root",
         "/Users/test/Library/Application Support/Stock EVA/backups",
         "--keep-daily",
@@ -184,6 +190,18 @@ def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
     python.parent.mkdir(parents=True)
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(0o755)
+    for directory in ("backend", "workspace", "dashboard", "docs"):
+        target = project / directory
+        target.mkdir()
+        (target / "sentinel.txt").write_text(directory)
+    (project / "index.html").write_text("stock eva")
+    (project / "pyproject.toml").write_text("[project]\nname='stock-eva-synthetic'\n")
+    (project / "uv.lock").write_text("synthetic lock")
+    (project / "README.md").write_text("synthetic")
+    for directory in ("market", "control", "user"):
+        target = project / "var" / directory
+        target.mkdir(parents=True)
+        (target / f"{directory}.sentinel").write_text(directory)
     (project / ".env").write_text(
         "\n".join(
             [
@@ -224,6 +242,23 @@ def fake_lsof(tmp_path: Path, *, occupied: bool) -> Path:
     return executable
 
 
+def fake_uv(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-uv"
+    executable.write_text(
+        """#!/bin/bash
+set -e
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+cat >"$UV_PROJECT_ENVIRONMENT/bin/python" <<'PY'
+#!/bin/sh
+exit 0
+PY
+chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
 def install_environment(
     tmp_path: Path,
     *,
@@ -237,6 +272,7 @@ def install_environment(
         "CALL_LOG": str(tmp_path / "launchctl.log"),
         "STOCK_EVA_LAUNCHCTL": str(launchctl),
         "STOCK_EVA_LSOF": str(lsof),
+        "STOCK_EVA_UV": str(fake_uv(tmp_path)),
         "STOCK_EVA_UNAME": "Darwin",
     }
 
@@ -283,6 +319,28 @@ def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
     assert stat.S_IMODE(log_root.stat().st_mode) == 0o700
     assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in log_root.iterdir())
+    runtime = home / "Library/Application Support/Stock EVA/runtime"
+    current = runtime / "current"
+    config = home / "Library/Application Support/Stock EVA/config"
+    data = home / "Library/Application Support/Stock EVA/data"
+    assert current.is_symlink()
+    assert (current / "backend/sentinel.txt").read_text() == "backend"
+    assert (current / ".venv/bin/python").is_file()
+    assert (current / "public/workspace/sentinel.txt").read_text() == "workspace"
+    assert not (current / "public/.env").exists()
+    assert not (current / "public/backend").exists()
+    assert not (current / "public/var").exists()
+    assert str(project) not in (installed[0]).read_text()
+    assert str(current) in (installed[0]).read_text()
+    runtime_env = (config / ".env").read_text()
+    assert f"STOCK_EVA_MARKET_DATA_DIR={data / 'market'}" in runtime_env
+    assert f"STOCK_EVA_USER_DATA_DIR={data / 'user'}" in runtime_env
+    assert f"STOCK_EVA_LOCAL_CONTROL_DIR={data / 'control'}" in runtime_env
+    assert (data / "control/control.sentinel").read_text() == "control"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config.stat().st_mode) == 0o700
+    assert stat.S_IMODE((config / ".env").stat().st_mode) == 0o600
+    assert stat.S_IMODE(data.stat().st_mode) == 0o700
 
 
 def test_installer_rejects_manual_port_conflict_before_writing_plists(
@@ -318,6 +376,10 @@ def test_installer_rolls_back_partial_bootstrap_failure(tmp_path: Path) -> None:
     agent_root = Path(environment["HOME"]) / "Library/LaunchAgents"
     assert list(agent_root.glob("com.finlay.stock-eva.*.plist")) == []
     assert "rollback: restored previous LaunchAgent state" in result.stderr
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    assert not (app_support / "runtime/current").exists()
+    assert list((app_support / "runtime/releases").glob("*")) == []
+    assert not (app_support / "config/.env").exists()
 
 
 def test_installer_rollback_restores_preexisting_loaded_agent(

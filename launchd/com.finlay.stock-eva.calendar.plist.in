@@ -15,7 +15,7 @@
     <string>--execute</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>__PROJECT_ROOT__</string>
+  <string>__CONFIG_ROOT__</string>
   <key>RunAtLoad</key>
   <true/>
   <key>StartCalendarInterval</key>
