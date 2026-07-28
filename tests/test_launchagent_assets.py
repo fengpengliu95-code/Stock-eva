@@ -182,6 +182,8 @@ def test_management_scripts_require_explicit_mutation_flags() -> None:
     assert '"$LAUNCHCTL" bootstrap' in installer
     assert '"$LAUNCHCTL" bootout' in uninstaller
     assert '/bin/mv -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"' in installer
+    assert "wait_for_http" in status
+    assert '[[ "$attempt" -le 15 ]]' in status
 
 
 def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
