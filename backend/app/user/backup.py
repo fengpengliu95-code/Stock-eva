@@ -74,8 +74,8 @@ class PrivateBackupService:
         except (OSError, sqlite3.Error) as exc:
             raise PrivateBackupError("private SQLite backup failed") from exc
         finally:
-            daily_stage.unlink(missing_ok=True)
-            weekly_stage.unlink(missing_ok=True)
+            self._remove_temporary_artifacts(daily_stage)
+            self._remove_temporary_artifacts(weekly_stage)
         return PrivateBackupOutcome(
             status="completed",
             daily_backup=daily,
@@ -92,6 +92,12 @@ class PrivateBackupService:
         )
         os.close(descriptor)
         return Path(name)
+
+    @staticmethod
+    def _remove_temporary_artifacts(path: Path) -> None:
+        path.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            path.with_name(f"{path.name}{suffix}").unlink(missing_ok=True)
 
     def _backup_to(self, target: Path) -> None:
         source_uri = f"{self.source.as_uri()}?mode=ro"

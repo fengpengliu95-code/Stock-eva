@@ -44,7 +44,7 @@ def test_backup_uses_sqlite_snapshot_and_passes_integrity_check(tmp_path: Path) 
     assert outcome.weekly_backup.exists()
     assert read_value(outcome.daily_backup) == "committed"
     assert read_value(outcome.weekly_backup) == "committed"
-    assert list((tmp_path / "backups").glob("*.partial")) == []
+    assert list((tmp_path / "backups").glob("*.partial*")) == []
 
 
 def test_same_day_and_week_replace_named_snapshot_without_unbounded_growth(
@@ -106,7 +106,7 @@ def test_failed_integrity_check_does_not_replace_existing_backup(
         service.run(now)
 
     assert existing.daily_backup.read_bytes() == original_bytes
-    assert list(backup_root.glob("*.partial")) == []
+    assert list(backup_root.glob("*.partial*")) == []
 
 
 @pytest.mark.parametrize(
