@@ -6,6 +6,13 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter
 
+from backend.app.classification.provider import (
+    BaoStockClassificationProvider,
+    ClassificationProviderError,
+)
+from backend.app.classification.service import ClassificationConflictError
+from backend.app.classification.store import ClassificationStore
+from backend.app.classification.sync import run_classification_sync
 from backend.app.config import get_settings
 from backend.app.market.automation import (
     MarketAutomationService,
@@ -207,6 +214,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export = subparsers.add_parser("export", help="export one stored date to Parquet")
     export.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
+    classification_sync = subparsers.add_parser(
+        "classification-sync",
+        help="plan or execute a point-in-time security/index/sector metadata sync",
+    )
+    classification_sync.add_argument(
+        "--as-of",
+        required=True,
+        type=date.fromisoformat,
+        dest="as_of",
+    )
+    classification_sync.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform bounded BaoStock metadata reads and publish; omitted means dry-run",
+    )
+    classification_sync.add_argument(
+        "--socket-timeout-seconds",
+        type=_socket_timeout_value,
+        help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
+    )
     private_backup = subparsers.add_parser(
         "backup-private-data",
         help="create a consistent local SQLite snapshot with bounded retention",
@@ -224,6 +251,46 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     settings = get_settings()
+    if args.command == "classification-sync":
+        store = ClassificationStore(
+            settings.market_data_dir / settings.classification_database_name,
+            temp_directory=settings.local_temp_dir / "classification-duckdb",
+        )
+        provider = (
+            BaoStockClassificationProvider(
+                min_request_interval_seconds=(
+                    settings.auto_refresh_min_request_interval_seconds
+                ),
+                socket_timeout_seconds=(
+                    args.socket_timeout_seconds
+                    or settings.baostock_socket_timeout_seconds
+                ),
+            )
+            if args.execute
+            else None
+        )
+        try:
+            result = run_classification_sync(
+                as_of=args.as_of,
+                execute=args.execute,
+                store=store,
+                provider=provider,
+            )
+        except (ClassificationProviderError, ClassificationConflictError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "as_of": args.as_of.isoformat(),
+                        "quality_issues": ["classification_sync_failed"],
+                        "writes_classification_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
+        return 0 if result.status in {"dry-run", "ready"} else 1
     if args.command == "backup-private-data":
         try:
             outcome = PrivateBackupService(

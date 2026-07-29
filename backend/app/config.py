@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     ]
     market_data_dir: Path = Path("var/market")
     market_database_name: str = "stock_eva.duckdb"
+    classification_database_name: str = "classification.duckdb"
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
     local_control_dir: Path = Path("var/control")
