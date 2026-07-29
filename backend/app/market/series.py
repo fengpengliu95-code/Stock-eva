@@ -22,17 +22,16 @@ class PriceSeriesService:
         adjustment: Literal["none", "qfq"] = "qfq",
     ) -> list[PriceSeriesPoint]:
         all_bars = self.store.symbol_bars(symbol, start, end, source="baostock")
+        if not all_bars:
+            return []
         bars = [bar for bar in all_bars if not bar.is_suspended]
         target_factor = None
         if adjustment == "qfq":
-            if not all_bars or all_bars[-1].adjust_factor is None:
-                target = all_bars[-1] if all_bars else None
-                detail = (
-                    f"{target.symbol} {target.trade_date}"
-                    if target is not None
-                    else f"{symbol} {end}"
+            if all_bars[-1].adjust_factor is None:
+                target = all_bars[-1]
+                raise DataQualityError(
+                    f"{target.symbol} {target.trade_date} missing adjust_factor"
                 )
-                raise DataQualityError(f"{detail} missing adjust_factor")
             target_factor = float(all_bars[-1].adjust_factor)
         result: list[PriceSeriesPoint] = []
         for bar in bars:

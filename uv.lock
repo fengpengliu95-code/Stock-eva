@@ -100,6 +100,20 @@ wheels = [
 ]
 
 [[package]]
+name = "build"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "os_name == 'nt'" },
+    { name = "packaging" },
+    { name = "pyproject-hooks" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/78/e0/df5e171f685f82f37b12e1f208064e24244911079d7b767447d1af7e0d70/build-1.5.0.tar.gz", hash = "sha256:302c22c3ba2a0fd5f3911918651341ebb3896176cbdec15bd421f80b1afc7647", size = 89796, upload-time = "2026-04-30T03:18:25.17Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/fe/6bea5c9162869c5beba5d9c8abbed835ec85bf1ec1fba05a3822325c45f3/build-1.5.0-py3-none-any.whl", hash = "sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f", size = 26018, upload-time = "2026-04-30T03:18:23.644Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -554,6 +568,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyproject-hooks"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -709,8 +732,10 @@ dependencies = [
     { name = "baostock" },
     { name = "duckdb" },
     { name = "fastapi" },
+    { name = "numpy" },
     { name = "pydantic-settings" },
     { name = "pytz" },
+    { name = "ta-lib" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -731,13 +756,36 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.4,<2" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
+    { name = "numpy", specifier = ">=2,<3" },
     { name = "pydantic-settings", specifier = ">=2.6,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<9" },
     { name = "pytz", specifier = ">=2025.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8,<1" },
+    { name = "ta-lib", specifier = "==0.7.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<1" },
 ]
 provides-extras = ["dev", "supplemental"]
+
+[[package]]
+name = "ta-lib"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "build" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/54/a1/4448598a7a7d8a30b8f1cee85f35720d0258aa75b4d25c990aeabb061efc/ta_lib-0.7.0.tar.gz", hash = "sha256:e0c2d2156b3702eb850bfb7a14c115870e087fa106d07ad51936078768581423", size = 409253, upload-time = "2026-07-04T02:18:32.884Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/4b/8e0ee213062817c70236eb90b48db57646f805af9fbdb9e448ed93dc2c7e/ta_lib-0.7.0-cp312-cp312-macosx_13_0_x86_64.whl", hash = "sha256:8b1221fcdf2b5a61b807bfe95ebed609928494f23bc446f4bd7af92cd9d7e88f", size = 1250510, upload-time = "2026-07-04T02:15:16.466Z" },
+    { url = "https://files.pythonhosted.org/packages/36/03/3da35d115312dd2c8556c6b3ac99453a3e55a2cfdfe2c415401a7baaa9d0/ta_lib-0.7.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:c723b66e842c2ae8f519bbaf03dfd1be0dbab1240fe3a40780d20ef0498e238d", size = 1118990, upload-time = "2026-07-04T02:15:18.956Z" },
+    { url = "https://files.pythonhosted.org/packages/21/99/3105450b8582b19f64ca40f511208e7c6f591cf9cf3cbccd4339af21bb8b/ta_lib-0.7.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d7f97a8ce6e11c0833eceecce445b06ac23248b69a2960edd247e311a77d6513", size = 3965455, upload-time = "2026-07-04T02:15:24.11Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/a7/1142143509a97b6a1123e32bd1b44fdea68e92131d89028ce87919fcac00/ta_lib-0.7.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:26de33f5eaa0386239681cc4d4c85a7761745fac2bad4ee17d227a8779200663", size = 4097142, upload-time = "2026-07-04T02:15:31.429Z" },
+    { url = "https://files.pythonhosted.org/packages/da/e8/941d4d10f9417363eed75e43a7bcf0c46fb7d792c9c937931c17203a388e/ta_lib-0.7.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:1d32a500689b6e498831ac629ef03c2792585ec889b6079205b492ad95660db0", size = 3594677, upload-time = "2026-07-04T02:15:39.668Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/0a/886229bd4a6a755e02acb7b21094f0149355961d0355a777aeb9bb59caed/ta_lib-0.7.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:b34d4e36a14cee0d6e86e3c52c3f1b4d84745cc9d31067d59d657b66ccda16f3", size = 3717838, upload-time = "2026-07-04T02:15:50.787Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/80/ff3d1a3844ef8e8b2d97242c58bbe4c08baba89b68362ca1f3f7b9f49519/ta_lib-0.7.0-cp312-cp312-win32.whl", hash = "sha256:755d3aa68f3da344cca3e8a610ad829b6dfd063c4cbafb58b3e1eadc30ddc5ab", size = 798641, upload-time = "2026-07-04T02:15:57.834Z" },
+    { url = "https://files.pythonhosted.org/packages/de/5c/308641df6e7c23739314af85fedb7a693cd93dadd9ed27a3ed5e8124c4b5/ta_lib-0.7.0-cp312-cp312-win_amd64.whl", hash = "sha256:6883ce7a7e66243fbe059adca468773ce95f2c6d866b3dadedcc83c9ac5c4373", size = 918482, upload-time = "2026-07-04T02:15:53.459Z" },
+    { url = "https://files.pythonhosted.org/packages/56/69/626b9e29d49fcc7b43c672e568195f16d00c407a07bbac656b5f3ca0af1b/ta_lib-0.7.0-cp312-cp312-win_arm64.whl", hash = "sha256:be8dab7f1852f08c66cc692a3b0b961c8f49d81655cf2e4a2470e7449cff6133", size = 782521, upload-time = "2026-07-04T02:15:55.884Z" },
+]
 
 [[package]]
 name = "tabulate"

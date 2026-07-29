@@ -42,6 +42,7 @@ python3 -m http.server 8080
 - `GET http://127.0.0.1:8000/api/v1/market/status`
 - `GET http://127.0.0.1:8000/api/v1/market/summary`
 - `GET http://127.0.0.1:8000/api/v1/market/supplemental`
+- `GET http://127.0.0.1:8000/api/v1/securities/sh.600000/analysis?start=2025-07-01&end=2026-07-24`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/positions`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/valuation`
 - `GET http://127.0.0.1:8000/api/v1/watchlists`
@@ -195,7 +196,9 @@ uv run --extra dev ruff check backend tests
 
 环境变量示例见 `.env.example`，工程边界与后续组件计划见
 [工程架构](docs/architecture.md)，行情契约与降级语义见
-[阶段 1 行情说明](docs/market-data.md)，本地持仓、自选、估值和备份边界见
+[阶段 1 行情说明](docs/market-data.md)；
+[个股技术分析 API](docs/security-analysis.md) 说明指标参数、暖机、前复权、来源、
+公式版本和质量错误；本地持仓、自选、估值和备份边界见
 [阶段 2 用户数据说明](docs/user-data.md)，策略 AST、指标和无未来数据语义见
 [阶段 3 策略 DSL](docs/strategy-dsl.md)，工作台交互与状态边界见
 [阶段 4 工作台说明](docs/workspace.md)，收盘后预警状态机见

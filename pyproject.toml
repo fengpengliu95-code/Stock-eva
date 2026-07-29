@@ -12,8 +12,10 @@ dependencies = [
   "baostock>=0.9.3,<1",
   "duckdb>=1.4,<2",
   "fastapi>=0.115,<1",
+  "numpy>=2,<3",
   "pydantic-settings>=2.6,<3",
   "pytz>=2025.2",
+  "ta-lib==0.7.0",
   "uvicorn[standard]>=0.32,<1",
 ]
 
