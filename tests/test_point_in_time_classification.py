@@ -765,6 +765,41 @@ def test_changed_record_content_with_same_lineage_reaches_conflict_guard(
     assert store.generation_count() == 1
 
 
+@pytest.mark.parametrize(
+    "read_path",
+    ["idempotent_publish", "generation_at", "read_snapshot"],
+)
+def test_persisted_legacy_generation_preserves_schema_version(
+    tmp_path: Path,
+    read_path: str,
+) -> None:
+    store, _ = service(tmp_path)
+    payload = snapshot(
+        securities=[security("sh.600000")],
+        memberships=[membership("sh.600000")],
+    )
+    published = store.publish(payload)
+    writer = store._connect_writer()
+    writer.execute(
+        """
+        UPDATE classification_generations
+        SET schema_version = 'classification-v2'
+        WHERE generation_id = ?
+        """,
+        [published.generation.generation_id],
+    )
+    writer.close()
+
+    generation = {
+        "idempotent_publish": lambda: store.publish(payload).generation,
+        "generation_at": lambda: store.generation_at(SNAPSHOT_DATE),
+        "read_snapshot": lambda: store.read_snapshot(SNAPSHOT_DATE).generation,
+    }[read_path]()
+
+    assert generation is not None
+    assert generation.schema_version == "classification-v2"
+
+
 def test_conflicting_same_source_snapshot_fails_closed(tmp_path: Path) -> None:
     store, _ = service(tmp_path)
     store.publish(

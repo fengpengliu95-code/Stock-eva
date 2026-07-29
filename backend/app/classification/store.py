@@ -802,9 +802,9 @@ class ClassificationStore:
     def _generation_by_id(self, connection, generation_id: str) -> GenerationSummary | None:
         row = connection.execute(
             """
-            SELECT sequence, generation_id, source, source_version, source_snapshot_date,
-                   source_date_semantics, observed_at, row_counts, coverage_audits,
-                   market_scope
+            SELECT sequence, generation_id, schema_version, source, source_version,
+                   source_snapshot_date, source_date_semantics, observed_at, row_counts,
+                   coverage_audits, market_scope
             FROM classification_generations WHERE generation_id = ?
             """,
             [generation_id],
@@ -816,14 +816,18 @@ class ClassificationStore:
         return GenerationSummary(
             sequence=row[0],
             generation_id=row[1],
-            source=row[2],
-            source_version=row[3],
-            source_snapshot_date=row[4],
-            source_date_semantics=row[5],
-            observed_at=row[6],
-            row_counts=json.loads(row[7]),
-            coverage_audits=[CoverageAudit.model_validate(item) for item in json.loads(row[8])],
-            market_scope=MarketScope.model_validate_json(row[9]),
+            schema_version=row[2],
+            source=row[3],
+            source_version=row[4],
+            source_snapshot_date=row[5],
+            source_date_semantics=row[6],
+            observed_at=row[7],
+            row_counts=json.loads(row[8]),
+            coverage_audits=[
+                CoverageAudit.model_validate(item)
+                for item in json.loads(row[9])
+            ],
+            market_scope=MarketScope.model_validate_json(row[10]),
         )
 
     def generation_at(self, as_of: date) -> GenerationSummary | None:
@@ -836,9 +840,9 @@ class ClassificationStore:
             row = self._execute(
                 connection,
                 """
-                SELECT sequence, generation_id, source, source_version, source_snapshot_date,
-                       source_date_semantics, observed_at, row_counts, coverage_audits,
-                       market_scope
+                SELECT sequence, generation_id, schema_version, source, source_version,
+                       source_snapshot_date, source_date_semantics, observed_at, row_counts,
+                       coverage_audits, market_scope
                 FROM classification_generations
                 WHERE promoted = TRUE
                   AND source_snapshot_date <= ?
@@ -951,9 +955,9 @@ class ClassificationStore:
             row = self._execute(
                 connection,
                 """
-                SELECT sequence, generation_id, source, source_version,
-                       source_snapshot_date, source_date_semantics, observed_at,
-                       row_counts, coverage_audits, market_scope
+                SELECT sequence, generation_id, schema_version, source,
+                       source_version, source_snapshot_date, source_date_semantics,
+                       observed_at, row_counts, coverage_audits, market_scope
                 FROM classification_generations
                 WHERE promoted = TRUE
                   AND source_snapshot_date <= ?

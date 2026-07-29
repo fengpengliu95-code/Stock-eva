@@ -55,6 +55,9 @@ Release 1 verdict: **PENDING — do not claim GO**
   plus stable record type/natural identity, lineage and content hash. Readiness inputs cannot
   collide, taxonomy order/duplicates are identity-neutral, and changed content with a reused
   lineage reaches the conflict guard instead of being treated as idempotent.
+- Persisted generation reads preserve each row's schema version. Legacy v2 rows remain v2
+  through idempotent publish, `generation_at` and atomic `read_snapshot`; Pydantic defaults
+  cannot relabel stored history as v3.
 
 ## Verification
 
@@ -96,16 +99,18 @@ Each correction was observed RED before its production change:
     - declared taxonomies were omitted from generation identity
     - declared taxonomy order and duplicates were not canonicalized
     - changed record content with a reused lineage was incorrectly treated as idempotent
+14. persisted schema-version review follow-up: 3 failed
+    - idempotent publish, generation_at and read_snapshot relabeled stored v2 rows as v3
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 101 passed
+# 104 passed
 
 uv run --extra dev pytest -q
-# 426 passed
+# 429 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
