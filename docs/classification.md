@@ -46,6 +46,13 @@ classification endpoint 通过一次原子 snapshot read，只从 promoted gener
 初始化负责旧 schema 的 `promoted` 列迁移及可信历史回填；GET reader 只检查契约，
 不执行 migration。
 
+Generation identity 使用 `classification-v3` hash/schema contract。Writer 先对
+`declared_taxonomies` 去重排序；identity 包含 canonical taxonomies，以及每类 record
+的稳定 type、natural identity、lineage hash 和去除 `observed_at` 后的 content hash。
+因此 taxonomy readiness 输入不同会创建不同 candidate，而同 lineage 下的内容变化会
+进入 source-snapshot conflict guard，不能被误判为幂等。旧 v2 generations 保持不可变，
+writer-only migration 只维护 promoted history；GET 不重写版本或 identity。
+
 `observed_at` 晚于 `as_of` 的记录不可见。来源没有提供结束日时 `effective_to` 保持
 `null`，系统不推断结束日。
 

@@ -621,6 +621,10 @@ def test_taxonomies_are_isolated(tmp_path: Path) -> None:
                     taxonomy_id="fixture.size_taxonomy",
                 ),
             ],
+            declared_taxonomies=[
+                TAXONOMY_BAOSTOCK_INDUSTRY,
+                "fixture.size_taxonomy",
+            ],
         )
     )
 
@@ -668,6 +672,97 @@ def test_generation_identity_includes_source_date_semantics(tmp_path: Path) -> N
         != observed.generation.generation_id
     )
     assert store.generation_count() == 2
+
+
+def test_generation_identity_includes_declared_taxonomies(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    payload = snapshot(
+        securities=[security("sh.600000")],
+        memberships=[membership("sh.600000")],
+    )
+
+    promoted = store.publish(payload)
+    candidate = store.publish(
+        payload.model_copy(update={"declared_taxonomies": []})
+    )
+
+    assert promoted.promoted is True
+    assert promoted.generation.schema_version == "classification-v3"
+    assert candidate.generation.generation_id != promoted.generation.generation_id
+    assert candidate.inserted is True
+    assert candidate.generation.coverage_audits == []
+    assert candidate.promoted is False
+    assert store.ready_generation() == promoted.generation.generation_id
+
+
+def test_declared_taxonomy_order_and_duplicates_do_not_change_identity(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    size_taxonomy = "fixture.size_taxonomy"
+    memberships = [
+        membership("sh.600000"),
+        membership(
+            "sh.600000",
+            "large-cap",
+            taxonomy_id=size_taxonomy,
+        ),
+    ]
+    first_payload = snapshot(
+        securities=[security("sh.600000")],
+        memberships=memberships,
+        declared_taxonomies=[
+            size_taxonomy,
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            size_taxonomy,
+        ],
+    )
+    second_payload = snapshot(
+        securities=[security("sh.600000")],
+        memberships=memberships,
+        declared_taxonomies=[
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            size_taxonomy,
+        ],
+    )
+
+    normalized = store._normalized(first_payload)
+    first = store.publish(first_payload)
+    second = store.publish(second_payload)
+
+    assert normalized.declared_taxonomies == [
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        size_taxonomy,
+    ]
+    assert first.generation.generation_id == second.generation.generation_id
+    assert first.inserted is True
+    assert second.inserted is False
+
+
+def test_changed_record_content_with_same_lineage_reaches_conflict_guard(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    payload = snapshot(
+        securities=[security("sh.600000")],
+        memberships=[membership("sh.600000")],
+    )
+    store.publish(payload)
+    changed_security = payload.securities[0].model_copy(
+        update={"name": "Changed without lineage update"}
+    )
+
+    with pytest.raises(
+        ClassificationConflictError,
+        match="conflicting security master",
+    ):
+        store.publish(
+            payload.model_copy(update={"securities": [changed_security]})
+        )
+
+    assert store.generation_count() == 1
 
 
 def test_conflicting_same_source_snapshot_fails_closed(tmp_path: Path) -> None:

@@ -361,24 +361,67 @@ class ClassificationStore:
                 "securities": securities,
                 "index_components": components,
                 "sector_memberships": memberships,
+                "declared_taxonomies": sorted(set(snapshot.declared_taxonomies)),
             }
         )
 
-    @staticmethod
-    def _generation_id(snapshot: ClassificationSnapshot) -> str:
+    @classmethod
+    def _generation_id(cls, snapshot: ClassificationSnapshot) -> str:
+        records = []
+        for record_type, rows, natural_key in (
+            (
+                "security",
+                snapshot.securities,
+                lambda row: (
+                    row.source,
+                    row.source_snapshot_date.isoformat(),
+                    row.security_id,
+                ),
+            ),
+            (
+                "index_component",
+                snapshot.index_components,
+                lambda row: (
+                    row.source,
+                    row.source_snapshot_date.isoformat(),
+                    row.index_id,
+                    row.security_id,
+                ),
+            ),
+            (
+                "sector_membership",
+                snapshot.sector_memberships,
+                lambda row: (
+                    row.source,
+                    row.source_snapshot_date.isoformat(),
+                    row.taxonomy_id,
+                    row.security_id,
+                ),
+            ),
+        ):
+            records.extend(
+                {
+                    "record_type": record_type,
+                    "natural_identity": natural_key(row),
+                    "lineage_hash": row.lineage_hash,
+                    "content_hash": cls._content_hash(row),
+                }
+                for row in rows
+            )
         payload = {
             "schema_version": CLASSIFICATION_SCHEMA_VERSION,
             "source": snapshot.source,
             "source_version": snapshot.source_version,
             "source_snapshot_date": snapshot.source_snapshot_date.isoformat(),
             "source_date_semantics": snapshot.source_date_semantics,
-            "lineages": sorted(
-                row.lineage_hash
-                for row in [
-                    *snapshot.securities,
-                    *snapshot.index_components,
-                    *snapshot.sector_memberships,
-                ]
+            "declared_taxonomies": snapshot.declared_taxonomies,
+            "records": sorted(
+                records,
+                key=lambda item: (
+                    item["record_type"],
+                    item["natural_identity"],
+                    item["content_hash"],
+                ),
             ),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -404,10 +447,7 @@ class ClassificationStore:
             if row.security_id in eligible
             for reason in actionability_reasons(row)
         )
-        taxonomy_ids = sorted(
-            set(snapshot.declared_taxonomies)
-            | {row.taxonomy_id for row in snapshot.sector_memberships}
-        )
+        taxonomy_ids = snapshot.declared_taxonomies
         audits = []
         for taxonomy_id in taxonomy_ids:
             mapped_ids = {

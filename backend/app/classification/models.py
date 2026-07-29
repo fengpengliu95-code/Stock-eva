@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 TAXONOMY_BAOSTOCK_INDUSTRY = "baostock.industry_classification"
-CLASSIFICATION_SCHEMA_VERSION = "classification-v2"
+CLASSIFICATION_SCHEMA_VERSION = "classification-v3"
 BOARD_DERIVATION_VERSION = "cn-symbol-prefix-v1"
 
 ClassificationStatus = Literal["empty", "ready", "degraded", "not_available"]

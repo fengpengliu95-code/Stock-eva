@@ -51,6 +51,10 @@ Release 1 verdict: **PENDING — do not claim GO**
   A later-published older ready generation remains available for historical `as_of`
   without regressing the current pointer's business date.
 - Legacy `promoted` history migration is writer-only; GET readers do not run migration.
+- Generation identity uses the `classification-v3` contract: canonical declared taxonomies
+  plus stable record type/natural identity, lineage and content hash. Readiness inputs cannot
+  collide, taxonomy order/duplicates are identity-neutral, and changed content with a reused
+  lineage reaches the conflict guard instead of being treated as idempotent.
 
 ## Verification
 
@@ -88,16 +92,20 @@ Each correction was observed RED before its production change:
     - a degraded newer candidate leaked through a later older ready pointer
     - later publication of valid older history regressed the current business date
     - legacy writer initialization did not persist explicit promoted history
+13. generation identity review follow-up: 3 failed
+    - declared taxonomies were omitted from generation identity
+    - declared taxonomy order and duplicates were not canonicalized
+    - changed record content with a reused lineage was incorrectly treated as idempotent
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 98 passed
+# 101 passed
 
 uv run --extra dev pytest -q
-# 423 passed
+# 426 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
