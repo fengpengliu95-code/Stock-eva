@@ -114,16 +114,18 @@ Each correction was observed RED before its production change:
     - two no-op-close request attempts left two live daemon operation workers
     - a non-main-thread call executed the client instead of failing closed before network
     - an expiring pre-existing timer whose handler returned leaked an internal interrupt
+17. Classification session ownership follow-up: 1 failed
+    - rejected worker-thread login logged out and discarded a session owned by another call
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 106 passed
+# 107 passed
 
 uv run --extra dev pytest -q
-# 441 passed
+# 442 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

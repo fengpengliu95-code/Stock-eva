@@ -135,8 +135,10 @@ class BaoStockClassificationProvider:
 
     def fetch(self, as_of: date) -> ClassificationSnapshot:
         initial_request_count = self.session._provider_request_count
+        owns_session = False
         try:
             self.session._login()
+            owns_session = True
             observed_at = self.clock()
             all_fields, all_rows = self.session._read(
                 lambda: self.session.client.query_all_stock(day=as_of.isoformat())
@@ -161,7 +163,8 @@ class BaoStockClassificationProvider:
         except (BaoStockError, KeyError, ValueError) as exc:
             raise ClassificationProviderError("BaoStock classification metadata failed") from exc
         finally:
-            self.session._logout()
+            if owns_session:
+                self.session._logout()
             self.last_request_count = (
                 self.session._provider_request_count - initial_request_count
             )

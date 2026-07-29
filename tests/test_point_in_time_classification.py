@@ -2427,3 +2427,49 @@ def test_classification_cli_initial_login_timeout_is_controlled_and_write_free(
         for thread in threading.enumerate():
             if thread.name.startswith("stock-eva-baostock-operation-login"):
                 thread.join(0.2)
+
+
+def test_classification_fetch_does_not_logout_session_it_did_not_acquire() -> None:
+    class CountingClient:
+        def __init__(self) -> None:
+            self.context = type("Context", (), {"default_socket": object()})()
+            self.login_calls = 0
+            self.query_calls = 0
+            self.logout_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            raise AssertionError("worker fetch must fail before login")
+
+        def query_all_stock(self, **_kwargs):
+            self.query_calls += 1
+            raise AssertionError("worker fetch must fail before query")
+
+        def logout(self):
+            self.logout_calls += 1
+
+    client = CountingClient()
+    provider = BaoStockClassificationProvider(client=client)
+    original_socket = client.context.default_socket
+    provider.session._session_usable = True
+    errors: list[BaseException] = []
+
+    def fetch_from_worker() -> None:
+        try:
+            provider.fetch(SNAPSHOT_DATE)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=fetch_from_worker)
+    worker.start()
+    worker.join(0.2)
+
+    assert worker.is_alive() is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], ClassificationProviderError)
+    assert client.login_calls == 0
+    assert client.query_calls == 0
+    assert client.logout_calls == 0
+    assert provider.session._session_usable is True
+    assert client.context.default_socket is original_socket
+    assert provider.session.client is client
