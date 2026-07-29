@@ -30,11 +30,21 @@ Classification coverage 的分母是请求 `as_of` 当日已经上市且尚未�
 `source_snapshot_date` 都不越过 enclosing snapshot。相同输入重复发布返回同一
 generation；同一 source snapshot 的冲突内容拒绝发布。
 
-Candidate 可以持久化，但只有全部 coverage audit 都达到 ready（分母非零且映射率至少
-95%）时，才在同一事务最后移动唯一 ready pointer。降级 candidate 不替换上一可信代；
-没有旧 ready 时保持无 ready。所有 classification endpoint 通过一次原子 snapshot read
-选择 generation，并从该 generation 读取 records、scope 和 ID，因此并发发布及相同
-source `updateDate` 的连续发布不会混代、重复或泄漏上一代成员。
+Candidate 可以持久化，但 generation 只有在 audits 非空、包含 mandatory
+`baostock.industry_classification` audit，且全部 required audit 都为 ready（分母
+非零且映射率至少 95%）时才标记 `promoted=true`。空 taxonomy、零分母和低覆盖
+candidate 永不 promotion；`all([])` 不能成为 ready。
+
+`promoted` 是持久化的可读历史，不通过 current pointer sequence 间接推断。所有
+classification endpoint 通过一次原子 snapshot read，只从 promoted generations 中按
+`source_snapshot_date`、`observed_at`、`sequence` 选择 `as_of` 可见代，再从同一代
+读取 records、scope 和 ID。因此降级 candidate 不会泄漏，并发发布及相同 source
+`updateDate` 的连续发布不会混代、重复或泄漏上一代成员。
+
+较旧但质量合格的 historical generation 可以 promotion 并供合法历史 `as_of` 读取，
+但 current ready pointer 只在业务 `source_snapshot_date` 不回退时更新。Writer
+初始化负责旧 schema 的 `promoted` 列迁移及可信历史回填；GET reader 只检查契约，
+不执行 migration。
 
 `observed_at` 晚于 `as_of` 的记录不可见。来源没有提供结束日时 `effective_to` 保持
 `null`，系统不推断结束日。

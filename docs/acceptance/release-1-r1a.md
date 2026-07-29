@@ -43,6 +43,14 @@ Release 1 verdict: **PENDING — do not claim GO**
 - Sync publication reports `new_generation`; idempotent re-runs report both
   `new_generation=false` and `writes_classification_data=false` from the atomic publish
   outcome.
+- Promotion is non-vacuous: audits must be non-empty, include the mandatory BaoStock
+  industry taxonomy and all be ready. Empty-taxonomy generations remain auditable
+  candidates and cannot create or replace ready.
+- Read selection uses explicit persisted promoted history rather than a current-pointer
+  sequence cutoff. Degraded candidates never enter records, scope or coverage responses.
+  A later-published older ready generation remains available for historical `as_of`
+  without regressing the current pointer's business date.
+- Legacy `promoted` history migration is writer-only; GET readers do not run migration.
 
 ## Verification
 
@@ -75,16 +83,21 @@ Each correction was observed RED before its production change:
     - all five endpoint families reached the store instead of returning 422
 11. actual write reporting: 1 failed
     - idempotent execute lacked `new_generation` and still reported a write
+12. promoted-history review follow-up: 5 failed
+    - empty audits vacuously advanced ready and could replace a trusted pointer
+    - a degraded newer candidate leaked through a later older ready pointer
+    - later publication of valid older history regressed the current business date
+    - legacy writer initialization did not persist explicit promoted history
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 93 passed
+# 98 passed
 
 uv run --extra dev pytest -q
-# 418 passed
+# 423 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

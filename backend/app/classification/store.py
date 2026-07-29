@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from backend.app.classification.models import (
     BOARD_DERIVATION_VERSION,
     CLASSIFICATION_SCHEMA_VERSION,
+    TAXONOMY_BAOSTOCK_INDUSTRY,
     ClassificationPublishOutcome,
     ClassificationSnapshot,
     CoverageAudit,
@@ -127,7 +128,8 @@ class ClassificationStore:
                 observed_at TIMESTAMPTZ NOT NULL,
                 row_counts JSON NOT NULL,
                 coverage_audits JSON NOT NULL,
-                market_scope JSON NOT NULL
+                market_scope JSON NOT NULL,
+                promoted BOOLEAN NOT NULL DEFAULT FALSE
             )
             """
         )
@@ -136,6 +138,13 @@ class ClassificationStore:
             ALTER TABLE classification_generations
             ADD COLUMN IF NOT EXISTS source_date_semantics VARCHAR
             DEFAULT 'source_observed'
+            """
+        )
+        connection.execute(
+            """
+            ALTER TABLE classification_generations
+            ADD COLUMN IF NOT EXISTS promoted BOOLEAN
+            DEFAULT FALSE
             """
         )
         connection.execute(
@@ -178,6 +187,7 @@ class ClassificationStore:
                 )
                 """
             )
+        self._migrate_promoted_history(connection)
         return connection
 
     def _connect_reader(self) -> duckdb.DuckDBPyConnection | None:
@@ -190,6 +200,70 @@ class ClassificationStore:
     def _execute(self, connection, sql: str, parameters: list[object] | None = None):
         self.query_count += 1
         return connection.execute(sql, parameters or [])
+
+    @staticmethod
+    def _audits_are_promotable(audits: list[CoverageAudit]) -> bool:
+        return (
+            bool(audits)
+            and TAXONOMY_BAOSTOCK_INDUSTRY
+            in {audit.taxonomy_id for audit in audits}
+            and all(audit.status == "ready" for audit in audits)
+        )
+
+    def _migrate_promoted_history(self, connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT generation_id, coverage_audits
+            FROM classification_generations
+            WHERE promoted IS NULL OR promoted = FALSE
+            """
+        ).fetchall()
+        connection.begin()
+        try:
+            for generation_id, raw_audits in rows:
+                audits = [
+                    CoverageAudit.model_validate(item)
+                    for item in json.loads(raw_audits)
+                ]
+                if self._audits_are_promotable(audits):
+                    connection.execute(
+                        """
+                        UPDATE classification_generations
+                        SET promoted = TRUE
+                        WHERE generation_id = ?
+                        """,
+                        [generation_id],
+                    )
+            latest = connection.execute(
+                """
+                SELECT sequence, generation_id
+                FROM classification_generations
+                WHERE promoted = TRUE
+                ORDER BY source_snapshot_date DESC, observed_at DESC, sequence DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            connection.execute("DELETE FROM classification_ready_pointer")
+            if latest is not None:
+                connection.execute(
+                    "INSERT INTO classification_ready_pointer VALUES (1, ?, ?)",
+                    [latest[0], latest[1]],
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _has_promoted_history(connection) -> bool:
+        row = connection.execute(
+            """
+            SELECT count(*)
+            FROM pragma_table_info('classification_generations')
+            WHERE name = 'promoted'
+            """
+        ).fetchone()
+        return bool(row and row[0])
 
     @staticmethod
     def _content_hash(record: BaseModel) -> str:
@@ -385,23 +459,30 @@ class ClassificationStore:
     ) -> None:
         if not rows:
             return
-        pointer = self._ready_pointer(connection)
-        if pointer is None:
-            return
         source = rows[0].source
         snapshots = sorted({row.source_snapshot_date for row in rows})
         placeholders = ", ".join("?" for _ in snapshots)
-        columns = ", ".join([*group_columns, "security_id", "lineage_hash", "content_hash"])
+        columns = ", ".join(
+            f"records.{column}"
+            for column in [
+                *group_columns,
+                "security_id",
+                "lineage_hash",
+                "content_hash",
+            ]
+        )
         existing = self._execute(
             connection,
             f"""
             SELECT {columns}
-            FROM {table}
-            WHERE generation_sequence <= ?
-              AND source = ?
-              AND source_snapshot_date IN ({placeholders})
+            FROM {table} AS records
+            JOIN classification_generations AS generations
+              ON generations.generation_id = records.generation_id
+            WHERE generations.promoted = TRUE
+              AND records.source = ?
+              AND records.source_snapshot_date IN ({placeholders})
             """,
-            [pointer[0], source, *snapshots],
+            [source, *snapshots],
         ).fetchall()
         existing_map = {
             (*row[: len(group_columns)], row[len(group_columns)]): (
@@ -429,12 +510,18 @@ class ClassificationStore:
         try:
             existing = self._generation_by_id(connection, generation_id)
             if existing is not None:
-                pointer = self._ready_pointer(connection)
                 return ClassificationPublishOutcome(
                     generation=existing,
                     inserted=False,
-                    promoted=(
-                        pointer is not None and pointer[1] == existing.generation_id
+                    promoted=bool(
+                        connection.execute(
+                            """
+                            SELECT promoted
+                            FROM classification_generations
+                            WHERE generation_id = ?
+                            """,
+                            [existing.generation_id],
+                        ).fetchone()[0]
                     ),
                 )
             self._assert_no_published_conflicts(
@@ -469,8 +556,23 @@ class ClassificationStore:
                 "sector_membership_history": len(snapshot.sector_memberships),
             }
             audits = self._coverage_audits(snapshot, generation_id)
-            should_promote = all(audit.status == "ready" for audit in audits)
+            should_promote = self._audits_are_promotable(audits)
             scope = market_scope(snapshot.securities)
+            pointer = self._ready_pointer(connection)
+            pointer_date = None
+            if pointer is not None:
+                pointer_date = connection.execute(
+                    """
+                    SELECT source_snapshot_date
+                    FROM classification_generations
+                    WHERE generation_id = ?
+                    """,
+                    [pointer[1]],
+                ).fetchone()[0]
+            should_advance_pointer = should_promote and (
+                pointer_date is None
+                or snapshot.source_snapshot_date >= pointer_date
+            )
             connection.begin()
             try:
                 connection.execute(
@@ -486,9 +588,10 @@ class ClassificationStore:
                         observed_at,
                         row_counts,
                         coverage_audits,
-                        market_scope
+                        market_scope,
+                        promoted
                     ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     [
@@ -506,6 +609,7 @@ class ClassificationStore:
                             ensure_ascii=False,
                         ),
                         scope.model_dump_json(),
+                        should_promote,
                     ],
                 )
                 self._insert_security_rows(
@@ -517,7 +621,7 @@ class ClassificationStore:
                 self._insert_sector_rows(
                     connection, next_sequence, generation_id, snapshot.sector_memberships
                 )
-                if should_promote:
+                if should_advance_pointer:
                     connection.execute("DELETE FROM classification_ready_pointer")
                     connection.execute(
                         "INSERT INTO classification_ready_pointer VALUES (1, ?, ?)",
@@ -687,8 +791,7 @@ class ClassificationStore:
         if connection is None:
             return None
         try:
-            pointer = self._ready_pointer(connection)
-            if pointer is None:
+            if not self._has_promoted_history(connection):
                 return None
             row = self._execute(
                 connection,
@@ -697,13 +800,13 @@ class ClassificationStore:
                        source_date_semantics, observed_at, row_counts, coverage_audits,
                        market_scope
                 FROM classification_generations
-                WHERE sequence <= ?
+                WHERE promoted = TRUE
                   AND source_snapshot_date <= ?
                   AND CAST(observed_at AS DATE) <= ?
-                ORDER BY source_snapshot_date DESC, sequence DESC
+                ORDER BY source_snapshot_date DESC, observed_at DESC, sequence DESC
                 LIMIT 1
                 """,
-                [pointer[0], as_of, as_of],
+                [as_of, as_of],
             ).fetchone()
             return self._generation_from_row(row) if row is not None else None
         finally:
@@ -792,26 +895,35 @@ class ClassificationStore:
                 sector_snapshot_date=None,
             )
         try:
+            if not self._has_promoted_history(connection):
+                return ClassificationReadSnapshot(
+                    ready_generation_id=None,
+                    generation=None,
+                    securities=[],
+                    security_snapshot_date=None,
+                    index_components=[],
+                    index_snapshot_date=None,
+                    sector_memberships=[],
+                    sector_snapshot_date=None,
+                )
             pointer = self._ready_pointer(connection)
             ready_generation_id = pointer[1] if pointer else None
-            generation = None
-            if pointer is not None:
-                row = self._execute(
-                    connection,
-                    """
-                    SELECT sequence, generation_id, source, source_version,
-                           source_snapshot_date, source_date_semantics, observed_at,
-                           row_counts, coverage_audits, market_scope
-                    FROM classification_generations
-                    WHERE sequence <= ?
-                      AND source_snapshot_date <= ?
-                      AND CAST(observed_at AS DATE) <= ?
-                    ORDER BY source_snapshot_date DESC, sequence DESC
-                    LIMIT 1
-                    """,
-                    [pointer[0], as_of, as_of],
-                ).fetchone()
-                generation = self._generation_from_row(row) if row is not None else None
+            row = self._execute(
+                connection,
+                """
+                SELECT sequence, generation_id, source, source_version,
+                       source_snapshot_date, source_date_semantics, observed_at,
+                       row_counts, coverage_audits, market_scope
+                FROM classification_generations
+                WHERE promoted = TRUE
+                  AND source_snapshot_date <= ?
+                  AND CAST(observed_at AS DATE) <= ?
+                ORDER BY source_snapshot_date DESC, observed_at DESC, sequence DESC
+                LIMIT 1
+                """,
+                [as_of, as_of],
+            ).fetchone()
+            generation = self._generation_from_row(row) if row is not None else None
             securities: list[SecurityMasterRecord] = []
             security_date = None
             components: list[IndexComponentRecord] = []
@@ -871,21 +983,20 @@ class ClassificationStore:
         if connection is None:
             return [], None, None
         try:
-            pointer = self._ready_pointer(connection)
-            if pointer is None:
+            if not self._has_promoted_history(connection):
                 return [], None, None
             generation = self._execute(
                 connection,
                 """
                 SELECT sequence, generation_id
                 FROM classification_generations
-                WHERE sequence <= ?
+                WHERE promoted = TRUE
                   AND source_snapshot_date <= ?
                   AND CAST(observed_at AS DATE) <= ?
-                ORDER BY source_snapshot_date DESC, sequence DESC
+                ORDER BY source_snapshot_date DESC, observed_at DESC, sequence DESC
                 LIMIT 1
                 """,
-                [pointer[0], as_of, as_of],
+                [as_of, as_of],
             ).fetchone()
             if generation is None:
                 return [], None, None

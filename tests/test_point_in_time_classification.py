@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 
+import duckdb
 import httpx
 import pytest
 
@@ -132,6 +133,7 @@ def snapshot(
     securities: list[SecurityMasterRecord] | None = None,
     memberships: list[SectorMembershipRecord] | None = None,
     components: list[IndexComponentRecord] | None = None,
+    declared_taxonomies: list[str] | None = None,
 ) -> ClassificationSnapshot:
     return ClassificationSnapshot(
         source="baostock",
@@ -142,7 +144,9 @@ def snapshot(
         index_components=components or [],
         sector_memberships=memberships or [],
         declared_taxonomies=(
-            [TAXONOMY_BAOSTOCK_INDUSTRY] if memberships is not None else []
+            [TAXONOMY_BAOSTOCK_INDUSTRY]
+            if declared_taxonomies is None
+            else declared_taxonomies
         ),
     )
 
@@ -199,7 +203,8 @@ def test_security_list_and_delist_dates_are_applied_at_as_of(tmp_path: Path) -> 
                     listed=date(2020, 1, 1),
                     delisted=date(2026, 7, 29),
                 )
-            ]
+            ],
+            memberships=[membership("sh.600000")],
         )
     )
 
@@ -346,12 +351,25 @@ def test_index_component_history_uses_latest_whole_snapshot(tmp_path: Path) -> N
                 component("sh.600000", snapshot_date=first_date, observed_at=first_observed),
                 component("sz.000001", snapshot_date=first_date, observed_at=first_observed),
             ],
+            memberships=[
+                membership(
+                    "sh.600000",
+                    snapshot_date=first_date,
+                    observed_at=first_observed,
+                ),
+                membership(
+                    "sz.000001",
+                    snapshot_date=first_date,
+                    observed_at=first_observed,
+                ),
+            ],
         )
     )
     store.publish(
         snapshot(
             securities=[security("sh.600000")],
             components=[component("sh.600000")],
+            memberships=[membership("sh.600000")],
         )
     )
 
@@ -850,15 +868,21 @@ def test_market_scope_and_eligibility_are_truthful(
 ) -> None:
     store, classification = service(tmp_path)
     security_type = "index" if board == "index" else "stock"
+    rows = [
+        security(
+            symbol,
+            board=board,
+            security_type=security_type,
+        )
+    ]
+    memberships = [membership(symbol)]
+    if expected_reason is not None:
+        rows.insert(0, security("sh.600000"))
+        memberships = [membership("sh.600000")]
     store.publish(
         snapshot(
-            securities=[
-                security(
-                    symbol,
-                    board=board,
-                    security_type=security_type,
-                )
-            ]
+            securities=rows,
+            memberships=memberships,
         )
     )
 
@@ -873,7 +897,14 @@ def test_suspended_security_remains_coverage_eligible_with_actionability_reason(
     tmp_path: Path,
 ) -> None:
     store, classification = service(tmp_path)
-    store.publish(snapshot(securities=[security("sz.300001", board="chinext", tradable=False)]))
+    store.publish(
+        snapshot(
+            securities=[
+                security("sz.300001", board="chinext", tradable=False)
+            ],
+            memberships=[membership("sz.300001")],
+        )
+    )
 
     response = classification.securities(SNAPSHOT_DATE, symbol="sz.300001")
 
@@ -900,7 +931,8 @@ def test_price_uncertainty_remains_coverage_eligible_but_not_actionable(
                     "sh.600000",
                     price_available=price_available,
                 )
-            ]
+            ],
+            memberships=[membership("sh.600000")],
         )
     )
 
@@ -1021,6 +1053,58 @@ def test_low_coverage_candidate_is_persisted_without_initial_ready_pointer(
     assert store.ready_generation() is None
 
 
+def test_empty_declared_taxonomies_never_vacuously_promote(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+
+    outcome = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            declared_taxonomies=[],
+        )
+    )
+
+    assert outcome.inserted is True
+    assert outcome.generation.coverage_audits == []
+    assert outcome.promoted is False
+    assert store.ready_generation() is None
+
+
+def test_empty_declared_taxonomies_candidate_does_not_replace_ready(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    trusted = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    candidate_date = date(2026, 7, 29)
+    candidate_observed = datetime(2026, 7, 29, 12, tzinfo=UTC)
+
+    outcome = store.publish(
+        snapshot(
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+            securities=[
+                security(
+                    "sh.688001",
+                    board="star",
+                    snapshot_date=candidate_date,
+                    observed_at=candidate_observed,
+                )
+            ],
+            declared_taxonomies=[],
+        )
+    )
+
+    assert outcome.generation.coverage_audits == []
+    assert outcome.promoted is False
+    assert store.ready_generation() == trusted.generation.generation_id
+
+
 def test_degraded_candidate_does_not_replace_existing_ready_generation(
     tmp_path: Path,
 ) -> None:
@@ -1085,6 +1169,119 @@ def test_zero_denominator_candidate_never_becomes_ready(tmp_path: Path) -> None:
         "no_eligible_securities"
     ]
     assert store.ready_generation() is None
+
+
+def test_degraded_candidate_never_leaks_through_later_ready_pointer(
+    tmp_path: Path,
+) -> None:
+    store, classification = service(tmp_path)
+    candidate_date = date(2026, 7, 29)
+    candidate_observed = datetime(2026, 7, 29, 12, tzinfo=UTC)
+    candidate = store.publish(
+        snapshot(
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+            securities=[
+                security(
+                    "sh.688001",
+                    board="star",
+                    snapshot_date=candidate_date,
+                    observed_at=candidate_observed,
+                ),
+                security(
+                    "sz.300001",
+                    board="chinext",
+                    snapshot_date=candidate_date,
+                    observed_at=candidate_observed,
+                ),
+            ],
+            memberships=[
+                membership(
+                    "sh.688001",
+                    snapshot_date=candidate_date,
+                    observed_at=candidate_observed,
+                )
+            ],
+        )
+    )
+    trusted = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+
+    selected = store.read_snapshot(
+        candidate_date,
+        include_securities=True,
+        taxonomy_id=TAXONOMY_BAOSTOCK_INDUSTRY,
+    )
+    securities = classification.securities(candidate_date)
+    coverage = classification.coverage(
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        candidate_date,
+    )
+
+    assert candidate.promoted is False
+    assert store.ready_generation() == trusted.generation.generation_id
+    assert selected.generation == trusted.generation
+    assert [row.symbol for row in selected.securities] == ["sh.600000"]
+    assert selected.generation.market_scope.covered_boards == ["main"]
+    assert securities.status == "ready"
+    assert [row.symbol for row in securities.securities] == ["sh.600000"]
+    assert coverage.status == "ready"
+    assert coverage.coverage_ratio == 1
+
+
+def test_older_ready_history_is_readable_without_regressing_current_pointer(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    current_date = date(2026, 7, 29)
+    current_observed = datetime(2026, 7, 29, 12, tzinfo=UTC)
+    current = store.publish(
+        snapshot(
+            snapshot_date=current_date,
+            observed_at=current_observed,
+            securities=[
+                security(
+                    "sh.688001",
+                    board="star",
+                    snapshot_date=current_date,
+                    observed_at=current_observed,
+                )
+            ],
+            memberships=[
+                membership(
+                    "sh.688001",
+                    snapshot_date=current_date,
+                    observed_at=current_observed,
+                )
+            ],
+        )
+    )
+    historical = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+
+    historical_read = store.read_snapshot(
+        SNAPSHOT_DATE,
+        include_securities=True,
+    )
+    current_read = store.read_snapshot(
+        current_date,
+        include_securities=True,
+    )
+
+    assert historical.promoted is True
+    assert store.ready_generation() == current.generation.generation_id
+    assert historical_read.generation == historical.generation
+    assert [row.symbol for row in historical_read.securities] == ["sh.600000"]
+    assert current_read.generation == current.generation
+    assert [row.symbol for row in current_read.securities] == ["sh.688001"]
 
 
 def test_coverage_is_reproducible_and_reports_unmapped_symbols(tmp_path: Path) -> None:
@@ -1616,7 +1813,12 @@ def test_existing_classification_database_get_executes_no_write_or_schema_ddl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ClassificationStore(tmp_path / "classification.duckdb")
-    store.publish(snapshot(securities=[security("sh.600000")]))
+    store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
     store_module = __import__(
         "backend.app.classification.store",
         fromlist=["duckdb"],
@@ -1665,7 +1867,12 @@ def test_classification_read_is_compatible_with_same_process_writer(
     tmp_path: Path,
 ) -> None:
     store = ClassificationStore(tmp_path / "classification.duckdb")
-    store.publish(snapshot(securities=[security("sh.600000")]))
+    store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
     writer = store._connect_writer()
     try:
         response = api_request(
@@ -1677,6 +1884,58 @@ def test_classification_read_is_compatible_with_same_process_writer(
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+
+
+def test_legacy_schema_migration_is_writer_only(tmp_path: Path) -> None:
+    database = tmp_path / "classification.duckdb"
+    connection = duckdb.connect(str(database))
+    connection.execute(
+        """
+        CREATE TABLE classification_generations (
+            sequence BIGINT PRIMARY KEY,
+            generation_id VARCHAR UNIQUE NOT NULL,
+            schema_version VARCHAR NOT NULL,
+            source VARCHAR NOT NULL,
+            source_version VARCHAR NOT NULL,
+            source_snapshot_date DATE NOT NULL,
+            source_date_semantics VARCHAR NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            row_counts JSON NOT NULL,
+            coverage_audits JSON NOT NULL,
+            market_scope JSON NOT NULL
+        )
+        """
+    )
+    connection.close()
+    store = ClassificationStore(
+        database,
+        temp_directory=tmp_path / "classification-temp",
+    )
+
+    reader = store._connect_reader()
+    assert reader is not None
+    reader_columns = {
+        row[1]
+        for row in reader.execute(
+            "PRAGMA table_info('classification_generations')"
+        ).fetchall()
+    }
+    reader.close()
+
+    assert "promoted" not in reader_columns
+    assert not store.temp_directory.exists()
+
+    writer = store._connect_writer()
+    writer_columns = {
+        row[1]
+        for row in writer.execute(
+            "PRAGMA table_info('classification_generations')"
+        ).fetchall()
+    }
+    writer.close()
+
+    assert "promoted" in writer_columns
+    assert store.temp_directory.exists()
 
 
 @pytest.mark.parametrize(
