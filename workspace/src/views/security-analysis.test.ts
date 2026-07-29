@@ -34,6 +34,9 @@ describe("security analysis view", () => {
     expect(document.body.textContent).toContain("qfq");
     expect(document.body.textContent).toContain("ta-lib-0.7.0-r0-v1");
     expect(document.body.textContent).toContain("—");
+    expect(
+      getByRole(document.body, "img").getAttribute("aria-label"),
+    ).toContain("MACD、RSI14");
     expect(getByRole(document.body, "table", { name: "技术指标数值替代" })).toBeTruthy();
     expect(renderChart).toHaveBeenCalledTimes(1);
   });

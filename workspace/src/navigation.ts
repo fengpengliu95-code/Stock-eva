@@ -29,17 +29,34 @@ export function bindSecurityEntrypoints(
   root: Document,
   navigate: (symbol: string, sourceView: SourceView) => void,
 ): () => void {
-  const onClick = (event: MouseEvent): void => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
+  const routeFor = (
+    target: EventTarget | null,
+  ): { symbol: string; sourceView: SourceView } | null => {
+    if (!(target instanceof Element)) return null;
     const control = target.closest<HTMLElement>("[data-security-symbol]");
-    if (!control) return;
+    if (!control) return null;
     const symbol = control.dataset.securitySymbol?.toLowerCase() ?? "";
     const source = control.dataset.securitySource ?? "";
-    if (!SYMBOL_PATTERN.test(symbol) || !isSourceView(source)) return;
+    if (!SYMBOL_PATTERN.test(symbol) || !isSourceView(source)) return null;
+    return { symbol, sourceView: source };
+  };
+  const onClick = (event: MouseEvent): void => {
+    const route = routeFor(event.target);
+    if (!route) return;
     event.preventDefault();
-    navigate(symbol, source);
+    navigate(route.symbol, route.sourceView);
+  };
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
+    const route = routeFor(event.target);
+    if (!route) return;
+    event.preventDefault();
+    navigate(route.symbol, route.sourceView);
   };
   root.addEventListener("click", onClick);
-  return () => root.removeEventListener("click", onClick);
+  root.addEventListener("keydown", onKeyDown);
+  return () => {
+    root.removeEventListener("click", onClick);
+    root.removeEventListener("keydown", onKeyDown);
+  };
 }

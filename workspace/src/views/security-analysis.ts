@@ -241,7 +241,7 @@ export function renderSecurityAnalysis(
   chart.setAttribute("role", "img");
   chart.setAttribute(
     "aria-label",
-    `${response.symbol} 前复权日 K、成交量及 MA5、10、20、60、120、250 图表`,
+    `${response.symbol} 前复权日 K、成交量、MA5、10、20、60、120、250、MACD、RSI14 图表`,
   );
   chartPanel.append(heading, summary, chart);
   content.append(chartPanel);

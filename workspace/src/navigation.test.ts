@@ -32,11 +32,16 @@ describe("security navigation", () => {
     const user = userEvent.setup();
 
     fireEvent.click(button);
+    expect(navigate).toHaveBeenCalledTimes(1);
     button.focus();
     await user.keyboard("{Enter}");
+    expect(navigate).toHaveBeenCalledTimes(2);
     await user.keyboard(" ");
-
     expect(navigate).toHaveBeenCalledTimes(3);
+    fireEvent.keyDown(button, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledTimes(4);
+    fireEvent.keyDown(button, { key: " " });
+    expect(navigate).toHaveBeenCalledTimes(5);
     expect(navigate).toHaveBeenLastCalledWith("sh.600000", "portfolio");
     unbind();
   });

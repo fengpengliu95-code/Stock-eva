@@ -15,7 +15,10 @@ import type {
 
 const API_MA = "STOCK_EVA_API_MA";
 const API_VOLUME = "STOCK_EVA_API_VOLUME";
+const API_MACD = "STOCK_EVA_API_MACD";
+const API_RSI = "STOCK_EVA_API_RSI";
 const MA_FIELDS = ["ma5", "ma10", "ma20", "ma60", "ma120", "ma250"] as const;
+const MACD_FIELDS = ["macd", "macd_signal", "macd_hist"] as const;
 
 type IndicatorField =
   | (typeof MA_FIELDS)[number]
@@ -119,6 +122,27 @@ function registerBackendIndicators(
             : null,
       })),
   });
+  register({
+    name: API_MACD,
+    shortName: "API MACD",
+    figures: [
+      { key: "macd", title: "MACD: ", type: "line" },
+      { key: "macd_signal", title: "Signal: ", type: "line" },
+      {
+        key: "macd_hist",
+        title: "Hist: ",
+        type: "bar",
+        baseValue: 0,
+      },
+    ],
+    calc: (data) => backendIndicatorResult(data, MACD_FIELDS),
+  });
+  register({
+    name: API_RSI,
+    shortName: "API RSI14",
+    figures: [{ key: "rsi14", title: "RSI14: ", type: "line" }],
+    calc: (data) => backendIndicatorResult(data, ["rsi14"]),
+  });
   registeredBy.add(register);
 }
 
@@ -177,5 +201,7 @@ export function createStockCockpitChart(
   });
   chart.createIndicator({ name: API_MA, paneId: "candle_pane" }, true);
   chart.createIndicator(API_VOLUME);
+  chart.createIndicator(API_MACD);
+  chart.createIndicator(API_RSI);
   return () => dependencies.dispose(container);
 }
