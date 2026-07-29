@@ -52,9 +52,15 @@ def test_api_and_workspace_agents_are_local_only_and_recoverable() -> None:
     ]
     assert web["RunAtLoad"] is True
     assert web["KeepAlive"] is True
-    assert web["ProgramArguments"][-4:] == [
-        "--bind",
+    assert web["WorkingDirectory"] == str(CONFIG_ROOT)
+    assert web["ProgramArguments"] == [
+        str(RUNTIME_CURRENT / ".venv/bin/python"),
+        "-m",
+        "backend.app.static_server",
+        "--host",
         "127.0.0.1",
+        "--port",
+        "8080",
         "--directory",
         str(RUNTIME_CURRENT / "public"),
     ]

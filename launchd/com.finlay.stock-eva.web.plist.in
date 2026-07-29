@@ -9,10 +9,11 @@
   <array>
     <string>__PYTHON__</string>
     <string>-m</string>
-    <string>http.server</string>
-    <string>8080</string>
-    <string>--bind</string>
+    <string>backend.app.static_server</string>
+    <string>--host</string>
     <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8080</string>
     <string>--directory</string>
     <string>__PUBLIC_ROOT__</string>
   </array>

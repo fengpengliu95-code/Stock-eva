@@ -38,7 +38,9 @@ LaunchAgent 后台进程直接打开该卷；把项目 Python 或工作目录放
 
 LaunchAgent 只引用 `Application Support` 下的绝对路径。Web 只发布
 `runtime/current/public`，不能访问 `.env`、后端源码或用户数据库。开发仓库继续用于
-开发和构建，不是后台运行目录。
+开发和构建，不是后台运行目录。Web agent 使用项目的标准库静态服务并只绑定
+`127.0.0.1:8080`；所有响应统一设置 `Cache-Control: no-store`，确保 release 切换后
+固定 URL 不会混用不同版本的 HTML、JavaScript 或 CSS。
 
 NAS `/Volumes/Stock/stock-eva-market` 是经 manifest、SHA-256、Parquet schema 和行数
 校验的归档源。交互式安装阶段先把 manifest 引用的文件复制到本机临时区，完整

@@ -17,13 +17,20 @@ cd ..
 
 ```bash
 uv run uvicorn backend.app.main:app --reload
-python3 -m http.server 8080
+uv run python -m backend.app.static_server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --directory .
 ```
 
 浏览器打开 `http://127.0.0.1:8080/`。根页面提供两个独立入口：
 
 - `workspace/`：Stock EVA 收盘复盘工作台；
 - `dashboard/`：原有量化学习知识库。
+
+本地静态服务为所有响应设置 `Cache-Control: no-store`。工作台的 HTML、JavaScript
+和 CSS 文件名不是内容哈希，因此发布后同一 URL 会重新读取同一 release 的资源，
+不会将旧 `app.js` 与新 module 混装；不要改回无明确缓存策略的通用静态服务。
 
 源码、构建和运行时的关系固定如下：
 
