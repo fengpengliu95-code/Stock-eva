@@ -19,17 +19,18 @@ def create_server(
     directory: Path,
 ) -> ThreadingHTTPServer:
     try:
-        is_loopback = ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError as error:
-        raise ValueError("static server host must be a loopback IP address") from error
-    if not is_loopback:
-        raise ValueError("static server host must be a loopback IP address")
+        raise ValueError("static server host must be an IPv4 loopback address") from error
+    if not isinstance(address, ipaddress.IPv4Address) or not address.is_loopback:
+        raise ValueError("static server host must be an IPv4 loopback address")
 
+    resolved_directory = directory.resolve(strict=True)
     handler = partial(
         NoStoreStaticRequestHandler,
-        directory=str(directory),
+        directory=str(resolved_directory),
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return ThreadingHTTPServer((str(address), port), handler)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

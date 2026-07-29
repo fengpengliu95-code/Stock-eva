@@ -28,10 +28,15 @@ uv run uvicorn backend.app.main:app --reload
 另开一个终端，从项目根目录提供静态页面：
 
 ```bash
-python3 -m http.server 8080
+uv run python -m backend.app.static_server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --directory .
 ```
 
 打开 `http://127.0.0.1:8080/` 可分别进入 Stock EVA 复盘工作台与既有学习知识库。
+静态服务只接受 IPv4 loopback 地址，并为所有响应设置
+`Cache-Control: no-store`，避免固定文件名的 HTML、JavaScript 和 CSS 在升级时混装。
 工作台只读取 `http://127.0.0.1:8000/api/v1`；行情为空、部分、过期或失败时会保留
 对应状态，不使用演示数字补位。持仓、自选和策略状态只写入本地 SQLite。
 

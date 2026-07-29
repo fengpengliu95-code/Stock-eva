@@ -257,6 +257,79 @@ def fake_lsof(tmp_path: Path, *, occupied: bool) -> Path:
     return executable
 
 
+def stateful_fake_launchctl(tmp_path: Path) -> Path:
+    executable = tmp_path / "stateful-fake-launchctl"
+    executable.write_text(
+        """#!/bin/bash
+state="$LAUNCHCTL_STATE"
+target="$(/usr/bin/readlink "$RUNTIME_CURRENT_PATH" 2>/dev/null || true)"
+echo "$*" >> "$CALL_LOG"
+case "$1" in
+  print)
+    label="${2##*/}"
+    echo "launchctl|print|$label|$target" >> "$HANDOFF_EVENT_LOG"
+    /usr/bin/grep -Fxq "$label" "$state"
+    ;;
+  bootout)
+    label="${2##*/}"
+    echo "launchctl|bootout|$label|$target" >> "$HANDOFF_EVENT_LOG"
+    if [[ "${FAIL_BOOTOUT_LABEL:-}" == "$label" ]]; then
+      exit 8
+    fi
+    /usr/bin/grep -Fxv "$label" "$state" > "$state.next" || true
+    /bin/mv -f "$state.next" "$state"
+    ;;
+  bootstrap)
+    label="${3##*/}"
+    label="${label%.plist}"
+    echo "launchctl|bootstrap|$label|$target" >> "$HANDOFF_EVENT_LOG"
+    if [[ "${FAIL_LABEL:-}" == "$label" ]]; then
+      exit 9
+    fi
+    if ! /usr/bin/grep -Fxq "$label" "$state"; then
+      echo "$label" >> "$state"
+    fi
+    ;;
+esac
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def stateful_fake_lsof(tmp_path: Path) -> Path:
+    executable = tmp_path / "stateful-fake-lsof"
+    executable.write_text(
+        """#!/bin/bash
+port=""
+for argument in "$@"; do
+  case "$argument" in
+    -iTCP:*) port="${argument#-iTCP:}" ;;
+  esac
+done
+case "$port" in
+  8000) label="com.finlay.stock-eva.api" ;;
+  8080) label="com.finlay.stock-eva.web" ;;
+  *) label="" ;;
+esac
+occupied=0
+if [[ "$port" == "8080" && "${STICKY_WEB_PORT:-0}" == "1" ]]; then
+  occupied=1
+elif [[ -n "$label" ]] && /usr/bin/grep -Fxq "$label" "$LAUNCHCTL_STATE"; then
+  occupied=1
+fi
+target="$(/usr/bin/readlink "$RUNTIME_CURRENT_PATH" 2>/dev/null || true)"
+echo "lsof|$port|$target|$occupied" >> "$HANDOFF_EVENT_LOG"
+if [[ "$occupied" == "1" ]]; then
+  exit 0
+fi
+exit 1
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
 def fake_uv(tmp_path: Path) -> Path:
     executable = tmp_path / "fake-uv"
     executable.write_text(
@@ -308,6 +381,30 @@ def install_environment(
         "NPM_CALL_LOG": str(tmp_path / "npm.log"),
         "STOCK_EVA_UNAME": "Darwin",
     }
+
+
+def stateful_install_environment(tmp_path: Path) -> dict[str, str]:
+    environment = install_environment(
+        tmp_path,
+        launchctl=stateful_fake_launchctl(tmp_path),
+        lsof=stateful_fake_lsof(tmp_path),
+    )
+    runtime_current = (
+        Path(environment["HOME"])
+        / "Library/Application Support/Stock EVA/runtime/current"
+    )
+    launchctl_state = tmp_path / "launchctl-state"
+    launchctl_state.touch()
+    handoff_event_log = tmp_path / "handoff-events.log"
+    handoff_event_log.touch()
+    environment.update(
+        {
+            "LAUNCHCTL_STATE": str(launchctl_state),
+            "HANDOFF_EVENT_LOG": str(handoff_event_log),
+            "RUNTIME_CURRENT_PATH": str(runtime_current),
+        }
+    )
+    return environment
 
 
 def run_installer(
@@ -424,6 +521,103 @@ def test_installer_atomically_replaces_an_existing_runtime_symlink(
     assert current.is_symlink()
     assert current.readlink() != first_target
     assert (current / "backend/sentinel.txt").read_text() == "backend-v2"
+
+
+def test_installer_stops_web_and_releases_8080_before_current_handoff(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    event_log = Path(environment["HANDOFF_EVENT_LOG"])
+    event_log.write_text("")
+
+    (project / "uv.lock").write_text("synthetic lock v2")
+    (project / "backend/sentinel.txt").write_text("backend-v2")
+    second = run_installer(project, environment)
+
+    assert second.returncode == 0, second.stderr
+    new_target = str(current.readlink())
+    assert new_target != old_target
+    events = event_log.read_text().splitlines()
+    web_bootout = (
+        "launchctl|bootout|com.finlay.stock-eva.web|"
+        f"{old_target}"
+    )
+    released_8080 = f"lsof|8080|{old_target}|0"
+    api_bootout = (
+        "launchctl|bootout|com.finlay.stock-eva.api|"
+        f"{new_target}"
+    )
+    assert events.count(web_bootout) == 1
+    assert events.index(web_bootout) < events.index(released_8080)
+    assert events.index(released_8080) < events.index(api_bootout)
+    for label in (
+        "com.finlay.stock-eva.api",
+        "com.finlay.stock-eva.refresh",
+        "com.finlay.stock-eva.calendar",
+        "com.finlay.stock-eva.backup",
+    ):
+        assert events.count(f"launchctl|bootout|{label}|{new_target}") == 1
+        assert events.count(f"launchctl|bootstrap|{label}|{new_target}") == 1
+
+
+def test_installer_web_handoff_failure_restores_old_release_and_agents(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    agent_root = Path(environment["HOME"]) / "Library/LaunchAgents"
+    previous_web_plist = agent_root / "com.finlay.stock-eva.web.plist"
+    previous_web_plist.write_text("previous-web-plist")
+    event_log = Path(environment["HANDOFF_EVENT_LOG"])
+    event_log.write_text("")
+
+    (project / "uv.lock").write_text("synthetic lock v2")
+    (project / "backend/sentinel.txt").write_text("backend-v2")
+    environment["STICKY_WEB_PORT"] = "1"
+    second = run_installer(project, environment)
+
+    assert second.returncode != 0
+    assert "port 8080 remained occupied" in second.stderr
+    assert "rollback: restored previous LaunchAgent state" in second.stderr
+    assert str(current.readlink()) == old_target
+    assert (current / "backend/sentinel.txt").read_text() == "backend"
+    assert previous_web_plist.read_text() == "previous-web-plist"
+    releases = current.parent / "releases"
+    assert sorted(path.name for path in releases.iterdir()) == [
+        Path(old_target).name
+    ]
+    expected_labels = sorted(
+        path.name.removesuffix(".plist.in")
+        for path in LAUNCHD.glob("*.plist.in")
+    )
+    loaded_labels = sorted(
+        Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines()
+    )
+    assert loaded_labels == expected_labels
+    events = event_log.read_text().splitlines()
+    assert (
+        f"launchctl|bootout|com.finlay.stock-eva.web|{old_target}"
+        in events
+    )
+    observed_targets = {
+        parts[3] if parts[0] == "launchctl" else parts[2]
+        for event in events
+        if (parts := event.split("|"))[0] in ("launchctl", "lsof")
+    }
+    assert observed_targets <= {"", old_target}
+    assert (
+        f"launchctl|bootstrap|com.finlay.stock-eva.web|{old_target}"
+        in events
+    )
 
 
 def test_installer_rejects_manual_port_conflict_before_writing_plists(

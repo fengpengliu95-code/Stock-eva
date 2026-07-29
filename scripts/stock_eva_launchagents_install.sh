@@ -70,6 +70,7 @@ LABELS=(
   com.finlay.stock-eva.calendar
   com.finlay.stock-eva.backup
 )
+WEB_LABEL=com.finlay.stock-eva.web
 
 if [[ ! -x "$SOURCE_PYTHON" ]]; then
   echo "error: missing project Python at $SOURCE_PYTHON; run 'uv sync --extra dev' first" >&2
@@ -192,6 +193,17 @@ wait_for_unloaded() {
   local label="$1"
   for _attempt in {1..50}; do
     if ! "$LAUNCHCTL" print "$DOMAIN/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
+wait_for_port_release() {
+  local port="$1"
+  for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ! port_is_listening "$port"; then
       return 0
     fi
     /bin/sleep 0.1
@@ -420,6 +432,19 @@ elif [[ -e "$RUNTIME_CURRENT" ]]; then
   echo "error: runtime current pointer is not a symbolic link" >&2
   false
 fi
+
+if [[ -f "$PREVIOUS_ROOT/loaded.$WEB_LABEL" ]]; then
+  "$LAUNCHCTL" bootout "$DOMAIN/$WEB_LABEL" >/dev/null
+  if ! wait_for_unloaded "$WEB_LABEL"; then
+    echo "error: $WEB_LABEL remained loaded before runtime handoff" >&2
+    false
+  fi
+fi
+if ! wait_for_port_release 8080; then
+  echo "error: port 8080 remained occupied before runtime handoff" >&2
+  false
+fi
+
 NEXT_CURRENT="$RUNTIME_ROOT/.current.$$"
 /bin/rm -f "$NEXT_CURRENT"
 /bin/ln -s "releases/$RELEASE_ID" "$NEXT_CURRENT"
@@ -440,25 +465,22 @@ for log_name in "${LOG_FILES[@]}"; do
 done
 
 for label in "${LABELS[@]}"; do
-  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
+  if [[ "$label" != "$WEB_LABEL" \
+    && -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
     "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
   fi
 done
 for label in "${LABELS[@]}"; do
-  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]] && ! wait_for_unloaded "$label"; then
+  if [[ "$label" != "$WEB_LABEL" \
+    && -f "$PREVIOUS_ROOT/loaded.$label" ]] \
+    && ! wait_for_unloaded "$label"; then
     echo "error: $label remained loaded after bootout" >&2
     false
   fi
 done
 
 for port in 8000 8080; do
-  for _attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if ! port_is_listening "$port"; then
-      break
-    fi
-    /bin/sleep 0.1
-  done
-  if port_is_listening "$port"; then
+  if ! wait_for_port_release "$port"; then
     echo "error: port $port remained occupied after previous agents stopped" >&2
     false
   fi
