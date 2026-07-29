@@ -2,7 +2,7 @@ from datetime import date
 
 from backend.app.analysis.indicators import FORMULA_VERSION, calculate_indicators
 from backend.app.analysis.models import SecurityAnalysisResponse, TechnicalAnalysisPoint
-from backend.app.market.series import PriceSeriesService
+from backend.app.market.series import EmptyPriceSeriesError, PriceSeriesService
 from backend.app.market.store import MarketStore
 
 
@@ -17,19 +17,20 @@ class SecurityAnalysisService:
         start: date,
         end: date,
     ) -> SecurityAnalysisResponse:
-        prices = PriceSeriesService(self.store).read(
-            symbol,
-            start=start,
-            end=end,
-            adjustment="qfq",
-        )
-        if not prices:
+        try:
+            prices = PriceSeriesService(self.store).read(
+                symbol,
+                start=start,
+                end=end,
+                adjustment="qfq",
+            )
+        except EmptyPriceSeriesError as exc:
             return SecurityAnalysisResponse(
                 symbol=symbol,
                 status="empty",
                 as_of=None,
                 formula_version=FORMULA_VERSION,
-                quality_issues=["no_market_data"],
+                quality_issues=[exc.reason_code],
             )
 
         indicators = calculate_indicators([point.close for point in prices])

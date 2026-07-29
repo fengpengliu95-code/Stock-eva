@@ -212,10 +212,22 @@ def test_end_is_a_hard_as_of_boundary() -> None:
 def test_empty_window_has_explainable_response() -> None:
     store = RecordingMarketStore([])
 
-    response = request(store, analysis_path(end=START))
+    history = request(
+        store,
+        f"/api/v1/market/history/{SYMBOL}?start={START}&end={START}&adjustment=qfq",
+    )
+    unadjusted_history = request(
+        store,
+        f"/api/v1/market/history/{SYMBOL}?start={START}&end={START}&adjustment=none",
+    )
+    analysis = request(store, analysis_path(end=START))
 
-    assert response.status_code == 200
-    assert response.json() == {
+    assert history.status_code == 409
+    assert history.json()["detail"] == f"{SYMBOL} {START} no market data"
+    assert unadjusted_history.status_code == 200
+    assert unadjusted_history.json() == []
+    assert analysis.status_code == 200
+    assert analysis.json() == {
         "symbol": SYMBOL,
         "status": "empty",
         "as_of": None,
@@ -227,6 +239,24 @@ def test_empty_window_has_explainable_response() -> None:
     }
 
 
+def test_all_suspended_window_is_empty_without_requiring_suspension_factor() -> None:
+    store = RecordingMarketStore([bar(0, 10, factor=None, suspended=True)])
+
+    response = request(store, analysis_path(end=START))
+    unadjusted_history = request(
+        store,
+        f"/api/v1/market/history/{SYMBOL}?start={START}&end={START}&adjustment=none",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "empty"
+    assert response.json()["as_of"] is None
+    assert response.json()["quality_issues"] == ["no_effective_trading_data"]
+    assert response.json()["series"] == []
+    assert unadjusted_history.status_code == 200
+    assert unadjusted_history.json() == []
+
+
 def test_missing_adjust_factor_fails_closed() -> None:
     store = RecordingMarketStore([bar(0, 10, factor=None)])
 
@@ -234,6 +264,100 @@ def test_missing_adjust_factor_fails_closed() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == f"{SYMBOL} {START} missing adjust_factor"
+
+
+@pytest.mark.parametrize("factor", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_invalid_adjust_factor_fails_closed(factor: float) -> None:
+    store = RecordingMarketStore([bar(0, 10, factor=factor)])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 409
+    assert SYMBOL in response.json()["detail"]
+    assert str(START) in response.json()["detail"]
+    assert "invalid adjust_factor" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("first_factor", "last_factor"),
+    [(1e308, 1e-308), (1e-308, 1e308)],
+)
+def test_invalid_qfq_multiplier_fails_closed(
+    first_factor: float,
+    last_factor: float,
+) -> None:
+    store = RecordingMarketStore(
+        [
+            bar(0, 10, factor=first_factor),
+            bar(1, 10, factor=last_factor),
+        ]
+    )
+
+    response = request(store, analysis_path(end=START + timedelta(days=1)))
+
+    assert response.status_code == 409
+    assert "invalid qfq multiplier" in response.json()["detail"]
+
+
+def test_qfq_price_overflow_fails_closed() -> None:
+    enormous = bar(0, 1e308, factor=2).model_copy(update={"amount": 1e308})
+    store = RecordingMarketStore([enormous, bar(1, 10, factor=1)])
+
+    response = request(store, analysis_path(end=START + timedelta(days=1)))
+
+    assert response.status_code == 409
+    assert "invalid qfq open" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("open", float("nan")),
+        ("high", float("inf")),
+        ("low", float("-inf")),
+        ("close", float("nan")),
+        ("preclose", float("inf")),
+        ("volume", float("-inf")),
+        ("amount", float("inf")),
+        ("volume", -1.0),
+        ("amount", -1.0),
+    ],
+)
+def test_invalid_market_value_fails_closed(field: str, value: float) -> None:
+    invalid = bar(0, 10).model_copy(update={field: value})
+    store = RecordingMarketStore([invalid])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 409
+    assert SYMBOL in response.json()["detail"]
+    assert str(START) in response.json()["detail"]
+    assert f"invalid {field}" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_detail"),
+    [
+        ({"quality_status": "partial"}, "status=partial"),
+        ({"quality_status": "error"}, "status=error"),
+        ({"quality_issues": ["bad_price_source"]}, "issues=bad_price_source"),
+    ],
+)
+def test_non_ready_effective_bar_fails_closed(
+    updates: dict[str, object],
+    expected_detail: str,
+) -> None:
+    invalid = bar(0, 10).model_copy(update=updates)
+    store = RecordingMarketStore([invalid])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert SYMBOL in detail
+    assert str(START) in detail
+    assert "quality not ready" in detail
+    assert expected_detail in detail
 
 
 @pytest.mark.parametrize("symbol", ["600000", "xx.600000", "sh.60000", "SH.600000"])

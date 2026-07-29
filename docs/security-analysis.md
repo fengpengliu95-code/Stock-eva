@@ -21,12 +21,21 @@ GET /api/v1/securities/sh.600000/analysis?start=2025-07-01&end=2026-07-24
 - `source` 固定为 `baostock`。
 - 规范存储仍保存未复权 OHLCV 和 `adjust_factor`；此端点的价格字段统一按 `qfq`
   前复权，`price_adjustment` 固定为 `qfq`。
+- 前复权以请求窗口内最后一条有效、非停牌记录的 `adjust_factor` 为锚点；窗口末尾的
+  停牌占位既不改变锚点，也不要求具备复权因子。
 - 成交量和成交额不做价格复权。
 - 停牌占位记录不进入返回序列，也不参与任何指标窗口。
-- 请求窗口内完全没有记录时返回 `status=empty`、`as_of=null`、
-  `quality_issues=["no_market_data"]` 和空 `series`。
-- 只要所需有效记录缺少 `adjust_factor`，服务 fail closed 并返回 HTTP 409，不使用
-  未复权价格降级或补造因子。
+- 分析窗口内完全没有记录时返回 `status=empty`、`as_of=null`、
+  `quality_issues=["no_market_data"]` 和空 `series`；存在原始记录但全部为停牌占位时，
+  返回 `quality_issues=["no_effective_trading_data"]`。这是 analysis 端点的专用
+  empty 映射；既有 `/api/v1/market/history/{symbol}` 保持原兼容行为，对空 qfq 序列
+  返回 HTTP 409。
+- 每条有效记录进入复权和指标前都必须满足：`quality_status=ready`、
+  `quality_issues` 为空；OHLC、`preclose`、`volume`、`amount` 均为有限数值；
+  `volume/amount >= 0`；`adjust_factor` 为有限正数。
+- 违反上述门禁、缺失复权因子、非有限或非正的复权比例、非有限复权价格均 fail
+  closed 为 HTTP 409，detail 包含证券、日期和具体字段/质量问题。不使用未复权价格
+  降级，不把业务质量错误转换成暖机 `null`，也不把坏记录静默丢弃。
 
 ## 指标版本与暖机
 
