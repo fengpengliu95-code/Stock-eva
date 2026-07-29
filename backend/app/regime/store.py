@@ -317,12 +317,10 @@ class MarketRegimeStore:
             observed_index_series=observed_indexes,
             missing_index_series=missing_indexes,
             coverage_basis="symbol_presence_only",
-            expected_universe_count=None,
+            coverage_evidence_status="unavailable",
             observed_universe_count=observed_universe_count,
-            board_coverage_ratio=None,
             index_coverage_ratio=len(observed_indexes)
             / len(EXPECTED_INDEX_SERIES),
-            coverage_ratio=None,
             scope_status="narrow_provisional",
             can_support_full_a_share_conclusion=False,
             conclusion_disclaimer=(
@@ -682,14 +680,18 @@ def _finite_returns(
     returns: list[float] = []
     quality_issues: set[str] = set()
     for bar in bars:
+        preclose = _finite_float(bar.preclose)
+        if preclose is None or preclose <= 0:
+            quality_issues.add(f"{component}.invalid_return_input_excluded")
+            continue
+
         pct_change = _finite_float(bar.pct_change)
         if pct_change is not None:
             returns.append(pct_change / 100)
             continue
 
         close = _finite_float(bar.close)
-        preclose = _finite_float(bar.preclose)
-        if close is not None and preclose is not None and preclose != 0:
+        if close is not None:
             fallback = close / preclose - 1
             if math.isfinite(fallback):
                 returns.append(fallback)

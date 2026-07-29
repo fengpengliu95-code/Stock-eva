@@ -22,7 +22,8 @@ HTTP 按 `Asia/Shanghai` 日期拒绝未来 `as_of`（422）。service 本身不
 - 总分、置信度、缺失输入、支持证据、反例和质量问题；
 - 请求 `as_of`、实际行情 `data_as_of` 和内容 hash 血缘；
 - 公式版本、全部权重和阈值；
-- expected/observed/missing boards 与代表指数、coverage basis、可用 coverage ratio；
+- expected/observed/missing boards 与代表指数、observed-only coverage basis、
+  coverage evidence status 和代表指数存在比例；
 - 结果是否具备“全 A 股”结论能力和范围免责声明。
 
 `result_id` 是输入、公式版本、权重和阈值的规范 JSON SHA-256 摘要。同一输入重复
@@ -63,17 +64,10 @@ leadership=0.10
 战略阈值为 `bull >= 25`、`bear <= -25`，其余为 `range`。战术阈值为
 `risk_on >= 10`、`risk_off <= -10`，其余为 `neutral`。边界包含等号。
 
-置信度取以下三者的最小值：
-
-1. 有得分分项的权重之和；
-2. 分项质量加权和（ready=`1`、degraded=`0.75`、missing=`0`）；
-3. 权威 universe audit 给出的实际 market scope coverage ratio。
-
-`>=0.9` 为 high，`>=0.5` 为 medium，其余为 low。任何缺失分项、降级分项或
-narrow scope 都使结果状态成为 `degraded`；全部分项缺失时为 `empty`。
-没有权威时点 expected-universe denominator 时，`board_coverage_ratio` 和
-`coverage_ratio` 均为 `null`，第三项按 `0` 处理并记录
-`market_scope_coverage_not_audited`，不能从符号存在性推导高置信度。
+R1-B 没有可验证的权威 universe audit artifact，因此置信度固定为 `0 / low`，
+并记录 `market_scope_coverage_not_audited`。分项完整度和质量仍作为 reason 输出，
+但不能绕过市场范围真实性约束。任何可用分项也只能得到 `degraded`；全部分项缺失时
+为 `empty`。
 
 ## 市场范围真实性
 
@@ -87,13 +81,14 @@ narrow scope 都使结果状态成为 `degraded`；全部分项缺失时为 `emp
 R1-B 的 reader 只能从当日行列出 `observed_boards`、`observed_index_series` 和
 `observed_universe_count`。即使四个 board 都各出现少量股票且六个代表指数都存在，
 符号存在性也不等于全市场覆盖审计：`coverage_basis` 必须保持
-`symbol_presence_only`，`expected_universe_count`、`board_coverage_ratio` 和
-`coverage_ratio` 必须为 `null`，结果必须是 `narrow_provisional`、low confidence、
-`can_support_full_a_share_conclusion=false`。只有未来显式传入权威、可按时点重放的
-expected-universe denominator 并证明完整覆盖，才允许
-`coverage_basis=authoritative_universe_audit` 和全 A 结论能力。六个代表指数的
+`symbol_presence_only`，`coverage_evidence_status` 必须为 `unavailable`，结果必须
+是 `narrow_provisional`、low confidence、
+`can_support_full_a_share_conclusion=false`。R1-B 模型不提供
+`expected_universe_count`、board/full coverage ratio 或
+`authoritative_universe_audit` 提升路径，并禁止调用方附加这些字段。六个代表指数的
 `index_coverage_ratio` 只表示明确列出的六条指数序列存在比例，不证明股票 universe
-完整。
+完整。未来 R1-A 若接入真实、可按时点重放的权威审计 artifact，必须通过新的模型/
+公式版本集成，不能由 R1-B 调用方自填。
 
 R1-B 没有扩大 `all-main-board` 抓取，没有访问或写入真实 BaoStock/NAS/用户数据，
 也没有用合成数据填充生产。
@@ -111,10 +106,11 @@ store 每次只读取截止 `as_of` 的最近 130 个已存在交易日。股票
 
 风险预热分别判断：20 日波动率至少需要 21 个有效指数 session，60 日回撤至少需要
 60 个有效指数 session。未满 60 日时不得缩短窗口冒充 `index_drawdown_60d`，而是
-记录 `risk.index_drawdown_60d_warmup` 并降级。横截面收益率仅接受有限
-`pct_change`；NaN/inf 时，如果 `close`、`preclose` 有限且 `preclose != 0`，使用
-确定性的收盘价回退并记录 `pct_change_fallback_used`，否则排除该行并记录
-`invalid_return_input_excluded`。所有对外数值必须有限。
+记录 `risk.index_drawdown_60d_warmup` 并降级。横截面收益率要求 `close` 有限且
+为正，并且无论 provider `pct_change` 是否有限，都必须先确认 `preclose` 有限且
+大于零。有限 `pct_change` 仅在此前提下使用；NaN/inf 时使用确定性的
+`close / preclose - 1` 回退并记录 `pct_change_fallback_used`。分母无效时排除该行
+并记录 `invalid_return_input_excluded`。所有对外数值必须有限。
 
 配置了 local/NAS published dataset root 但 root 或 `manifest.json` 不存在时，
 read-only reader 返回空输入且不创建任何路径。已经发布的 manifest 若存在但损坏或

@@ -58,64 +58,21 @@ class RegimeComponentInput(RegimeModel):
 
 
 class ActualMarketScope(RegimeModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+
     expected_boards: list[str]
     observed_boards: list[str]
     missing_boards: list[str]
     expected_index_series: list[str]
     observed_index_series: list[str]
     missing_index_series: list[str]
-    coverage_basis: Literal[
-        "symbol_presence_only",
-        "authoritative_universe_audit",
-    ]
-    expected_universe_count: int | None = Field(default=None, ge=1)
+    coverage_basis: Literal["symbol_presence_only"] = "symbol_presence_only"
+    coverage_evidence_status: Literal["unavailable"] = "unavailable"
     observed_universe_count: int = Field(ge=0)
-    board_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
     index_coverage_ratio: float = Field(ge=0, le=1)
-    coverage_ratio: float | None = Field(default=None, ge=0, le=1)
-    scope_status: Literal["full_a_share_capable", "narrow_provisional"]
-    can_support_full_a_share_conclusion: bool
-    conclusion_disclaimer: str | None
-
-    @model_validator(mode="after")
-    def validate_scope_claim(self) -> "ActualMarketScope":
-        if (
-            self.scope_status == "full_a_share_capable"
-        ) != self.can_support_full_a_share_conclusion:
-            raise ValueError(
-                "scope status and full A-share conclusion capability must agree"
-            )
-        if self.coverage_basis == "symbol_presence_only":
-            if self.board_coverage_ratio is not None or self.coverage_ratio is not None:
-                raise ValueError(
-                    "symbol presence cannot provide board or full-market coverage ratios"
-                )
-            if self.expected_universe_count is not None:
-                raise ValueError(
-                    "symbol presence cannot provide an expected-universe denominator"
-                )
-            if self.can_support_full_a_share_conclusion:
-                raise ValueError(
-                    "full A-share capability requires an authoritative universe audit"
-                )
-        if self.can_support_full_a_share_conclusion:
-            if self.coverage_basis != "authoritative_universe_audit":
-                raise ValueError(
-                    "full A-share capability requires an authoritative universe audit"
-                )
-            if self.expected_universe_count is None:
-                raise ValueError(
-                    "full A-share capability requires an expected-universe denominator"
-                )
-            if self.observed_universe_count != self.expected_universe_count:
-                raise ValueError(
-                    "full A-share capability requires complete universe counts"
-                )
-            if self.board_coverage_ratio != 1 or self.coverage_ratio != 1:
-                raise ValueError("full A-share capability requires complete coverage")
-            if self.missing_boards or self.missing_index_series:
-                raise ValueError("full A-share capability cannot have missing scope")
-        return self
+    scope_status: Literal["narrow_provisional"] = "narrow_provisional"
+    can_support_full_a_share_conclusion: Literal[False] = False
+    conclusion_disclaimer: str
 
 
 class MarketRegimeInput(RegimeModel):

@@ -38,7 +38,7 @@ def _lineage(models, *, as_of: date = AS_OF):
     )
 
 
-def _scope(models, *, complete: bool = True):
+def _scope(models, *, all_expected_symbols_observed: bool = True):
     expected_boards = ["sse_main", "szse_main", "chinext", "star"]
     expected_indexes = [
         "sh.000001",
@@ -48,8 +48,16 @@ def _scope(models, *, complete: bool = True):
         "sh.000852",
         "sz.399006",
     ]
-    observed_boards = expected_boards if complete else expected_boards[:2]
-    observed_indexes = expected_indexes if complete else expected_indexes[:2]
+    observed_boards = (
+        expected_boards
+        if all_expected_symbols_observed
+        else expected_boards[:2]
+    )
+    observed_indexes = (
+        expected_indexes
+        if all_expected_symbols_observed
+        else expected_indexes[:2]
+    )
     return models.ActualMarketScope(
         expected_boards=expected_boards,
         observed_boards=observed_boards,
@@ -57,25 +65,15 @@ def _scope(models, *, complete: bool = True):
         expected_index_series=expected_indexes,
         observed_index_series=observed_indexes,
         missing_index_series=sorted(set(expected_indexes) - set(observed_indexes)),
-        coverage_basis=(
-            "authoritative_universe_audit"
-            if complete
-            else "symbol_presence_only"
-        ),
-        expected_universe_count=4 if complete else None,
-        observed_universe_count=4 if complete else 2,
-        board_coverage_ratio=1 if complete else None,
+        coverage_basis="symbol_presence_only",
+        coverage_evidence_status="unavailable",
+        observed_universe_count=4 if all_expected_symbols_observed else 2,
         index_coverage_ratio=len(observed_indexes) / len(expected_indexes),
-        coverage_ratio=1 if complete else None,
-        scope_status="full_a_share_capable" if complete else "narrow_provisional",
-        can_support_full_a_share_conclusion=complete,
+        scope_status="narrow_provisional",
+        can_support_full_a_share_conclusion=False,
         conclusion_disclaimer=(
-            None
-            if complete
-            else (
-                "Observed price history is narrow-scope and cannot support a full A-share "
-                "bull/bear conclusion."
-            )
+            "Observed price history is narrow-scope and cannot support a full A-share "
+            "bull/bear conclusion."
         ),
     )
 
@@ -128,7 +126,7 @@ def _inputs(
     models,
     score: float,
     *,
-    complete_scope: bool = True,
+    all_expected_symbols_observed: bool = True,
     overrides: dict[str, object] | None = None,
 ):
     components = {
@@ -144,7 +142,10 @@ def _inputs(
         liquidity=components["liquidity"],
         risk=components["risk"],
         leadership=components["leadership"],
-        actual_market_scope=_scope(models, complete=complete_scope),
+        actual_market_scope=_scope(
+            models,
+            all_expected_symbols_observed=all_expected_symbols_observed,
+        ),
         source_lineage=[_lineage(models)],
     )
 
@@ -169,8 +170,9 @@ def test_deterministic_states_cover_bull_range_bear_and_tactical_modes(
     assert result.strategic_state == strategic_state
     assert result.tactical_state == tactical_state
     assert result.total_score == score
-    assert result.status == "ready"
-    assert result.quality_status == "ready"
+    assert result.status == "degraded"
+    assert result.quality_status == "degraded"
+    assert result.confidence.level == "low"
     assert result.formula_version == "market-regime-v1"
     assert [item.name for item in result.component_scores] == [
         "trend",
@@ -265,7 +267,7 @@ def test_narrow_price_scope_is_truthful_and_low_confidence() -> None:
     models, service_module, _ = _regime_modules()
 
     result = service_module.MarketRegimeService().evaluate(
-        _inputs(models, 80, complete_scope=False)
+        _inputs(models, 80, all_expected_symbols_observed=False)
     )
 
     scope = result.actual_market_scope
@@ -456,11 +458,9 @@ def test_symbol_presence_never_proves_authoritative_full_a_scope(
     ]
     assert scope.missing_boards == []
     assert scope.missing_index_series == []
-    assert scope.board_coverage_ratio is None
     assert scope.index_coverage_ratio == 1
-    assert scope.coverage_ratio is None
     assert scope.coverage_basis == "symbol_presence_only"
-    assert scope.expected_universe_count is None
+    assert scope.coverage_evidence_status == "unavailable"
     assert scope.observed_universe_count == 4
     assert scope.can_support_full_a_share_conclusion is False
     assert scope.scope_status == "narrow_provisional"
@@ -512,6 +512,45 @@ def test_risk_is_ready_at_60_valid_index_sessions() -> None:
     assert inputs.risk.quality_status == "ready"
     assert inputs.risk.missing_inputs == []
     assert "index_drawdown_60d" in {
+        item.code
+        for item in (
+            *inputs.risk.supporting_evidence,
+            *inputs.risk.contrary_evidence,
+        )
+    }
+
+
+def test_zero_preclose_excludes_finite_provider_return_from_breadth_and_risk() -> None:
+    _, service_module, store_module = _regime_modules()
+    bars = [
+        bar.model_copy(update={"preclose": 0, "pct_change": 0})
+        if bar.trade_date == AS_OF and bar.security_type == "stock"
+        else bar
+        for bar in _market_bars(130)
+    ]
+
+    class InMemoryReader:
+        def bars_through(self, _as_of: date, *, max_sessions: int):
+            assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
+            return bars
+
+    inputs = store_module.MarketRegimeStore(InMemoryReader()).read(AS_OF)
+    result = service_module.MarketRegimeService().evaluate(inputs)
+
+    assert inputs.breadth.quality_status != "ready"
+    assert inputs.risk.quality_status != "ready"
+    assert "breadth.invalid_return_input_excluded" in inputs.breadth.quality_issues
+    assert "risk.invalid_return_input_excluded" in inputs.risk.quality_issues
+    assert "breadth.invalid_return_input_excluded" in result.quality_issues
+    assert "risk.invalid_return_input_excluded" in result.quality_issues
+    assert "advancing_ratio" not in {
+        item.code
+        for item in (
+            *inputs.breadth.supporting_evidence,
+            *inputs.breadth.contrary_evidence,
+        )
+    }
+    assert "cross_section_dispersion" not in {
         item.code
         for item in (
             *inputs.risk.supporting_evidence,
@@ -913,31 +952,43 @@ def test_regime_models_reject_non_finite_float_and_decimal(non_finite) -> None:
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    ("field", "value"),
     [
-        {
-            "coverage_basis": "symbol_presence_only",
-            "expected_universe_count": None,
-            "board_coverage_ratio": None,
-            "coverage_ratio": None,
-            "scope_status": "full_a_share_capable",
-            "can_support_full_a_share_conclusion": False,
-        },
+        ("coverage_basis", "authoritative_universe_audit"),
+        ("coverage_evidence_status", "available"),
+        ("scope_status", "full_a_share_capable"),
+        ("can_support_full_a_share_conclusion", True),
+        ("expected_universe_count", 4),
+        ("board_coverage_ratio", 1),
+        ("coverage_ratio", 1),
+    ],
+)
+def test_scope_model_rejects_r1b_full_a_promotion_fields(
+    field: str,
+    value,
+) -> None:
+    models, _, _ = _regime_modules()
+    payload = _scope(models).model_dump()
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        models.ActualMarketScope.model_validate(payload)
+
+
+def test_r1b_scope_rejects_complete_caller_supplied_authoritative_claim() -> None:
+    models, _, _ = _regime_modules()
+    payload = _scope(models).model_dump()
+    payload.update(
         {
             "coverage_basis": "authoritative_universe_audit",
             "expected_universe_count": 4,
-            "observed_universe_count": 3,
             "board_coverage_ratio": 1,
             "coverage_ratio": 1,
             "scope_status": "full_a_share_capable",
             "can_support_full_a_share_conclusion": True,
-        },
-    ],
-)
-def test_scope_model_rejects_inconsistent_full_a_claims(mutation: dict) -> None:
-    models, _, _ = _regime_modules()
-    payload = _scope(models).model_dump()
-    payload.update(mutation)
+            "conclusion_disclaimer": None,
+        }
+    )
 
     with pytest.raises(ValidationError):
         models.ActualMarketScope.model_validate(payload)

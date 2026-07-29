@@ -1,10 +1,10 @@
 # Release 1 R1-B acceptance
 
-Date: 2026-07-29 (Asia/Shanghai)
+Date: 2026-07-30 (Asia/Shanghai)
 
 R1-B review remediation: **LOCALLY VERIFIED — RE-REVIEW REQUIRED**
 
-Independent review: **CHANGES REQUIRED received; follow-up not yet re-reviewed**
+Independent review: **SECOND CHANGES REQUIRED received; follow-up not yet re-reviewed**
 
 Release 1 verdict: **PENDING — do not claim GO**
 
@@ -20,18 +20,23 @@ Release 1 verdict: **PENDING — do not claim GO**
   or guessing.
 - Expected and observed boards/index series, their missing sets, coverage basis and
   conclusion capability are explicit.
-- Symbol presence never supplies a stock-universe denominator. Without an authoritative,
-  point-in-time expected-universe audit, board/full-market coverage ratios stay null and
-  every result remains narrow provisional, low confidence and unsuitable for a full
-  A-share bull/bear conclusion—even when all four board labels and all six index symbols
-  are observed.
+- Symbol presence never supplies a stock-universe denominator. R1-B exposes no
+  authoritative audit variant, expected-universe count, or board/full-market coverage
+  ratio. Every result remains narrow provisional, low confidence and unsuitable for a
+  full A-share bull/bear conclusion—even when all four board labels and all six index
+  symbols are observed.
+- `ActualMarketScope` rejects caller-supplied full labels, true capability, authoritative
+  basis and extra audit/count/ratio fields. A future authoritative integration requires an
+  R1-A artifact and a model/formula version upgrade.
 - The six-series index ratio reports only representative-index presence; it does not prove
   stock-universe coverage.
 - Store reads are bounded by `as_of`; a defensive second boundary discards any future row.
 - Risk requires separate warmups: 21 valid index sessions for 20-day volatility and 60
   valid sessions for 60-day drawdown. A shorter window is never labeled as 60-day.
-- Non-finite `pct_change` uses a finite close/preclose fallback when possible; otherwise
-  the row is excluded and the component/result records a concrete quality issue.
+- Provider `pct_change` is accepted only when `preclose` is finite and positive.
+  Non-finite `pct_change` uses a finite positive-denominator close/preclose fallback when
+  possible; otherwise the row is excluded and the component/result records a concrete
+  quality issue.
 - HTTP rejects a future Shanghai `as_of` with 422 before store read.
 - A missing local market database, configured dataset root, or configured dataset manifest
   returns empty and creates no database, dataset path, temp state or schema.
@@ -81,26 +86,39 @@ uv run --extra dev pytest -o addopts='' -q \
 
 uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
 # Final focused GREEN: 36 passed
+
+# Second-review counterexamples added before production changes:
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_zero_preclose_excludes_finite_provider_return_from_breadth_and_risk \
+  tests/test_market_regime.py::test_r1b_scope_rejects_complete_caller_supplied_authoritative_claim
+# RED: 2 failed. Risk accepted preclose=0 with finite pct_change as ready, and the
+# caller-supplied complete authoritative scope passed validation.
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_zero_preclose_excludes_finite_provider_return_from_breadth_and_risk \
+  tests/test_market_regime.py::test_r1b_scope_rejects_complete_caller_supplied_authoritative_claim \
+  tests/test_market_regime.py::test_scope_model_rejects_r1b_full_a_promotion_fields \
+  tests/test_market_regime.py::test_deterministic_states_cover_bull_range_bear_and_tactical_modes
+# GREEN: 12 passed
+
+uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
+# Focused GREEN: 43 passed
 ```
 
 ## Verification
 
-Fresh final verification is recorded before the atomic commit:
-
-```text
 ```text
 uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
-# 36 passed in 0.46s
+# 43 passed in 0.45s
 
 uv run --extra dev pytest
-# 480 passed in 58.44s
+# 487 passed in 52.23s
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
 
 git diff --check
 # no output
-```
 ```
 
 ## Pending real and Release 1 gates
@@ -109,7 +127,8 @@ git diff --check
 - The required at-least-20-session historical replay on real published data is pending R1-E.
 - No live proof yet exists for one replayable result per ready trading day.
 - No authoritative point-in-time expected-universe denominator or board coverage audit is
-  available yet; therefore no runtime result can claim full-A capability.
+  available yet; therefore no R1-B runtime result can claim full-A capability. Future
+  integration requires an R1-A artifact and model/formula version upgrade.
 - Real ChiNext, STAR and representative-index price coverage remains unverified in this
   worker.
 - Leadership remains missing until R1-C supplies point-in-time sector persistence and leader

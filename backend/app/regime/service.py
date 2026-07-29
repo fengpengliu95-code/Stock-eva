@@ -89,13 +89,8 @@ class MarketRegimeService:
             issues.append("missing_component_inputs")
         if any(item.quality_status == "degraded" for item in components):
             issues.append("degraded_component_quality")
-        if not inputs.actual_market_scope.can_support_full_a_share_conclusion:
-            issues.append("narrow_scope_not_full_a_share")
-        if (
-            inputs.actual_market_scope.coverage_basis
-            != "authoritative_universe_audit"
-        ):
-            issues.append("market_scope_authoritative_coverage_unavailable")
+        issues.append("narrow_scope_not_full_a_share")
+        issues.append("market_scope_authoritative_coverage_unavailable")
         if inputs.actual_market_scope.missing_boards:
             issues.append("market_scope_missing_expected_boards")
         if inputs.actual_market_scope.missing_index_series:
@@ -108,7 +103,7 @@ class MarketRegimeService:
             status = "degraded"
         else:
             status = "ready"
-        confidence = self._confidence(components, inputs)
+        confidence = self._confidence(components)
         supporting = [
             evidence
             for component in components
@@ -160,7 +155,7 @@ class MarketRegimeService:
             return "risk_off"
         return "neutral"
 
-    def _confidence(self, components, inputs: MarketRegimeInput) -> RegimeConfidence:
+    def _confidence(self, components) -> RegimeConfidence:
         available_weight = sum(
             item.weight for item in components if item.score is not None
         )
@@ -175,26 +170,14 @@ class MarketRegimeService:
             )
             for item in components
         )
-        coverage_ratio = inputs.actual_market_scope.coverage_ratio
-        coverage_factor = coverage_ratio if coverage_ratio is not None else 0.0
-        value = round(
-            min(
-                available_weight,
-                quality_factor,
-                coverage_factor,
-            ),
-            4,
-        )
+        value = 0.0
         level = "high" if value >= 0.9 else "medium" if value >= 0.5 else "low"
         reasons = []
         if available_weight < 1:
             reasons.append("component_inputs_incomplete")
         if quality_factor < 1:
             reasons.append("component_quality_degraded")
-        if coverage_ratio is None:
-            reasons.append("market_scope_coverage_not_audited")
-        elif coverage_ratio < 1:
-            reasons.append("market_scope_incomplete")
+        reasons.append("market_scope_coverage_not_audited")
         return RegimeConfidence(value=value, level=level, reasons=reasons)
 
     def _result_id(self, inputs: MarketRegimeInput) -> str:
