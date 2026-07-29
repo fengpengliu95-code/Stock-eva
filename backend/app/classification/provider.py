@@ -135,9 +135,9 @@ class BaoStockClassificationProvider:
 
     def fetch(self, as_of: date) -> ClassificationSnapshot:
         initial_request_count = self.session._provider_request_count
-        self.session._login()
-        observed_at = self.clock()
         try:
+            self.session._login()
+            observed_at = self.clock()
             all_fields, all_rows = self.session._read(
                 lambda: self.session.client.query_all_stock(day=as_of.isoformat())
             )

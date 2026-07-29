@@ -132,15 +132,21 @@ socket 异常。socket `settimeout` 只限制单次无活动 `recv`；持续到�
 重置该计时，因此不能作为 query 或 pagination 的端到端期限。
 
 Stock EVA 在 wrapper 层对每次 login 和完整 request（包括全部 pagination）施加
-`socket_timeout_seconds` wall-clock deadline。到期后主线程主动 shutdown/close 当前
-BaoStock context socket并 discard session，使阻塞 worker 退出后 fail closed 为
-`BaoStockError`。Operation worker 是 daemon，正常 deadline 清理后不得残留。业务异常
-原样重抛，不转换成 transport retry。
+`socket_timeout_seconds` wall-clock deadline。macOS/POSIX CLI 主线程使用
+`ITIMER_REAL` 中断正在执行的同一 Python 调用栈；中断类型继承 `BaseException`，因此
+不会被 BaoStock 内部的 broad `except Exception` 吞掉。wrapper 边界将其转换为
+`BaoStockError`，并 shutdown/close 当前 context socket、discard session。timeout
+正确性不依赖 close 能否解除阻塞，也不创建 operation worker，因此没有 late network
+operation 或 daemon thread 累积。非主线程或无 POSIX interval timer 的环境在调用
+client 前直接 fail closed。既有 signal handler/timer 会在 operation 后恢复，更早的
+外层 timer 不会被内部 deadline 延后。业务异常仍原样重抛，不转换成 transport retry。
 
-每次 attempt 最多包含一个 bounded login 和一个 bounded request；`max_attempts` 的总
-上界可由 attempt 数、每 operation deadline、最多 1 秒 close/join grace 及配置的 request
-pace 推导。CLI provider failure 只输出聚合 error JSON、`writes_classification_data=false`，
-且在 provider 成功返回前不初始化 classification DB。
+login 与 request 各自最多执行 `max_attempts` 次；session 失效后的 request retry 也只会
+触发有限次 bounded login。总上界可由这些有限 attempt、每 operation deadline 及配置的
+request pace 相加推导，不存在后台清理 grace。Classification provider 的初始 login 与
+后续 metadata query 位于同一错误转换/cleanup 边界；CLI provider failure 只输出聚合
+error JSON、`writes_classification_data=false`，且在 provider 成功返回前不初始化
+classification DB。
 
 本次 R1-A recovery 只验证 synthetic contract。真实 BaoStock publication、live
 coverage、20-session history 和 browser acceptance 的状态见

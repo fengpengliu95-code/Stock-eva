@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -2334,3 +2335,95 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
     assert not (market_dir / "classification.duckdb").exists()
     assert not market_dir.exists()
     assert not temp_dir.exists()
+
+
+def test_classification_cli_initial_login_timeout_is_controlled_and_write_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    market_dir = tmp_path / "market"
+    temp_dir = tmp_path / "tmp"
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=market_dir,
+        local_temp_dir=temp_dir,
+    )
+
+    class NoOpCloseSocket:
+        def settimeout(self, _seconds: float) -> None:
+            pass
+
+        def shutdown(self, _how: int) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class BlockingLoginClient:
+        def __init__(self) -> None:
+            self.context = type("Context", (), {"default_socket": None})()
+            self.release = threading.Event()
+            self.continued = False
+            self.login_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            self.context.default_socket = NoOpCloseSocket()
+            self.release.wait()
+            self.continued = True
+            raise OSError("synthetic late login")
+
+    client = BlockingLoginClient()
+
+    def actual_provider(**_kwargs) -> BaoStockClassificationProvider:
+        return BaoStockClassificationProvider(
+            client=client,
+            min_request_interval_seconds=0,
+            socket_timeout_seconds=0.02,
+        )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockClassificationProvider", actual_provider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "1",
+        ],
+    )
+
+    try:
+        started = perf_counter()
+        assert cli.main() == 1
+        assert perf_counter() - started < 0.5
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "status": "error",
+            "as_of": SNAPSHOT_DATE.isoformat(),
+            "quality_issues": ["classification_sync_failed"],
+            "writes_classification_data": False,
+        }
+        assert client.continued is False
+        assert client.login_calls == 2
+        assert client.context.default_socket is None
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("stock-eva-baostock-operation-login")
+            and thread.is_alive()
+        ]
+        assert not (market_dir / "classification.duckdb").exists()
+        assert not market_dir.exists()
+        assert not temp_dir.exists()
+    finally:
+        client.release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("stock-eva-baostock-operation-login"):
+                thread.join(0.2)

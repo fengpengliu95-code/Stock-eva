@@ -1,4 +1,5 @@
 import json
+import signal
 import socket
 import threading
 import time
@@ -253,36 +254,42 @@ class DeadlineBlockingClient:
             connection.close()
 
 
+class NoOpCloseSocket(FakeSocket):
+    def shutdown(self, _how) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class NeverReleasedRequestClient:
+    def __init__(self) -> None:
+        self.context = SimpleNamespace(default_socket=None)
+        self.release = threading.Event()
+        self.query_calls = 0
+        self.continued: list[str] = []
+
+    def login(self):
+        self.context.default_socket = NoOpCloseSocket()
+        return FakeResult([], [])
+
+    def blocking_query(self):
+        self.query_calls += 1
+        self.release.wait()
+        self.continued.append("request continued after deadline")
+        return FakeResult(["code"], [["sh.600000"]])
+
+
 def assert_fails_within_deadline(
     operation,
     client: DeadlineBlockingClient,
     *,
     expected_seconds: float,
 ) -> None:
-    completed = threading.Event()
-    errors: list[BaseException] = []
-
-    def invoke() -> None:
-        try:
-            operation()
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            completed.set()
-
-    caller = threading.Thread(target=invoke, daemon=True, name="test-bounded-call")
-    caller.start()
-    finished_in_bound = completed.wait(expected_seconds)
-    if not finished_in_bound:
-        cleanup_deadline = time.monotonic() + 0.5
-        while caller.is_alive() and time.monotonic() < cleanup_deadline:
-            client.release_all()
-            caller.join(0.01)
-
-    assert finished_in_bound is True
-    assert caller.is_alive() is False
-    assert len(errors) == 1
-    assert isinstance(errors[0], BaoStockError)
+    started_at = time.monotonic()
+    with pytest.raises(BaoStockError):
+        operation()
+    assert time.monotonic() - started_at <= expected_seconds
     assert all(connection.closed for connection in client.sockets)
     assert client.continued == []
     assert not [
@@ -337,6 +344,182 @@ def test_retry_attempts_have_a_derived_total_wall_clock_bound() -> None:
         expected_seconds=(provider.max_attempts * timeout) + 0.15,
     )
     assert client.query_calls == provider.max_attempts
+
+
+def test_deadline_never_leaves_uncancellable_request_workers() -> None:
+    client = NeverReleasedRequestClient()
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=0.02,
+    )
+    provider._login()
+    existing_threads = {thread.ident for thread in threading.enumerate()}
+
+    try:
+        started_at = time.monotonic()
+        with pytest.raises(BaoStockError, match="wall-clock deadline exceeded"):
+            provider._read(client.blocking_query)
+        assert time.monotonic() - started_at <= (
+            provider.max_attempts * provider.socket_timeout_seconds
+        ) + 0.1
+
+        leaked_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.ident not in existing_threads
+            and thread.name.startswith("stock-eva-baostock-operation-request")
+            and thread.is_alive()
+        ]
+        assert leaked_workers == []
+        assert client.query_calls == provider.max_attempts
+        assert client.continued == []
+        assert client.context.default_socket is None
+    finally:
+        client.release.set()
+        for thread in threading.enumerate():
+            if (
+                thread.ident not in existing_threads
+                and thread.name.startswith("stock-eva-baostock-operation-request")
+            ):
+                thread.join(0.2)
+
+
+def test_non_main_thread_fails_closed_before_network_operation() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        socket_timeout_seconds=0.02,
+    )
+    operation_calls: list[str] = []
+    errors: list[BaseException] = []
+
+    def call_from_worker() -> None:
+        try:
+            provider._run_with_deadline(
+                lambda: operation_calls.append("called"),
+                operation_name="request",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=call_from_worker)
+    caller.start()
+    caller.join(0.2)
+
+    assert caller.is_alive() is False
+    assert operation_calls == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], BaoStockError)
+    assert "main thread" in str(errors[0])
+
+
+def test_deadline_interrupt_escapes_broad_exception_handler() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        socket_timeout_seconds=0.02,
+    )
+    swallowed: list[str] = []
+    unwound: list[str] = []
+
+    def operation() -> None:
+        try:
+            threading.Event().wait()
+        except Exception:
+            swallowed.append("deadline")
+        finally:
+            unwound.append("operation")
+
+    with pytest.raises(BaoStockError, match="wall-clock deadline exceeded"):
+        provider._run_with_deadline(operation, operation_name="request")
+
+    assert swallowed == []
+    assert unwound == ["operation"]
+
+
+def test_deadline_restores_existing_signal_handler_and_timer() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        socket_timeout_seconds=0.02,
+    )
+    original_handler = signal.getsignal(signal.SIGALRM)
+    original_delay, original_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    def existing_handler(_signum, _frame) -> None:
+        raise AssertionError("existing timer should not fire")
+
+    signal.signal(signal.SIGALRM, existing_handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.5)
+    try:
+        assert (
+            provider._run_with_deadline(lambda: "ok", operation_name="request")
+            == "ok"
+        )
+        restored_delay, restored_interval = signal.getitimer(signal.ITIMER_REAL)
+        assert signal.getsignal(signal.SIGALRM) is existing_handler
+        assert 0 < restored_delay <= 0.5
+        assert restored_interval == 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, original_handler)
+        signal.setitimer(signal.ITIMER_REAL, original_delay, original_interval)
+
+
+def test_earlier_existing_signal_timer_is_not_extended() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        socket_timeout_seconds=0.2,
+    )
+    original_handler = signal.getsignal(signal.SIGALRM)
+    original_delay, original_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    class ExistingDeadline(BaseException):
+        pass
+
+    def existing_handler(_signum, _frame) -> None:
+        raise ExistingDeadline
+
+    signal.signal(signal.SIGALRM, existing_handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.02)
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(ExistingDeadline):
+            provider._run_with_deadline(
+                lambda: threading.Event().wait(),
+                operation_name="request",
+            )
+        assert time.monotonic() - started_at < provider.socket_timeout_seconds
+        assert signal.getsignal(signal.SIGALRM) is existing_handler
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, original_handler)
+        signal.setitimer(signal.ITIMER_REAL, original_delay, original_interval)
+
+
+def test_returning_existing_timer_handler_still_fails_closed() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        socket_timeout_seconds=0.2,
+    )
+    original_handler = signal.getsignal(signal.SIGALRM)
+    original_delay, original_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    def returning_handler(_signum, _frame) -> None:
+        pass
+
+    signal.signal(signal.SIGALRM, returning_handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.02)
+    try:
+        with pytest.raises(BaoStockError, match="pre-existing timer expired"):
+            provider._run_with_deadline(
+                lambda: threading.Event().wait(),
+                operation_name="request",
+            )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, original_handler)
+        signal.setitimer(signal.ITIMER_REAL, original_delay, original_interval)
 
 
 class EofSocket(FakeSocket):

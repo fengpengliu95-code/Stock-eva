@@ -1,7 +1,9 @@
 import logging
+import signal
 import socket
 import threading
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic, sleep
@@ -69,6 +71,70 @@ class BaoStockError(RuntimeError):
 
 class _OperationDeadlineExceeded(BaoStockError):
     pass
+
+
+class _OperationDeadlineUnavailable(BaoStockError):
+    pass
+
+
+class _OperationDeadlineInterrupt(BaseException):
+    """Escape BaoStock's broad ``except Exception`` transport handling."""
+
+
+class _PreexistingTimerInterrupt(BaseException):
+    pass
+
+
+@contextmanager
+def _wall_clock_deadline(seconds: float):
+    if threading.current_thread() is not threading.main_thread():
+        raise _OperationDeadlineUnavailable(
+            "BaoStock wall-clock deadlines require the main thread"
+        )
+    if not all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    ):
+        raise _OperationDeadlineUnavailable(
+            "BaoStock wall-clock deadlines require POSIX interval timers"
+        )
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    previous_fires_first = 0 < previous_delay <= seconds
+    timer_delay = previous_delay if previous_fires_first else seconds
+    previous_fired = False
+    started_at = monotonic()
+
+    def raise_deadline(signum, frame):
+        nonlocal previous_fired
+        if previous_fires_first:
+            previous_fired = True
+            if callable(previous_handler):
+                previous_handler(signum, frame)
+            raise _PreexistingTimerInterrupt(
+                "pre-existing wall-clock timer expired during BaoStock operation"
+            )
+        raise _OperationDeadlineInterrupt
+
+    signal.signal(signal.SIGALRM, raise_deadline)
+    signal.setitimer(signal.ITIMER_REAL, timer_delay)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_fired:
+            restored_delay = previous_interval if previous_interval > 0 else 0
+        elif previous_delay > 0:
+            restored_delay = max(previous_delay - (monotonic() - started_at), 1e-6)
+        else:
+            restored_delay = 0
+        signal.setitimer(
+            signal.ITIMER_REAL,
+            restored_delay,
+            previous_interval,
+        )
 
 
 def _read_result(
@@ -219,37 +285,19 @@ class BaoStockProvider:
         self._session_usable = False
 
     def _run_with_deadline(self, operation, *, operation_name: str):
-        completed = threading.Event()
-        outcome: dict[str, Any] = {}
-
-        def invoke() -> None:
-            try:
-                outcome["value"] = operation()
-            except BaseException as exc:
-                outcome["error"] = exc
-            finally:
-                completed.set()
-
-        worker = threading.Thread(
-            target=invoke,
-            daemon=True,
-            name=f"stock-eva-baostock-operation-{operation_name}",
-        )
-        worker.start()
-        if not completed.wait(self.socket_timeout_seconds):
+        try:
+            with _wall_clock_deadline(self.socket_timeout_seconds):
+                return operation()
+        except _OperationDeadlineInterrupt:
             self._discard_session()
-            cleanup_grace = min(
-                1.0,
-                max(0.05, self.socket_timeout_seconds * 0.1),
-            )
-            completed.wait(cleanup_grace)
             raise _OperationDeadlineExceeded(
                 f"BaoStock {operation_name} wall-clock deadline exceeded"
-            )
-        error = outcome.get("error")
-        if error is not None:
-            raise error
-        return outcome.get("value")
+            ) from None
+        except _PreexistingTimerInterrupt:
+            self._discard_session()
+            raise _OperationDeadlineUnavailable(
+                "pre-existing timer expired during BaoStock operation"
+            ) from None
 
     def _logout(self) -> None:
         if not self._session_usable:
@@ -405,6 +453,8 @@ class BaoStockProvider:
                     ),
                     operation_name="request",
                 )
+            except _OperationDeadlineUnavailable:
+                raise
             except (BaoStockError, TimeoutError, OSError) as exc:
                 last_error = (
                     exc

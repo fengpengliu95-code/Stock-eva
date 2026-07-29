@@ -59,9 +59,10 @@ Release 1 verdict: **PENDING — do not claim GO**
   through idempotent publish, `generation_at` and atomic `read_snapshot`; Pydantic defaults
   cannot relabel stored history as v3.
 - BaoStock login, query construction and pagination have real per-attempt wall-clock
-  deadlines. Timeout actively closes/discards the context socket, leaves no operation
-  worker behind in deterministic tests, preserves non-transport exceptions, and keeps CLI
-  failure JSON/no-database-write behavior.
+  deadlines on the POSIX main-thread call stack. The deadline interrupt crosses BaoStock's
+  broad exception handling, no operation worker is created, unsupported execution contexts
+  fail before network access, and prior signal state is preserved. Initial-login timeout is
+  converted to controlled CLI JSON with no database or temp-directory write.
 
 ## Verification
 
@@ -108,16 +109,21 @@ Each correction was observed RED before its production change:
 15. BaoStock wall-clock deadline recovery: 4 failed
     - login, query and pagination ignored the configured end-to-end deadline
     - retry attempts had no tested derived total wall-clock bound
+16. BaoStock deadline review follow-up: 4 failed across three RED runs
+    - initial login timeout escaped classification error conversion and CLI JSON handling
+    - two no-op-close request attempts left two live daemon operation workers
+    - a non-main-thread call executed the client instead of failing closed before network
+    - an expiring pre-existing timer whose handler returned leaked an internal interrupt
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 105 passed
+# 106 passed
 
 uv run --extra dev pytest -q
-# 434 passed
+# 441 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
@@ -131,7 +137,8 @@ git diff --check
 - No real BaoStock classification publication was executed in this recovery.
 - The 2026-07-29 isolated live probe produced no aggregate JSON or database, remained blocked
   in BaoStock socket `recv` for about 15 minutes, and was terminated by the orchestrator with
-  exit 143. The synthetic deadline repair is verified, but the live probe has not been rerun
+  exit 143. The first worker-based repair failed review; the replacement POSIX main-thread
+  deadline is synthetic-only verified and has not been rerun against the public service
   pending review.
 - The eligible-universe live industry mapping target of at least 95% is not yet measured.
 - The required 20-session historical replay and no-future read acceptance is not yet run on

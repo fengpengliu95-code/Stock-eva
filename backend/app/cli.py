@@ -61,15 +61,22 @@ def _socket_timeout_value(value: str) -> float:
     return seconds
 
 
+class _ProbeTimeoutInterrupt(BaseException):
+    pass
+
+
 @contextmanager
 def _probe_timeout(seconds: int):
     def raise_timeout(_signum, _frame):
-        raise TimeoutError("metadata probe timed out")
+        raise _ProbeTimeoutInterrupt
 
     previous = signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
-        yield
+        try:
+            yield
+        except _ProbeTimeoutInterrupt as exc:
+            raise TimeoutError("metadata probe timed out") from exc
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
