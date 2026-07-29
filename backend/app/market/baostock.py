@@ -205,6 +205,8 @@ class BaoStockProvider:
         self._session_usable = False
 
     def _login(self) -> None:
+        if self._session_usable:
+            raise BaoStockError("BaoStock session is already active")
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             try:

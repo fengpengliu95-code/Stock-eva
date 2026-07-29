@@ -173,6 +173,56 @@ class FakeSocket:
         self.closed = True
 
 
+class ActiveSessionClient(FakeBaoStock):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.context = SimpleNamespace(default_socket=FakeSocket())
+        self.login_calls = 0
+        self.query_calls = 0
+        self.logout_calls = 0
+
+    def login(self):
+        self.login_calls += 1
+        raise TimeoutError("must not replace an active session")
+
+    def query_trade_dates(self, **kwargs):
+        self.query_calls += 1
+        return super().query_trade_dates(**kwargs)
+
+    def logout(self):
+        self.logout_calls += 1
+
+
+@pytest.mark.parametrize("entrypoint", ["login", "fetch"])
+def test_active_session_entry_fails_without_touching_existing_session(
+    entrypoint: str,
+) -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    client = ActiveSessionClient(payload)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+    provider._session_usable = True
+    original_socket = client.context.default_socket
+
+    with pytest.raises(BaoStockError, match="session is already active"):
+        if entrypoint == "login":
+            provider._login()
+        else:
+            provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    assert client.login_calls == 0
+    assert client.query_calls == 0
+    assert client.logout_calls == 0
+    assert original_socket.shutdown_calls == 0
+    assert original_socket.closed is False
+    assert client.context.default_socket is original_socket
+    assert provider._session_usable is True
+    assert provider.client is client
+
+
 class CloseReleasedSocket(FakeSocket):
     def __init__(self) -> None:
         super().__init__()

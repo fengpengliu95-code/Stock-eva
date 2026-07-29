@@ -116,6 +116,8 @@ Each correction was observed RED before its production change:
     - an expiring pre-existing timer whose handler returned leaked an internal interrupt
 17. Classification session ownership follow-up: 1 failed
     - rejected worker-thread login logged out and discarded a session owned by another call
+18. BaoStock active-session ownership follow-up: 2 failed
+    - direct login and fetch retried against, then discarded, a pre-existing active session
 ```
 
 Fresh final verification from the isolated worktree:
@@ -125,7 +127,7 @@ uv run --extra dev pytest tests/test_point_in_time_classification.py -q
 # 107 passed
 
 uv run --extra dev pytest -q
-# 442 passed
+# 444 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
