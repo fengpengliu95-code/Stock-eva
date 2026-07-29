@@ -15,6 +15,7 @@ workspace/            独立复盘工作台，只通过版本化 API 读写
 backend/app/          FastAPI 窄后端
   api/                版本化 HTTP 路由
   market/             Provider、规范化、控制状态、刷新与摘要
+  regime/             R1-B 确定性市场状态、只读输入适配和版本化公式
 tests/                后端契约测试
 var/market/           本地开发行情或控制 DuckDB，内容不进入 Git
 var/user/             本地 SQLite 用户数据，内容不进入 Git
@@ -38,6 +39,10 @@ docs/                 学习资料与工程架构说明
 - `GET /api/v1/market/status`
   - 纯本地只读，不触发行情网络请求。
   - 返回市场阶段、日历确认状态、期望交易日、发布指针、刷新/重试状态和能力边界。
+- `GET /api/v1/analysis/market-regime?as_of=YYYY-MM-DD`
+  - 只读重放战略/战术状态、五个版本化分项、置信度、证据和实际覆盖范围。
+  - 当前主板加两条指数历史只能返回 narrow provisional，不能称为全 A 股结论。
+  - 未来上海日期返回 422；缺失 DB/路径不创建任何文件或 schema。
 - `/api/docs`
   - FastAPI 生成的开发期接口文档。
 
@@ -78,6 +83,11 @@ published pointer；本地开发模式仍可直接使用 DuckDB。请求截止�
 阶段 3 的策略定义、不可变版本和运行结果也写入本地用户 SQLite；执行器只读
 published manifest 指定的 `as_of_date` 及以前单一来源数据。JSON AST 验证、指标
 计算、运行持久化和 API 保持分层，任何层都不接受源代码字符串或动态执行。
+
+R1-B 市场状态不新增持久化数据库。SELECT-only reader 按请求 `as_of` 读取最近
+130 个 canonical 交易日，构造 trend/breadth/liquidity/risk；R1-C 之前 leadership
+保持 missing。公式、权重、阈值、范围 coverage 和输入内容 hash 均随响应返回，
+同一输入可重复得到相同结果。详见 [R1-B 市场状态](market-regime.md)。
 
 阶段 4 前半使用无构建的原生 HTML/CSS/JS 接入版本化 API。根入口将复盘工作台与
 学习知识库分开；工作台不保存浏览器端副本、不内嵌示例行情，并原样呈现后端的

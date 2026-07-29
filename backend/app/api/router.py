@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from backend.app.api.alert import router as alert_router
+from backend.app.api.analysis import market_regime_router
 from backend.app.api.analysis import router as analysis_router
 from backend.app.api.classification import router as classification_router
 from backend.app.api.health import router as health_router
@@ -20,4 +21,5 @@ api_router.include_router(strategy_router)
 api_router.include_router(strategy_run_router)
 api_router.include_router(alert_router)
 api_router.include_router(analysis_router)
+api_router.include_router(market_regime_router)
 api_router.include_router(classification_router)

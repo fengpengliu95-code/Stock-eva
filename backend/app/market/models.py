@@ -11,7 +11,7 @@ class DailyBar(BaseModel):
     symbol: str
     security_type: Literal["stock", "index"]
     exchange: Literal["sh", "sz"]
-    board: Literal["main", "index"]
+    board: Literal["main", "chinext", "star", "index"]
     open: float
     high: float
     low: float

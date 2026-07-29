@@ -3,7 +3,18 @@ from datetime import UTC, date, datetime
 
 from backend.app.market.models import DailyBar
 
-INDEX_SYMBOLS = {"sh.000001", "sz.399001"}
+DAILY_INDEX_SYMBOLS = {
+    "sh.000001",
+    "sz.399001",
+    "sh.000016",
+    "sh.000300",
+    "sh.000852",
+    "sh.000905",
+    "sz.399006",
+}
+# Compatibility for existing normalize callers. BaoStock's all-main-board provider keeps
+# its own two-symbol summary-index set, so this broader normalization set does not widen it.
+INDEX_SYMBOLS = DAILY_INDEX_SYMBOLS
 
 
 def _record(fields: Sequence[str], row: Sequence[str]) -> dict[str, str]:
@@ -49,6 +60,17 @@ def _factor_on(
     return max(eligible, default=(trade_date, None), key=lambda item: item[0])[1]
 
 
+def _board_for(symbol: str, security_type: str) -> str:
+    if security_type == "index":
+        return "index"
+    code = symbol.split(".", 1)[-1]
+    if symbol.startswith("sz.") and code.startswith(("300", "301")):
+        return "chinext"
+    if symbol.startswith("sh.") and code.startswith(("688", "689")):
+        return "star"
+    return "main"
+
+
 def normalize_baostock_rows(
     *,
     fields: Sequence[str],
@@ -69,7 +91,7 @@ def normalize_baostock_rows(
 
         trade_date = date.fromisoformat(record["date"])
         symbol = record["code"].lower()
-        security_type = "index" if symbol in INDEX_SYMBOLS else "stock"
+        security_type = "index" if symbol in DAILY_INDEX_SYMBOLS else "stock"
         suspended = record["tradestatus"] != "1"
         factor = None if security_type == "index" else _factor_on(factors, symbol, trade_date)
         issues: list[str] = []
@@ -84,7 +106,7 @@ def normalize_baostock_rows(
                 symbol=symbol,
                 security_type=security_type,
                 exchange=symbol[:2],
-                board="index" if security_type == "index" else "main",
+                board=_board_for(symbol, security_type),
                 open=float(record["open"]),
                 high=float(record["high"]),
                 low=float(record["low"]),

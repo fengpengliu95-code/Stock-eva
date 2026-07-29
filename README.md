@@ -50,6 +50,7 @@ uv run python -m backend.app.static_server \
 - `GET http://127.0.0.1:8000/api/v1/classification/securities?as_of=2026-07-28`
 - `GET http://127.0.0.1:8000/api/v1/classification/indexes/hs300/components?as_of=2026-07-28`
 - `GET http://127.0.0.1:8000/api/v1/classification/coverage?as_of=2026-07-28&taxonomy_id=baostock.industry_classification`
+- `GET http://127.0.0.1:8000/api/v1/analysis/market-regime?as_of=2026-07-28`
 - `GET http://127.0.0.1:8000/api/v1/securities/sh.600000/analysis?start=2025-07-01&end=2026-07-24`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/positions`
 - `GET http://127.0.0.1:8000/api/v1/portfolio/valuation`
@@ -224,6 +225,8 @@ uv run --extra dev ruff check backend tests
 [阶段 1 行情说明](docs/market-data.md)；
 [R1-A 时点分类主数据](docs/classification.md) 说明证券/指数/行业 generation、
 覆盖率分母、可操作性和来源日期语义；
+[R1-B 市场状态](docs/market-regime.md) 说明确定性战略/战术状态、版本化公式、
+证据、置信度、实际市场范围和 narrow-scope 降级；
 [个股技术分析 API](docs/security-analysis.md) 说明指标参数、暖机、前复权、来源、
 公式版本和质量错误；本地持仓、自选、估值和备份边界见
 [阶段 2 用户数据说明](docs/user-data.md)，策略 AST、指标和无未来数据语义见

@@ -7,6 +7,11 @@ OHLCV 主源。AKShare 补充数据使用独立数据集、独立 manifest 和�
 不能与 BaoStock 的同一根 K 线拼接、平均或静默回填。AKShare 数据集已初始化；
 最近一次真实 canary 因上游不可用没有发布记录，因此其 published manifest 仍为空。
 
+Canonical 的 board/index 字段契约可以正确读取显式提供的创业板、科创板和代表性
+指数代码，但现有 `all-main-board` provider 路径没有因此扩大。未有真实发布覆盖前，
+任何派生市场状态必须按实际 observed boards/index series 降级，不能把字段兼容性
+称为真实全市场覆盖。
+
 市场摘要目前包含：
 
 - 上证综指 `sh.000001`、深证成指 `sz.399001`；
