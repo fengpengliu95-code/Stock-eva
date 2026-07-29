@@ -4,6 +4,7 @@ from datetime import date
 from backend.app.classification.models import (
     INDEX_CATALOG,
     TAXONOMY_BAOSTOCK_INDUSTRY,
+    Actionability,
     CoverageAudit,
     Eligibility,
     IndexComponentsResponse,
@@ -16,6 +17,7 @@ from backend.app.classification.models import (
 from backend.app.classification.store import (
     ClassificationConflictError,
     ClassificationStore,
+    actionability_reasons,
     eligibility_reason,
     market_scope,
 )
@@ -60,6 +62,10 @@ class ClassificationService:
                     eligible=eligibility_reason(row, as_of) is None,
                     exclusion_reason=eligibility_reason(row, as_of),
                 ),
+                actionability=Actionability(
+                    actionable=not actionability_reasons(row),
+                    reasons=actionability_reasons(row),
+                ),
             )
             for row in rows
         ]
@@ -90,7 +96,7 @@ class ClassificationService:
         if not rows:
             issue = (
                 "component_history_not_supplied_by_source"
-                if not metadata.component_history_supported
+                if metadata.component_history_capability == "not_supplied"
                 else "no_trusted_snapshot_at_as_of"
             )
             return IndexComponentsResponse(
@@ -102,13 +108,15 @@ class ClassificationService:
                 components=[],
                 quality_issues=[issue],
             )
+        unverified = metadata.component_history_capability == "unverified"
         return IndexComponentsResponse(
-            status="ready",
+            status="degraded" if unverified else "ready",
             as_of=as_of,
             generation_id=generation_id,
             index=metadata,
             source_snapshot_date=snapshot_date,
             components=rows,
+            quality_issues=["component_history_unverified"] if unverified else [],
         )
 
     def _ensure_taxonomy(self, taxonomy_id: str) -> None:
@@ -206,6 +214,12 @@ class ClassificationService:
             for row in securities
             if (reason := eligibility_reason(row, as_of)) is not None
         )
+        actionability = Counter(
+            reason
+            for row in securities
+            if row.security_id in eligible
+            for reason in actionability_reasons(row)
+        )
         mapped_ids = {row.security_id for row in memberships}
         unmapped = sorted(
             symbol for security_id, symbol in eligible.items() if security_id not in mapped_ids
@@ -230,6 +244,7 @@ class ClassificationService:
             coverage_ratio=ratio,
             unmapped_symbols=unmapped,
             exclusion_reasons=dict(sorted(reasons.items())),
+            actionability_reasons=dict(sorted(actionability.items())),
             source_lineage=[f"{generation.source}@{generation.source_version}"],
             quality_issues=issues,
         )

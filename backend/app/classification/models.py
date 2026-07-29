@@ -4,10 +4,12 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 TAXONOMY_BAOSTOCK_INDUSTRY = "baostock.industry_classification"
-CLASSIFICATION_SCHEMA_VERSION = "classification-v1"
+CLASSIFICATION_SCHEMA_VERSION = "classification-v2"
 BOARD_DERIVATION_VERSION = "cn-symbol-prefix-v1"
 
 ClassificationStatus = Literal["empty", "ready", "degraded", "not_available"]
+SourceDateSemantics = Literal["source_observed", "requested_unverified"]
+ComponentHistoryCapability = Literal["verified", "unverified", "not_supplied"]
 
 
 class IndexMetadata(BaseModel):
@@ -15,7 +17,7 @@ class IndexMetadata(BaseModel):
     symbol: str
     name: str
     component_source: str | None
-    component_history_supported: bool
+    component_history_capability: ComponentHistoryCapability
 
 
 INDEX_CATALOG = {
@@ -24,35 +26,49 @@ INDEX_CATALOG = {
         symbol="sh.000001",
         name="上证综指",
         component_source=None,
-        component_history_supported=False,
+        component_history_capability="not_supplied",
     ),
     "szse_component": IndexMetadata(
         index_id="szse_component",
         symbol="sz.399001",
         name="深证成指",
         component_source=None,
-        component_history_supported=False,
+        component_history_capability="not_supplied",
     ),
     "hs300": IndexMetadata(
         index_id="hs300",
         symbol="sh.000300",
         name="沪深300",
         component_source="baostock.query_hs300_stocks",
-        component_history_supported=True,
+        component_history_capability="unverified",
     ),
     "sz50": IndexMetadata(
         index_id="sz50",
         symbol="sh.000016",
         name="上证50",
         component_source="baostock.query_sz50_stocks",
-        component_history_supported=True,
+        component_history_capability="unverified",
     ),
     "csi500": IndexMetadata(
         index_id="csi500",
         symbol="sh.000905",
         name="中证500",
         component_source="baostock.query_zz500_stocks",
-        component_history_supported=True,
+        component_history_capability="unverified",
+    ),
+    "csi1000": IndexMetadata(
+        index_id="csi1000",
+        symbol="sh.000852",
+        name="中证1000",
+        component_source=None,
+        component_history_capability="not_supplied",
+    ),
+    "chinext_index": IndexMetadata(
+        index_id="chinext_index",
+        symbol="sz.399006",
+        name="创业板指",
+        component_source=None,
+        component_history_capability="not_supplied",
     ),
 }
 
@@ -68,10 +84,12 @@ class SecurityMasterRecord(BaseModel):
     list_date: date | None
     delist_date: date | None
     is_tradable: bool
-    source_status: str
+    listing_status: str
+    daily_trade_status: str
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: SourceDateSemantics = "source_observed"
     effective_from: date | None
     effective_to: date | None
     observed_at: datetime
@@ -89,6 +107,7 @@ class IndexComponentRecord(BaseModel):
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: SourceDateSemantics = "source_observed"
     effective_from: date | None
     effective_to: date | None
     observed_at: datetime
@@ -109,6 +128,7 @@ class SectorMembershipRecord(BaseModel):
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: SourceDateSemantics = "source_observed"
     effective_from: date | None
     effective_to: date | None
     observed_at: datetime
@@ -120,6 +140,7 @@ class ClassificationSnapshot(BaseModel):
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: SourceDateSemantics = "source_observed"
     observed_at: datetime
     securities: list[SecurityMasterRecord] = Field(default_factory=list)
     index_components: list[IndexComponentRecord] = Field(default_factory=list)
@@ -134,8 +155,14 @@ class Eligibility(BaseModel):
     exclusion_reason: str | None = None
 
 
+class Actionability(BaseModel):
+    actionable: bool
+    reasons: list[str] = Field(default_factory=list)
+
+
 class SecurityAtAsOf(SecurityMasterRecord):
     eligibility: Eligibility
+    actionability: Actionability
 
 
 class MarketScope(BaseModel):
@@ -159,6 +186,7 @@ class GenerationSummary(BaseModel):
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: SourceDateSemantics = "source_observed"
     observed_at: datetime
     row_counts: dict[str, int]
     coverage_audits: list["CoverageAudit"]
@@ -224,6 +252,7 @@ class CoverageAudit(BaseModel):
     target_ratio: float = 0.95
     unmapped_symbols: list[str]
     exclusion_reasons: dict[str, int]
+    actionability_reasons: dict[str, int] = Field(default_factory=dict)
     source_lineage: list[str]
     quality_issues: list[str] = Field(default_factory=list)
 

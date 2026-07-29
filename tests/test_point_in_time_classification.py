@@ -58,7 +58,8 @@ def security(
         delist_date=delisted,
         is_tradable=tradable,
         price_available=price_available,
-        source_status="1" if tradable else "0",
+        listing_status="1" if delisted is None else "0",
+        daily_trade_status="1" if tradable else "0",
         source="baostock",
         source_version="0.9.3",
         source_snapshot_date=snapshot_date,
@@ -152,6 +153,37 @@ def test_source_without_end_date_never_gets_inferred_end_date() -> None:
     row = membership("sh.600000")
 
     assert row.effective_to is None
+
+
+def test_index_component_history_capabilities_are_truthful() -> None:
+    assert {
+        index_id: metadata.component_history_capability
+        for index_id, metadata in INDEX_CATALOG.items()
+    } == {
+        "sse_composite": "not_supplied",
+        "szse_component": "not_supplied",
+        "hs300": "unverified",
+        "sz50": "unverified",
+        "csi500": "unverified",
+        "csi1000": "not_supplied",
+        "chinext_index": "not_supplied",
+    }
+    assert all(
+        metadata.component_history_capability != "verified"
+        for metadata in INDEX_CATALOG.values()
+    )
+    assert (
+        "component_history_supported"
+        not in type(INDEX_CATALOG["hs300"]).model_fields
+    )
+    assert (
+        INDEX_CATALOG["csi1000"].symbol,
+        INDEX_CATALOG["csi1000"].component_source,
+    ) == ("sh.000852", None)
+    assert (
+        INDEX_CATALOG["chinext_index"].symbol,
+        INDEX_CATALOG["chinext_index"].component_source,
+    ) == ("sz.399006", None)
 
 
 def test_security_list_and_delist_dates_are_applied_at_as_of(tmp_path: Path) -> None:
@@ -329,6 +361,93 @@ def test_index_component_history_uses_latest_whole_snapshot(tmp_path: Path) -> N
     assert current.components[0].effective_to is None
 
 
+def test_repeated_source_dates_select_only_the_latest_visible_generation(
+    tmp_path: Path,
+) -> None:
+    store, classification = service(tmp_path)
+    first_generation_date = date(2026, 7, 27)
+    source_update_date = date(2026, 7, 20)
+    first_observed = datetime(2026, 7, 27, 12, tzinfo=UTC)
+    store.publish(
+        snapshot(
+            snapshot_date=first_generation_date,
+            observed_at=first_observed,
+            securities=[
+                security(
+                    "sh.600000",
+                    snapshot_date=first_generation_date,
+                    observed_at=first_observed,
+                ),
+                security(
+                    "sz.000001",
+                    snapshot_date=first_generation_date,
+                    observed_at=first_observed,
+                ),
+            ],
+            components=[
+                component(
+                    "sh.600000",
+                    snapshot_date=source_update_date,
+                    observed_at=first_observed,
+                ),
+                component(
+                    "sz.000001",
+                    snapshot_date=source_update_date,
+                    observed_at=first_observed,
+                ),
+            ],
+            memberships=[
+                membership(
+                    "sh.600000",
+                    snapshot_date=source_update_date,
+                    observed_at=first_observed,
+                ),
+                membership(
+                    "sz.000001",
+                    snapshot_date=source_update_date,
+                    observed_at=first_observed,
+                ),
+            ],
+        )
+    )
+    second = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            components=[
+                component(
+                    "sh.600000",
+                    snapshot_date=source_update_date,
+                    observed_at=OBSERVED,
+                )
+            ],
+            memberships=[
+                membership(
+                    "sh.600000",
+                    snapshot_date=source_update_date,
+                    observed_at=OBSERVED,
+                )
+            ],
+        )
+    )
+
+    components = classification.index_components("hs300", SNAPSHOT_DATE)
+    sectors = classification.sectors(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
+    members = classification.sector_members(
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        "bank",
+        SNAPSHOT_DATE,
+    )
+
+    assert [row.symbol for row in components.components] == ["sh.600000"]
+    assert components.generation_id == second.generation_id
+    assert [(row.sector_id, row.member_count) for row in sectors.sectors] == [
+        ("bank", 1)
+    ]
+    assert sectors.generation_id == second.generation_id
+    assert [row.symbol for row in members.members] == ["sh.600000"]
+    assert members.generation_id == second.generation_id
+
+
 def test_taxonomies_are_isolated(tmp_path: Path) -> None:
     store, classification = service(tmp_path)
     store.publish(
@@ -369,6 +488,20 @@ def test_exact_duplicate_rows_and_republication_are_idempotent(tmp_path: Path) -
         "index_component_history": 0,
         "sector_membership_history": 1,
     }
+
+
+def test_generation_identity_includes_source_date_semantics(tmp_path: Path) -> None:
+    store, _ = service(tmp_path)
+
+    observed = store.publish(snapshot())
+    request_only = store.publish(
+        snapshot().model_copy(
+            update={"source_date_semantics": "requested_unverified"}
+        )
+    )
+
+    assert request_only.generation_id != observed.generation_id
+    assert store.generation_count() == 2
 
 
 def test_conflicting_same_source_snapshot_fails_closed(tmp_path: Path) -> None:
@@ -499,21 +632,25 @@ def test_market_scope_and_eligibility_are_truthful(
     assert response.market_scope.derivation_version == "cn-symbol-prefix-v1"
 
 
-def test_suspended_security_is_excluded_with_reason(tmp_path: Path) -> None:
+def test_suspended_security_remains_coverage_eligible_with_actionability_reason(
+    tmp_path: Path,
+) -> None:
     store, classification = service(tmp_path)
     store.publish(snapshot(securities=[security("sz.300001", board="chinext", tradable=False)]))
 
     response = classification.securities(SNAPSHOT_DATE, symbol="sz.300001")
 
-    assert response.securities[0].eligibility.eligible is False
-    assert response.securities[0].eligibility.exclusion_reason == "suspended"
+    assert response.securities[0].eligibility.eligible is True
+    assert response.securities[0].eligibility.exclusion_reason is None
+    assert response.securities[0].actionability.actionable is False
+    assert response.securities[0].actionability.reasons == ["suspended"]
 
 
 @pytest.mark.parametrize(
     ("price_available", "expected_reason"),
     [(False, "no_price"), (None, "price_not_audited")],
 )
-def test_price_coverage_uncertainty_fails_closed(
+def test_price_uncertainty_remains_coverage_eligible_but_not_actionable(
     tmp_path: Path,
     price_available: bool | None,
     expected_reason: str,
@@ -532,8 +669,53 @@ def test_price_coverage_uncertainty_fails_closed(
 
     response = classification.securities(SNAPSHOT_DATE, symbol="sh.600000")
 
-    assert response.securities[0].eligibility.eligible is False
-    assert response.securities[0].eligibility.exclusion_reason == expected_reason
+    assert response.securities[0].eligibility.eligible is True
+    assert response.securities[0].eligibility.exclusion_reason is None
+    assert response.securities[0].actionability.actionable is False
+    assert response.securities[0].actionability.reasons == [expected_reason]
+
+
+def test_coverage_denominator_excludes_only_out_of_scope_or_unlisted_securities(
+    tmp_path: Path,
+) -> None:
+    store, classification = service(tmp_path)
+    eligible = [
+        security("sh.600000"),
+        security("sz.300001", board="chinext", tradable=False),
+        security("sh.688001", board="star", price_available=None),
+        security("sz.000002", price_available=False),
+    ]
+    excluded = [
+        security("sh.600001", listed=date(2026, 7, 29)),
+        security("sz.000003", delisted=SNAPSHOT_DATE),
+        security("bj.830001", board="bse"),
+        security("sz.200001", board="b_share"),
+        security("sh.000001", board="index", security_type="index"),
+    ]
+    store.publish(
+        snapshot(
+            securities=[*eligible, *excluded],
+            memberships=[membership(row.symbol) for row in eligible],
+        )
+    )
+
+    audit = classification.coverage(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
+
+    assert audit.eligible_count == 4
+    assert audit.mapped_count == 4
+    assert audit.coverage_ratio == 1
+    assert audit.exclusion_reasons == {
+        "delisted": 1,
+        "non_stock": 1,
+        "not_listed_yet": 1,
+        "unsupported_board": 1,
+        "unsupported_exchange": 1,
+    }
+    assert audit.actionability_reasons == {
+        "no_price": 1,
+        "price_not_audited": 1,
+        "suspended": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -637,10 +819,19 @@ class FakeResult:
 
 
 class FakeClassificationClient:
-    def __init__(self, *, mixed_industry_dates: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        mixed_industry_dates: bool = False,
+        industry_date: str = "2026-07-20",
+        index_date: str = "2026-07-20",
+    ) -> None:
         self.calls: list[str] = []
         self.logged_out = False
         self.mixed_industry_dates = mixed_industry_dates
+        self.industry_date = industry_date
+        self.index_date = index_date
+        self.query_all_stock_day: str | None = None
 
     def login(self):
         return FakeResult([], [])
@@ -648,8 +839,9 @@ class FakeClassificationClient:
     def logout(self):
         self.logged_out = True
 
-    def query_all_stock(self, **_kwargs):
+    def query_all_stock(self, **kwargs):
         self.calls.append("query_all_stock")
+        self.query_all_stock_day = kwargs["day"]
         return FakeResult(
             ["code", "tradeStatus", "code_name"],
             [
@@ -676,13 +868,13 @@ class FakeClassificationClient:
 
     def query_stock_industry(self, **_kwargs):
         self.calls.append("query_stock_industry")
-        second_date = "2026-07-21" if self.mixed_industry_dates else "2026-07-20"
+        second_date = "2026-07-21" if self.mixed_industry_dates else self.industry_date
         return FakeResult(
             ["updateDate", "code", "code_name", "industry", "industryClassification"],
             [
-                ["2026-07-20", "sh.600000", "浦发银行", "银行", "证监会行业分类"],
+                [self.industry_date, "sh.600000", "浦发银行", "银行", "证监会行业分类"],
                 [second_date, "sz.300001", "创业板样本", "软件服务", "证监会行业分类"],
-                ["2026-07-20", "sh.688001", "科创板样本", "半导体", "证监会行业分类"],
+                [self.industry_date, "sh.688001", "科创板样本", "半导体", "证监会行业分类"],
             ],
         )
 
@@ -693,19 +885,19 @@ class FakeClassificationClient:
     def query_hs300_stocks(self, **_kwargs):
         return self._index(
             "query_hs300_stocks",
-            [["2026-07-20", "sh.600000", "浦发银行"]],
+            [[self.index_date, "sh.600000", "浦发银行"]],
         )
 
     def query_sz50_stocks(self, **_kwargs):
         return self._index(
             "query_sz50_stocks",
-            [["2026-07-20", "sh.600000", "浦发银行"]],
+            [[self.index_date, "sh.600000", "浦发银行"]],
         )
 
     def query_zz500_stocks(self, **_kwargs):
         return self._index(
             "query_zz500_stocks",
-            [["2026-07-20", "sz.300001", "创业板样本"]],
+            [[self.index_date, "sz.300001", "创业板样本"]],
         )
 
 
@@ -753,6 +945,16 @@ def test_provider_builds_extended_security_and_classification_snapshot() -> None
     assert by_symbol["sh.600000"].list_date == date(1999, 11, 10)
     assert by_symbol["sh.600000"].delist_date is None
     assert by_symbol["sh.600000"].price_available is None
+    assert by_symbol["sh.600000"].listing_status == "1"
+    assert by_symbol["sh.600000"].daily_trade_status == "1"
+    assert payload.source_date_semantics == "requested_unverified"
+    assert by_symbol["sh.600000"].source_date_semantics == "requested_unverified"
+    assert all(
+        row.source_date_semantics == "source_observed"
+        for row in [*payload.index_components, *payload.sector_memberships]
+    )
+    assert client.query_all_stock_day == SNAPSHOT_DATE.isoformat()
+    assert "source_status" not in type(by_symbol["sh.600000"]).model_fields
     assert {row.index_id for row in payload.index_components} == {
         "hs300",
         "sz50",
@@ -786,6 +988,25 @@ def test_provider_fails_closed_on_mixed_source_snapshot_dates() -> None:
     )
 
     with pytest.raises(ClassificationProviderError, match="mixed industry snapshot dates"):
+        provider.fetch(SNAPSHOT_DATE)
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        FakeClassificationClient(industry_date="2026-07-29"),
+        FakeClassificationClient(index_date="2026-07-29"),
+    ],
+)
+def test_provider_rejects_source_update_date_after_requested_as_of(
+    client: FakeClassificationClient,
+) -> None:
+    provider = BaoStockClassificationProvider(
+        client=client,
+        clock=lambda: OBSERVED,
+    )
+
+    with pytest.raises(ClassificationProviderError, match="after requested as_of"):
         provider.fetch(SNAPSHOT_DATE)
 
 
@@ -853,8 +1074,19 @@ def test_api_ready_and_degraded_coverage_contract(tmp_path: Path) -> None:
         "main",
         "chinext",
     }
+    assert securities.json()["securities"][0]["listing_status"] == "1"
+    assert securities.json()["securities"][0]["daily_trade_status"] == "1"
+    assert securities.json()["securities"][0]["actionability"] == {
+        "actionable": True,
+        "reasons": [],
+    }
     assert "BSE" in securities.json()["market_scope"]["excluded_markets"]
     assert components.status_code == 200
+    assert components.json()["status"] == "degraded"
+    assert components.json()["index"]["component_history_capability"] == "unverified"
+    assert components.json()["quality_issues"] == [
+        "component_history_unverified"
+    ]
     assert [row["symbol"] for row in components.json()["components"]] == ["sh.600000"]
     assert sectors.status_code == 200
     assert sectors.json()["sectors"][0]["sector_id"] == "bank"
@@ -887,6 +1119,13 @@ def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
             f"?as_of={SNAPSHOT_DATE}"
         ),
     )
+    csi1000_metadata_only = api_request(
+        empty_store,
+        (
+            "/api/v1/classification/indexes/csi1000/components"
+            f"?as_of={SNAPSHOT_DATE}"
+        ),
+    )
 
     assert empty.status_code == 200
     assert empty.json()["status"] == "empty"
@@ -895,6 +1134,12 @@ def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
     assert before_first.json()["quality_issues"] == ["no_trusted_snapshot_at_as_of"]
     assert metadata_only.status_code == 200
     assert metadata_only.json()["quality_issues"] == [
+        "component_history_not_supplied_by_source"
+    ]
+    assert csi1000_metadata_only.status_code == 200
+    assert csi1000_metadata_only.json()["index"]["symbol"] == "sh.000852"
+    assert csi1000_metadata_only.json()["components"] == []
+    assert csi1000_metadata_only.json()["quality_issues"] == [
         "component_history_not_supplied_by_source"
     ]
 
@@ -991,3 +1236,23 @@ def test_classification_sync_execute_observes_and_publishes(tmp_path: Path) -> N
     assert result.generation is not None
     assert provider.calls == [SNAPSHOT_DATE]
     assert store.ready_generation() == result.generation.generation_id
+
+
+def test_classification_sync_execute_rejects_future_as_of_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    store = ClassificationStore(tmp_path / "classification.duckdb")
+    provider = RecordingClassificationProvider(
+        snapshot(securities=[security("sh.600000")])
+    )
+
+    with pytest.raises(ValueError, match="future as_of"):
+        run_classification_sync(
+            as_of=date.max,
+            execute=True,
+            store=store,
+            provider=provider,
+        )
+
+    assert provider.calls == []
+    assert store.ready_generation() is None

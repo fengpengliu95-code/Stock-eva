@@ -43,13 +43,18 @@ def eligibility_reason(row: SecurityMasterRecord, as_of: date) -> str | None:
         return "not_listed_yet"
     if row.delist_date is not None and as_of >= row.delist_date:
         return "delisted"
-    if not row.is_tradable:
-        return "suspended"
-    if row.price_available is False:
-        return "no_price"
-    if row.price_available is None:
-        return "price_not_audited"
     return None
+
+
+def actionability_reasons(row: SecurityMasterRecord) -> list[str]:
+    reasons = []
+    if not row.is_tradable:
+        reasons.append("suspended")
+    if row.price_available is False:
+        reasons.append("no_price")
+    elif row.price_available is None:
+        reasons.append("price_not_audited")
+    return reasons
 
 
 def market_scope(rows: list[SecurityMasterRecord]) -> MarketScope:
@@ -104,11 +109,19 @@ class ClassificationStore:
                 source VARCHAR NOT NULL,
                 source_version VARCHAR NOT NULL,
                 source_snapshot_date DATE NOT NULL,
+                source_date_semantics VARCHAR NOT NULL,
                 observed_at TIMESTAMPTZ NOT NULL,
                 row_counts JSON NOT NULL,
                 coverage_audits JSON NOT NULL,
                 market_scope JSON NOT NULL
             )
+            """
+        )
+        connection.execute(
+            """
+            ALTER TABLE classification_generations
+            ADD COLUMN IF NOT EXISTS source_date_semantics VARCHAR
+            DEFAULT 'source_observed'
             """
         )
         connection.execute(
@@ -239,6 +252,7 @@ class ClassificationStore:
             "source": snapshot.source,
             "source_version": snapshot.source_version,
             "source_snapshot_date": snapshot.source_snapshot_date.isoformat(),
+            "source_date_semantics": snapshot.source_date_semantics,
             "lineages": sorted(
                 row.lineage_hash
                 for row in [
@@ -265,6 +279,12 @@ class ClassificationStore:
             for row in snapshot.securities
             if reasons[row.security_id] is None
         }
+        actionability = Counter(
+            reason
+            for row in snapshot.securities
+            if row.security_id in eligible
+            for reason in actionability_reasons(row)
+        )
         taxonomy_ids = sorted(
             set(snapshot.declared_taxonomies)
             | {row.taxonomy_id for row in snapshot.sector_memberships}
@@ -302,6 +322,7 @@ class ClassificationStore:
                     exclusion_reasons=dict(
                         sorted(Counter(reason for reason in reasons.values() if reason).items())
                     ),
+                    actionability_reasons=dict(sorted(actionability.items())),
                     source_lineage=[f"{snapshot.source}@{snapshot.source_version}"],
                     quality_issues=issues,
                 )
@@ -401,7 +422,21 @@ class ClassificationStore:
             try:
                 connection.execute(
                     """
-                    INSERT INTO classification_generations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO classification_generations (
+                        sequence,
+                        generation_id,
+                        schema_version,
+                        source,
+                        source_version,
+                        source_snapshot_date,
+                        source_date_semantics,
+                        observed_at,
+                        row_counts,
+                        coverage_audits,
+                        market_scope
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     [
                         next_sequence,
@@ -410,6 +445,7 @@ class ClassificationStore:
                         snapshot.source,
                         snapshot.source_version,
                         snapshot.source_snapshot_date,
+                        snapshot.source_date_semantics,
                         snapshot.observed_at,
                         json.dumps(row_counts, ensure_ascii=False),
                         json.dumps(
@@ -443,6 +479,7 @@ class ClassificationStore:
                 source=snapshot.source,
                 source_version=snapshot.source_version,
                 source_snapshot_date=snapshot.source_snapshot_date,
+                source_date_semantics=snapshot.source_date_semantics,
                 observed_at=snapshot.observed_at,
                 row_counts=row_counts,
                 coverage_audits=audits,
@@ -560,7 +597,8 @@ class ClassificationStore:
         row = connection.execute(
             """
             SELECT sequence, generation_id, source, source_version, source_snapshot_date,
-                   observed_at, row_counts, coverage_audits, market_scope
+                   source_date_semantics, observed_at, row_counts, coverage_audits,
+                   market_scope
             FROM classification_generations WHERE generation_id = ?
             """,
             [generation_id],
@@ -575,10 +613,11 @@ class ClassificationStore:
             source=row[2],
             source_version=row[3],
             source_snapshot_date=row[4],
-            observed_at=row[5],
-            row_counts=json.loads(row[6]),
-            coverage_audits=[CoverageAudit.model_validate(item) for item in json.loads(row[7])],
-            market_scope=MarketScope.model_validate_json(row[8]),
+            source_date_semantics=row[5],
+            observed_at=row[6],
+            row_counts=json.loads(row[7]),
+            coverage_audits=[CoverageAudit.model_validate(item) for item in json.loads(row[8])],
+            market_scope=MarketScope.model_validate_json(row[9]),
         )
 
     def generation_at(self, as_of: date) -> GenerationSummary | None:
@@ -591,7 +630,8 @@ class ClassificationStore:
                 connection,
                 """
                 SELECT sequence, generation_id, source, source_version, source_snapshot_date,
-                       observed_at, row_counts, coverage_audits, market_scope
+                       source_date_semantics, observed_at, row_counts, coverage_audits,
+                       market_scope
                 FROM classification_generations
                 WHERE sequence <= ?
                   AND source_snapshot_date <= ?
@@ -619,12 +659,35 @@ class ClassificationStore:
             pointer = self._ready_pointer(connection)
             if pointer is None:
                 return [], None, None
+            generation = self._execute(
+                connection,
+                """
+                SELECT sequence, generation_id
+                FROM classification_generations
+                WHERE sequence <= ?
+                  AND source_snapshot_date <= ?
+                  AND CAST(observed_at AS DATE) <= ?
+                ORDER BY source_snapshot_date DESC, sequence DESC
+                LIMIT 1
+                """,
+                [pointer[0], as_of, as_of],
+            ).fetchone()
+            if generation is None:
+                return [], None, None
+            generation_sequence = int(generation[0])
+            generation_id = generation[1]
             conditions = [
-                "generation_sequence <= ?",
+                "generation_sequence = ?",
+                "generation_id = ?",
                 "source_snapshot_date <= ?",
                 "CAST(observed_at AS DATE) <= ?",
             ]
-            parameters: list[object] = [pointer[0], as_of, as_of]
+            parameters: list[object] = [
+                generation_sequence,
+                generation_id,
+                as_of,
+                as_of,
+            ]
             for column, value in (filters or {}).items():
                 conditions.append(f"{column} = ?")
                 parameters.append(value)
@@ -664,7 +727,11 @@ class ClassificationStore:
             ).fetchall()
             if not rows:
                 return [], None, selected_date
-            return [model.model_validate_json(row[0]) for row in rows], rows[0][1], selected_date
+            return (
+                [model.model_validate_json(row[0]) for row in rows],
+                generation_id,
+                selected_date,
+            )
         finally:
             connection.close()
 

@@ -28,6 +28,8 @@ def run_classification_sync(
             execute_requires="--execute",
             generation=None,
         )
+    if as_of > date.today():
+        raise ValueError("classification execute rejects future as_of")
     if provider is None:
         raise ValueError("classification execute requires a provider")
     snapshot = provider.fetch(as_of)

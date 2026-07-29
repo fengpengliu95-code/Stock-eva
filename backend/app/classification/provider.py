@@ -71,12 +71,18 @@ def _single_snapshot_date(
     rows: list[dict[str, str]],
     *,
     label: str,
+    requested_as_of: date,
 ) -> date | None:
     dates = {_date(row["updateDate"]) for row in rows}
     dates.discard(None)
     if len(dates) > 1:
         raise ClassificationProviderError(f"mixed {label} snapshot dates")
-    return next(iter(dates), None)
+    snapshot_date = next(iter(dates), None)
+    if snapshot_date is not None and snapshot_date > requested_as_of:
+        raise ClassificationProviderError(
+            f"{label} snapshot date is after requested as_of"
+        )
+    return snapshot_date
 
 
 class BaoStockClassificationProvider:
@@ -143,7 +149,11 @@ class BaoStockClassificationProvider:
         security_ids = {row.security_id for row in securities}
 
         industry_records = _row_dicts(industry_fields, industry_rows)
-        _single_snapshot_date(industry_records, label="industry")
+        _single_snapshot_date(
+            industry_records,
+            label="industry",
+            requested_as_of=as_of,
+        )
         memberships = [
             self._sector_record(row, observed_at)
             for row in industry_records
@@ -152,7 +162,11 @@ class BaoStockClassificationProvider:
         components: list[IndexComponentRecord] = []
         for index_id, (fields, rows) in index_payloads.items():
             records = _row_dicts(fields, rows)
-            _single_snapshot_date(records, label=f"{index_id} component")
+            _single_snapshot_date(
+                records,
+                label=f"{index_id} component",
+                requested_as_of=as_of,
+            )
             for row in records:
                 if f"baostock:{row['code']}" not in security_ids:
                     raise ClassificationProviderError(
@@ -163,6 +177,7 @@ class BaoStockClassificationProvider:
             source="baostock",
             source_version=self.source_version,
             source_snapshot_date=as_of,
+            source_date_semantics="requested_unverified",
             observed_at=observed_at,
             securities=securities,
             index_components=components,
@@ -205,13 +220,14 @@ class BaoStockClassificationProvider:
             delist_date=delist_date,
             is_tradable=(
                 row["tradeStatus"] == "1"
-                and (basic is None or basic["status"] == "1")
             ),
             price_available=None,
-            source_status=raw["status"] or row["tradeStatus"],
+            listing_status=raw["status"],
+            daily_trade_status=row["tradeStatus"],
             source="baostock",
             source_version=self.source_version,
             source_snapshot_date=snapshot_date,
+            source_date_semantics="requested_unverified",
             effective_from=list_date,
             effective_to=delist_date,
             observed_at=observed_at,
@@ -256,6 +272,7 @@ class BaoStockClassificationProvider:
             source="baostock",
             source_version=self.source_version,
             source_snapshot_date=snapshot_date,
+            source_date_semantics="source_observed",
             effective_from=snapshot_date,
             effective_to=None,
             observed_at=observed_at,
@@ -287,6 +304,7 @@ class BaoStockClassificationProvider:
             source="baostock",
             source_version=self.source_version,
             source_snapshot_date=snapshot_date,
+            source_date_semantics="source_observed",
             effective_from=snapshot_date,
             effective_to=None,
             observed_at=observed_at,
