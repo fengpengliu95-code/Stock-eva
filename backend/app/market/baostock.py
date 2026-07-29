@@ -67,6 +67,10 @@ class BaoStockError(RuntimeError):
     pass
 
 
+class _OperationDeadlineExceeded(BaoStockError):
+    pass
+
+
 def _read_result(
     result: Any,
     *,
@@ -138,7 +142,13 @@ class BaoStockProvider:
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             try:
-                result = self._call_login()
+                result = self._run_with_deadline(
+                    self._call_login,
+                    operation_name="login",
+                )
+            except _OperationDeadlineExceeded as exc:
+                last_error = exc
+                continue
             except (TimeoutError, OSError):
                 last_error = BaoStockError("BaoStock login transport failed")
                 self._discard_session()
@@ -207,6 +217,39 @@ class BaoStockProvider:
             except Exception:
                 pass
         self._session_usable = False
+
+    def _run_with_deadline(self, operation, *, operation_name: str):
+        completed = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def invoke() -> None:
+            try:
+                outcome["value"] = operation()
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            daemon=True,
+            name=f"stock-eva-baostock-operation-{operation_name}",
+        )
+        worker.start()
+        if not completed.wait(self.socket_timeout_seconds):
+            self._discard_session()
+            cleanup_grace = min(
+                1.0,
+                max(0.05, self.socket_timeout_seconds * 0.1),
+            )
+            completed.wait(cleanup_grace)
+            raise _OperationDeadlineExceeded(
+                f"BaoStock {operation_name} wall-clock deadline exceeded"
+            )
+        error = outcome.get("error")
+        if error is not None:
+            raise error
+        return outcome.get("value")
 
     def _logout(self) -> None:
         if not self._session_usable:
@@ -355,9 +398,12 @@ class BaoStockProvider:
             self._pace_request()
             self._ensure_session()
             try:
-                return _read_result(
-                    operation(),
-                    before_page_request=self._pace_request,
+                return self._run_with_deadline(
+                    lambda: _read_result(
+                        operation(),
+                        before_page_request=self._pace_request,
+                    ),
+                    operation_name="request",
                 )
             except (BaoStockError, TimeoutError, OSError) as exc:
                 last_error = (

@@ -1,12 +1,14 @@
 import json
 import socket
+import threading
+import time
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from backend.app.market.baostock import BaoStockProvider
+from backend.app.market.baostock import BaoStockError, BaoStockProvider
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "baostock_daily.json"
 
@@ -168,6 +170,173 @@ class FakeSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+class CloseReleasedSocket(FakeSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recv_started = threading.Event()
+        self.released = threading.Event()
+
+    def recv(self, _size) -> bytes:
+        self.recv_started.set()
+        self.released.wait()
+        raise OSError("synthetic connection closed")
+
+    def shutdown(self, how) -> None:
+        super().shutdown(how)
+        self.released.set()
+
+    def close(self) -> None:
+        super().close()
+        self.released.set()
+
+
+class BlockingPaginationResult:
+    fields = ["code"]
+    error_code = "0"
+    error_msg = ""
+    data = [["sh.600000"]]
+    per_page_count = 1
+
+    def __init__(self, connection: CloseReleasedSocket, continued: list[str]) -> None:
+        self.connection = connection
+        self.continued = continued
+        self.cur_row_num = 0
+
+    def next(self) -> bool:
+        if self.cur_row_num == 0:
+            return True
+        self.connection.recv(8192)
+        self.continued.append("pagination continued after close")
+        return False
+
+    def get_row_data(self) -> list[str]:
+        self.cur_row_num += 1
+        return ["sh.600000"]
+
+
+class DeadlineBlockingClient:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.context = SimpleNamespace(default_socket=None)
+        self.sockets: list[CloseReleasedSocket] = []
+        self.query_calls = 0
+        self.continued: list[str] = []
+
+    def _new_socket(self) -> CloseReleasedSocket:
+        connection = CloseReleasedSocket()
+        self.sockets.append(connection)
+        self.context.default_socket = connection
+        return connection
+
+    def login(self):
+        connection = self._new_socket()
+        if self.mode == "login":
+            connection.recv(8192)
+            self.continued.append("login continued after close")
+        return FakeResult([], [])
+
+    def logout(self):
+        return FakeResult([], [])
+
+    def blocking_query(self):
+        self.query_calls += 1
+        connection = self.context.default_socket
+        if self.mode == "query":
+            connection.recv(8192)
+            self.continued.append("query continued after close")
+        return BlockingPaginationResult(connection, self.continued)
+
+    def release_all(self) -> None:
+        for connection in self.sockets:
+            connection.close()
+
+
+def assert_fails_within_deadline(
+    operation,
+    client: DeadlineBlockingClient,
+    *,
+    expected_seconds: float,
+) -> None:
+    completed = threading.Event()
+    errors: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            operation()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    caller = threading.Thread(target=invoke, daemon=True, name="test-bounded-call")
+    caller.start()
+    finished_in_bound = completed.wait(expected_seconds)
+    if not finished_in_bound:
+        cleanup_deadline = time.monotonic() + 0.5
+        while caller.is_alive() and time.monotonic() < cleanup_deadline:
+            client.release_all()
+            caller.join(0.01)
+
+    assert finished_in_bound is True
+    assert caller.is_alive() is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], BaoStockError)
+    assert all(connection.closed for connection in client.sockets)
+    assert client.continued == []
+    assert not [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("stock-eva-baostock-operation-")
+        and thread.is_alive()
+    ]
+
+
+@pytest.mark.parametrize("mode", ["login", "query", "pagination"])
+def test_wall_clock_deadline_closes_blocking_baostock_operation(mode: str) -> None:
+    timeout = 0.02
+    client = DeadlineBlockingClient(mode)
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=timeout,
+    )
+
+    if mode == "login":
+        def operation():
+            return provider._login()
+    else:
+        provider._login()
+
+        def operation():
+            return provider._read(client.blocking_query)
+
+    assert_fails_within_deadline(
+        operation,
+        client,
+        expected_seconds=timeout + 0.12,
+    )
+
+
+def test_retry_attempts_have_a_derived_total_wall_clock_bound() -> None:
+    timeout = 0.02
+    client = DeadlineBlockingClient("query")
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=timeout,
+    )
+    provider._login()
+
+    assert_fails_within_deadline(
+        lambda: provider._read(client.blocking_query),
+        client,
+        expected_seconds=(provider.max_attempts * timeout) + 0.15,
+    )
+    assert client.query_calls == provider.max_attempts
 
 
 class EofSocket(FakeSocket):

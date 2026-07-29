@@ -58,6 +58,10 @@ Release 1 verdict: **PENDING — do not claim GO**
 - Persisted generation reads preserve each row's schema version. Legacy v2 rows remain v2
   through idempotent publish, `generation_at` and atomic `read_snapshot`; Pydantic defaults
   cannot relabel stored history as v3.
+- BaoStock login, query construction and pagination have real per-attempt wall-clock
+  deadlines. Timeout actively closes/discards the context socket, leaves no operation
+  worker behind in deterministic tests, preserves non-transport exceptions, and keeps CLI
+  failure JSON/no-database-write behavior.
 
 ## Verification
 
@@ -101,16 +105,19 @@ Each correction was observed RED before its production change:
     - changed record content with a reused lineage was incorrectly treated as idempotent
 14. persisted schema-version review follow-up: 3 failed
     - idempotent publish, generation_at and read_snapshot relabeled stored v2 rows as v3
+15. BaoStock wall-clock deadline recovery: 4 failed
+    - login, query and pagination ignored the configured end-to-end deadline
+    - retry attempts had no tested derived total wall-clock bound
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 104 passed
+# 105 passed
 
 uv run --extra dev pytest -q
-# 429 passed
+# 434 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
@@ -122,12 +129,15 @@ git diff --check
 ## Pending real acceptance gates
 
 - No real BaoStock classification publication was executed in this recovery.
+- The 2026-07-29 isolated live probe produced no aggregate JSON or database, remained blocked
+  in BaoStock socket `recv` for about 15 minutes, and was terminated by the orchestrator with
+  exit 143. The synthetic deadline repair is verified, but the live probe has not been rerun
+  pending review.
 - The eligible-universe live industry mapping target of at least 95% is not yet measured.
 - The required 20-session historical replay and no-future read acceptance is not yet run on
   real published generations.
 - Browser acceptance for market to sector to leader to stock drill-down belongs to later
   Release 1 work and remains pending.
-- The live provider probe previously timed out; component history capability therefore remains
-  `unverified`, not `verified`.
+- Component history capability remains `unverified`, not `verified`.
 
 These pending gates prevent a Release 1 GO claim.

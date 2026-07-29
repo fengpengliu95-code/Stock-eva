@@ -125,6 +125,23 @@ Sync 结果的 `new_generation` 明确表示是否插入新 generation；
 `writes_classification_data` 与同一原子 publish outcome 一致。幂等重跑两者均为
 `false`，不使用易竞态的 generation count 前后比较。
 
+## BaoStock operation deadline
+
+BaoStock 0.9.3 的 `send_msg` 会循环 `recv(8192)` 直到收到协议结束标记，并在内部捕获
+socket 异常。socket `settimeout` 只限制单次无活动 `recv`；持续到达但永不完成的分片会
+重置该计时，因此不能作为 query 或 pagination 的端到端期限。
+
+Stock EVA 在 wrapper 层对每次 login 和完整 request（包括全部 pagination）施加
+`socket_timeout_seconds` wall-clock deadline。到期后主线程主动 shutdown/close 当前
+BaoStock context socket并 discard session，使阻塞 worker 退出后 fail closed 为
+`BaoStockError`。Operation worker 是 daemon，正常 deadline 清理后不得残留。业务异常
+原样重抛，不转换成 transport retry。
+
+每次 attempt 最多包含一个 bounded login 和一个 bounded request；`max_attempts` 的总
+上界可由 attempt 数、每 operation deadline、最多 1 秒 close/join grace 及配置的 request
+pace 推导。CLI provider failure 只输出聚合 error JSON、`writes_classification_data=false`，
+且在 provider 成功返回前不初始化 classification DB。
+
 本次 R1-A recovery 只验证 synthetic contract。真实 BaoStock publication、live
 coverage、20-session history 和 browser acceptance 的状态见
 [`docs/acceptance/release-1-r1a.md`](acceptance/release-1-r1a.md)。

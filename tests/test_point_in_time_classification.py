@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -7,6 +9,7 @@ import duckdb
 import httpx
 import pytest
 
+from backend.app import cli
 from backend.app.api.classification import get_classification_store
 from backend.app.classification.models import (
     INDEX_CATALOG,
@@ -28,6 +31,7 @@ from backend.app.classification.service import (
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.cli import build_parser
+from backend.app.config import Settings
 from backend.app.main import app
 
 OBSERVED = datetime(2026, 7, 28, 12, tzinfo=UTC)
@@ -2279,3 +2283,54 @@ def test_classification_sync_execute_rejects_future_as_of_before_provider_call(
 
     assert provider.calls == []
     assert store.ready_generation() is None
+
+
+def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    market_dir = tmp_path / "market"
+    temp_dir = tmp_path / "tmp"
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=market_dir,
+        local_temp_dir=temp_dir,
+    )
+
+    class DeadlineProvider:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def fetch(self, _as_of: date) -> ClassificationSnapshot:
+            raise ClassificationProviderError(
+                "BaoStock request wall-clock deadline exceeded"
+            )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockClassificationProvider", DeadlineProvider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "120",
+        ],
+    )
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "error",
+        "as_of": SNAPSHOT_DATE.isoformat(),
+        "quality_issues": ["classification_sync_failed"],
+        "writes_classification_data": False,
+    }
+    assert not (market_dir / "classification.duckdb").exists()
+    assert not market_dir.exists()
+    assert not temp_dir.exists()
