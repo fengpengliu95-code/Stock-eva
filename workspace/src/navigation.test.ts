@@ -20,6 +20,15 @@ describe("security navigation", () => {
     expect(parseSecurityHash("#security/not-a-symbol")).toBeNull();
   });
 
+  it.each([
+    "#security/%?from=portfolio",
+    "#security/%2?from=portfolio",
+    "#security/%ZZ?from=watchlists",
+    "#security/%E0%A4%A?from=portfolio",
+  ])("rejects malformed percent encoding without throwing: %s", (hash) => {
+    expect(parseSecurityHash(hash)).toBeNull();
+  });
+
   it("opens native symbol buttons for click, Enter and Space activation", async () => {
     document.body.innerHTML = `
       <button type="button" data-security-symbol="sh.600000" data-security-source="portfolio">
@@ -38,9 +47,30 @@ describe("security navigation", () => {
     expect(navigate).toHaveBeenCalledTimes(2);
     await user.keyboard(" ");
     expect(navigate).toHaveBeenCalledTimes(3);
-    fireEvent.keyDown(button, { key: "Enter" });
+    const enterEvent = new KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    });
+    button.dispatchEvent(enterEvent);
+    expect(enterEvent.defaultPrevented).toBe(true);
     expect(navigate).toHaveBeenCalledTimes(4);
-    fireEvent.keyDown(button, { key: " " });
+    const spaceEvent = new KeyboardEvent("keydown", {
+      key: " ",
+      bubbles: true,
+      cancelable: true,
+    });
+    button.dispatchEvent(spaceEvent);
+    expect(spaceEvent.defaultPrevented).toBe(true);
+    expect(navigate).toHaveBeenCalledTimes(5);
+    const repeatEvent = new KeyboardEvent("keydown", {
+      key: "Enter",
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    button.dispatchEvent(repeatEvent);
+    expect(repeatEvent.defaultPrevented).toBe(false);
     expect(navigate).toHaveBeenCalledTimes(5);
     expect(navigate).toHaveBeenLastCalledWith("sh.600000", "portfolio");
     unbind();

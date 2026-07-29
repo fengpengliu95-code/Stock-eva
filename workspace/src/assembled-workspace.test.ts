@@ -10,6 +10,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error Vite's ?raw loader supplies the assembled production HTML.
 import workspaceHtml from "../index.html?raw";
 
+let disposeSecurityCockpit: (() => void) | undefined;
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -25,9 +27,16 @@ function installAssembledDocument(html: string): void {
 }
 
 describe("assembled legacy workspace and cockpit entry", () => {
+  // app.js is an intentional non-module singleton with anonymous window
+  // listeners. Keep its full assembly in one scenario; the security module
+  // imported beside it has an explicit teardown and is always released here.
   afterEach(() => {
+    disposeSecurityCockpit?.();
+    disposeSecurityCockpit = undefined;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    document.body.replaceChildren();
+    window.history.replaceState(null, "", "#portfolio");
   });
 
   it("uses real legacy holding/watchlist controls for source-aware navigation", async () => {
@@ -99,7 +108,8 @@ describe("assembled legacy workspace and cockpit entry", () => {
     // generated module referenced by the same assembled index.html.
     // @ts-expect-error app.js intentionally remains an untyped legacy script.
     await import("../app.js");
-    await import("./main");
+    const cockpitModule = await import("./main");
+    disposeSecurityCockpit = cockpitModule.disposeSecurityCockpit;
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
 
     const holding = await waitFor(() =>

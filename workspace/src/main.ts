@@ -25,6 +25,9 @@ declare global {
 let cockpitState: CockpitState = initialCockpitState;
 let abortController: AbortController | null = null;
 let chartCleanup: ChartCleanup | null = null;
+let restoredHash: string | null = null;
+let disposeBindings: (() => void) | null = null;
+let waitingForDomReady = false;
 
 function root(): HTMLElement {
   const value = document.querySelector<HTMLElement>("#security-analysis");
@@ -61,12 +64,13 @@ async function openSecurity(
       fetch,
       controller.signal,
     );
+    if (abortController !== controller || controller.signal.aborted) return;
     cockpitState = transitionCockpit(cockpitState, {
       type: "success",
       response,
     });
   } catch (error) {
-    if (controller.signal.aborted) return;
+    if (abortController !== controller || controller.signal.aborted) return;
     if (error instanceof NoTradingDatesError) {
       cockpitState = transitionCockpit(cockpitState, {
         type: "empty",
@@ -90,29 +94,65 @@ async function openSecurity(
 
 function navigate(symbol: string, sourceView: SourceView): void {
   const hash = securityHash(symbol, sourceView);
+  restoredHash = hash;
   window.history.pushState(null, "", hash);
   void openSecurity(symbol, sourceView);
 }
 
 function restoreFromHash(): void {
-  const route = parseSecurityHash(window.location.hash);
+  const hash = window.location.hash;
+  if (hash === restoredHash) return;
+  restoredHash = hash;
+  const route = parseSecurityHash(hash);
   if (route) void openSecurity(route.symbol, route.sourceView);
   else {
     abortController?.abort();
+    abortController = null;
     chartCleanup?.();
     chartCleanup = null;
   }
 }
 
-function initialize(): void {
-  bindSecurityEntrypoints(document, navigate);
+export function initializeSecurityCockpit(): void {
+  if (disposeBindings) return;
+  cockpitState = initialCockpitState;
+  restoredHash = null;
+  const unbindEntrypoints = bindSecurityEntrypoints(document, navigate);
   window.addEventListener("popstate", restoreFromHash);
   window.addEventListener("hashchange", restoreFromHash);
+  const cleanup = (): void => {
+    if (disposeBindings !== cleanup) return;
+    unbindEntrypoints();
+    window.removeEventListener("popstate", restoreFromHash);
+    window.removeEventListener("hashchange", restoreFromHash);
+    abortController?.abort();
+    abortController = null;
+    chartCleanup?.();
+    chartCleanup = null;
+    cockpitState = initialCockpitState;
+    restoredHash = null;
+    disposeBindings = null;
+  };
+  disposeBindings = cleanup;
   restoreFromHash();
 }
 
+function onDocumentReady(): void {
+  waitingForDomReady = false;
+  initializeSecurityCockpit();
+}
+
+export function disposeSecurityCockpit(): void {
+  if (waitingForDomReady) {
+    document.removeEventListener("DOMContentLoaded", onDocumentReady);
+    waitingForDomReady = false;
+  }
+  disposeBindings?.();
+}
+
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", initialize, { once: true });
+  waitingForDomReady = true;
+  document.addEventListener("DOMContentLoaded", onDocumentReady, { once: true });
 } else {
-  initialize();
+  initializeSecurityCockpit();
 }

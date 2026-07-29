@@ -2,6 +2,7 @@
 
 - Date: 2026-07-29 (Asia/Shanghai)
 - Branch baseline: `codex/r0-frontend` at `0271a0a`
+- Code-review follow-up baseline: `b0e159b`
 - Scope: R0-B synthetic worker acceptance only; this is not Release 0 completion.
 
 ## TDD evidence
@@ -134,6 +135,67 @@ http://127.0.0.1:18080/workspace/?scenario=quality#security/sh.600000?from=portf
   browser Back, watchlist navigation, keyboard activation, hash reload,
   ready/empty/409 scenario changes, and the 390×844 viewport change.
 
+## Code-review follow-up
+
+The malformed-route test was added before the parser change. Four cases
+(`%`, truncated escape, non-hex escape, and truncated UTF-8) failed with
+`URIError: URI malformed`. After the minimal `URIError` guard, all return
+`null`; exceptions outside `decodeURIComponent` are not swallowed.
+
+The deterministic request-ownership test supplies fetch promises that ignore
+AbortSignal:
+
+```text
+open A -> open B -> resolve B -> resolve A
+
+RED: expected rendered symbol sz.000001, received sh.600000
+GREEN: hash, status, and rendered metadata remain sz.000001
+```
+
+The same test repeats the sequence with stale A rejecting after B. Neither the
+old success nor the old failure can update the B state. It also verifies that
+disposing the security module removes delegated controls and history
+listeners, aborts the current request, clears chart state, and permits one
+clean reinitialization.
+
+For history navigation, the test changes from security A to security B and
+then dispatches the browser's `popstate` plus `hashchange` pair. With the hash
+identity check temporarily removed, the regression test failed:
+
+```text
+expected 12 fetch calls, received 14
+```
+
+Restoring the check produces one dates+analysis request pair and the test
+passes. Direct hash changes are still observed through `hashchange`; only the
+second event for the already-restored hash is ignored.
+
+The Enter/Space test now directly asserts `defaultPrevented=true`, one
+navigation per key action, and `repeat=true` neither prevents the event nor
+navigates.
+
+### Follow-up assembled browser race
+
+A temporary server again served the actual production `workspace/index.html`,
+legacy `app.js`, and rebuilt `assets/security-cockpit.js`. It exposed the real
+legacy holding and watchlist controls together and intercepted only local API
+requests. The synthetic analysis transport ignored abort and automatically
+released A only after B completed. The observed trace was:
+
+```text
+requested:sh.600000
+requested:sz.000001
+resolved:sz.000001
+auto-release-a
+resolved:sh.600000
+```
+
+After the final line, the URL remained
+`#security/sz.000001?from=watchlists`, the rendered metadata remained
+`sz.000001`, status remained `sz.000001 无可绘制数据`, and browser
+warning/error logs were `[]`. The 18080 harness was stopped and deleted; live
+8000/8080 services and production user data were not touched.
+
 ## Final command verification
 
 ```text
@@ -142,10 +204,10 @@ npm ci
 # added 113 packages; full dev tree reports 1 low-severity development issue
 
 npm test
-# 7 files passed; 20 tests passed
+# 8 files passed; 25 tests passed
 
 npm run build
-# Vite 7.3.6; 7 modules; security-cockpit.js 349.04 kB
+# Vite 7.3.6; 7 modules; security-cockpit.js 349.80 kB
 
 npm audit --omit=dev
 # found 0 vulnerabilities

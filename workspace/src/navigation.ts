@@ -19,7 +19,13 @@ export function securityHash(symbol: string, sourceView: SourceView): string {
 export function parseSecurityHash(hash: string): SecurityRoute | null {
   const match = /^#security\/([^?]+)(?:\?(.*))?$/.exec(hash);
   if (!match) return null;
-  const symbol = decodeURIComponent(match[1]).toLowerCase();
+  let symbol: string;
+  try {
+    symbol = decodeURIComponent(match[1]).toLowerCase();
+  } catch (error) {
+    if (error instanceof URIError) return null;
+    throw error;
+  }
   const sourceView = new URLSearchParams(match[2] ?? "").get("from");
   if (!SYMBOL_PATTERN.test(symbol) || !isSourceView(sourceView)) return null;
   return { symbol, sourceView };
