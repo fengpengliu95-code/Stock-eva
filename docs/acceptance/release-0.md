@@ -2,7 +2,7 @@
 
 Date: 2026-07-29 (Asia/Shanghai)
 
-Verdict: **GO for deployment**
+Verdict: **GO — deployed and live-readback verified**
 
 Release 0 now supports an end-to-end, after-close technical review from a
 manual holding or watchlist item to a real-data stock cockpit. This verdict
@@ -20,12 +20,19 @@ be07ead fix(analysis): tighten price and empty-series contracts
 fa14baa feat(workspace): add security analysis cockpit
 72c2912 fix(workspace): add API-backed indicator panes
 afc8208 fix(workspace): guard cockpit navigation races
+2f90f13 fix(launchd): prevent stale workspace assets
+b2b6563 fix(launchd): close web release handoff window
+07f38d5 fix(launchd): report incomplete agent rollback
 ```
 
 The backend package passed two specification/quality review-fix cycles. The
 workspace package passed a specification review-fix cycle and two code-quality
-review-fix cycles. The final independent code-quality review reported no
-Critical, Important, or Minor findings.
+review-fix cycles. The production cache correction then passed three
+code-quality review-fix cycles: reviewers found and closed the old-server
+handoff window, the IPv6/IPv4 contract mismatch, incomplete directory and
+README coverage, and a false-success rollback message. The final independent
+specification and code-quality reviews reported no Critical, Important, or
+Minor findings.
 
 ## Fresh integrated verification
 
@@ -45,18 +52,64 @@ npm audit --omit=dev
 
 cd ..
 uv run --extra dev pytest
-# 307 passed in 33.46s
+# 325 passed in 55.23s
 
 uv run --extra dev ruff check backend tests
 # All checks passed
 
-uv lock --check
+/bin/bash -n scripts/stock_eva_launchagents_install.sh
 git diff --check
 ```
 
 The full development dependency tree reports one low-severity development-only
 issue. It is not present in the production dependency audit and is stripped
 from the installed runtime.
+
+## Production deployment and cache-upgrade readback
+
+The first production deployment exposed a real fixed-filename upgrade defect:
+the runtime files were current, but the old `python -m http.server` process and
+browser heuristic cache could combine an old `workspace/app.js` with the new
+module bundle. The module populated the cockpit while the old shell kept it
+hidden. Release 0 was therefore held at no-go until the defect was corrected.
+
+The approved correction:
+
+- serves all static responses with exactly one `Cache-Control: no-store`;
+- accepts only an explicit IPv4 loopback bind;
+- resolves the public directory to the concrete release at process startup;
+- stops and verifies the old Web agent and port 8080 before switching
+  `runtime/current`;
+- restores the old release, configuration, plists, and previously loaded
+  agents on failure; incomplete agent recovery is reported honestly with the
+  affected label and stage.
+
+The installer deployed main commit
+`07f38d58fb74c92c6f61698ba5ba85636c0560c1`. Live readback confirmed:
+
+```text
+runtime/current -> releases/07f38d58fb74c92c6f61698ba5ba85636c0560c1
+API LaunchAgent:      loaded / ready
+Web LaunchAgent:      loaded / ready
+Refresh LaunchAgent:  loaded
+Calendar LaunchAgent: loaded
+Backup LaunchAgent:   loaded
+storage: local_dataset / ready / serving_source=local
+```
+
+Both `/workspace/` and the unchanged fixed URL `/workspace/app.js` returned
+`Cache-Control: no-store`. The production analysis API returned `ready`,
+`as_of=2026-07-29`, `baostock`, `ta-lib-0.7.0-r0-v1`, and 263 sessions for the
+explicit 2025-07-01 through 2026-07-29 request.
+
+The same retained browser profile and original URL
+`/workspace/?release=045065b#security/sh.600000?from=portfolio` were then
+navigated normally without clearing the cache and without changing the
+subresource URLs. Before navigation, the stale shell showed the overview and
+kept a populated cockpit hidden. After navigation, the title was
+`个股技术分析 · Stock EVA`, the overview was hidden, the cockpit was visible,
+and the real request completed with 260 effective sessions, 18 canvases, and
+20 alternative-table rows. Browser warnings and errors remained empty.
 
 ## Performance
 
