@@ -1,5 +1,6 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -21,6 +22,23 @@ from backend.app.config import Settings, get_settings
 router = APIRouter(prefix="/classification", tags=["classification"])
 
 
+def get_classification_today() -> date:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
+def _reject_future_as_of(as_of: date, today: date) -> None:
+    if as_of > today:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "future_as_of",
+                "as_of": as_of.isoformat(),
+                "today": today.isoformat(),
+                "timezone": "Asia/Shanghai",
+            },
+        )
+
+
 def get_classification_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ClassificationStore:
@@ -34,8 +52,10 @@ def get_classification_store(
 def classification_securities(
     as_of: date,
     store: Annotated[ClassificationStore, Depends(get_classification_store)],
+    today: Annotated[date, Depends(get_classification_today)],
     symbol: Annotated[str | None, Query(pattern=r"^(?:sh|sz|bj)\.\d{6}$")] = None,
 ) -> SecurityResponse:
+    _reject_future_as_of(as_of, today)
     return ClassificationService(store).securities(as_of, symbol=symbol)
 
 
@@ -47,7 +67,9 @@ def classification_index_components(
     index_id: str,
     as_of: date,
     store: Annotated[ClassificationStore, Depends(get_classification_store)],
+    today: Annotated[date, Depends(get_classification_today)],
 ) -> IndexComponentsResponse:
+    _reject_future_as_of(as_of, today)
     try:
         return ClassificationService(store).index_components(index_id, as_of)
     except UnknownIndexError as exc:
@@ -65,7 +87,9 @@ def classification_sectors(
     taxonomy_id: str,
     as_of: date,
     store: Annotated[ClassificationStore, Depends(get_classification_store)],
+    today: Annotated[date, Depends(get_classification_today)],
 ) -> SectorResponse:
+    _reject_future_as_of(as_of, today)
     try:
         return ClassificationService(store).sectors(taxonomy_id, as_of)
     except UnknownTaxonomyError as exc:
@@ -84,7 +108,9 @@ def classification_sector_members(
     sector_id: str,
     as_of: date,
     store: Annotated[ClassificationStore, Depends(get_classification_store)],
+    today: Annotated[date, Depends(get_classification_today)],
 ) -> SectorMembersResponse:
+    _reject_future_as_of(as_of, today)
     try:
         return ClassificationService(store).sector_members(
             taxonomy_id,
@@ -103,7 +129,9 @@ def classification_coverage(
     as_of: date,
     taxonomy_id: str,
     store: Annotated[ClassificationStore, Depends(get_classification_store)],
+    today: Annotated[date, Depends(get_classification_today)],
 ) -> CoverageAudit:
+    _reject_future_as_of(as_of, today)
     try:
         return ClassificationService(store).coverage(taxonomy_id, as_of)
     except UnknownTaxonomyError as exc:

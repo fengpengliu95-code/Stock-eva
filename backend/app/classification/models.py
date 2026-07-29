@@ -193,6 +193,12 @@ class GenerationSummary(BaseModel):
     market_scope: MarketScope
 
 
+class ClassificationPublishOutcome(BaseModel):
+    generation: GenerationSummary
+    inserted: bool
+    promoted: bool
+
+
 class SecurityResponse(BaseModel):
     status: ClassificationStatus
     as_of: date
@@ -262,6 +268,7 @@ class ClassificationSyncResult(BaseModel):
     as_of: date
     network_requests: int
     writes_classification_data: bool
+    new_generation: bool
     execute_requires: str | None
     generation: GenerationSummary | None
     quality_issues: list[str] = Field(default_factory=list)

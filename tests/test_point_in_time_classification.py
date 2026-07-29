@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 
@@ -141,6 +141,9 @@ def snapshot(
         securities=securities or [],
         index_components=components or [],
         sector_memberships=memberships or [],
+        declared_taxonomies=(
+            [TAXONOMY_BAOSTOCK_INDUSTRY] if memberships is not None else []
+        ),
     )
 
 
@@ -439,13 +442,152 @@ def test_repeated_source_dates_select_only_the_latest_visible_generation(
     )
 
     assert [row.symbol for row in components.components] == ["sh.600000"]
-    assert components.generation_id == second.generation_id
+    assert components.generation_id == second.generation.generation_id
     assert [(row.sector_id, row.member_count) for row in sectors.sectors] == [
         ("bank", 1)
     ]
-    assert sectors.generation_id == second.generation_id
+    assert sectors.generation_id == second.generation.generation_id
     assert [row.symbol for row in members.members] == ["sh.600000"]
-    assert members.generation_id == second.generation_id
+    assert members.generation_id == second.generation.generation_id
+
+
+def _publish_after_snapshot_read(
+    store: ClassificationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: ClassificationSnapshot,
+) -> None:
+    if hasattr(store, "read_snapshot"):
+        original = store.read_snapshot
+
+        def read_then_publish(*args, **kwargs):
+            selected = original(*args, **kwargs)
+            store.publish(candidate)
+            return selected
+
+        monkeypatch.setattr(store, "read_snapshot", read_then_publish)
+        return
+
+    original = store.securities_at
+
+    def read_then_publish(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        store.publish(candidate)
+        return selected
+
+    monkeypatch.setattr(store, "securities_at", read_then_publish)
+
+
+def test_securities_response_keeps_records_generation_and_scope_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, classification = service(tmp_path)
+    first = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    candidate = snapshot(
+        securities=[
+            security("sh.600000"),
+            security("sh.688001", board="star"),
+        ],
+        memberships=[
+            membership("sh.600000"),
+            membership("sh.688001"),
+        ],
+    )
+    _publish_after_snapshot_read(store, monkeypatch, candidate)
+
+    response = classification.securities(SNAPSHOT_DATE)
+
+    assert [row.symbol for row in response.securities] == ["sh.600000"]
+    assert response.generation_id == first.generation.generation_id
+    assert response.market_scope.covered_boards == ["main"]
+
+
+def test_coverage_keeps_security_and_membership_records_in_one_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, classification = service(tmp_path)
+    first = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    candidate = snapshot(
+        securities=[
+            security("sh.600000"),
+            security("sh.688001", board="star"),
+        ],
+        memberships=[membership("sh.688001")],
+    )
+    _publish_after_snapshot_read(store, monkeypatch, candidate)
+
+    response = classification.coverage(
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        SNAPSHOT_DATE,
+    )
+
+    assert response.generation_id == first.generation.generation_id
+    assert response.eligible_count == 1
+    assert response.mapped_count == 1
+    assert response.coverage_ratio == 1
+    assert response.unmapped_symbols == []
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["securities", "index_components", "sectors", "sector_members", "coverage"],
+)
+def test_service_endpoints_do_not_reselect_generation_through_legacy_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+    store, classification = service(tmp_path)
+    published = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            components=[component("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+
+    def fail_reselection(*_args, **_kwargs):
+        raise AssertionError("endpoint reselected classification generation")
+
+    monkeypatch.setattr(store, "generation_at", fail_reselection)
+    monkeypatch.setattr(store, "securities_at", fail_reselection)
+    monkeypatch.setattr(store, "index_components_at", fail_reselection)
+    monkeypatch.setattr(store, "sector_memberships_at", fail_reselection)
+    calls = {
+        "securities": lambda: classification.securities(SNAPSHOT_DATE),
+        "index_components": lambda: classification.index_components(
+            "hs300",
+            SNAPSHOT_DATE,
+        ),
+        "sectors": lambda: classification.sectors(
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            SNAPSHOT_DATE,
+        ),
+        "sector_members": lambda: classification.sector_members(
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            "bank",
+            SNAPSHOT_DATE,
+        ),
+        "coverage": lambda: classification.coverage(
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            SNAPSHOT_DATE,
+        ),
+    }
+
+    response = calls[endpoint]()
+
+    assert response.generation_id == published.generation.generation_id
 
 
 def test_taxonomies_are_isolated(tmp_path: Path) -> None:
@@ -481,9 +623,11 @@ def test_exact_duplicate_rows_and_republication_are_idempotent(tmp_path: Path) -
     first = store.publish(payload)
     second = store.publish(payload)
 
-    assert second.generation_id == first.generation_id
+    assert second.generation.generation_id == first.generation.generation_id
+    assert first.inserted is True
+    assert second.inserted is False
     assert store.generation_count() == 1
-    assert first.row_counts == {
+    assert first.generation.row_counts == {
         "security_master_history": 1,
         "index_component_history": 0,
         "sector_membership_history": 1,
@@ -493,14 +637,18 @@ def test_exact_duplicate_rows_and_republication_are_idempotent(tmp_path: Path) -
 def test_generation_identity_includes_source_date_semantics(tmp_path: Path) -> None:
     store, _ = service(tmp_path)
 
-    observed = store.publish(snapshot())
+    base = snapshot(securities=[security("sh.600000")])
+    observed = store.publish(base)
     request_only = store.publish(
-        snapshot().model_copy(
+        base.model_copy(
             update={"source_date_semantics": "requested_unverified"}
         )
     )
 
-    assert request_only.generation_id != observed.generation_id
+    assert (
+        request_only.generation.generation_id
+        != observed.generation.generation_id
+    )
     assert store.generation_count() == 2
 
 
@@ -592,6 +740,95 @@ def test_unknown_security_membership_fails_publication(tmp_path: Path) -> None:
         )
 
     assert store.ready_generation() is None
+
+
+@pytest.mark.parametrize("record_kind", ["security", "index", "sector"])
+@pytest.mark.parametrize(
+    ("violation", "expected_error"),
+    [
+        ("future_source_date", "source_snapshot_date exceeds enclosing snapshot"),
+        ("source", "source does not match enclosing snapshot"),
+        ("source_version", "source_version does not match enclosing snapshot"),
+        ("observed_at", "observed_at exceeds enclosing snapshot"),
+    ],
+)
+def test_store_rejects_records_that_violate_snapshot_envelope(
+    tmp_path: Path,
+    record_kind: str,
+    violation: str,
+    expected_error: str,
+) -> None:
+    store, _ = service(tmp_path)
+    trusted = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    candidate_date = date(2026, 7, 29)
+    candidate_observed = datetime(2026, 7, 29, 12, tzinfo=UTC)
+    securities = [
+        security(
+            "sh.600000",
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+        )
+    ]
+    components = [
+        component(
+            "sh.600000",
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+        )
+    ]
+    memberships = [
+        membership(
+            "sh.600000",
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+        )
+    ]
+    rows = {
+        "security": securities,
+        "index": components,
+        "sector": memberships,
+    }[record_kind]
+    update = {
+        "future_source_date": {"source_snapshot_date": date(2026, 7, 30)},
+        "source": {"source": "not-baostock"},
+        "source_version": {"source_version": "not-0.9.3"},
+        "observed_at": {"observed_at": candidate_observed + timedelta(seconds=1)},
+    }[violation]
+    rows[0] = rows[0].model_copy(update=update)
+
+    with pytest.raises(ClassificationConflictError, match=expected_error):
+        store.publish(
+            snapshot(
+                snapshot_date=candidate_date,
+                observed_at=candidate_observed,
+                securities=securities,
+                components=components,
+                memberships=memberships,
+            )
+        )
+
+    assert store.ready_generation() == trusted.generation.generation_id
+    assert store.generation_count() == 1
+
+
+def test_store_rejects_empty_security_master_without_ready_pointer(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+
+    with pytest.raises(
+        ClassificationConflictError,
+        match="security master must not be empty",
+    ):
+        store.publish(snapshot())
+
+    assert store.ready_generation() is None
+    assert store.generation_count() == 0
 
 
 @pytest.mark.parametrize(
@@ -730,9 +967,11 @@ def test_coverage_threshold_boundary(
     store, classification = service(tmp_path)
     securities = [security(f"sh.{600000 + index:06d}") for index in range(100)]
     memberships = [membership(row.symbol) for row in securities[:mapped]]
-    store.publish(snapshot(securities=securities, memberships=memberships))
+    outcome = store.publish(
+        snapshot(securities=securities, memberships=memberships)
+    )
 
-    audit = classification.coverage(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
+    audit = outcome.generation.coverage_audits[0]
 
     assert audit.status == expected_status
     assert audit.eligible_count == 100
@@ -744,16 +983,17 @@ def test_coverage_threshold_boundary(
 def test_coverage_zero_denominator_is_degraded_not_one_hundred_percent(
     tmp_path: Path,
 ) -> None:
-    store, classification = service(tmp_path)
-    store.publish(
+    store, _ = service(tmp_path)
+    outcome = store.publish(
         snapshot(
             securities=[
                 security("sh.000001", board="index", security_type="index"),
-            ]
+            ],
+            memberships=[],
         )
     )
 
-    audit = classification.coverage(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
+    audit = outcome.generation.coverage_audits[0]
 
     assert audit.status == "degraded"
     assert audit.eligible_count == 0
@@ -761,22 +1001,114 @@ def test_coverage_zero_denominator_is_degraded_not_one_hundred_percent(
     assert audit.quality_issues == ["no_eligible_securities"]
 
 
+def test_low_coverage_candidate_is_persisted_without_initial_ready_pointer(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    securities = [security(f"sh.{600000 + index:06d}") for index in range(100)]
+
+    outcome = store.publish(
+        snapshot(
+            securities=securities,
+            memberships=[membership(row.symbol) for row in securities[:94]],
+        )
+    )
+
+    assert outcome.inserted is True
+    assert outcome.promoted is False
+    assert outcome.generation.coverage_audits[0].status == "degraded"
+    assert store.generation_count() == 1
+    assert store.ready_generation() is None
+
+
+def test_degraded_candidate_does_not_replace_existing_ready_generation(
+    tmp_path: Path,
+) -> None:
+    store, _ = service(tmp_path)
+    trusted = store.publish(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    candidate_date = date(2026, 7, 29)
+    candidate_observed = datetime(2026, 7, 29, 12, tzinfo=UTC)
+    securities = [
+        security(
+            f"sh.{600000 + index:06d}",
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+        )
+        for index in range(100)
+    ]
+
+    outcome = store.publish(
+        snapshot(
+            snapshot_date=candidate_date,
+            observed_at=candidate_observed,
+            securities=securities,
+            memberships=[
+                membership(
+                    row.symbol,
+                    snapshot_date=candidate_date,
+                    observed_at=candidate_observed,
+                )
+                for row in securities[:94]
+            ],
+        )
+    )
+
+    assert outcome.inserted is True
+    assert outcome.promoted is False
+    assert outcome.generation.coverage_audits[0].coverage_ratio == pytest.approx(
+        0.94
+    )
+    assert store.generation_count() == 2
+    assert store.ready_generation() == trusted.generation.generation_id
+
+
+def test_zero_denominator_candidate_never_becomes_ready(tmp_path: Path) -> None:
+    store, _ = service(tmp_path)
+
+    outcome = store.publish(
+        snapshot(
+            securities=[
+                security("sh.000001", board="index", security_type="index"),
+            ],
+            memberships=[],
+        )
+    )
+
+    assert outcome.inserted is True
+    assert outcome.promoted is False
+    assert outcome.generation.coverage_audits[0].quality_issues == [
+        "no_eligible_securities"
+    ]
+    assert store.ready_generation() is None
+
+
 def test_coverage_is_reproducible_and_reports_unmapped_symbols(tmp_path: Path) -> None:
-    store, classification = service(tmp_path)
-    store.publish(
+    store, _ = service(tmp_path)
+    first = store.publish(
+        snapshot(
+            securities=[security("sh.600000"), security("sz.000001")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+    second = store.publish(
         snapshot(
             securities=[security("sh.600000"), security("sz.000001")],
             memberships=[membership("sh.600000")],
         )
     )
 
-    first = classification.coverage(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
-    second = classification.coverage(TAXONOMY_BAOSTOCK_INDUSTRY, SNAPSHOT_DATE)
+    first_audit = first.generation.coverage_audits[0]
+    second_audit = second.generation.coverage_audits[0]
 
-    assert first == second
-    assert first.unmapped_symbols == ["sz.000001"]
-    assert first.generation_id is not None
-    assert first.source_lineage == ["baostock@0.9.3"]
+    assert first_audit == second_audit
+    assert first_audit.unmapped_symbols == ["sz.000001"]
+    assert first_audit.generation_id is not None
+    assert first_audit.source_lineage == ["baostock@0.9.3"]
 
 
 def test_large_member_query_uses_bounded_queries_and_time(tmp_path: Path) -> None:
@@ -901,6 +1233,112 @@ class FakeClassificationClient:
         )
 
 
+class IncompleteClassificationClient(FakeClassificationClient):
+    def __init__(self, failure: str) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def query_all_stock(self, **kwargs):
+        if self.failure == "empty_all":
+            self.calls.append("query_all_stock")
+            self.query_all_stock_day = kwargs["day"]
+            return FakeResult(["code", "tradeStatus", "code_name"], [])
+        if self.failure == "missing_all_field":
+            self.calls.append("query_all_stock")
+            self.query_all_stock_day = kwargs["day"]
+            return FakeResult(
+                ["code", "code_name"],
+                [["sh.600000", "浦发银行"]],
+            )
+        return super().query_all_stock(**kwargs)
+
+    def query_stock_basic(self, **kwargs):
+        if self.failure == "empty_basic":
+            self.calls.append("query_stock_basic")
+            return FakeResult(
+                ["code", "code_name", "ipoDate", "outDate", "type", "status"],
+                [],
+            )
+        if self.failure == "missing_basic_field":
+            self.calls.append("query_stock_basic")
+            return FakeResult(
+                ["code", "code_name", "ipoDate", "outDate", "type"],
+                [["sh.600000", "浦发银行", "1999-11-10", "", "1"]],
+            )
+        if self.failure in {"missing_target_basic", "unusable_target_basic"}:
+            result = super().query_stock_basic(**kwargs)
+            rows = [
+                ["sz.300001", "创业板样本", "2009-10-30", "", "1", "1"],
+                ["sh.688001", "科创板样本", "2019-07-22", "", "1", "1"],
+                ["sh.000001", "上证综指", "1991-07-15", "", "2", "1"],
+                ["sz.200001", "深市B股样本", "1995-01-01", "", "1", "1"],
+            ]
+            if self.failure == "unusable_target_basic":
+                rows.append(["sh.600000", "浦发银行", "1999-11-10", "", "", ""])
+            return FakeResult(result.fields, rows)
+        return super().query_stock_basic(**kwargs)
+
+    def query_stock_industry(self, **kwargs):
+        if self.failure == "empty_industry":
+            self.calls.append("query_stock_industry")
+            return FakeResult(
+                [
+                    "updateDate",
+                    "code",
+                    "code_name",
+                    "industry",
+                    "industryClassification",
+                ],
+                [],
+            )
+        if self.failure == "missing_industry_field":
+            self.calls.append("query_stock_industry")
+            return FakeResult(
+                ["updateDate", "code", "code_name", "industry"],
+                [["2026-07-20", "sh.600000", "浦发银行", "银行"]],
+            )
+        return super().query_stock_industry(**kwargs)
+
+    def query_hs300_stocks(self, **kwargs):
+        if self.failure == "empty_component":
+            return self._index("query_hs300_stocks", [])
+        if self.failure == "missing_component_field":
+            self.calls.append("query_hs300_stocks")
+            return FakeResult(
+                ["updateDate", "code"],
+                [["2026-07-20", "sh.600000"]],
+            )
+        return super().query_hs300_stocks(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        ("empty_all", "query_all_stock returned no rows"),
+        ("missing_all_field", "query_all_stock missing required fields"),
+        ("empty_basic", "query_stock_basic returned no rows"),
+        ("missing_basic_field", "query_stock_basic missing required fields"),
+        ("missing_target_basic", "target A-share has no usable basic metadata"),
+        ("unusable_target_basic", "target A-share has no usable basic metadata"),
+        ("empty_industry", "query_stock_industry returned no rows"),
+        ("missing_industry_field", "query_stock_industry missing required fields"),
+        ("empty_component", "hs300 component returned no rows"),
+        ("missing_component_field", "hs300 component missing required fields"),
+    ],
+)
+def test_provider_rejects_empty_or_incomplete_required_metadata(
+    failure: str,
+    expected_error: str,
+) -> None:
+    provider = BaoStockClassificationProvider(
+        client=IncompleteClassificationClient(failure),
+        clock=lambda: OBSERVED,
+    )
+
+    with pytest.raises(ClassificationProviderError, match=expected_error):
+        provider.fetch(SNAPSHOT_DATE)
+
+
 @pytest.mark.parametrize(
     ("symbol", "source_type", "expected"),
     [
@@ -1010,8 +1448,14 @@ def test_provider_rejects_source_update_date_after_requested_as_of(
         provider.fetch(SNAPSHOT_DATE)
 
 
-def api_request(store: ClassificationStore, path: str) -> httpx.Response:
+def api_request(
+    store: ClassificationStore,
+    path: str,
+    *,
+    overrides: dict | None = None,
+) -> httpx.Response:
     app.dependency_overrides[get_classification_store] = lambda: store
+    app.dependency_overrides.update(overrides or {})
 
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
@@ -1024,7 +1468,7 @@ def api_request(store: ClassificationStore, path: str) -> httpx.Response:
         app.dependency_overrides.clear()
 
 
-def test_api_ready_and_degraded_coverage_contract(tmp_path: Path) -> None:
+def test_api_ready_coverage_contract(tmp_path: Path) -> None:
     store = ClassificationStore(tmp_path / "classification.duckdb")
     store.publish(
         snapshot(
@@ -1032,7 +1476,10 @@ def test_api_ready_and_degraded_coverage_contract(tmp_path: Path) -> None:
                 security("sh.600000"),
                 security("sz.300001", board="chinext"),
             ],
-            memberships=[membership("sh.600000")],
+            memberships=[
+                membership("sh.600000"),
+                membership("sz.300001"),
+            ],
             components=[component("sh.600000")],
         )
     )
@@ -1093,9 +1540,9 @@ def test_api_ready_and_degraded_coverage_contract(tmp_path: Path) -> None:
     assert members.status_code == 200
     assert members.json()["members"][0]["raw_classification"] == "证监会行业分类"
     assert coverage.status_code == 200
-    assert coverage.json()["status"] == "degraded"
-    assert coverage.json()["coverage_ratio"] == 0.5
-    assert coverage.json()["unmapped_symbols"] == ["sz.300001"]
+    assert coverage.json()["status"] == "ready"
+    assert coverage.json()["coverage_ratio"] == 1
+    assert coverage.json()["unmapped_symbols"] == []
 
 
 def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
@@ -1142,6 +1589,135 @@ def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
     assert csi1000_metadata_only.json()["quality_issues"] == [
         "component_history_not_supplied_by_source"
     ]
+
+
+def test_missing_classification_database_get_has_no_filesystem_side_effects(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "missing-parent" / "classification.duckdb"
+    temp_directory = tmp_path / "missing-temp" / "duckdb"
+    store = ClassificationStore(database, temp_directory=temp_directory)
+
+    response = api_request(
+        store,
+        f"/api/v1/classification/securities?as_of={SNAPSHOT_DATE}",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "empty"
+    assert not database.exists()
+    assert not database.parent.exists()
+    assert not temp_directory.exists()
+    assert not temp_directory.parent.exists()
+
+
+def test_existing_classification_database_get_executes_no_write_or_schema_ddl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ClassificationStore(tmp_path / "classification.duckdb")
+    store.publish(snapshot(securities=[security("sh.600000")]))
+    store_module = __import__(
+        "backend.app.classification.store",
+        fromlist=["duckdb"],
+    )
+    original_connect = store_module.duckdb.connect
+    database_before = store.path.read_bytes()
+
+    class RejectingDdlConnection:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+        def execute(self, sql, parameters=None):
+            operation = sql.lstrip().split(None, 1)[0].upper()
+            if operation in {
+                "CREATE",
+                "ALTER",
+                "DROP",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+            }:
+                raise AssertionError(
+                    f"read path executed write or schema DDL: {operation}"
+                )
+            return self.connection.execute(sql, parameters or [])
+
+        def close(self) -> None:
+            self.connection.close()
+
+    def connect_without_ddl(*args, **kwargs):
+        return RejectingDdlConnection(original_connect(*args, **kwargs))
+
+    monkeypatch.setattr(store_module.duckdb, "connect", connect_without_ddl)
+
+    response = api_request(
+        store,
+        f"/api/v1/classification/securities?as_of={SNAPSHOT_DATE}",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert store.path.read_bytes() == database_before
+
+
+def test_classification_read_is_compatible_with_same_process_writer(
+    tmp_path: Path,
+) -> None:
+    store = ClassificationStore(tmp_path / "classification.duckdb")
+    store.publish(snapshot(securities=[security("sh.600000")]))
+    writer = store._connect_writer()
+    try:
+        response = api_request(
+            store,
+            f"/api/v1/classification/securities?as_of={SNAPSHOT_DATE}",
+        )
+    finally:
+        writer.close()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/classification/securities?as_of=2026-07-30",
+        "/api/v1/classification/indexes/hs300/components?as_of=2026-07-30",
+        (
+            "/api/v1/classification/taxonomies/"
+            f"{TAXONOMY_BAOSTOCK_INDUSTRY}/sectors?as_of=2026-07-30"
+        ),
+        (
+            "/api/v1/classification/taxonomies/"
+            f"{TAXONOMY_BAOSTOCK_INDUSTRY}/sectors/bank/members"
+            "?as_of=2026-07-30"
+        ),
+        (
+            "/api/v1/classification/coverage?as_of=2026-07-30"
+            f"&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}"
+        ),
+    ],
+)
+def test_classification_api_rejects_future_as_of_before_store_access(
+    path: str,
+) -> None:
+    import backend.app.api.classification as classification_api
+
+    class RejectReadStore:
+        def read_snapshot(self, *_args, **_kwargs):
+            raise AssertionError("future as_of reached classification store")
+
+    response = api_request(
+        RejectReadStore(),
+        path,
+        overrides={
+            classification_api.get_classification_today: lambda: date(2026, 7, 29)
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "future_as_of"
 
 
 def test_api_rejects_invalid_date_and_unknown_classifiers(tmp_path: Path) -> None:
@@ -1205,6 +1781,32 @@ def test_classification_sync_is_dry_run_by_default(tmp_path: Path) -> None:
     assert store.ready_generation() is None
 
 
+def test_sync_persists_degraded_candidate_without_ready_pointer(tmp_path: Path) -> None:
+    store = ClassificationStore(tmp_path / "classification.duckdb")
+    provider = RecordingClassificationProvider(
+        snapshot(
+            securities=[
+                security("sh.600000"),
+                security("sz.000001"),
+            ],
+            memberships=[membership("sh.600000")],
+        )
+    )
+
+    result = run_classification_sync(
+        as_of=SNAPSHOT_DATE,
+        execute=True,
+        store=store,
+        provider=provider,
+    )
+
+    assert result.status == "degraded"
+    assert result.writes_classification_data is True
+    assert result.generation is not None
+    assert store.ready_generation() is None
+    assert store.generation_count() == 1
+
+
 def test_classification_sync_execute_observes_and_publishes(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -1236,6 +1838,38 @@ def test_classification_sync_execute_observes_and_publishes(tmp_path: Path) -> N
     assert result.generation is not None
     assert provider.calls == [SNAPSHOT_DATE]
     assert store.ready_generation() == result.generation.generation_id
+
+
+def test_classification_sync_idempotent_rerun_reports_no_write(
+    tmp_path: Path,
+) -> None:
+    store = ClassificationStore(tmp_path / "classification.duckdb")
+    provider = RecordingClassificationProvider(
+        snapshot(
+            securities=[security("sh.600000")],
+            memberships=[membership("sh.600000")],
+        )
+    )
+
+    first = run_classification_sync(
+        as_of=SNAPSHOT_DATE,
+        execute=True,
+        store=store,
+        provider=provider,
+    )
+    second = run_classification_sync(
+        as_of=SNAPSHOT_DATE,
+        execute=True,
+        store=store,
+        provider=provider,
+    )
+
+    assert first.writes_classification_data is True
+    assert first.new_generation is True
+    assert second.writes_classification_data is False
+    assert second.new_generation is False
+    assert second.generation == first.generation
+    assert store.generation_count() == 1
 
 
 def test_classification_sync_execute_rejects_future_as_of_before_provider_call(

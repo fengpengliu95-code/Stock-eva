@@ -25,6 +25,7 @@ def run_classification_sync(
             as_of=as_of,
             network_requests=0,
             writes_classification_data=False,
+            new_generation=False,
             execute_requires="--execute",
             generation=None,
         )
@@ -33,7 +34,8 @@ def run_classification_sync(
     if provider is None:
         raise ValueError("classification execute requires a provider")
     snapshot = provider.fetch(as_of)
-    generation = store.publish(snapshot)
+    outcome = store.publish(snapshot)
+    generation = outcome.generation
     issues = sorted(
         {
             issue
@@ -45,7 +47,8 @@ def run_classification_sync(
         status="degraded" if issues else "ready",
         as_of=as_of,
         network_requests=getattr(provider, "last_request_count", 6),
-        writes_classification_data=True,
+        writes_classification_data=outcome.inserted,
+        new_generation=outcome.inserted,
         execute_requires=None,
         generation=generation,
         quality_issues=issues,

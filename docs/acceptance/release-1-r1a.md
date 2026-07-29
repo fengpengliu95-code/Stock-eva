@@ -24,6 +24,25 @@ Release 1 verdict: **PENDING — do not claim GO**
   BSE exclusion, versioned board derivation, idempotent immutable generations, conflict-safe
   atomic publication, unknown classifiers, empty/degraded states and dry-run no-write remain
   covered.
+- Central publication rejects an empty security master and any record whose source,
+  source version, observed timestamp or source snapshot date violates its enclosing snapshot.
+  A failed candidate neither creates a generation nor advances the ready pointer.
+- Every endpoint reads records, market scope and generation identity from one selected
+  generation. Deterministic publish insertion tests cover securities, indexes, sectors,
+  members and coverage, including security/membership co-generation.
+- Provider required result sets and fields fail closed. Target SSE/SZSE main/ChiNext/STAR
+  symbols require usable basic type/status metadata; required industry and component
+  results cannot be empty.
+- Degraded candidates are persisted for audit but never replace a trusted ready pointer.
+  Zero-denominator and below-95% candidates remain non-ready.
+- Classification GET is read-only: a missing database creates no DB, parent or temp
+  directory; an existing database read executes no schema DDL/DML, leaves DB bytes
+  unchanged and remains compatible with an open same-process writer.
+- All HTTP classification endpoints reject a future Shanghai `as_of` with 422 before a
+  store read. Service-level synthetic historical replay remains unrestricted.
+- Sync publication reports `new_generation`; idempotent re-runs report both
+  `new_generation=false` and `writes_classification_data=false` from the atomic publish
+  outcome.
 
 ## Verification
 
@@ -42,16 +61,30 @@ Each correction was observed RED before its production change:
    - boolean capability and silent ready response remained
 5. representative index master: 2 failed
    - catalog entries were absent and CSI1000 returned HTTP 404
+6. publication snapshot integrity follow-up: 13 failed
+   - direct store publication accepted empty security and envelope-inconsistent records
+7. single-generation atomic reads: 7 failed
+   - endpoint responses could mix generation A records with generation B scope/identity
+8. upstream completeness and ready pointer: 14 failed across two RED runs
+   - empty or incomplete required provider results were accepted, and degraded candidates
+     advanced ready
+9. GET read-only boundary: 3 failed across two RED runs
+   - missing-DB GET created filesystem state and existing-DB GET executed schema DDL
+   - a physical read-only DuckDB handle conflicted with an open same-process writer
+10. future HTTP `as_of`: 5 failed
+    - all five endpoint families reached the store instead of returning 422
+11. actual write reporting: 1 failed
+    - idempotent execute lacked `new_generation` and still reported a write
 ```
 
 Fresh final verification from the isolated worktree:
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q
-# 50 passed
+# 93 passed
 
 uv run --extra dev pytest -q
-# 375 passed
+# 418 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

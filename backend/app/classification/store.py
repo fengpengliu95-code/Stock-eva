@@ -1,6 +1,7 @@
 import hashlib
 import json
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import TypeVar
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 from backend.app.classification.models import (
     BOARD_DERIVATION_VERSION,
     CLASSIFICATION_SCHEMA_VERSION,
+    ClassificationPublishOutcome,
     ClassificationSnapshot,
     CoverageAudit,
     GenerationSummary,
@@ -26,6 +28,18 @@ Record = TypeVar(
     IndexComponentRecord,
     SectorMembershipRecord,
 )
+
+
+@dataclass(frozen=True)
+class ClassificationReadSnapshot:
+    ready_generation_id: str | None
+    generation: GenerationSummary | None
+    securities: list[SecurityMasterRecord]
+    security_snapshot_date: date | None
+    index_components: list[IndexComponentRecord]
+    index_snapshot_date: date | None
+    sector_memberships: list[SectorMembershipRecord]
+    sector_snapshot_date: date | None
 
 
 class ClassificationConflictError(RuntimeError):
@@ -95,7 +109,7 @@ class ClassificationStore:
         self.temp_directory = temp_directory or path.parent / ".classification-duckdb-tmp"
         self.query_count = 0
 
-    def _connect(self) -> duckdb.DuckDBPyConnection:
+    def _connect_writer(self) -> duckdb.DuckDBPyConnection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.temp_directory.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect(str(self.path))
@@ -166,6 +180,13 @@ class ClassificationStore:
             )
         return connection
 
+    def _connect_reader(self) -> duckdb.DuckDBPyConnection | None:
+        if not self.path.is_file():
+            return None
+        # Match writer configuration so DuckDB permits concurrent same-process handles.
+        # This path executes SELECT statements only and never initializes schema or temp state.
+        return duckdb.connect(str(self.path))
+
     def _execute(self, connection, sql: str, parameters: list[object] | None = None):
         self.query_count += 1
         return connection.execute(sql, parameters or [])
@@ -200,6 +221,30 @@ class ClassificationStore:
         return sorted(result.values(), key=lambda row: row.record_id)
 
     def _normalized(self, snapshot: ClassificationSnapshot) -> ClassificationSnapshot:
+        if not snapshot.securities:
+            raise ClassificationConflictError("security master must not be empty")
+        for label, rows in (
+            ("security", snapshot.securities),
+            ("index", snapshot.index_components),
+            ("sector", snapshot.sector_memberships),
+        ):
+            for row in rows:
+                if row.source != snapshot.source:
+                    raise ClassificationConflictError(
+                        f"{label} record source does not match enclosing snapshot"
+                    )
+                if row.source_version != snapshot.source_version:
+                    raise ClassificationConflictError(
+                        f"{label} record source_version does not match enclosing snapshot"
+                    )
+                if row.source_snapshot_date > snapshot.source_snapshot_date:
+                    raise ClassificationConflictError(
+                        f"{label} record source_snapshot_date exceeds enclosing snapshot"
+                    )
+                if row.observed_at > snapshot.observed_at:
+                    raise ClassificationConflictError(
+                        f"{label} record observed_at exceeds enclosing snapshot"
+                    )
         securities = self._deduplicate(
             snapshot.securities,
             key=lambda row: (row.source, row.source_snapshot_date, row.security_id),
@@ -377,14 +422,21 @@ class ClassificationStore:
             ):
                 raise ClassificationConflictError(f"conflicting {label} in source snapshot")
 
-    def publish(self, incoming: ClassificationSnapshot) -> GenerationSummary:
+    def publish(self, incoming: ClassificationSnapshot) -> ClassificationPublishOutcome:
         snapshot = self._normalized(incoming)
         generation_id = self._generation_id(snapshot)
-        connection = self._connect()
+        connection = self._connect_writer()
         try:
             existing = self._generation_by_id(connection, generation_id)
             if existing is not None:
-                return existing
+                pointer = self._ready_pointer(connection)
+                return ClassificationPublishOutcome(
+                    generation=existing,
+                    inserted=False,
+                    promoted=(
+                        pointer is not None and pointer[1] == existing.generation_id
+                    ),
+                )
             self._assert_no_published_conflicts(
                 connection,
                 "security_master_history",
@@ -417,6 +469,7 @@ class ClassificationStore:
                 "sector_membership_history": len(snapshot.sector_memberships),
             }
             audits = self._coverage_audits(snapshot, generation_id)
+            should_promote = all(audit.status == "ready" for audit in audits)
             scope = market_scope(snapshot.securities)
             connection.begin()
             try:
@@ -464,26 +517,31 @@ class ClassificationStore:
                 self._insert_sector_rows(
                     connection, next_sequence, generation_id, snapshot.sector_memberships
                 )
-                connection.execute("DELETE FROM classification_ready_pointer")
-                connection.execute(
-                    "INSERT INTO classification_ready_pointer VALUES (1, ?, ?)",
-                    [next_sequence, generation_id],
-                )
+                if should_promote:
+                    connection.execute("DELETE FROM classification_ready_pointer")
+                    connection.execute(
+                        "INSERT INTO classification_ready_pointer VALUES (1, ?, ?)",
+                        [next_sequence, generation_id],
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-            return GenerationSummary(
-                generation_id=generation_id,
-                sequence=next_sequence,
-                source=snapshot.source,
-                source_version=snapshot.source_version,
-                source_snapshot_date=snapshot.source_snapshot_date,
-                source_date_semantics=snapshot.source_date_semantics,
-                observed_at=snapshot.observed_at,
-                row_counts=row_counts,
-                coverage_audits=audits,
-                market_scope=scope,
+            return ClassificationPublishOutcome(
+                generation=GenerationSummary(
+                    generation_id=generation_id,
+                    sequence=next_sequence,
+                    source=snapshot.source,
+                    source_version=snapshot.source_version,
+                    source_snapshot_date=snapshot.source_snapshot_date,
+                    source_date_semantics=snapshot.source_date_semantics,
+                    observed_at=snapshot.observed_at,
+                    row_counts=row_counts,
+                    coverage_audits=audits,
+                    market_scope=scope,
+                ),
+                inserted=True,
+                promoted=should_promote,
             )
         finally:
             connection.close()
@@ -577,7 +635,9 @@ class ClassificationStore:
         return (int(row[0]), row[1]) if row is not None else None
 
     def ready_generation(self) -> str | None:
-        connection = self._connect()
+        connection = self._connect_reader()
+        if connection is None:
+            return None
         try:
             pointer = self._ready_pointer(connection)
             return pointer[1] if pointer else None
@@ -585,7 +645,9 @@ class ClassificationStore:
             connection.close()
 
     def generation_count(self) -> int:
-        connection = self._connect()
+        connection = self._connect_reader()
+        if connection is None:
+            return 0
         try:
             return int(
                 connection.execute("SELECT count(*) FROM classification_generations").fetchone()[0]
@@ -621,7 +683,9 @@ class ClassificationStore:
         )
 
     def generation_at(self, as_of: date) -> GenerationSummary | None:
-        connection = self._connect()
+        connection = self._connect_reader()
+        if connection is None:
+            return None
         try:
             pointer = self._ready_pointer(connection)
             if pointer is None:
@@ -645,6 +709,155 @@ class ClassificationStore:
         finally:
             connection.close()
 
+    def _records_for_generation(
+        self,
+        connection,
+        generation: GenerationSummary,
+        table: str,
+        model,
+        as_of: date,
+        *,
+        filters: dict[str, str] | None = None,
+        apply_effective_window: bool = True,
+    ) -> tuple[list, date | None]:
+        conditions = [
+            "generation_sequence = ?",
+            "generation_id = ?",
+            "source_snapshot_date <= ?",
+            "CAST(observed_at AS DATE) <= ?",
+        ]
+        parameters: list[object] = [
+            generation.sequence,
+            generation.generation_id,
+            as_of,
+            as_of,
+        ]
+        for column, value in (filters or {}).items():
+            conditions.append(f"{column} = ?")
+            parameters.append(value)
+        if apply_effective_window:
+            conditions.extend(
+                [
+                    "(effective_from IS NULL OR effective_from <= ?)",
+                    "(effective_to IS NULL OR effective_to >= ?)",
+                ]
+            )
+            parameters.extend([as_of, as_of])
+        where = " AND ".join(conditions)
+        snapshot_row = self._execute(
+            connection,
+            f"""
+            SELECT source_snapshot_date
+            FROM {table}
+            WHERE {where}
+            ORDER BY source_snapshot_date DESC
+            LIMIT 1
+            """,
+            parameters,
+        ).fetchone()
+        if snapshot_row is None:
+            return [], None
+        selected_date = snapshot_row[0]
+        rows = self._execute(
+            connection,
+            f"""
+            SELECT payload
+            FROM {table}
+            WHERE {where}
+              AND source_snapshot_date = ?
+            ORDER BY symbol
+            """,
+            [*parameters, selected_date],
+        ).fetchall()
+        return [model.model_validate_json(row[0]) for row in rows], selected_date
+
+    def read_snapshot(
+        self,
+        as_of: date,
+        *,
+        include_securities: bool = False,
+        index_id: str | None = None,
+        taxonomy_id: str | None = None,
+    ) -> ClassificationReadSnapshot:
+        connection = self._connect_reader()
+        if connection is None:
+            return ClassificationReadSnapshot(
+                ready_generation_id=None,
+                generation=None,
+                securities=[],
+                security_snapshot_date=None,
+                index_components=[],
+                index_snapshot_date=None,
+                sector_memberships=[],
+                sector_snapshot_date=None,
+            )
+        try:
+            pointer = self._ready_pointer(connection)
+            ready_generation_id = pointer[1] if pointer else None
+            generation = None
+            if pointer is not None:
+                row = self._execute(
+                    connection,
+                    """
+                    SELECT sequence, generation_id, source, source_version,
+                           source_snapshot_date, source_date_semantics, observed_at,
+                           row_counts, coverage_audits, market_scope
+                    FROM classification_generations
+                    WHERE sequence <= ?
+                      AND source_snapshot_date <= ?
+                      AND CAST(observed_at AS DATE) <= ?
+                    ORDER BY source_snapshot_date DESC, sequence DESC
+                    LIMIT 1
+                    """,
+                    [pointer[0], as_of, as_of],
+                ).fetchone()
+                generation = self._generation_from_row(row) if row is not None else None
+            securities: list[SecurityMasterRecord] = []
+            security_date = None
+            components: list[IndexComponentRecord] = []
+            index_date = None
+            memberships: list[SectorMembershipRecord] = []
+            sector_date = None
+            if generation is not None and include_securities:
+                securities, security_date = self._records_for_generation(
+                    connection,
+                    generation,
+                    "security_master_history",
+                    SecurityMasterRecord,
+                    as_of,
+                    apply_effective_window=False,
+                )
+            if generation is not None and index_id is not None:
+                components, index_date = self._records_for_generation(
+                    connection,
+                    generation,
+                    "index_component_history",
+                    IndexComponentRecord,
+                    as_of,
+                    filters={"index_id": index_id},
+                )
+            if generation is not None and taxonomy_id is not None:
+                memberships, sector_date = self._records_for_generation(
+                    connection,
+                    generation,
+                    "sector_membership_history",
+                    SectorMembershipRecord,
+                    as_of,
+                    filters={"taxonomy_id": taxonomy_id},
+                )
+            return ClassificationReadSnapshot(
+                ready_generation_id=ready_generation_id,
+                generation=generation,
+                securities=securities,
+                security_snapshot_date=security_date,
+                index_components=components,
+                index_snapshot_date=index_date,
+                sector_memberships=memberships,
+                sector_snapshot_date=sector_date,
+            )
+        finally:
+            connection.close()
+
     def _records_at(
         self,
         table: str,
@@ -654,7 +867,9 @@ class ClassificationStore:
         filters: dict[str, str] | None = None,
         apply_effective_window: bool = True,
     ) -> tuple[list, str | None, date | None]:
-        connection = self._connect()
+        connection = self._connect_reader()
+        if connection is None:
+            return [], None, None
         try:
             pointer = self._ready_pointer(connection)
             if pointer is None:

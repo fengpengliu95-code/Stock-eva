@@ -36,8 +36,11 @@ class ClassificationService:
         self.store = store
 
     def securities(self, as_of: date, *, symbol: str | None = None) -> SecurityResponse:
-        rows, generation_id, snapshot_date = self.store.securities_at(as_of)
-        generation = self.store.generation_at(as_of)
+        selected = self.store.read_snapshot(as_of, include_securities=True)
+        rows = selected.securities
+        generation = selected.generation
+        generation_id = generation.generation_id if generation is not None else None
+        snapshot_date = selected.security_snapshot_date
         scope = generation.market_scope if generation is not None else market_scope([])
         if symbol is not None:
             rows = [row for row in rows if row.symbol == symbol]
@@ -45,7 +48,7 @@ class ClassificationService:
             return SecurityResponse(
                 status=(
                     "not_available"
-                    if generation is not None or self.store.ready_generation() is not None
+                    if generation is not None or selected.ready_generation_id is not None
                     else "empty"
                 ),
                 as_of=as_of,
@@ -92,7 +95,14 @@ class ClassificationService:
         metadata = INDEX_CATALOG.get(index_id)
         if metadata is None:
             raise UnknownIndexError(index_id)
-        rows, generation_id, snapshot_date = self.store.index_components_at(index_id, as_of)
+        selected = self.store.read_snapshot(as_of, index_id=index_id)
+        rows = selected.index_components
+        generation_id = (
+            selected.generation.generation_id
+            if selected.generation is not None
+            else None
+        )
+        snapshot_date = selected.index_snapshot_date
         if not rows:
             issue = (
                 "component_history_not_supplied_by_source"
@@ -119,8 +129,8 @@ class ClassificationService:
             quality_issues=["component_history_unverified"] if unverified else [],
         )
 
-    def _ensure_taxonomy(self, taxonomy_id: str) -> None:
-        generation = self.store.generation_at(date.max)
+    @staticmethod
+    def _ensure_taxonomy(taxonomy_id: str, generation) -> None:
         known = {TAXONOMY_BAOSTOCK_INDUSTRY}
         if generation is not None:
             known.update(item.taxonomy_id for item in generation.coverage_audits)
@@ -128,10 +138,18 @@ class ClassificationService:
             raise UnknownTaxonomyError(taxonomy_id)
 
     def sectors(self, taxonomy_id: str, as_of: date) -> SectorResponse:
-        self._ensure_taxonomy(taxonomy_id)
-        rows, generation_id, snapshot_date = self.store.sector_memberships_at(
-            taxonomy_id, as_of
+        selected = self.store.read_snapshot(
+            as_of,
+            taxonomy_id=taxonomy_id,
         )
+        self._ensure_taxonomy(taxonomy_id, selected.generation)
+        rows = selected.sector_memberships
+        generation_id = (
+            selected.generation.generation_id
+            if selected.generation is not None
+            else None
+        )
+        snapshot_date = selected.sector_snapshot_date
         if not rows:
             return SectorResponse(
                 status="not_available",
@@ -167,11 +185,19 @@ class ClassificationService:
         sector_id: str,
         as_of: date,
     ) -> SectorMembersResponse:
-        self._ensure_taxonomy(taxonomy_id)
         before = self.store.query_count
-        rows, generation_id, snapshot_date = self.store.sector_memberships_at(
-            taxonomy_id, as_of
+        selected = self.store.read_snapshot(
+            as_of,
+            taxonomy_id=taxonomy_id,
         )
+        self._ensure_taxonomy(taxonomy_id, selected.generation)
+        rows = selected.sector_memberships
+        generation_id = (
+            selected.generation.generation_id
+            if selected.generation is not None
+            else None
+        )
+        snapshot_date = selected.sector_snapshot_date
         members = [row for row in rows if row.sector_id == sector_id]
         return SectorMembersResponse(
             status="ready" if members else "not_available",
@@ -186,8 +212,13 @@ class ClassificationService:
         )
 
     def coverage(self, taxonomy_id: str, as_of: date) -> CoverageAudit:
-        self._ensure_taxonomy(taxonomy_id)
-        generation = self.store.generation_at(as_of)
+        selected = self.store.read_snapshot(
+            as_of,
+            include_securities=True,
+            taxonomy_id=taxonomy_id,
+        )
+        generation = selected.generation
+        self._ensure_taxonomy(taxonomy_id, generation)
         if generation is None:
             return CoverageAudit(
                 status="empty",
@@ -202,8 +233,8 @@ class ClassificationService:
                 source_lineage=[],
                 quality_issues=["no_classification_generation"],
             )
-        securities, _, _ = self.store.securities_at(as_of)
-        memberships, _, _ = self.store.sector_memberships_at(taxonomy_id, as_of)
+        securities = selected.securities
+        memberships = selected.sector_memberships
         eligible = {
             row.security_id: row.symbol
             for row in securities

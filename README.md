@@ -178,8 +178,8 @@ uv run python -m backend.app.cli backup-private-data
 4 个周快照，不写市场 NAS。
 
 R1-A 分类同步默认是无网络、无写入的 dry-run。只有显式 `--execute` 才会调用
-BaoStock 并原子发布新的 classification generation；未来 `as_of` 会在 provider
-调用前被拒绝：
+BaoStock 并持久化新的 classification candidate；只有 coverage audit ready 的候选
+才原子推进 ready generation。未来 `as_of` 会在 provider 调用前被拒绝：
 
 ```bash
 uv run python -m backend.app.cli classification-sync --as-of 2026-07-28
@@ -190,7 +190,8 @@ uv run python -m backend.app.cli classification-sync \
 ```
 
 该命令写入独立的 classification DuckDB，不打开用户 SQLite、NAS manifest 或生产
-用户数据库。完整的 coverage、actionability、来源日期和指数历史能力契约见
+用户数据库。Classification GET 使用无 DDL 的只读路径，缺失 DB 时不创建文件或目录。
+完整的 coverage、actionability、来源日期和指数历史能力契约见
 [R1-A 时点分类主数据](docs/classification.md)。
 
 历史日期和前复权序列端点：
