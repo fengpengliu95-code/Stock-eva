@@ -286,6 +286,14 @@ case "$1" in
     if [[ "${FAIL_LABEL:-}" == "$label" ]]; then
       exit 9
     fi
+    fail_once_marker="$state.fail-once.$label"
+    if [[ "${FAIL_ONCE_LABEL:-}" == "$label" && ! -f "$fail_once_marker" ]]; then
+      /usr/bin/touch "$fail_once_marker"
+      exit 9
+    fi
+    if [[ "${BOOTSTRAP_NO_LOAD_LABEL:-}" == "$label" ]]; then
+      exit 0
+    fi
     if ! /usr/bin/grep -Fxq "$label" "$state"; then
       echo "$label" >> "$state"
     fi
@@ -618,6 +626,75 @@ def test_installer_web_handoff_failure_restores_old_release_and_agents(
         f"launchctl|bootstrap|com.finlay.stock-eva.web|{old_target}"
         in events
     )
+
+
+@pytest.mark.parametrize(
+    ("faults", "missing_label", "failure_phase"),
+    [
+        pytest.param(
+            {"FAIL_LABEL": "com.finlay.stock-eva.calendar"},
+            "com.finlay.stock-eva.calendar",
+            "bootstrap",
+            id="rollback-bootstrap-fails",
+        ),
+        pytest.param(
+            {
+                "FAIL_ONCE_LABEL": "com.finlay.stock-eva.calendar",
+                "BOOTSTRAP_NO_LOAD_LABEL": "com.finlay.stock-eva.web",
+            },
+            "com.finlay.stock-eva.web",
+            "verify_loaded",
+            id="rollback-bootstrap-never-loads",
+        ),
+    ],
+)
+def test_installer_reports_incomplete_rollback_when_loaded_agent_is_missing(
+    tmp_path: Path,
+    faults: dict[str, str],
+    missing_label: str,
+    failure_phase: str,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    config = app_support / "config/.env"
+    previous_config = config.read_text()
+    agent_root = Path(environment["HOME"]) / "Library/LaunchAgents"
+    previous_calendar_plist = agent_root / "com.finlay.stock-eva.calendar.plist"
+    previous_calendar_plist.write_text("previous-calendar-plist")
+
+    (project / "uv.lock").write_text("synthetic lock v2")
+    (project / "backend/sentinel.txt").write_text("backend-v2")
+    (project / ".env").write_text(
+        (project / ".env").read_text() + "STOCK_EVA_TEST_MARKER=new\n"
+    )
+    environment.update(faults)
+    second = run_installer(project, environment)
+
+    assert second.returncode == 9
+    assert "rollback incomplete" in second.stderr
+    assert f"{missing_label}:{failure_phase}" in second.stderr
+    assert "rollback: restored previous LaunchAgent state" not in second.stderr
+    assert str(current.readlink()) == old_target
+    assert (current / "backend/sentinel.txt").read_text() == "backend"
+    assert config.read_text() == previous_config
+    assert previous_calendar_plist.read_text() == "previous-calendar-plist"
+    releases = app_support / "runtime/releases"
+    assert sorted(path.name for path in releases.iterdir()) == [
+        Path(old_target).name
+    ]
+    expected_loaded = {
+        path.name.removesuffix(".plist.in")
+        for path in LAUNCHD.glob("*.plist.in")
+    } - {missing_label}
+    actual_loaded = set(
+        Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines()
+    )
+    assert actual_loaded == expected_loaded
 
 
 def test_installer_rejects_manual_port_conflict_before_writing_plists(

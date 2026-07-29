@@ -200,6 +200,17 @@ wait_for_unloaded() {
   return 1
 }
 
+wait_for_loaded() {
+  local label="$1"
+  for _attempt in {1..50}; do
+    if "$LAUNCHCTL" print "$DOMAIN/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
 wait_for_port_release() {
   local port="$1"
   for _attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -242,6 +253,7 @@ RELEASE_CREATED=0
 CONFIG_CHANGED=0
 rollback() {
   status=$?
+  local -a restore_failures=()
   trap - ERR
   set +e
   if [[ "$MUTATION_STARTED" == "1" ]]; then
@@ -278,12 +290,20 @@ rollback() {
     fi
     for label in "${LABELS[@]}"; do
       if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
-        "$LAUNCHCTL" bootstrap \
+        if ! "$LAUNCHCTL" bootstrap \
           "$DOMAIN" \
-          "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1 || true
+          "$LAUNCH_AGENT_ROOT/$label.plist" >/dev/null 2>&1; then
+          restore_failures+=("$label:bootstrap")
+        elif ! wait_for_loaded "$label"; then
+          restore_failures+=("$label:verify_loaded")
+        fi
       fi
     done
-    echo "rollback: restored previous LaunchAgent state" >&2
+    if ((${#restore_failures[@]} == 0)); then
+      echo "rollback: restored previous LaunchAgent state" >&2
+    else
+      echo "rollback incomplete: ${restore_failures[*]}" >&2
+    fi
   fi
   exit "$status"
 }
