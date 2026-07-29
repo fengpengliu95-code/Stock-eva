@@ -701,6 +701,7 @@ def test_api_rejects_future_shanghai_date_before_store_read() -> None:
 
 def test_api_missing_database_is_empty_and_creates_no_filesystem_state(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     analysis_api = import_module("backend.app.api.analysis")
     root = tmp_path / "absent-runtime"
@@ -711,15 +712,31 @@ def test_api_missing_database_is_empty_and_creates_no_filesystem_state(
         local_lock_dir=root / "locks",
         local_temp_dir=root / "temp",
         user_data_dir=root / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
     )
+    hostile_dataset = tmp_path / "hostile-dataset"
+    hostile_dataset.mkdir()
+    (hostile_dataset / "manifest.json").write_text("{not-json", encoding="utf-8")
+    monkeypatch.setenv(
+        "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT",
+        str(hostile_dataset),
+    )
+    get_settings.cache_clear()
 
-    response = _api_request(
-        f"/api/v1/analysis/market-regime?as_of={AS_OF}",
-        {
-            get_settings: lambda: settings,
-            analysis_api.get_regime_today: lambda: AS_OF,
-        },
-    )
+    regime_store = analysis_api.get_market_regime_store(settings)
+
+    try:
+        response = _api_request(
+            f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+            {
+                analysis_api.get_market_regime_store: lambda: regime_store,
+                analysis_api.get_regime_today: lambda: AS_OF,
+            },
+            raise_app_exceptions=False,
+        )
+    finally:
+        get_settings.cache_clear()
 
     assert response.status_code == 200
     payload = response.json()
@@ -756,12 +773,15 @@ def test_api_existing_database_executes_select_only_and_preserves_bytes(
         local_lock_dir=tmp_path / "locks",
         local_temp_dir=reader_temp,
         user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
     )
+    regime_store = analysis_api.get_market_regime_store(settings)
 
     response = _api_request(
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
         {
-            get_settings: lambda: settings,
+            analysis_api.get_market_regime_store: lambda: regime_store,
             analysis_api.get_regime_today: lambda: AS_OF,
         },
     )
@@ -798,13 +818,23 @@ def test_api_missing_dataset_root_or_manifest_is_empty_without_writes(
         local_lock_dir=runtime / "locks",
         local_temp_dir=runtime / "temp",
         user_data_dir=runtime / "user",
-        **{dataset_setting: dataset_root},
+        local_market_dataset_root=(
+            dataset_root
+            if dataset_setting == "local_market_dataset_root"
+            else None
+        ),
+        nas_market_dataset_root=(
+            dataset_root
+            if dataset_setting == "nas_market_dataset_root"
+            else None
+        ),
     )
+    regime_store = analysis_api.get_market_regime_store(settings)
 
     response = _api_request(
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
         {
-            get_settings: lambda: settings,
+            analysis_api.get_market_regime_store: lambda: regime_store,
             analysis_api.get_regime_today: lambda: AS_OF,
         },
         raise_app_exceptions=False,
@@ -836,12 +866,14 @@ def test_api_corrupt_existing_dataset_manifest_remains_explicit_failure(
         local_temp_dir=runtime / "temp",
         user_data_dir=runtime / "user",
         local_market_dataset_root=dataset_root,
+        nas_market_dataset_root=None,
     )
+    regime_store = analysis_api.get_market_regime_store(settings)
 
     response = _api_request(
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
         {
-            get_settings: lambda: settings,
+            analysis_api.get_market_regime_store: lambda: regime_store,
             analysis_api.get_regime_today: lambda: AS_OF,
         },
         raise_app_exceptions=False,
@@ -894,12 +926,15 @@ def test_api_non_finite_pct_change_falls_back_or_excludes_without_500(
         local_lock_dir=tmp_path / "locks",
         local_temp_dir=tmp_path / "reader-temp",
         user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
     )
+    regime_store = analysis_api.get_market_regime_store(settings)
 
     response = _api_request(
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
         {
-            get_settings: lambda: settings,
+            analysis_api.get_market_regime_store: lambda: regime_store,
             analysis_api.get_regime_today: lambda: AS_OF,
         },
         raise_app_exceptions=False,

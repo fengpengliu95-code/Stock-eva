@@ -6,6 +6,8 @@ R1-B review remediation: **LOCALLY VERIFIED — RE-REVIEW REQUIRED**
 
 Independent review: **SECOND CHANGES REQUIRED received; follow-up not yet re-reviewed**
 
+Mainline fresh-suite isolation follow-up: **LOCALLY VERIFIED**
+
 Release 1 verdict: **PENDING — do not claim GO**
 
 ## Scope verified in this worker
@@ -103,6 +105,27 @@ uv run --extra dev pytest -o addopts='' -q \
 
 uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
 # Focused GREEN: 43 passed
+
+# Mainline fresh-suite isolation reproduction:
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_api_missing_database_is_empty_and_creates_no_filesystem_state
+# RED: 1 failed (503 instead of 200). A stale indirect get_settings override missed the
+# FastAPI dependency identity and read only the temporary hostile corrupt manifest.
+
+# After directly overriding get_market_regime_store with stores built from explicit Settings:
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_api_missing_database_is_empty_and_creates_no_filesystem_state \
+  tests/test_market_regime.py::test_api_existing_database_executes_select_only_and_preserves_bytes \
+  tests/test_market_regime.py::test_api_non_finite_pct_change_falls_back_or_excludes_without_500 \
+  tests/test_market_regime.py::test_api_missing_dataset_root_or_manifest_is_empty_without_writes \
+  tests/test_market_regime.py::test_api_corrupt_existing_dataset_manifest_remains_explicit_failure
+# GREEN: 8 passed
+
+env \
+  STOCK_EVA_LOCAL_MARKET_DATASET_ROOT=/tmp/stock-eva-r1b-hostile-env-c55429e \
+  STOCK_EVA_NAS_MARKET_DATASET_ROOT=/tmp/stock-eva-r1b-hostile-nas-c55429e \
+  uv run --extra dev pytest -o addopts='' -q <same targeted tests>
+# Hostile-env GREEN: 8 passed
 ```
 
 ## Verification
@@ -112,7 +135,7 @@ uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
 # 43 passed in 0.45s
 
 uv run --extra dev pytest
-# 487 passed in 52.23s
+# 487 passed in 55.19s
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
