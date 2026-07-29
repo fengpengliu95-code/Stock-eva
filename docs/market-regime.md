@@ -22,7 +22,7 @@ HTTP 按 `Asia/Shanghai` 日期拒绝未来 `as_of`（422）。service 本身不
 - 总分、置信度、缺失输入、支持证据、反例和质量问题；
 - 请求 `as_of`、实际行情 `data_as_of` 和内容 hash 血缘；
 - 公式版本、全部权重和阈值；
-- expected/observed/missing boards 与代表指数、分项及总 coverage ratio；
+- expected/observed/missing boards 与代表指数、coverage basis、可用 coverage ratio；
 - 结果是否具备“全 A 股”结论能力和范围免责声明。
 
 `result_id` 是输入、公式版本、权重和阈值的规范 JSON SHA-256 摘要。同一输入重复
@@ -67,10 +67,13 @@ leadership=0.10
 
 1. 有得分分项的权重之和；
 2. 分项质量加权和（ready=`1`、degraded=`0.75`、missing=`0`）；
-3. 实际 market scope coverage ratio。
+3. 权威 universe audit 给出的实际 market scope coverage ratio。
 
 `>=0.9` 为 high，`>=0.5` 为 medium，其余为 low。任何缺失分项、降级分项或
 narrow scope 都使结果状态成为 `degraded`；全部分项缺失时为 `empty`。
+没有权威时点 expected-universe denominator 时，`board_coverage_ratio` 和
+`coverage_ratio` 均为 `null`，第三项按 `0` 处理并记录
+`market_scope_coverage_not_audited`，不能从符号存在性推导高置信度。
 
 ## 市场范围真实性
 
@@ -81,12 +84,19 @@ narrow scope 都使结果状态成为 `degraded`；全部分项缺失时为 `emp
 
 北交所仍是 roadmap 的单独决策项，不被静默纳入或排除“全 A 股”文案。
 
-当前既有 canonical 历史实际只发布沪深主板，以及上证综指和深证成指。因此用当前
-生产形态读取时，接口必须返回 `narrow_provisional`、low confidence、
-`narrow_scope_not_full_a_share`，并明确“不能支持全 A 股牛熊结论”。R1-B 仅把
-canonical 模型和显式代码归类补通到创业板、科创板及代表指数；没有扩大
-`all-main-board` 抓取，没有访问或写入真实 BaoStock/NAS/用户数据，也没有用合成数据
-填充生产。
+R1-B 的 reader 只能从当日行列出 `observed_boards`、`observed_index_series` 和
+`observed_universe_count`。即使四个 board 都各出现少量股票且六个代表指数都存在，
+符号存在性也不等于全市场覆盖审计：`coverage_basis` 必须保持
+`symbol_presence_only`，`expected_universe_count`、`board_coverage_ratio` 和
+`coverage_ratio` 必须为 `null`，结果必须是 `narrow_provisional`、low confidence、
+`can_support_full_a_share_conclusion=false`。只有未来显式传入权威、可按时点重放的
+expected-universe denominator 并证明完整覆盖，才允许
+`coverage_basis=authoritative_universe_audit` 和全 A 结论能力。六个代表指数的
+`index_coverage_ratio` 只表示明确列出的六条指数序列存在比例，不证明股票 universe
+完整。
+
+R1-B 没有扩大 `all-main-board` 抓取，没有访问或写入真实 BaoStock/NAS/用户数据，
+也没有用合成数据填充生产。
 
 成交额趋势只是 price-volume evidence，不是主力、北向或机构资金净流入。在合格
 资金证据进入后续 release 前，`liquidity.fund_flow_evidence` 保持 missing，流动性
@@ -98,6 +108,17 @@ store 每次只读取截止 `as_of` 的最近 130 个已存在交易日。股票
 `raw_close(d) × backFactor(d) / backFactor(data_as_of)`；停牌、非 ready 行和缺失
 复权因子不进入相关宽度计算。任何 reader 异常返回的未来行都会被二次丢弃，并产生
 `future_market_rows_discarded`。
+
+风险预热分别判断：20 日波动率至少需要 21 个有效指数 session，60 日回撤至少需要
+60 个有效指数 session。未满 60 日时不得缩短窗口冒充 `index_drawdown_60d`，而是
+记录 `risk.index_drawdown_60d_warmup` 并降级。横截面收益率仅接受有限
+`pct_change`；NaN/inf 时，如果 `close`、`preclose` 有限且 `preclose != 0`，使用
+确定性的收盘价回退并记录 `pct_change_fallback_used`，否则排除该行并记录
+`invalid_return_input_excluded`。所有对外数值必须有限。
+
+配置了 local/NAS published dataset root 但 root 或 `manifest.json` 不存在时，
+read-only reader 返回空输入且不创建任何路径。已经发布的 manifest 若存在但损坏或
+与对象不一致，则保留显式 storage failure；不能把损坏数据集吞成“无数据”。
 
 R1-B 只生成按请求即时确定性结果，不持久化新的 regime 数据库。Release 1 的
 “每个 ready 交易日一份快照”及至少 20 个真实历史交易日验收由 R1-E 在受控真实

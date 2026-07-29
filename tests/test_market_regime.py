@@ -1,5 +1,7 @@
 import asyncio
+import math
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
 
@@ -48,8 +50,6 @@ def _scope(models, *, complete: bool = True):
     ]
     observed_boards = expected_boards if complete else expected_boards[:2]
     observed_indexes = expected_indexes if complete else expected_indexes[:2]
-    observed = len(observed_boards) + len(observed_indexes)
-    expected = len(expected_boards) + len(expected_indexes)
     return models.ActualMarketScope(
         expected_boards=expected_boards,
         observed_boards=observed_boards,
@@ -57,9 +57,16 @@ def _scope(models, *, complete: bool = True):
         expected_index_series=expected_indexes,
         observed_index_series=observed_indexes,
         missing_index_series=sorted(set(expected_indexes) - set(observed_indexes)),
-        board_coverage_ratio=len(observed_boards) / len(expected_boards),
+        coverage_basis=(
+            "authoritative_universe_audit"
+            if complete
+            else "symbol_presence_only"
+        ),
+        expected_universe_count=4 if complete else None,
+        observed_universe_count=4 if complete else 2,
+        board_coverage_ratio=1 if complete else None,
         index_coverage_ratio=len(observed_indexes) / len(expected_indexes),
-        coverage_ratio=observed / expected,
+        coverage_ratio=1 if complete else None,
         scope_status="full_a_share_capable" if complete else "narrow_provisional",
         can_support_full_a_share_conclusion=complete,
         conclusion_disclaimer=(
@@ -312,9 +319,11 @@ def _bar(
     security_type: str = "stock",
     board: str = "main",
     close: float = 10,
+    preclose: float | None = None,
     amount: float = 10_000,
-    pct_change: float = 0,
+    pct_change: float | None = 0,
 ) -> DailyBar:
+    preclose = close if preclose is None else preclose
     return DailyBar(
         trade_date=trade_date,
         symbol=symbol,
@@ -325,7 +334,7 @@ def _bar(
         high=close,
         low=close,
         close=close,
-        preclose=close,
+        preclose=preclose,
         volume=1_000,
         amount=amount,
         turnover_rate=1,
@@ -376,9 +385,8 @@ def test_service_input_rejects_future_data_lineage() -> None:
         models.MarketRegimeInput.model_validate(payload)
 
 
-def test_store_derives_versioned_price_components_and_full_observed_scope() -> None:
-    _, service_module, store_module = _regime_modules()
-    start = AS_OF - timedelta(days=129)
+def _market_bars(session_count: int) -> list[DailyBar]:
+    start = AS_OF - timedelta(days=session_count - 1)
     stock_specs = [
         ("sh.600000", "main"),
         ("sz.000001", "main"),
@@ -393,8 +401,8 @@ def test_store_derives_versioned_price_components_and_full_observed_scope() -> N
         "sh.000852",
         "sz.399006",
     ]
-    bars = []
-    for offset in range(130):
+    bars: list[DailyBar] = []
+    for offset in range(session_count):
         trade_date = start + timedelta(days=offset)
         bars.extend(
             _bar(
@@ -417,6 +425,15 @@ def test_store_derives_versioned_price_components_and_full_observed_scope() -> N
             )
             for symbol in index_symbols
         )
+    return bars
+
+
+@pytest.mark.parametrize("session_count", [21, 130])
+def test_symbol_presence_never_proves_authoritative_full_a_scope(
+    session_count: int,
+) -> None:
+    _, service_module, store_module = _regime_modules()
+    bars = _market_bars(session_count)
 
     class InMemoryReader:
         def bars_through(self, as_of: date, *, max_sessions: int):
@@ -427,18 +444,80 @@ def test_store_derives_versioned_price_components_and_full_observed_scope() -> N
     inputs = store_module.MarketRegimeStore(InMemoryReader()).read(AS_OF)
     result = service_module.MarketRegimeService().evaluate(inputs)
 
-    assert inputs.trend.quality_status == "ready"
-    assert inputs.breadth.quality_status == "ready"
-    assert inputs.liquidity.quality_status == "degraded"
-    assert inputs.risk.quality_status == "ready"
-    assert inputs.leadership.quality_status == "missing"
-    assert inputs.actual_market_scope.can_support_full_a_share_conclusion is True
-    assert inputs.actual_market_scope.coverage_ratio == 1
-    assert result.strategic_state == "bull"
-    assert result.tactical_state == "risk_on"
+    scope = inputs.actual_market_scope
+    assert scope.observed_boards == ["chinext", "sse_main", "star", "szse_main"]
+    assert scope.observed_index_series == [
+        "sh.000001",
+        "sh.000300",
+        "sh.000852",
+        "sh.000905",
+        "sz.399001",
+        "sz.399006",
+    ]
+    assert scope.missing_boards == []
+    assert scope.missing_index_series == []
+    assert scope.board_coverage_ratio is None
+    assert scope.index_coverage_ratio == 1
+    assert scope.coverage_ratio is None
+    assert scope.coverage_basis == "symbol_presence_only"
+    assert scope.expected_universe_count is None
+    assert scope.observed_universe_count == 4
+    assert scope.can_support_full_a_share_conclusion is False
+    assert scope.scope_status == "narrow_provisional"
     assert result.status == "degraded"
-    assert result.total_score is not None
-    assert result.total_score > 25
+    assert result.confidence.level == "low"
+    assert "market_scope_authoritative_coverage_unavailable" in result.quality_issues
+
+
+def test_risk_requires_60_valid_index_sessions_for_drawdown() -> None:
+    _, _, store_module = _regime_modules()
+
+    class InMemoryReader:
+        def bars_through(self, _as_of: date, *, max_sessions: int):
+            assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
+            return _market_bars(21)
+
+    inputs = store_module.MarketRegimeStore(InMemoryReader()).read(AS_OF)
+
+    assert inputs.risk.score is not None
+    assert inputs.risk.quality_status == "degraded"
+    assert "risk.index_drawdown_60d_warmup" in inputs.risk.missing_inputs
+    assert "index_volatility_20d" in {
+        item.code
+        for item in (
+            *inputs.risk.supporting_evidence,
+            *inputs.risk.contrary_evidence,
+        )
+    }
+    assert "index_drawdown_60d" not in {
+        item.code
+        for item in (
+            *inputs.risk.supporting_evidence,
+            *inputs.risk.contrary_evidence,
+        )
+    }
+
+
+def test_risk_is_ready_at_60_valid_index_sessions() -> None:
+    _, _, store_module = _regime_modules()
+
+    class InMemoryReader:
+        def bars_through(self, _as_of: date, *, max_sessions: int):
+            assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
+            return _market_bars(60)
+
+    inputs = store_module.MarketRegimeStore(InMemoryReader()).read(AS_OF)
+
+    assert inputs.risk.score is not None
+    assert inputs.risk.quality_status == "ready"
+    assert inputs.risk.missing_inputs == []
+    assert "index_drawdown_60d" in {
+        item.code
+        for item in (
+            *inputs.risk.supporting_evidence,
+            *inputs.risk.contrary_evidence,
+        )
+    }
 
 
 def test_canonical_contract_identifies_chinext_star_and_representative_indexes() -> None:
@@ -535,11 +614,19 @@ def test_canonical_contract_identifies_chinext_star_and_representative_indexes()
     ]
 
 
-def _api_request(path: str, overrides: dict | None = None) -> httpx.Response:
+def _api_request(
+    path: str,
+    overrides: dict | None = None,
+    *,
+    raise_app_exceptions: bool = True,
+) -> httpx.Response:
     app.dependency_overrides.update(overrides or {})
 
     async def send() -> httpx.Response:
-        transport = httpx.ASGITransport(app=app)
+        transport = httpx.ASGITransport(
+            app=app,
+            raise_app_exceptions=raise_app_exceptions,
+        )
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.get(path)
 
@@ -644,3 +731,213 @@ def test_api_existing_database_executes_select_only_and_preserves_bytes(
     assert response.json()["data_as_of"] == str(AS_OF)
     assert database.read_bytes() == before
     assert not reader_temp.exists()
+
+
+@pytest.mark.parametrize(
+    ("dataset_setting", "create_root"),
+    [
+        ("local_market_dataset_root", False),
+        ("nas_market_dataset_root", False),
+        ("local_market_dataset_root", True),
+        ("nas_market_dataset_root", True),
+    ],
+)
+def test_api_missing_dataset_root_or_manifest_is_empty_without_writes(
+    tmp_path: Path,
+    dataset_setting: str,
+    create_root: bool,
+) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+    runtime = tmp_path / "absent-runtime"
+    dataset_root = tmp_path / f"{dataset_setting}-dataset"
+    if create_root:
+        dataset_root.mkdir()
+    settings = Settings(
+        market_data_dir=runtime / "market",
+        local_control_dir=runtime / "control",
+        local_staging_dir=runtime / "staging",
+        local_lock_dir=runtime / "locks",
+        local_temp_dir=runtime / "temp",
+        user_data_dir=runtime / "user",
+        **{dataset_setting: dataset_root},
+    )
+
+    response = _api_request(
+        f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        {
+            get_settings: lambda: settings,
+            analysis_api.get_regime_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "empty"
+    assert not runtime.exists()
+    if create_root:
+        assert list(dataset_root.iterdir()) == []
+    else:
+        assert not dataset_root.exists()
+
+
+def test_api_corrupt_existing_dataset_manifest_remains_explicit_failure(
+    tmp_path: Path,
+) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+    runtime = tmp_path / "runtime"
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    manifest = dataset_root / "manifest.json"
+    manifest.write_text("{not-json", encoding="utf-8")
+    settings = Settings(
+        market_data_dir=runtime / "market",
+        local_control_dir=runtime / "control",
+        local_staging_dir=runtime / "staging",
+        local_lock_dir=runtime / "locks",
+        local_temp_dir=runtime / "temp",
+        user_data_dir=runtime / "user",
+        local_market_dataset_root=dataset_root,
+    )
+
+    response = _api_request(
+        f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        {
+            get_settings: lambda: settings,
+            analysis_api.get_regime_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "market_storage_unavailable"
+    assert manifest.read_text(encoding="utf-8") == "{not-json"
+    assert not runtime.exists()
+
+
+def test_api_non_finite_pct_change_falls_back_or_excludes_without_500(
+    tmp_path: Path,
+) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+    database = tmp_path / "market" / "market.duckdb"
+    MarketStore(
+        database,
+        temp_directory=tmp_path / "writer-temp",
+    ).upsert_bars(
+        [
+            _bar(
+                AS_OF,
+                "sh.600000",
+                close=11,
+                preclose=10,
+                pct_change=float("nan"),
+            ),
+            _bar(
+                AS_OF,
+                "sz.000001",
+                close=9,
+                preclose=10,
+                pct_change=float("inf"),
+            ),
+            _bar(
+                AS_OF,
+                "sz.300001",
+                close=10,
+                preclose=0,
+                pct_change=float("-inf"),
+            ),
+        ]
+    )
+    settings = Settings(
+        market_data_dir=database.parent,
+        market_database_name=database.name,
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+    )
+
+    response = _api_request(
+        f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        {
+            get_settings: lambda: settings,
+            analysis_api.get_regime_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "breadth.pct_change_fallback_used" in payload["quality_issues"]
+    assert "breadth.invalid_return_input_excluded" in payload["quality_issues"]
+    assert "risk.pct_change_fallback_used" in payload["quality_issues"]
+    assert "risk.invalid_return_input_excluded" in payload["quality_issues"]
+
+    def assert_finite(value) -> None:
+        if isinstance(value, float):
+            assert math.isfinite(value)
+        elif isinstance(value, list):
+            for item in value:
+                assert_finite(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                assert_finite(item)
+
+    assert_finite(payload)
+
+
+@pytest.mark.parametrize(
+    "non_finite",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_regime_models_reject_non_finite_float_and_decimal(non_finite) -> None:
+    models, _, _ = _regime_modules()
+    payload = _inputs(models, 20).model_dump()
+    payload["trend"]["score"] = non_finite
+
+    with pytest.raises(ValidationError):
+        models.MarketRegimeInput.model_validate(payload)
+
+    payload = _inputs(models, 20).model_dump()
+    payload["trend"]["supporting_evidence"][0]["value"] = non_finite
+
+    with pytest.raises(ValidationError):
+        models.MarketRegimeInput.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {
+            "coverage_basis": "symbol_presence_only",
+            "expected_universe_count": None,
+            "board_coverage_ratio": None,
+            "coverage_ratio": None,
+            "scope_status": "full_a_share_capable",
+            "can_support_full_a_share_conclusion": False,
+        },
+        {
+            "coverage_basis": "authoritative_universe_audit",
+            "expected_universe_count": 4,
+            "observed_universe_count": 3,
+            "board_coverage_ratio": 1,
+            "coverage_ratio": 1,
+            "scope_status": "full_a_share_capable",
+            "can_support_full_a_share_conclusion": True,
+        },
+    ],
+)
+def test_scope_model_rejects_inconsistent_full_a_claims(mutation: dict) -> None:
+    models, _, _ = _regime_modules()
+    payload = _scope(models).model_dump()
+    payload.update(mutation)
+
+    with pytest.raises(ValidationError):
+        models.ActualMarketScope.model_validate(payload)

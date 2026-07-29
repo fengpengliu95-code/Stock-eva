@@ -21,7 +21,7 @@ from backend.app.regime.models import (
     RegimeComponentInput,
     SourceLineage,
 )
-from backend.app.storage.dataset import NasMarketStore
+from backend.app.storage.dataset import MANIFEST_NAME, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import configured_market_dataset_root
 
@@ -94,6 +94,7 @@ class PublishedDatasetMarketReader:
         dataset_root: Path,
         staging_root: Path,
     ) -> None:
+        self.dataset_root = dataset_root
         self.store = NasMarketStore(
             MarketStore(control_path, temp_directory=control_temp),
             dataset_root,
@@ -106,6 +107,12 @@ class PublishedDatasetMarketReader:
         *,
         max_sessions: int,
     ) -> list[DailyBar]:
+        if not self.dataset_root.exists():
+            return []
+        if self.dataset_root.is_dir() and not (
+            self.dataset_root / MANIFEST_NAME
+        ).exists():
+            return []
         rows, _ = self.store._query(
             f"""
             SELECT {_BAR_COLUMNS}
@@ -230,6 +237,7 @@ class MarketRegimeStore:
         missing_inputs: list[str],
         *,
         lineage: list[SourceLineage] | None = None,
+        quality_issues: list[str] | None = None,
     ) -> RegimeComponentInput:
         return RegimeComponentInput(
             name=name,
@@ -237,6 +245,7 @@ class MarketRegimeStore:
             formula_version=formula_version,
             quality_status="missing",
             missing_inputs=missing_inputs,
+            quality_issues=quality_issues or [],
             source_lineage=lineage or [],
         )
 
@@ -293,9 +302,13 @@ class MarketRegimeStore:
         missing_indexes = sorted(
             set(EXPECTED_INDEX_SERIES) - set(observed_indexes)
         )
-        complete = not missing_boards and not missing_indexes
-        observed_count = len(observed_boards) + len(observed_indexes)
-        expected_count = len(EXPECTED_BOARDS) + len(EXPECTED_INDEX_SERIES)
+        observed_universe_count = len(
+            {
+                bar.symbol
+                for bar in current
+                if bar.security_type == "stock"
+            }
+        )
         return ActualMarketScope(
             expected_boards=list(EXPECTED_BOARDS),
             observed_boards=observed_boards,
@@ -303,21 +316,19 @@ class MarketRegimeStore:
             expected_index_series=list(EXPECTED_INDEX_SERIES),
             observed_index_series=observed_indexes,
             missing_index_series=missing_indexes,
-            board_coverage_ratio=len(observed_boards) / len(EXPECTED_BOARDS),
+            coverage_basis="symbol_presence_only",
+            expected_universe_count=None,
+            observed_universe_count=observed_universe_count,
+            board_coverage_ratio=None,
             index_coverage_ratio=len(observed_indexes)
             / len(EXPECTED_INDEX_SERIES),
-            coverage_ratio=observed_count / expected_count,
-            scope_status=(
-                "full_a_share_capable" if complete else "narrow_provisional"
-            ),
-            can_support_full_a_share_conclusion=complete,
+            coverage_ratio=None,
+            scope_status="narrow_provisional",
+            can_support_full_a_share_conclusion=False,
             conclusion_disclaimer=(
-                None
-                if complete
-                else (
-                    "Observed price history is narrow-scope and cannot support "
-                    "a full A-share bull/bear conclusion."
-                )
+                "Symbol presence is observed, but authoritative point-in-time "
+                "expected-universe coverage has not been audited. This result is "
+                "narrow-scope and cannot support a full A-share bull/bear conclusion."
             ),
         )
 
@@ -394,7 +405,7 @@ class MarketRegimeStore:
             bar
             for rows in histories.values()
             for bar in rows[-1:]
-            if bar.trade_date == as_of and _bar_is_usable(bar)
+            if bar.trade_date == as_of and _bar_is_return_candidate(bar)
         ]
         if not current:
             return self._missing_component(
@@ -405,24 +416,18 @@ class MarketRegimeStore:
             )
 
         signals: list[tuple[str, float, float]] = []
-        returns = [
-            (
-                bar.pct_change / 100
-                if bar.pct_change is not None
-                else bar.close / bar.preclose - 1
-            )
-            for bar in current
-            if bar.preclose > 0
-        ]
+        returns, quality_issues = _finite_returns(current, component="breadth")
+        missing: list[str] = []
         if returns:
             ratio = sum(value > 0 for value in returns) / len(returns)
             signals.append(("advancing_ratio", _ratio_score(ratio), ratio))
+        else:
+            missing.append("breadth.advancing_declining_returns")
 
         adjusted = {
             symbol: _adjusted_closes(rows, as_of=as_of)
             for symbol, rows in histories.items()
         }
-        missing: list[str] = []
         for period in (20, 60):
             eligible = [
                 values
@@ -454,6 +459,7 @@ class MarketRegimeStore:
                 "breadth-price-v1",
                 ["breadth.market_breadth"],
                 lineage=[lineage],
+                quality_issues=quality_issues,
             )
         supporting, contrary = _metric_evidence(
             "breadth",
@@ -464,8 +470,9 @@ class MarketRegimeStore:
             name="breadth",
             score=round(fmean(score for _, score, _ in signals), 4),
             formula_version="breadth-price-v1",
-            quality_status="degraded" if missing else "ready",
+            quality_status="degraded" if missing or quality_issues else "ready",
             missing_inputs=missing,
+            quality_issues=quality_issues,
             supporting_evidence=supporting,
             contrary_evidence=contrary,
             source_lineage=[lineage],
@@ -526,49 +533,60 @@ class MarketRegimeStore:
         )
         volatilities: list[float] = []
         drawdowns: list[float] = []
-        for rows in index_histories.values():
+        index_series_missing = False
+        volatility_warmup = False
+        drawdown_warmup = False
+        for symbol in EXPECTED_INDEX_SERIES:
+            rows = index_histories.get(symbol, [])
             valid = _valid_bars(rows)
-            if not valid or valid[-1].trade_date != as_of or len(valid) < 21:
+            if not valid or valid[-1].trade_date != as_of:
+                index_series_missing = True
                 continue
+            if len(valid) < 21:
+                volatility_warmup = True
+            if len(valid) < 60:
+                drawdown_warmup = True
             closes = [bar.close for bar in valid]
-            returns = [
-                closes[index] / closes[index - 1] - 1
-                for index in range(max(1, len(closes) - 20), len(closes))
-            ]
-            if returns:
+            if len(valid) >= 21:
+                returns = [
+                    closes[index] / closes[index - 1] - 1
+                    for index in range(len(closes) - 20, len(closes))
+                ]
                 volatilities.append(pstdev(returns))
-            window = closes[-60:]
-            running_high = window[0]
-            worst = 0.0
-            for close in window:
-                running_high = max(running_high, close)
-                worst = min(worst, close / running_high - 1)
-            drawdowns.append(abs(worst))
+            if len(valid) >= 60:
+                window = closes[-60:]
+                running_high = window[0]
+                worst = 0.0
+                for close in window:
+                    running_high = max(running_high, close)
+                    worst = min(worst, close / running_high - 1)
+                drawdowns.append(abs(worst))
 
-        current_returns = [
-            (
-                bar.pct_change / 100
-                if bar.pct_change is not None
-                else bar.close / bar.preclose - 1
-            )
+        current_stock_bars = [
+            bar
             for bar in bars
             if bar.trade_date == as_of
             and bar.security_type == "stock"
-            and _bar_is_usable(bar)
-            and bar.preclose > 0
+            and _bar_is_return_candidate(bar)
         ]
+        current_returns, quality_issues = _finite_returns(
+            current_stock_bars,
+            component="risk",
+        )
         metrics: list[tuple[str, float, float]] = []
         missing: list[str] = []
+        if index_series_missing:
+            missing.append("risk.representative_indexes")
         if volatilities:
             value = fmean(volatilities)
             metrics.append(("index_volatility_20d", _low_risk_score(value, 0.01, 0.03), value))
-        else:
-            missing.append("risk.index_volatility")
+        if not volatilities or volatility_warmup:
+            missing.append("risk.index_volatility_20d_warmup")
         if drawdowns:
             value = max(drawdowns)
             metrics.append(("index_drawdown_60d", _low_risk_score(value, 0.05, 0.20), value))
-        else:
-            missing.append("risk.index_drawdown")
+        if not drawdowns or drawdown_warmup:
+            missing.append("risk.index_drawdown_60d_warmup")
         if len(current_returns) >= 2:
             value = pstdev(current_returns)
             metrics.append(
@@ -582,14 +600,16 @@ class MarketRegimeStore:
                 "risk-price-v1",
                 ["risk.market_risk"],
                 lineage=[lineage],
+                quality_issues=quality_issues,
             )
         supporting, contrary = _metric_evidence("risk", metrics, as_of=as_of)
         return RegimeComponentInput(
             name="risk",
             score=round(fmean(score for _, score, _ in metrics), 4),
             formula_version="risk-price-v1",
-            quality_status="degraded" if missing else "ready",
+            quality_status="degraded" if missing or quality_issues else "ready",
             missing_inputs=missing,
+            quality_issues=quality_issues,
             supporting_evidence=supporting,
             contrary_evidence=contrary,
             source_lineage=[lineage],
@@ -641,6 +661,53 @@ def _bar_is_usable(bar: DailyBar) -> bool:
         and math.isfinite(bar.amount)
         and bar.amount >= 0
     )
+
+
+def _bar_is_return_candidate(bar: DailyBar) -> bool:
+    close = _finite_float(bar.close)
+    return (
+        bar.quality_status == "ready"
+        and not bar.quality_issues
+        and not bar.is_suspended
+        and close is not None
+        and close > 0
+    )
+
+
+def _finite_returns(
+    bars: list[DailyBar],
+    *,
+    component: str,
+) -> tuple[list[float], list[str]]:
+    returns: list[float] = []
+    quality_issues: set[str] = set()
+    for bar in bars:
+        pct_change = _finite_float(bar.pct_change)
+        if pct_change is not None:
+            returns.append(pct_change / 100)
+            continue
+
+        close = _finite_float(bar.close)
+        preclose = _finite_float(bar.preclose)
+        if close is not None and preclose is not None and preclose != 0:
+            fallback = close / preclose - 1
+            if math.isfinite(fallback):
+                returns.append(fallback)
+                if bar.pct_change is not None:
+                    quality_issues.add(f"{component}.pct_change_fallback_used")
+                continue
+        quality_issues.add(f"{component}.invalid_return_input_excluded")
+    return returns, sorted(quality_issues)
+
+
+def _finite_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _valid_bars(bars: list[DailyBar]) -> list[DailyBar]:

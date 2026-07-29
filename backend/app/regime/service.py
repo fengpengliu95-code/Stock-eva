@@ -75,13 +75,27 @@ class MarketRegimeService:
                 for missing in component.missing_inputs
             }
         )
-        issues = sorted(set(inputs.quality_issues))
+        issues = sorted(
+            {
+                *inputs.quality_issues,
+                *(
+                    issue
+                    for component in components
+                    for issue in component.quality_issues
+                ),
+            }
+        )
         if missing_inputs:
             issues.append("missing_component_inputs")
         if any(item.quality_status == "degraded" for item in components):
             issues.append("degraded_component_quality")
         if not inputs.actual_market_scope.can_support_full_a_share_conclusion:
             issues.append("narrow_scope_not_full_a_share")
+        if (
+            inputs.actual_market_scope.coverage_basis
+            != "authoritative_universe_audit"
+        ):
+            issues.append("market_scope_authoritative_coverage_unavailable")
         if inputs.actual_market_scope.missing_boards:
             issues.append("market_scope_missing_expected_boards")
         if inputs.actual_market_scope.missing_index_series:
@@ -161,11 +175,13 @@ class MarketRegimeService:
             )
             for item in components
         )
+        coverage_ratio = inputs.actual_market_scope.coverage_ratio
+        coverage_factor = coverage_ratio if coverage_ratio is not None else 0.0
         value = round(
             min(
                 available_weight,
                 quality_factor,
-                inputs.actual_market_scope.coverage_ratio,
+                coverage_factor,
             ),
             4,
         )
@@ -175,7 +191,9 @@ class MarketRegimeService:
             reasons.append("component_inputs_incomplete")
         if quality_factor < 1:
             reasons.append("component_quality_degraded")
-        if inputs.actual_market_scope.coverage_ratio < 1:
+        if coverage_ratio is None:
+            reasons.append("market_scope_coverage_not_audited")
+        elif coverage_ratio < 1:
             reasons.append("market_scope_incomplete")
         return RegimeConfidence(value=value, level=level, reasons=reasons)
 
