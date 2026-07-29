@@ -136,14 +136,40 @@ git diff --check
 # no output
 ```
 
+## Live acceptance evidence
+
+All live runs used the fixed `2026-07-29` `as_of` and isolated temporary storage.
+They did not publish a trusted classification generation:
+
+1. The initial wrapper remained blocked in one BaoStock socket `recv` for about
+   15 minutes. The orchestrator terminated it with SIGTERM (`exit 143`); it
+   emitted no aggregate result and wrote no classification database.
+2. After the wall-clock deadline repair, a full TEMP sync with a 30-second
+   operation deadline exited `1` after `71.830s`. It returned controlled
+   `classification_sync_failed` JSON with `writes_classification_data=false`
+   and created no classification database.
+3. A bounded single-operation diagnostic later completed
+   `query_all_stock(2026-07-29)` in `29.701s` and returned `7306` rows. This
+   proves that the source can complete the request, but not that its latency or
+   availability is stable.
+4. A subsequent full TEMP sync with a 120-second operation deadline exited `1`
+   after `372.854s`. It again returned controlled
+   `classification_sync_failed` JSON with `writes_classification_data=false`
+   and created no classification database.
+5. The immediately following `max_attempts=1` staged diagnostic stopped at
+   `query_all_stock(2026-07-29)` after its `120.010s` wall-clock deadline.
+   Taken together with the earlier `29.701s` success, this is evidence of
+   unstable source response rather than a verified stable slow-query bound.
+
+No live run touched the production classification path, NAS, `stock_eva.duckdb`,
+or the user database. No threshold was lowered, no date was substituted, and
+no production publication was attempted.
+
 ## Pending real acceptance gates
 
-- No real BaoStock classification publication was executed in this recovery.
-- The 2026-07-29 isolated live probe produced no aggregate JSON or database, remained blocked
-  in BaoStock socket `recv` for about 15 minutes, and was terminated by the orchestrator with
-  exit 143. The first worker-based repair failed review; the replacement POSIX main-thread
-  deadline is synthetic-only verified and has not been rerun against the public service
-  pending review.
+- No real BaoStock classification publication completed in this recovery.
+- No live TEMP run reached a promoted ready generation, so promotion and
+  production-readback acceptance remain pending.
 - The eligible-universe live industry mapping target of at least 95% is not yet measured.
 - The required 20-session historical replay and no-future read acceptance is not yet run on
   real published generations.
