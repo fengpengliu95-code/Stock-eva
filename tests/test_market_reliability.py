@@ -309,7 +309,7 @@ def test_qfq_series_multiplies_prices_and_excludes_suspensions(tmp_path: Path) -
     assert series[0].adjust_factor == pytest.approx(1)
 
 
-def test_qfq_series_reports_no_effective_data_when_all_rows_are_suspended(
+def test_qfq_series_returns_empty_when_all_rows_are_suspended(
     tmp_path: Path,
 ) -> None:
     store = MarketStore(tmp_path / "market.duckdb")
@@ -317,24 +317,30 @@ def test_qfq_series_reports_no_effective_data_when_all_rows_are_suspended(
         update={
             "is_trading": False,
             "is_suspended": True,
-            "adjust_factor": None,
+            "adjust_factor": 1.0,
             "quality_status": "partial",
             "quality_issues": ["suspended_placeholder"],
         }
     )
     save_fixture(store, [suspended], "all-suspended", suspended.trade_date)
 
-    with pytest.raises(DataQualityError) as captured:
-        PriceSeriesService(store).read(
-            suspended.symbol,
-            start=suspended.trade_date,
-            end=suspended.trade_date,
-            adjustment="qfq",
-        )
+    service = PriceSeriesService(store)
+    result = service.read_result(
+        suspended.symbol,
+        start=suspended.trade_date,
+        end=suspended.trade_date,
+        adjustment="qfq",
+    )
+    series = service.read(
+        suspended.symbol,
+        start=suspended.trade_date,
+        end=suspended.trade_date,
+        adjustment="qfq",
+    )
 
-    assert captured.value.reason_code == "no_effective_trading_data"
-    assert suspended.symbol in str(captured.value)
-    assert str(suspended.trade_date) in str(captured.value)
+    assert result.points == []
+    assert result.empty_reason == "no_effective_trading_data"
+    assert series == []
 
 
 def test_qfq_series_normalizes_cumulative_back_factor_to_requested_end(

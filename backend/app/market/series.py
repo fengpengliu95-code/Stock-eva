@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from datetime import date
 from typing import Literal
 
@@ -11,18 +12,19 @@ class DataQualityError(ValueError):
 
 
 class EmptyPriceSeriesError(DataQualityError):
-    def __init__(
-        self,
-        symbol: str,
-        as_of: date,
-        reason_code: Literal["no_market_data", "no_effective_trading_data"],
-    ) -> None:
-        self.reason_code = reason_code
-        detail = {
-            "no_market_data": "no market data",
-            "no_effective_trading_data": "no effective trading data",
-        }[reason_code]
-        super().__init__(f"{symbol} {as_of} {detail}")
+    reason_code: Literal["no_market_data"] = "no_market_data"
+
+    def __init__(self, symbol: str, as_of: date) -> None:
+        super().__init__(f"{symbol} {as_of} no market data")
+
+
+EmptyReason = Literal["no_market_data", "no_effective_trading_data"]
+
+
+@dataclass(frozen=True)
+class PriceSeriesReadResult:
+    points: list[PriceSeriesPoint]
+    empty_reason: EmptyReason | None = None
 
 
 _PRICE_FIELDS = ("open", "high", "low", "close", "preclose")
@@ -38,7 +40,12 @@ def _validate_effective_bar(bar: DailyBar, *, adjustment: Literal["none", "qfq"]
         )
     for field in (*_PRICE_FIELDS, *_ACTIVITY_FIELDS):
         value = getattr(bar, field)
-        if not math.isfinite(value) or (field in _ACTIVITY_FIELDS and value < 0):
+        invalid = not math.isfinite(value)
+        if field in _PRICE_FIELDS:
+            invalid = invalid or value <= 0
+        else:
+            invalid = invalid or value < 0
+        if invalid:
             raise DataQualityError(
                 f"{bar.symbol} {bar.trade_date} invalid {field}={value!r}"
             )
@@ -63,20 +70,33 @@ class PriceSeriesService:
         end: date,
         adjustment: Literal["none", "qfq"] = "qfq",
     ) -> list[PriceSeriesPoint]:
+        result = self.read_result(
+            symbol,
+            start=start,
+            end=end,
+            adjustment=adjustment,
+        )
+        if adjustment == "qfq" and result.empty_reason == "no_market_data":
+            raise EmptyPriceSeriesError(symbol, end)
+        return result.points
+
+    def read_result(
+        self,
+        symbol: str,
+        *,
+        start: date,
+        end: date,
+        adjustment: Literal["none", "qfq"] = "qfq",
+    ) -> PriceSeriesReadResult:
         all_bars = self.store.symbol_bars(symbol, start, end, source="baostock")
         if not all_bars:
-            if adjustment == "qfq":
-                raise EmptyPriceSeriesError(symbol, end, "no_market_data")
-            return []
+            return PriceSeriesReadResult(points=[], empty_reason="no_market_data")
         bars = [bar for bar in all_bars if not bar.is_suspended]
         if not bars:
-            if adjustment == "qfq":
-                raise EmptyPriceSeriesError(
-                    symbol,
-                    all_bars[-1].trade_date,
-                    "no_effective_trading_data",
-                )
-            return []
+            return PriceSeriesReadResult(
+                points=[],
+                empty_reason="no_effective_trading_data",
+            )
         for bar in bars:
             _validate_effective_bar(bar, adjustment=adjustment)
         target_factor = 1.0
@@ -98,7 +118,7 @@ class PriceSeriesService:
                 for field in _PRICE_FIELDS
             }
             for field, value in adjusted_prices.items():
-                if not math.isfinite(value):
+                if not math.isfinite(value) or value <= 0:
                     raise DataQualityError(
                         f"{bar.symbol} {bar.trade_date} invalid qfq {field}={value!r}"
                     )
@@ -118,4 +138,4 @@ class PriceSeriesService:
                     source=bar.source,
                 )
             )
-        return result
+        return PriceSeriesReadResult(points=result)

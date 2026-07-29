@@ -46,11 +46,11 @@ def bar(
         security_type="stock",
         exchange="sh",
         board="main",
-        open=close - 0.5,
+        open=max(close - 0.5, close / 2),
         high=close + 1,
-        low=close - 1,
+        low=max(close - 1, close / 2),
         close=close,
-        preclose=close - 1,
+        preclose=max(close - 1, close / 2),
         volume=1_000 + index,
         amount=(1_000 + index) * close,
         turnover_rate=1,
@@ -239,22 +239,40 @@ def test_empty_window_has_explainable_response() -> None:
     }
 
 
-def test_all_suspended_window_is_empty_without_requiring_suspension_factor() -> None:
-    store = RecordingMarketStore([bar(0, 10, factor=None, suspended=True)])
+def test_all_suspended_history_compatibility_and_analysis_empty() -> None:
+    store = RecordingMarketStore([bar(0, 10, factor=1, suspended=True)])
 
-    response = request(store, analysis_path(end=START))
+    qfq_history = request(
+        store,
+        f"/api/v1/market/history/{SYMBOL}?start={START}&end={START}&adjustment=qfq",
+    )
     unadjusted_history = request(
         store,
         f"/api/v1/market/history/{SYMBOL}?start={START}&end={START}&adjustment=none",
     )
+    response = request(store, analysis_path(end=START))
 
+    assert qfq_history.status_code == 200
+    assert qfq_history.json() == []
+    assert unadjusted_history.status_code == 200
+    assert unadjusted_history.json() == []
     assert response.status_code == 200
     assert response.json()["status"] == "empty"
     assert response.json()["as_of"] is None
     assert response.json()["quality_issues"] == ["no_effective_trading_data"]
     assert response.json()["series"] == []
-    assert unadjusted_history.status_code == 200
-    assert unadjusted_history.json() == []
+    assert len(store.queries) == 3
+
+
+def test_analysis_all_suspended_missing_factor_is_empty_with_one_query() -> None:
+    store = RecordingMarketStore([bar(0, 10, factor=None, suspended=True)])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 200
+    assert response.json()["quality_issues"] == ["no_effective_trading_data"]
+    assert response.json()["series"] == []
+    assert store.queries == [(SYMBOL, START, START, "baostock")]
 
 
 def test_missing_adjust_factor_fails_closed() -> None:
@@ -307,6 +325,48 @@ def test_qfq_price_overflow_fails_closed() -> None:
 
     assert response.status_code == 409
     assert "invalid qfq open" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "preclose"])
+@pytest.mark.parametrize("value", [0.0, -1.0])
+def test_non_positive_market_price_fails_closed(field: str, value: float) -> None:
+    invalid = bar(0, 10).model_copy(update={field: value})
+    store = RecordingMarketStore([invalid])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 409
+    assert f"invalid {field}" in response.json()["detail"]
+
+
+def test_qfq_price_underflow_to_zero_fails_closed() -> None:
+    tiny = bar(0, 1, factor=5e-324).model_copy(
+        update={
+            "open": 0.25,
+            "high": 0.25,
+            "low": 0.25,
+            "close": 0.25,
+            "preclose": 0.25,
+            "amount": 250,
+        }
+    )
+    store = RecordingMarketStore([tiny, bar(1, 10, factor=1)])
+
+    response = request(store, analysis_path(end=START + timedelta(days=1)))
+
+    assert response.status_code == 409
+    assert "invalid qfq open=0.0" in response.json()["detail"]
+
+
+def test_zero_volume_and_amount_are_valid() -> None:
+    inactive_values = bar(0, 10).model_copy(update={"volume": 0.0, "amount": 0.0})
+    store = RecordingMarketStore([inactive_values])
+
+    response = request(store, analysis_path(end=START))
+
+    assert response.status_code == 200
+    assert response.json()["series"][0]["volume"] == 0
+    assert response.json()["series"][0]["amount"] == 0
 
 
 @pytest.mark.parametrize(
