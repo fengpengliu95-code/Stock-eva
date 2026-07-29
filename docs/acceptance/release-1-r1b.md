@@ -144,11 +144,104 @@ git diff --check
 # no output
 ```
 
+## Real local narrow-scope replay acceptance
+
+Run date: 2026-07-30 (Asia/Shanghai)
+
+The worker read only the explicit public local market sources:
+
+- published dataset:
+  `/Users/finlay/Library/Application Support/Stock EVA/data/market-dataset`;
+- control DB:
+  `/Users/finlay/Library/Application Support/Stock EVA/data/market/stock_eva.duckdb`.
+
+No NAS path or user database was opened. The latest 20 distinct manifest trading dates at
+or before `2026-07-29` were replayed twice through `MarketRegimeStore` and
+`MarketRegimeService`. No bar payload was emitted.
+
+```text
+trading dates: 2026-07-02 ... 2026-07-29
+trading days: 20
+replay rounds / store reads: 2 / 40
+future rows: 0
+data_as_of <= as_of: 20/20 in both rounds
+full result equality: 20/20
+result_id equality: 20/20
+score equality: 20/20
+strategic/tactical/status equality: 20/20
+unique result IDs in one round: 20
+
+strategic states: bear=14, range=6
+tactical states: risk_off=17, neutral=3
+status: degraded=20
+quality status: degraded=20
+score range: -61.6877 ... -0.4422
+
+scope capability false / narrow_provisional / coverage unavailable: 20/20
+observed universe range: 3191 ... 3197
+observed boards on all dates: sse_main, szse_main
+observed indexes on all dates: sh.000001, sz.399001
+```
+
+The aggregate missing-input set was:
+
+```text
+leadership.leader_diffusion
+leadership.sector_persistence
+liquidity.fund_flow_evidence
+risk.representative_indexes
+trend.index:sh.000300
+trend.index:sh.000852
+trend.index:sh.000905
+trend.index:sz.399006
+```
+
+The aggregate quality-code set was:
+
+```text
+degraded_component_quality
+market_scope_authoritative_coverage_unavailable
+market_scope_missing_expected_boards
+market_scope_missing_expected_index_series
+missing_component_inputs
+narrow_scope_not_full_a_share
+```
+
+The `2026-07-29` readback matched the known single-day result:
+
+```text
+data_as_of: 2026-07-29
+result_id: regime-81b4cbb9645f95bee5885416
+observed universe: 3191
+strategic / tactical: bear / risk_off
+status / score: degraded / -36.4379
+confidence: low / 0.0
+full-A capability: false
+```
+
+Every dataset file and the control DB were hashed before and after both rounds:
+
+```text
+control DB bytes: 3158016
+control DB SHA-256 before/after:
+  7841558f400338d5f70cc5fb915ef671deff09bb57c3cf33544a4c405f3c58c2
+
+dataset files: 265/265 unchanged
+dataset bytes: 39207949
+dataset path+file-hash tree SHA-256 before/after:
+  df0506ff04769071320e1c2dd322b39f8b5f84ceba9bc7ef7081d7d5b8637eaa
+```
+
+This is a deterministic replay of the observed main-board/two-index local dataset, not
+full-A acceptance or a Release 1 GO. It does not include R1-C leadership implementation,
+user data, or a user-judgement comparison.
+
 ## Pending real and Release 1 gates
 
-- No real market dataset was opened in this worker.
-- The required at-least-20-session historical replay on real published data is pending R1-E.
-- No live proof yet exists for one replayable result per ready trading day.
+- The 20-session local published-data replay above is verified, but no full-A coverage
+  artifact exists.
+- Snapshot persistence for one result per ready trading day remains an R1-E gate; this
+  acceptance evaluated results in memory and did not persist regime rows.
 - No authoritative point-in-time expected-universe denominator or board coverage audit is
   available yet; therefore no R1-B runtime result can claim full-A capability. Future
   integration requires an R1-A artifact and model/formula version upgrade.
