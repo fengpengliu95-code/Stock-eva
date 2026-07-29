@@ -66,7 +66,9 @@ API、日历、日终刷新、策略和预警随后只读写本机镜像，不�
    改写 `STOCK_EVA_USER_DATA_DIR` 或 `STOCK_EVA_USER_DATABASE_NAME`，安装器
    会 fail closed，而不会静默备份错误文件。
 3. `.venv/bin/python` 已存在且依赖完整。
-4. 停止目前手动启动、占用 8000/8080 端口的验收进程。
+4. `npm` 可执行，且 `workspace/package-lock.json` 已跟踪；安装器会用 lockfile 在
+   release staging 内构建前端，不使用项目根目录或未跟踪 `node_modules`。
+5. 停止目前手动启动、占用 8000/8080 端口的验收进程。
 
 安装时 NAS 未挂载、挂载类型错误、哨兵、manifest、hash、schema 或行数无效时，
 镜像步骤 fail closed，既不会替换上一镜像，也不会安装一套依赖不完整行情的服务。
@@ -97,7 +99,10 @@ LaunchAgent 不会主动挂载 SMB，也不包含网络凭据。
 
 release 只从当前 Git 提交提取 tracked 文件；不会复制项目 `.env`、`var/`、未跟踪
 PDF 或 `node_modules`。生产环境使用 `uv sync --frozen --no-dev --no-editable` 重新
-构建，避免 `.pth` 继续引用 `Documents` 开发路径。`current` 仅在 release、配置和
+构建 Python 环境，避免 `.pth` 继续引用 `Documents` 开发路径。工作台在隔离
+staging 中执行 `npm ci --ignore-scripts` 与 `npm run build`，随后删除
+`node_modules`、TypeScript 源码和构建配置，只把生成的静态文件移入 `public/workspace`。
+`current` 仅在 release、配置和
 本机行情镜像全部校验后以 manifest 最后发布；安装或 bootstrap 失败会恢复旧 plist、旧 release
 指针和旧配置。
 

@@ -197,6 +197,12 @@ def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
         target = project / directory
         target.mkdir()
         (target / "sentinel.txt").write_text(directory)
+    (project / "workspace/package.json").write_text(
+        '{"scripts":{"build":"vite build"},"dependencies":{"klinecharts":"10.0.0"}}'
+    )
+    (project / "workspace/package-lock.json").write_text(
+        '{"name":"synthetic","lockfileVersion":3}'
+    )
     (project / "index.html").write_text("stock eva")
     (project / "pyproject.toml").write_text("[project]\nname='stock-eva-synthetic'\n")
     (project / "uv.lock").write_text("synthetic lock")
@@ -262,6 +268,22 @@ chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"
     return executable
 
 
+def fake_npm(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-npm"
+    executable.write_text(
+        """#!/bin/bash
+set -e
+echo "$*" >> "$NPM_CALL_LOG"
+if [[ "$1" == "run" && "$2" == "build" ]]; then
+  mkdir -p assets
+  printf 'built from locked sources' > assets/security-cockpit.js
+fi
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
 def install_environment(
     tmp_path: Path,
     *,
@@ -276,6 +298,8 @@ def install_environment(
         "STOCK_EVA_LAUNCHCTL": str(launchctl),
         "STOCK_EVA_LSOF": str(lsof),
         "STOCK_EVA_UV": str(fake_uv(tmp_path)),
+        "STOCK_EVA_NPM": str(fake_npm(tmp_path)),
+        "NPM_CALL_LOG": str(tmp_path / "npm.log"),
         "STOCK_EVA_UNAME": "Darwin",
     }
 
@@ -347,6 +371,29 @@ def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
     assert stat.S_IMODE(config.stat().st_mode) == 0o700
     assert stat.S_IMODE((config / ".env").stat().st_mode) == 0o600
     assert stat.S_IMODE(data.stat().st_mode) == 0o700
+
+
+def test_installer_builds_workspace_from_locked_sources(tmp_path: Path) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+
+    result = run_installer(project, environment)
+
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["NPM_CALL_LOG"]).read_text().splitlines()
+    assert calls == ["ci --ignore-scripts", "run build"]
+    current = (
+        Path(environment["HOME"])
+        / "Library/Application Support/Stock EVA/runtime/current"
+    )
+    assert (
+        current / "public/workspace/assets/security-cockpit.js"
+    ).read_text() == "built from locked sources"
+    assert not (current / "public/workspace/node_modules").exists()
 
 
 def test_installer_atomically_replaces_an_existing_runtime_symlink(

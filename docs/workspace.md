@@ -2,7 +2,18 @@
 
 ## 本地启动
 
-分别启动 API 与静态文件服务：
+前端源码和 npm 依赖都限制在 `workspace/`，不使用项目根目录的 `package.json`、
+`node_modules` 或公网 CDN。首次检出或前端源码变化后先运行：
+
+```bash
+cd workspace
+npm ci
+npm test
+npm run build
+cd ..
+```
+
+然后分别启动 API 与现有 Python 静态文件服务：
 
 ```bash
 uv run uvicorn backend.app.main:app --reload
@@ -13,6 +24,45 @@ python3 -m http.server 8080
 
 - `workspace/`：Stock EVA 收盘复盘工作台；
 - `dashboard/`：原有量化学习知识库。
+
+源码、构建和运行时的关系固定如下：
+
+```text
+workspace/src/**/*.ts
+  + workspace/package-lock.json
+  -> npm run build
+  -> workspace/assets/security-cockpit.js
+  -> /workspace/（开发静态服务）
+  -> runtime/current/public/workspace/（LaunchAgent）
+```
+
+`workspace/assets/security-cockpit.js` 是由 Vite 生成并跟踪的审计产物，不应手工编辑。
+安装器从当前 Git 提交创建隔离 staging，执行 `npm ci --ignore-scripts` 和
+`npm run build` 后再发布静态目录，并删除 staging 中的 `node_modules`、TypeScript
+源码和构建配置。生产运行时不需要 Node.js，也不会发布依赖缓存。
+
+## 个股技术驾驶舱
+
+持仓表和当前自选列表中的证券代码是原生按钮，鼠标或键盘激活后直接进入个股页；
+URL hash 保存 `symbol` 和来源视图，重载或浏览器前进/后退仍可恢复，并提供返回来源
+的路径。
+
+个股页严格按以下顺序读取本地 API：
+
+1. `GET /api/v1/market/history/dates`；
+2. 取响应中最后最多 260 个有效交易日作为 `start/end`；
+3. `GET /api/v1/securities/{symbol}/analysis?start=...&end=...`。
+
+前端不会推测周末、节假日或最近交易日，也不会计算、补齐或回退任何指标。
+KLineChart 10.0.0 只负责渲染后端返回的前复权 OHLC、真实成交量和
+MA5/10/20/60/120/250。MACD(12,26,9) 与 RSI14 由独立数值面板展示；表格提供最近
+20 个有效交易日的文本替代。所有暖机 `null` 显示为 `—`，不转换成零。
+
+页首保留 `symbol`、实际 `as_of`、`source`、`price_adjustment`、
+`formula_version`、`status` 和 `quality_issues`。`no_market_data` 与
+`no_effective_trading_data` 使用不同空态；HTTP 409 作为数据质量门禁 fail closed；
+一般网络错误单独说明本地 API 连接问题。loading、empty 和 error 状态都不会创建
+KLineChart 实例或注入示例蜡烛。
 
 ## 数据与状态边界
 
@@ -46,6 +96,8 @@ SQLite 状态，不调用任何外部通知服务。
 - 板块、持仓、策略和自选预警使用独立工作区，不再挤在同一首屏；
 - 桌面使用宽松的 12 列布局，主图不低于 `420px`、次级图不低于 `280px`；
 - `390px` 宽度下导航可横向键盘滚动，内容降级为单列；
+- 个股图表容器、元数据和指标面板在 `390px × 844px` 下保持在 viewport 内，
+  宽表只在自身容器横向滚动，不造成 body 横向溢出；
 - A 股红涨绿跌同时配有“上涨/下跌”文字和正负号，不只依赖颜色；
 - 原生表单控件、可见焦点、跳转主内容链接和状态播报支持键盘操作；
 - 页面只显示安全错误摘要，不展示服务端堆栈。
@@ -60,7 +112,23 @@ SQLite 状态，不调用任何外部通知服务。
 
 - 前端自动轮询、实时行情和盘中提醒；
 - 后端板块分类、成分映射、板块历史序列和可信资金流适配层；
-- 组合历史净值序列与持仓股票详情行情；
+- 组合历史净值序列；
 - 自动调度、外部推送、邮件、短信及跨设备通知；
 - 大规模真实历史回填后的全市场策略扫描；
 - 券商连接、下单、自动交易或投资建议。
+
+## 浏览器验收
+
+构建并启动本地 API/静态服务后，在真实数据环境执行：
+
+1. 打开 `http://127.0.0.1:8080/workspace/`，确认原有总览、市场、板块空态、持仓、
+   策略、自选和预警无控制台错误；
+2. 从一个真实持仓和一个真实自选分别激活证券按钮，确认一次交互进入驾驶舱；
+3. 对照 Network 中的 dates/analysis 响应，核对请求窗口、页首元数据、最后一根
+   OHLCV、MA、MACD、RSI 和 `null → —`；
+4. 重载包含 `#security/{symbol}?from=...` 的地址，确认 symbol 恢复且返回路径正确；
+5. 只用键盘 Tab、Enter、Space 和浏览器前进/后退完成两条入口与返回流程，确认焦点
+   始终可见；
+6. 使用 390×844 viewport 检查 body 无横向滚动，并启用 reduced motion；
+7. 用可控 API 响应分别验证两个 empty、HTTP 409 和连接失败；这些状态中不得出现
+   canvas 或蜡烛。

@@ -32,6 +32,7 @@ SYSTEM_NAME="${STOCK_EVA_UNAME:-$(uname -s)}"
 LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
 LSOF="${STOCK_EVA_LSOF:-/usr/sbin/lsof}"
 UV="${STOCK_EVA_UV:-$(command -v uv || true)}"
+NPM="${STOCK_EVA_NPM:-$(command -v npm || true)}"
 
 if [[ "$SYSTEM_NAME" != "Darwin" ]]; then
   echo "error: LaunchAgents are supported only on macOS" >&2
@@ -76,6 +77,10 @@ if [[ ! -x "$SOURCE_PYTHON" ]]; then
 fi
 if [[ -z "$UV" || ! -x "$UV" ]]; then
   echo "error: uv executable is required to build an isolated runtime" >&2
+  exit 1
+fi
+if [[ -z "$NPM" || ! -x "$NPM" ]]; then
+  echo "error: npm executable is required to build the workspace" >&2
   exit 1
 fi
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -307,6 +312,19 @@ if [[ ! -f "$RELEASE_ROOT/.ready" ]]; then
       /usr/bin/ditto "$PROJECT_ROOT/$relative" "$RUNTIME_STAGE/$relative"
     done
   fi
+  (
+    cd "$RUNTIME_STAGE/workspace"
+    "$NPM" ci --ignore-scripts
+    "$NPM" run build
+  )
+  /bin/rm -rf \
+    "$RUNTIME_STAGE/workspace/node_modules" \
+    "$RUNTIME_STAGE/workspace/src"
+  /bin/rm -f \
+    "$RUNTIME_STAGE/workspace/package.json" \
+    "$RUNTIME_STAGE/workspace/package-lock.json" \
+    "$RUNTIME_STAGE/workspace/tsconfig.json" \
+    "$RUNTIME_STAGE/workspace/vite.config.ts"
   /bin/mkdir -p "$RUNTIME_STAGE/public"
   for relative in index.html workspace dashboard docs; do
     /bin/mv "$RUNTIME_STAGE/$relative" "$RUNTIME_STAGE/public/$relative"

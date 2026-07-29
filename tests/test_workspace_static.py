@@ -114,6 +114,7 @@ def test_workspace_preserves_large_empty_chart_frames_and_390px_layout() -> None
     assert "--chart-primary-height: 420px" in styles
     assert "--chart-secondary-height: 280px" in styles
     assert "@media (max-width: 390px)" in styles
+    assert "overflow-x: clip" in styles
 
 
 def test_workspace_uses_native_controls_and_has_no_inline_event_handlers() -> None:
@@ -215,3 +216,38 @@ def test_workspace_alert_script_uses_local_api_and_safe_dom_rendering() -> None:
     assert script.count("await loadWatchlists();\n      await loadAlerts();") >= 2
     assert "localStorage" not in script
     assert "innerHTML" not in script
+
+
+def test_workspace_exposes_security_cockpit_without_public_cdn() -> None:
+    html = (ROOT / "workspace" / "index.html").read_text()
+    parser = parse(ROOT / "workspace" / "index.html")
+
+    assert {
+        "security-analysis",
+        "security-back",
+        "security-status",
+        "security-content",
+    } <= parser.ids
+    assert "./assets/security-cockpit.js" in html
+    assert "cdn.jsdelivr.net" not in html
+    assert "unpkg.com" not in html
+
+
+def test_workspace_build_is_scoped_and_reproducible() -> None:
+    package = (ROOT / "workspace" / "package.json").read_text()
+    lock = (ROOT / "workspace" / "package-lock.json").read_text()
+    config = (ROOT / "workspace" / "vite.config.ts").read_text()
+
+    assert '"klinecharts": "10.0.0"' in package
+    assert '"build": "vite build"' in package
+    assert '"lockfileVersion": 3' in lock
+    assert "security-cockpit.js" in config
+    assert "assets" in config
+
+
+def test_workspace_bundle_has_no_node_runtime_dependency() -> None:
+    bundle = (
+        ROOT / "workspace" / "assets" / "security-cockpit.js"
+    ).read_text()
+
+    assert "process.env" not in bundle

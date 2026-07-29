@@ -10,6 +10,7 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./style.css">
   <script src="./app.js" defer></script>
+  <script type="module" src="./assets/security-cockpit.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要内容</a>
@@ -407,6 +408,22 @@
             <p id="alert-action-status" class="form-status" role="status" aria-live="polite"></p>
           </article>
         </section>
+      </section>
+
+      <section id="security-analysis" class="workspace-view" data-view="security" aria-labelledby="security-view-title" hidden>
+        <div class="security-navigation">
+          <a id="security-back" class="text-link" href="#portfolio" data-view-target="portfolio">← 返回持仓</a>
+          <p class="as-of-note">BACKEND VALUES ONLY</p>
+        </div>
+        <div class="view-intro security-intro">
+          <div>
+            <p class="panel-kicker">SECURITY REVIEW / 个股技术驾驶舱</p>
+            <h2 id="security-view-title">个股技术分析</h2>
+            <p>先读取后端确认的有效交易日，再显示前复权日 K、成交量和技术指标。浏览器不计算指标。</p>
+          </div>
+        </div>
+        <div id="security-status" class="sr-only" role="status" aria-live="polite">尚未选择证券</div>
+        <div id="security-content" class="security-content"></div>
       </section>
 
       <footer>

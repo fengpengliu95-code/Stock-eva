@@ -26,6 +26,17 @@ function clear(element) {
   element.replaceChildren();
 }
 
+function createSecurityButton(symbol, source) {
+  const analyze = node("button", symbol, "security-symbol-button mono");
+  analyze.type = "button";
+  analyze.dataset.securitySymbol = symbol;
+  analyze.dataset.securitySource = source;
+  analyze.setAttribute("aria-label", `查看 ${symbol} 个股技术分析`);
+  return analyze;
+}
+
+window.stockEvaCreateSecurityButton = createSecurityButton;
+
 function safeMessage(error) {
   if (error && Number.isInteger(error.status)) return `请求失败（HTTP ${error.status}）`;
   return "无法连接本地 API，请确认后端仅在本机运行。";
@@ -361,7 +372,11 @@ function renderPositions() {
   byId("positions-empty").textContent = state.positions.length ? "" : "尚未录入手动持仓。";
   state.positions.forEach((position) => {
     const row = node("tr");
-    [position.symbol, position.quantity, position.avg_cost, position.as_of_date, `v${position.version}`]
+    const symbolCell = node("td");
+    const analyze = createSecurityButton(position.symbol, "portfolio");
+    symbolCell.append(analyze);
+    row.append(symbolCell);
+    [position.quantity, position.avg_cost, position.as_of_date, `v${position.version}`]
       .forEach((value) => row.append(node("td", value)));
     const actions = node("td", null, "row-actions");
     const edit = node("button", "编辑", "button-secondary");
@@ -474,7 +489,8 @@ async function loadWatchlistItems() {
     byId("watchlist-empty").textContent = items.length ? "" : "当前列表还没有证券。";
     items.forEach((item) => {
       const row = node("li");
-      row.append(node("span", item.symbol, "mono"));
+      const analyze = createSecurityButton(item.symbol, "watchlists");
+      row.append(analyze);
       const remove = node("button", "移除", "button-secondary");
       remove.type = "button";
       remove.addEventListener("click", async () => {
@@ -776,10 +792,12 @@ const VIEW_TITLES = {
   portfolio: "持仓",
   strategies: "策略",
   watchlists: "自选预警",
+  security: "个股技术分析",
 };
 
 function activateView(identifier, updateHash = true) {
-  const target = VIEW_TITLES[identifier] ? identifier : "overview";
+  const requested = identifier.startsWith("security/") ? "security" : identifier;
+  const target = VIEW_TITLES[requested] ? requested : "overview";
   document.querySelectorAll("[data-view]").forEach((view) => {
     const active = view.dataset.view === target;
     view.hidden = !active;
@@ -798,6 +816,8 @@ function activateView(identifier, updateHash = true) {
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
   });
 }
+
+window.stockEvaActivateView = activateView;
 
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("[data-view-target]").forEach((link) => {

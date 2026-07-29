@@ -1,0 +1,56 @@
+import type { SecurityAnalysisResponse } from "../api";
+
+export function analysisFixture(
+  overrides: Partial<SecurityAnalysisResponse> = {},
+): SecurityAnalysisResponse {
+  return {
+    symbol: "sh.600000",
+    status: "ready",
+    as_of: "2025-01-03",
+    source: "baostock",
+    price_adjustment: "qfq",
+    formula_version: "ta-lib-0.7.0-r0-v1",
+    quality_issues: [],
+    series: [
+      {
+        trade_date: "2025-01-02",
+        open: 10,
+        high: 12,
+        low: 9,
+        close: 11,
+        volume: 1000,
+        amount: 11000,
+        ma5: null,
+        ma10: null,
+        ma20: null,
+        ma60: null,
+        ma120: null,
+        ma250: null,
+        macd: null,
+        macd_signal: null,
+        macd_hist: null,
+        rsi14: null,
+      },
+      {
+        trade_date: "2025-01-03",
+        open: 11,
+        high: 13,
+        low: 10,
+        close: 12,
+        volume: 1200,
+        amount: 14400,
+        ma5: 11.5,
+        ma10: 11.25,
+        ma20: 11,
+        ma60: null,
+        ma120: null,
+        ma250: null,
+        macd: 0.2,
+        macd_signal: 0.1,
+        macd_hist: 0.1,
+        rsi14: 55,
+      },
+    ],
+    ...overrides,
+  };
+}

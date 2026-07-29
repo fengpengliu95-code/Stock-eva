@@ -34,3 +34,6 @@ var/user/*
 # Generated artifacts and scratch space
 output/
 tmp/
+
+# Workspace-local dependency cache (the audited bundle under workspace/assets is tracked)
+workspace/node_modules/
