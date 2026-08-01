@@ -112,7 +112,7 @@ function metricDetails(metrics: MetricScore[]): HTMLElement {
       `${metric.metric} · 得分 ${value(metric.score)}`,
     );
     const coverage =
-      metric.effective_count !== undefined && metric.target_count !== undefined
+      metric.effective_count !== null && metric.target_count !== null
         ? `${metric.effective_count} / ${metric.target_count}`
         : "—";
     detail.append(
@@ -270,6 +270,8 @@ function renderSector(
   button.dataset.decisionSector = ranking.sector_id;
   button.dataset.decisionAsOf = query.asOf;
   button.dataset.decisionTaxonomy = query.taxonomyId;
+  button.setAttribute("aria-pressed", selected ? "true" : "false");
+  if (selected) button.setAttribute("aria-current", "true");
   heading.append(title, button);
   article.append(
     heading,

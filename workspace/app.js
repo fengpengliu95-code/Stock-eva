@@ -1,6 +1,7 @@
 "use strict";
 
 const API_BASE = "http://127.0.0.1:8000/api/v1";
+const ROUTE_CHANGE_EVENT = "stock-eva-route-change";
 
 const state = {
   market: null,
@@ -812,9 +813,9 @@ function activateView(identifier, updateHash = true) {
   if (updateHash && window.location.hash !== `#${target}`) {
     window.history.pushState(null, "", `#${target}`);
   }
-  window.requestAnimationFrame(() => {
-    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
-  });
+  if (updateHash) window.dispatchEvent(new Event(ROUTE_CHANGE_EVENT));
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
 }
 
 window.stockEvaActivateView = activateView;

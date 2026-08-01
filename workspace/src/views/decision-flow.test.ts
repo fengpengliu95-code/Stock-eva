@@ -87,6 +87,10 @@ describe("after-close decision flow view", () => {
       expect.stringContaining("后端第二行"),
       expect.stringContaining("后端第一名"),
     ]);
+    expect(sectorButtons[0].getAttribute("aria-pressed")).toBe("true");
+    expect(sectorButtons[0].getAttribute("aria-current")).toBe("true");
+    expect(sectorButtons[1].getAttribute("aria-pressed")).toBe("false");
+    expect(sectorButtons[1].hasAttribute("aria-current")).toBe(false);
     expect(sectorStage.textContent).toContain("原始值 0.12");
     expect(sectorStage.textContent).toContain("18 / 20");
     expect(sectorStage.textContent).toContain("覆盖率 90%");
@@ -118,6 +122,8 @@ describe("after-close decision flow view", () => {
     expect(leaders.textContent).toContain("不可作为操作首选");
     expect(leaders.textContent).toContain("涨跌停锁定状态不可用");
     expect(leaders.textContent).toContain("leader-qualification-v1");
+    expect(leaders.textContent).toContain("覆盖样本 —");
+    expect(leaders.textContent).toContain("覆盖率 —");
     expect(leaders.textContent).toContain("relative_strength_qualified");
     expect(leaders.textContent).toContain("trend_quality_below_threshold");
     expect(leaders.textContent).toContain("sh.600009");

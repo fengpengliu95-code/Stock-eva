@@ -95,9 +95,9 @@ export interface MetricScore {
   quality_status: QualityStatus;
   missing_inputs: string[];
   quality_issues: string[];
-  effective_count?: number;
-  target_count?: number;
-  coverage_ratio?: number;
+  effective_count: number | null;
+  target_count: number | null;
+  coverage_ratio: number | null;
 }
 
 export interface ClassificationLineage {
@@ -267,12 +267,20 @@ function nullableNumber(value: unknown, label: string): number | null {
   return value === null ? null : finiteNumber(value, label);
 }
 
+function optionalNullableNumber(value: unknown, label: string): number | null {
+  return value === undefined || value === null ? null : finiteNumber(value, label);
+}
+
 function integer(value: unknown, label: string): number {
   const result = finiteNumber(value, label);
   if (!Number.isInteger(result) || result < 0) {
     throw new TypeError(`${label} must be a non-negative integer`);
   }
   return result;
+}
+
+function optionalNullableInteger(value: unknown, label: string): number | null {
+  return value === undefined || value === null ? null : integer(value, label);
 }
 
 function booleanValue(value: unknown, label: string): boolean {
@@ -539,18 +547,19 @@ function metric(value: unknown, label: string): MetricScore {
     ),
     missing_inputs: strings(source.missing_inputs, `${label}.missing_inputs`),
     quality_issues: strings(source.quality_issues, `${label}.quality_issues`),
-  };
-  for (const key of ["effective_count", "target_count"] as const) {
-    if (source[key] !== undefined) {
-      result[key] = integer(source[key], `${label}.${key}`);
-    }
-  }
-  if (source.coverage_ratio !== undefined) {
-    result.coverage_ratio = finiteNumber(
+    effective_count: optionalNullableInteger(
+      source.effective_count,
+      `${label}.effective_count`,
+    ),
+    target_count: optionalNullableInteger(
+      source.target_count,
+      `${label}.target_count`,
+    ),
+    coverage_ratio: optionalNullableNumber(
       source.coverage_ratio,
       `${label}.coverage_ratio`,
-    );
-  }
+    ),
+  };
   return result;
 }
 

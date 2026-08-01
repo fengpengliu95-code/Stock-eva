@@ -66,6 +66,25 @@ const metric = {
   coverage_ratio: 0.9,
 };
 
+// R1-C commit 5b69992, derived from MetricScore.model_dump(mode="json").
+// Leader metrics do not carry sector member coverage, so Pydantic emits the
+// optional count/ratio keys explicitly as JSON null rather than omitting them.
+const leaderMetric = {
+  ...metric,
+  metric: "tradability",
+  raw_value: 1,
+  unit: "boolean",
+  score: 100,
+  weight: 0.2,
+  weighted_score: 20,
+  formula_version: "classification-and-canonical-current-tradeability-v1",
+  quality_status: "ready" as const,
+  quality_issues: [],
+  effective_count: null,
+  target_count: null,
+  coverage_ratio: null,
+};
+
 export function marketFixture(
   overrides: Partial<MarketRegimeResponse> = {},
 ): MarketRegimeResponse {
@@ -212,7 +231,7 @@ export function sectorsFixture(
         ranking_exclusion_reasons: [],
         total_score: 60,
         confidence: { ...confidence, value: 0.6, level: "medium" },
-        metric_scores: [metric],
+        metric_scores: [leaderMetric],
         supporting_evidence: [],
         contrary_evidence: [],
         quality_status: "ready",
@@ -259,7 +278,7 @@ export function leadersFixture(
         qualification_version: "leader-qualification-v1",
         qualification_reasons: ["relative_strength_qualified"],
         disqualification_reasons: [],
-        metric_scores: [metric],
+        metric_scores: [leaderMetric],
         supporting_evidence: [],
         contrary_evidence: [],
         quality_status: "degraded",

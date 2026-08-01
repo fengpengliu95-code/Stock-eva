@@ -125,6 +125,20 @@ function metric(metricName: string, rawValue = 0.12) {
   };
 }
 
+function r1cLeaderMetric() {
+  return {
+    ...metric("tradability", 1),
+    unit: "boolean",
+    score: 100,
+    weighted_score: 10,
+    formula_version: "classification-and-canonical-current-tradeability-v1",
+    // R1-C 5b69992 MetricScore.model_dump(mode="json") emits these keys.
+    effective_count: null,
+    target_count: null,
+    coverage_ratio: null,
+  };
+}
+
 function sectorPayload(overrides: Record<string, unknown> = {}) {
   return {
     result_id: "rotation-1",
@@ -188,7 +202,7 @@ function sectorPayload(overrides: Record<string, unknown> = {}) {
         ranking_exclusion_reasons: [],
         total_score: 60,
         confidence: { value: 0.7, level: "medium", reasons: [] },
-        metric_scores: [metric("relative_strength_20d")],
+        metric_scores: [r1cLeaderMetric()],
         supporting_evidence: [],
         contrary_evidence: [],
         quality_status: "ready",
@@ -237,7 +251,7 @@ function leadersPayload(overrides: Record<string, unknown> = {}) {
         qualification_version: "leader-qualification-v1",
         qualification_reasons: ["relative_strength_qualified"],
         disqualification_reasons: [],
-        metric_scores: [metric("relative_strength_20d")],
+        metric_scores: [r1cLeaderMetric()],
         supporting_evidence: [],
         contrary_evidence: [],
         quality_status: "degraded",
@@ -314,6 +328,13 @@ describe("decision API contracts", () => {
       expect.objectContaining({
         leader_qualified: true,
         qualification_version: "leader-qualification-v1",
+      }),
+    );
+    expect(leaders.candidates[0].metric_scores[0]).toEqual(
+      expect.objectContaining({
+        effective_count: null,
+        target_count: null,
+        coverage_ratio: null,
       }),
     );
   });
