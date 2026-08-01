@@ -4,6 +4,7 @@ from backend.app.api.alert import router as alert_router
 from backend.app.api.analysis import market_regime_router
 from backend.app.api.analysis import router as analysis_router
 from backend.app.api.classification import router as classification_router
+from backend.app.api.fund_flow import router as fund_flow_router
 from backend.app.api.health import router as health_router
 from backend.app.api.market import router as market_router
 from backend.app.api.sector import router as sector_router
@@ -25,3 +26,4 @@ api_router.include_router(analysis_router)
 api_router.include_router(market_regime_router)
 api_router.include_router(sector_router)
 api_router.include_router(classification_router)
+api_router.include_router(fund_flow_router)

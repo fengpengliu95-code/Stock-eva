@@ -909,8 +909,11 @@ def _fund_flow_from_row(row: dict[str, object]) -> ReportedFundFlowPoint:
         scope=row["scope"],
         scope_name=row["scope_name"],
         **{key: row[key] for key in _COLUMNS if key.startswith("reported_")},
+        source=row["source"],
+        upstream=row["upstream"],
         source_endpoint=row["endpoint"],
         observed_at=row["observed_at"],
+        quality_status=row["quality_status"],
     )
 
 
