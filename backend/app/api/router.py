@@ -7,6 +7,8 @@ from backend.app.api.classification import router as classification_router
 from backend.app.api.fund_flow import router as fund_flow_router
 from backend.app.api.health import router as health_router
 from backend.app.api.market import router as market_router
+from backend.app.api.portfolio_risk import analysis_router as portfolio_risk_router
+from backend.app.api.portfolio_risk import portfolio_router as portfolio_snapshot_router
 from backend.app.api.sector import router as sector_router
 from backend.app.api.storage import router as storage_router
 from backend.app.api.strategy import router as strategy_router
@@ -27,3 +29,5 @@ api_router.include_router(market_regime_router)
 api_router.include_router(sector_router)
 api_router.include_router(classification_router)
 api_router.include_router(fund_flow_router)
+api_router.include_router(portfolio_snapshot_router)
+api_router.include_router(portfolio_risk_router)
