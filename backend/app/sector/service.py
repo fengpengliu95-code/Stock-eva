@@ -37,6 +37,7 @@ from backend.app.sector.models import (
     SectorRanking,
     SectorRotationResponse,
 )
+from backend.app.security_identity import derive_security_identity
 
 SECTOR_LOOKBACK_SESSIONS = 80
 FUND_FLOW_MISSING = "fund_flow.r2_evidence_not_integrated"
@@ -1090,7 +1091,7 @@ class SectorRotationService:
                 score=100,
                 weight=self.leader_policy.weights["tradability"],
                 unit="boolean",
-                formula="classification-and-canonical-current-tradeability-v1",
+                formula="classification-and-canonical-current-tradability-v1",
             )
         ]
         for period in (5, 20, 60):
@@ -1436,8 +1437,7 @@ def _market_lineage(bars: list[DailyBar]) -> MarketLineage:
 
 def _usable_bar(bar: DailyBar) -> bool:
     return (
-        bar.security_type == "stock"
-        and bar.symbol.startswith(f"{bar.exchange}.")
+        _canonical_bar_scope_reason(bar) is None
         and bar.board == "main"
         and bar.quality_status == "ready"
         and not bar.quality_issues
@@ -1452,15 +1452,35 @@ def _usable_bar(bar: DailyBar) -> bool:
     )
 
 
+def _canonical_bar_scope_reason(bar: DailyBar) -> str | None:
+    if bar.security_type != "stock":
+        return "canonical_security_type_mismatch"
+    identity = derive_security_identity(bar.symbol, "1")
+    if identity.exchange not in {"sh", "sz"} or identity.board == "other":
+        return "canonical_symbol_prefix_unsupported"
+    if bar.exchange != identity.exchange:
+        return "canonical_exchange_mismatch"
+    if bar.board != identity.board:
+        return "canonical_board_prefix_mismatch"
+    return None
+
+
 def _canonical_classification_scope_reason(
     security: SecurityMasterRecord,
     bar: DailyBar,
 ) -> str | None:
     if bar.security_type != "stock" or bar.security_type != security.security_type:
         return "canonical_security_type_mismatch"
-    if bar.exchange != security.exchange or not bar.symbol.startswith(f"{bar.exchange}."):
+    identity = derive_security_identity(bar.symbol, "1")
+    if identity.exchange not in {"sh", "sz"} or identity.board == "other":
+        return "canonical_symbol_prefix_unsupported"
+    if bar.exchange != security.exchange or bar.exchange != identity.exchange:
         return "canonical_exchange_mismatch"
-    if bar.board != "main" or bar.board != security.board:
+    if bar.board != security.board:
+        return "canonical_board_mismatch"
+    if bar.board != identity.board:
+        return "canonical_board_prefix_mismatch"
+    if bar.board != "main":
         return "canonical_board_mismatch"
     return None
 

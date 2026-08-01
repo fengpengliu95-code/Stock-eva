@@ -37,9 +37,11 @@ Release 1 verdict: **PENDING — do not claim GO**
   ineligible securities are excluded with reasons. `price_available=null` is not itself an
   exclusion when a trustworthy current canonical bar proves price availability.
 - A classification member and its current canonical bar must agree on security type, exchange
-  and board, and the canonical symbol prefix must agree with its exchange. A mismatch is
-  excluded with a specific reason and cannot enter priced coverage, sector metrics, leader
-  candidates or the effective denominator of leader count/diffusion/persistence.
+  and board. Their exchange and board must also agree with the shared versioned
+  `cn-symbol-prefix-v1` derivation. ChiNext/STAR symbols cannot be relabeled as main-board
+  securities, and unknown stock prefixes fail closed with a specific reason. A mismatch cannot
+  enter priced coverage, sector metrics, market/sector cache, leader candidates or the effective
+  denominator of leader count/diffusion/persistence.
 - Research-leader qualification is deterministic and versioned. Qualified-leader count,
   diffusion and persistence reflect only candidates passing relative-strength, activity,
   trend and sector-contribution gates; changing the qualification version changes candidate,
@@ -132,17 +134,30 @@ uv run --extra dev pytest -o addopts='' -q \
   tests/test_sector_rotation.py::test_canonical_classification_scope_mismatch_is_excluded_everywhere
 # Repair GREEN: 3 passed in 0.51s. Board, exchange and security-type mismatches now carry
 # specific reasons and cannot affect candidate or sector-leadership effective counts.
+
+# Prefix-derivation final repair RED: 6 failed and 1 passed. Classification and market rows that
+# both mislabeled sz.300/301 or sh.688/689 as main-board, plus an unknown stock prefix, still
+# entered the benchmark, cache, sector metrics and leader candidates. The public tradability
+# metric formula version also retained the misspelling `tradeability`. The legal-main/index
+# compatibility control passed.
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_sector_rotation.py::test_canonical_symbol_prefix_scope_mismatch_is_excluded_everywhere \
+  tests/test_sector_rotation.py::test_supported_main_board_prefixes_and_index_history_remain_compatible \
+  tests/test_sector_rotation.py::test_tradability_metric_formula_uses_contract_spelling
+# Repair GREEN: 7 passed in 0.74s. A separate regression also proves that classification and
+# market rows agreeing on the wrong exchange still fail against the symbol exchange prefix.
 ```
 
 ## Fresh verification
 
 ```text
 uv run --extra dev pytest -o addopts='' -q
-# 548 passed in 68.22s.
+# 556 passed in 67.93s.
 
 uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py --durations=5
-# 56 passed in 9.65s; the 3,000-symbol x 65-session representative-scale
-# leader-ranking case completed in 3.21s, below its 15s guardrail.
+# 64 passed in 10.88s; the 3,000-symbol x 65-session representative-scale
+# leader-ranking case completed in 3.70s, below its 15s guardrail.
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

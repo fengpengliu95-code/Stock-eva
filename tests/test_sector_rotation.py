@@ -59,17 +59,18 @@ def _security(
     *,
     snapshot_date: date = CLASSIFICATION_DATE,
     board: str = "main",
+    exchange: str | None = None,
     tradable: bool = True,
     price_available: bool | None = True,
 ) -> SecurityMasterRecord:
     observed_at = datetime.combine(snapshot_date, datetime.min.time(), tzinfo=UTC)
-    exchange = symbol.split(".", 1)[0]
+    resolved_exchange = exchange or symbol.split(".", 1)[0]
     return SecurityMasterRecord(
         record_id=f"security:{snapshot_date}:{symbol}",
         security_id=f"baostock:{symbol}",
         symbol=symbol,
         name=f"Fixture {symbol}",
-        exchange=exchange,
+        exchange=resolved_exchange,
         board=board,
         security_type="stock",
         list_date=date(2000, 1, 1),
@@ -1448,7 +1449,11 @@ def test_leader_ranking_representative_scale_has_stable_runtime_budget(
     tmp_path: Path,
 ) -> None:
     sector_service = import_module("backend.app.sector.service")
-    symbols = [f"sh.{600000 + index:06d}" for index in range(3000)]
+    symbols = [
+        f"sh.{prefix}{index:03d}"
+        for prefix in (600, 601, 603, 605)
+        for index in range(750)
+    ]
     securities = [_security(symbol) for symbol in symbols]
     memberships = [_membership(symbol, "market") for symbol in symbols]
     generation = import_module("backend.app.classification.models").GenerationSummary(
@@ -2025,3 +2030,135 @@ def test_canonical_classification_scope_mismatch_is_excluded_everywhere(
         assert metrics[name].effective_count == 1
         assert metrics[name].target_count == 2
         assert metrics[name].score is None
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected_reason"),
+    [
+        ("sz.300001", "canonical_board_prefix_mismatch"),
+        ("sz.301001", "canonical_board_prefix_mismatch"),
+        ("sh.688001", "canonical_board_prefix_mismatch"),
+        ("sh.689001", "canonical_board_prefix_mismatch"),
+        ("sh.999999", "canonical_symbol_prefix_unsupported"),
+    ],
+)
+def test_canonical_symbol_prefix_scope_mismatch_is_excluded_everywhere(
+    tmp_path: Path,
+    symbol: str,
+    expected_reason: str,
+) -> None:
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth", symbol: "growth"},
+        [
+            *_bars("sh.600001", drift=0.003),
+            *_bars(symbol, drift=0.02, board="main"),
+        ],
+    )
+
+    context = service._read_context(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert [item.symbol for item in leaders.candidates] == ["sh.600001"]
+    exclusions = {item.symbol: item.reasons for item in leaders.exclusions}
+    assert expected_reason in exclusions[symbol]
+    assert symbol not in context.cache.valid_histories
+    assert symbol not in service._sector_cache(context, context.memberships).symbols
+
+    ranking = rotation.rankings[0]
+    metrics = {item.metric: item for item in ranking.metric_scores}
+    assert rotation.actual_scope.observed_market_symbols == 1
+    assert rotation.actual_scope.priced_classified_symbols == 1
+    assert ranking.priced_member_count == 1
+    assert f"sector.{expected_reason}" in ranking.quality_issues
+    assert metrics["relative_strength_20d"].effective_count == 1
+    for name in ("leader_count", "leader_diffusion", "leader_persistence_days"):
+        assert metrics[name].effective_count == 1
+        assert metrics[name].target_count == 2
+
+
+def test_symbol_exchange_prefix_mismatch_is_excluded_when_sources_agree_on_wrong_exchange(
+    tmp_path: Path,
+) -> None:
+    classification, _, _ = _publish_classification(
+        tmp_path / "classification.duckdb",
+        {"sh.600001": "growth", "sh.600002": "growth"},
+        security_overrides={"sh.600002": {"exchange": "sz"}},
+    )
+    mismatched = [
+        bar.model_copy(update={"exchange": "sz"})
+        for bar in _bars("sh.600002", drift=0.02)
+    ]
+    sector_service = import_module("backend.app.sector.service")
+    service = sector_service.SectorRotationService(
+        classification,
+        _BarsReader([*_bars("sh.600001", drift=0.003), *mismatched]),
+    )
+
+    context = service._read_context(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert [item.symbol for item in leaders.candidates] == ["sh.600001"]
+    exclusions = {item.symbol: item.reasons for item in leaders.exclusions}
+    assert "canonical_exchange_mismatch" in exclusions["sh.600002"]
+    assert "sh.600002" not in context.cache.valid_histories
+    assert rotation.actual_scope.observed_market_symbols == 1
+    assert rotation.actual_scope.priced_classified_symbols == 1
+    assert "sector.canonical_exchange_mismatch" in rotation.rankings[0].quality_issues
+
+
+def test_supported_main_board_prefixes_and_index_history_remain_compatible(
+    tmp_path: Path,
+) -> None:
+    main_symbols = [
+        "sh.600001",
+        "sh.601001",
+        "sh.603001",
+        "sh.605001",
+        "sz.000001",
+        "sz.001001",
+        "sz.002001",
+        "sz.003001",
+    ]
+    index_rows = [
+        bar.model_copy(
+            update={"security_type": "index", "board": "index", "adjust_factor": None}
+        )
+        for bar in _bars("sh.000001", drift=0.001)
+    ]
+    service, _, _ = _service(
+        tmp_path,
+        {symbol: "growth" for symbol in main_symbols},
+        [
+            *(bar for symbol in main_symbols for bar in _bars(symbol, drift=0.003)),
+            *index_rows,
+        ],
+    )
+
+    context = service._read_context(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert sorted(item.symbol for item in leaders.candidates) == main_symbols
+    assert rotation.actual_scope.observed_market_symbols == len(main_symbols)
+    assert rotation.actual_scope.priced_classified_symbols == len(main_symbols)
+    assert sorted(context.cache.valid_histories) == main_symbols
+    assert "sh.000001" not in context.histories
+    assert rotation.market_lineage.record_count == (len(main_symbols) + 1) * 65
+
+
+def test_tradability_metric_formula_uses_contract_spelling(tmp_path: Path) -> None:
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth"},
+        _bars("sh.600001", drift=0.003),
+    )
+
+    result = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+    metrics = {item.metric: item for item in result.candidates[0].metric_scores}
+
+    assert metrics["tradability"].formula_version == (
+        "classification-and-canonical-current-tradability-v1"
+    )

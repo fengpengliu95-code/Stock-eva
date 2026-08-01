@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 
 from backend.app.market.models import DailyBar
+from backend.app.security_identity import derive_security_identity
 
 DAILY_INDEX_SYMBOLS = {
     "sh.000001",
@@ -61,14 +62,8 @@ def _factor_on(
 
 
 def _board_for(symbol: str, security_type: str) -> str:
-    if security_type == "index":
-        return "index"
-    code = symbol.split(".", 1)[-1]
-    if symbol.startswith("sz.") and code.startswith(("300", "301")):
-        return "chinext"
-    if symbol.startswith("sh.") and code.startswith(("688", "689")):
-        return "star"
-    return "main"
+    source_type = "2" if security_type == "index" else "1"
+    return derive_security_identity(symbol, source_type).board
 
 
 def normalize_baostock_rows(
