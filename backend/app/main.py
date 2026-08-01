@@ -22,7 +22,7 @@ from backend.app.market.calendar_sync import (
     CalendarSyncStore,
     run_calendar_sync_loop,
 )
-from backend.app.market.store import MarketStore
+from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
@@ -146,6 +146,20 @@ async def nas_dataset_error_handler(_, __: DatasetError) -> JSONResponse:
                 "code": "market_storage_unavailable",
                 "storage_status": "unavailable",
                 "reason_code": "nas_dataset_read_failed",
+            }
+        },
+    )
+
+
+@app.exception_handler(MarketStoreReadError)
+async def market_store_read_error_handler(_, __: MarketStoreReadError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "code": "market_storage_unavailable",
+                "storage_status": "unavailable",
+                "reason_code": "market_control_read_failed",
             }
         },
     )

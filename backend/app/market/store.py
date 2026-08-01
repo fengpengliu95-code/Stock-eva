@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -6,14 +7,31 @@ import duckdb
 from backend.app.market.models import DailyBar, RefreshResult
 
 MAX_SYMBOL_RANGE_QUERY = 200
+_DUCKDB_SAME_DATABASE_CONFIGURATION_ERROR = (
+    "Connection Error: Can't open a connection to same database file with a different "
+    "configuration than existing connections"
+)
+
+
+class MarketStoreReadError(RuntimeError):
+    """A SELECT-only control database cannot be read safely."""
 
 
 class MarketStore:
-    def __init__(self, path: Path, *, temp_directory: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        temp_directory: Path | None = None,
+        read_only: bool = False,
+    ) -> None:
         self.path = path
         self.temp_directory = temp_directory or path.parent / ".duckdb-tmp"
+        self.read_only = read_only
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
+        if self.read_only:
+            raise RuntimeError("read-only market store cannot open a writer connection")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.temp_directory.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect(str(self.path))
@@ -139,6 +157,33 @@ class MarketStore:
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS quality_issues JSON DEFAULT '[]'"
         )
         return connection
+
+    def _connect_reader(self) -> duckdb.DuckDBPyConnection | None:
+        if not self.path.is_file():
+            return None
+        try:
+            return duckdb.connect(str(self.path), read_only=self.read_only)
+        except duckdb.ConnectionException as exc:
+            if not self.read_only or str(exc).strip() != _DUCKDB_SAME_DATABASE_CONFIGURATION_ERROR:
+                raise
+            # DuckDB forbids mixed access-mode handles to one database in the
+            # same process. Reopen with the writer's configuration so SELECT-only
+            # readers retain MVCC access to the last committed snapshot.
+            return duckdb.connect(str(self.path))
+
+    @contextmanager
+    def _reader(self):
+        connection = None
+        try:
+            connection = self._connect_reader()
+            yield connection
+        except MarketStoreReadError:
+            raise
+        except (duckdb.Error, OSError, TypeError, ValueError) as exc:
+            raise MarketStoreReadError("market control database cannot be read") from exc
+        finally:
+            if connection is not None:
+                connection.close()
 
     def exists(self) -> bool:
         return self.path.is_file()
@@ -410,8 +455,8 @@ class MarketStore:
     ) -> set[tuple]:
         if not trading_dates or not symbols or not self.exists():
             return set()
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             rows = connection.execute(
                 """
                 SELECT trade_date, symbol FROM daily_bars
@@ -421,20 +466,20 @@ class MarketStore:
                 """,
                 [list(dict.fromkeys(trading_dates)), sorted(set(symbols)), source],
             ).fetchall()
-        finally:
-            connection.close()
         return set(rows)
 
     def count_bars(self) -> int:
-        connection = self._connect()
-        try:
+        if not self.exists():
+            return 0
+        with self._reader() as connection:
+            assert connection is not None
             return connection.execute("SELECT count(*) FROM daily_bars").fetchone()[0]
-        finally:
-            connection.close()
 
     def latest_refresh(self) -> RefreshResult | None:
-        connection = self._connect()
-        try:
+        if not self.exists():
+            return None
+        with self._reader() as connection:
+            assert connection is not None
             row = connection.execute(
                 """
                 SELECT run_id, requested_date, source, status, requested_count,
@@ -445,8 +490,6 @@ class MarketStore:
                 LIMIT 1
                 """
             ).fetchone()
-        finally:
-            connection.close()
         if row is None:
             return None
         return self._refresh_result_from_row(row)
@@ -473,8 +516,8 @@ class MarketStore:
     def published_refresh(self) -> RefreshResult | None:
         if not self.exists():
             return None
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             row = connection.execute(
                 """
                 SELECT r.run_id, r.requested_date, r.source, r.status,
@@ -486,8 +529,6 @@ class MarketStore:
                 WHERE p.singleton = 1
                 """
             ).fetchone()
-        finally:
-            connection.close()
         if row is None:
             return None
         return self._refresh_result_from_row(row)
@@ -521,8 +562,8 @@ class MarketStore:
     def scheduler_state(self):
         if not self.exists():
             return None
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             row = connection.execute(
                 """
                 SELECT target_session, refresh_state, attempt_count,
@@ -532,8 +573,6 @@ class MarketStore:
                 WHERE singleton = 1
                 """
             ).fetchone()
-        finally:
-            connection.close()
         if row is None:
             return None
         from backend.app.market.automation import SchedulerState
@@ -552,8 +591,8 @@ class MarketStore:
     def list_refreshes(self, limit: int = 100) -> list[RefreshResult]:
         if not self.exists():
             return []
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             rows = connection.execute(
                 """
                 SELECT run_id, requested_date, source, status, requested_count,
@@ -565,13 +604,13 @@ class MarketStore:
                 """,
                 [limit],
             ).fetchall()
-        finally:
-            connection.close()
         return [self._refresh_result_from_row(row) for row in rows]
 
     def bars_for(self, trade_date, source: str) -> list[dict[str, object]]:
-        connection = self._connect()
-        try:
+        if not self.exists():
+            return []
+        with self._reader() as connection:
+            assert connection is not None
             cursor = connection.execute(
                 """
                 SELECT symbol, security_type, close, pct_change, amount, is_suspended,
@@ -584,14 +623,12 @@ class MarketStore:
             )
             columns = [item[0] for item in cursor.description]
             return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
-        finally:
-            connection.close()
 
     def available_dates(self, source: str = "baostock") -> list:
         if not self.exists():
             return []
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             return [
                 row[0]
                 for row in connection.execute(
@@ -604,14 +641,12 @@ class MarketStore:
                     [source],
                 ).fetchall()
             ]
-        finally:
-            connection.close()
 
     def canonical_bars(self, trade_date, source: str = "baostock") -> list[DailyBar]:
         if not self.exists():
             return []
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             rows = connection.execute(
                 """
                 SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
@@ -624,15 +659,13 @@ class MarketStore:
                 """,
                 [trade_date, source],
             ).fetchall()
-        finally:
-            connection.close()
         return [self._daily_bar_from_row(row) for row in rows]
 
     def symbol_bars(self, symbol, start, end, source: str = "baostock") -> list[DailyBar]:
         if start > end or not self.exists():
             return []
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             rows = connection.execute(
                 """
                 SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
@@ -647,8 +680,6 @@ class MarketStore:
                 """,
                 [symbol, start, end, source],
             ).fetchall()
-        finally:
-            connection.close()
         return [self._daily_bar_from_row(row) for row in rows]
 
     def symbols_bars(
@@ -666,8 +697,8 @@ class MarketStore:
         grouped: dict[str, list[DailyBar]] = {symbol: [] for symbol in normalized}
         if not normalized or start > end or not self.exists():
             return grouped
-        connection = self._connect()
-        try:
+        with self._reader() as connection:
+            assert connection is not None
             rows = connection.execute(
                 """
                 SELECT trade_date, symbol, security_type, exchange, board, open, high, low,
@@ -682,8 +713,6 @@ class MarketStore:
                 """,
                 [normalized, start, end, source],
             ).fetchall()
-        finally:
-            connection.close()
         for row in rows:
             grouped[row[1]].append(self._daily_bar_from_row(row))
         return grouped

@@ -71,8 +71,10 @@ class ReadOnlyDuckDbMarketReader:
     ) -> list[DailyBar]:
         if not self.path.is_file():
             return []
-        connection = duckdb.connect(str(self.path))
+        connection: duckdb.DuckDBPyConnection | None = None
         try:
+            connection = MarketStore(self.path, read_only=True)._connect_reader()
+            assert connection is not None
             rows = connection.execute(
                 f"""
                 SELECT {_BAR_COLUMNS}
@@ -90,8 +92,11 @@ class ReadOnlyDuckDbMarketReader:
                 """,
                 [as_of, max_sessions, as_of],
             ).fetchall()
+        except (duckdb.Error, OSError, TypeError, ValueError) as exc:
+            raise MarketReadUnavailable("market_storage_unavailable") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
         return [MarketStore._daily_bar_from_row(row) for row in rows]
 
 
@@ -111,7 +116,8 @@ class PublishedSnapshotDuckDbMarketReader:
             return []
         connection: duckdb.DuckDBPyConnection | None = None
         try:
-            connection = duckdb.connect(str(self.path))
+            connection = MarketStore(self.path, read_only=True)._connect_reader()
+            assert connection is not None
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -279,7 +285,11 @@ class PublishedDatasetMarketReader:
     ) -> None:
         self.dataset_root = dataset_root
         self.store = NasMarketStore(
-            MarketStore(control_path, temp_directory=control_temp),
+            MarketStore(
+                control_path,
+                temp_directory=control_temp,
+                read_only=True,
+            ),
             dataset_root,
             staging_root,
         )

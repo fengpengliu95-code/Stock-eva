@@ -32,7 +32,10 @@ router = APIRouter(prefix="/market", tags=["market"])
 def get_calendar_sync_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CalendarSyncStore:
-    return CalendarSyncStore(settings.local_control_dir / settings.calendar_sync_database_name)
+    return CalendarSyncStore(
+        settings.local_control_dir / settings.calendar_sync_database_name,
+        initialize=False,
+    )
 
 
 def get_market_store(
@@ -49,10 +52,10 @@ def get_market_store(
             },
         )
     layout = StorageLayout(settings)
-    layout.ensure_local_runtime_dirs()
     control = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
+        read_only=True,
     )
     if readiness.mode in {"nas", "local_dataset"}:
         dataset_root = configured_market_dataset_root(settings)
@@ -64,7 +67,6 @@ def get_market_store(
         )
         try:
             store.ensure_readiness()
-            store.reconcile_control_pointer()
         except (DatasetError, OSError) as exc:
             raise HTTPException(
                 status_code=503,

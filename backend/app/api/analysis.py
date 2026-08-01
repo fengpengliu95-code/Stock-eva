@@ -13,6 +13,7 @@ from backend.app.market.store import MarketStore
 from backend.app.regime.models import MarketRegimeResult
 from backend.app.regime.service import MarketRegimeService
 from backend.app.regime.store import (
+    MarketReadUnavailable,
     MarketRegimeStore,
     market_regime_store_from_settings,
 )
@@ -69,4 +70,13 @@ def market_regime(
                 "timezone": "Asia/Shanghai",
             },
         )
-    return MarketRegimeService().evaluate(store.read(as_of))
+    try:
+        return MarketRegimeService().evaluate(store.read(as_of))
+    except MarketReadUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": exc.code,
+                "storage_status": "unavailable",
+            },
+        ) from exc

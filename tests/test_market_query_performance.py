@@ -57,6 +57,11 @@ class CountingMarketStore(MarketStore):
         self.connection_count += 1
         return ProbedConnection(super()._connect(), self)
 
+    def _connect_reader(self):
+        self.connection_count += 1
+        connection = super()._connect_reader()
+        return None if connection is None else ProbedConnection(connection, self)
+
     def reset_probe(self) -> None:
         self.connection_count = 0
         self.execute_count = 0

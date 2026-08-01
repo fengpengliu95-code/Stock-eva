@@ -189,6 +189,10 @@ class NasMarketStore:
         self.manifest_lock_path = manifest_lock_path or staging_root / "nas-manifest.lock"
         self.publisher = DatasetPublication()
 
+    def _ensure_writable(self) -> None:
+        if self.control.read_only:
+            raise RuntimeError("read-only market store cannot run writer lifecycle")
+
     @property
     def path(self) -> Path:
         return self.control.path
@@ -319,6 +323,7 @@ class NasMarketStore:
         return self.control.scheduler_state()
 
     def save_scheduler_state(self, state) -> None:
+        self._ensure_writable()
         self.control.save_scheduler_state(state)
 
     def list_refreshes(self, limit: int = 100):
@@ -355,6 +360,7 @@ class NasMarketStore:
 
     def reconcile_control_pointer(self, source: str = "baostock") -> RefreshResult | None:
         """Repair a local pointer after a manifest-first publication crash."""
+        self._ensure_writable()
         manifest = self._manifest()
         entries = [item for item in manifest["files"] if item["source"] == source]
         if not entries:
@@ -455,6 +461,7 @@ class NasMarketStore:
         return set(rows)
 
     def _publish_bars(self, bars: list[DailyBar]) -> None:
+        self._ensure_writable()
         if not bars:
             raise DatasetError("cannot publish an empty bar set")
         by_date: dict[tuple[date, str], list[DailyBar]] = defaultdict(list)
@@ -557,6 +564,7 @@ class NasMarketStore:
         *,
         publish: bool | None = None,
     ) -> None:
+        self._ensure_writable()
         publish = result.status == "ready" if publish is None else publish
         if publish:
             MarketStore._validate_ready_publication(result)
@@ -568,6 +576,7 @@ class NasMarketStore:
 
     def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
         """Export a published partition locally without modifying the NAS dataset."""
+        self._ensure_writable()
         # Export has the same trust boundary as read APIs: never copy a file
         # merely because its path appears in a manifest.
         self._paths()
