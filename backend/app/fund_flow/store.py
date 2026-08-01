@@ -4,7 +4,11 @@ from pathlib import Path
 import duckdb
 
 from backend.app.config import Settings
-from backend.app.fund_flow.models import EvidenceScope, FundFlowEvidenceSnapshot
+from backend.app.fund_flow.models import (
+    MARKET_UPSTREAM_SCOPE_IDENTITY,
+    EvidenceScope,
+    FundFlowEvidenceSnapshot,
+)
 from backend.app.market.supplement_ingestion import (
     PINNED_PROVIDER_VERSION,
     SupplementalDatasetError,
@@ -58,6 +62,9 @@ class FundFlowEvidenceStore:
         try:
             manifest = self.supplemental_store._manifest(allow_missing=True)
             kind = "market_fund_flow" if scope == "market" else "sector_fund_flow"
+            upstream_scope_identity = (
+                MARKET_UPSTREAM_SCOPE_IDENTITY if scope == "market" else scope_id
+            )
             entries = [item for item in manifest["files"] if item["dataset_kind"] == kind]
             if not entries:
                 return self._empty_snapshot(
@@ -77,7 +84,7 @@ class FundFlowEvidenceStore:
                 path=path,
                 kind=kind,
                 source_scope="market" if scope == "market" else "industry",
-                scope_id=scope_id,
+                upstream_scope_identity=upstream_scope_identity,
                 as_of=as_of,
             )
             points = [_fund_flow_from_row(row) for row in rows]
@@ -88,11 +95,10 @@ class FundFlowEvidenceStore:
                     as_of=as_of,
                     scope=scope,
                     scope_id=scope_id,
+                    upstream_scope_identity=upstream_scope_identity,
                     publication_as_of=date.fromisoformat(str(entry["as_of"])),
                     published_at=published_at,
-                    provider_contract=str(
-                        entry.get("provider_contract") or PINNED_PROVIDER_VERSION
-                    ),
+                    provider_contract=entry["provider_contract"],
                     object_sha256=str(entry["sha256"]),
                     future_point_count=future_point_count,
                     quality_issues=["fund_flow_scope_has_no_points_at_or_before_as_of"],
@@ -107,9 +113,10 @@ class FundFlowEvidenceStore:
                 as_of=as_of,
                 scope=scope,
                 scope_id=scope_id,
+                upstream_scope_identity=upstream_scope_identity,
                 publication_as_of=date.fromisoformat(str(entry["as_of"])),
                 published_at=published_at,
-                provider_contract=str(entry.get("provider_contract") or PINNED_PROVIDER_VERSION),
+                provider_contract=entry["provider_contract"],
                 object_sha256=str(entry["sha256"]),
                 points=points,
                 future_point_count=future_point_count,
@@ -140,7 +147,7 @@ class FundFlowEvidenceStore:
         path: Path,
         kind: str,
         source_scope: str,
-        scope_id: str,
+        upstream_scope_identity: str,
         as_of: date,
     ) -> tuple[list[dict[str, object]], int]:
         connection = duckdb.connect(":memory:")
@@ -155,7 +162,7 @@ class FundFlowEvidenceStore:
                   AND trade_date <= ?
                 ORDER BY trade_date, observed_at
                 """,
-                [str(path), kind, source_scope, scope_id, as_of],
+                [str(path), kind, source_scope, upstream_scope_identity, as_of],
             ).fetchall()
             columns = [item[0] for item in connection.description]
             future_point_count = int(
@@ -168,7 +175,7 @@ class FundFlowEvidenceStore:
                       AND scope_name = ?
                       AND trade_date > ?
                     """,
-                    [str(path), kind, source_scope, scope_id, as_of],
+                    [str(path), kind, source_scope, upstream_scope_identity, as_of],
                 ).fetchone()[0]
             )
         finally:
@@ -189,6 +196,9 @@ class FundFlowEvidenceStore:
             as_of=as_of,
             scope=scope,
             scope_id=scope_id,
+            upstream_scope_identity=(
+                MARKET_UPSTREAM_SCOPE_IDENTITY if scope == "market" else scope_id
+            ),
             provider_contract=PINNED_PROVIDER_VERSION,
             quality_issues=quality_issues,
         )

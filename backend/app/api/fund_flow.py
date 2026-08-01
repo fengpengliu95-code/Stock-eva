@@ -6,7 +6,10 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app.config import Settings, get_settings
-from backend.app.fund_flow.models import FundFlowEvidenceResult
+from backend.app.fund_flow.models import (
+    MARKET_ANALYSIS_UNIVERSE,
+    FundFlowEvidenceResult,
+)
 from backend.app.fund_flow.service import FundFlowEvidenceService
 from backend.app.fund_flow.store import FundFlowEvidenceStore
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
@@ -27,15 +30,15 @@ def get_fund_flow_store(
 
 def _scope_id(scope: str, value: str | None) -> str:
     if scope == "market":
-        if value not in {None, "all_a_share"}:
+        if value not in {None, MARKET_ANALYSIS_UNIVERSE}:
             raise HTTPException(
                 status_code=422,
                 detail={
                     "code": "invalid_scope_id",
-                    "reason": "market scope_id must be all_a_share or omitted",
+                    "reason": (f"market scope_id must be {MARKET_ANALYSIS_UNIVERSE} or omitted"),
                 },
             )
-        return "all_a_share"
+        return MARKET_ANALYSIS_UNIVERSE
     if value is None or value != value.strip() or not _SECTOR_SCOPE_ID.fullmatch(value):
         raise HTTPException(
             status_code=422,

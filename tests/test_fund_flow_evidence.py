@@ -7,13 +7,22 @@ import pytest
 
 from backend.app.api import fund_flow as fund_flow_api
 from backend.app.config import Settings, get_settings
-from backend.app.fund_flow.models import FundFlowEvidenceSnapshot
-from backend.app.fund_flow.service import FundFlowEvidenceService
+from backend.app.fund_flow.models import (
+    FundFlowEvidencePolicy,
+    FundFlowEvidenceSnapshot,
+    UnavailableEvidenceLevel,
+)
+from backend.app.fund_flow.service import (
+    DEFAULT_FUND_FLOW_POLICY,
+    FundFlowEvidenceService,
+)
 from backend.app.fund_flow.store import FundFlowEvidenceStore
 from backend.app.main import app
+from backend.app.market.akshare_supplemental import AKShareSupplementalProvider
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.supplement_ingestion import (
     _COLUMNS,
+    PINNED_PROVIDER_VERSION,
     SupplementalDatasetInitializer,
     SupplementalIngestionRequest,
     SupplementalIngestionService,
@@ -25,6 +34,8 @@ from backend.app.market.supplemental import ReportedFundFlowPoint
 AS_OF = date(2026, 7, 29)
 OBSERVED_AT = datetime(2026, 7, 29, 10, 30, tzinfo=UTC)
 ENDPOINT = "stock_market_fund_flow"
+MARKET_ANALYSIS_UNIVERSE = "sh_sz_market"
+MARKET_UPSTREAM_SCOPE = "沪深市场"
 
 
 def _sessions(calendar: TradingCalendar, *, end: date, count: int) -> list[date]:
@@ -40,7 +51,7 @@ def _points(
     sessions: list[date],
     *,
     scope: str = "market",
-    scope_name: str = "all_a_share",
+    scope_name: str = MARKET_UPSTREAM_SCOPE,
     endpoint: str = ENDPOINT,
     source: str = "akshare",
     upstream: str = "eastmoney",
@@ -79,7 +90,8 @@ def _snapshot(
         source_status=source_status,
         as_of=as_of,
         scope="market",
-        scope_id="all_a_share",
+        scope_id=MARKET_ANALYSIS_UNIVERSE,
+        upstream_scope_identity=MARKET_UPSTREAM_SCOPE,
         publication_as_of=publication_as_of,
         published_at=published_at,
         provider_contract="akshare-1.18.78-contract",
@@ -148,6 +160,42 @@ def test_missing_middle_session_fails_closed_even_with_twenty_points() -> None:
     assert "non_contiguous_trading_sessions" in result.quality_issues
 
 
+@pytest.mark.parametrize("closed_date", [date(2026, 7, 25), date(2026, 5, 1)])
+def test_closed_weekend_or_holiday_source_point_blocks_publication(
+    closed_date: date,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    assert calendar.session_status(closed_date) == "closed"
+
+    result = FundFlowEvidenceService(calendar).evaluate(
+        _snapshot(_points([*sessions, closed_date]))
+    )
+
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
+    assert result.semantic_lineage == []
+    assert "source_point_on_closed_session" in result.quality_issues
+
+
+def test_unknown_source_session_blocks_publication_as_calendar_unverifiable() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    unknown_date = date(1900, 1, 2)
+    assert calendar.session_status(unknown_date) == "unknown"
+
+    result = FundFlowEvidenceService(calendar).evaluate(
+        _snapshot(_points([*sessions, unknown_date]))
+    )
+
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
+    assert result.semantic_lineage == []
+    assert "trading_calendar_unverifiable" in result.quality_issues
+
+
 @pytest.mark.parametrize(
     ("mutation", "issue"),
     [
@@ -190,7 +238,7 @@ def test_published_row_cannot_mask_a_different_upstream_as_eastmoney() -> None:
         {
             "trade_date": AS_OF,
             "scope": "market",
-            "scope_name": "all_a_share",
+            "scope_name": MARKET_UPSTREAM_SCOPE,
             "reported_main_net_inflow": 1.0,
             "source": "akshare",
             "upstream": "different_upstream",
@@ -307,6 +355,42 @@ def test_future_points_are_excluded_from_values_and_stable_result_id() -> None:
     assert clean_result.result_id == repeated.result_id
 
 
+def test_formula_and_unavailable_semantics_are_reflected_in_response_and_result_id() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    snapshot = _snapshot(_points(sessions))
+    baseline = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    v2_policy = FundFlowEvidencePolicy(
+        **DEFAULT_FUND_FLOW_POLICY.model_dump(exclude={"formula_version"}),
+        formula_version="fund-flow-evidence-l1-v2",
+    )
+    formula_changed = FundFlowEvidenceService(calendar, v2_policy).evaluate(snapshot)
+
+    assert formula_changed.formula_version == "fund-flow-evidence-l1-v2"
+    assert formula_changed.result_id != baseline.result_id
+
+    changed_unavailable_policy = FundFlowEvidencePolicy(
+        **v2_policy.model_dump(exclude={"unavailable_levels"}),
+        unavailable_levels=(
+            UnavailableEvidenceLevel(
+                evidence_level="L2",
+                reason="different_l2_availability_semantics",
+            ),
+            v2_policy.unavailable_levels[1],
+        ),
+    )
+    unavailable_changed = FundFlowEvidenceService(
+        calendar,
+        changed_unavailable_policy,
+    ).evaluate(snapshot)
+
+    assert unavailable_changed.unavailable_levels[0].reason == (
+        "different_l2_availability_semantics"
+    )
+    assert unavailable_changed.result_id != formula_changed.result_id
+
+
 class HistoryProvider:
     def __init__(self, points: list[ReportedFundFlowPoint]) -> None:
         self.points = points
@@ -319,6 +403,21 @@ class HistoryProvider:
             point
             for point in self.points
             if point.scope_name == sector_name and point.trade_date <= through_date
+        ]
+
+
+class RealContractMarketClient:
+    def __init__(self, sessions: list[date]) -> None:
+        self.sessions = sessions
+
+    def stock_market_fund_flow(self):
+        return [
+            {
+                "日期": session,
+                "主力净流入-净额": float((index + 1) * 100_000_000),
+                "主力净流入-净占比": float(index + 1) / 10,
+            }
+            for index, session in enumerate(self.sessions)
         ]
 
 
@@ -410,6 +509,38 @@ def _publish_sector_history(
     return settings
 
 
+def _publish_real_contract_market_history(
+    tmp_path: Path,
+    sessions: list[date],
+) -> Settings:
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+    provider = AKShareSupplementalProvider(
+        client=RealContractMarketClient(sessions),
+        clock=lambda: OBSERVED_AT,
+    )
+    source_points = provider.market_fund_flow_history(through_date=AS_OF)
+    assert {point.scope_name for point in source_points} == {MARKET_UPSTREAM_SCOPE}
+    SupplementalIngestionService(store, provider).execute(
+        SupplementalIngestionRequest(
+            through_date=AS_OF,
+            include_market_flow=True,
+            canary=True,
+        )
+    )
+    _set_synthetic_publication_time(settings, AS_OF)
+    return settings
+
+
 @pytest.mark.anyio
 async def test_api_is_read_only_and_returns_structured_not_configured_empty_and_error(
     tmp_path: Path,
@@ -462,6 +593,49 @@ async def test_api_is_read_only_and_returns_structured_not_configured_empty_and_
     assert error["availability"] == "error"
     assert error["quality_issues"] == ["supplemental_published_snapshot_unavailable"]
     assert after == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider_contract", [PINNED_PROVIDER_VERSION]),
+        ("provider_contract", "unsupported-provider-contract"),
+        ("source", "different-source"),
+    ],
+)
+def test_manifest_semantic_metadata_corruption_fails_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    settings = _publish_market_history(
+        tmp_path,
+        _points(sessions),
+        through_date=AS_OF,
+    )
+    manifest_path = settings.supplemental_data_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][0][field] = value
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    snapshot = FundFlowEvidenceStore.from_settings(settings).read(
+        as_of=AS_OF,
+        scope="market",
+        scope_id=MARKET_ANALYSIS_UNIVERSE,
+    )
+    result = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    assert snapshot.source_status == "error"
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.source_version == PINNED_PROVIDER_VERSION
+    assert result.raw_observed_points == []
+    assert result.quality_issues == ["supplemental_published_snapshot_unavailable"]
 
 
 @pytest.mark.anyio
@@ -534,6 +708,48 @@ async def test_api_published_history_preserves_semantics_and_never_masquerades_a
         if path.is_file()
     }
     assert files_after == files_before
+
+
+@pytest.mark.anyio
+async def test_real_provider_market_scope_is_readable_without_all_a_share_overclaim(
+    tmp_path: Path,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    settings = _publish_real_contract_market_history(tmp_path, sessions)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[fund_flow_api.get_fund_flow_today] = lambda: AS_OF
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/api/v1/analysis/fund-flow-evidence",
+                params={"as_of": AS_OF.isoformat(), "scope": "market"},
+            )
+            legacy_overclaim = await client.get(
+                "/api/v1/analysis/fund-flow-evidence",
+                params={
+                    "as_of": AS_OF.isoformat(),
+                    "scope": "market",
+                    "scope_id": "all_a_share",
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["availability"] == "ready"
+    assert payload["scope_id"] == MARKET_ANALYSIS_UNIVERSE
+    assert payload["analysis_universe"] == MARKET_ANALYSIS_UNIVERSE
+    assert payload["upstream_scope_identity"] == MARKET_UPSTREAM_SCOPE
+    assert {point["upstream_scope_identity"] for point in payload["raw_observed_points"]} == {
+        MARKET_UPSTREAM_SCOPE
+    }
+    assert {item["upstream_scope_identity"] for item in payload["semantic_lineage"]} == {
+        MARKET_UPSTREAM_SCOPE
+    }
+    assert legacy_overclaim.status_code == 422
 
 
 @pytest.mark.anyio
@@ -681,7 +897,7 @@ def test_failed_ingestion_keeps_last_trusted_manifest_for_analysis(
     snapshot = FundFlowEvidenceStore.from_settings(settings).read(
         as_of=AS_OF,
         scope="market",
-        scope_id="all_a_share",
+        scope_id=MARKET_ANALYSIS_UNIVERSE,
     )
     result = FundFlowEvidenceService(calendar).evaluate(snapshot)
     assert manifest.read_bytes() == before

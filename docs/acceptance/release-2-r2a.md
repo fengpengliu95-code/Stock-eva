@@ -2,14 +2,16 @@
 
 Date: 2026-08-01 (Asia/Shanghai)
 
-R2-A fund-flow evidence slice: **LOCALLY VERIFIED — INDEPENDENT REVIEW REQUIRED**
+R2-A fund-flow evidence slice: **REPAIRED LOCALLY — INDEPENDENT RE-REVIEW REQUIRED**
 
 Release 2 verdict: **PENDING — do not claim GO**
 
 ## Scope verified in this worker
 
 - `GET /api/v1/analysis/fund-flow-evidence` is a deterministic, read-only analysis
-  endpoint for `market` and exact `sector` scopes.
+  endpoint for the truthful `sh_sz_market` market universe and exact `sector` scopes.
+  Market responses preserve the distinct upstream scope identity `沪深市场`; the API
+  rejects the unsupported `all_a_share` label rather than widening the source claim.
 - L1 is explicitly an upstream-reported order-size proxy. The API preserves
   `source`, `upstream`, `endpoint`, explicit `trade_date`, units, provider/formula
   version, object SHA-256 lineage and confidence. It never describes the records as
@@ -22,6 +24,10 @@ Release 2 verdict: **PENDING — do not claim GO**
 - The 1/5/20-session aggregates use one source, upstream, endpoint, scope and
   provider contract. Mixed sources, upstreams, endpoints, scopes, duplicate dates and
   non-finite values fail closed rather than being added together.
+- Every source `trade_date` is checked against the confirmed exchange calendar.
+  Weekend/holiday points fail closed and unknown calendar years are explicitly
+  `trading_calendar_unverifiable`; neither can enter raw evidence or lineage while a
+  trend remains publishable.
 - A trend conclusion requires 20 contiguous exchange trading sessions, complete
   1/5/20 windows, zero trading-session staleness, a ready source snapshot, no future
   records, verified publication knowledge and an immutable object hash. Nineteen
@@ -41,6 +47,13 @@ Release 2 verdict: **PENDING — do not claim GO**
 - `result_id` and semantic lineage IDs are stable for identical inputs. Publication
   time, source semantics, formula/provider version, object hash, scope, dates, metrics,
   missing inputs and confidence participate in the deterministic result payload.
+- One versioned policy object drives response `formula_version`, evidence semantics,
+  units and L2/L3 availability. `result_id` hashes the complete validated response
+  semantics except the ID itself, so formula, units, reasons and unavailable-level
+  changes cannot retain an old identity.
+- Manifest entries must carry `source=akshare` and the exact supported non-empty
+  provider contract. Wrong types, unsupported versions and changed sources return a
+  structured error instead of being stringified into trusted lineage.
 - Price divergence and member-level sector diffusion are explicitly unavailable in
   this slice. They remain null and are listed in `missing_inputs`; they are not
   inferred from L1 records.
@@ -78,6 +91,32 @@ uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
 # RED: 2 failed.
 uv run --extra dev pytest -q tests/test_fund_flow_evidence.py
 # GREEN: 19 passed.
+
+# Independent specification review then found four semantic counterexamples.
+# The real provider scope first returned empty because the API queried all_a_share.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k real_provider_market_scope
+# RED: 1 failed (availability=empty).
+# GREEN: 1 passed; sh_sz_market remains distinct from upstream identity 沪深市场.
+
+# Closed weekend, statutory holiday and unknown-year dates were initially publishable.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k 'closed_weekend_or_holiday or unknown_source_session'
+# RED: 3 failed (all availability=ready).
+# GREEN: 3 passed.
+
+# Corrupt manifest source/provider semantics were initially accepted.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k manifest_semantic_metadata_corruption
+# RED: 3 failed (all source_status=ready).
+# GREEN: 3 passed.
+
+# A formula-version change altered the ID but not the reported version; an L2 reason
+# change altered the response but not the ID.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k formula_and_unavailable_semantics
+# RED: 1 failed.
+# GREEN: 1 passed with a single policy and full-response canonical ID.
 ```
 
 ## Verification
@@ -87,10 +126,10 @@ uv run --extra dev pytest -q \
   tests/test_market_supplemental.py \
   tests/test_supplemental_ingestion.py \
   tests/test_fund_flow_evidence.py
-# 34 passed in 0.81s
+# 42 passed
 
 uv run --extra dev pytest
-# 506 passed in 53.96s
+# 514 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
@@ -124,7 +163,7 @@ that evidence exists, production trend availability must be shown as unavailable
 
 ## Pending Release 2 gates
 
-- Independent specification and code-quality review of this R2-A slice.
+- Independent specification and code-quality re-review of this repaired R2-A slice.
 - Bounded real market and 3-5-sector canary with at least 20 auditable contiguous
   sessions before any live trend language is published.
 - A versioned historical publication-pointer contract if historical replay is to move

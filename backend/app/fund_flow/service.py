@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from backend.app.fund_flow.models import (
     FundFlowConclusion,
     FundFlowConfidence,
+    FundFlowEvidencePolicy,
     FundFlowEvidenceResult,
     FundFlowEvidenceSnapshot,
     FundFlowMetrics,
@@ -20,23 +21,30 @@ from backend.app.market.calendar import TradingCalendar
 from backend.app.market.supplement_ingestion import PINNED_PROVIDER_VERSION
 from backend.app.market.supplemental import ReportedFundFlowPoint
 
-FORMULA_VERSION = "fund-flow-evidence-l1-v1"
 WINDOW_SESSIONS = 20
-_UNAVAILABLE_LEVELS = [
-    UnavailableEvidenceLevel(
-        evidence_level="L2",
-        reason="public_institutional_activity_source_not_configured",
+DEFAULT_FUND_FLOW_POLICY = FundFlowEvidencePolicy(
+    formula_version="fund-flow-evidence-l1-v1",
+    unavailable_levels=(
+        UnavailableEvidenceLevel(
+            evidence_level="L2",
+            reason="public_institutional_activity_source_not_configured",
+        ),
+        UnavailableEvidenceLevel(
+            evidence_level="L3",
+            reason="price_volume_inference_not_implemented_in_this_slice",
+        ),
     ),
-    UnavailableEvidenceLevel(
-        evidence_level="L3",
-        reason="price_volume_inference_not_implemented_in_this_slice",
-    ),
-]
+)
 
 
 class FundFlowEvidenceService:
-    def __init__(self, calendar: TradingCalendar) -> None:
+    def __init__(
+        self,
+        calendar: TradingCalendar,
+        policy: FundFlowEvidencePolicy = DEFAULT_FUND_FLOW_POLICY,
+    ) -> None:
         self.calendar = calendar
+        self.policy = policy
 
     def evaluate(
         self,
@@ -209,8 +217,8 @@ class FundFlowEvidenceService:
             lineage=[],
         )
 
-    @staticmethod
     def _invalid_issue(
+        self,
         points: list[ReportedFundFlowPoint],
         snapshot: FundFlowEvidenceSnapshot,
     ) -> str | None:
@@ -245,10 +253,16 @@ class FundFlowEvidenceService:
             return "mixed_source_or_semantics"
         expected_source_scope = "market" if snapshot.scope == "market" else "industry"
         if any(
-            point.scope != expected_source_scope or point.scope_name != snapshot.scope_id
+            point.scope != expected_source_scope
+            or point.scope_name != snapshot.upstream_scope_identity
             for point in points
         ):
             return "mixed_source_or_semantics"
+        session_statuses = {self.calendar.session_status(point.trade_date) for point in points}
+        if "unknown" in session_statuses:
+            return "trading_calendar_unverifiable"
+        if "closed" in session_statuses:
+            return "source_point_on_closed_session"
         return None
 
     def _expected_sessions(self, end: date) -> tuple[list[date], str | None]:
@@ -397,6 +411,8 @@ class FundFlowEvidenceService:
             "source": source.model_dump(mode="json"),
             "scope": snapshot.scope,
             "scope_id": snapshot.scope_id,
+            "analysis_universe": snapshot.scope_id,
+            "upstream_scope_identity": snapshot.upstream_scope_identity,
             "metric": "reported_main_net_inflow",
             "date_semantics": "explicit_trade_date",
             "earliest": points[0].trade_date.isoformat(),
@@ -412,6 +428,8 @@ class FundFlowEvidenceService:
                 source=source,
                 scope=snapshot.scope,
                 scope_id=snapshot.scope_id,
+                analysis_universe=snapshot.scope_id,
+                upstream_scope_identity=snapshot.upstream_scope_identity,
                 earliest_input_date=points[0].trade_date,
                 latest_input_date=points[-1].trade_date,
                 record_count=len(points),
@@ -452,44 +470,20 @@ class FundFlowEvidenceService:
                 endpoint=point.source_endpoint,
                 scope=snapshot.scope,
                 scope_id=snapshot.scope_id,
+                analysis_universe=snapshot.scope_id,
+                upstream_scope_identity=point.scope_name,
             )
             for point in points
         ]
-        payload = {
-            "evidence_level": "L1",
-            "availability": availability,
-            "scope": snapshot.scope,
-            "scope_id": snapshot.scope_id,
-            "as_of": snapshot.as_of.isoformat(),
-            "data_as_of": data_as_of.isoformat() if data_as_of else None,
-            "last_trusted_date": (last_trusted_date.isoformat() if last_trusted_date else None),
-            "staleness_sessions": staleness_sessions,
-            "publication_knowledge": publication_knowledge,
-            "computed_at": (snapshot.published_at.isoformat() if snapshot.published_at else None),
-            "source": source.model_dump(mode="json") if source else None,
-            "source_version": snapshot.provider_contract or PINNED_PROVIDER_VERSION,
-            "formula_version": FORMULA_VERSION,
-            "raw_observed_points": [point.model_dump(mode="json") for point in raw_points],
-            "metrics": metrics.model_dump(mode="json") if metrics else None,
-            "missing_sessions": [item.isoformat() for item in missing_sessions],
-            "missing_inputs": sorted(set(missing_inputs)),
-            "quality_issues": sorted(issues),
-            "confidence": confidence.model_dump(mode="json"),
-            "can_publish_trend": can_publish,
-            "conclusion": conclusion.model_dump(mode="json") if conclusion else None,
-            "semantic_lineage": [item.model_dump(mode="json") for item in lineage],
-        }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return FundFlowEvidenceResult(
-            result_id=f"fund-flow-{hashlib.sha256(encoded.encode()).hexdigest()[:24]}",
+        candidate = FundFlowEvidenceResult(
+            result_id="fund-flow-000000000000000000000000",
+            evidence_basis=self.policy.evidence_basis,
+            interpretation=self.policy.interpretation,
             availability=availability,
             scope=snapshot.scope,
             scope_id=snapshot.scope_id,
+            analysis_universe=snapshot.scope_id,
+            upstream_scope_identity=(snapshot.upstream_scope_identity if points else None),
             as_of=snapshot.as_of,
             data_as_of=data_as_of,
             last_trusted_date=last_trusted_date,
@@ -498,6 +492,9 @@ class FundFlowEvidenceService:
             computed_at=snapshot.published_at,
             source=source,
             source_version=snapshot.provider_contract or PINNED_PROVIDER_VERSION,
+            formula_version=self.policy.formula_version,
+            date_semantics=self.policy.date_semantics,
+            units=self.policy.units,
             raw_observed_points=raw_points,
             metrics=metrics,
             missing_sessions=missing_sessions,
@@ -507,5 +504,14 @@ class FundFlowEvidenceService:
             can_publish_trend=can_publish,
             conclusion=conclusion,
             semantic_lineage=lineage,
-            unavailable_levels=_UNAVAILABLE_LEVELS,
+            unavailable_levels=list(self.policy.unavailable_levels),
+        )
+        encoded = json.dumps(
+            candidate.model_dump(mode="json", exclude={"result_id"}),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return candidate.model_copy(
+            update={"result_id": (f"fund-flow-{hashlib.sha256(encoded.encode()).hexdigest()[:24]}")}
         )

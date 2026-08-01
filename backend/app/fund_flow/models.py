@@ -14,6 +14,8 @@ AvailabilityStatus = Literal[
     "error",
 ]
 EvidenceScope = Literal["market", "sector"]
+MARKET_ANALYSIS_UNIVERSE = "sh_sz_market"
+MARKET_UPSTREAM_SCOPE_IDENTITY = "沪深市场"
 
 
 class FundFlowModel(BaseModel):
@@ -29,6 +31,7 @@ class FundFlowEvidenceSnapshot(BaseModel):
     as_of: date
     scope: EvidenceScope
     scope_id: str
+    upstream_scope_identity: str
     publication_as_of: date | None = None
     published_at: datetime | None = None
     provider_contract: str | None = None
@@ -66,6 +69,8 @@ class FundFlowObservedPoint(FundFlowModel):
     endpoint: str
     scope: EvidenceScope
     scope_id: str
+    analysis_universe: str
+    upstream_scope_identity: str
     date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
 
 
@@ -103,6 +108,8 @@ class FundFlowSemanticLineage(FundFlowModel):
     source: FundFlowSource
     scope: EvidenceScope
     scope_id: str
+    analysis_universe: str
+    upstream_scope_identity: str
     metric: Literal["reported_main_net_inflow"] = "reported_main_net_inflow"
     date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
     earliest_input_date: date
@@ -122,6 +129,27 @@ class UnavailableEvidenceLevel(FundFlowModel):
     reason: str
 
 
+class FundFlowEvidencePolicy(FundFlowModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, frozen=True)
+
+    formula_version: str = Field(min_length=1)
+    evidence_basis: Literal["upstream_reported_main_net_inflow_proxy"] = (
+        "upstream_reported_main_net_inflow_proxy"
+    )
+    interpretation: Literal["upstream_reported_not_ohlcv_inferred"] = (
+        "upstream_reported_not_ohlcv_inferred"
+    )
+    date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
+    units: FundFlowUnits = Field(default_factory=FundFlowUnits)
+    unavailable_levels: tuple[UnavailableEvidenceLevel, ...]
+
+    @model_validator(mode="after")
+    def validate_unavailable_levels(self) -> "FundFlowEvidencePolicy":
+        if [item.evidence_level for item in self.unavailable_levels] != ["L2", "L3"]:
+            raise ValueError("policy must define ordered L2 and L3 availability")
+        return self
+
+
 class FundFlowEvidenceResult(FundFlowModel):
     result_id: str = Field(pattern=r"^fund-flow-[0-9a-f]{24}$")
     evidence_level: Literal["L1"] = "L1"
@@ -134,6 +162,8 @@ class FundFlowEvidenceResult(FundFlowModel):
     availability: AvailabilityStatus
     scope: EvidenceScope
     scope_id: str
+    analysis_universe: str
+    upstream_scope_identity: str | None
     as_of: date
     data_as_of: date | None
     last_trusted_date: date | None
@@ -142,7 +172,7 @@ class FundFlowEvidenceResult(FundFlowModel):
     computed_at: datetime | None
     source: FundFlowSource | None
     source_version: str
-    formula_version: Literal["fund-flow-evidence-l1-v1"] = "fund-flow-evidence-l1-v1"
+    formula_version: str = Field(min_length=1)
     date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
     units: FundFlowUnits = Field(default_factory=FundFlowUnits)
     raw_observed_points: list[FundFlowObservedPoint] = Field(default_factory=list)

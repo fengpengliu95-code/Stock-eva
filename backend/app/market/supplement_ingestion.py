@@ -468,6 +468,15 @@ class SupplementalStore:
     def _validate_manifest_item(item) -> None:
         if not isinstance(item, dict) or item.get("dataset_kind") not in _KINDS:
             raise SupplementalDatasetError("supplemental manifest file is invalid")
+        if item.get("source") != "akshare":
+            raise SupplementalDatasetError("supplemental manifest source is invalid")
+        provider_contract = item.get("provider_contract")
+        if (
+            not isinstance(provider_contract, str)
+            or not provider_contract
+            or provider_contract != PINNED_PROVIDER_VERSION
+        ):
+            raise SupplementalDatasetError("supplemental manifest provider contract is invalid")
         relative = Path(str(item.get("path", "")))
         if (
             relative.is_absolute()
