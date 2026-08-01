@@ -51,6 +51,9 @@ R1-C v1 强制 `narrow_main_board`：
 - 额外行情证券可以进入“实际可观测主板基准”，但不能成为分类成员或龙头；
 - `as_of` 时尚未上市、已经退市、非股票或不受支持市场/板块的 classification member
   在分组、coverage denominator、指标和龙头候选前统一排除；
+- classification 主数据与当日 canonical bar 的 `security_type`、`exchange`、`board` 必须
+  彼此一致，且行情 symbol 的交易所前缀必须匹配 `exchange`；不一致项以具体 quality/exclusion
+  reason 返回，不能进入已定价覆盖、板块指标、研究龙头候选或龙头扩散分母；
 - `can_support_full_a_share_conclusion=false`；
 - `can_support_all_industry_conclusion=false`。
 
@@ -107,7 +110,7 @@ canonical bar 的可交易性门禁；停牌、非交易、坏质量、非法价
 
 候选分项包括：
 
-- `tradeability`；
+- `tradability`；
 - 相对实际可观测主板基准的 5/20/60 日相对强度；
 - 当日成交额相对之前 20 日均值的活跃度；
 - 前复权收盘相对 MA20/60 的趋势质量；

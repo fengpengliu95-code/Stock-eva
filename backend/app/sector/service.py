@@ -403,9 +403,7 @@ class SectorRotationService:
         raw_current = {
             bar.symbol: bar
             for bar in bars
-            if data_as_of is not None
-            and bar.trade_date == data_as_of
-            and bar.security_type == "stock"
+            if data_as_of is not None and bar.trade_date == data_as_of
         }
         market_lineage = _market_lineage(bars) if bars else None
         actual_scope = self._actual_scope(
@@ -476,7 +474,12 @@ class SectorRotationService:
             bar.symbol for bar in current.values() if bar.board == "main" and _usable_bar(bar)
         }
         priced = {
-            row.symbol for row in eligible_members if row.board == "main" and row.symbol in observed
+            row.symbol
+            for row in eligible_members
+            if row.board == "main"
+            and (bar := current.get(row.symbol)) is not None
+            and _canonical_classification_scope_reason(row, bar) is None
+            and row.symbol in observed
         }
         markets = sorted(
             {
@@ -509,24 +512,34 @@ class SectorRotationService:
     ) -> SectorRanking:
         eligibility_reason = self._membership_eligibility_reason
         members = [item for item in members if eligibility_reason(context, item) is None]
-        member_symbols = [
-            item.symbol
+        main_members = [
+            (item, security)
             for item in members
             if (
                 (security := context.securities.get(item.security_id)) is not None
                 and security.board == "main"
             )
         ]
-        priced_symbols = [
-            symbol
-            for symbol in member_symbols
+        member_symbols = [item.symbol for item, _security in main_members]
+        current_scope_issues = {
+            f"sector.{reason}"
+            for item, security in main_members
+            if (bar := context.raw_current.get(item.symbol)) is not None
+            and (reason := _canonical_classification_scope_reason(security, bar)) is not None
+        }
+        priced_symbols = []
+        for item, security in main_members:
+            bar = context.raw_current.get(item.symbol)
+            rows = context.histories.get(item.symbol)
             if (
-                (rows := context.histories.get(symbol))
+                bar is not None
+                and _canonical_classification_scope_reason(security, bar) is None
+                and rows
                 and context.data_as_of is not None
                 and rows[-1].trade_date == context.data_as_of
                 and _usable_bar(rows[-1])
-            )
-        ]
+            ):
+                priced_symbols.append(item.symbol)
         sector_cache = self._sector_cache(context, members)
         research_candidates = [
             self._leader_candidate(context, member, sector_cache)
@@ -547,7 +560,10 @@ class SectorRotationService:
         )
         total_score = _weighted_total(metrics)
         missing = sorted({value for metric in metrics for value in metric.missing_inputs})
-        issues = {value for metric in metrics for value in metric.quality_issues}
+        issues = {
+            *current_scope_issues,
+            *(value for metric in metrics for value in metric.quality_issues),
+        }
         if len(priced_symbols) < len(members):
             issues.add("sector.member_price_missing")
         if len(member_symbols) < len(members):
@@ -996,6 +1012,9 @@ class SectorRotationService:
         if bar is None:
             reasons.append("missing_current_price")
             return reasons
+        if (reason := _canonical_classification_scope_reason(security, bar)) is not None:
+            reasons.append(reason)
+            return reasons
         if bar.is_suspended:
             reasons.append("suspended")
         if not bar.is_trading:
@@ -1036,7 +1055,9 @@ class SectorRotationService:
                 (security := context.securities.get(item.security_id)) is not None
                 and eligibility_reason(security, context.as_of) is None
                 and security.board == "main"
-                and item.symbol in context.histories
+                and (bar := context.raw_current.get(item.symbol)) is not None
+                and _canonical_classification_scope_reason(security, bar) is None
+                and item.symbol in context.cache.valid_histories
             )
         )
         daily = _daily_group_returns_from_cache(context.cache.daily_returns, symbols)
@@ -1416,6 +1437,7 @@ def _market_lineage(bars: list[DailyBar]) -> MarketLineage:
 def _usable_bar(bar: DailyBar) -> bool:
     return (
         bar.security_type == "stock"
+        and bar.symbol.startswith(f"{bar.exchange}.")
         and bar.board == "main"
         and bar.quality_status == "ready"
         and not bar.quality_issues
@@ -1428,6 +1450,19 @@ def _usable_bar(bar: DailyBar) -> bool:
         and math.isfinite(bar.amount)
         and bar.amount >= 0
     )
+
+
+def _canonical_classification_scope_reason(
+    security: SecurityMasterRecord,
+    bar: DailyBar,
+) -> str | None:
+    if bar.security_type != "stock" or bar.security_type != security.security_type:
+        return "canonical_security_type_mismatch"
+    if bar.exchange != security.exchange or not bar.symbol.startswith(f"{bar.exchange}."):
+        return "canonical_exchange_mismatch"
+    if bar.board != "main" or bar.board != security.board:
+        return "canonical_board_mismatch"
+    return None
 
 
 def _finite_positive(value) -> bool:

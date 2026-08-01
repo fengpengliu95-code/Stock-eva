@@ -1978,3 +1978,50 @@ def test_sector_score_ties_break_only_by_sector_id_even_with_different_sizes(
 
     assert result.rankings[0].total_score == result.rankings[1].total_score
     assert [item.sector_id for item in result.rankings] == ["alpha", "zeta"]
+
+
+@pytest.mark.parametrize(
+    ("current_bar_updates", "expected_reason"),
+    [
+        ({"board": "chinext"}, "canonical_board_mismatch"),
+        ({"exchange": "sz"}, "canonical_exchange_mismatch"),
+        (
+            {"security_type": "index", "board": "index"},
+            "canonical_security_type_mismatch",
+        ),
+    ],
+)
+def test_canonical_classification_scope_mismatch_is_excluded_everywhere(
+    tmp_path: Path,
+    current_bar_updates: dict[str, object],
+    expected_reason: str,
+) -> None:
+    anchor = _bars("sh.600001", drift=0.003)
+    mismatched = _bars("sh.600002", drift=0.02)
+    mismatched[-1] = mismatched[-1].model_copy(update=current_bar_updates)
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth", "sh.600002": "growth"},
+        [*anchor, *mismatched],
+    )
+
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert [item.symbol for item in leaders.candidates] == ["sh.600001"]
+    exclusions = {item.symbol: item.reasons for item in leaders.exclusions}
+    assert expected_reason in exclusions["sh.600002"]
+
+    ranking = rotation.rankings[0]
+    metrics = {item.metric: item for item in ranking.metric_scores}
+    assert rotation.actual_scope.observed_market_symbols == 1
+    assert rotation.actual_scope.priced_classified_symbols == 1
+    assert ranking.priced_member_count == 1
+    assert f"sector.{expected_reason}" in ranking.quality_issues
+    assert metrics["relative_strength_20d"].effective_count == 1
+    assert metrics["relative_strength_20d"].target_count == 2
+    assert metrics["relative_strength_20d"].score is None
+    for name in ("leader_count", "leader_diffusion", "leader_persistence_days"):
+        assert metrics[name].effective_count == 1
+        assert metrics[name].target_count == 2
+        assert metrics[name].score is None

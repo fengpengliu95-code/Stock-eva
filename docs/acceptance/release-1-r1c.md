@@ -36,6 +36,10 @@ Release 1 verdict: **PENDING — do not claim GO**
 - Suspended, non-trading, bad-quality, invalid-price/activity, out-of-scope and `as_of`
   ineligible securities are excluded with reasons. `price_available=null` is not itself an
   exclusion when a trustworthy current canonical bar proves price availability.
+- A classification member and its current canonical bar must agree on security type, exchange
+  and board, and the canonical symbol prefix must agree with its exchange. A mismatch is
+  excluded with a specific reason and cannot enter priced coverage, sector metrics, leader
+  candidates or the effective denominator of leader count/diffusion/persistence.
 - Research-leader qualification is deterministic and versioned. Qualified-leader count,
   diffusion and persistence reflect only candidates passing relative-strength, activity,
   trend and sector-contribution gates; changing the qualification version changes candidate,
@@ -119,16 +123,25 @@ uv run --extra dev pytest -o addopts='' -q \
   tests/test_sector_rotation.py::test_empty_result_ids_include_complete_policy_identity \
   tests/test_sector_rotation.py::test_no_candidate_degraded_leader_id_includes_qualification_version
 # Repair GREEN: 7 passed in 0.74s. Two additional malformed-placeholder cases also pass.
+
+# Final approval-review repair RED: 3 failed. A classification-main member whose current
+# canonical bar reported a ChiNext board or a conflicting exchange still became the first
+# leader candidate; a security-type mismatch produced only a generic missing-price reason.
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_sector_rotation.py::test_canonical_classification_scope_mismatch_is_excluded_everywhere
+# Repair GREEN: 3 passed in 0.51s. Board, exchange and security-type mismatches now carry
+# specific reasons and cannot affect candidate or sector-leadership effective counts.
 ```
 
 ## Fresh verification
 
 ```text
 uv run --extra dev pytest -o addopts='' -q
-# 545 passed in 65.52s.
+# 548 passed in 68.22s.
 
 uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py --durations=5
-# 53 passed in 9.58s; the 3,000-symbol x 65-session representative-scale
+# 56 passed in 9.65s; the 3,000-symbol x 65-session representative-scale
 # leader-ranking case completed in 3.21s, below its 15s guardrail.
 
 uv run --extra dev ruff check backend tests
