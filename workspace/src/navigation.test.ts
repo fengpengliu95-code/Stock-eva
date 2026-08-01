@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   bindSecurityEntrypoints,
+  decisionHash,
+  parseDecisionHash,
   parseSecurityHash,
   securityHash,
 } from "./navigation";
@@ -18,6 +20,37 @@ describe("security navigation", () => {
       sourceView: "watchlists",
     });
     expect(parseSecurityHash("#security/not-a-symbol")).toBeNull();
+  });
+
+  it("round-trips historical decision and sector context through reloadable hashes", () => {
+    const decision = decisionHash({
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector/a b",
+    });
+
+    expect(decision).toBe(
+      "#overview?as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector%2Fa+b",
+    );
+    expect(parseDecisionHash(decision)).toEqual({
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector/a b",
+    });
+    expect(parseDecisionHash("#overview?as_of=tomorrow")).toBeNull();
+
+    const security = securityHash("sh.600001", "sectors", {
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector/a b",
+    });
+    expect(parseSecurityHash(security)).toEqual({
+      symbol: "sh.600001",
+      sourceView: "sectors",
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector/a b",
+    });
   });
 
   it.each([
@@ -73,6 +106,30 @@ describe("security navigation", () => {
     expect(repeatEvent.defaultPrevented).toBe(false);
     expect(navigate).toHaveBeenCalledTimes(5);
     expect(navigate).toHaveBeenLastCalledWith("sh.600000", "portfolio");
+    unbind();
+  });
+
+  it("passes decision context from a leader control without dropping as_of", () => {
+    document.body.innerHTML = `
+      <button
+        type="button"
+        data-security-symbol="sh.600001"
+        data-security-source="sectors"
+        data-security-as-of="2026-01-31"
+        data-security-taxonomy="baostock.industry_classification"
+        data-security-sector="sector-a"
+      >查看技术驾驶舱</button>
+    `;
+    const navigate = vi.fn();
+    const unbind = bindSecurityEntrypoints(document, navigate);
+
+    fireEvent.click(document.querySelector("button")!);
+
+    expect(navigate).toHaveBeenCalledWith("sh.600001", "sectors", {
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector-a",
+    });
     unbind();
   });
 });

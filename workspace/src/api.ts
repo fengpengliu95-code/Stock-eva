@@ -171,10 +171,18 @@ function parseTradingDates(value: unknown): string[] {
 
 export function selectTradingDateWindow(
   dates: string[],
+  asOf?: string,
 ): { start: string; end: string } {
   const validDates = parseTradingDates(dates);
-  if (validDates.length === 0) throw new NoTradingDatesError();
-  const window = validDates.slice(-260);
+  if (asOf !== undefined && !ISO_DATE_PATTERN.test(asOf)) {
+    throw new TypeError("as_of must be an ISO date");
+  }
+  const boundedDates =
+    asOf === undefined
+      ? validDates
+      : validDates.filter((tradeDate) => tradeDate <= asOf);
+  if (boundedDates.length === 0) throw new NoTradingDatesError();
+  const window = boundedDates.slice(-260);
   return { start: window[0], end: window[window.length - 1] };
 }
 
@@ -206,12 +214,13 @@ export async function fetchSecurityAnalysis(
   symbol: string,
   fetcher: typeof fetch = fetch,
   signal: AbortSignal = new AbortController().signal,
+  asOf?: string,
 ): Promise<SecurityAnalysisResponse> {
   if (!SYMBOL_PATTERN.test(symbol)) throw new TypeError("invalid security symbol");
   const dates = parseTradingDates(
     await fetchJson("/market/history/dates", fetcher, signal),
   );
-  const { start, end } = selectTradingDateWindow(dates);
+  const { start, end } = selectTradingDateWindow(dates, asOf);
   const query = new URLSearchParams({ start, end });
   const payload = await fetchJson(
     `/securities/${encodeURIComponent(symbol)}/analysis?${query}`,

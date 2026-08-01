@@ -27,7 +27,9 @@ function formatValue(value: number | null, digits = 4): string {
 }
 
 function sourceLabel(sourceView: SourceView): string {
-  return sourceView === "portfolio" ? "持仓" : "自选预警";
+  if (sourceView === "portfolio") return "持仓";
+  if (sourceView === "watchlists") return "自选预警";
+  return "盘后决策流";
 }
 
 function renderMetadata(response: SecurityAnalysisResponse): HTMLElement {
@@ -173,8 +175,20 @@ export function renderSecurityAnalysis(
     status.textContent = "尚未选择证券";
     return null;
   }
-  back.href = `#${state.sourceView}`;
-  back.dataset.viewTarget = state.sourceView;
+  if (state.decisionContext) {
+    const query = new URLSearchParams({
+      as_of: state.decisionContext.asOf,
+      taxonomy_id: state.decisionContext.taxonomyId,
+      sector_id: state.decisionContext.sectorId,
+    });
+    back.href = `#overview?${query}`;
+    back.dataset.decisionReturn = "true";
+    delete back.dataset.viewTarget;
+  } else {
+    back.href = `#${state.sourceView}`;
+    back.dataset.viewTarget = state.sourceView;
+    delete back.dataset.decisionReturn;
+  }
   back.textContent = `← 返回${sourceLabel(state.sourceView)}`;
   if (state.phase === "loading") {
     status.textContent = `正在读取 ${state.symbol} 的交易日和后端分析…`;

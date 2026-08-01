@@ -1,11 +1,18 @@
 import type { SecurityAnalysisResponse } from "./api";
 
-export type SourceView = "portfolio" | "watchlists";
+export type SourceView = "portfolio" | "watchlists" | "sectors";
 export type EmptyReason = "no_market_data" | "no_effective_trading_data";
+
+export interface DecisionContext {
+  asOf: string;
+  taxonomyId: string;
+  sectorId: string;
+}
 
 interface CockpitContext {
   symbol: string;
   sourceView: SourceView;
+  decisionContext?: DecisionContext;
 }
 
 export type CockpitState =
@@ -35,7 +42,13 @@ function context(state: CockpitState): CockpitContext {
   if (state.phase === "idle") {
     throw new Error("cockpit response received before load");
   }
-  return { symbol: state.symbol, sourceView: state.sourceView };
+  return {
+    symbol: state.symbol,
+    sourceView: state.sourceView,
+    ...(state.decisionContext
+      ? { decisionContext: state.decisionContext }
+      : {}),
+  };
 }
 
 export function transitionCockpit(
@@ -47,6 +60,9 @@ export function transitionCockpit(
       phase: "loading",
       symbol: action.symbol,
       sourceView: action.sourceView,
+      ...(action.decisionContext
+        ? { decisionContext: action.decisionContext }
+        : {}),
     };
   }
   const current = context(state);

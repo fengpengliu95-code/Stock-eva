@@ -23,6 +23,38 @@ describe("security analysis API", () => {
       start: dates[0],
       end: dates[1],
     });
+    expect(selectTradingDateWindow(dates, dates[99])).toEqual({
+      start: dates[0],
+      end: dates[99],
+    });
+  });
+
+  it("keeps a historical as_of boundary in the technical cockpit request", async () => {
+    const payload = analysisFixture({ as_of: "2025-01-02" });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify(["2025-01-02", "2025-01-03", "2025-01-06"]),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(payload), { status: 200 }),
+      );
+
+    await fetchSecurityAnalysis(
+      "sh.600000",
+      fetcher,
+      new AbortController().signal,
+      "2025-01-02",
+    );
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8000/api/v1/securities/sh.600000/analysis?start=2025-01-02&end=2025-01-02",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("preserves indicator nulls instead of coercing them to zero", () => {

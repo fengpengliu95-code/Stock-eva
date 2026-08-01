@@ -41,6 +41,9 @@ describe("assembled legacy workspace and cockpit entry", () => {
 
   it("uses real legacy holding/watchlist controls for source-aware navigation", async () => {
     installAssembledDocument(workspaceHtml);
+    expect(
+      getByRole(document.body, "region", { name: "盘后决策流" }),
+    ).toBeTruthy();
     vi.stubGlobal("scrollTo", vi.fn());
     vi.stubGlobal(
       "fetch",

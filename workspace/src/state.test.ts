@@ -23,6 +23,27 @@ describe("security cockpit state machine", () => {
     expect(ready).toMatchObject({ phase: "ready" });
   });
 
+  it("preserves historical sector context through every cockpit state", () => {
+    const decisionContext = {
+      asOf: "2025-01-02",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "banking",
+    };
+    const loading = transitionCockpit(initialCockpitState, {
+      type: "load",
+      symbol: "sh.600000",
+      sourceView: "sectors",
+      decisionContext,
+    });
+    const ready = transitionCockpit(loading, {
+      type: "success",
+      response: analysisFixture({ as_of: "2025-01-02" }),
+    });
+
+    expect(loading).toMatchObject({ decisionContext });
+    expect(ready).toMatchObject({ decisionContext });
+  });
+
   it.each(["no_market_data", "no_effective_trading_data"])(
     "keeps %s as an explicit empty state",
     (reason) => {
