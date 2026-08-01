@@ -264,6 +264,40 @@ def test_partial_retry_cannot_mutate_published_bars_for_same_session(
     assert store.published_refresh().status == "ready"
 
 
+def test_active_partial_bar_cannot_produce_ready_publication_or_move_pointer(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    session = date(2026, 7, 23)
+    save_published(store, session)
+    pointer_before = store.published_refresh()
+    poisoned = [
+        bar.model_copy(
+            update={
+                "quality_status": "partial",
+                "quality_issues": ["fixture_active_partial"],
+            }
+        )
+        if bar.symbol == "sh.600000"
+        else bar
+        for bar in fixture_bars(session)
+    ]
+
+    result = module.run_publication_refresh(
+        store,
+        CompleteProvider(poisoned),
+        trade_date=session,
+        required_symbols={"sh.600000"},
+    )
+
+    assert result.status == "partial"
+    assert "invalid_publication_bar_quality:sh.600000:active_bar_not_ready" in (
+        result.quality_issues
+    )
+    assert store.published_refresh().run_id == pointer_before.run_id
+
+
 def test_complete_publication_requires_user_symbols_and_factor_completeness(
     tmp_path: Path,
 ) -> None:

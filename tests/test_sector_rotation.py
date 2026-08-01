@@ -19,6 +19,10 @@ from backend.app.config import Settings
 from backend.app.main import app
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.regime.store import (
+    MarketReadUnavailable,
+    PublishedSnapshotDuckDbMarketReader,
+)
 
 AS_OF = date(2026, 1, 31)
 CLASSIFICATION_DATE = date(2025, 11, 1)
@@ -1538,6 +1542,109 @@ def test_fake_ready_publication_cannot_replace_complete_same_day_partition(
     assert store.published_refresh().run_id == pointer_before.run_id
 
 
+def test_ready_publication_rejects_active_partial_bar_and_preserves_partition(
+    tmp_path: Path,
+) -> None:
+    market_path = tmp_path / "market.duckdb"
+    store = MarketStore(market_path)
+    first = [
+        _bars("sh.600001", drift=0.003, count=1)[0],
+        _bars("sh.600002", drift=0.002, count=1)[0],
+    ]
+    store.save_refresh(first, _refresh("complete", AS_OF, count=2), publish=True)
+    pointer_before = store.published_refresh()
+    poisoned = [
+        first[0].model_copy(
+            update={
+                "quality_status": "partial",
+                "quality_issues": ["fixture_active_partial"],
+            }
+        ),
+        first[1],
+    ]
+
+    with pytest.raises(ValueError, match="active_bar_not_ready"):
+        store.save_refresh(
+            poisoned,
+            _refresh("fake-ready-quality", AS_OF, count=2),
+            publish=True,
+        )
+
+    connection = duckdb.connect(str(market_path))
+    try:
+        published = connection.execute(
+            "SELECT symbol, quality_status FROM published_daily_bars ORDER BY symbol"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert published == [("sh.600001", "ready"), ("sh.600002", "ready")]
+    assert store.published_refresh().run_id == pointer_before.run_id
+
+
+def test_ready_publication_allows_explicit_suspended_placeholder(
+    tmp_path: Path,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    suspended = _bars("sh.600001", drift=0.003, count=1)[0].model_copy(
+        update={
+            "is_trading": False,
+            "is_suspended": True,
+            "adjust_factor": None,
+            "quality_status": "partial",
+            "quality_issues": ["suspended_placeholder"],
+        }
+    )
+
+    store.save_refresh(
+        [suspended],
+        _refresh("suspended-placeholder", AS_OF),
+        publish=True,
+    )
+
+    assert store.published_refresh().run_id == "suspended-placeholder"
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_issue"),
+    [
+        (
+            {
+                "is_trading": False,
+                "is_suspended": False,
+                "quality_status": "ready",
+                "quality_issues": [],
+            },
+            "non_trading_bar_not_suspended",
+        ),
+        (
+            {
+                "is_trading": False,
+                "is_suspended": True,
+                "quality_status": "partial",
+                "quality_issues": ["unexpected_placeholder_issue"],
+            },
+            "invalid_suspended_placeholder",
+        ),
+    ],
+)
+def test_ready_publication_rejects_malformed_non_trading_placeholders(
+    tmp_path: Path,
+    updates: dict[str, object],
+    expected_issue: str,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    bar = _bars("sh.600001", drift=0.003, count=1)[0].model_copy(update=updates)
+
+    with pytest.raises(ValueError, match=expected_issue):
+        store.save_refresh(
+            [bar],
+            _refresh("invalid-placeholder", AS_OF),
+            publish=True,
+        )
+
+    assert store.published_refresh() is None
+
+
 def test_local_publication_requires_one_complete_explicit_date_partition(
     tmp_path: Path,
 ) -> None:
@@ -1639,6 +1746,68 @@ def test_publication_audit_corruption_returns_structured_503(
     assert response.json()["detail"]["code"] == "market_publication_state_unavailable"
 
 
+def test_published_reader_rejects_pointer_rollback_to_valid_older_partition(
+    tmp_path: Path,
+) -> None:
+    market_path = tmp_path / "market.duckdb"
+    store = MarketStore(market_path)
+    older = AS_OF - timedelta(days=1)
+    for trade_date, run_id in ((older, "older-run"), (AS_OF, "latest-run")):
+        store.save_refresh(
+            [_bars("sh.600001", drift=0.003, count=1, end=trade_date)[0]],
+            _refresh(run_id, trade_date),
+            publish=True,
+        )
+    connection = duckdb.connect(str(market_path))
+    try:
+        connection.execute(
+            "UPDATE published_snapshots SET run_id = ?, trade_date = ?",
+            ["older-run", older],
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        MarketReadUnavailable,
+        match="market_publication_state_unavailable",
+    ):
+        PublishedSnapshotDuckDbMarketReader(market_path).bars_through(
+            AS_OF,
+            max_sessions=80,
+        )
+
+
+def test_published_reader_rejects_source_tampered_historical_partition(
+    tmp_path: Path,
+) -> None:
+    market_path = tmp_path / "market.duckdb"
+    store = MarketStore(market_path)
+    older = AS_OF - timedelta(days=1)
+    for trade_date, run_id in ((older, "older-run"), (AS_OF, "latest-run")):
+        store.save_refresh(
+            [_bars("sh.600001", drift=0.003, count=1, end=trade_date)[0]],
+            _refresh(run_id, trade_date),
+            publish=True,
+        )
+    connection = duckdb.connect(str(market_path))
+    try:
+        connection.execute(
+            "UPDATE published_daily_bars SET source = 'tampered' WHERE trade_date = ?",
+            [older],
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        MarketReadUnavailable,
+        match="market_publication_state_unavailable",
+    ):
+        PublishedSnapshotDuckDbMarketReader(market_path).bars_through(
+            AS_OF,
+            max_sessions=80,
+        )
+
+
 def test_as_of_ineligible_members_never_rank_or_become_leader_candidates(
     tmp_path: Path,
 ) -> None:
@@ -1714,6 +1883,82 @@ def test_qualification_version_changes_candidate_sector_and_result_ids(
         if item.metric.startswith("leader_")
     }
     assert all("research-leader-qualification-v9" in value for value in leadership_v9.values())
+
+
+def test_empty_result_ids_include_complete_policy_identity(
+    tmp_path: Path,
+) -> None:
+    sector_service = import_module("backend.app.sector.service")
+    classification, _, _ = _publish_classification(
+        tmp_path / "classification.duckdb",
+        {"sh.600001": "growth"},
+    )
+    v1 = sector_service.SectorRotationService(classification, _BarsReader([]))
+    changed_sector_weights = dict(sector_service.SectorPolicy().weights)
+    changed_sector_weights["relative_strength_5d"] = 0.07
+    sector_changed = sector_service.SectorRotationService(
+        classification,
+        _BarsReader([]),
+        sector_policy=sector_service.SectorPolicy(weights=changed_sector_weights),
+    )
+    leader_changed = sector_service.SectorRotationService(
+        classification,
+        _BarsReader([]),
+        leader_policy=sector_service.LeaderPolicy(
+            qualification_version="research-leader-qualification-v9"
+        ),
+    )
+
+    rotation_v1 = v1.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation_sector_changed = sector_changed.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation_leader_changed = leader_changed.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders_v1 = v1.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+    leaders_sector_changed = sector_changed.leaders(
+        AS_OF,
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        "growth",
+    )
+    leaders_leader_changed = leader_changed.leaders(
+        AS_OF,
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+        "growth",
+    )
+
+    assert rotation_v1.status == rotation_sector_changed.status == "empty"
+    assert rotation_v1.status == rotation_leader_changed.status == "empty"
+    assert leaders_v1.status == leaders_sector_changed.status == "empty"
+    assert leaders_v1.status == leaders_leader_changed.status == "empty"
+    assert rotation_v1.result_id != rotation_sector_changed.result_id
+    assert rotation_v1.result_id != rotation_leader_changed.result_id
+    assert leaders_v1.result_id != leaders_sector_changed.result_id
+    assert leaders_v1.result_id != leaders_leader_changed.result_id
+
+
+def test_no_candidate_degraded_leader_id_includes_qualification_version(
+    tmp_path: Path,
+) -> None:
+    sector_service = import_module("backend.app.sector.service")
+    classification, _, _ = _publish_classification(
+        tmp_path / "classification.duckdb",
+        {"sh.600001": "growth"},
+        security_overrides={"sh.600001": {"tradable": False}},
+    )
+    bars = _bars("sh.600001", drift=0.003)
+    v1 = sector_service.SectorRotationService(classification, _BarsReader(bars))
+    v9 = sector_service.SectorRotationService(
+        classification,
+        _BarsReader(bars),
+        leader_policy=sector_service.LeaderPolicy(
+            qualification_version="research-leader-qualification-v9"
+        ),
+    )
+
+    leaders_v1 = v1.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+    leaders_v9 = v9.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert leaders_v1.status == leaders_v9.status == "degraded"
+    assert leaders_v1.candidates == leaders_v9.candidates == []
+    assert leaders_v1.result_id != leaders_v9.result_id
 
 
 def test_sector_score_ties_break_only_by_sector_id_even_with_different_sizes(

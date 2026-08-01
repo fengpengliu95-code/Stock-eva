@@ -134,46 +134,69 @@ class PublishedSnapshotDuckDbMarketReader:
             if pointer is None:
                 raise MarketReadUnavailable("market_publication_state_unavailable")
             pointer_run_id, pointer_date = pointer
-            audits = {}
 
-            def trusted_audit(run_id: str):
-                if run_id in audits:
-                    return audits[run_id]
-                row = connection.execute(
-                    f"""
-                    SELECT {_REFRESH_COLUMNS}
-                    FROM refresh_runs
-                    WHERE run_id = ?
-                    """,
-                    [run_id],
-                ).fetchone()
-                if row is None:
-                    raise MarketReadUnavailable("market_publication_state_unavailable")
-                try:
+            inventory = connection.execute(
+                """
+                SELECT
+                    trade_date,
+                    count(DISTINCT source) AS source_count,
+                    min(source) AS source,
+                    count(DISTINCT publication_run_id) AS run_count,
+                    min(publication_run_id) AS publication_run_id,
+                    count(*) AS row_count,
+                    count(DISTINCT symbol) AS symbol_count
+                FROM published_daily_bars
+                GROUP BY trade_date
+                ORDER BY trade_date
+                """
+            ).fetchall()
+            if not inventory:
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+            run_ids = sorted({row[4] for row in inventory})
+            audit_rows = connection.execute(
+                f"""
+                SELECT {_REFRESH_COLUMNS}
+                FROM refresh_runs
+                WHERE run_id = ANY(?)
+                """,
+                [run_ids],
+            ).fetchall()
+            audits = {}
+            try:
+                for row in audit_rows:
                     audit = MarketStore._refresh_result_from_row(row)
                     MarketStore._validate_ready_publication(audit)
-                except ValueError as exc:
-                    raise MarketReadUnavailable("market_publication_state_unavailable") from exc
-                audits[run_id] = audit
-                return audit
-
-            pointer_audit = trusted_audit(pointer_run_id)
-            if pointer_audit.requested_date != pointer_date or pointer_audit.source != "baostock":
+                    audits[audit.run_id] = audit
+            except (TypeError, ValueError) as exc:
+                raise MarketReadUnavailable("market_publication_state_unavailable") from exc
+            if set(audits) != set(run_ids):
                 raise MarketReadUnavailable("market_publication_state_unavailable")
-            pointer_rows = connection.execute(
-                """
-                SELECT publication_run_id, symbol
-                FROM published_daily_bars
-                WHERE source = 'baostock' AND trade_date = ?
-                """,
-                [pointer_date],
-            ).fetchall()
-            if (
-                not pointer_rows
-                or {row[0] for row in pointer_rows} != {pointer_run_id}
-                or len({row[1] for row in pointer_rows}) != pointer_audit.succeeded_count
-                or len(pointer_rows) != pointer_audit.succeeded_count
-            ):
+            for (
+                trade_date,
+                source_count,
+                source,
+                run_count,
+                run_id,
+                row_count,
+                symbol_count,
+            ) in inventory:
+                if (
+                    source_count != 1
+                    or source != "baostock"
+                    or run_count != 1
+                    or row_count != symbol_count
+                ):
+                    raise MarketReadUnavailable("market_publication_state_unavailable")
+                audit = audits[run_id]
+                if (
+                    audit.requested_date != trade_date
+                    or audit.source != source
+                    or row_count != audit.succeeded_count
+                ):
+                    raise MarketReadUnavailable("market_publication_state_unavailable")
+
+            latest_date, _, _, _, latest_run_id, _, _ = inventory[-1]
+            if pointer_date != latest_date or pointer_run_id != latest_run_id:
                 raise MarketReadUnavailable("market_publication_state_unavailable")
 
             published_as_of = min(as_of, pointer_date)
@@ -222,9 +245,11 @@ class PublishedSnapshotDuckDbMarketReader:
                 symbols = {row[1] for row in partition_rows}
                 if len(run_ids) != 1:
                     raise MarketReadUnavailable("market_publication_state_unavailable")
-                audit = trusted_audit(next(iter(run_ids)))
+                run_id = next(iter(run_ids))
+                audit = audits.get(run_id)
                 if (
-                    audit.requested_date != trade_date
+                    audit is None
+                    or audit.requested_date != trade_date
                     or audit.source != source
                     or len(symbols) != audit.succeeded_count
                     or len(partition_rows) != audit.succeeded_count

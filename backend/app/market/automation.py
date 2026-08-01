@@ -195,7 +195,9 @@ def _publication_issues(batch, required_symbols: set[str]) -> list[str]:
         if bar.security_type == "stock" and not bar.is_suspended and bar.adjust_factor is None
     )
     issues.extend(
-        f"quality_error:{bar.symbol}" for bar in batch.bars if bar.quality_status == "error"
+        f"invalid_publication_bar_quality:{bar.symbol}:{issue}"
+        for bar in batch.bars
+        if (issue := MarketStore.publication_bar_quality_issue(bar)) is not None
     )
     return list(dict.fromkeys(issues))
 

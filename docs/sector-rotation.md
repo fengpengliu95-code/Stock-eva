@@ -26,9 +26,18 @@ HTTP 按 `Asia/Shanghai` 日期在读取 store 前拒绝未来 `as_of`（422）�
 本地 DuckDB 发布采用一日一分区。`published_snapshots` pointer 和每个被读取的
 `published_daily_bars.publication_run_id` 都必须关联到 `refresh_runs` 中完整的
 `ready` audit：requested/succeeded 数相等、coverage 为 1、failed/quality issues
-为空，并与该分区日期、来源和唯一 symbol 数一致。partial/unpublished 同日重跑不能覆盖
-已发布分区；合法同日完整重跑只替换该日，历史分区保留。外部 Parquet 数据集继续由不可变
-manifest 和对象 checksum 承担同一信任边界。
+为空，并与该分区日期、来源和唯一 symbol 数一致。reader 会先审计未按 source 过滤的全部
+published 分区；当前只允许 `baostock`，未知 source、混合 run 或 source/run 篡改均失败
+关闭。pointer 必须指向全局最新 published 日期的唯一 run；历史 `as_of` 仍可读取旧分区，
+但不能借由回滚 pointer 隐藏更新分区。partial/unpublished 同日重跑不能覆盖已发布分区；合法
+同日完整重跑只替换该日，历史分区保留。外部 Parquet 数据集继续由不可变 manifest 和对象
+checksum 承担同一信任边界。
+
+完整发布还会在 store 边界交叉验证 bar 级质量：交易中证券必须
+`is_trading=true`、`is_suspended=false`、`quality_status=ready` 且无 quality issue；唯一允许的
+非交易占位是 `is_trading=false`、`is_suspended=true`、`quality_status=partial` 且 quality
+issue 精确为 `suspended_placeholder`。任何不一致在事务开始前拒绝，旧 pointer 和分区保持
+不变。
 
 当前 R1-A 尚无 live promoted classification generation，因此生产 readback 预期为
 `empty`。这不是用合成结果填充生产的理由。
@@ -129,5 +138,6 @@ R1-C 不猜测该输入：所有候选均返回
 - R1-C v1 因资金与范围边界不会借由量价证据升级成完整全市场 `ready` 结论。
 
 `result_id`、`ranking_id` 和 `candidate_id` 均由规范化输入、classification
-generation、market lineage、公式版本、资格版本和权重生成。分数相同的板块按 `sector_id`
-排序，分数相同的候选按 `symbol` 排序。
+generation、market lineage，以及完整 sector/leader policy（公式版本、资格版本、权重和
+coverage/ranking 门限）生成。policy identity 在 empty、无候选 degraded 和正常结果中都直接
+进入稳定 ID；分数相同的板块按 `sector_id` 排序，分数相同的候选按 `symbol` 排序。

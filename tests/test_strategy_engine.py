@@ -61,6 +61,7 @@ def save_history(store: MarketStore, bars: list[DailyBar]) -> None:
                 started_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
                 completed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
             ),
+            publish=False,
         )
 
 

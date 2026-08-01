@@ -171,6 +171,21 @@ class MarketStore:
             raise ValueError("ready publication must be complete")
 
     @staticmethod
+    def publication_bar_quality_issue(bar: DailyBar) -> str | None:
+        """Return why a canonical bar cannot belong to a complete publication."""
+        if bar.is_trading:
+            if bar.is_suspended:
+                return "active_bar_marked_suspended"
+            if bar.quality_status != "ready" or bar.quality_issues:
+                return "active_bar_not_ready"
+            return None
+        if not bar.is_suspended:
+            return "non_trading_bar_not_suspended"
+        if bar.quality_status != "partial" or bar.quality_issues != ["suspended_placeholder"]:
+            return "invalid_suspended_placeholder"
+        return None
+
+    @staticmethod
     def _validate_local_publication_bars(
         bars: list[DailyBar],
         result: RefreshResult,
@@ -187,6 +202,14 @@ class MarketStore:
         symbols = {bar.symbol for bar in bars}
         if len(symbols) != result.succeeded_count:
             raise ValueError("ready local publication count does not match refresh audit")
+        invalid = [
+            (bar.symbol, issue)
+            for bar in bars
+            if (issue := MarketStore.publication_bar_quality_issue(bar)) is not None
+        ]
+        if invalid:
+            symbol, issue = invalid[0]
+            raise ValueError(f"invalid ready publication bar {symbol}: {issue}")
 
     def _save_refresh(
         self,

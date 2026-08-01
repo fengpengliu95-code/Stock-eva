@@ -53,8 +53,19 @@ Release 1 verdict: **PENDING — do not claim GO**
 - Local DuckDB analysis reads only explicit daily `published_daily_bars` partitions. The
   current pointer and every selected partition must link to a complete ready refresh audit;
   missing/tampered status, coverage, run or partition count fails closed with structured 503.
+- The reader audits the complete unfiltered published partition inventory before applying the
+  BaoStock business filter. Unknown/mixed sources are rejected, and the pointer must reference
+  the unique run for the newest published date; a self-consistent rollback to an older run is
+  rejected while historical `as_of` replay remains available.
 - An incomplete fake-ready object is rejected again at the store boundary before deleting a
   same-day partition or moving the pointer. Complete same-day reruns preserve prior history.
+- A complete audit cannot publish an active partial/bad-quality bar. The only permitted
+  non-trading row is the explicit suspended placeholder contract; rejection occurs before any
+  transaction mutates the prior pointer or partition. Publication automation applies the same
+  bar-quality rule before declaring a run ready.
+- Stable IDs directly include the complete sector and leader policy identity. Sector/leader
+  empty results and no-candidate degraded leader results change when weights, formula versions
+  or the research-leader qualification version changes.
 - A real temporary DuckDB classification store and canonical market store were read through
   both APIs without changing either database or creating reader temp state.
 - No frontend, R2 fund-flow, portfolio, order, broker, deployment, network, NAS or user-data
@@ -93,17 +104,32 @@ uv run --extra dev pytest -o addopts='' -q \
   tests/test_sector_rotation.py::test_qualification_version_changes_candidate_sector_and_result_ids \
   tests/test_sector_rotation.py::test_sector_score_ties_break_only_by_sector_id_even_with_different_sizes
 # Repair GREEN: 13 passed in 0.74s.
+
+# Third independent-review repair RED: 6 failed and 1 passed. Active partial bars still
+# published, a valid old pointer rollback and a fully source-tampered historical partition were
+# accepted, and empty/no-candidate IDs reused the prior qualification/policy identity. The one
+# passing case confirmed the existing suspended-placeholder fixture remained readable.
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_automation.py::test_active_partial_bar_cannot_produce_ready_publication_or_move_pointer \
+  tests/test_sector_rotation.py::test_ready_publication_rejects_active_partial_bar_and_preserves_partition \
+  tests/test_sector_rotation.py::test_ready_publication_allows_explicit_suspended_placeholder \
+  tests/test_sector_rotation.py::test_published_reader_rejects_pointer_rollback_to_valid_older_partition \
+  tests/test_sector_rotation.py::test_published_reader_rejects_source_tampered_historical_partition \
+  tests/test_sector_rotation.py::test_empty_result_ids_include_complete_policy_identity \
+  tests/test_sector_rotation.py::test_no_candidate_degraded_leader_id_includes_qualification_version
+# Repair GREEN: 7 passed in 0.74s. Two additional malformed-placeholder cases also pass.
 ```
 
 ## Fresh verification
 
 ```text
 uv run --extra dev pytest -o addopts='' -q
-# 536 passed in 68.76s.
+# 545 passed in 65.52s.
 
 uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py --durations=5
-# 45 passed in 9.69s; the 3,000-symbol x 65-session representative-scale
-# leader-ranking case completed in 3.31s, below its 15s guardrail.
+# 53 passed in 9.58s; the 3,000-symbol x 65-session representative-scale
+# leader-ranking case completed in 3.21s, below its 15s guardrail.
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

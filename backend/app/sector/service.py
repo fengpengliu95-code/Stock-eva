@@ -148,6 +148,21 @@ class SectorRotationService:
         self.sector_policy = sector_policy or SectorPolicy()
         self.leader_policy = leader_policy or LeaderPolicy()
 
+    def _policy_identity(self) -> dict[str, object]:
+        return {
+            "sector": {
+                "formula_version": self.sector_policy.formula_version,
+                "weights": self.sector_policy.weights,
+                "minimum_member_coverage": self.sector_policy.minimum_member_coverage,
+                "minimum_rank_members": self.sector_policy.minimum_rank_members,
+            },
+            "leader": {
+                "formula_version": self.leader_policy.formula_version,
+                "qualification_version": self.leader_policy.qualification_version,
+                "weights": self.leader_policy.weights,
+            },
+        }
+
     def rotation(self, as_of: date, taxonomy_id: str) -> SectorRotationResponse:
         context = self._read_context(as_of, taxonomy_id)
         if context.classification_lineage is None:
@@ -211,6 +226,7 @@ class SectorRotationService:
                 "rankings": rankings,
                 "formula_version": self.sector_policy.formula_version,
                 "weights": self.sector_policy.weights,
+                "policies": self._policy_identity(),
             },
         )
         return SectorRotationResponse(
@@ -297,6 +313,7 @@ class SectorRotationService:
                 "exclusions": exclusions,
                 "formula_version": self.leader_policy.formula_version,
                 "weights": self.leader_policy.weights,
+                "policies": self._policy_identity(),
             },
         )
         return LeaderRankingResponse(
@@ -553,6 +570,7 @@ class SectorRotationService:
                 "formula_version": self.sector_policy.formula_version,
                 "weights": self.sector_policy.weights,
                 "leader_qualification_version": self.leader_policy.qualification_version,
+                "policies": self._policy_identity(),
             },
         )
         ranking_exclusion_reasons = []
@@ -1198,6 +1216,7 @@ class SectorRotationService:
                 "leader_qualified": qualified,
                 "qualification_reasons": qualification_reasons,
                 "disqualification_reasons": disqualification_reasons,
+                "policies": self._policy_identity(),
             },
         )
         security = context.securities[member.security_id]
@@ -1249,6 +1268,7 @@ class SectorRotationService:
                 "missing_inputs": missing,
                 "quality_issues": issues,
                 "formula_version": self.sector_policy.formula_version,
+                "policies": self._policy_identity(),
             },
         )
         return SectorRotationResponse(
