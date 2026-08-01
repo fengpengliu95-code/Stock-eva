@@ -7,14 +7,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.app.classification.store import ClassificationStore
 from backend.app.config import Settings, get_settings
 from backend.app.regime.store import (
+    MarketReadUnavailable,
     PublishedDatasetMarketReader,
-    ReadOnlyDuckDbMarketReader,
+    PublishedSnapshotDuckDbMarketReader,
 )
 from backend.app.sector.models import (
     LeaderRankingResponse,
     SectorRotationResponse,
 )
 from backend.app.sector.service import (
+    ClassificationStorageUnavailableError,
     SectorRotationService,
     UnknownTaxonomyError,
 )
@@ -47,7 +49,7 @@ def get_sector_rotation_service(
     layout = StorageLayout(settings)
     dataset_root = configured_market_dataset_root(settings)
     if dataset_root is None:
-        reader = ReadOnlyDuckDbMarketReader(layout.local_paths.market_database)
+        reader = PublishedSnapshotDuckDbMarketReader(layout.local_paths.market_database)
     else:
         reader = PublishedDatasetMarketReader(
             control_path=layout.local_paths.market_database,
@@ -70,6 +72,16 @@ def _unknown_taxonomy(exc: UnknownTaxonomyError) -> HTTPException:
     )
 
 
+def _analysis_storage_unavailable(code: str) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": code,
+            "storage_status": "unavailable",
+        },
+    )
+
+
 @router.get(
     "/sector-rotation",
     response_model=SectorRotationResponse,
@@ -88,6 +100,10 @@ def sector_rotation(
         return service.rotation(as_of, taxonomy_id)
     except UnknownTaxonomyError as exc:
         raise _unknown_taxonomy(exc) from exc
+    except ClassificationStorageUnavailableError as exc:
+        raise _analysis_storage_unavailable("classification_storage_unavailable") from exc
+    except MarketReadUnavailable as exc:
+        raise _analysis_storage_unavailable(exc.code) from exc
 
 
 @router.get(
@@ -109,3 +125,7 @@ def sector_leaders(
         return service.leaders(as_of, taxonomy_id, sector_id)
     except UnknownTaxonomyError as exc:
         raise _unknown_taxonomy(exc) from exc
+    except ClassificationStorageUnavailableError as exc:
+        raise _analysis_storage_unavailable("classification_storage_unavailable") from exc
+    except MarketReadUnavailable as exc:
+        raise _analysis_storage_unavailable(exc.code) from exc

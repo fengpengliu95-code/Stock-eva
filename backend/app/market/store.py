@@ -82,6 +82,38 @@ class MarketStore:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS published_daily_bars (
+                publication_run_id VARCHAR NOT NULL,
+                trade_date DATE NOT NULL,
+                symbol VARCHAR NOT NULL,
+                security_type VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                board VARCHAR NOT NULL,
+                open DOUBLE NOT NULL,
+                high DOUBLE NOT NULL,
+                low DOUBLE NOT NULL,
+                close DOUBLE NOT NULL,
+                preclose DOUBLE NOT NULL,
+                volume DOUBLE NOT NULL,
+                amount DOUBLE NOT NULL,
+                turnover_rate DOUBLE,
+                pct_change DOUBLE,
+                adjust_factor DOUBLE,
+                price_adjustment VARCHAR NOT NULL,
+                is_trading BOOLEAN NOT NULL,
+                is_suspended BOOLEAN NOT NULL,
+                is_st BOOLEAN NOT NULL,
+                source VARCHAR NOT NULL,
+                source_record_id VARCHAR NOT NULL,
+                ingested_at TIMESTAMPTZ NOT NULL,
+                quality_status VARCHAR NOT NULL,
+                quality_issues JSON NOT NULL,
+                PRIMARY KEY (trade_date, symbol, source)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS market_automation_state (
                 singleton INTEGER PRIMARY KEY,
                 target_session DATE,
@@ -125,6 +157,12 @@ class MarketStore:
         try:
             connection.begin()
             self._upsert_bars(connection, bars)
+            if publish and bars:
+                self._replace_published_bars(
+                    connection,
+                    bars,
+                    publication_run_id=result.run_id,
+                )
             connection.execute("DELETE FROM refresh_runs WHERE run_id = ?", [result.run_id])
             connection.execute(
                 """
@@ -221,6 +259,67 @@ class MarketStore:
                 unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
                 unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
                 unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?)
+            """,
+            columns,
+        )
+
+    @staticmethod
+    def _replace_published_bars(
+        connection: duckdb.DuckDBPyConnection,
+        bars: list[DailyBar],
+        *,
+        publication_run_id: str,
+    ) -> None:
+        deduplicated = {(bar.trade_date, bar.symbol, bar.source): bar for bar in bars}
+        touched_partitions = sorted({(bar.trade_date, bar.source) for bar in deduplicated.values()})
+        for trade_date, source in touched_partitions:
+            connection.execute(
+                """
+                DELETE FROM published_daily_bars
+                WHERE trade_date = ? AND source = ?
+                """,
+                [trade_date, source],
+            )
+        rows = [
+            [
+                publication_run_id,
+                bar.trade_date,
+                bar.symbol,
+                bar.security_type,
+                bar.exchange,
+                bar.board,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.preclose,
+                bar.volume,
+                bar.amount,
+                bar.turnover_rate,
+                bar.pct_change,
+                bar.adjust_factor,
+                bar.price_adjustment,
+                bar.is_trading,
+                bar.is_suspended,
+                bar.is_st,
+                bar.source,
+                bar.source_record_id,
+                bar.ingested_at,
+                bar.quality_status,
+                json.dumps(bar.quality_issues, ensure_ascii=False),
+            ]
+            for bar in deduplicated.values()
+        ]
+        columns = [list(column) for column in zip(*rows, strict=True)]
+        connection.execute(
+            """
+            INSERT INTO published_daily_bars
+            SELECT
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?), unnest(?), unnest(?), unnest(?), unnest(?), unnest(?),
+                unnest(?)
             """,
             columns,
         )

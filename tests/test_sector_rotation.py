@@ -1,8 +1,10 @@
 import asyncio
+import time
 from datetime import UTC, date, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
 
+import duckdb
 import httpx
 import pytest
 
@@ -15,7 +17,7 @@ from backend.app.classification.models import (
 from backend.app.classification.store import ClassificationReadSnapshot, ClassificationStore
 from backend.app.config import Settings
 from backend.app.main import app
-from backend.app.market.models import DailyBar
+from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
 
 AS_OF = date(2026, 1, 31)
@@ -207,6 +209,27 @@ def _bars(
     return rows
 
 
+def _refresh(
+    run_id: str,
+    requested_date: date,
+    *,
+    status: str = "ready",
+    count: int = 1,
+) -> RefreshResult:
+    return RefreshResult(
+        run_id=run_id,
+        requested_date=requested_date,
+        source="baostock",
+        status=status,
+        requested_count=count,
+        succeeded_count=count if status == "ready" else 0,
+        coverage_ratio=1 if status == "ready" else 0,
+        quality_issues=[] if status == "ready" else ["fixture_incomplete"],
+        started_at=datetime.combine(requested_date, datetime.min.time(), tzinfo=UTC),
+        completed_at=datetime.combine(requested_date, datetime.min.time(), tzinfo=UTC),
+    )
+
+
 class _BarsReader:
     def __init__(self, bars: list[DailyBar]) -> None:
         self.bars = bars
@@ -289,6 +312,9 @@ def test_sector_ranking_exposes_v1_metrics_reasons_and_missing_flow(
         "turnover_concentration_top3",
         "persistence_days",
         "cross_section_dispersion",
+        "leader_count",
+        "leader_diffusion",
+        "leader_persistence_days",
     }
     assert all(item.formula_version for item in growth.metric_scores)
     assert all(item.raw_value is not None for item in growth.metric_scores)
@@ -857,10 +883,15 @@ def test_real_duckdb_stores_integrate_through_read_only_api(
     assert promoted is True
     assert classification.ready_generation() == generation_id
     market_database = market_dir / "market.duckdb"
+    integration_bars = _bars("sh.600001", drift=0.003)
     MarketStore(
         market_database,
         temp_directory=tmp_path / "writer-temp",
-    ).upsert_bars(_bars("sh.600001", drift=0.003))
+    ).save_refresh(
+        integration_bars,
+        _refresh("integration-published", AS_OF, count=len(integration_bars)),
+        publish=True,
+    )
     settings = Settings(
         market_data_dir=market_dir,
         market_database_name=market_database.name,
@@ -900,3 +931,552 @@ def test_real_duckdb_stores_integrate_through_read_only_api(
     assert (market_dir / "classification.duckdb").read_bytes() == classification_before
     assert market_database.read_bytes() == market_before
     assert not settings.local_temp_dir.exists()
+
+
+def test_r1c_reads_only_published_rows_after_same_day_partial_overwrite(
+    tmp_path: Path,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    market_dir = tmp_path / "market"
+    _publish_classification(
+        market_dir / "classification.duckdb",
+        {"sh.600001": "growth", "sh.600002": "growth"},
+    )
+    market_database = market_dir / "market.duckdb"
+    store = MarketStore(market_database, temp_directory=tmp_path / "writer-temp")
+    published = [
+        *_bars("sh.600001", drift=0.006, amount_drift=0.01),
+        *_bars("sh.600002", drift=0.002),
+    ]
+    store.save_refresh(
+        published,
+        _refresh("published", AS_OF, count=len(published)),
+        publish=True,
+    )
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name=market_database.name,
+        classification_database_name="classification.duckdb",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+    before = sector_api.get_sector_rotation_service(settings)
+    rotation_before = before.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders_before = before.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    poisoned = published[-1].model_copy(
+        update={
+            "close": published[-1].close + 999,
+            "quality_status": "partial",
+            "quality_issues": ["fixture_partial"],
+        }
+    )
+    store.save_refresh(
+        [poisoned],
+        _refresh("partial", AS_OF, status="partial"),
+        publish=False,
+    )
+    after = sector_api.get_sector_rotation_service(settings)
+    rotation_after = after.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders_after = after.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert rotation_after.result_id == rotation_before.result_id
+    assert rotation_after.market_lineage == rotation_before.market_lineage
+    assert leaders_after.result_id == leaders_before.result_id
+
+
+def test_historical_partial_never_becomes_published_after_later_pointer(
+    tmp_path: Path,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    old_date = AS_OF - timedelta(days=2)
+    partial_date = AS_OF - timedelta(days=1)
+    market_dir = tmp_path / "market"
+    _publish_classification(
+        market_dir / "classification.duckdb",
+        {"sh.600001": "growth"},
+    )
+    market_database = market_dir / "market.duckdb"
+    store = MarketStore(market_database, temp_directory=tmp_path / "writer-temp")
+    old_bars = _bars("sh.600001", drift=0.003, end=old_date)
+    store.save_refresh(
+        old_bars,
+        _refresh("old-published", old_date, count=len(old_bars)),
+        publish=True,
+    )
+    store.save_refresh(
+        _bars("sh.600001", drift=0.5, count=1, end=partial_date),
+        _refresh("historical-partial", partial_date, status="partial"),
+        publish=False,
+    )
+    store.save_refresh(
+        _bars("sh.600001", drift=0.004, count=1, end=AS_OF),
+        _refresh("later-published", AS_OF),
+        publish=True,
+    )
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name=market_database.name,
+        classification_database_name="classification.duckdb",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    result = sector_api.get_sector_rotation_service(settings).rotation(
+        partial_date,
+        TAXONOMY_BAOSTOCK_INDUSTRY,
+    )
+
+    assert result.data_as_of == old_date
+    assert result.market_lineage.latest_input_date == old_date
+
+
+def test_existing_unpublished_market_database_fails_closed_with_structured_503(
+    tmp_path: Path,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    market_dir = tmp_path / "market"
+    _publish_classification(
+        market_dir / "classification.duckdb",
+        {"sh.600001": "growth"},
+    )
+    MarketStore(market_dir / "market.duckdb").upsert_bars(_bars("sh.600001", drift=0.003))
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name="market.duckdb",
+        classification_database_name="classification.duckdb",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    response = _api_get(
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
+        {
+            sector_api.get_sector_rotation_service: lambda: sector_api.get_sector_rotation_service(
+                settings
+            ),
+            sector_api.get_sector_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "market_publication_state_unavailable"
+
+
+def test_real_provider_shape_with_unverified_classification_price_can_rank(
+    tmp_path: Path,
+) -> None:
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth", "sh.600002": "growth"},
+        [
+            *_bars("sh.600001", drift=0.006, amount_drift=0.01),
+            *_bars("sh.600002", drift=0.002),
+        ],
+        security_overrides={
+            "sh.600001": {"price_available": None},
+            "sh.600002": {"price_available": None},
+        },
+    )
+
+    result = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert {item.symbol for item in result.candidates} == {
+        "sh.600001",
+        "sh.600002",
+    }
+    assert all(
+        "classification_price_not_verified" not in item.reasons for item in result.exclusions
+    )
+
+
+def test_low_horizon_member_coverage_is_missing_and_not_rank_eligible(
+    tmp_path: Path,
+) -> None:
+    symbols = [f"sh.{600100 + index:06d}" for index in range(10)]
+    bars = [
+        *_bars(symbols[0], drift=0.006),
+        *[_bars(symbol, drift=0.002, count=1)[0] for symbol in symbols[1:]],
+    ]
+    service, _, _ = _service(
+        tmp_path,
+        {symbol: "thin-history" for symbol in symbols},
+        bars,
+    )
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    ranking = result.rankings[0]
+    metrics = {item.metric: item for item in ranking.metric_scores}
+
+    for name in (
+        "relative_strength_60d",
+        "above_ma60_breadth",
+        "turnover_change_20d",
+    ):
+        assert metrics[name].effective_count == 1
+        assert metrics[name].target_count == 10
+        assert metrics[name].coverage_ratio == 0.1
+        assert metrics[name].quality_status == "missing"
+        assert metrics[name].score is None
+    assert ranking.ranking_eligible is False
+    assert ranking.total_score is None
+    assert "sector.insufficient_comparable_member_coverage" in ranking.quality_issues
+
+
+def test_non_main_update_does_not_advance_sector_data_as_of(
+    tmp_path: Path,
+) -> None:
+    main_as_of = AS_OF - timedelta(days=1)
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth"},
+        [
+            *_bars("sh.600001", drift=0.003, end=main_as_of),
+            *_bars("sz.300001", drift=0.02, count=1, board="chinext"),
+        ],
+    )
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+
+    assert result.data_as_of == main_as_of
+    assert result.market_lineage.latest_input_date == main_as_of
+    assert "non_main_rows_after_data_as_of_excluded" in result.quality_issues
+
+
+def test_market_lineage_hashes_semantic_filter_fields_and_changes_result_id(
+    tmp_path: Path,
+) -> None:
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth"},
+        _bars("sh.600001", drift=0.003),
+    )
+    ready = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    changed_bars = _bars("sh.600001", drift=0.003)
+    changed_bars[-1] = changed_bars[-1].model_copy(update={"is_trading": False})
+    changed_service, _, _ = _service(
+        tmp_path / "changed",
+        {"sh.600001": "growth"},
+        changed_bars,
+    )
+    changed = changed_service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+
+    assert ready.market_lineage.content_hash != changed.market_lineage.content_hash
+    assert ready.result_id != changed.result_id
+
+
+def test_formula_version_drives_response_and_all_stable_ids(tmp_path: Path) -> None:
+    sector_service = import_module("backend.app.sector.service")
+    classification, _, _ = _publish_classification(
+        tmp_path / "classification.duckdb",
+        {"sh.600001": "growth", "sh.600002": "growth"},
+    )
+    bars = [
+        *_bars("sh.600001", drift=0.006, amount_drift=0.01),
+        *_bars("sh.600002", drift=0.002),
+    ]
+    v1 = sector_service.SectorRotationService(
+        classification,
+        _BarsReader(bars),
+    )
+    v9 = sector_service.SectorRotationService(
+        classification,
+        _BarsReader(bars),
+        sector_policy=sector_service.SectorPolicy(formula_version="sector-rotation-v9"),
+        leader_policy=sector_service.LeaderPolicy(formula_version="leader-ranking-v9"),
+    )
+
+    rotation_v1 = v1.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation_v9 = v9.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders_v1 = v1.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+    leaders_v9 = v9.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert rotation_v9.formula_version == "sector-rotation-v9"
+    assert leaders_v9.formula_version == "leader-ranking-v9"
+    assert rotation_v1.result_id != rotation_v9.result_id
+    assert rotation_v1.rankings[0].ranking_id != rotation_v9.rankings[0].ranking_id
+    assert leaders_v1.result_id != leaders_v9.result_id
+    assert leaders_v1.candidates[0].candidate_id != leaders_v9.candidates[0].candidate_id
+
+
+def test_sector_leadership_metrics_and_research_qualification_are_explicit(
+    tmp_path: Path,
+) -> None:
+    service, _, _ = _service(
+        tmp_path,
+        {
+            "sh.600001": "growth",
+            "sh.600002": "growth",
+            "sh.600003": "growth",
+        },
+        [
+            *_bars("sh.600001", drift=0.008, amount_drift=0.02),
+            *_bars("sh.600002", drift=0.004, amount_drift=0.01),
+            *_bars("sh.600003", drift=-0.002),
+            *_bars("sz.000999", drift=0.001),
+        ],
+    )
+
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    metrics = {item.metric: item for item in rotation.rankings[0].metric_scores}
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert {"leader_count", "leader_diffusion", "leader_persistence_days"} <= set(metrics)
+    assert metrics["leader_count"].raw_value >= 1
+    assert metrics["leader_diffusion"].raw_value > 0
+    assert metrics["leader_persistence_days"].raw_value is not None
+    assert any(item.leader_qualified for item in leaders.candidates)
+    assert all(item.actionable_primary is False for item in leaders.candidates)
+    assert all(item.limit_lock_status == "unavailable" for item in leaders.candidates)
+    assert all(item.qualification_version for item in leaders.candidates)
+
+
+def test_requested_unverified_classification_provenance_is_degraded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "classification.duckdb"
+    securities = [
+        _security("sh.600001").model_copy(update={"source_date_semantics": "requested_unverified"})
+    ]
+    memberships = [
+        _membership("sh.600001", "growth").model_copy(
+            update={"source_date_semantics": "requested_unverified"}
+        )
+    ]
+    store = ClassificationStore(path)
+    outcome = store.publish(
+        ClassificationSnapshot(
+            source="baostock",
+            source_version="0.9.3",
+            source_snapshot_date=CLASSIFICATION_DATE,
+            source_date_semantics="requested_unverified",
+            observed_at=OBSERVED_AT,
+            securities=securities,
+            sector_memberships=memberships,
+        )
+    )
+    assert outcome.promoted is True
+    sector_service = import_module("backend.app.sector.service")
+    service = sector_service.SectorRotationService(
+        store,
+        _BarsReader(_bars("sh.600001", drift=0.003)),
+    )
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+
+    assert result.classification_lineage.source_date_semantics == "requested_unverified"
+    assert "classification_source_date_requested_unverified" in result.quality_issues
+    assert result.status == "degraded"
+
+
+def test_extreme_amount_aggregation_fails_closed_without_500(
+    tmp_path: Path,
+) -> None:
+    huge = 1.7e308
+    service, _, _ = _service(
+        tmp_path,
+        {"sh.600001": "growth", "sh.600002": "growth"},
+        [
+            *_bars("sh.600001", drift=0.003, amount=huge),
+            *_bars("sh.600002", drift=0.002, amount=huge),
+        ],
+    )
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    metrics = {item.metric: item for item in result.rankings[0].metric_scores}
+
+    assert metrics["turnover_change_5d"].score is None
+    assert metrics["turnover_change_20d"].score is None
+    assert metrics["turnover_concentration_top3"].score is None
+    assert "sector.turnover_non_finite" in result.rankings[0].quality_issues
+
+
+@pytest.mark.parametrize(
+    ("database", "expected_code"),
+    [
+        ("classification", "classification_storage_unavailable"),
+        ("market", "market_storage_unavailable"),
+    ],
+)
+def test_corrupt_analysis_database_returns_stable_structured_503(
+    tmp_path: Path,
+    database: str,
+    expected_code: str,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    market_dir = tmp_path / "market"
+    if database == "classification":
+        market_dir.mkdir(parents=True)
+        (market_dir / "classification.duckdb").write_bytes(b"not-a-duckdb")
+    else:
+        _publish_classification(
+            market_dir / "classification.duckdb",
+            {"sh.600001": "growth"},
+        )
+        (market_dir / "market.duckdb").write_bytes(b"not-a-duckdb")
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name="market.duckdb",
+        classification_database_name="classification.duckdb",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    response = _api_get(
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
+        {
+            sector_api.get_sector_rotation_service: lambda: sector_api.get_sector_rotation_service(
+                settings
+            ),
+            sector_api.get_sector_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    ("database", "expected_code"),
+    [
+        ("classification", "classification_storage_unavailable"),
+        ("market", "market_storage_unavailable"),
+    ],
+)
+def test_semantically_corrupt_analysis_rows_return_structured_503(
+    tmp_path: Path,
+    database: str,
+    expected_code: str,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    market_dir = tmp_path / "market"
+    classification_path = market_dir / "classification.duckdb"
+    _publish_classification(classification_path, {"sh.600001": "growth"})
+    market_path = market_dir / "market.duckdb"
+    bars = _bars("sh.600001", drift=0.003)
+    MarketStore(market_path).save_refresh(
+        bars,
+        _refresh("published", AS_OF, count=len(bars)),
+        publish=True,
+    )
+    target = classification_path if database == "classification" else market_path
+    connection = duckdb.connect(str(target))
+    try:
+        if database == "classification":
+            connection.execute("UPDATE classification_generations SET coverage_audits = '[{}]'")
+        else:
+            connection.execute("UPDATE published_daily_bars SET quality_issues = '{}'")
+    finally:
+        connection.close()
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name=market_path.name,
+        classification_database_name=classification_path.name,
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "reader-temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    response = _api_get(
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
+        {
+            sector_api.get_sector_rotation_service: lambda: sector_api.get_sector_rotation_service(
+                settings
+            ),
+            sector_api.get_sector_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == expected_code
+
+
+def test_leader_ranking_representative_scale_has_stable_runtime_budget(
+    tmp_path: Path,
+) -> None:
+    sector_service = import_module("backend.app.sector.service")
+    symbols = [f"sh.{600000 + index:06d}" for index in range(3000)]
+    securities = [_security(symbol) for symbol in symbols]
+    memberships = [_membership(symbol, "market") for symbol in symbols]
+    generation = import_module("backend.app.classification.models").GenerationSummary(
+        generation_id="fixture-generation",
+        sequence=1,
+        source="baostock",
+        source_version="0.9.3",
+        source_snapshot_date=CLASSIFICATION_DATE,
+        observed_at=OBSERVED_AT,
+        row_counts={"securities": len(symbols), "sector_memberships": len(symbols)},
+        coverage_audits=[
+            import_module("backend.app.classification.models").CoverageAudit(
+                status="ready",
+                as_of=CLASSIFICATION_DATE,
+                generation_id="fixture-generation",
+                taxonomy_id=TAXONOMY_BAOSTOCK_INDUSTRY,
+                eligible_count=len(symbols),
+                mapped_count=len(symbols),
+                coverage_ratio=1,
+                unmapped_symbols=[],
+                exclusion_reasons={},
+                source_lineage=[],
+            )
+        ],
+        market_scope=import_module("backend.app.classification.store").market_scope(securities),
+    )
+
+    class SnapshotStore:
+        def read_snapshot(self, *_args, **_kwargs):
+            return ClassificationReadSnapshot(
+                ready_generation_id=generation.generation_id,
+                generation=generation,
+                securities=securities,
+                security_snapshot_date=CLASSIFICATION_DATE,
+                index_components=[],
+                index_snapshot_date=None,
+                sector_memberships=memberships,
+                sector_snapshot_date=CLASSIFICATION_DATE,
+            )
+
+    bars = [
+        bar
+        for index, symbol in enumerate(symbols)
+        for bar in _bars(
+            symbol,
+            drift=0.001 + (index % 7) * 0.0001,
+            amount_drift=0.001,
+        )
+    ]
+    service = sector_service.SectorRotationService(SnapshotStore(), _BarsReader(bars))
+
+    started = time.perf_counter()
+    result = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "market")
+    elapsed = time.perf_counter() - started
+
+    assert len(result.candidates) == 3000
+    assert elapsed < 15

@@ -17,6 +17,7 @@ class ClassificationLineage(SectorModel):
     source: str
     source_version: str
     source_snapshot_date: date
+    source_date_semantics: Literal["source_observed", "requested_unverified"]
     taxonomy_id: str
     coverage_ratio: float = Field(ge=0, le=1)
 
@@ -77,6 +78,9 @@ class MetricScore(SectorModel):
     weighted_score: float | None
     formula_version: str
     quality_status: MetricQuality
+    effective_count: int | None = Field(default=None, ge=0)
+    target_count: int | None = Field(default=None, ge=0)
+    coverage_ratio: float | None = Field(default=None, ge=0, le=1)
     missing_inputs: list[str] = Field(default_factory=list)
     quality_issues: list[str] = Field(default_factory=list)
 
@@ -96,6 +100,8 @@ class SectorRanking(SectorModel):
     sector_name: str
     member_count: int = Field(ge=0)
     priced_member_count: int = Field(ge=0)
+    ranking_eligible: bool
+    ranking_exclusion_reasons: list[str] = Field(default_factory=list)
     total_score: float | None = Field(default=None, ge=-100, le=100)
     confidence: Confidence
     metric_scores: list[MetricScore]
@@ -121,6 +127,10 @@ class LeaderCandidate(SectorModel):
     actionable_primary: Literal[False] = False
     actionability_status: Literal["risk_inputs_unavailable"] = "risk_inputs_unavailable"
     limit_lock_status: Literal["unavailable"] = "unavailable"
+    leader_qualified: bool
+    qualification_version: str
+    qualification_reasons: list[str] = Field(default_factory=list)
+    disqualification_reasons: list[str] = Field(default_factory=list)
     metric_scores: list[MetricScore]
     supporting_evidence: list[EvidenceReason]
     contrary_evidence: list[EvidenceReason]
@@ -131,7 +141,7 @@ class LeaderCandidate(SectorModel):
 
 class SectorRotationResponse(SectorModel):
     result_id: str
-    formula_version: Literal["sector-rotation-v1"] = "sector-rotation-v1"
+    formula_version: str = Field(min_length=1)
     status: AnalysisStatus
     quality_status: AnalysisStatus
     as_of: date
@@ -161,7 +171,7 @@ class SectorRotationResponse(SectorModel):
 
 class LeaderRankingResponse(SectorModel):
     result_id: str
-    formula_version: Literal["leader-ranking-v1"] = "leader-ranking-v1"
+    formula_version: str = Field(min_length=1)
     status: AnalysisStatus
     quality_status: AnalysisStatus
     as_of: date

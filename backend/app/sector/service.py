@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from statistics import fmean, pstdev
 
+import duckdb
+
 from backend.app.classification.models import (
     TAXONOMY_BAOSTOCK_INDUSTRY,
     GenerationSummary,
@@ -40,9 +42,14 @@ SECTOR_LOOKBACK_SESSIONS = 80
 FUND_FLOW_MISSING = "fund_flow.r2_evidence_not_integrated"
 NARROW_SCOPE_ISSUE = "narrow_main_board_scope_not_full_a_share"
 LIMIT_LOCK_MISSING = "leader.limit_lock_status"
+LEADER_QUALIFICATION_VERSION = "research-leader-qualification-v1"
 
 
 class UnknownTaxonomyError(ValueError):
+    pass
+
+
+class ClassificationStorageUnavailableError(RuntimeError):
     pass
 
 
@@ -51,19 +58,24 @@ class SectorPolicy:
     formula_version: str = "sector-rotation-v1"
     weights: dict[str, float] = field(
         default_factory=lambda: {
-            "relative_strength_5d": 0.10,
-            "relative_strength_20d": 0.15,
-            "relative_strength_60d": 0.15,
-            "advancing_breadth": 0.10,
-            "above_ma20_breadth": 0.10,
-            "above_ma60_breadth": 0.10,
-            "turnover_change_5d": 0.05,
-            "turnover_change_20d": 0.05,
-            "turnover_concentration_top3": 0.05,
-            "persistence_days": 0.10,
-            "cross_section_dispersion": 0.05,
+            "relative_strength_5d": 0.08,
+            "relative_strength_20d": 0.12,
+            "relative_strength_60d": 0.12,
+            "advancing_breadth": 0.08,
+            "above_ma20_breadth": 0.08,
+            "above_ma60_breadth": 0.08,
+            "turnover_change_5d": 0.04,
+            "turnover_change_20d": 0.04,
+            "turnover_concentration_top3": 0.04,
+            "persistence_days": 0.08,
+            "cross_section_dispersion": 0.04,
+            "leader_count": 0.05,
+            "leader_diffusion": 0.10,
+            "leader_persistence_days": 0.05,
         }
     )
+    minimum_member_coverage: float = 0.8
+    minimum_rank_members: int = 2
 
 
 @dataclass(frozen=True)
@@ -92,11 +104,31 @@ class _Context:
     securities: dict[str, SecurityMasterRecord]
     memberships: list[SectorMembershipRecord]
     histories: dict[str, list[DailyBar]]
+    cache: "_MarketCache"
     raw_current: dict[str, DailyBar]
     market_lineage: MarketLineage | None
     classification_lineage: ClassificationLineage | None
     actual_scope: ActualSectorScope
     quality_issues: list[str]
+
+
+@dataclass(frozen=True)
+class _MarketCache:
+    valid_histories: dict[str, list[DailyBar]]
+    adjusted_closes: dict[str, list[float]]
+    period_returns: dict[int, dict[str, float]]
+    benchmark_period_returns: dict[int, float | None]
+    daily_returns: dict[str, dict[date, float]]
+    market_daily_returns: dict[date, float]
+    current_returns: dict[str, float]
+
+
+@dataclass(frozen=True)
+class _SectorCache:
+    symbols: tuple[str, ...]
+    daily_returns: dict[date, float]
+    current_mean: float | None
+    return_counts: dict[int, int]
 
 
 class SectorRotationService:
@@ -141,6 +173,7 @@ class SectorRotationService:
             key=lambda item: (
                 item.total_score is None,
                 -(item.total_score or 0),
+                -item.priced_member_count,
                 item.sector_id,
             )
         )
@@ -171,11 +204,13 @@ class SectorRotationService:
                 "classification": context.classification_lineage,
                 "market": context.market_lineage,
                 "rankings": rankings,
+                "formula_version": self.sector_policy.formula_version,
                 "weights": self.sector_policy.weights,
             },
         )
         return SectorRotationResponse(
             result_id=result_id,
+            formula_version=self.sector_policy.formula_version,
             status=status,
             quality_status=status,
             as_of=as_of,
@@ -199,6 +234,7 @@ class SectorRotationService:
         context = self._read_context(as_of, taxonomy_id)
         sector_members = [item for item in context.memberships if item.sector_id == sector_id]
         sector_name = sector_members[0].sector_name if sector_members else None
+        sector_cache = self._sector_cache(context, sector_members)
         candidates: list[LeaderCandidate] = []
         exclusions: list[LeaderExclusion] = []
         if context.classification_lineage is not None and context.data_as_of is not None:
@@ -209,7 +245,7 @@ class SectorRotationService:
                         LeaderExclusion(symbol=member.symbol, reasons=sorted(set(reasons)))
                     )
                     continue
-                candidates.append(self._leader_candidate(context, member, sector_members))
+                candidates.append(self._leader_candidate(context, member, sector_cache))
         candidates.sort(
             key=lambda item: (
                 item.total_score is None,
@@ -254,11 +290,13 @@ class SectorRotationService:
                 "market": context.market_lineage,
                 "candidates": candidates,
                 "exclusions": exclusions,
+                "formula_version": self.leader_policy.formula_version,
                 "weights": self.leader_policy.weights,
             },
         )
         return LeaderRankingResponse(
             result_id=result_id,
+            formula_version=self.leader_policy.formula_version,
             status=status,
             quality_status=status,
             as_of=as_of,
@@ -277,31 +315,42 @@ class SectorRotationService:
         )
 
     def _read_context(self, as_of: date, taxonomy_id: str) -> _Context:
-        selected = self.classification_store.read_snapshot(
-            as_of,
-            include_securities=True,
-            taxonomy_id=taxonomy_id,
-        )
+        try:
+            selected = self.classification_store.read_snapshot(
+                as_of,
+                include_securities=True,
+                taxonomy_id=taxonomy_id,
+            )
+        except (duckdb.Error, OSError, TypeError, ValueError) as exc:
+            raise ClassificationStorageUnavailableError from exc
         raw_bars = self.market_reader.bars_through(
             as_of,
             max_sessions=SECTOR_LOOKBACK_SESSIONS,
         )
         future_bars = [bar for bar in raw_bars if bar.trade_date > as_of]
         bars = [bar for bar in raw_bars if bar.trade_date <= as_of]
-        dates = sorted({bar.trade_date for bar in bars})
-        if len(dates) > SECTOR_LOOKBACK_SESSIONS:
-            allowed = set(dates[-SECTOR_LOOKBACK_SESSIONS:])
+        trusted_main_dates = sorted({bar.trade_date for bar in bars if _usable_bar(bar)})
+        data_as_of = trusted_main_dates[-1] if trusted_main_dates else None
+        later_out_of_scope = data_as_of is not None and any(
+            bar.trade_date > data_as_of for bar in bars
+        )
+        if data_as_of is not None:
+            allowed = set(trusted_main_dates[-SECTOR_LOOKBACK_SESSIONS:])
             bars = [bar for bar in bars if bar.trade_date in allowed]
-            dates = dates[-SECTOR_LOOKBACK_SESSIONS:]
-        data_as_of = dates[-1] if dates else None
+        else:
+            bars = []
         quality_issues = []
         if future_bars:
             quality_issues.append("future_market_rows_discarded")
+        if later_out_of_scope:
+            quality_issues.append("non_main_rows_after_data_as_of_excluded")
         if data_as_of is not None and data_as_of < as_of:
             quality_issues.append("market_data_stale_for_requested_as_of")
 
         generation = selected.generation
         self._ensure_taxonomy(taxonomy_id, generation)
+        if generation is not None and generation.source_date_semantics == "requested_unverified":
+            quality_issues.append("classification_source_date_requested_unverified")
         coverage = self._coverage_for(generation, taxonomy_id)
         classification_lineage = (
             ClassificationLineage(
@@ -310,6 +359,7 @@ class SectorRotationService:
                 source=generation.source,
                 source_version=generation.source_version,
                 source_snapshot_date=generation.source_snapshot_date,
+                source_date_semantics=generation.source_date_semantics,
                 taxonomy_id=taxonomy_id,
                 coverage_ratio=coverage,
             )
@@ -327,6 +377,7 @@ class SectorRotationService:
         histories = _histories(
             bar for bar in bars if bar.security_type == "stock" and bar.board == "main"
         )
+        cache = _market_cache(histories, data_as_of)
         raw_current = {
             bar.symbol: bar
             for bar in bars
@@ -348,6 +399,7 @@ class SectorRotationService:
             securities=securities,
             memberships=memberships,
             histories=histories,
+            cache=cache,
             raw_current=raw_current,
             market_lineage=market_lineage,
             classification_lineage=classification_lineage,
@@ -451,7 +503,24 @@ class SectorRotationService:
                 and _usable_bar(rows[-1])
             )
         ]
-        metrics = self._sector_metrics(context, priced_symbols)
+        sector_cache = self._sector_cache(context, members)
+        research_candidates = [
+            self._leader_candidate(context, member, sector_cache)
+            for member in sorted(members, key=lambda item: item.symbol)
+            if not self._leader_exclusion_reasons(context, member)
+        ]
+        metrics = self._sector_metrics(
+            context,
+            priced_symbols,
+            sector_cache=sector_cache,
+            target_count=len(member_symbols),
+        )
+        metrics.extend(
+            self._sector_leadership_metrics(
+                research_candidates,
+                target_count=len(member_symbols),
+            )
+        )
         total_score = _weighted_total(metrics)
         missing = sorted({value for metric in metrics for value in metric.missing_inputs})
         issues = {value for metric in metrics for value in metric.quality_issues}
@@ -474,9 +543,27 @@ class SectorRotationService:
                 "sector_id": sector_id,
                 "members": sorted(item.symbol for item in members),
                 "metrics": metrics,
+                "formula_version": self.sector_policy.formula_version,
                 "weights": self.sector_policy.weights,
             },
         )
+        ranking_exclusion_reasons = []
+        if len(priced_symbols) < self.sector_policy.minimum_rank_members:
+            ranking_exclusion_reasons.append("insufficient_priced_members")
+            issues.add("sector.insufficient_members_for_ranking")
+        target_count = len(member_symbols)
+        priced_coverage = len(priced_symbols) / target_count if target_count else 0
+        if target_count and priced_coverage < self.sector_policy.minimum_member_coverage:
+            ranking_exclusion_reasons.append("insufficient_comparable_member_coverage")
+            issues.add("sector.insufficient_comparable_member_coverage")
+        if any(
+            "sector.insufficient_comparable_member_coverage" in metric.quality_issues
+            for metric in metrics
+        ):
+            ranking_exclusion_reasons.append("insufficient_horizon_member_coverage")
+            issues.add("sector.insufficient_comparable_member_coverage")
+        ranking_exclusion_reasons = sorted(set(ranking_exclusion_reasons))
+        ranking_eligible = not ranking_exclusion_reasons
         return SectorRanking(
             rank=1,
             ranking_id=ranking_id,
@@ -484,13 +571,19 @@ class SectorRotationService:
             sector_name=sector_name,
             member_count=len(members),
             priced_member_count=len(priced_symbols),
-            total_score=total_score,
+            ranking_eligible=ranking_eligible,
+            ranking_exclusion_reasons=ranking_exclusion_reasons,
+            total_score=(total_score if ranking_eligible else None),
             confidence=confidence,
             metric_scores=metrics,
             supporting_evidence=supporting,
             contrary_evidence=contrary,
             quality_status=(
-                "missing" if total_score is None else "degraded" if missing or issues else "ready"
+                "missing"
+                if total_score is None or not ranking_eligible
+                else "degraded"
+                if missing or issues
+                else "ready"
             ),
             missing_inputs=missing,
             quality_issues=sorted(issues),
@@ -500,6 +593,9 @@ class SectorRotationService:
         self,
         context: _Context,
         symbols: list[str],
+        *,
+        sector_cache: _SectorCache,
+        target_count: int,
     ) -> list[MetricScore]:
         metrics = []
         for period, weight in (
@@ -508,111 +604,151 @@ class SectorRotationService:
             (60, self.sector_policy.weights["relative_strength_60d"]),
         ):
             member_returns = [
-                value
+                returns[symbol]
                 for symbol in symbols
-                if (
-                    value := _period_return(
-                        context.histories.get(symbol, []),
-                        period,
-                        context.data_as_of,
-                    )
-                )
-                is not None
+                if symbol in (returns := context.cache.period_returns[period])
             ]
-            benchmark = _market_period_return(
-                context.histories,
-                period,
-                context.data_as_of,
-            )
+            benchmark = context.cache.benchmark_period_returns[period]
+            member_mean = _finite_mean(member_returns)
             raw = (
-                fmean(member_returns) - benchmark
-                if member_returns and benchmark is not None
+                member_mean - benchmark
+                if member_mean is not None and benchmark is not None
                 else None
             )
+            coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+                len(member_returns),
+                target_count,
+                minimum=self.sector_policy.minimum_member_coverage,
+                minimum_count=self.sector_policy.minimum_rank_members,
+            )
+            missing = [f"sector.relative_strength_{period}d_warmup"] if raw is None else []
+            missing.extend(coverage_missing)
             metrics.append(
                 _metric(
                     f"relative_strength_{period}d",
                     raw=raw,
-                    score=_clamp(raw * 1000) if raw is not None else None,
+                    score=(_clamp(raw * 1000) if raw is not None and coverage_ok else None),
                     weight=weight,
                     unit="decimal_relative_return",
                     formula=f"sector-equal-weight-minus-observed-main-benchmark-{period}d-v1",
-                    missing=([f"sector.relative_strength_{period}d_warmup"] if raw is None else []),
+                    effective_count=len(member_returns),
+                    target_count=target_count,
+                    missing=sorted(set(missing)),
+                    issues=coverage_issues,
                 )
             )
 
         current_returns = [
-            value
+            context.cache.current_returns[symbol]
             for symbol in symbols
-            if (
-                value := _daily_return(
-                    _current_bar(context.histories.get(symbol, []), context.data_as_of)
-                )
-            )
-            is not None
+            if symbol in context.cache.current_returns
         ]
         advance = (
             sum(value > 0 for value in current_returns) / len(current_returns)
             if current_returns
             else None
         )
+        coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+            len(current_returns),
+            target_count,
+            minimum=self.sector_policy.minimum_member_coverage,
+            minimum_count=self.sector_policy.minimum_rank_members,
+        )
         metrics.append(
             _metric(
                 "advancing_breadth",
                 raw=advance,
-                score=_ratio_score(advance) if advance is not None else None,
+                score=(_ratio_score(advance) if advance is not None and coverage_ok else None),
                 weight=self.sector_policy.weights["advancing_breadth"],
                 unit="ratio",
                 formula="sector-advancing-member-ratio-v1",
-                missing=["sector.advancing_breadth"] if advance is None else [],
+                effective_count=len(current_returns),
+                target_count=target_count,
+                missing=sorted(
+                    {
+                        *(["sector.advancing_breadth"] if advance is None else []),
+                        *coverage_missing,
+                    }
+                ),
+                issues=coverage_issues,
             )
         )
         for period in (20, 60):
             eligible = [
-                closes
+                context.cache.adjusted_closes[symbol]
                 for symbol in symbols
-                if len(
-                    closes := _adjusted_closes(
-                        context.histories.get(symbol, []),
-                        context.data_as_of,
-                    )
-                )
-                >= period
+                if len(context.cache.adjusted_closes.get(symbol, [])) >= period
             ]
-            raw = (
-                sum(closes[-1] > fmean(closes[-period:]) for closes in eligible) / len(eligible)
-                if eligible
-                else None
+            ma_signals = [
+                closes[-1] > mean
+                for closes in eligible
+                if (mean := _finite_mean(closes[-period:])) is not None
+            ]
+            raw = sum(ma_signals) / len(ma_signals) if ma_signals else None
+            coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+                len(ma_signals),
+                target_count,
+                minimum=self.sector_policy.minimum_member_coverage,
+                minimum_count=self.sector_policy.minimum_rank_members,
             )
             name = f"above_ma{period}_breadth"
             metrics.append(
                 _metric(
                     name,
                     raw=raw,
-                    score=_ratio_score(raw) if raw is not None else None,
+                    score=(_ratio_score(raw) if raw is not None and coverage_ok else None),
                     weight=self.sector_policy.weights[name],
                     unit="ratio",
                     formula=f"sector-qfq-close-above-ma{period}-ratio-v1",
-                    missing=[f"sector.above_ma{period}_breadth_warmup"] if raw is None else [],
+                    effective_count=len(ma_signals),
+                    target_count=target_count,
+                    missing=sorted(
+                        {
+                            *([f"sector.above_ma{period}_breadth_warmup"] if raw is None else []),
+                            *coverage_missing,
+                        }
+                    ),
+                    issues=coverage_issues,
                 )
             )
         for period in (5, 20):
-            raw = _turnover_change(
-                context.histories,
+            raw, effective_count, non_finite = _turnover_change(
+                context.cache.valid_histories,
                 symbols,
                 period,
                 context.data_as_of,
             )
+            coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+                effective_count,
+                target_count,
+                minimum=self.sector_policy.minimum_member_coverage,
+                minimum_count=self.sector_policy.minimum_rank_members,
+            )
+            issues = list(coverage_issues)
+            if non_finite:
+                issues.append("sector.turnover_non_finite")
             name = f"turnover_change_{period}d"
             metrics.append(
                 _metric(
                     name,
                     raw=raw,
-                    score=_clamp(raw * 100) if raw is not None else None,
+                    score=(
+                        _clamp(raw * 100)
+                        if raw is not None and coverage_ok and not non_finite
+                        else None
+                    ),
                     weight=self.sector_policy.weights[name],
                     unit="decimal_change",
                     formula=f"sector-current-turnover-vs-prior-{period}d-mean-v1",
-                    missing=[f"sector.turnover_change_{period}d_warmup"] if raw is None else [],
+                    effective_count=effective_count,
+                    target_count=target_count,
+                    missing=sorted(
+                        {
+                            *([f"sector.turnover_change_{period}d_warmup"] if raw is None else []),
+                            *coverage_missing,
+                        }
+                    ),
+                    issues=sorted(set(issues)),
                 )
             )
         current_amounts = [
@@ -627,52 +763,191 @@ class SectorRotationService:
             is not None
             and _usable_bar(bar)
         ]
-        amount_total = sum(current_amounts)
+        amount_total = _finite_sum(current_amounts)
+        concentration_numerator = _finite_sum(sorted(current_amounts, reverse=True)[:3])
         concentration = (
-            sum(sorted(current_amounts, reverse=True)[:3]) / amount_total
-            if amount_total > 0
+            concentration_numerator / amount_total
+            if (
+                concentration_numerator is not None
+                and amount_total is not None
+                and amount_total > 0
+            )
             else None
         )
+        non_finite_amount = bool(current_amounts) and (
+            amount_total is None or concentration_numerator is None
+        )
+        coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+            len(current_amounts),
+            target_count,
+            minimum=self.sector_policy.minimum_member_coverage,
+            minimum_count=self.sector_policy.minimum_rank_members,
+        )
+        concentration_issues = list(coverage_issues)
+        if non_finite_amount:
+            concentration_issues.append("sector.turnover_non_finite")
         metrics.append(
             _metric(
                 "turnover_concentration_top3",
                 raw=concentration,
-                score=_clamp((0.75 - concentration) * 200) if concentration is not None else None,
+                score=(
+                    _clamp((0.75 - concentration) * 200)
+                    if (concentration is not None and coverage_ok and not non_finite_amount)
+                    else None
+                ),
                 weight=self.sector_policy.weights["turnover_concentration_top3"],
                 unit="ratio",
                 formula="sector-top3-turnover-share-cohesion-v1",
-                missing=["sector.turnover_concentration"] if concentration is None else [],
+                effective_count=len(current_amounts),
+                target_count=target_count,
+                missing=sorted(
+                    {
+                        *(["sector.turnover_concentration"] if concentration is None else []),
+                        *coverage_missing,
+                    }
+                ),
+                issues=sorted(set(concentration_issues)),
             )
         )
         persistence = _sector_persistence_days(
-            context.histories,
-            symbols,
+            sector_cache.daily_returns,
+            context.cache.market_daily_returns,
             context.data_as_of,
+        )
+        coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+            len(current_returns),
+            target_count,
+            minimum=self.sector_policy.minimum_member_coverage,
+            minimum_count=self.sector_policy.minimum_rank_members,
         )
         metrics.append(
             _metric(
                 "persistence_days",
                 raw=float(persistence) if persistence is not None else None,
-                score=_clamp(persistence / 20 * 100) if persistence is not None else None,
+                score=(
+                    _clamp(persistence / 20 * 100)
+                    if persistence is not None and coverage_ok
+                    else None
+                ),
                 weight=self.sector_policy.weights["persistence_days"],
                 unit="signed_sessions",
                 formula="sector-consecutive-relative-return-sign-max20-v1",
-                missing=["sector.persistence_history"] if persistence is None else [],
+                effective_count=len(current_returns),
+                target_count=target_count,
+                missing=sorted(
+                    {
+                        *(["sector.persistence_history"] if persistence is None else []),
+                        *coverage_missing,
+                    }
+                ),
+                issues=coverage_issues,
             )
         )
-        dispersion = pstdev(current_returns) if len(current_returns) >= 2 else None
+        try:
+            dispersion = pstdev(current_returns) if len(current_returns) >= 2 else None
+        except (OverflowError, ValueError):
+            dispersion = None
+        dispersion = _finite_number(dispersion)
+        coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+            len(current_returns),
+            target_count,
+            minimum=self.sector_policy.minimum_member_coverage,
+            minimum_count=self.sector_policy.minimum_rank_members,
+        )
         metrics.append(
             _metric(
                 "cross_section_dispersion",
                 raw=dispersion,
-                score=_low_dispersion_score(dispersion) if dispersion is not None else None,
+                score=(
+                    _low_dispersion_score(dispersion)
+                    if dispersion is not None and coverage_ok
+                    else None
+                ),
                 weight=self.sector_policy.weights["cross_section_dispersion"],
                 unit="return_standard_deviation",
                 formula="sector-current-return-population-dispersion-v1",
-                missing=["sector.cross_section_dispersion"] if dispersion is None else [],
+                effective_count=len(current_returns),
+                target_count=target_count,
+                missing=sorted(
+                    {
+                        *(["sector.cross_section_dispersion"] if dispersion is None else []),
+                        *coverage_missing,
+                    }
+                ),
+                issues=coverage_issues,
             )
         )
         return metrics
+
+    def _sector_leadership_metrics(
+        self,
+        candidates: list[LeaderCandidate],
+        *,
+        target_count: int,
+    ) -> list[MetricScore]:
+        effective_count = len(candidates)
+        coverage_ok, coverage_missing, coverage_issues = _member_coverage(
+            effective_count,
+            target_count,
+            minimum=self.sector_policy.minimum_member_coverage,
+            minimum_count=self.sector_policy.minimum_rank_members,
+        )
+        qualified = [item for item in candidates if item.leader_qualified]
+        leader_count = len(qualified)
+        diffusion = leader_count / effective_count if effective_count else None
+        persistence_values = [
+            metric.raw_value
+            for candidate in qualified
+            for metric in candidate.metric_scores
+            if metric.metric == "persistence_days" and metric.raw_value is not None
+        ]
+        persistence = _finite_mean(persistence_values)
+        common = {
+            "effective_count": effective_count,
+            "target_count": target_count,
+            "issues": coverage_issues,
+        }
+        return [
+            _metric(
+                "leader_count",
+                raw=leader_count,
+                score=(_clamp((leader_count - 1) * 50) if coverage_ok else None),
+                weight=self.sector_policy.weights["leader_count"],
+                unit="qualified_research_leaders",
+                formula="qualified-research-leader-count-v1",
+                missing=coverage_missing,
+                **common,
+            ),
+            _metric(
+                "leader_diffusion",
+                raw=diffusion,
+                score=(_ratio_score(diffusion) if diffusion is not None and coverage_ok else None),
+                weight=self.sector_policy.weights["leader_diffusion"],
+                unit="qualified_candidate_ratio",
+                formula="qualified-research-leader-diffusion-v1",
+                missing=coverage_missing,
+                **common,
+            ),
+            _metric(
+                "leader_persistence_days",
+                raw=persistence,
+                score=(
+                    _clamp(persistence / 20 * 100)
+                    if persistence is not None and coverage_ok
+                    else None
+                ),
+                weight=self.sector_policy.weights["leader_persistence_days"],
+                unit="mean_signed_sessions",
+                formula="qualified-leader-mean-persistence-max20-v1",
+                missing=sorted(
+                    {
+                        *(["sector.qualified_leader_persistence"] if persistence is None else []),
+                        *coverage_missing,
+                    }
+                ),
+                **common,
+            ),
+        ]
 
     def _leader_exclusion_reasons(
         self,
@@ -687,8 +962,6 @@ class SectorRotationService:
             reasons.append("outside_narrow_main_board_scope")
         if not security.is_tradable:
             reasons.append("classification_not_tradable")
-        if security.price_available is not True:
-            reasons.append("classification_price_not_verified")
         bar = context.raw_current.get(member.symbol)
         if bar is None:
             reasons.append("missing_current_price")
@@ -710,15 +983,12 @@ class SectorRotationService:
             reasons.append("invalid_price_or_activity_input")
         return reasons
 
-    def _leader_candidate(
-        self,
+    @staticmethod
+    def _sector_cache(
         context: _Context,
-        member: SectorMembershipRecord,
         sector_members: list[SectorMembershipRecord],
-    ) -> LeaderCandidate:
-        symbol = member.symbol
-        rows = context.histories[symbol]
-        sector_symbols = [
+    ) -> _SectorCache:
+        symbols = tuple(
             item.symbol
             for item in sector_members
             if (
@@ -726,7 +996,30 @@ class SectorRotationService:
                 and security.board == "main"
                 and item.symbol in context.histories
             )
+        )
+        daily = _daily_group_returns_from_cache(context.cache.daily_returns, symbols)
+        current_values = [
+            context.cache.current_returns[symbol]
+            for symbol in symbols
+            if symbol in context.cache.current_returns
         ]
+        return _SectorCache(
+            symbols=symbols,
+            daily_returns=daily,
+            current_mean=_finite_mean(current_values),
+            return_counts={
+                period: sum(symbol in context.cache.period_returns[period] for symbol in symbols)
+                for period in (5, 20, 60)
+            },
+        )
+
+    def _leader_candidate(
+        self,
+        context: _Context,
+        member: SectorMembershipRecord,
+        sector_cache: _SectorCache,
+    ) -> LeaderCandidate:
+        symbol = member.symbol
         metrics = [
             _metric(
                 "tradability",
@@ -738,12 +1031,8 @@ class SectorRotationService:
             )
         ]
         for period in (5, 20, 60):
-            stock_return = _period_return(rows, period, context.data_as_of)
-            benchmark = _market_period_return(
-                context.histories,
-                period,
-                context.data_as_of,
-            )
+            stock_return = context.cache.period_returns[period].get(symbol)
+            benchmark = context.cache.benchmark_period_returns[period]
             raw = (
                 stock_return - benchmark
                 if stock_return is not None and benchmark is not None
@@ -761,7 +1050,12 @@ class SectorRotationService:
                     missing=[f"leader.relative_strength_{period}d_warmup"] if raw is None else [],
                 )
             )
-        activity = _activity_ratio(rows, 20, context.data_as_of)
+        activity = _activity_ratio(
+            context.cache.valid_histories.get(symbol, []),
+            20,
+            context.data_as_of,
+            history_is_valid=True,
+        )
         metrics.append(
             _metric(
                 "trading_activity_20d",
@@ -773,7 +1067,7 @@ class SectorRotationService:
                 missing=["leader.trading_activity_20d_warmup"] if activity is None else [],
             )
         )
-        closes = _adjusted_closes(rows, context.data_as_of)
+        closes = context.cache.adjusted_closes.get(symbol, [])
         trend_signals = [
             100 if closes[-1] > fmean(closes[-period:]) else -100
             for period in (20, 60)
@@ -791,21 +1085,11 @@ class SectorRotationService:
                 missing=["leader.trend_quality_warmup"] if trend is None else [],
             )
         )
-        stock_20 = _period_return(rows, 20, context.data_as_of)
-        valid_sector_20 = [
-            value
-            for item in sector_symbols
-            if (
-                value := _period_return(
-                    context.histories[item],
-                    20,
-                    context.data_as_of,
-                )
-            )
-            is not None
-        ]
+        stock_20 = context.cache.period_returns[20].get(symbol)
         contribution = (
-            stock_20 / len(valid_sector_20) if stock_20 is not None and valid_sector_20 else None
+            stock_20 / sector_cache.return_counts[20]
+            if stock_20 is not None and sector_cache.return_counts[20]
+            else None
         )
         metrics.append(
             _metric(
@@ -819,9 +1103,8 @@ class SectorRotationService:
             )
         )
         persistence = _leader_persistence_days(
-            context.histories,
-            symbol,
-            sector_symbols,
+            context.cache.daily_returns.get(symbol, {}),
+            sector_cache.daily_returns,
             context.data_as_of,
         )
         metrics.append(
@@ -835,15 +1118,11 @@ class SectorRotationService:
                 missing=["leader.persistence_history"] if persistence is None else [],
             )
         )
-        current = _daily_return(_current_bar(rows, context.data_as_of))
-        sector_current = [
-            value
-            for item in sector_symbols
-            if (value := _daily_return(_current_bar(context.histories[item], context.data_as_of)))
-            is not None
-        ]
+        current = context.cache.current_returns.get(symbol)
         deviation = (
-            abs(current - fmean(sector_current)) if current is not None and sector_current else None
+            abs(current - sector_cache.current_mean)
+            if current is not None and sector_cache.current_mean is not None
+            else None
         )
         metrics.append(
             _metric(
@@ -887,10 +1166,12 @@ class SectorRotationService:
                 "sector_id": member.sector_id,
                 "symbol": symbol,
                 "metrics": metrics,
+                "formula_version": self.leader_policy.formula_version,
                 "weights": self.leader_policy.weights,
             },
         )
         security = context.securities[member.security_id]
+        qualified, qualification_reasons, disqualification_reasons = _leader_qualification(metrics)
         return LeaderCandidate(
             rank=1,
             candidate_id=candidate_id,
@@ -900,6 +1181,10 @@ class SectorRotationService:
             confidence=confidence,
             actionable_primary=False,
             limit_lock_status="unavailable",
+            leader_qualified=qualified,
+            qualification_version=LEADER_QUALIFICATION_VERSION,
+            qualification_reasons=qualification_reasons,
+            disqualification_reasons=disqualification_reasons,
             metric_scores=metrics,
             supporting_evidence=supporting,
             contrary_evidence=contrary,
@@ -934,10 +1219,12 @@ class SectorRotationService:
                 "market": context.market_lineage,
                 "missing_inputs": missing,
                 "quality_issues": issues,
+                "formula_version": self.sector_policy.formula_version,
             },
         )
         return SectorRotationResponse(
             result_id=result_id,
+            formula_version=self.sector_policy.formula_version,
             status="empty",
             quality_status="empty",
             as_of=context.as_of,
@@ -962,16 +1249,98 @@ def _histories(bars) -> dict[str, list[DailyBar]]:
     return dict(result)
 
 
+def _market_cache(
+    histories: dict[str, list[DailyBar]],
+    data_as_of: date | None,
+) -> _MarketCache:
+    valid_histories = {
+        symbol: valid
+        for symbol, bars in histories.items()
+        if (valid := _valid_history(bars, data_as_of))
+    }
+    adjusted_closes: dict[str, list[float]] = {}
+    for symbol, bars in valid_histories.items():
+        target = _finite_number(bars[-1].adjust_factor)
+        if target is None or target <= 0:
+            continue
+        closes = []
+        for bar in bars:
+            factor = _finite_number(bar.adjust_factor)
+            if factor is None or factor <= 0:
+                closes = []
+                break
+            close = _finite_number(bar.close * factor / target)
+            if close is None or close <= 0:
+                closes = []
+                break
+            closes.append(close)
+        if closes:
+            adjusted_closes[symbol] = closes
+
+    period_returns: dict[int, dict[str, float]] = {}
+    benchmark_period_returns: dict[int, float | None] = {}
+    for period in (5, 20, 60):
+        returns = {
+            symbol: value
+            for symbol, closes in adjusted_closes.items()
+            if (value := _period_return_from_closes(closes, period)) is not None
+        }
+        period_returns[period] = returns
+        benchmark_period_returns[period] = _finite_mean(returns.values())
+
+    daily_returns: dict[str, dict[date, float]] = {}
+    grouped: dict[date, list[float]] = defaultdict(list)
+    for symbol, bars in histories.items():
+        symbol_returns = {
+            bar.trade_date: value for bar in bars if (value := _daily_return(bar)) is not None
+        }
+        if not symbol_returns:
+            continue
+        daily_returns[symbol] = symbol_returns
+        for day, value in symbol_returns.items():
+            grouped[day].append(value)
+    market_daily_returns = {
+        day: value for day, values in grouped.items() if (value := _finite_mean(values)) is not None
+    }
+    current_returns = {
+        symbol: rows[data_as_of]
+        for symbol, rows in daily_returns.items()
+        if data_as_of is not None and data_as_of in rows
+    }
+    return _MarketCache(
+        valid_histories=valid_histories,
+        adjusted_closes=adjusted_closes,
+        period_returns=period_returns,
+        benchmark_period_returns=benchmark_period_returns,
+        daily_returns=daily_returns,
+        market_daily_returns=market_daily_returns,
+        current_returns=current_returns,
+    )
+
+
 def _market_lineage(bars: list[DailyBar]) -> MarketLineage:
     stable = [
         {
             "trade_date": bar.trade_date.isoformat(),
             "symbol": bar.symbol,
+            "security_type": bar.security_type,
+            "exchange": bar.exchange,
+            "board": bar.board,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
             "close": bar.close,
             "preclose": bar.preclose,
+            "volume": bar.volume,
             "amount": bar.amount,
+            "turnover_rate": bar.turnover_rate,
+            "pct_change": bar.pct_change,
             "adjust_factor": bar.adjust_factor,
+            "price_adjustment": bar.price_adjustment,
+            "is_trading": bar.is_trading,
             "is_suspended": bar.is_suspended,
+            "is_st": bar.is_st,
+            "source": bar.source,
             "quality_status": bar.quality_status,
             "quality_issues": bar.quality_issues,
             "source_record_id": bar.source_record_id,
@@ -1060,6 +1429,13 @@ def _period_return(
     data_as_of: date | None,
 ) -> float | None:
     closes = _adjusted_closes(bars, data_as_of)
+    return _period_return_from_closes(closes, period)
+
+
+def _period_return_from_closes(
+    closes: list[float],
+    period: int,
+) -> float | None:
     if len(closes) < period + 1:
         return None
     result = closes[-1] / closes[-period - 1] - 1
@@ -1091,19 +1467,34 @@ def _turnover_change(
     symbols: list[str],
     period: int,
     data_as_of: date | None,
-) -> float | None:
-    daily: dict[date, float] = defaultdict(float)
+) -> tuple[float | None, int, bool]:
+    comparable: dict[str, dict[date, float]] = {}
     for symbol in symbols:
-        for bar in _valid_history(histories.get(symbol, []), data_as_of):
-            daily[bar.trade_date] += bar.amount
-    dates = sorted(daily)
-    if len(dates) < period + 1 or not dates or dates[-1] != data_as_of:
-        return None
-    prior = [daily[item] for item in dates[-period - 1 : -1]]
-    baseline = fmean(prior)
-    if baseline <= 0:
-        return None
-    return daily[dates[-1]] / baseline - 1
+        valid = histories.get(symbol, [])
+        if len(valid) >= period + 1:
+            comparable[symbol] = {bar.trade_date: bar.amount for bar in valid}
+    if not comparable or data_as_of is None:
+        return None, len(comparable), False
+    common_dates = set.intersection(*(set(rows) for rows in comparable.values()))
+    dates = sorted(common_dates)
+    if len(dates) < period + 1 or dates[-1] != data_as_of:
+        return None, len(comparable), False
+    window = dates[-period - 1 :]
+    totals = []
+    for day in window:
+        total = _finite_sum(rows[day] for rows in comparable.values())
+        if total is None:
+            return None, len(comparable), True
+        totals.append(total)
+    baseline = _finite_mean(totals[:-1])
+    if baseline is None or baseline <= 0:
+        return None, len(comparable), baseline is None
+    result = totals[-1] / baseline - 1
+    return (
+        (result if math.isfinite(result) else None),
+        len(comparable),
+        not math.isfinite(result),
+    )
 
 
 def _daily_market_returns(
@@ -1131,6 +1522,19 @@ def _daily_group_returns(
     return {day: fmean(values) for day, values in grouped.items() if values}
 
 
+def _daily_group_returns_from_cache(
+    daily_returns: dict[str, dict[date, float]],
+    symbols: tuple[str, ...] | list[str],
+) -> dict[date, float]:
+    grouped: dict[date, list[float]] = defaultdict(list)
+    for symbol in symbols:
+        for day, value in daily_returns.get(symbol, {}).items():
+            grouped[day].append(value)
+    return {
+        day: mean for day, values in grouped.items() if (mean := _finite_mean(values)) is not None
+    }
+
+
 def _signed_persistence(spreads: dict[date, float], data_as_of: date | None) -> int | None:
     dates = sorted(spreads)
     if not dates or data_as_of is None or dates[-1] != data_as_of:
@@ -1149,24 +1553,19 @@ def _signed_persistence(spreads: dict[date, float], data_as_of: date | None) -> 
 
 
 def _sector_persistence_days(
-    histories: dict[str, list[DailyBar]],
-    symbols: list[str],
+    sector: dict[date, float],
+    market: dict[date, float],
     data_as_of: date | None,
 ) -> int | None:
-    sector = _daily_group_returns(histories, symbols)
-    market = _daily_market_returns(histories)
     spreads = {day: value - market[day] for day, value in sector.items() if day in market}
     return _signed_persistence(spreads, data_as_of)
 
 
 def _leader_persistence_days(
-    histories: dict[str, list[DailyBar]],
-    symbol: str,
-    sector_symbols: list[str],
+    stock: dict[date, float],
+    sector: dict[date, float],
     data_as_of: date | None,
 ) -> int | None:
-    stock = _daily_group_returns(histories, [symbol])
-    sector = _daily_group_returns(histories, sector_symbols)
     spreads = {day: value - sector[day] for day, value in stock.items() if day in sector}
     return _signed_persistence(spreads, data_as_of)
 
@@ -1175,14 +1574,17 @@ def _activity_ratio(
     bars: list[DailyBar],
     period: int,
     data_as_of: date | None,
+    *,
+    history_is_valid: bool = False,
 ) -> float | None:
-    valid = _valid_history(bars, data_as_of)
+    valid = bars if history_is_valid else _valid_history(bars, data_as_of)
     if len(valid) < period + 1:
         return None
-    baseline = fmean(bar.amount for bar in valid[-period - 1 : -1])
-    if baseline <= 0:
+    baseline = _finite_mean(bar.amount for bar in valid[-period - 1 : -1])
+    if baseline is None or baseline <= 0:
         return None
-    return valid[-1].amount / baseline
+    result = valid[-1].amount / baseline
+    return result if math.isfinite(result) else None
 
 
 def _metric(
@@ -1193,11 +1595,19 @@ def _metric(
     weight: float,
     unit: str,
     formula: str,
+    effective_count: int | None = None,
+    target_count: int | None = None,
     missing: list[str] | None = None,
     issues: list[str] | None = None,
 ) -> MetricScore:
-    numeric_raw = float(raw) if raw is not None else None
-    numeric_score = round(float(score), 6) if score is not None else None
+    numeric_raw = _finite_number(raw)
+    numeric_score = _finite_number(score)
+    numeric_score = round(numeric_score, 6) if numeric_score is not None else None
+    coverage_ratio = (
+        round(effective_count / target_count, 6)
+        if effective_count is not None and target_count
+        else None
+    )
     quality = "missing" if numeric_score is None else "degraded" if missing or issues else "ready"
     return MetricScore(
         metric=name,
@@ -1208,9 +1618,29 @@ def _metric(
         weighted_score=(round(numeric_score * weight, 6) if numeric_score is not None else None),
         formula_version=formula,
         quality_status=quality,
+        effective_count=effective_count,
+        target_count=target_count,
+        coverage_ratio=coverage_ratio,
         missing_inputs=missing or [],
         quality_issues=issues or [],
     )
+
+
+def _member_coverage(
+    effective_count: int,
+    target_count: int,
+    *,
+    minimum: float,
+    minimum_count: int,
+) -> tuple[bool, list[str], list[str]]:
+    ratio = effective_count / target_count if target_count else 0
+    missing = []
+    if effective_count < minimum_count:
+        missing.append("sector.minimum_comparable_members")
+    if target_count == 0 or ratio < minimum:
+        missing.append("sector.minimum_comparable_member_coverage")
+    issues = ["sector.insufficient_comparable_member_coverage"] if missing else []
+    return not missing, missing, issues
 
 
 def _weighted_total(metrics: list[MetricScore]) -> float | None:
@@ -1247,6 +1677,37 @@ def _metric_reasons(
     return supporting, contrary
 
 
+def _leader_qualification(
+    metrics: list[MetricScore],
+) -> tuple[bool, list[str], list[str]]:
+    by_name = {metric.metric: metric for metric in metrics}
+    checks = {
+        "positive_relative_strength_20d": (
+            by_name.get("relative_strength_20d") is not None
+            and by_name["relative_strength_20d"].raw_value is not None
+            and by_name["relative_strength_20d"].raw_value > 0
+        ),
+        "active_turnover_20d": (
+            by_name.get("trading_activity_20d") is not None
+            and by_name["trading_activity_20d"].raw_value is not None
+            and by_name["trading_activity_20d"].raw_value >= 1
+        ),
+        "positive_trend_quality": (
+            by_name.get("trend_quality") is not None
+            and by_name["trend_quality"].score is not None
+            and by_name["trend_quality"].score > 0
+        ),
+        "positive_sector_contribution_20d": (
+            by_name.get("sector_contribution_20d") is not None
+            and by_name["sector_contribution_20d"].raw_value is not None
+            and by_name["sector_contribution_20d"].raw_value > 0
+        ),
+    }
+    supporting = sorted(name for name, passed in checks.items() if passed)
+    contrary = sorted(name for name, passed in checks.items() if not passed)
+    return not contrary, supporting, contrary
+
+
 def _confidence(
     metrics: list[MetricScore],
     *,
@@ -1267,6 +1728,35 @@ def _confidence(
 
 def _clamp(value: float) -> float:
     return max(-100.0, min(100.0, value))
+
+
+def _finite_number(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _finite_sum(values) -> float | None:
+    try:
+        result = math.fsum(values)
+    except (OverflowError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _finite_mean(values) -> float | None:
+    rows = list(values)
+    if not rows:
+        return None
+    total = _finite_sum(rows)
+    if total is None:
+        return None
+    result = total / len(rows)
+    return result if math.isfinite(result) else None
 
 
 def _ratio_score(value: float) -> float:

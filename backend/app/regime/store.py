@@ -45,6 +45,12 @@ class MarketBarsReader(Protocol):
     ) -> list[DailyBar]: ...
 
 
+class MarketReadUnavailable(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class ReadOnlyDuckDbMarketReader:
     """SELECT-only local reader; missing storage remains missing."""
 
@@ -81,6 +87,93 @@ class ReadOnlyDuckDbMarketReader:
         finally:
             connection.close()
         return [MarketStore._daily_bar_from_row(row) for row in rows]
+
+
+class PublishedSnapshotDuckDbMarketReader:
+    """Read only writer-captured rows attached to an explicit published pointer."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def bars_through(
+        self,
+        as_of: date,
+        *,
+        max_sessions: int,
+    ) -> list[DailyBar]:
+        if not self.path.is_file():
+            return []
+        connection: duckdb.DuckDBPyConnection | None = None
+        try:
+            connection = duckdb.connect(str(self.path))
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'main'
+                    """
+                ).fetchall()
+            }
+            if not {"published_snapshots", "published_daily_bars"} <= tables:
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+            pointer = connection.execute(
+                """
+                SELECT trade_date
+                FROM published_snapshots
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if pointer is None:
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+            published_as_of = min(as_of, pointer[0])
+            published_count = connection.execute(
+                """
+                SELECT count(*)
+                FROM published_daily_bars
+                WHERE source = 'baostock' AND trade_date <= ?
+                """,
+                [published_as_of],
+            ).fetchone()[0]
+            if not published_count:
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+            rows = connection.execute(
+                f"""
+                SELECT {_BAR_COLUMNS}
+                FROM published_daily_bars
+                WHERE source = 'baostock'
+                  AND trade_date IN (
+                      SELECT DISTINCT trade_date
+                      FROM published_daily_bars
+                      WHERE source = 'baostock'
+                        AND trade_date <= ?
+                        AND security_type = 'stock'
+                        AND board = 'main'
+                        AND quality_status = 'ready'
+                        AND is_trading = TRUE
+                        AND is_suspended = FALSE
+                        AND close > 0
+                        AND preclose > 0
+                        AND adjust_factor > 0
+                        AND amount >= 0
+                      ORDER BY trade_date DESC
+                      LIMIT ?
+                  )
+                  AND trade_date <= ?
+                ORDER BY trade_date, symbol
+                """,
+                [published_as_of, max_sessions, published_as_of],
+            ).fetchall()
+            bars = [MarketStore._daily_bar_from_row(row) for row in rows]
+        except MarketReadUnavailable:
+            raise
+        except (duckdb.Error, OSError, TypeError, ValueError) as exc:
+            raise MarketReadUnavailable("market_storage_unavailable") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+        return bars
 
 
 class PublishedDatasetMarketReader:
