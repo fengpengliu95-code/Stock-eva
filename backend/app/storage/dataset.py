@@ -387,7 +387,7 @@ class NasMarketStore:
             started_at=now,
             completed_at=now,
         )
-        self.control.save_refresh([], result, publish=True)
+        self.control.save_external_publication(result)
         return result
 
     def canonical_bars(self, trade_date, source: str = "baostock") -> list[DailyBar]:
@@ -559,10 +559,12 @@ class NasMarketStore:
     ) -> None:
         publish = result.status == "ready" if publish is None else publish
         if publish:
-            if result.status != "ready":
-                raise ValueError("only ready refreshes can be published")
+            MarketStore._validate_ready_publication(result)
+            MarketStore._validate_local_publication_bars(bars, result)
             self._publish_bars(bars)
-        self.control.save_refresh([], result, publish=publish)
+            self.control.save_external_publication(result)
+        else:
+            self.control.save_refresh([], result, publish=False)
 
     def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
         """Export a published partition locally without modifying the NAS dataset."""

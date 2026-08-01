@@ -98,6 +98,7 @@ def test_duckdb_upsert_is_idempotent(tmp_path: Path) -> None:
         status="ready",
         requested_count=len(rows),
         succeeded_count=len(rows),
+        coverage_ratio=1,
         failed_symbols=[],
         started_at=datetime(2026, 7, 24, 10, 0, tzinfo=UTC),
         completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
@@ -108,6 +109,36 @@ def test_duckdb_upsert_is_idempotent(tmp_path: Path) -> None:
 
     assert store.count_bars() == len(rows)
     assert store.latest_refresh().run_id == "fixture-run"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"succeeded_count": 1},
+        {"coverage_ratio": 0.5},
+        {"failed_symbols": ["sz.000002"]},
+        {"quality_issues": ["incomplete_symbol_coverage"]},
+    ],
+)
+def test_ready_refresh_result_rejects_incomplete_publication_state(updates) -> None:
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    payload = {
+        "run_id": "invalid-ready",
+        "requested_date": date(2026, 7, 23),
+        "source": "baostock",
+        "status": "ready",
+        "requested_count": 2,
+        "succeeded_count": 2,
+        "coverage_ratio": 1,
+        "failed_symbols": [],
+        "quality_issues": [],
+        "started_at": now,
+        "completed_at": now,
+    }
+    payload.update(updates)
+
+    with pytest.raises(ValueError, match="ready refresh must be complete"):
+        RefreshResult(**payload)
 
 
 def test_market_summary_reports_breadth_indexes_and_partial_state(tmp_path: Path) -> None:
@@ -197,6 +228,7 @@ def test_failed_attempt_does_not_replace_last_published_snapshot(tmp_path: Path)
         status="ready",
         requested_count=len(rows),
         succeeded_count=len(rows),
+        coverage_ratio=1,
         started_at=datetime(2026, 7, 24, 10, 0, tzinfo=UTC),
         completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
     )

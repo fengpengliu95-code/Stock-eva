@@ -35,6 +35,12 @@ _BAR_COLUMNS = """
     source, source_record_id, ingested_at, quality_status, quality_issues
 """
 
+_REFRESH_COLUMNS = """
+    run_id, requested_date, source, status, requested_count,
+    succeeded_count, coverage_ratio, failed_symbols, quality_issues,
+    error_message, started_at, completed_at, request_key, run_kind
+"""
+
 
 class MarketBarsReader(Protocol):
     def bars_through(
@@ -116,18 +122,61 @@ class PublishedSnapshotDuckDbMarketReader:
                     """
                 ).fetchall()
             }
-            if not {"published_snapshots", "published_daily_bars"} <= tables:
+            if not {"published_snapshots", "published_daily_bars", "refresh_runs"} <= tables:
                 raise MarketReadUnavailable("market_publication_state_unavailable")
             pointer = connection.execute(
                 """
-                SELECT trade_date
+                SELECT run_id, trade_date
                 FROM published_snapshots
                 WHERE singleton = 1
                 """
             ).fetchone()
             if pointer is None:
                 raise MarketReadUnavailable("market_publication_state_unavailable")
-            published_as_of = min(as_of, pointer[0])
+            pointer_run_id, pointer_date = pointer
+            audits = {}
+
+            def trusted_audit(run_id: str):
+                if run_id in audits:
+                    return audits[run_id]
+                row = connection.execute(
+                    f"""
+                    SELECT {_REFRESH_COLUMNS}
+                    FROM refresh_runs
+                    WHERE run_id = ?
+                    """,
+                    [run_id],
+                ).fetchone()
+                if row is None:
+                    raise MarketReadUnavailable("market_publication_state_unavailable")
+                try:
+                    audit = MarketStore._refresh_result_from_row(row)
+                    MarketStore._validate_ready_publication(audit)
+                except ValueError as exc:
+                    raise MarketReadUnavailable("market_publication_state_unavailable") from exc
+                audits[run_id] = audit
+                return audit
+
+            pointer_audit = trusted_audit(pointer_run_id)
+            if pointer_audit.requested_date != pointer_date or pointer_audit.source != "baostock":
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+            pointer_rows = connection.execute(
+                """
+                SELECT publication_run_id, symbol
+                FROM published_daily_bars
+                WHERE source = 'baostock' AND trade_date = ?
+                """,
+                [pointer_date],
+            ).fetchall()
+            if (
+                not pointer_rows
+                or {row[0] for row in pointer_rows} != {pointer_run_id}
+                or len({row[1] for row in pointer_rows}) != pointer_audit.succeeded_count
+                or len(pointer_rows) != pointer_audit.succeeded_count
+            ):
+                raise MarketReadUnavailable("market_publication_state_unavailable")
+
+            published_as_of = min(as_of, pointer_date)
             published_count = connection.execute(
                 """
                 SELECT count(*)
@@ -140,7 +189,7 @@ class PublishedSnapshotDuckDbMarketReader:
                 raise MarketReadUnavailable("market_publication_state_unavailable")
             rows = connection.execute(
                 f"""
-                SELECT {_BAR_COLUMNS}
+                SELECT publication_run_id, {_BAR_COLUMNS}
                 FROM published_daily_bars
                 WHERE source = 'baostock'
                   AND trade_date IN (
@@ -165,7 +214,23 @@ class PublishedSnapshotDuckDbMarketReader:
                 """,
                 [published_as_of, max_sessions, published_as_of],
             ).fetchall()
-            bars = [MarketStore._daily_bar_from_row(row) for row in rows]
+            partitions: dict[tuple[date, str], list[tuple[str, str]]] = defaultdict(list)
+            for row in rows:
+                partitions[(row[1], row[20])].append((row[0], row[2]))
+            for (trade_date, source), partition_rows in partitions.items():
+                run_ids = {row[0] for row in partition_rows}
+                symbols = {row[1] for row in partition_rows}
+                if len(run_ids) != 1:
+                    raise MarketReadUnavailable("market_publication_state_unavailable")
+                audit = trusted_audit(next(iter(run_ids)))
+                if (
+                    audit.requested_date != trade_date
+                    or audit.source != source
+                    or len(symbols) != audit.succeeded_count
+                    or len(partition_rows) != audit.succeeded_count
+                ):
+                    raise MarketReadUnavailable("market_publication_state_unavailable")
+            bars = [MarketStore._daily_bar_from_row(row[1:]) for row in rows]
         except MarketReadUnavailable:
             raise
         except (duckdb.Error, OSError, TypeError, ValueError) as exc:

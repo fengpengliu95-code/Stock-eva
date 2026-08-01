@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 DataStatus = Literal["empty", "ready", "partial", "stale", "error"]
 
@@ -40,14 +40,29 @@ class RefreshResult(BaseModel):
     requested_date: date
     source: Literal["baostock"]
     status: Literal["ready", "partial", "error"]
-    requested_count: int
-    succeeded_count: int
-    coverage_ratio: float | None = None
+    requested_count: int = Field(ge=0)
+    succeeded_count: int = Field(ge=0)
+    coverage_ratio: float | None = Field(default=None, ge=0, le=1)
     failed_symbols: list[str] = Field(default_factory=list)
     quality_issues: list[str] = Field(default_factory=list)
     error_message: str | None = None
     started_at: datetime
     completed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_ready_is_complete(self) -> "RefreshResult":
+        if self.status != "ready":
+            return self
+        if (
+            self.requested_count <= 0
+            or self.succeeded_count != self.requested_count
+            or self.coverage_ratio != 1
+            or self.failed_symbols
+            or self.quality_issues
+            or self.error_message is not None
+        ):
+            raise ValueError("ready refresh must be complete")
+        return self
 
 
 class Completeness(BaseModel):

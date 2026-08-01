@@ -230,6 +230,27 @@ def _refresh(
     )
 
 
+def _publish_history(
+    store: MarketStore,
+    bars: list[DailyBar],
+    *,
+    run_prefix: str,
+) -> None:
+    by_date: dict[date, list[DailyBar]] = {}
+    for bar in bars:
+        by_date.setdefault(bar.trade_date, []).append(bar)
+    for trade_date, partition in sorted(by_date.items()):
+        store.save_refresh(
+            partition,
+            _refresh(
+                f"{run_prefix}-{trade_date.isoformat()}",
+                trade_date,
+                count=len({bar.symbol for bar in partition}),
+            ),
+            publish=True,
+        )
+
+
 class _BarsReader:
     def __init__(self, bars: list[DailyBar]) -> None:
         self.bars = bars
@@ -715,7 +736,7 @@ def test_unknown_market_symbols_and_non_main_board_prices_do_not_expand_scope(
     assert result.actual_scope.included_boards == ["main"]
     assert "chinext" in result.actual_scope.excluded_classification_boards
     assert result.actual_scope.priced_classified_symbols == 1
-    assert [item.sector_id for item in result.rankings] == ["main", "chinext"]
+    assert [item.sector_id for item in result.rankings] == ["chinext", "main"]
     chinext = next(item for item in result.rankings if item.sector_id == "chinext")
     assert chinext.total_score is None
     assert "sector.member_outside_narrow_main_board_scope" in chinext.quality_issues
@@ -884,13 +905,14 @@ def test_real_duckdb_stores_integrate_through_read_only_api(
     assert classification.ready_generation() == generation_id
     market_database = market_dir / "market.duckdb"
     integration_bars = _bars("sh.600001", drift=0.003)
-    MarketStore(
+    market_store = MarketStore(
         market_database,
         temp_directory=tmp_path / "writer-temp",
-    ).save_refresh(
+    )
+    _publish_history(
+        market_store,
         integration_bars,
-        _refresh("integration-published", AS_OF, count=len(integration_bars)),
-        publish=True,
+        run_prefix="integration-published",
     )
     settings = Settings(
         market_data_dir=market_dir,
@@ -948,10 +970,10 @@ def test_r1c_reads_only_published_rows_after_same_day_partial_overwrite(
         *_bars("sh.600001", drift=0.006, amount_drift=0.01),
         *_bars("sh.600002", drift=0.002),
     ]
-    store.save_refresh(
+    _publish_history(
+        store,
         published,
-        _refresh("published", AS_OF, count=len(published)),
-        publish=True,
+        run_prefix="published",
     )
     settings = Settings(
         market_data_dir=market_dir,
@@ -1004,10 +1026,10 @@ def test_historical_partial_never_becomes_published_after_later_pointer(
     market_database = market_dir / "market.duckdb"
     store = MarketStore(market_database, temp_directory=tmp_path / "writer-temp")
     old_bars = _bars("sh.600001", drift=0.003, end=old_date)
-    store.save_refresh(
+    _publish_history(
+        store,
         old_bars,
-        _refresh("old-published", old_date, count=len(old_bars)),
-        publish=True,
+        run_prefix="old-published",
     )
     store.save_refresh(
         _bars("sh.600001", drift=0.5, count=1, end=partial_date),
@@ -1376,10 +1398,10 @@ def test_semantically_corrupt_analysis_rows_return_structured_503(
     _publish_classification(classification_path, {"sh.600001": "growth"})
     market_path = market_dir / "market.duckdb"
     bars = _bars("sh.600001", drift=0.003)
-    MarketStore(market_path).save_refresh(
+    _publish_history(
+        MarketStore(market_path),
         bars,
-        _refresh("published", AS_OF, count=len(bars)),
-        publish=True,
+        run_prefix="published",
     )
     target = classification_path if database == "classification" else market_path
     connection = duckdb.connect(str(target))
@@ -1480,3 +1502,234 @@ def test_leader_ranking_representative_scale_has_stable_runtime_budget(
 
     assert len(result.candidates) == 3000
     assert elapsed < 15
+
+
+def test_fake_ready_publication_cannot_replace_complete_same_day_partition(
+    tmp_path: Path,
+) -> None:
+    market_path = tmp_path / "market.duckdb"
+    store = MarketStore(market_path)
+    first = [
+        _bars("sh.600001", drift=0.003, count=1)[0],
+        _bars("sh.600002", drift=0.002, count=1)[0],
+    ]
+    store.save_refresh(first, _refresh("complete", AS_OF, count=2), publish=True)
+    pointer_before = store.published_refresh()
+    fake_ready = _refresh("fake-ready", AS_OF, count=2).model_copy(
+        update={
+            "succeeded_count": 1,
+            "coverage_ratio": 0.5,
+            "failed_symbols": ["sh.600002"],
+            "quality_issues": ["incomplete_symbol_coverage"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="ready publication must be complete"):
+        store.save_refresh([first[0].model_copy(update={"close": 999})], fake_ready, publish=True)
+
+    connection = duckdb.connect(str(market_path))
+    try:
+        published = connection.execute(
+            "SELECT symbol, close FROM published_daily_bars ORDER BY symbol"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert published == [("sh.600001", first[0].close), ("sh.600002", first[1].close)]
+    assert store.published_refresh().run_id == pointer_before.run_id
+
+
+def test_local_publication_requires_one_complete_explicit_date_partition(
+    tmp_path: Path,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    prior = AS_OF - timedelta(days=1)
+    multi_date = [
+        _bars("sh.600001", drift=0.003, count=1, end=prior)[0],
+        _bars("sh.600001", drift=0.003, count=1, end=AS_OF)[0],
+    ]
+
+    with pytest.raises(ValueError, match="one explicit trade-date partition"):
+        store.save_refresh(
+            multi_date,
+            _refresh("implicit-multi-date", AS_OF, count=1).model_copy(
+                update={"run_kind": "backfill"}
+            ),
+            publish=True,
+        )
+
+    for trade_date, close in ((prior, 10.5), (AS_OF, 11.5)):
+        row = _bars("sh.600001", drift=0.003, count=1, end=trade_date)[0].model_copy(
+            update={"close": close}
+        )
+        store.save_refresh(
+            [row],
+            _refresh(f"explicit-{trade_date}", trade_date),
+            publish=True,
+        )
+    rerun = _bars("sh.600001", drift=0.003, count=1, end=AS_OF)[0].model_copy(
+        update={"close": 12.5}
+    )
+    store.save_refresh([rerun], _refresh("same-day-rerun", AS_OF), publish=True)
+
+    connection = duckdb.connect(str(store.path))
+    try:
+        rows = connection.execute(
+            "SELECT trade_date, close FROM published_daily_bars ORDER BY trade_date"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(prior, 10.5), (AS_OF, 12.5)]
+
+
+@pytest.mark.parametrize("corruption", ["partial", "coverage", "missing_run", "row_count"])
+def test_publication_audit_corruption_returns_structured_503(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    sector_api = import_module("backend.app.api.sector")
+    market_dir = tmp_path / "market"
+    _publish_classification(
+        market_dir / "classification.duckdb",
+        {"sh.600001": "growth", "sh.600002": "growth"},
+    )
+    market_path = market_dir / "market.duckdb"
+    store = MarketStore(market_path)
+    bars = [
+        _bars("sh.600001", drift=0.003, count=1)[0],
+        _bars("sh.600002", drift=0.002, count=1)[0],
+    ]
+    store.save_refresh(bars, _refresh("published", AS_OF, count=2), publish=True)
+    connection = duckdb.connect(str(market_path))
+    try:
+        if corruption == "partial":
+            connection.execute("UPDATE refresh_runs SET status = 'partial'")
+        elif corruption == "coverage":
+            connection.execute("UPDATE refresh_runs SET coverage_ratio = 0.5")
+        elif corruption == "missing_run":
+            connection.execute("DELETE FROM refresh_runs")
+        else:
+            connection.execute("DELETE FROM published_daily_bars WHERE symbol = 'sh.600002'")
+    finally:
+        connection.close()
+    settings = Settings(
+        market_data_dir=market_dir,
+        market_database_name=market_path.name,
+        classification_database_name="classification.duckdb",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    response = _api_get(
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
+        {
+            sector_api.get_sector_rotation_service: lambda: sector_api.get_sector_rotation_service(
+                settings
+            ),
+            sector_api.get_sector_today: lambda: AS_OF,
+        },
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "market_publication_state_unavailable"
+
+
+def test_as_of_ineligible_members_never_rank_or_become_leader_candidates(
+    tmp_path: Path,
+) -> None:
+    classification_path = tmp_path / "classification.duckdb"
+    symbols = ["sh.600001", "sh.600002"]
+    securities = [
+        _security(symbol).model_copy(update={"delist_date": AS_OF, "is_tradable": True})
+        for symbol in symbols
+    ]
+    store = ClassificationStore(classification_path)
+    outcome = store.publish(
+        ClassificationSnapshot(
+            source="baostock",
+            source_version="0.9.3",
+            source_snapshot_date=CLASSIFICATION_DATE,
+            observed_at=OBSERVED_AT,
+            securities=securities,
+            sector_memberships=[_membership(symbol, "delisted") for symbol in symbols],
+        )
+    )
+    assert outcome.promoted is True
+    sector_service = import_module("backend.app.sector.service")
+    service = sector_service.SectorRotationService(
+        store,
+        _BarsReader(_bars(symbols[0], drift=0.003) + _bars(symbols[1], drift=0.002)),
+    )
+
+    rotation = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders = service.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "delisted")
+
+    assert rotation.actual_scope.classification_eligible_symbols == 0
+    assert rotation.rankings == []
+    assert "classification_ineligible_delisted_excluded" in rotation.quality_issues
+    assert leaders.candidates == []
+    assert {item.symbol for item in leaders.exclusions} == set(symbols)
+    assert all("classification_ineligible_delisted" in item.reasons for item in leaders.exclusions)
+
+
+def test_qualification_version_changes_candidate_sector_and_result_ids(
+    tmp_path: Path,
+) -> None:
+    sector_service = import_module("backend.app.sector.service")
+    classification, _, _ = _publish_classification(
+        tmp_path / "classification.duckdb",
+        {"sh.600001": "growth", "sh.600002": "growth"},
+    )
+    bars = [
+        *_bars("sh.600001", drift=0.006, amount_drift=0.01),
+        *_bars("sh.600002", drift=0.002),
+    ]
+    v1 = sector_service.SectorRotationService(classification, _BarsReader(bars))
+    v9 = sector_service.SectorRotationService(
+        classification,
+        _BarsReader(bars),
+        leader_policy=sector_service.LeaderPolicy(
+            qualification_version="research-leader-qualification-v9"
+        ),
+    )
+
+    rotation_v1 = v1.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    rotation_v9 = v9.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    leaders_v1 = v1.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+    leaders_v9 = v9.leaders(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY, "growth")
+
+    assert leaders_v9.candidates[0].qualification_version.endswith("v9")
+    assert leaders_v1.candidates[0].candidate_id != leaders_v9.candidates[0].candidate_id
+    assert leaders_v1.result_id != leaders_v9.result_id
+    assert rotation_v1.rankings[0].ranking_id != rotation_v9.rankings[0].ranking_id
+    assert rotation_v1.result_id != rotation_v9.result_id
+    leadership_v9 = {
+        item.metric: item.formula_version
+        for item in rotation_v9.rankings[0].metric_scores
+        if item.metric.startswith("leader_")
+    }
+    assert all("research-leader-qualification-v9" in value for value in leadership_v9.values())
+
+
+def test_sector_score_ties_break_only_by_sector_id_even_with_different_sizes(
+    tmp_path: Path,
+) -> None:
+    mapping = {
+        "sh.600001": "alpha",
+        "sh.600002": "alpha",
+        "sh.600003": "zeta",
+        "sh.600004": "zeta",
+        "sh.600005": "zeta",
+    }
+    bars = [bar for symbol in mapping for bar in _bars(symbol, drift=0.003, amount=100, count=65)]
+    service, _, _ = _service(tmp_path, mapping, bars)
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+
+    assert result.rankings[0].total_score == result.rankings[1].total_score
+    assert [item.sector_id for item in result.rankings] == ["alpha", "zeta"]

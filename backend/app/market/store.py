@@ -151,13 +151,56 @@ class MarketStore:
         publish: bool | None = None,
     ) -> None:
         publish = result.status == "ready" if publish is None else publish
-        if publish and result.status != "ready":
-            raise ValueError("only ready refreshes can be published")
+        if publish:
+            self._validate_ready_publication(result)
+            self._validate_local_publication_bars(bars, result)
+        self._save_refresh(bars, result, publish=publish, capture_published_bars=publish)
+
+    def save_external_publication(self, result: RefreshResult) -> None:
+        """Persist a trusted external-dataset pointer without local bar materialization."""
+        self._validate_ready_publication(result)
+        self._save_refresh([], result, publish=True, capture_published_bars=False)
+
+    @staticmethod
+    def _validate_ready_publication(result: RefreshResult) -> None:
+        try:
+            validated = RefreshResult.model_validate(result.model_dump())
+        except ValueError as exc:
+            raise ValueError("ready publication must be complete") from exc
+        if validated.status != "ready":
+            raise ValueError("ready publication must be complete")
+
+    @staticmethod
+    def _validate_local_publication_bars(
+        bars: list[DailyBar],
+        result: RefreshResult,
+    ) -> None:
+        if not bars:
+            raise ValueError("ready local publication requires non-empty bars")
+        partitions = {(bar.trade_date, bar.source) for bar in bars}
+        expected_partition = {(result.requested_date, result.source)}
+        if partitions != expected_partition:
+            raise ValueError("ready local publication requires one explicit trade-date partition")
+        identities = [(bar.trade_date, bar.symbol, bar.source) for bar in bars]
+        if len(set(identities)) != len(identities):
+            raise ValueError("ready local publication contains duplicate symbols")
+        symbols = {bar.symbol for bar in bars}
+        if len(symbols) != result.succeeded_count:
+            raise ValueError("ready local publication count does not match refresh audit")
+
+    def _save_refresh(
+        self,
+        bars: list[DailyBar],
+        result: RefreshResult,
+        *,
+        publish: bool,
+        capture_published_bars: bool,
+    ) -> None:
         connection = self._connect()
         try:
             connection.begin()
             self._upsert_bars(connection, bars)
-            if publish and bars:
+            if capture_published_bars:
                 self._replace_published_bars(
                     connection,
                     bars,
@@ -383,6 +426,10 @@ class MarketStore:
             connection.close()
         if row is None:
             return None
+        return self._refresh_result_from_row(row)
+
+    @staticmethod
+    def _refresh_result_from_row(row) -> RefreshResult:
         return RefreshResult(
             run_id=row[0],
             requested_date=row[1],
@@ -420,22 +467,7 @@ class MarketStore:
             connection.close()
         if row is None:
             return None
-        return RefreshResult(
-            run_id=row[0],
-            requested_date=row[1],
-            source=row[2],
-            status=row[3],
-            requested_count=row[4],
-            succeeded_count=row[5],
-            coverage_ratio=row[6],
-            failed_symbols=json.loads(row[7]),
-            quality_issues=json.loads(row[8]),
-            error_message=row[9],
-            started_at=row[10],
-            completed_at=row[11],
-            request_key=row[12],
-            run_kind=row[13],
-        )
+        return self._refresh_result_from_row(row)
 
     def save_scheduler_state(self, state) -> None:
         connection = self._connect()
@@ -512,25 +544,7 @@ class MarketStore:
             ).fetchall()
         finally:
             connection.close()
-        return [
-            RefreshResult(
-                run_id=row[0],
-                requested_date=row[1],
-                source=row[2],
-                status=row[3],
-                requested_count=row[4],
-                succeeded_count=row[5],
-                coverage_ratio=row[6],
-                failed_symbols=json.loads(row[7]),
-                quality_issues=json.loads(row[8]),
-                error_message=row[9],
-                started_at=row[10],
-                completed_at=row[11],
-                request_key=row[12],
-                run_kind=row[13],
-            )
-            for row in rows
-        ]
+        return [self._refresh_result_from_row(row) for row in rows]
 
     def bars_for(self, trade_date, source: str) -> list[dict[str, object]]:
         connection = self._connect()

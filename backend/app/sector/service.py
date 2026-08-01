@@ -81,6 +81,7 @@ class SectorPolicy:
 @dataclass(frozen=True)
 class LeaderPolicy:
     formula_version: str = "leader-ranking-v1"
+    qualification_version: str = LEADER_QUALIFICATION_VERSION
     weights: dict[str, float] = field(
         default_factory=lambda: {
             "tradability": 0.10,
@@ -164,7 +165,12 @@ class SectorRotationService:
 
         grouped: dict[tuple[str, str], list[SectorMembershipRecord]] = defaultdict(list)
         for membership in context.memberships:
+            reason = self._membership_eligibility_reason(context, membership)
+            if reason is not None:
+                context.quality_issues.append(f"{reason}_excluded")
+                continue
             grouped[(membership.sector_id, membership.sector_name)].append(membership)
+        context.quality_issues = sorted(set(context.quality_issues))
         rankings = [
             self._sector_ranking(context, sector_id, sector_name, members)
             for (sector_id, sector_name), members in sorted(grouped.items())
@@ -173,7 +179,6 @@ class SectorRotationService:
             key=lambda item: (
                 item.total_score is None,
                 -(item.total_score or 0),
-                -item.priced_member_count,
                 item.sector_id,
             )
         )
@@ -485,6 +490,8 @@ class SectorRotationService:
         sector_name: str,
         members: list[SectorMembershipRecord],
     ) -> SectorRanking:
+        eligibility_reason = self._membership_eligibility_reason
+        members = [item for item in members if eligibility_reason(context, item) is None]
         member_symbols = [
             item.symbol
             for item in members
@@ -545,6 +552,7 @@ class SectorRotationService:
                 "metrics": metrics,
                 "formula_version": self.sector_policy.formula_version,
                 "weights": self.sector_policy.weights,
+                "leader_qualification_version": self.leader_policy.qualification_version,
             },
         )
         ranking_exclusion_reasons = []
@@ -907,6 +915,7 @@ class SectorRotationService:
             "target_count": target_count,
             "issues": coverage_issues,
         }
+        qualification_version = self.leader_policy.qualification_version
         return [
             _metric(
                 "leader_count",
@@ -914,7 +923,7 @@ class SectorRotationService:
                 score=(_clamp((leader_count - 1) * 50) if coverage_ok else None),
                 weight=self.sector_policy.weights["leader_count"],
                 unit="qualified_research_leaders",
-                formula="qualified-research-leader-count-v1",
+                formula=f"qualified-research-leader-count-v1+{qualification_version}",
                 missing=coverage_missing,
                 **common,
             ),
@@ -924,7 +933,7 @@ class SectorRotationService:
                 score=(_ratio_score(diffusion) if diffusion is not None and coverage_ok else None),
                 weight=self.sector_policy.weights["leader_diffusion"],
                 unit="qualified_candidate_ratio",
-                formula="qualified-research-leader-diffusion-v1",
+                formula=f"qualified-research-leader-diffusion-v1+{qualification_version}",
                 missing=coverage_missing,
                 **common,
             ),
@@ -938,7 +947,7 @@ class SectorRotationService:
                 ),
                 weight=self.sector_policy.weights["leader_persistence_days"],
                 unit="mean_signed_sessions",
-                formula="qualified-leader-mean-persistence-max20-v1",
+                formula=f"qualified-leader-mean-persistence-max20-v1+{qualification_version}",
                 missing=sorted(
                     {
                         *(["sector.qualified_leader_persistence"] if persistence is None else []),
@@ -958,6 +967,9 @@ class SectorRotationService:
         if security is None:
             return ["unknown_classification_member"]
         reasons = []
+        eligibility = eligibility_reason(security, context.as_of)
+        if eligibility is not None:
+            reasons.append(f"classification_ineligible_{eligibility}")
         if security.board != "main":
             reasons.append("outside_narrow_main_board_scope")
         if not security.is_tradable:
@@ -984,6 +996,17 @@ class SectorRotationService:
         return reasons
 
     @staticmethod
+    def _membership_eligibility_reason(
+        context: _Context,
+        member: SectorMembershipRecord,
+    ) -> str | None:
+        security = context.securities.get(member.security_id)
+        if security is None:
+            return "unknown_classification_member"
+        reason = eligibility_reason(security, context.as_of)
+        return f"classification_ineligible_{reason}" if reason is not None else None
+
+    @staticmethod
     def _sector_cache(
         context: _Context,
         sector_members: list[SectorMembershipRecord],
@@ -993,6 +1016,7 @@ class SectorRotationService:
             for item in sector_members
             if (
                 (security := context.securities.get(item.security_id)) is not None
+                and eligibility_reason(security, context.as_of) is None
                 and security.board == "main"
                 and item.symbol in context.histories
             )
@@ -1158,6 +1182,8 @@ class SectorRotationService:
             ],
         )
         supporting, contrary = _metric_reasons(metrics)
+        qualified, qualification_reasons, disqualification_reasons = _leader_qualification(metrics)
+        qualification_version = self.leader_policy.qualification_version
         candidate_id = _stable_id(
             "leader",
             {
@@ -1168,10 +1194,13 @@ class SectorRotationService:
                 "metrics": metrics,
                 "formula_version": self.leader_policy.formula_version,
                 "weights": self.leader_policy.weights,
+                "qualification_version": qualification_version,
+                "leader_qualified": qualified,
+                "qualification_reasons": qualification_reasons,
+                "disqualification_reasons": disqualification_reasons,
             },
         )
         security = context.securities[member.security_id]
-        qualified, qualification_reasons, disqualification_reasons = _leader_qualification(metrics)
         return LeaderCandidate(
             rank=1,
             candidate_id=candidate_id,
@@ -1182,7 +1211,7 @@ class SectorRotationService:
             actionable_primary=False,
             limit_lock_status="unavailable",
             leader_qualified=qualified,
-            qualification_version=LEADER_QUALIFICATION_VERSION,
+            qualification_version=qualification_version,
             qualification_reasons=qualification_reasons,
             disqualification_reasons=disqualification_reasons,
             metric_scores=metrics,
