@@ -112,8 +112,8 @@ function metricDetails(metrics: MetricScore[]): HTMLElement {
       `${metric.metric} · 得分 ${value(metric.score)}`,
     );
     const coverage =
-      metric.observed_count !== undefined && metric.eligible_count !== undefined
-        ? `${metric.observed_count} / ${metric.eligible_count}`
+      metric.effective_count !== undefined && metric.target_count !== undefined
+        ? `${metric.effective_count} / ${metric.target_count}`
         : "—";
     detail.append(
       summary,
@@ -244,6 +244,11 @@ function renderSector(
   selected: boolean,
   query: DecisionQuery,
 ): HTMLElement {
+  const metricRaw = (name: string): number | null | undefined =>
+    ranking.metric_scores.find((item) => item.metric === name)?.raw_value;
+  const leaderCount = metricRaw("leader_count");
+  const leaderDiffusion = metricRaw("leader_diffusion");
+  const leaderPersistence = metricRaw("leader_persistence_days");
   const article = element(
     "article",
     undefined,
@@ -271,14 +276,16 @@ function renderSector(
     rows([
       ["成员/有价", `${ranking.priced_member_count} / ${ranking.member_count}`],
       ["质量", ranking.quality_status],
-      ["龙头数量", ranking.leader_count === undefined ? "—" : String(ranking.leader_count)],
-      ["扩散度", percent(ranking.leader_diffusion)],
-      ["持续", ranking.persistence_days === undefined ? "—" : `${ranking.persistence_days} 日`],
+      ["排名资格", ranking.ranking_eligible ? "eligible" : "excluded"],
+      ["龙头数量", leaderCount === null || leaderCount === undefined ? "—" : value(leaderCount, 0)],
+      ["扩散度", percent(leaderDiffusion)],
+      ["持续", leaderPersistence === null || leaderPersistence === undefined ? "—" : `${value(leaderPersistence)} 日`],
     ]),
     metricDetails(ranking.metric_scores),
     tokens("支持证据", [evidenceText(ranking.supporting_evidence)]),
     tokens("反例", [evidenceText(ranking.contrary_evidence)]),
     tokens("缺失输入", ranking.missing_inputs),
+    tokens("排名排除原因", ranking.ranking_exclusion_reasons),
     tokens("质量问题", ranking.quality_issues),
   );
   return article;
@@ -399,6 +406,8 @@ function renderLeaders(
       heading,
       rows([
         ["可操作性", `${candidate.actionable_primary ? "可" : "不可"}作为操作首选`],
+        ["研究龙头资格", candidate.leader_qualified ? "qualified" : "not qualified"],
+        ["资格版本", candidate.qualification_version],
         ["操作状态", candidate.actionability_status],
         ["涨跌停锁定", candidate.limit_lock_status === "unavailable" ? "涨跌停锁定状态不可用" : candidate.limit_lock_status],
         ["质量", candidate.quality_status],
@@ -407,6 +416,8 @@ function renderLeaders(
       tokens("支持证据", [evidenceText(candidate.supporting_evidence)]),
       tokens("反例", [evidenceText(candidate.contrary_evidence)]),
       tokens("缺失输入", candidate.missing_inputs),
+      tokens("资格原因", candidate.qualification_reasons),
+      tokens("不合格原因", candidate.disqualification_reasons),
       tokens("风险/质量", candidate.quality_issues),
     );
     candidates.append(article);

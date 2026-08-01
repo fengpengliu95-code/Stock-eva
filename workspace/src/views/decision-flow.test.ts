@@ -117,6 +117,9 @@ describe("after-close decision flow view", () => {
     expect(controls[0].dataset.securitySector).toBe("sector-b");
     expect(leaders.textContent).toContain("不可作为操作首选");
     expect(leaders.textContent).toContain("涨跌停锁定状态不可用");
+    expect(leaders.textContent).toContain("leader-qualification-v1");
+    expect(leaders.textContent).toContain("relative_strength_qualified");
+    expect(leaders.textContent).toContain("trend_quality_below_threshold");
     expect(leaders.textContent).toContain("sh.600009");
     expect(leaders.textContent).toContain("suspended");
     expect(leaders.textContent).toContain("bad_price_quality");

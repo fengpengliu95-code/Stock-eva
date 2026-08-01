@@ -95,8 +95,8 @@ export interface MetricScore {
   quality_status: QualityStatus;
   missing_inputs: string[];
   quality_issues: string[];
-  observed_count?: number;
-  eligible_count?: number;
+  effective_count?: number;
+  target_count?: number;
   coverage_ratio?: number;
 }
 
@@ -138,6 +138,8 @@ export interface SectorRanking {
   sector_name: string;
   member_count: number;
   priced_member_count: number;
+  ranking_eligible: boolean;
+  ranking_exclusion_reasons: string[];
   total_score: number | null;
   confidence: Confidence;
   metric_scores: MetricScore[];
@@ -146,9 +148,6 @@ export interface SectorRanking {
   quality_status: QualityStatus;
   missing_inputs: string[];
   quality_issues: string[];
-  leader_count?: number;
-  leader_diffusion?: number;
-  persistence_days?: number;
 }
 
 export interface SectorRotationResponse {
@@ -178,6 +177,10 @@ export interface LeaderCandidate {
   actionable_primary: false;
   actionability_status: string;
   limit_lock_status: string;
+  leader_qualified: boolean;
+  qualification_version: string;
+  qualification_reasons: string[];
+  disqualification_reasons: string[];
   metric_scores: MetricScore[];
   supporting_evidence: EvidenceItem[];
   contrary_evidence: EvidenceItem[];
@@ -537,7 +540,7 @@ function metric(value: unknown, label: string): MetricScore {
     missing_inputs: strings(source.missing_inputs, `${label}.missing_inputs`),
     quality_issues: strings(source.quality_issues, `${label}.quality_issues`),
   };
-  for (const key of ["observed_count", "eligible_count"] as const) {
+  for (const key of ["effective_count", "target_count"] as const) {
     if (source[key] !== undefined) {
       result[key] = integer(source[key], `${label}.${key}`);
     }
@@ -662,6 +665,14 @@ function sectorRanking(value: unknown, label: string): SectorRanking {
       source.priced_member_count,
       `${label}.priced_member_count`,
     ),
+    ranking_eligible: booleanValue(
+      source.ranking_eligible,
+      `${label}.ranking_eligible`,
+    ),
+    ranking_exclusion_reasons: strings(
+      source.ranking_exclusion_reasons,
+      `${label}.ranking_exclusion_reasons`,
+    ),
     total_score: nullableNumber(source.total_score, `${label}.total_score`),
     confidence: confidence(source.confidence, `${label}.confidence`),
     metric_scores: metricList(source.metric_scores, `${label}.metric_scores`),
@@ -680,17 +691,6 @@ function sectorRanking(value: unknown, label: string): SectorRanking {
     missing_inputs: strings(source.missing_inputs, `${label}.missing_inputs`),
     quality_issues: strings(source.quality_issues, `${label}.quality_issues`),
   };
-  for (const key of ["leader_count", "persistence_days"] as const) {
-    if (source[key] !== undefined) {
-      result[key] = integer(source[key], `${label}.${key}`);
-    }
-  }
-  if (source.leader_diffusion !== undefined) {
-    result.leader_diffusion = finiteNumber(
-      source.leader_diffusion,
-      `${label}.leader_diffusion`,
-    );
-  }
   return result;
 }
 
@@ -752,6 +752,22 @@ function leaderCandidate(value: unknown, label: string): LeaderCandidate {
     limit_lock_status: stringValue(
       source.limit_lock_status,
       `${label}.limit_lock_status`,
+    ),
+    leader_qualified: booleanValue(
+      source.leader_qualified,
+      `${label}.leader_qualified`,
+    ),
+    qualification_version: stringValue(
+      source.qualification_version,
+      `${label}.qualification_version`,
+    ),
+    qualification_reasons: strings(
+      source.qualification_reasons,
+      `${label}.qualification_reasons`,
+    ),
+    disqualification_reasons: strings(
+      source.disqualification_reasons,
+      `${label}.disqualification_reasons`,
     ),
     metric_scores: metricList(source.metric_scores, `${label}.metric_scores`),
     supporting_evidence: evidenceList(

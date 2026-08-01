@@ -119,8 +119,8 @@ function metric(metricName: string, rawValue = 0.12) {
     quality_status: "ready",
     missing_inputs: [],
     quality_issues: [],
-    observed_count: 18,
-    eligible_count: 20,
+    effective_count: 18,
+    target_count: 20,
     coverage_ratio: 0.9,
   };
 }
@@ -161,17 +161,21 @@ function sectorPayload(overrides: Record<string, unknown> = {}) {
         sector_name: "板块乙",
         member_count: 20,
         priced_member_count: 18,
+        ranking_eligible: true,
+        ranking_exclusion_reasons: [],
         total_score: 48,
         confidence: { value: 0.55, level: "medium", reasons: [] },
-        metric_scores: [metric("relative_strength_20d")],
+        metric_scores: [
+          metric("relative_strength_20d"),
+          metric("leader_count", 3),
+          metric("leader_diffusion", 0.15),
+          metric("leader_persistence_days", 5),
+        ],
         supporting_evidence: [],
         contrary_evidence: [],
         quality_status: "degraded",
         missing_inputs: [],
         quality_issues: ["member_history_coverage_low"],
-        leader_count: 3,
-        leader_diffusion: 0.15,
-        persistence_days: 5,
       },
       {
         rank: 1,
@@ -180,6 +184,8 @@ function sectorPayload(overrides: Record<string, unknown> = {}) {
         sector_name: "板块甲",
         member_count: 30,
         priced_member_count: 30,
+        ranking_eligible: true,
+        ranking_exclusion_reasons: [],
         total_score: 60,
         confidence: { value: 0.7, level: "medium", reasons: [] },
         metric_scores: [metric("relative_strength_20d")],
@@ -227,6 +233,10 @@ function leadersPayload(overrides: Record<string, unknown> = {}) {
         actionable_primary: false,
         actionability_status: "risk_inputs_unavailable",
         limit_lock_status: "unavailable",
+        leader_qualified: true,
+        qualification_version: "leader-qualification-v1",
+        qualification_reasons: ["relative_strength_qualified"],
+        disqualification_reasons: [],
         metric_scores: [metric("relative_strength_20d")],
         supporting_evidence: [],
         contrary_evidence: [],
@@ -244,6 +254,10 @@ function leadersPayload(overrides: Record<string, unknown> = {}) {
         actionable_primary: false,
         actionability_status: "risk_inputs_unavailable",
         limit_lock_status: "unavailable",
+        leader_qualified: false,
+        qualification_version: "leader-qualification-v1",
+        qualification_reasons: [],
+        disqualification_reasons: ["trend_quality_below_threshold"],
         metric_scores: [metric("relative_strength_20d")],
         supporting_evidence: [],
         contrary_evidence: [],
@@ -280,16 +294,27 @@ describe("decision API contracts", () => {
     const leaders = parseSectorLeaders(leadersPayload());
 
     expect(rotation.rankings.map((item) => item.rank)).toEqual([2, 1]);
-    expect(rotation.rankings[0]).toEqual(
-      expect.objectContaining({
-        leader_count: 3,
-        leader_diffusion: 0.15,
-        persistence_days: 5,
-      }),
+    expect(rotation.rankings[0].ranking_eligible).toBe(true);
+    expect(rotation.rankings[0].metric_scores[0]).toEqual(
+      expect.objectContaining({ effective_count: 18, target_count: 20 }),
     );
+    expect(
+      rotation.rankings[0].metric_scores.map((item) => item.metric),
+    ).toEqual([
+      "relative_strength_20d",
+      "leader_count",
+      "leader_diffusion",
+      "leader_persistence_days",
+    ]);
     expect(leaders.candidates.map((item) => item.rank)).toEqual([2, 1]);
     expect(leaders.candidates.every((item) => !item.actionable_primary)).toBe(
       true,
+    );
+    expect(leaders.candidates[0]).toEqual(
+      expect.objectContaining({
+        leader_qualified: true,
+        qualification_version: "leader-qualification-v1",
+      }),
     );
   });
 
