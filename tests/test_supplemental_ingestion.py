@@ -299,7 +299,7 @@ def test_failed_batch_keeps_previous_manifest_and_records_safe_error(
     good.execute(request())
     before = (tmp_path / "dataset" / "manifest.json").read_bytes()
 
-    bad_request = request().model_copy(update={"through_date": date(2026, 7, 25)})
+    bad_request = request().model_copy(update={"through_date": date(2026, 7, 27)})
     bad = SupplementalIngestionService(store, provider(MissingDateClient()))
     with pytest.raises(SupplementalDataError, match="explicit source date"):
         bad.execute(bad_request)

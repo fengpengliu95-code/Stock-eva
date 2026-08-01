@@ -18,7 +18,12 @@ from backend.app.fund_flow.service import (
 )
 from backend.app.fund_flow.store import FundFlowEvidenceStore
 from backend.app.main import app
-from backend.app.market.akshare_supplemental import AKShareSupplementalProvider
+from backend.app.market.akshare_supplemental import (
+    MARKET_FUND_FLOW_ENDPOINT,
+    SECTOR_FUND_FLOW_ENDPOINT,
+    AKShareSupplementalProvider,
+    SupplementalDataError,
+)
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.supplement_ingestion import (
     _COLUMNS,
@@ -33,7 +38,7 @@ from backend.app.market.supplemental import ReportedFundFlowPoint
 
 AS_OF = date(2026, 7, 29)
 OBSERVED_AT = datetime(2026, 7, 29, 10, 30, tzinfo=UTC)
-ENDPOINT = "stock_market_fund_flow"
+ENDPOINT = MARKET_FUND_FLOW_ENDPOINT
 MARKET_ANALYSIS_UNIVERSE = "sh_sz_market"
 MARKET_UPSTREAM_SCOPE = "沪深市场"
 
@@ -179,6 +184,97 @@ def test_closed_weekend_or_holiday_source_point_blocks_publication(
     assert "source_point_on_closed_session" in result.quality_issues
 
 
+@pytest.mark.parametrize("closed_as_of", [date(2026, 7, 25), date(2026, 5, 1)])
+def test_closed_analysis_as_of_never_publishes_a_trend(closed_as_of: date) -> None:
+    calendar = get_trading_calendar()
+    data_as_of = calendar.previous_session(closed_as_of)
+    assert data_as_of is not None
+    sessions = _sessions(calendar, end=data_as_of, count=20)
+    observed_at = datetime(
+        data_as_of.year,
+        data_as_of.month,
+        data_as_of.day,
+        10,
+        30,
+        tzinfo=UTC,
+    )
+    snapshot = _snapshot(
+        [point.model_copy(update={"observed_at": observed_at}) for point in _points(sessions)],
+        as_of=closed_as_of,
+        publication_as_of=data_as_of,
+        published_at=observed_at,
+    )
+
+    result = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    assert calendar.session_status(closed_as_of) == "closed"
+    assert result.availability != "ready"
+    assert result.can_publish_trend is False
+    assert result.conclusion is None
+    assert result.last_trusted_date == data_as_of
+    assert "analysis_as_of_closed_session" in result.quality_issues
+
+
+def test_unknown_analysis_as_of_never_publishes_a_trend() -> None:
+    calendar = get_trading_calendar()
+    unknown_as_of = date(2027, 1, 4)
+    assert calendar.session_status(unknown_as_of) == "unknown"
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+
+    result = FundFlowEvidenceService(calendar).evaluate(
+        _snapshot(_points(sessions), as_of=unknown_as_of)
+    )
+
+    assert result.availability != "ready"
+    assert result.can_publish_trend is False
+    assert result.conclusion is None
+    assert result.last_trusted_date == AS_OF
+    assert "trading_calendar_unverifiable" in result.quality_issues
+
+
+def test_closed_analysis_as_of_keeps_structured_reason_when_source_is_empty() -> None:
+    calendar = get_trading_calendar()
+    closed_as_of = date(2026, 7, 25)
+    snapshot = _snapshot([], as_of=closed_as_of).model_copy(
+        update={
+            "source_status": "empty",
+            "publication_as_of": None,
+            "published_at": None,
+        }
+    )
+
+    result = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    assert result.availability == "empty"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
+    assert "analysis_as_of_closed_session" in result.quality_issues
+
+
+@pytest.mark.parametrize("publication_as_of", [date(2026, 7, 25), date(1900, 1, 2)])
+def test_closed_or_unknown_publication_date_never_publishes(
+    publication_as_of: date,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    snapshot = _snapshot(
+        _points(sessions),
+        publication_as_of=publication_as_of,
+    )
+
+    result = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    assert result.availability != "ready"
+    assert result.can_publish_trend is False
+    assert result.publication_knowledge == "unverifiable"
+    expected_issue = (
+        "publication_as_of_closed_session"
+        if calendar.session_status(publication_as_of) == "closed"
+        else "trading_calendar_unverifiable"
+    )
+    assert expected_issue in result.quality_issues
+
+
 def test_unknown_source_session_blocks_publication_as_calendar_unverifiable() -> None:
     calendar = get_trading_calendar()
     sessions = _sessions(calendar, end=AS_OF, count=20)
@@ -250,6 +346,21 @@ def test_published_row_cannot_mask_a_different_upstream_as_eastmoney() -> None:
 
     with pytest.raises(ValueError, match="upstream"):
         _fund_flow_from_row(row)
+
+
+@pytest.mark.parametrize("endpoint", ["", SECTOR_FUND_FLOW_ENDPOINT])
+def test_uniform_wrong_market_endpoint_fails_closed(endpoint: str) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+
+    result = FundFlowEvidenceService(calendar).evaluate(
+        _snapshot(_points(sessions, endpoint=endpoint))
+    )
+
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
+    assert "provider_contract_mismatch" in result.quality_issues
 
 
 def test_stale_last_trusted_point_is_exposed_but_never_republished() -> None:
@@ -353,6 +464,131 @@ def test_future_points_are_excluded_from_values_and_stable_result_id() -> None:
     assert "future_source_points_discarded" in future_result.quality_issues
     assert clean_result.metrics == future_result.metrics
     assert clean_result.result_id == repeated.result_id
+
+
+def test_observation_time_is_audited_and_participates_in_semantic_identity() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    baseline_snapshot = _snapshot(_points(sessions))
+    baseline = FundFlowEvidenceService(calendar).evaluate(baseline_snapshot)
+    changed_observation = datetime(2026, 7, 29, 10, 29, tzinfo=UTC)
+    changed_snapshot = baseline_snapshot.model_copy(
+        update={
+            "points": [
+                point.model_copy(update={"observed_at": changed_observation})
+                for point in baseline_snapshot.points
+            ],
+        }
+    )
+    changed = FundFlowEvidenceService(calendar).evaluate(changed_snapshot)
+
+    assert {point.observed_at for point in baseline.raw_observed_points} == {OBSERVED_AT}
+    assert baseline.semantic_lineage[0].earliest_observed_at == OBSERVED_AT
+    assert baseline.semantic_lineage[0].latest_observed_at == OBSERVED_AT
+    assert changed.result_id != baseline.result_id
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "issue"),
+    [
+        (datetime(2026, 7, 29, 10, 30), "source_observation_timestamp_unverifiable"),
+        (datetime(2026, 8, 1, 10, 30, tzinfo=UTC), "source_observed_after_publication"),
+    ],
+)
+def test_naive_or_future_observation_time_fails_closed(
+    observed_at: datetime,
+    issue: str,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    points = [point.model_copy(update={"observed_at": observed_at}) for point in _points(sessions)]
+
+    result = FundFlowEvidenceService(calendar).evaluate(_snapshot(points))
+
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
+    assert issue in result.quality_issues
+
+
+def test_missing_concentration_components_are_explicit_and_reduce_confidence() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    complete = FundFlowEvidenceService(calendar).evaluate(_snapshot(_points(sessions)))
+    incomplete_points = [
+        point.model_copy(
+            update={
+                "reported_medium_net_inflow": None,
+                "reported_small_net_inflow": None,
+            }
+        )
+        for point in _points(sessions)
+    ]
+    incomplete = FundFlowEvidenceService(calendar).evaluate(_snapshot(incomplete_points))
+    all_missing_points = [
+        point.model_copy(
+            update={
+                "reported_super_large_net_inflow": None,
+                "reported_large_net_inflow": None,
+                "reported_medium_net_inflow": None,
+                "reported_small_net_inflow": None,
+            }
+        )
+        for point in _points(sessions)
+    ]
+    all_missing = FundFlowEvidenceService(calendar).evaluate(_snapshot(all_missing_points))
+
+    assert incomplete.availability == "ready"
+    assert incomplete.can_publish_trend is True
+    assert incomplete.metrics is not None
+    assert incomplete.metrics.concentration_1d is None
+    assert incomplete.metrics.concentration_component_count_1d == 2
+    assert incomplete.metrics.concentration_denominator_abs_1d is not None
+    assert "complete_order_size_components_for_concentration" in incomplete.missing_inputs
+    assert "concentration_components_incomplete_2_of_4" in incomplete.quality_issues
+    assert incomplete.confidence.value < complete.confidence.value
+    assert "concentration_unavailable" in incomplete.confidence.reasons
+    assert all_missing.metrics is not None
+    assert all_missing.metrics.concentration_component_count_1d == 0
+    assert all_missing.metrics.concentration_denominator_abs_1d is None
+    assert "concentration_components_incomplete_0_of_4" in all_missing.quality_issues
+    assert all_missing.confidence.value == incomplete.confidence.value
+
+
+def test_result_id_ignores_non_semantic_publication_seconds() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    points = _points(sessions)
+    first_snapshot = _snapshot(points)
+    second_snapshot = first_snapshot.model_copy(
+        update={"published_at": OBSERVED_AT.replace(second=1)}
+    )
+    service = FundFlowEvidenceService(calendar)
+
+    first = service.evaluate(first_snapshot)
+    second = service.evaluate(second_snapshot)
+
+    assert first.computed_at != second.computed_at
+    assert first.publication_knowledge == second.publication_knowledge == "verified"
+    assert first.result_id == second.result_id
+
+
+def test_publication_time_that_changes_visibility_changes_result_id() -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    baseline_snapshot = _snapshot(_points(sessions))
+    delayed_snapshot = baseline_snapshot.model_copy(
+        update={"published_at": datetime(2026, 7, 30, 10, 30, tzinfo=UTC)}
+    )
+    service = FundFlowEvidenceService(calendar)
+
+    baseline = service.evaluate(baseline_snapshot)
+    delayed = service.evaluate(delayed_snapshot)
+
+    assert baseline.publication_knowledge == "verified"
+    assert delayed.publication_knowledge == "unverifiable"
+    assert delayed.can_publish_trend is False
+    assert baseline.result_id != delayed.result_id
 
 
 def test_formula_and_unavailable_semantics_are_reflected_in_response_and_result_id() -> None:
@@ -541,6 +777,144 @@ def _publish_real_contract_market_history(
     return settings
 
 
+@pytest.mark.parametrize(
+    "through_date",
+    [date(2026, 7, 25), date(1900, 1, 2), date(2026, 7, 30)],
+)
+def test_ingestion_rejects_closed_unknown_or_future_publication_dates_before_writes(
+    tmp_path: Path,
+    through_date: date,
+) -> None:
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+
+    class NeverCalledProvider:
+        calls = 0
+
+        def market_fund_flow_history(self, *, through_date: date):
+            self.calls += 1
+            raise AssertionError("provider must not be called")
+
+    provider = NeverCalledProvider()
+    service = SupplementalIngestionService(
+        store,
+        provider,
+        calendar=get_trading_calendar(),
+        clock=lambda: OBSERVED_AT,
+    )
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(ValueError, match="through_date"):
+        service.execute(
+            SupplementalIngestionRequest(
+                through_date=through_date,
+                include_market_flow=True,
+                canary=True,
+            )
+        )
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert provider.calls == 0
+    assert after == before
+
+
+def test_ingestion_rejects_uniform_wrong_endpoint_without_moving_manifest(
+    tmp_path: Path,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+    manifest_path = settings.supplemental_data_dir / "manifest.json"
+    before = manifest_path.read_bytes()
+    service = SupplementalIngestionService(
+        store,
+        HistoryProvider(_points(sessions, endpoint=SECTOR_FUND_FLOW_ENDPOINT)),
+        calendar=calendar,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    with pytest.raises(SupplementalDataError, match="provider contract"):
+        service.execute(
+            SupplementalIngestionRequest(
+                through_date=AS_OF,
+                include_market_flow=True,
+                canary=True,
+            )
+        )
+
+    assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    [datetime(2026, 7, 29, 10, 30), datetime(2026, 7, 30, 10, 30, tzinfo=UTC)],
+)
+def test_ingestion_rejects_unauditable_observation_time_without_moving_manifest(
+    tmp_path: Path,
+    observed_at: datetime,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    points = [point.model_copy(update={"observed_at": observed_at}) for point in _points(sessions)]
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+    manifest_path = settings.supplemental_data_dir / "manifest.json"
+    before = manifest_path.read_bytes()
+    service = SupplementalIngestionService(
+        store,
+        HistoryProvider(points),
+        calendar=calendar,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    with pytest.raises(SupplementalDataError, match="observation time"):
+        service.execute(
+            SupplementalIngestionRequest(
+                through_date=AS_OF,
+                include_market_flow=True,
+                canary=True,
+            )
+        )
+
+    assert manifest_path.read_bytes() == before
+
+
 @pytest.mark.anyio
 async def test_api_is_read_only_and_returns_structured_not_configured_empty_and_error(
     tmp_path: Path,
@@ -600,7 +974,10 @@ async def test_api_is_read_only_and_returns_structured_not_configured_empty_and_
     [
         ("provider_contract", [PINNED_PROVIDER_VERSION]),
         ("provider_contract", "unsupported-provider-contract"),
+        ("source", ["akshare"]),
         ("source", "different-source"),
+        ("endpoint", SECTOR_FUND_FLOW_ENDPOINT),
+        ("units", {"reported_main_net_inflow": "shares"}),
     ],
 )
 def test_manifest_semantic_metadata_corruption_fails_closed(
@@ -814,7 +1191,7 @@ async def test_sector_scope_reads_only_the_exact_published_sector_semantics(
         sessions,
         scope="industry",
         scope_name="银行",
-        endpoint="stock_sector_fund_flow_hist",
+        endpoint=SECTOR_FUND_FLOW_ENDPOINT,
     )
     settings = _publish_sector_history(
         tmp_path,
@@ -854,7 +1231,7 @@ async def test_sector_scope_reads_only_the_exact_published_sector_semantics(
     assert payload["availability"] == "ready"
     assert payload["scope"] == "sector"
     assert payload["scope_id"] == "银行"
-    assert payload["source"]["endpoint"] == "stock_sector_fund_flow_hist"
+    assert payload["source"]["endpoint"] == SECTOR_FUND_FLOW_ENDPOINT
     assert {point["scope_id"] for point in payload["raw_observed_points"]} == {"银行"}
     assert absent.status_code == 200
     assert absent.json()["availability"] == "empty"
@@ -869,7 +1246,21 @@ def test_failed_ingestion_keeps_last_trusted_manifest_for_analysis(
     sessions = _sessions(calendar, end=previous, count=20)
     settings = _publish_market_history(
         tmp_path,
-        _points(sessions),
+        [
+            point.model_copy(
+                update={
+                    "observed_at": datetime(
+                        previous.year,
+                        previous.month,
+                        previous.day,
+                        10,
+                        30,
+                        tzinfo=UTC,
+                    )
+                }
+            )
+            for point in _points(sessions)
+        ],
         through_date=previous,
     )
     manifest = settings.supplemental_data_dir / "manifest.json"

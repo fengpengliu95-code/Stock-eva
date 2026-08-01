@@ -11,19 +11,23 @@ import json
 import os
 import shutil
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.market.akshare_supplemental import (
+    FUND_FLOW_CONTRACT_BY_SCOPE,
     AKShareSupplementalProvider,
     SupplementalDataError,
     SupplementalSourceUnavailableError,
 )
+from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.supplemental import (
     IndustryClassificationRecord,
     ReportedFundFlowPoint,
@@ -477,6 +481,19 @@ class SupplementalStore:
             or provider_contract != PINNED_PROVIDER_VERSION
         ):
             raise SupplementalDatasetError("supplemental manifest provider contract is invalid")
+        kind = str(item["dataset_kind"])
+        if kind in {"market_fund_flow", "sector_fund_flow"}:
+            scope = "market" if kind == "market_fund_flow" else "sector"
+            contract = FUND_FLOW_CONTRACT_BY_SCOPE[scope]
+            if (
+                item.get("upstream") != contract["upstream"]
+                or item.get("source_scope") != contract["source_scope"]
+                or item.get("endpoint") != contract["endpoint"]
+                or item.get("units") != contract["units"]
+            ):
+                raise SupplementalDatasetError(
+                    "supplemental manifest fund-flow contract is invalid"
+                )
         relative = Path(str(item.get("path", "")))
         if (
             relative.is_absolute()
@@ -548,19 +565,29 @@ class SupplementalStore:
                     )
                     final.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(partial, final)
-                    final_entries.append(
-                        {
-                            "dataset_kind": kind,
-                            "path": str(final.relative_to(self.root)),
-                            "sha256": checksum,
-                            "row_count": len(rows),
-                            "as_of": run.through_date.isoformat(),
-                            "min_trade_date": min(row["trade_date"] for row in rows).isoformat(),
-                            "max_trade_date": max(row["trade_date"] for row in rows).isoformat(),
-                            "source": "akshare",
-                            "provider_contract": PINNED_PROVIDER_VERSION,
-                        }
-                    )
+                    entry = {
+                        "dataset_kind": kind,
+                        "path": str(final.relative_to(self.root)),
+                        "sha256": checksum,
+                        "row_count": len(rows),
+                        "as_of": run.through_date.isoformat(),
+                        "min_trade_date": min(row["trade_date"] for row in rows).isoformat(),
+                        "max_trade_date": max(row["trade_date"] for row in rows).isoformat(),
+                        "source": "akshare",
+                        "provider_contract": PINNED_PROVIDER_VERSION,
+                    }
+                    if kind in {"market_fund_flow", "sector_fund_flow"}:
+                        scope = "market" if kind == "market_fund_flow" else "sector"
+                        contract = FUND_FLOW_CONTRACT_BY_SCOPE[scope]
+                        entry.update(
+                            {
+                                "upstream": contract["upstream"],
+                                "source_scope": contract["source_scope"],
+                                "endpoint": contract["endpoint"],
+                                "units": contract["units"],
+                            }
+                        )
+                    final_entries.append(entry)
 
                 current = self._manifest(allow_missing=False)
                 if str(current["generation"]) != baseline_generation:
@@ -646,6 +673,28 @@ class SupplementalStore:
                 """,
                 [str(path)],
             ).fetchone()
+            contract_invalid = 0
+            if kind in {"market_fund_flow", "sector_fund_flow"}:
+                scope = "market" if kind == "market_fund_flow" else "sector"
+                contract = FUND_FLOW_CONTRACT_BY_SCOPE[scope]
+                contract_invalid = int(
+                    connection.execute(
+                        """
+                        SELECT count(*)
+                        FROM read_parquet(?, hive_partitioning = false)
+                        WHERE source != ? OR upstream != ? OR scope != ?
+                           OR endpoint != ? OR quality_status != 'ready'
+                           OR scope_name IS NULL OR scope_name = ''
+                        """,
+                        [
+                            str(path),
+                            contract["source"],
+                            contract["upstream"],
+                            contract["source_scope"],
+                            contract["endpoint"],
+                        ],
+                    ).fetchone()[0]
+                )
         except duckdb.Error as exc:
             raise SupplementalDatasetError("supplemental parquet validation failed") from exc
         finally:
@@ -655,6 +704,8 @@ class SupplementalStore:
             raise SupplementalDatasetError("supplemental parquet schema is invalid")
         if row[:7] != (expected_rows, 1, kind, 0, 0, 0, expected_rows):
             raise SupplementalDatasetError("supplemental parquet contents are invalid")
+        if contract_invalid:
+            raise SupplementalDatasetError("supplemental fund-flow contract is invalid")
         if row[7] is None or row[7] > as_of:
             raise SupplementalDatasetError("supplemental parquet exceeds the requested date")
 
@@ -777,9 +828,14 @@ class SupplementalIngestionService:
         self,
         store: SupplementalStore,
         provider: AKShareSupplementalProvider,
+        *,
+        calendar: TradingCalendar | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
+        self.calendar = calendar or get_trading_calendar()
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
     def plan(request: SupplementalIngestionRequest) -> dict[str, object]:
@@ -800,6 +856,15 @@ class SupplementalIngestionService:
     def execute(self, request: SupplementalIngestionRequest) -> SupplementalRun:
         if not request.canary:
             raise ValueError("explicit canary authorization is required")
+        now = self.clock()
+        if now.utcoffset() is None:
+            raise ValueError("supplemental ingestion clock must be timezone-aware")
+        today = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        if request.through_date > today:
+            raise ValueError("supplemental through_date must not be in the future")
+        session_status = self.calendar.session_status(request.through_date)
+        if session_status != "open":
+            raise ValueError("supplemental through_date must be a confirmed open trading session")
         existing = self.store.ready_run(request.request_key)
         if existing is not None:
             return existing
@@ -849,6 +914,11 @@ class SupplementalIngestionService:
             ]
         if request.include_market_flow:
             market = self.provider.market_fund_flow_history(through_date=request.through_date)
+            self._validate_fund_flow_points(
+                market,
+                scope="market",
+                now=self.clock(),
+            )
             rows["market_fund_flow"] = [_fund_flow_row(item) for item in market]
         if request.sector_names:
             sector_records: list[ReportedFundFlowPoint] = []
@@ -859,10 +929,36 @@ class SupplementalIngestionService:
                         through_date=request.through_date,
                     )
                 )
+            self._validate_fund_flow_points(
+                sector_records,
+                scope="sector",
+                now=self.clock(),
+            )
             rows["sector_fund_flow"] = [_fund_flow_row(item) for item in sector_records]
         if any(not values for values in rows.values()):
             raise SupplementalDataError("audited supplemental dataset returned no dated records")
         return rows
+
+    @staticmethod
+    def _validate_fund_flow_points(
+        points: list[ReportedFundFlowPoint],
+        *,
+        scope: Literal["market", "sector"],
+        now: datetime,
+    ) -> None:
+        contract = FUND_FLOW_CONTRACT_BY_SCOPE[scope]
+        if now.utcoffset() is None:
+            raise SupplementalDataError("supplemental validation clock is not auditable")
+        for point in points:
+            if (
+                point.source != contract["source"]
+                or point.upstream != contract["upstream"]
+                or point.scope != contract["source_scope"]
+                or point.source_endpoint != contract["endpoint"]
+            ):
+                raise SupplementalDataError("fund-flow provider contract mismatch")
+            if point.observed_at.utcoffset() is None or point.observed_at > now:
+                raise SupplementalDataError("fund-flow observation time is not auditable")
 
 
 def _base_row() -> dict[str, object]:

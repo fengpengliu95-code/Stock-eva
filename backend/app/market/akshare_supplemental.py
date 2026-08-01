@@ -10,8 +10,32 @@ from backend.app.market.supplemental import (
 _CLASSIFICATION_ENDPOINT = (
     "https://www.swsresearch.com/swindex/pdf/SwClass2021/StockClassifyUse_stock.xls"
 )
-_MARKET_FLOW_ENDPOINT = "https://data.eastmoney.com/zjlx/dpzjlx.html"
-_SECTOR_FLOW_ENDPOINT = "https://data.eastmoney.com/bkzj/"
+MARKET_FUND_FLOW_ENDPOINT = "https://data.eastmoney.com/zjlx/dpzjlx.html"
+SECTOR_FUND_FLOW_ENDPOINT = "https://data.eastmoney.com/bkzj/"
+FUND_FLOW_UNITS_CONTRACT = {
+    "reported_main_net_inflow": "CNY",
+    "reported_main_net_inflow_ratio": "percent",
+    "reported_super_large_net_inflow": "CNY",
+    "reported_large_net_inflow": "CNY",
+    "reported_medium_net_inflow": "CNY",
+    "reported_small_net_inflow": "CNY",
+}
+FUND_FLOW_CONTRACT_BY_SCOPE = {
+    "market": {
+        "source": "akshare",
+        "upstream": "eastmoney",
+        "source_scope": "market",
+        "endpoint": MARKET_FUND_FLOW_ENDPOINT,
+        "units": FUND_FLOW_UNITS_CONTRACT,
+    },
+    "sector": {
+        "source": "akshare",
+        "upstream": "eastmoney",
+        "source_scope": "industry",
+        "endpoint": SECTOR_FUND_FLOW_ENDPOINT,
+        "units": FUND_FLOW_UNITS_CONTRACT,
+    },
+}
 
 
 class SupplementalDataError(ValueError):
@@ -91,7 +115,7 @@ class AKShareSupplementalProvider:
             scope="market",
             scope_name="沪深市场",
             through_date=through_date,
-            source_endpoint=_MARKET_FLOW_ENDPOINT,
+            source_endpoint=MARKET_FUND_FLOW_ENDPOINT,
         )
 
     def sector_fund_flow_history(
@@ -105,14 +129,12 @@ class AKShareSupplementalProvider:
             raise SupplementalDataError("sector name is required")
         return self._fund_flow_records(
             self._source_call(
-                lambda: self.client.stock_sector_fund_flow_hist(
-                    symbol=normalized_name
-                )
+                lambda: self.client.stock_sector_fund_flow_hist(symbol=normalized_name)
             ),
             scope="industry",
             scope_name=normalized_name,
             through_date=through_date,
-            source_endpoint=_SECTOR_FLOW_ENDPOINT,
+            source_endpoint=SECTOR_FUND_FLOW_ENDPOINT,
         )
 
     @staticmethod

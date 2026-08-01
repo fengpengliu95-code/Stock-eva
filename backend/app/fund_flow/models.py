@@ -58,6 +58,7 @@ class FundFlowUnits(FundFlowModel):
 
 class FundFlowObservedPoint(FundFlowModel):
     trade_date: date
+    observed_at: datetime
     reported_main_net_inflow: float
     reported_main_net_inflow_ratio: float | None = None
     reported_super_large_net_inflow: float | None = None
@@ -82,6 +83,8 @@ class FundFlowMetrics(FundFlowModel):
     continuity_ratio_20d: float = Field(ge=0, le=1)
     z_score_20d: float | None
     concentration_1d: float | None = Field(default=None, ge=0, le=1)
+    concentration_component_count_1d: int = Field(default=0, ge=0, le=4)
+    concentration_denominator_abs_1d: float | None = Field(default=None, ge=0)
     price_divergence_20d: float | None = None
     sector_diffusion_20d: float | None = Field(default=None, ge=0, le=1)
 
@@ -114,12 +117,16 @@ class FundFlowSemanticLineage(FundFlowModel):
     date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
     earliest_input_date: date
     latest_input_date: date
+    earliest_observed_at: datetime
+    latest_observed_at: datetime
     record_count: int = Field(ge=1)
 
     @model_validator(mode="after")
     def validate_dates(self) -> "FundFlowSemanticLineage":
         if self.earliest_input_date > self.latest_input_date:
             raise ValueError("earliest_input_date must not exceed latest_input_date")
+        if self.earliest_observed_at > self.latest_observed_at:
+            raise ValueError("earliest_observed_at must not exceed latest_observed_at")
         return self
 
 

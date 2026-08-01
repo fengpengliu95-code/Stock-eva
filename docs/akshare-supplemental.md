@@ -41,7 +41,12 @@ EVA 首版仅设计为用户本地、私人研究；不重新发布原始数据�
 - 依赖通过 `uv sync --extra supplemental` 单独安装，默认运行环境不加载 AKShare；
 - 构造 provider 和所有 GET 请求均不联网；
 - 每条记录保留 `source=akshare`、实际上游、源页面、观察时间与明确源日期；
+- 市场与板块资金流分别固定到 `stock_market_fund_flow` 和
+  `stock_sector_fund_flow_hist` 的 source/upstream/scope/endpoint/unit 合同；摄取、
+  manifest 读取和分析服务三层都拒绝空 endpoint、跨 scope endpoint 或单位漂移；
 - `through_date` 是硬上界，未来日期不会进入结果；
+- `through_date` 还必须是不晚于上海当日的已确认开市日；周末、法定节假日和未知年份
+  在调用 provider 或写审计前失败；
 - 缺少明确日期或必需的上游主力净流入字段时整批失败，不用抓取时间代替；
 - 输出字段使用 `reported_*`，明确表示上游报告口径；
 - fund-flow 模型没有 OHLCV 字段，东财响应中的指数收盘价被主动丢弃。
@@ -65,7 +70,9 @@ OHLCV/amount。
 行业列表组成；同一请求成功后重复执行直接返回原运行。新结果先在本机 staging 写入，
 校验日期上界、主键唯一性、来源、schema、记录数和 SHA-256；随后复制到数据集
 `_staging`，从目标盘 readback，再同共享 rename 为不可变对象；最后一次性替换
-manifest。任一步失败只记录安全错误码，旧 manifest 不移动。
+manifest。资金流 manifest 同时固化 upstream、source scope、endpoint 和 units。
+观察时间必须带时区且不得晚于摄取时钟或 manifest 发布时间。任一步失败只记录安全
+错误码，旧 manifest 不移动。
 
 ## 显式初始化与 canary
 

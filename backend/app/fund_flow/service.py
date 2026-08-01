@@ -17,6 +17,9 @@ from backend.app.fund_flow.models import (
     FundFlowSource,
     UnavailableEvidenceLevel,
 )
+from backend.app.market.akshare_supplemental import (
+    FUND_FLOW_CONTRACT_BY_SCOPE,
+)
 from backend.app.market.calendar import TradingCalendar
 from backend.app.market.supplement_ingestion import PINNED_PROVIDER_VERSION
 from backend.app.market.supplemental import ReportedFundFlowPoint
@@ -60,26 +63,45 @@ class FundFlowEvidenceService:
         )
         if discarded_future:
             issues.add("future_source_points_discarded")
+        analysis_session_status = self.calendar.session_status(snapshot.as_of)
+        if analysis_session_status == "closed":
+            issues.add("analysis_as_of_closed_session")
+        elif analysis_session_status == "unknown":
+            issues.add("trading_calendar_unverifiable")
 
         if snapshot.source_status in {"not_configured", "empty", "error"}:
             return self._empty_result(snapshot, issues=issues)
         invalid_issue = self._invalid_issue(points, snapshot)
         if invalid_issue is not None:
             issues.add(invalid_issue)
+            historical_unverifiable = invalid_issue == "historical_observation_not_visible_as_of"
+            if historical_unverifiable:
+                issues.add("historical_publication_knowledge_unverifiable")
             return self._build_result(
                 snapshot,
-                availability="error",
+                availability=("insufficient_history" if historical_unverifiable else "error"),
                 points=[],
                 data_as_of=None,
                 last_trusted_date=None,
                 staleness_sessions=None,
-                publication_knowledge="not_applicable",
+                publication_knowledge=(
+                    "unverifiable" if historical_unverifiable else "not_applicable"
+                ),
                 source=None,
                 metrics=None,
                 missing_sessions=[],
-                missing_inputs=["valid_single_semantics_l1_history"],
+                missing_inputs=[
+                    (
+                        "historically_visible_observation"
+                        if historical_unverifiable
+                        else "valid_single_semantics_l1_history"
+                    )
+                ],
                 issues=issues,
-                confidence=self._confidence("error"),
+                confidence=self._confidence(
+                    "insufficient_history" if historical_unverifiable else "error",
+                    historical_unverifiable=historical_unverifiable,
+                ),
                 can_publish=False,
                 conclusion=None,
                 lineage=[],
@@ -97,6 +119,15 @@ class FundFlowEvidenceService:
             endpoint=points[0].source_endpoint,
         )
         data_as_of = points[-1].trade_date
+        publication_session_status = (
+            self.calendar.session_status(snapshot.publication_as_of)
+            if snapshot.publication_as_of is not None
+            else "unknown"
+        )
+        if publication_session_status == "closed":
+            issues.add("publication_as_of_closed_session")
+        elif publication_session_status == "unknown":
+            issues.add("trading_calendar_unverifiable")
         expected, calendar_issue = self._expected_sessions(data_as_of)
         if calendar_issue:
             issues.add(calendar_issue)
@@ -125,6 +156,8 @@ class FundFlowEvidenceService:
             or snapshot.as_of < snapshot.publication_as_of
             or published_on is None
             or published_on > snapshot.as_of
+            or analysis_session_status != "open"
+            or publication_session_status != "open"
             else "verified"
         )
         if publication_knowledge == "unverifiable":
@@ -139,6 +172,19 @@ class FundFlowEvidenceService:
             "member_level_evidence_for_diffusion",
             "price_series_for_divergence",
         ]
+        concentration_available = (
+            metrics.concentration_component_count_1d == 4
+            and metrics.concentration_denominator_abs_1d not in {None, 0}
+        )
+        if metrics.concentration_component_count_1d < 4:
+            missing_inputs.append("complete_order_size_components_for_concentration")
+            issues.add(
+                "concentration_components_incomplete_"
+                f"{metrics.concentration_component_count_1d}_of_4"
+            )
+        elif metrics.concentration_denominator_abs_1d == 0:
+            missing_inputs.append("nonzero_order_size_denominator_for_concentration")
+            issues.add("concentration_denominator_is_zero")
         history_ready = (
             len(expected) == WINDOW_SESSIONS
             and not missing_sessions
@@ -153,6 +199,8 @@ class FundFlowEvidenceService:
             and "source_data_exceeds_publication_as_of" not in issues
             and "publication_timestamp_unavailable" not in issues
             and not discarded_future
+            and analysis_session_status == "open"
+            and publication_session_status == "open"
         )
         if can_publish:
             availability = "ready"
@@ -183,6 +231,7 @@ class FundFlowEvidenceService:
             confidence=self._confidence(
                 availability,
                 historical_unverifiable=(publication_knowledge == "unverifiable"),
+                concentration_available=concentration_available,
             ),
             can_publish=can_publish,
             conclusion=conclusion,
@@ -251,7 +300,19 @@ class FundFlowEvidenceService:
         }
         if len(semantic_keys) > 1:
             return "mixed_source_or_semantics"
-        expected_source_scope = "market" if snapshot.scope == "market" else "industry"
+        contract = FUND_FLOW_CONTRACT_BY_SCOPE[snapshot.scope]
+        expected_source_scope = str(contract["source_scope"])
+        if (
+            snapshot.provider_contract != PINNED_PROVIDER_VERSION
+            or self.policy.units.model_dump(mode="json") != contract["units"]
+            or any(
+                point.source != contract["source"]
+                or point.upstream != contract["upstream"]
+                or point.source_endpoint != contract["endpoint"]
+                for point in points
+            )
+        ):
+            return "provider_contract_mismatch"
         if any(
             point.scope != expected_source_scope
             or point.scope_name != snapshot.upstream_scope_identity
@@ -263,6 +324,17 @@ class FundFlowEvidenceService:
             return "trading_calendar_unverifiable"
         if "closed" in session_statuses:
             return "source_point_on_closed_session"
+        for point in points:
+            if point.observed_at.utcoffset() is None:
+                return "source_observation_timestamp_unverifiable"
+            if (
+                snapshot.published_at is not None
+                and snapshot.published_at.utcoffset() is not None
+                and point.observed_at > snapshot.published_at
+            ):
+                return "source_observed_after_publication"
+            if point.observed_at.astimezone(ZoneInfo("Asia/Shanghai")).date() > snapshot.as_of:
+                return "historical_observation_not_visible_as_of"
         return None
 
     def _expected_sessions(self, end: date) -> tuple[list[date], str | None]:
@@ -320,18 +392,21 @@ class FundFlowEvidenceService:
             latest.reported_medium_net_inflow,
             latest.reported_small_net_inflow,
         ]
+        available_components = [float(item) for item in components if item is not None]
+        component_count = len(available_components)
+        denominator = (
+            sum(abs(item) for item in available_components) if available_components else None
+        )
         concentration = None
-        if all(item is not None for item in components):
-            denominator = sum(abs(float(item)) for item in components)
-            if denominator:
-                concentration = round(
-                    (
-                        abs(float(latest.reported_super_large_net_inflow))
-                        + abs(float(latest.reported_large_net_inflow))
-                    )
-                    / denominator,
-                    6,
+        if component_count == 4 and denominator:
+            concentration = round(
+                (
+                    abs(float(latest.reported_super_large_net_inflow))
+                    + abs(float(latest.reported_large_net_inflow))
                 )
+                / denominator,
+                6,
+            )
         z_score = None
         if twenty is not None:
             deviation = pstdev(twenty)
@@ -353,6 +428,10 @@ class FundFlowEvidenceService:
             ),
             z_score_20d=z_score,
             concentration_1d=concentration,
+            concentration_component_count_1d=component_count,
+            concentration_denominator_abs_1d=(
+                round(denominator, 6) if denominator is not None else None
+            ),
             price_divergence_20d=None,
             sector_diffusion_20d=None,
         )
@@ -380,6 +459,7 @@ class FundFlowEvidenceService:
         availability: str,
         *,
         historical_unverifiable: bool = False,
+        concentration_available: bool = True,
     ) -> FundFlowConfidence:
         if availability == "ready":
             value = 0.75
@@ -394,6 +474,13 @@ class FundFlowEvidenceService:
         else:
             value = 0.0
             reasons = [f"source_{availability}"]
+        if not concentration_available and availability not in {
+            "not_configured",
+            "empty",
+            "error",
+        }:
+            value = max(0.0, value - 0.1)
+            reasons.append("concentration_unavailable")
         level = "high" if value >= 0.9 else "medium" if value >= 0.5 else "low"
         return FundFlowConfidence(value=value, level=level, reasons=reasons)
 
@@ -418,6 +505,8 @@ class FundFlowEvidenceService:
             "earliest": points[0].trade_date.isoformat(),
             "latest": points[-1].trade_date.isoformat(),
             "record_count": len(points),
+            "earliest_observed_at": min(point.observed_at for point in points).isoformat(),
+            "latest_observed_at": max(point.observed_at for point in points).isoformat(),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return [
@@ -432,6 +521,8 @@ class FundFlowEvidenceService:
                 upstream_scope_identity=snapshot.upstream_scope_identity,
                 earliest_input_date=points[0].trade_date,
                 latest_input_date=points[-1].trade_date,
+                earliest_observed_at=min(point.observed_at for point in points),
+                latest_observed_at=max(point.observed_at for point in points),
                 record_count=len(points),
             )
         ]
@@ -459,6 +550,7 @@ class FundFlowEvidenceService:
         raw_points = [
             FundFlowObservedPoint(
                 trade_date=point.trade_date,
+                observed_at=point.observed_at,
                 reported_main_net_inflow=point.reported_main_net_inflow,
                 reported_main_net_inflow_ratio=point.reported_main_net_inflow_ratio,
                 reported_super_large_net_inflow=point.reported_super_large_net_inflow,
@@ -507,7 +599,7 @@ class FundFlowEvidenceService:
             unavailable_levels=list(self.policy.unavailable_levels),
         )
         encoded = json.dumps(
-            candidate.model_dump(mode="json", exclude={"result_id"}),
+            candidate.model_dump(mode="json", exclude={"result_id", "computed_at"}),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

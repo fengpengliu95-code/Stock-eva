@@ -13,9 +13,9 @@ Release 2 verdict: **PENDING — do not claim GO**
   Market responses preserve the distinct upstream scope identity `沪深市场`; the API
   rejects the unsupported `all_a_share` label rather than widening the source claim.
 - L1 is explicitly an upstream-reported order-size proxy. The API preserves
-  `source`, `upstream`, `endpoint`, explicit `trade_date`, units, provider/formula
-  version, object SHA-256 lineage and confidence. It never describes the records as
-  exchange-certified institutional identity.
+  `source`, `upstream`, the exact audited source page, explicit `trade_date`, aware
+  `observed_at`, units, provider/formula version, object SHA-256 lineage and confidence.
+  It never describes the records as exchange-certified institutional identity.
 - L2 public institutional traces and L3 price-volume inference are separate
   `unavailable` records in this slice. They are not zero-filled, combined with L1 or
   presented as observations.
@@ -28,6 +28,18 @@ Release 2 verdict: **PENDING — do not claim GO**
   Weekend/holiday points fail closed and unknown calendar years are explicitly
   `trading_calendar_unverifiable`; neither can enter raw evidence or lineage while a
   trend remains publishable.
+- Explicit ingestion `through_date`, analysis `as_of` and manifest publication dates
+  must be confirmed open sessions. Closed or unknown ingestion dates fail before any
+  provider or audit write. A weekend/holiday query may preserve the prior session as
+  `last_trusted_date`, but it is degraded and cannot publish a weekend trend.
+- The pinned provider contract maps market evidence only to the AKShare
+  `stock_market_fund_flow` operation and its Eastmoney market source page, and sector
+  evidence only to `stock_sector_fund_flow_hist` and its sector source page. Source,
+  upstream, scope, endpoint and units are validated during ingestion, in the immutable
+  manifest and again by the analysis service. Uniformly wrong endpoints fail closed.
+- Observation timestamps must be timezone-aware and no later than publication. A
+  later-observed backfill is not exposed as historically known evidence; historical
+  publication knowledge remains `unverifiable` and cannot publish.
 - A trend conclusion requires 20 contiguous exchange trading sessions, complete
   1/5/20 windows, zero trading-session staleness, a ready source snapshot, no future
   records, verified publication knowledge and an immutable object hash. Nineteen
@@ -42,18 +54,24 @@ Release 2 verdict: **PENDING — do not claim GO**
   published manifest/object fails closed as `error`.
 - Current supplemental manifests keep only one pointer per dataset kind. Therefore a
   later manifest cannot retroactively prove that object history was visible on an
-  earlier `as_of`. Such requests return raw evidence with
-  `publication_knowledge=unverifiable` and cannot publish a trend.
-- `result_id` and semantic lineage IDs are stable for identical inputs. Publication
-  time, source semantics, formula/provider version, object hash, scope, dates, metrics,
-  missing inputs and confidence participate in the deterministic result payload.
+  earlier `as_of`. Later-observed rows are withheld from historical raw evidence,
+  `publication_knowledge=unverifiable`, and no trend can be published.
+- `result_id` and semantic lineage IDs are stable for identical semantic inputs.
+  Source and observation semantics, formula/provider version, object hash, scope,
+  dates, metrics, missing inputs and confidence participate. The exact seconds of
+  `computed_at` are deliberately excluded: moving publication by one second without
+  changing visibility or any evidence semantics keeps the same ID. If publication
+  knowledge or any gate changes, those changed response semantics still change the ID.
 - One versioned policy object drives response `formula_version`, evidence semantics,
-  units and L2/L3 availability. `result_id` hashes the complete validated response
-  semantics except the ID itself, so formula, units, reasons and unavailable-level
-  changes cannot retain an old identity.
-- Manifest entries must carry `source=akshare` and the exact supported non-empty
-  provider contract. Wrong types, unsupported versions and changed sources return a
+  units and L2/L3 availability. Formula, units, reasons and unavailable-level changes
+  cannot retain an old identity.
+- Manifest entries carry `source=akshare`, the exact supported provider contract,
+  upstream, source scope, endpoint and unit map. Wrong types or values return a
   structured error instead of being stringified into trusted lineage.
+- Missing or partial order-size components leave concentration null, disclose the
+  valid component count and absolute denominator, add a structured missing input and
+  lower confidence. The independently valid 20-session main-flow trend is not silently
+  zero-filled or blocked solely by an unavailable concentration breakdown.
 - Price divergence and member-level sector diffusion are explicitly unavailable in
   this slice. They remain null and are listed in `missing_inputs`; they are not
   inferred from L1 records.
@@ -116,7 +134,28 @@ uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
 uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
   -k formula_and_unavailable_semantics
 # RED: 1 failed.
-# GREEN: 1 passed with a single policy and full-response canonical ID.
+# GREEN: 1 passed with a single policy and semantic-response canonical ID.
+
+# Second independent re-review reconstructed four additional counterexamples plus a
+# stable-ID canonicalization defect before repair:
+# - closed analysis/publication dates returned ready/can_publish=true;
+# - a uniform cross-scope or empty endpoint was accepted;
+# - naive/future observation timestamps were accepted and not returned in lineage;
+# - missing concentration inputs retained the same confidence and no missing reason;
+# - a one-second computed_at-only change changed result_id.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py
+# RED: collection failed because the fixed provider-contract constants and new
+# observation/metric schema did not exist. Direct baseline probes reproduced all five
+# incorrect results above.
+
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py
+# GREEN: 50 passed.
+
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k 'manifest_semantic_metadata_corruption or uniform_wrong or observation_time \
+      or concentration or result_id_ignores or publication_time or closed_analysis \
+      or unknown_analysis or publication_date or ingestion_rejects'
+# GREEN: 26 passed.
 ```
 
 ## Verification
@@ -126,10 +165,10 @@ uv run --extra dev pytest -q \
   tests/test_market_supplemental.py \
   tests/test_supplemental_ingestion.py \
   tests/test_fund_flow_evidence.py
-# 42 passed
+# 65 passed
 
 uv run --extra dev pytest
-# 514 passed
+# 537 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
