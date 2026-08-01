@@ -30,8 +30,11 @@ Release 2 verdict: **PENDING — do not claim GO**
   trend remains publishable.
 - Explicit ingestion `through_date`, analysis `as_of` and manifest publication dates
   must be confirmed open sessions. Closed or unknown ingestion dates fail before any
-  provider or audit write. A weekend/holiday query may preserve the prior session as
-  `last_trusted_date`, but it is degraded and cannot publish a weekend trend.
+  provider or audit write. Same-day ingestion additionally requires the calendar's
+  after-close data-ready boundary; a pre-ready request performs no provider, audit or
+  staging write, while completed historical sessions remain eligible. A
+  weekend/holiday query may preserve the prior session as `last_trusted_date`, but it
+  is degraded and cannot publish a weekend trend.
 - The pinned provider contract maps market evidence only to the AKShare
   `stock_market_fund_flow` operation and its Eastmoney market source page, and sector
   evidence only to `stock_sector_fund_flow_hist` and its sector source page. Source,
@@ -78,6 +81,12 @@ Release 2 verdict: **PENDING — do not claim GO**
 - A GET against missing or corrupt synthetic roots created no database, directory,
   schema or cache. A GET against a ready synthetic publication left the complete file
   tree byte-for-byte unchanged.
+- Fund-flow reads validate the requested dataset kind's manifest entry, immutable
+  object hash, Parquet schema and source contract. An older unrelated classification
+  or other fund-flow kind remains an informational
+  `supplemental_dataset_dates_differ` issue and cannot demote a complete current
+  market object; corruption of the requested object still returns `error`, and a
+  sector query never falls back to a market object.
 - No network, AKShare installation, NAS path, production database, user database,
   broker, order path, R1-C score or workspace UI was used or modified.
 
@@ -156,6 +165,20 @@ uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
       or concentration or result_id_ignores or publication_time or closed_analysis \
       or unknown_analysis or publication_date or ingestion_rejects'
 # GREEN: 26 passed.
+
+# Final independent review found two further counterexamples:
+# - same-day ingestion at 10:00 Asia/Shanghai called the provider and published;
+# - older unrelated classification/sector objects made a complete current market
+#   object partial.
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py \
+  -k 'data_ready or unrelated_older or corrupt_target_market'
+# RED: 2 failed, 3 passed.
+# GREEN: 5 passed. The pre-ready rejection leaves provider/audit/manifest unchanged;
+# the ready cutoff and completed historical sessions remain accepted; target-object
+# corruption still fails closed and sector never falls back to market.
+
+uv run --extra dev pytest -q tests/test_fund_flow_evidence.py
+# GREEN: 55 passed.
 ```
 
 ## Verification
@@ -165,10 +188,10 @@ uv run --extra dev pytest -q \
   tests/test_market_supplemental.py \
   tests/test_supplemental_ingestion.py \
   tests/test_fund_flow_evidence.py
-# 65 passed
+# 70 passed
 
 uv run --extra dev pytest
-# 537 passed
+# 542 passed
 
 uv run --extra dev ruff check backend tests
 # All checks passed!

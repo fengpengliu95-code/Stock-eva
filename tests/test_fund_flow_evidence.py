@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -34,7 +35,10 @@ from backend.app.market.supplement_ingestion import (
     SupplementalStore,
     _fund_flow_from_row,
 )
-from backend.app.market.supplemental import ReportedFundFlowPoint
+from backend.app.market.supplemental import (
+    IndustryClassificationRecord,
+    ReportedFundFlowPoint,
+)
 
 AS_OF = date(2026, 7, 29)
 OBSERVED_AT = datetime(2026, 7, 29, 10, 30, tzinfo=UTC)
@@ -835,6 +839,117 @@ def test_ingestion_rejects_closed_unknown_or_future_publication_dates_before_wri
     assert after == before
 
 
+def test_ingestion_rejects_same_day_before_data_ready_before_writes(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+
+    class NeverCalledProvider:
+        calls = 0
+
+        def market_fund_flow_history(self, *, through_date: date):
+            self.calls += 1
+            raise AssertionError("provider must not be called")
+
+    provider = NeverCalledProvider()
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    before_ready = datetime(
+        2026,
+        7,
+        29,
+        10,
+        0,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+
+    with pytest.raises(ValueError, match="data-ready"):
+        SupplementalIngestionService(
+            store,
+            provider,
+            calendar=get_trading_calendar(),
+            clock=lambda: before_ready,
+        ).execute(
+            SupplementalIngestionRequest(
+                through_date=AS_OF,
+                include_market_flow=True,
+                canary=True,
+            )
+        )
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert provider.calls == 0
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("now", "through_date"),
+    [
+        (
+            datetime(2026, 7, 29, 18, 11, tzinfo=ZoneInfo("Asia/Shanghai")),
+            AS_OF,
+        ),
+        (
+            datetime(2026, 7, 29, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            date(2026, 7, 28),
+        ),
+    ],
+)
+def test_ingestion_allows_data_ready_or_historical_open_session(
+    tmp_path: Path,
+    now: datetime,
+    through_date: date,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=through_date, count=20)
+    points = [point.model_copy(update={"observed_at": now}) for point in _points(sessions)]
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+    provider = HistoryProvider(points)
+
+    result = SupplementalIngestionService(
+        store,
+        provider,
+        calendar=calendar,
+        clock=lambda: now,
+    ).execute(
+        SupplementalIngestionRequest(
+            through_date=through_date,
+            include_market_flow=True,
+            canary=True,
+        )
+    )
+
+    assert result.status == "ready"
+    assert result.through_date == through_date
+
+
 def test_ingestion_rejects_uniform_wrong_endpoint_without_moving_manifest(
     tmp_path: Path,
 ) -> None:
@@ -1013,6 +1128,136 @@ def test_manifest_semantic_metadata_corruption_fails_closed(
     assert result.source_version == PINNED_PROVIDER_VERSION
     assert result.raw_observed_points == []
     assert result.quality_issues == ["supplemental_published_snapshot_unavailable"]
+
+
+def test_unrelated_older_datasets_do_not_degrade_ready_market_evidence(
+    tmp_path: Path,
+) -> None:
+    calendar = get_trading_calendar()
+    previous = calendar.previous_session(AS_OF)
+    assert previous is not None
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    settings = _settings(tmp_path)
+    SupplementalDatasetInitializer(
+        settings.supplemental_data_dir,
+        require_smb=False,
+    ).initialize()
+    supplemental_store = SupplementalStore(
+        settings.supplemental_data_dir,
+        settings.local_control_dir / settings.supplemental_audit_database_name,
+        staging_root=settings.local_staging_dir / "supplemental",
+        lock_path=settings.local_lock_dir / "supplemental.lock",
+    )
+
+    class ClassificationProvider:
+        def classification_history(self, *, through_date: date):
+            assert through_date == previous
+            return [
+                IndustryClassificationRecord(
+                    source_symbol="600000",
+                    industry_code="801780",
+                    industry_name="银行",
+                    effective_from=previous,
+                    source_updated_on=previous,
+                    source_endpoint=(
+                        "https://www.swsresearch.com/swindex/pdf/"
+                        "SwClass2021/StockClassifyUse_stock.xls"
+                    ),
+                    observed_at=OBSERVED_AT,
+                )
+            ]
+
+    SupplementalIngestionService(
+        supplemental_store,
+        ClassificationProvider(),
+        calendar=calendar,
+    ).execute(
+        SupplementalIngestionRequest(
+            through_date=previous,
+            include_classification=True,
+            canary=True,
+        )
+    )
+    SupplementalIngestionService(
+        supplemental_store,
+        HistoryProvider(
+            _points(
+                _sessions(calendar, end=previous, count=20),
+                scope="industry",
+                scope_name="银行",
+                endpoint=SECTOR_FUND_FLOW_ENDPOINT,
+            )
+        ),
+        calendar=calendar,
+    ).execute(
+        SupplementalIngestionRequest(
+            through_date=previous,
+            sector_names=["银行"],
+            canary=True,
+        )
+    )
+    SupplementalIngestionService(
+        supplemental_store,
+        HistoryProvider(_points(sessions)),
+        calendar=calendar,
+    ).execute(
+        SupplementalIngestionRequest(
+            through_date=AS_OF,
+            include_market_flow=True,
+            canary=True,
+        )
+    )
+    _set_synthetic_publication_time(settings, AS_OF)
+
+    store = FundFlowEvidenceStore.from_settings(settings)
+    market_snapshot = store.read(
+        as_of=AS_OF,
+        scope="market",
+        scope_id=MARKET_ANALYSIS_UNIVERSE,
+    )
+    market_result = FundFlowEvidenceService(calendar).evaluate(market_snapshot)
+    absent_sector = store.read(
+        as_of=AS_OF,
+        scope="sector",
+        scope_id="半导体",
+    )
+
+    assert market_snapshot.source_status == "ready"
+    assert "supplemental_dataset_dates_differ" in market_snapshot.quality_issues
+    assert "supplemental_snapshot_partial" not in market_snapshot.quality_issues
+    assert market_result.availability == "ready"
+    assert market_result.can_publish_trend is True
+    assert absent_sector.source_status == "empty"
+    assert absent_sector.points == []
+
+
+def test_corrupt_target_market_object_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    calendar = get_trading_calendar()
+    sessions = _sessions(calendar, end=AS_OF, count=20)
+    settings = _publish_market_history(
+        tmp_path,
+        _points(sessions),
+        through_date=AS_OF,
+    )
+    manifest = json.loads(
+        (settings.supplemental_data_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    target = settings.supplemental_data_dir / manifest["files"][0]["path"]
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+    snapshot = FundFlowEvidenceStore.from_settings(settings).read(
+        as_of=AS_OF,
+        scope="market",
+        scope_id=MARKET_ANALYSIS_UNIVERSE,
+    )
+    result = FundFlowEvidenceService(calendar).evaluate(snapshot)
+
+    assert snapshot.source_status == "error"
+    assert result.availability == "error"
+    assert result.can_publish_trend is False
+    assert result.raw_observed_points == []
 
 
 @pytest.mark.anyio

@@ -45,8 +45,9 @@ EVA 首版仅设计为用户本地、私人研究；不重新发布原始数据�
   `stock_sector_fund_flow_hist` 的 source/upstream/scope/endpoint/unit 合同；摄取、
   manifest 读取和分析服务三层都拒绝空 endpoint、跨 scope endpoint 或单位漂移；
 - `through_date` 是硬上界，未来日期不会进入结果；
-- `through_date` 还必须是不晚于上海当日的已确认开市日；周末、法定节假日和未知年份
-  在调用 provider 或写审计前失败；
+- `through_date` 还必须是不晚于上海时钟下最后一个已确认“收盘数据就绪”的开市日；
+  当日尚未到日历定义的数据就绪时刻、周末、法定节假日、未知年份和未来日期都在调用
+  provider 或写审计前失败，已经完成的历史交易日仍可补采；
 - 缺少明确日期或必需的上游主力净流入字段时整批失败，不用抓取时间代替；
 - 输出字段使用 `reported_*`，明确表示上游报告口径；
 - fund-flow 模型没有 OHLCV 字段，东财响应中的指数收盘价被主动丢弃。
@@ -58,6 +59,11 @@ EVA 首版仅设计为用户本地、私人研究；不重新发布原始数据�
 - 已发布：返回最后通过校验的市场资金、行业资金与行业分类记录；
 - 清单、文件、hash 或 schema 损坏：`status=error`，不回退到半套数据；
 - GET 不构造 provider、不抓取、不落库、不生成排名。
+
+资金证据读取会按请求的 market/sector dataset kind 独立验证目标 manifest entry、对象
+hash、Parquet schema 和来源合同。无关分类或另一资金 dataset kind 的 `as_of` 不同只作为
+可见的全局信息提示，不把一个自身完整的目标对象降为 partial；目标对象缺失、损坏、
+合同漂移或日期不完整仍然失败关闭。
 
 独立摄取链路使用 `stock-eva-supplemental` 哨兵、manifest 和不可变 ZSTD
 Parquet；不会写 BaoStock canonical bar 表。每行统一保留

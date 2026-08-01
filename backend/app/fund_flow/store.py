@@ -14,6 +14,7 @@ from backend.app.market.supplement_ingestion import (
     SupplementalDatasetError,
     SupplementalStore,
     _fund_flow_from_row,
+    _sha256,
     supplemental_dataset_root,
 )
 
@@ -49,23 +50,31 @@ class FundFlowEvidenceStore:
         scope: EvidenceScope,
         scope_id: str,
     ) -> FundFlowEvidenceSnapshot:
-        published = self.supplemental_store.read_response(enabled=self.enabled)
-        if published.status in {"not_configured", "empty", "error"}:
+        if not self.enabled:
             return self._empty_snapshot(
-                source_status=published.status,
+                source_status="not_configured",
                 as_of=as_of,
                 scope=scope,
                 scope_id=scope_id,
-                quality_issues=published.quality_issues,
+                quality_issues=["akshare_supplemental_disabled"],
             )
 
         try:
             manifest = self.supplemental_store._manifest(allow_missing=True)
+            files = manifest["files"]
+            if not files:
+                return self._empty_snapshot(
+                    source_status="empty",
+                    as_of=as_of,
+                    scope=scope,
+                    scope_id=scope_id,
+                    quality_issues=["supplemental_not_published"],
+                )
             kind = "market_fund_flow" if scope == "market" else "sector_fund_flow"
             upstream_scope_identity = (
                 MARKET_UPSTREAM_SCOPE_IDENTITY if scope == "market" else scope_id
             )
-            entries = [item for item in manifest["files"] if item["dataset_kind"] == kind]
+            entries = [item for item in files if item["dataset_kind"] == kind]
             if not entries:
                 return self._empty_snapshot(
                     source_status="empty",
@@ -80,6 +89,14 @@ class FundFlowEvidenceStore:
                 )
             entry = entries[0]
             path = self.supplemental_store.root / str(entry["path"])
+            if not path.is_file() or _sha256(path) != entry["sha256"]:
+                raise SupplementalDatasetError("published supplemental object is invalid")
+            self.supplemental_store._validate_parquet(
+                path,
+                kind,
+                int(entry["row_count"]),
+                as_of=date.fromisoformat(str(entry["as_of"])),
+            )
             rows, future_point_count = self._query(
                 path=path,
                 kind=kind,
@@ -89,6 +106,8 @@ class FundFlowEvidenceStore:
             )
             points = [_fund_flow_from_row(row) for row in rows]
             published_at = self._published_at(manifest)
+            publication_dates = {date.fromisoformat(str(item["as_of"])) for item in files}
+            issues = ["supplemental_dataset_dates_differ"] if len(publication_dates) > 1 else []
             if not points:
                 return FundFlowEvidenceSnapshot(
                     source_status="empty",
@@ -101,15 +120,17 @@ class FundFlowEvidenceStore:
                     provider_contract=entry["provider_contract"],
                     object_sha256=str(entry["sha256"]),
                     future_point_count=future_point_count,
-                    quality_issues=["fund_flow_scope_has_no_points_at_or_before_as_of"],
+                    quality_issues=sorted(
+                        {
+                            *issues,
+                            "fund_flow_scope_has_no_points_at_or_before_as_of",
+                        }
+                    ),
                 )
-            issues = list(published.quality_issues)
-            if published.status == "partial":
-                issues.append("supplemental_snapshot_partial")
             if published_at is None:
                 issues.append("publication_timestamp_unavailable")
             return FundFlowEvidenceSnapshot(
-                source_status=published.status,
+                source_status="ready",
                 as_of=as_of,
                 scope=scope,
                 scope_id=scope_id,
