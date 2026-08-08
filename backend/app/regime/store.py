@@ -21,7 +21,7 @@ from backend.app.regime.models import (
     RegimeComponentInput,
     SourceLineage,
 )
-from backend.app.storage.dataset import MANIFEST_NAME, NasMarketStore
+from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import configured_market_dataset_root
 
@@ -300,29 +300,26 @@ class PublishedDatasetMarketReader:
         *,
         max_sessions: int,
     ) -> list[DailyBar]:
-        if not self.dataset_root.exists():
-            return []
-        if self.dataset_root.is_dir() and not (
-            self.dataset_root / MANIFEST_NAME
-        ).exists():
-            return []
-        rows, _ = self.store._query(
-            f"""
-            SELECT {_BAR_COLUMNS}
-            FROM daily_bars
-            WHERE source = 'baostock'
-              AND trade_date IN (
-                  SELECT DISTINCT trade_date
-                  FROM daily_bars
-                  WHERE source = 'baostock' AND trade_date <= ?
-                  ORDER BY trade_date DESC
-                  LIMIT ?
-              )
-              AND trade_date <= ?
-            ORDER BY trade_date, symbol
-            """,
-            [as_of, max_sessions, as_of],
-        )
+        try:
+            rows, _ = self.store._query(
+                f"""
+                SELECT {_BAR_COLUMNS}
+                FROM daily_bars
+                WHERE source = 'baostock'
+                  AND trade_date IN (
+                      SELECT DISTINCT trade_date
+                      FROM daily_bars
+                      WHERE source = 'baostock' AND trade_date <= ?
+                      ORDER BY trade_date DESC
+                      LIMIT ?
+                  )
+                  AND trade_date <= ?
+                ORDER BY trade_date, symbol
+                """,
+                [as_of, max_sessions, as_of],
+            )
+        except DatasetError as exc:
+            raise MarketReadUnavailable("market_storage_unavailable") from exc
         return [MarketStore._daily_bar_from_row(row) for row in rows]
 
 

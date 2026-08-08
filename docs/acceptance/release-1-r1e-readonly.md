@@ -19,6 +19,11 @@ The write happened at more than one layer:
    `GET /market/status` also initialized its SQLite schema.
 4. The local regime and published-snapshot readers were named read-only but opened DuckDB without
    `read_only=True`.
+5. The dataset-backed regime and sector readers bypassed `StoragePreflight`: missing roots,
+   sentinels or manifests were returned as valid empty analysis, while a non-object manifest could
+   escape the untyped parser as HTTP 500.
+6. Writable manifest reconciliation selected from `published_snapshots` before any explicit writer
+   schema initialization, so a legacy control database could not repair its pointer.
 
 The production symptom (an empty `published_daily_bars` table appearing after GET) is therefore
 explained by the request dependency and read-method call graph, not by the immutable dataset reader.
@@ -31,10 +36,20 @@ explained by the request dependency and read-method call graph, not by the immut
   existing empty result; malformed or incompatible control schema fails closed as structured HTTP
   503 with `reason_code=market_control_read_failed`.
 - Dataset manifest/hash/schema validation remains enabled through `NasMarketStore.ensure_readiness()`.
-- `GET /market/status` uses `CalendarSyncStore(initialize=False)`.
+- `GET /market/status` uses `CalendarSyncStore(initialize=False)`. Its state read opens SQLite in
+  URI `mode=ro` with no wait; a missing database still returns the default state without creating
+  anything, while missing schema, invalid payload and an exclusive lock return structured 503
+  `calendar_control_read_failed` without changing bytes, mtime or schema.
+- Every dataset read validates both `DatasetSentinel` and `DatasetManifest`, then validates each
+  manifest item before consulting paths or Parquet. Missing/invalid metadata maps to the same
+  structured `market_storage_unavailable` 503 from direct regime and sector routes; only a fully
+  valid empty manifest returns HTTP 200 with an empty analysis.
 - Local regime and published-snapshot readers request DuckDB `read_only=True`.
 - A read-only dataset store rejects save, publication, export, scheduler-state, and reconciliation
   lifecycles before touching the dataset, staging directory, or control file.
+- `MarketStore.initialize_schema()` is an explicit writer-only operation. Writable manifest
+  reconciliation calls it before reading a pointer and maps initialization failure to
+  `DatasetError`; GET dependencies cannot reach it because their control store is read-only.
 - Schema initialization, publication, and manifest-first pointer repair remain owned by explicit
   writer stores used by CLI/ingestion/automation startup and `FullMarketHistoryService.execute()`.
 
@@ -66,6 +81,19 @@ it failed with DuckDB's same-database/different-configuration `ConnectionExcepti
 proved that a read-only `NasMarketStore.save_refresh()` published files before its control writer
 guard rejected the request.
 
+The independent audit-repair RED command was:
+
+```text
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_get_read_only.py tests/test_full_market_history.py \
+  -k 'calendar_status_read_failures or direct_analysis_readers or writable_reconciler_repairs_legacy or reconciler_maps_control_schema or lifespan_writer_owner_repairs_legacy or full_history_writer_owner_repairs_legacy or full_history_cli_writer_owner_repairs_legacy'
+```
+
+It produced `13 failed, 3 passed`. The failures reproduced all eight unavailable dataset metadata
+states, legacy control-schema reconciliation in direct/lifespan/full-history/CLI owners, and control
+schema initialization error mapping. The three calendar cases already passed because the preserved
+WIP had implemented the SQLite reader; review then aligned its public error code with the contract.
+
 ### GREEN coverage
 
 `tests/test_market_get_read_only.py` covers:
@@ -79,11 +107,17 @@ guard rejected the request.
 - no reconciliation call from a GET dependency;
 - missing dataset-backed and local-mode control/runtime paths remain absent;
 - malformed dataset-backed and local control schema returns structured 503 without migration;
+- missing/corrupt/locked calendar control state returns structured 503 without initialization;
+- correct taxonomy `baostock.industry_classification` is used by sector GET coverage;
+- missing/invalid sentinel, manifest, generation and item metadata fail closed for both direct
+  market-regime and sector readers, while a valid empty manifest remains HTTP 200/empty;
 - normal local reads request DuckDB `read_only=True` and reject `_connect()` writer access;
 - exact configuration mismatch fallback, similar/non-matching error fail-closed behavior;
 - an independent read-only API store sees the previous committed value during an in-process writer
   transaction and the new value after commit;
 - explicit local writer initialization/save and explicit dataset pointer reconciliation still work;
+- legacy writer-owned control schema is migrated before reconciliation in direct, lifespan,
+  full-history service and CLI paths;
 - read-only dataset writer lifecycles fail before any dataset, staging, or control mutation.
 
 ## Verification
@@ -97,13 +131,21 @@ Initial clean baseline at `95e70ae`:
 Final focused suite:
 
 ```text
-20 passed in 1.87s
+uv run --extra dev pytest -o addopts='' -q tests/test_market_get_read_only.py
+27 passed in 1.52s
+```
+
+Related calendar/dataset/regime/sector/full-history/acceptance suite:
+
+```text
+198 passed in 16.30s
 ```
 
 Final full suite after documentation:
 
 ```text
-623 passed in 64.99s
+uv run --extra dev pytest -o addopts='' -q
+640 passed in 64.87s
 ```
 
 Lint:
@@ -115,8 +157,9 @@ All checks passed!
 
 The repository-wide `ruff format --check backend tests` is not a clean baseline: it reports
 pre-existing format differences across files outside this slice. No broad formatting rewrite was
-performed. The R1-E new test and newly formatted market-store changes passed the focused format
-check (`5 files already formatted`). The final `git diff --check` also passed.
+performed. Five fully changed R1-E files passed focused format check (`5 files already formatted`),
+and Ruff range checks passed every changed hunk in the four files with unrelated pre-existing
+format drift. The final `git diff --check` also passed.
 
 ## Deferred acceptance
 

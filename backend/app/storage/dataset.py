@@ -18,9 +18,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import duckdb
+from pydantic import ValidationError
 
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.storage.models import DatasetManifest, DatasetSentinel
 
 SENTINEL_NAME = ".stock-eva-dataset.json"
 MANIFEST_NAME = "manifest.json"
@@ -203,14 +205,26 @@ class NasMarketStore:
 
     def _manifest(self) -> dict[str, object]:
         try:
-            payload = json.loads((self.root / MANIFEST_NAME).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise DatasetError("published manifest is unavailable") from exc
-        if payload.get("dataset") != DATASET or payload.get("schema_version") != SCHEMA_VERSION:
+            sentinel_payload = json.loads((self.root / SENTINEL_NAME).read_text(encoding="utf-8"))
+            manifest_payload = json.loads((self.root / MANIFEST_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DatasetError("published dataset metadata is unavailable") from exc
+        if not isinstance(sentinel_payload, dict) or not isinstance(manifest_payload, dict):
+            raise DatasetError("published dataset metadata is unavailable")
+        if (
+            sentinel_payload.get("dataset") != DATASET
+            or sentinel_payload.get("schema_version") != SCHEMA_VERSION
+            or manifest_payload.get("dataset") != DATASET
+            or manifest_payload.get("schema_version") != SCHEMA_VERSION
+        ):
             raise DatasetError("published manifest has an unsupported schema")
-        files = payload.get("files")
-        if not isinstance(files, list):
-            raise DatasetError("published manifest has invalid files")
+        try:
+            DatasetSentinel.model_validate(sentinel_payload)
+            DatasetManifest.model_validate(manifest_payload)
+        except ValidationError as exc:
+            raise DatasetError("published dataset metadata is unavailable") from exc
+        payload = manifest_payload
+        files = payload["files"]
         for item in files:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 raise DatasetError("published manifest has invalid file metadata")
@@ -362,6 +376,10 @@ class NasMarketStore:
         """Repair a local pointer after a manifest-first publication crash."""
         self._ensure_writable()
         manifest = self._manifest()
+        try:
+            self.control.initialize_schema()
+        except (duckdb.Error, OSError, TypeError, ValueError) as exc:
+            raise DatasetError("local control schema cannot be initialized") from exc
         entries = [item for item in manifest["files"] if item["source"] == source]
         if not entries:
             return None

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -9,14 +10,17 @@ import duckdb
 import httpx
 import pytest
 
+import backend.app.main as main_module
 import backend.app.market.store as market_store_module
+from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
 from backend.app.market.calendar_sync import CalendarSyncStore
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore, MarketStoreReadError
-from backend.app.storage.dataset import NasMarketStore
+from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.models import StorageReadiness
 from backend.app.user.store import UserStore
 
 AS_OF = date(2026, 7, 23)
@@ -178,6 +182,18 @@ def _schema(path: Path) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
         connection.close()
 
 
+def _sqlite_schema(path: Path) -> tuple[tuple[str, str | None], ...]:
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        return tuple(
+            connection.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+
 def _tree(root: Path) -> tuple[tuple[str, str, int, int], ...]:
     return tuple(
         (
@@ -199,6 +215,7 @@ class _StorageFingerprint:
     dataset_tree: tuple[tuple[str, str, int, int], ...]
     calendar_hash: str | None = None
     calendar_mtime_ns: int | None = None
+    calendar_schema: tuple[tuple[str, str | None], ...] | None = None
 
 
 def _fingerprint(
@@ -219,6 +236,11 @@ def _fingerprint(
         ),
         calendar_mtime_ns=(
             calendar_path.stat().st_mtime_ns
+            if calendar_path is not None and calendar_path.is_file()
+            else None
+        ),
+        calendar_schema=(
+            _sqlite_schema(calendar_path)
             if calendar_path is not None and calendar_path.is_file()
             else None
         ),
@@ -248,7 +270,7 @@ def test_market_consuming_gets_do_not_change_control_or_dataset(tmp_path: Path) 
         f"/api/v1/market/history/sh.600000?start={AS_OF}&end={AS_OF}",
         f"/api/v1/securities/sh.600000/analysis?start={AS_OF}&end={AS_OF}",
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
-        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id=baostock_industry",
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
         f"/api/v1/classification/securities?as_of={AS_OF}&symbol=sh.600000",
         f"/api/v1/analysis/fund-flow-evidence?as_of={AS_OF}",
         "/api/v1/portfolio/valuation",
@@ -293,11 +315,16 @@ def test_missing_market_storage_gets_create_no_runtime_paths(tmp_path: Path) -> 
         "/api/v1/market/supplemental",
         "/api/v1/market/history/dates",
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
-        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id=baostock_industry",
+        f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
     ]
     responses = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
 
     assert all(response.status_code < 500 for response in responses)
+    assert [response.status_code for response in responses[-2:]] == [200, 200]
+    assert [response.json()["status"] for response in responses[-2:]] == [
+        "empty",
+        "empty",
+    ]
     assert not runtime.exists()
 
     enabled = settings.model_copy(update={"akshare_supplemental_enabled": True})
@@ -328,6 +355,153 @@ def test_corrupt_control_schema_is_503_without_implicit_migration(tmp_path: Path
         "reason_code": "market_control_read_failed",
     }
     assert _fingerprint(control, dataset_root) == before
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing_table", "invalid_payload", "exclusive_lock"],
+)
+def test_calendar_status_read_failures_are_structured_and_read_only(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root)
+    control = _publish_fixture(settings, dataset_root)
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    connection = sqlite3.connect(calendar_path)
+    if failure == "missing_table":
+        connection.execute("DROP TABLE calendar_sync_state")
+        connection.commit()
+    elif failure == "invalid_payload":
+        connection.execute(
+            "INSERT OR REPLACE INTO calendar_sync_state (singleton, payload_json) VALUES (1, '[]')"
+        )
+        connection.commit()
+    before = _fingerprint(control, dataset_root, calendar_path)
+    if failure == "exclusive_lock":
+        connection.execute("BEGIN EXCLUSIVE")
+    else:
+        connection.close()
+
+    try:
+        response = _api_get(
+            "/api/v1/market/status",
+            settings,
+            raise_app_exceptions=False,
+        )
+    finally:
+        if failure == "exclusive_lock":
+            connection.rollback()
+            connection.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "calendar_control_read_failed",
+        "storage_status": "unavailable",
+    }
+    assert _fingerprint(control, dataset_root, calendar_path) == before
+
+
+def test_calendar_select_only_reader_supports_relative_database_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    writer = CalendarSyncStore(Path("control/calendar.sqlite3"))
+    before = _sha256(writer.path)
+
+    state = CalendarSyncStore(writer.path, initialize=False).state()
+
+    assert state.last_attempt_at is None
+    assert _sha256(writer.path) == before
+
+
+@pytest.mark.parametrize(
+    "dataset_state",
+    [
+        "missing_root",
+        "missing_sentinel",
+        "invalid_sentinel",
+        "missing_manifest",
+        "manifest_array",
+        "missing_generation",
+        "wrong_generation_type",
+        "wrong_file_type",
+    ],
+)
+def test_direct_analysis_readers_fail_closed_for_unavailable_dataset_metadata(
+    tmp_path: Path,
+    dataset_state: str,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    if dataset_state != "missing_root":
+        dataset_root.mkdir()
+        if dataset_state != "missing_sentinel":
+            sentinel: object = {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+            }
+            if dataset_state == "invalid_sentinel":
+                sentinel = []
+            (dataset_root / ".stock-eva-dataset.json").write_text(
+                json.dumps(sentinel),
+                encoding="utf-8",
+            )
+        if dataset_state not in {"missing_sentinel", "missing_manifest"}:
+            manifest: object = {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+            if dataset_state == "manifest_array":
+                manifest = []
+            elif dataset_state == "missing_generation":
+                del manifest["generation"]
+            elif dataset_state == "wrong_generation_type":
+                manifest["generation"] = 7
+            elif dataset_state == "wrong_file_type":
+                manifest["files"] = [
+                    {
+                        "path": "bars/source=baostock/date=2026-07-23.parquet",
+                        "sha256": "0" * 64,
+                        "trade_date": AS_OF.isoformat(),
+                        "source": "baostock",
+                        "row_count": "1",
+                    }
+                ]
+            (dataset_root / "manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+    settings = _settings(tmp_path, dataset_root)
+    before = _tree(dataset_root) if dataset_root.exists() else None
+
+    responses = [
+        _api_get(
+            f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+            settings,
+            raise_app_exceptions=False,
+        ),
+        _api_get(
+            f"/api/v1/analysis/sector-rotation?as_of={AS_OF}"
+            f"&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
+            settings,
+            raise_app_exceptions=False,
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [503, 503]
+    assert [response.json()["detail"] for response in responses] == [
+        {"code": "market_storage_unavailable", "storage_status": "unavailable"},
+        {"code": "market_storage_unavailable", "storage_status": "unavailable"},
+    ]
+    assert not (tmp_path / "runtime").exists()
+    if before is None:
+        assert not dataset_root.exists()
+    else:
+        assert _tree(dataset_root) == before
 
 
 def test_local_mode_missing_and_corrupt_storage_never_initialize_on_get(
@@ -403,6 +577,130 @@ def test_explicit_writer_and_reconciler_still_own_schema_and_pointer(tmp_path: P
     assert repaired is not None
     assert repaired.run_id == repaired_control.published_refresh().run_id
     assert repaired.requested_date == AS_OF
+
+
+def test_writable_reconciler_repairs_legacy_control_schema_before_pointer_read(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    _empty_dataset(dataset_root)
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "publisher.duckdb"),
+        dataset_root,
+        tmp_path / "publisher-staging",
+    )
+    publisher._publish_bars(_bars())
+    dataset_before = _tree(dataset_root)
+    control = MarketStore(tmp_path / "control" / "market.duckdb")
+    initialized = control._connect()
+    initialized.close()
+    connection = duckdb.connect(str(control.path))
+    try:
+        connection.execute("DROP TABLE published_snapshots")
+        connection.execute("DROP TABLE published_daily_bars")
+        connection.execute("ALTER TABLE refresh_runs DROP COLUMN coverage_ratio")
+        connection.execute("ALTER TABLE refresh_runs DROP COLUMN request_key")
+        connection.execute("ALTER TABLE refresh_runs DROP COLUMN run_kind")
+        connection.execute("ALTER TABLE refresh_runs DROP COLUMN quality_issues")
+    finally:
+        connection.close()
+
+    repaired = NasMarketStore(
+        control,
+        dataset_root,
+        tmp_path / "repair-staging",
+    ).reconcile_control_pointer()
+
+    assert repaired is not None
+    assert repaired.requested_date == AS_OF
+    assert control.published_refresh().run_id == repaired.run_id
+    assert {table for table, _columns in _schema(control.path)} >= {
+        "published_snapshots",
+        "published_daily_bars",
+        "refresh_runs",
+    }
+    assert _tree(dataset_root) == dataset_before
+
+
+def test_reconciler_maps_control_schema_initialization_failure_to_dataset_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    _empty_dataset(dataset_root)
+    control = MarketStore(tmp_path / "control" / "market.duckdb")
+    store = NasMarketStore(control, dataset_root, tmp_path / "staging")
+
+    def fail_initialization() -> None:
+        raise OSError("fixture control unavailable")
+
+    monkeypatch.setattr(control, "initialize_schema", fail_initialization, raising=False)
+
+    with pytest.raises(DatasetError, match="control schema"):
+        store.reconcile_control_pointer()
+
+    assert not control.path.exists()
+    assert not (tmp_path / "staging").exists()
+
+
+def test_lifespan_writer_owner_repairs_legacy_control_schema(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    _empty_dataset(dataset_root)
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "publisher.duckdb"),
+        dataset_root,
+        tmp_path / "publisher-staging",
+    )
+    publisher._publish_bars(_bars())
+    settings = _settings(tmp_path, dataset_root).model_copy(update={"auto_refresh_enabled": True})
+    control_path = settings.market_data_dir / settings.market_database_name
+    control = MarketStore(control_path)
+    initialized = control._connect()
+    initialized.close()
+    connection = duckdb.connect(str(control_path))
+    try:
+        connection.execute("DROP TABLE published_snapshots")
+    finally:
+        connection.close()
+
+    class ReadyPreflight:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def inspect(self) -> StorageReadiness:
+            return StorageReadiness(
+                mode="local_dataset",
+                status="ready",
+                market_data_available=True,
+                serving_source="local",
+                mount_type="local",
+                sentinel_status="ready",
+                manifest_status="ready",
+                dataset_generation="fixture",
+            )
+
+    async def idle_loop(_service, stop, **_kwargs) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "settings", settings)
+    monkeypatch.setattr(main_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args: None)
+    monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def run_lifespan() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(run_lifespan())
+
+    pointer = MarketStore(control_path, read_only=True).published_refresh()
+    assert pointer is not None
+    assert pointer.requested_date == AS_OF
 
 
 def test_market_store_reader_sees_previous_commit_during_writer_transaction(

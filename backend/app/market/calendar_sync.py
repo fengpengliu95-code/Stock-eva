@@ -160,6 +160,10 @@ class CalendarSyncPolicy:
         return datetime.combine(following, when, tzinfo=SHANGHAI)
 
 
+class CalendarSyncStoreReadError(RuntimeError):
+    """A SELECT-only calendar control database cannot be read safely."""
+
+
 class CalendarSyncStore:
     """Local SQLite control state; no market or user data lives here."""
 
@@ -171,6 +175,15 @@ class CalendarSyncStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _connect_reader(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"{self.path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=0,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -217,15 +230,20 @@ class CalendarSyncStore:
     def state(self) -> CalendarSyncState:
         if not self.path.exists():
             return CalendarSyncState()
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM calendar_sync_state WHERE singleton = 1"
-            ).fetchone()
-        return (
-            CalendarSyncState()
-            if row is None
-            else CalendarSyncState.model_validate_json(row["payload_json"])
-        )
+        try:
+            with self._connect_reader() as connection:
+                row = connection.execute(
+                    "SELECT payload_json FROM calendar_sync_state WHERE singleton = 1"
+                ).fetchone()
+            return (
+                CalendarSyncState()
+                if row is None
+                else CalendarSyncState.model_validate_json(row["payload_json"])
+            )
+        except (sqlite3.Error, OSError, UnicodeError, TypeError, ValueError) as exc:
+            raise CalendarSyncStoreReadError(
+                "calendar sync control database cannot be read"
+            ) from exc
 
     def save(
         self,

@@ -3,6 +3,8 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import duckdb
+
 import backend.app.cli as cli
 from backend.app.cli import build_parser
 from backend.app.config import Settings
@@ -84,6 +86,16 @@ def store_for(tmp_path: Path) -> NasMarketStore:
         nas_root(tmp_path),
         tmp_path / "staging",
     )
+
+
+def drop_published_pointer_schema(path: Path) -> None:
+    initialized = MarketStore(path)._connect()
+    initialized.close()
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute("DROP TABLE published_snapshots")
+    finally:
+        connection.close()
 
 
 def test_plan_and_execution_resume_from_manifest_without_replacing_dates(
@@ -208,6 +220,31 @@ def test_resume_repairs_local_pointer_when_manifest_publish_won_the_crash(
     assert pointer.request_key.startswith("nas-manifest-reconcile:baostock:")
 
 
+def test_full_history_writer_owner_repairs_legacy_control_before_execute(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 23)
+    store = store_for(tmp_path)
+    store._publish_bars(fixture_bars(trade_date))
+    drop_published_pointer_schema(store.control.path)
+    provider = FullProvider([trade_date])
+    service = FullMarketHistoryService(store, provider)
+    plan = service.plan(
+        start_date=trade_date,
+        end_date=trade_date,
+        max_sessions=1,
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "ready"
+    assert result.skipped_sessions == 1
+    assert provider.fetch_calls == []
+    pointer = store.control.published_refresh()
+    assert pointer is not None
+    assert pointer.requested_date == trade_date
+
+
 def test_full_history_cli_is_dry_run_unless_explicit_execution_flag_is_present() -> None:
     parser = build_parser()
     planned = parser.parse_args(
@@ -308,6 +345,79 @@ def test_full_history_cli_dry_run_queries_only_calendar_and_never_fetches(
     assert provider.calendar_calls == 1
     assert provider.fetch_calls == 0
     assert json.loads((root / "manifest.json").read_text())["files"] == []
+
+
+def test_full_history_cli_writer_owner_repairs_legacy_control(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = nas_root(tmp_path)
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "publisher.duckdb"),
+        root,
+        tmp_path / "publisher-staging",
+    )
+    trade_date = date(2026, 7, 23)
+    publisher._publish_bars(fixture_bars(trade_date))
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=root,
+    )
+    control_path = settings.market_data_dir / settings.market_database_name
+    drop_published_pointer_schema(control_path)
+
+    class ReadyPreflight:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def inspect(self):
+            return StorageReadiness(
+                mode="nas",
+                status="ready",
+                market_data_available=True,
+                serving_source="nas",
+                mount_type="smbfs",
+                sentinel_status="ready",
+                manifest_status="ready",
+                dataset_generation="fixture",
+            )
+
+    class CalendarOnlyProvider:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def trading_dates(self, start_date, end_date):
+            assert start_date == end_date == trade_date
+            return [trade_date]
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(cli, "BaoStockProvider", CalendarOnlyProvider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "full-market-backfill",
+            "--start",
+            trade_date.isoformat(),
+            "--end",
+            trade_date.isoformat(),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "dry-run"
+    pointer = MarketStore(control_path, read_only=True).published_refresh()
+    assert pointer is not None
+    assert pointer.requested_date == trade_date
 
 
 def test_full_history_cli_execution_acquires_lock_before_calendar_request(

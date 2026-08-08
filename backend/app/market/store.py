@@ -158,6 +158,11 @@ class MarketStore:
         )
         return connection
 
+    def initialize_schema(self) -> None:
+        """Explicitly initialize or migrate schema for a writer-owned store."""
+        connection = self._connect()
+        connection.close()
+
     def _connect_reader(self) -> duckdb.DuckDBPyConnection | None:
         if not self.path.is_file():
             return None

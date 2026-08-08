@@ -801,7 +801,7 @@ def test_api_existing_database_executes_select_only_and_preserves_bytes(
         ("nas_market_dataset_root", True),
     ],
 )
-def test_api_missing_dataset_root_or_manifest_is_empty_without_writes(
+def test_api_missing_dataset_root_or_manifest_is_unavailable_without_writes(
     tmp_path: Path,
     dataset_setting: str,
     create_root: bool,
@@ -819,14 +819,10 @@ def test_api_missing_dataset_root_or_manifest_is_empty_without_writes(
         local_temp_dir=runtime / "temp",
         user_data_dir=runtime / "user",
         local_market_dataset_root=(
-            dataset_root
-            if dataset_setting == "local_market_dataset_root"
-            else None
+            dataset_root if dataset_setting == "local_market_dataset_root" else None
         ),
         nas_market_dataset_root=(
-            dataset_root
-            if dataset_setting == "nas_market_dataset_root"
-            else None
+            dataset_root if dataset_setting == "nas_market_dataset_root" else None
         ),
     )
     regime_store = analysis_api.get_market_regime_store(settings)
@@ -840,8 +836,11 @@ def test_api_missing_dataset_root_or_manifest_is_empty_without_writes(
         raise_app_exceptions=False,
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "empty"
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "market_storage_unavailable",
+        "storage_status": "unavailable",
+    }
     assert not runtime.exists()
     if create_root:
         assert list(dataset_root.iterdir()) == []

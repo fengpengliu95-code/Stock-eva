@@ -822,7 +822,7 @@ def test_api_missing_databases_are_empty_and_create_no_state(
     "dataset_setting",
     ["local_market_dataset_root", "nas_market_dataset_root"],
 )
-def test_api_missing_dataset_manifest_is_empty_without_writes(
+def test_api_missing_dataset_manifest_is_unavailable_without_writes(
     tmp_path: Path,
     dataset_setting: str,
 ) -> None:
@@ -855,8 +855,11 @@ def test_api_missing_dataset_manifest_is_empty_without_writes(
         raise_app_exceptions=False,
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "empty"
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "market_storage_unavailable",
+        "storage_status": "unavailable",
+    }
     assert not runtime.exists()
     assert list(dataset_root.iterdir()) == []
 

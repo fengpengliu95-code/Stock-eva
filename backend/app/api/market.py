@@ -8,7 +8,11 @@ from backend.app.api.storage import get_storage_readiness
 from backend.app.config import Settings, get_settings
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
-from backend.app.market.calendar_sync import CalendarSyncPolicy, CalendarSyncStore
+from backend.app.market.calendar_sync import (
+    CalendarSyncPolicy,
+    CalendarSyncStore,
+    CalendarSyncStoreReadError,
+)
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
@@ -137,7 +141,16 @@ def market_status(
     expected = calendar.latest_expected_session(now)
     published = store.published_refresh()
     scheduler = store.scheduler_state()
-    calendar_maintenance = calendar_sync.state()
+    try:
+        calendar_maintenance = calendar_sync.state()
+    except CalendarSyncStoreReadError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "calendar_control_read_failed",
+                "storage_status": "unavailable",
+            },
+        ) from exc
     calendar_decision = CalendarSyncPolicy().decide(
         now,
         state=calendar_maintenance,
