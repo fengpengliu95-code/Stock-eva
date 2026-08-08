@@ -43,7 +43,7 @@ from backend.app.storage.initialize import (
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.strategy.store import StrategyStore
-from backend.app.user.backup import PrivateBackupError, PrivateBackupService
+from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
 from backend.app.user.store import UserStore
 
 
@@ -265,12 +265,9 @@ def main() -> int:
         )
         provider = (
             BaoStockClassificationProvider(
-                min_request_interval_seconds=(
-                    settings.auto_refresh_min_request_interval_seconds
-                ),
+                min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
                 socket_timeout_seconds=(
-                    args.socket_timeout_seconds
-                    or settings.baostock_socket_timeout_seconds
+                    args.socket_timeout_seconds or settings.baostock_socket_timeout_seconds
                 ),
             )
             if args.execute
@@ -300,8 +297,11 @@ def main() -> int:
         return 0 if result.status in {"dry-run", "ready"} else 1
     if args.command == "backup-private-data":
         try:
-            outcome = PrivateBackupService(
-                settings.user_data_dir / settings.user_database_name,
+            outcome = PrivateBackupSetService(
+                {
+                    "user": settings.user_data_dir / settings.user_database_name,
+                    "portfolio": (settings.user_data_dir / settings.portfolio_database_name),
+                },
                 args.backup_root,
                 keep_daily=args.keep_daily,
                 keep_weekly=args.keep_weekly,
@@ -324,8 +324,10 @@ def main() -> int:
                     "status": outcome.status,
                     "integrity_check": outcome.integrity_check,
                     "completed_at": outcome.completed_at.isoformat(),
-                    "daily_snapshot": outcome.daily_backup.name,
-                    "weekly_snapshot": outcome.weekly_backup.name,
+                    "bundle_id": outcome.bundle_id,
+                    "daily_bundle": outcome.daily_bundle.name,
+                    "weekly_bundle": outcome.weekly_bundle.name,
+                    "database_status": outcome.database_status,
                     "writes_market_data": False,
                 },
                 ensure_ascii=False,

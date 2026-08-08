@@ -2,7 +2,7 @@ import hashlib
 import json
 import math
 from collections import defaultdict
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Protocol
@@ -327,9 +327,7 @@ def market_regime_store_from_settings(settings: Settings) -> "MarketRegimeStore"
     layout = StorageLayout(settings)
     dataset_root = configured_market_dataset_root(settings)
     if dataset_root is None:
-        reader: MarketBarsReader = ReadOnlyDuckDbMarketReader(
-            layout.local_paths.market_database
-        )
+        reader: MarketBarsReader = ReadOnlyDuckDbMarketReader(layout.local_paths.market_database)
     else:
         reader = PublishedDatasetMarketReader(
             control_path=layout.local_paths.market_database,
@@ -346,19 +344,45 @@ class MarketRegimeStore:
     def __init__(self, reader: MarketBarsReader) -> None:
         self.reader = reader
 
-    def read(self, as_of: date) -> MarketRegimeInput:
+    def read(
+        self,
+        as_of: date,
+        *,
+        known_at: datetime | None = None,
+    ) -> MarketRegimeInput:
         raw_bars = self.reader.bars_through(
             as_of,
             max_sessions=REGIME_LOOKBACK_SESSIONS,
         )
         future_rows = [bar for bar in raw_bars if bar.trade_date > as_of]
-        bars = [bar for bar in raw_bars if bar.trade_date <= as_of]
+        post_cutoff_rows = []
+        if known_at is not None:
+            cutoff = known_at.astimezone(UTC)
+            post_cutoff_rows = [
+                bar
+                for bar in raw_bars
+                if bar.ingested_at.utcoffset() is None or bar.ingested_at.astimezone(UTC) > cutoff
+            ]
+        bars = [
+            bar
+            for bar in raw_bars
+            if bar.trade_date <= as_of
+            and (
+                known_at is None
+                or (
+                    bar.ingested_at.utcoffset() is not None
+                    and bar.ingested_at.astimezone(UTC) <= cutoff
+                )
+            )
+        ]
         dates = sorted({bar.trade_date for bar in bars})
         if len(dates) > REGIME_LOOKBACK_SESSIONS:
             allowed = set(dates[-REGIME_LOOKBACK_SESSIONS:])
             bars = [bar for bar in bars if bar.trade_date in allowed]
             dates = dates[-REGIME_LOOKBACK_SESSIONS:]
         quality_issues = ["future_market_rows_discarded"] if future_rows else []
+        if post_cutoff_rows:
+            quality_issues.append("post_cutoff_market_rows_discarded")
         if not bars:
             return self._empty(as_of, quality_issues=quality_issues)
 
@@ -477,27 +501,16 @@ class MarketRegimeStore:
             {
                 board
                 for bar in current
-                if bar.security_type == "stock"
-                and (board := _scope_board(bar)) is not None
+                if bar.security_type == "stock" and (board := _scope_board(bar)) is not None
             }
         )
         observed_indexes = sorted(
-            {
-                bar.symbol
-                for bar in current
-                if bar.symbol in EXPECTED_INDEX_SERIES
-            }
+            {bar.symbol for bar in current if bar.symbol in EXPECTED_INDEX_SERIES}
         )
         missing_boards = sorted(set(EXPECTED_BOARDS) - set(observed_boards))
-        missing_indexes = sorted(
-            set(EXPECTED_INDEX_SERIES) - set(observed_indexes)
-        )
+        missing_indexes = sorted(set(EXPECTED_INDEX_SERIES) - set(observed_indexes))
         observed_universe_count = len(
-            {
-                bar.symbol
-                for bar in current
-                if bar.security_type == "stock"
-            }
+            {bar.symbol for bar in current if bar.security_type == "stock"}
         )
         return ActualMarketScope(
             expected_boards=list(EXPECTED_BOARDS),
@@ -509,8 +522,7 @@ class MarketRegimeStore:
             coverage_basis="symbol_presence_only",
             coverage_evidence_status="unavailable",
             observed_universe_count=observed_universe_count,
-            index_coverage_ratio=len(observed_indexes)
-            / len(EXPECTED_INDEX_SERIES),
+            index_coverage_ratio=len(observed_indexes) / len(EXPECTED_INDEX_SERIES),
             scope_status="narrow_provisional",
             can_support_full_a_share_conclusion=False,
             conclusion_disclaimer=(
@@ -526,9 +538,7 @@ class MarketRegimeStore:
         as_of: date,
         lineage: SourceLineage,
     ) -> RegimeComponentInput:
-        histories = _histories(
-            bar for bar in bars if bar.symbol in EXPECTED_INDEX_SERIES
-        )
+        histories = _histories(bar for bar in bars if bar.symbol in EXPECTED_INDEX_SERIES)
         signals: list[float] = []
         supporting: list[EvidenceItem] = []
         contrary: list[EvidenceItem] = []
@@ -546,9 +556,7 @@ class MarketRegimeStore:
                 "above_ma20": _sign(closes[-1] - fmean(closes[-20:])),
                 "above_ma60": _sign(closes[-1] - fmean(closes[-60:])),
                 "above_ma120": _sign(closes[-1] - fmean(closes[-120:])),
-                "ma20_slope_5d": _sign(
-                    fmean(closes[-20:]) - fmean(closes[-25:-5])
-                ),
+                "ma20_slope_5d": _sign(fmean(closes[-20:]) - fmean(closes[-25:-5])),
             }
             for metric, signal in metrics.items():
                 signals.append(signal * 100)
@@ -613,15 +621,10 @@ class MarketRegimeStore:
             missing.append("breadth.advancing_declining_returns")
 
         adjusted = {
-            symbol: _adjusted_closes(rows, as_of=as_of)
-            for symbol, rows in histories.items()
+            symbol: _adjusted_closes(rows, as_of=as_of) for symbol, rows in histories.items()
         }
         for period in (20, 60):
-            eligible = [
-                values
-                for values in adjusted.values()
-                if len(values) >= period
-            ]
+            eligible = [values for values in adjusted.values() if len(values) >= period]
             if eligible:
                 ratio = sum(values[-1] > fmean(values[-period:]) for values in eligible)
                 ratio /= len(eligible)
@@ -630,12 +633,12 @@ class MarketRegimeStore:
                 missing.append(f"breadth.ma{period}")
         eligible_60 = [values for values in adjusted.values() if len(values) >= 60]
         if eligible_60:
-            high_ratio = sum(
-                values[-1] >= max(values[-60:-1]) for values in eligible_60
-            ) / len(eligible_60)
-            low_ratio = sum(
-                values[-1] <= min(values[-60:-1]) for values in eligible_60
-            ) / len(eligible_60)
+            high_ratio = sum(values[-1] >= max(values[-60:-1]) for values in eligible_60) / len(
+                eligible_60
+            )
+            low_ratio = sum(values[-1] <= min(values[-60:-1]) for values in eligible_60) / len(
+                eligible_60
+            )
             spread_score = _clamp((high_ratio - low_ratio) * 500)
             signals.append(("new_high_low_spread", spread_score, high_ratio - low_ratio))
         else:
@@ -716,9 +719,7 @@ class MarketRegimeStore:
         as_of: date,
         lineage: SourceLineage,
     ) -> RegimeComponentInput:
-        index_histories = _histories(
-            bar for bar in bars if bar.symbol in EXPECTED_INDEX_SERIES
-        )
+        index_histories = _histories(bar for bar in bars if bar.symbol in EXPECTED_INDEX_SERIES)
         volatilities: list[float] = []
         drawdowns: list[float] = []
         index_series_missing = False
@@ -777,9 +778,7 @@ class MarketRegimeStore:
             missing.append("risk.index_drawdown_60d_warmup")
         if len(current_returns) >= 2:
             value = pstdev(current_returns)
-            metrics.append(
-                ("cross_section_dispersion", _low_risk_score(value, 0.015, 0.04), value)
-            )
+            metrics.append(("cross_section_dispersion", _low_risk_score(value, 0.015, 0.04), value))
         else:
             missing.append("risk.cross_section_dispersion")
         if not metrics:

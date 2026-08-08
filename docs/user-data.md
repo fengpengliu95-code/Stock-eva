@@ -9,6 +9,11 @@
 阶段 3 的策略定义、版本、运行输入和信号解释也保存在同一数据库，因此备份与隐私
 要求同样适用于策略记录。
 
+Release 2 的手工日度现金、NAV、持仓成本和不可变修订单独保存在
+`var/user/stock_eva_portfolio.sqlite3`。该专库固定使用 rollback-journal (`DELETE`)
+模式，避免只读 GET 在共享 WAL 库旁创建或改写 `-shm`。两个数据库都属于私有用户
+数据；专库缺失只表示“尚未初始化或无法证明存在”，不能被描述为完整空组合。
+
 持仓字段包括：
 
 - `symbol`
@@ -73,16 +78,19 @@
 
 ## 备份与恢复
 
-备份前先停止 API 写入，然后使用 SQLite 在线备份命令：
+日常备份使用同一条命令生成包含两个数据库、manifest、逐库 SHA-256 和完整性校验的
+原子 bundle：
 
 ```bash
-mkdir -p "$HOME/StockEVA-private-backups"
-sqlite3 var/user/stock_eva_user.sqlite3 \
-  ".backup '$HOME/StockEVA-private-backups/stock_eva_user-backup.sqlite3'"
-sqlite3 "$HOME/StockEVA-private-backups/stock_eva_user-backup.sqlite3" \
-  "PRAGMA integrity_check;"
+uv run python -m backend.app.cli backup-private-data \
+  --backup-root "$HOME/StockEVA-private-backups"
 ```
 
-只有 `integrity_check` 返回 `ok` 才视为可用备份。恢复时停止 API，先备份当前数据库，
-再把已验证备份复制回配置的 `STOCK_EVA_USER_DATA_DIR`，启动后先调用只读列表接口检查。
-恢复会替换当前用户状态，因此不要在 API 运行或仍有写请求时操作。
+只有 manifest identity、两个已存在数据库的 SHA-256 和 `integrity_check=ok` 都通过时，
+bundle 才可用于恢复。如果专库从未创建，manifest 会记录 `not_initialized` 且 bundle
+为 `partial`。备份根目录及 bundle 目录权限为 `0700`，manifest 与 SQLite 快照为
+`0600`；校验器拒绝弱权限和符号链接证据。恢复时停止全部 5 个 LaunchAgent 和所有
+写入，先备份当前状态，再把同一 bundle 中的两库作为一个集合恢复；恢复后先调用
+只读接口检查。旧单库备份只能表示
+portfolio 未初始化，不能伪造或推断现金/NAV。当前没有“全量导出/彻底清除”API；不能
+把删除 live 数据库误称为同时删除了备份。

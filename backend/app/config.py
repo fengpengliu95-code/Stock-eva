@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     classification_database_name: str = "classification.duckdb"
     user_data_dir: Path = Path("var/user")
     user_database_name: str = "stock_eva_user.sqlite3"
+    portfolio_database_name: str = "stock_eva_portfolio.sqlite3"
     local_control_dir: Path = Path("var/control")
     factor_cache_database_name: str = "baostock_back_factor_cache.sqlite3"
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
@@ -48,6 +49,26 @@ class Settings(BaseSettings):
         ge=1.0,
         le=120.0,
     )
+
+    @field_validator("user_database_name", "portfolio_database_name")
+    @classmethod
+    def validate_private_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("private database name must be a local .sqlite3 basename")
+        return value
+
+    @model_validator(mode="after")
+    def private_database_names_are_distinct(self) -> "Settings":
+        if self.user_database_name.casefold() == self.portfolio_database_name.casefold():
+            raise ValueError("user and portfolio database names must be distinct")
+        return self
 
 
 @lru_cache

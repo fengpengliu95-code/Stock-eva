@@ -112,6 +112,13 @@ if /usr/bin/grep -q '^STOCK_EVA_USER_DATABASE_NAME=' "$ENV_FILE" \
   echo "error: LaunchAgent backup requires STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3" >&2
   exit 1
 fi
+if /usr/bin/grep -q '^STOCK_EVA_PORTFOLIO_DATABASE_NAME=' "$ENV_FILE" \
+  && ! /usr/bin/grep -Eq \
+    '^STOCK_EVA_PORTFOLIO_DATABASE_NAME=stock_eva_portfolio.sqlite3$' \
+    "$ENV_FILE"; then
+  echo "error: LaunchAgent backup requires STOCK_EVA_PORTFOLIO_DATABASE_NAME=stock_eva_portfolio.sqlite3" >&2
+  exit 1
+fi
 
 RUNTIME_ASSETS=(backend workspace dashboard docs index.html pyproject.toml uv.lock README.md)
 for relative in "${RUNTIME_ASSETS[@]}"; do
@@ -397,6 +404,8 @@ DATA_ROOT_ESCAPED="$(escape_sed "$DATA_ROOT")"
 /usr/bin/sed \
   -e "s|^STOCK_EVA_MARKET_DATA_DIR=.*$|STOCK_EVA_MARKET_DATA_DIR=$DATA_ROOT_ESCAPED/market|" \
   -e "s|^STOCK_EVA_USER_DATA_DIR=.*$|STOCK_EVA_USER_DATA_DIR=$DATA_ROOT_ESCAPED/user|" \
+  -e "s|^STOCK_EVA_USER_DATABASE_NAME=.*$|STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3|" \
+  -e "s|^STOCK_EVA_PORTFOLIO_DATABASE_NAME=.*$|STOCK_EVA_PORTFOLIO_DATABASE_NAME=stock_eva_portfolio.sqlite3|" \
   -e "s|^STOCK_EVA_LOCAL_CONTROL_DIR=.*$|STOCK_EVA_LOCAL_CONTROL_DIR=$DATA_ROOT_ESCAPED/control|" \
   -e "s|^STOCK_EVA_LOCAL_STAGING_DIR=.*$|STOCK_EVA_LOCAL_STAGING_DIR=$DATA_ROOT_ESCAPED/staging|" \
   -e "s|^STOCK_EVA_LOCAL_LOCK_DIR=.*$|STOCK_EVA_LOCAL_LOCK_DIR=$DATA_ROOT_ESCAPED/locks|" \
@@ -412,6 +421,8 @@ while IFS='|' read -r key value; do
 done <<EOF
 STOCK_EVA_MARKET_DATA_DIR|$DATA_ROOT/market
 STOCK_EVA_USER_DATA_DIR|$DATA_ROOT/user
+STOCK_EVA_USER_DATABASE_NAME|stock_eva_user.sqlite3
+STOCK_EVA_PORTFOLIO_DATABASE_NAME|stock_eva_portfolio.sqlite3
 STOCK_EVA_LOCAL_CONTROL_DIR|$DATA_ROOT/control
 STOCK_EVA_LOCAL_STAGING_DIR|$DATA_ROOT/staging
 STOCK_EVA_LOCAL_LOCK_DIR|$DATA_ROOT/locks

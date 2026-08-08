@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from backend.app import cli
 from backend.app.config import Settings, get_settings
@@ -132,6 +133,10 @@ def test_local_runtime_layout_never_creates_the_configured_nas_root(
     assert layout.duckdb_temporary == tmp_path / "tmp" / "duckdb"
     assert layout.local_paths.market_database.parent == tmp_path / "market"
     assert layout.local_paths.user_database.parent == tmp_path / "user"
+    assert layout.local_paths.portfolio_database == (
+        tmp_path / "user" / "stock_eva_portfolio.sqlite3"
+    )
+    assert layout.local_paths.portfolio_database != layout.local_paths.user_database
     assert layout.local_paths.factor_cache_database == (
         tmp_path / "control" / "baostock_back_factor_cache.sqlite3"
     )
@@ -146,6 +151,45 @@ def test_local_runtime_layout_never_creates_the_configured_nas_root(
         )
     )
     assert nas_root.exists() is False
+    assert layout.local_paths.user_database.exists() is False
+    assert layout.local_paths.portfolio_database.exists() is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "../portfolio.sqlite3", "/tmp/portfolio.sqlite3", "portfolio.db"],
+)
+def test_portfolio_database_name_is_a_safe_sqlite_basename(name: str) -> None:
+    with pytest.raises(ValidationError, match="database_name"):
+        Settings(_env_file=None, portfolio_database_name=name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["./stock_eva_user.sqlite3", "nested/user.sqlite3", "/tmp/user.sqlite3", "user.db"],
+)
+def test_shared_user_database_name_is_also_a_safe_sqlite_basename(name: str) -> None:
+    with pytest.raises(ValidationError, match="database_name"):
+        Settings(_env_file=None, user_database_name=name)
+
+
+@pytest.mark.parametrize(
+    ("user_name", "portfolio_name"),
+    [
+        ("same.sqlite3", "same.sqlite3"),
+        ("STOCK_EVA.sqlite3", "stock_eva.sqlite3"),
+    ],
+)
+def test_private_database_names_must_be_distinct(
+    user_name: str,
+    portfolio_name: str,
+) -> None:
+    with pytest.raises(ValidationError, match="must be distinct"):
+        Settings(
+            _env_file=None,
+            user_database_name=user_name,
+            portfolio_database_name=portfolio_name,
+        )
 
 
 def test_nas_preflight_validates_smb_mount_sentinel_and_manifest(

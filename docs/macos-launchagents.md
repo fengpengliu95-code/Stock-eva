@@ -64,8 +64,10 @@ API、日历、日终刷新、策略和预警随后只读写本机镜像，不�
    所有者，避免 API 内置循环重复运行。
    安装器会把可变目录改写为 `Application Support/Stock EVA/data` 下的绝对路径，
    并设置 `STOCK_EVA_LOCAL_MARKET_DATASET_ROOT` 指向本机镜像。私有备份的源固定为
-   `data/user/stock_eva_user.sqlite3`；如果项目 `.env` 显式
-   改写 `STOCK_EVA_USER_DATA_DIR` 或 `STOCK_EVA_USER_DATABASE_NAME`，安装器
+   `data/user/stock_eva_user.sqlite3` 与
+   `data/user/stock_eva_portfolio.sqlite3` 的同一原子 bundle；如果项目 `.env` 显式
+   改写 `STOCK_EVA_USER_DATA_DIR`、`STOCK_EVA_USER_DATABASE_NAME` 或
+   `STOCK_EVA_PORTFOLIO_DATABASE_NAME`，安装器
    会 fail closed，而不会静默备份错误文件。
 3. `.venv/bin/python` 已存在且依赖完整。
 4. `npm` 可执行，且 `workspace/package-lock.json` 已跟踪；安装器会用 lockfile 在

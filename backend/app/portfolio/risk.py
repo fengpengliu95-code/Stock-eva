@@ -3,7 +3,7 @@ import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Protocol
 
@@ -12,10 +12,12 @@ import duckdb
 from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
 from backend.app.classification.store import ClassificationReadSnapshot
 from backend.app.market.models import DailyBar
-from backend.app.portfolio.ledger import PortfolioLedger
+from backend.app.portfolio.ledger import PortfolioLedger, portfolio_evidence_cutoff
 from backend.app.portfolio.models import (
     AtrBudget,
+    ClassificationEvidenceLineage,
     DrawdownMetrics,
+    MarketEvidenceLineage,
     MarketRegimeContext,
     PortfolioDailySnapshot,
     PortfolioExposure,
@@ -30,7 +32,12 @@ from backend.app.portfolio.models import (
     TargetExposureBand,
 )
 from backend.app.regime.service import MarketRegimeService
-from backend.app.regime.store import MarketBarsReader, MarketReadUnavailable, MarketRegimeStore
+from backend.app.regime.store import (
+    CANONICAL_SOURCE_VERSION,
+    MarketBarsReader,
+    MarketReadUnavailable,
+    MarketRegimeStore,
+)
 
 
 class ClassificationReader(Protocol):
@@ -38,13 +45,14 @@ class ClassificationReader(Protocol):
         self,
         as_of: date,
         *,
+        known_at: datetime | None = None,
         include_securities: bool = False,
         taxonomy_id: str | None = None,
     ) -> ClassificationReadSnapshot: ...
 
 
 class RegimeReader(Protocol):
-    def read(self, as_of: date): ...
+    def read(self, as_of: date, *, known_at: datetime | None = None): ...
 
 
 class PortfolioRiskDependencyUnavailable(RuntimeError):
@@ -57,8 +65,8 @@ class DeterministicRegimeReader:
     def __init__(self, store: MarketRegimeStore) -> None:
         self.store = store
 
-    def read(self, as_of: date):
-        return MarketRegimeService().evaluate(self.store.read(as_of))
+    def read(self, as_of: date, *, known_at: datetime | None = None):
+        return MarketRegimeService().evaluate(self.store.read(as_of, known_at=known_at))
 
 
 @dataclass(frozen=True)
@@ -106,11 +114,18 @@ class PortfolioRiskService:
         self.regime_reader = regime_reader
         self.policy = policy or PortfolioRiskPolicy()
 
-    def evaluate(self, as_of: date) -> PortfolioRiskResult:
-        snapshot = self.ledger.read_selected(as_of)
+    def evaluate(
+        self,
+        as_of: date,
+        *,
+        known_at: datetime | None = None,
+    ) -> PortfolioRiskResult:
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
+        view = self.ledger.read_risk_view(as_of, known_at=cutoff)
+        snapshot = view.snapshot
         if snapshot is None:
-            return self._empty(as_of)
-        history = self.ledger.read_history(as_of)
+            return self._empty(as_of, cutoff)
+        history = view.history
         issues: set[str] = set()
         missing: set[str] = set()
         if snapshot.as_of < as_of:
@@ -122,8 +137,22 @@ class PortfolioRiskService:
         )
         if any(bar.trade_date > as_of for bar in raw_bars):
             issues.add("future_market_rows_discarded")
+        post_cutoff_market_rows = [
+            bar
+            for bar in raw_bars
+            if _normalized_observed_at(bar.ingested_at) is None
+            or _normalized_observed_at(bar.ingested_at) > cutoff
+        ]
+        if post_cutoff_market_rows:
+            issues.add("post_cutoff_market_rows_discarded")
         bars = sorted(
-            (bar for bar in raw_bars if bar.trade_date <= as_of),
+            (
+                bar
+                for bar in raw_bars
+                if bar.trade_date <= as_of
+                and (observed := _normalized_observed_at(bar.ingested_at)) is not None
+                and observed <= cutoff
+            ),
             key=lambda item: (item.trade_date, item.symbol),
         )
         data_as_of = max((bar.trade_date for bar in bars), default=None)
@@ -135,15 +164,30 @@ class PortfolioRiskService:
         for bar in bars:
             histories[bar.symbol].append(bar)
 
-        classification = self._classification(as_of)
+        market_lineage = _market_lineage(bars)
+        if market_lineage is not None:
+            issues.add("market.publication_visibility_unverifiable")
+        classification = self._classification(as_of, cutoff)
+        classification_lineage = _classification_lineage(classification)
+        if classification_lineage is not None:
+            lineage_dates = [
+                classification_lineage.source_snapshot_date,
+                classification_lineage.security_snapshot_date,
+                classification_lineage.sector_snapshot_date,
+            ]
+            if classification_lineage.observed_at > cutoff or any(
+                value is not None and value > as_of for value in lineage_dates
+            ):
+                classification_lineage = None
         sector_map, mapping_ratio, complete_sectors = self._sector_map(
             as_of,
+            cutoff,
             snapshot,
             classification,
             issues,
             missing,
         )
-        regime = self._regime(as_of, issues, missing)
+        regime = self._regime(as_of, cutoff, issues, missing)
 
         preliminary: list[dict[str, object]] = []
         for position in snapshot.positions:
@@ -270,7 +314,7 @@ class PortfolioRiskService:
             missing.add("classification.coverage_95_percent")
 
         atr_values = [item.atr_risk_amount for item in positions]
-        all_atr = all(value is not None for value in atr_values)
+        all_atr = all_prices and all(value is not None for value in atr_values)
         total_atr = (
             sum((value for value in atr_values if value is not None), Decimal("0"))
             if all_atr
@@ -291,7 +335,7 @@ class PortfolioRiskService:
                 else None
             ),
             total_atr=total_atr_ratio,
-            max_drawdown=drawdown.max_drawdown,
+            max_drawdown=(drawdown.max_drawdown if drawdown.status == "ready" else None),
         )
         target = self._target_band(regime, gross_ratio)
         if regime is not None:
@@ -329,24 +373,13 @@ class PortfolioRiskService:
         payload = {
             "formula_version": self.policy.formula_version,
             "as_of": as_of,
+            "evidence_cutoff_at": cutoff,
+            "computed_at": cutoff,
             "data_as_of": data_as_of,
-            "snapshot": {
-                "snapshot_id": snapshot.snapshot_id,
-                "as_of": snapshot.as_of,
-                "revision": snapshot.revision,
-                "content_hash": snapshot.content_hash,
-            },
+            "snapshot": lineage,
             "policy": policy,
-            "market_content_hash": _market_hash(bars),
-            "classification": {
-                "generation_id": (
-                    classification.generation.generation_id
-                    if classification.generation is not None
-                    else None
-                ),
-                "mapping_ratio": mapping_ratio,
-                "complete": complete_sectors,
-            },
+            "market_lineage": market_lineage,
+            "classification_lineage": classification_lineage,
             "regime": regime,
             "nav": nav,
             "exposure": exposure,
@@ -365,8 +398,12 @@ class PortfolioRiskService:
             status=status,
             quality_status=status,
             as_of=as_of,
+            evidence_cutoff_at=cutoff,
+            computed_at=cutoff,
             data_as_of=data_as_of,
             snapshot=lineage,
+            market_lineage=market_lineage,
+            classification_lineage=classification_lineage,
             policy=policy,
             nav=nav,
             exposure=exposure,
@@ -381,10 +418,15 @@ class PortfolioRiskService:
             quality_issues=sorted(issues),
         )
 
-    def _classification(self, as_of: date) -> ClassificationReadSnapshot:
+    def _classification(
+        self,
+        as_of: date,
+        cutoff: datetime,
+    ) -> ClassificationReadSnapshot:
         try:
             return self.classification_reader.read_snapshot(
                 as_of,
+                known_at=cutoff,
                 include_securities=True,
                 taxonomy_id=TAXONOMY_BAOSTOCK_INDUSTRY,
             )
@@ -394,11 +436,12 @@ class PortfolioRiskService:
     def _regime(
         self,
         as_of: date,
+        cutoff: datetime,
         issues: set[str],
         missing: set[str],
     ) -> MarketRegimeContext | None:
         try:
-            result = self.regime_reader.read(as_of)
+            result = self.regime_reader.read(as_of, known_at=cutoff)
         except MarketReadUnavailable:
             raise
         except (duckdb.Error, OSError, TypeError, ValueError) as exc:
@@ -427,6 +470,7 @@ class PortfolioRiskService:
     def _sector_map(
         self,
         as_of: date,
+        cutoff: datetime,
         snapshot: PortfolioDailySnapshot,
         selected: ClassificationReadSnapshot,
         issues: set[str],
@@ -438,7 +482,12 @@ class PortfolioRiskService:
         if generation is None:
             missing.add("classification.promoted_generation")
             return {}, Decimal("0"), False
-        if generation.source_snapshot_date > as_of or generation.observed_at.date() > as_of:
+        generation_observed = _normalized_observed_at(generation.observed_at)
+        if (
+            generation.source_snapshot_date > as_of
+            or generation_observed is None
+            or generation_observed > cutoff
+        ):
             issues.add("future_classification_generation_discarded")
             return {}, Decimal("0"), False
         audit = next(
@@ -460,7 +509,8 @@ class PortfolioRiskService:
             item.security_id
             for item in selected.securities
             if item.source_snapshot_date <= as_of
-            and item.observed_at.date() <= as_of
+            and (observed := _normalized_observed_at(item.observed_at)) is not None
+            and observed <= cutoff
             and (item.list_date is None or item.list_date <= as_of)
             and (item.delist_date is None or item.delist_date > as_of)
         }
@@ -469,7 +519,8 @@ class PortfolioRiskService:
             for item in selected.sector_memberships
             if item.security_id in valid_security_ids
             and item.source_snapshot_date <= as_of
-            and item.observed_at.date() <= as_of
+            and (observed := _normalized_observed_at(item.observed_at)) is not None
+            and observed <= cutoff
             and (item.effective_from is None or item.effective_from <= as_of)
             and (item.effective_to is None or item.effective_to >= as_of)
         }
@@ -503,16 +554,36 @@ class PortfolioRiskService:
         data_as_of: date | None,
     ) -> tuple[Decimal | None, str | None]:
         required = self.policy.atr_period + 1
-        if data_as_of is None or len(rows) < required or rows[-1].trade_date != data_as_of:
+        if data_as_of is None:
             return None, "atr14_warmup"
-        window = rows[-required:]
-        if any(not _valid_price_bar(bar) for bar in window):
-            return None, "atr14_quality"
+        usable = [bar for bar in rows if _valid_effective_price_bar(bar)]
+        if len(usable) < required:
+            return None, "atr14_warmup"
+        window = usable[-required:]
+        if any(bar.adjust_factor is None for bar in window):
+            return None, "atr14_adjust_factor_missing"
+        factors = [Decimal(str(bar.adjust_factor)) for bar in window]
+        if any(not factor.is_finite() or factor <= 0 for factor in factors):
+            return None, "atr14_adjust_factor_invalid"
+        latest_factor = factors[-1]
+        adjusted = []
+        for bar, factor in zip(window, factors, strict=True):
+            multiplier = factor / latest_factor
+            high = Decimal(str(bar.high)) * multiplier
+            low = Decimal(str(bar.low)) * multiplier
+            close = Decimal(str(bar.close)) * multiplier
+            if (
+                not multiplier.is_finite()
+                or multiplier <= 0
+                or not all(value.is_finite() and value > 0 for value in (high, low, close))
+                or high < low
+            ):
+                return None, "atr14_qfq_invalid"
+            adjusted.append((high, low, close))
         true_ranges = []
-        for previous, current in zip(window, window[1:], strict=False):
-            high = Decimal(str(current.high))
-            low = Decimal(str(current.low))
-            previous_close = Decimal(str(previous.close))
+        for previous, current in zip(adjusted, adjusted[1:], strict=False):
+            high, low, _ = current
+            previous_close = previous[2]
             true_ranges.append(
                 max(
                     high - low,
@@ -737,7 +808,7 @@ class PortfolioRiskService:
             },
         )
 
-    def _empty(self, as_of: date) -> PortfolioRiskResult:
+    def _empty(self, as_of: date, cutoff: datetime) -> PortfolioRiskResult:
         policy = self._policy_metadata()
         nav = PortfolioNav(
             cash=None,
@@ -782,6 +853,8 @@ class PortfolioRiskService:
         payload = {
             "formula_version": self.policy.formula_version,
             "as_of": as_of,
+            "evidence_cutoff_at": cutoff,
+            "computed_at": cutoff,
             "policy": policy,
             "missing": missing,
         }
@@ -791,8 +864,12 @@ class PortfolioRiskService:
             status="empty",
             quality_status="empty",
             as_of=as_of,
+            evidence_cutoff_at=cutoff,
+            computed_at=cutoff,
             data_as_of=None,
             snapshot=None,
+            market_lineage=None,
+            classification_lineage=None,
             policy=policy,
             nav=nav,
             exposure=exposure,
@@ -809,6 +886,12 @@ class PortfolioRiskService:
 
 
 def _valid_price_bar(bar: DailyBar) -> bool:
+    return _valid_effective_price_bar(bar) and (
+        bar.adjust_factor is not None and math.isfinite(bar.adjust_factor) and bar.adjust_factor > 0
+    )
+
+
+def _valid_effective_price_bar(bar: DailyBar) -> bool:
     values = [bar.open, bar.high, bar.low, bar.close, bar.preclose, bar.amount]
     return (
         bar.security_type == "stock"
@@ -821,9 +904,6 @@ def _valid_price_bar(bar: DailyBar) -> bool:
         and bar.high >= bar.low
         and bar.close > 0
         and bar.preclose > 0
-        and bar.adjust_factor is not None
-        and math.isfinite(bar.adjust_factor)
-        and bar.adjust_factor > 0
         and bar.amount >= 0
     )
 
@@ -863,10 +943,91 @@ def _market_hash(bars: list[DailyBar]) -> str:
             "quality_status": bar.quality_status,
             "quality_issues": bar.quality_issues,
             "source_record_id": bar.source_record_id,
+            "ingested_at": bar.ingested_at.astimezone(UTC).isoformat(),
         }
-        for bar in bars
+        for bar in sorted(bars, key=lambda item: (item.trade_date, item.symbol))
     ]
     encoded = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _market_lineage(bars: list[DailyBar]) -> MarketEvidenceLineage | None:
+    if not bars:
+        return None
+    dates = [bar.trade_date for bar in bars]
+    content_hash = _market_hash(bars)
+    publication_payload = {
+        "source": "baostock",
+        "source_version": CANONICAL_SOURCE_VERSION,
+        "data_as_of": max(dates),
+        "earliest_input_date": min(dates),
+        "latest_input_date": max(dates),
+        "record_count": len(bars),
+        "content_hash": content_hash,
+        "publication_visibility_status": "unverifiable",
+    }
+    digest = _stable_hash(publication_payload)
+    return MarketEvidenceLineage(
+        publication_id=None,
+        logical_content_id=f"market-content-{digest[:24]}",
+        **publication_payload,
+    )
+
+
+def _classification_lineage(
+    selected: ClassificationReadSnapshot,
+) -> ClassificationEvidenceLineage | None:
+    generation = selected.generation
+    if generation is None:
+        return None
+    content = {
+        "generation": generation.model_dump(mode="json"),
+        "security_snapshot_date": selected.security_snapshot_date,
+        "sector_snapshot_date": selected.sector_snapshot_date,
+        "securities": [
+            item.model_dump(mode="json")
+            for item in sorted(selected.securities, key=lambda value: value.record_id)
+        ],
+        "sector_memberships": [
+            item.model_dump(mode="json")
+            for item in sorted(
+                selected.sector_memberships,
+                key=lambda value: value.record_id,
+            )
+        ],
+        "taxonomy_id": TAXONOMY_BAOSTOCK_INDUSTRY,
+    }
+    observed_at = _normalized_observed_at(generation.observed_at)
+    if observed_at is None:
+        return None
+    return ClassificationEvidenceLineage(
+        generation_id=generation.generation_id,
+        schema_version=generation.schema_version,
+        source=generation.source,
+        source_version=generation.source_version,
+        source_snapshot_date=generation.source_snapshot_date,
+        observed_at=observed_at,
+        taxonomy_id=TAXONOMY_BAOSTOCK_INDUSTRY,
+        security_snapshot_date=selected.security_snapshot_date,
+        sector_snapshot_date=selected.sector_snapshot_date,
+        content_hash=_stable_hash(content),
+    )
+
+
+def _normalized_observed_at(value: datetime) -> datetime | None:
+    if value.utcoffset() is None:
+        return None
+    return value.astimezone(UTC)
+
+
+def _stable_hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 

@@ -1,10 +1,13 @@
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from backend.app.portfolio.models import (
     PortfolioDailySnapshot,
@@ -40,6 +43,33 @@ class PortfolioLedgerConflict(PortfolioLedgerError):
 
 class PortfolioLedgerUnavailable(PortfolioLedgerError):
     pass
+
+
+class PortfolioEvidenceCutoffInvalid(PortfolioLedgerError):
+    pass
+
+
+@dataclass(frozen=True)
+class PortfolioRiskReadView:
+    snapshot: PortfolioDailySnapshot | None
+    history: list[PortfolioDailySnapshot]
+    evidence_cutoff_at: datetime
+
+
+def portfolio_evidence_cutoff(
+    as_of: date,
+    known_at: datetime | None = None,
+) -> datetime:
+    """Resolve the knowledge boundary independently from the effective date."""
+    if known_at is None:
+        return datetime.combine(
+            as_of,
+            time.max,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        ).astimezone(UTC)
+    if known_at.utcoffset() is None:
+        raise PortfolioEvidenceCutoffInvalid("known_at must include a timezone offset")
+    return known_at.astimezone(UTC)
 
 
 def _decimal_text(value: Decimal | None) -> str | None:
@@ -83,7 +113,7 @@ def _snapshot_id(as_of: date, revision: int, content_hash: str) -> str:
 
 
 class PortfolioLedger:
-    """Append-only manual daily snapshots in the existing private SQLite file."""
+    """Append-only manual daily snapshots in the dedicated private SQLite file."""
 
     def __init__(
         self,
@@ -97,10 +127,17 @@ class PortfolioLedger:
     def _connect_writer(self) -> sqlite3.Connection:
         with user_database_initialization(self.path):
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            existed = self.path.exists()
             connection = sqlite3.connect(self.path, timeout=5)
+            if not existed:
+                os.chmod(self.path, 0o600)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
+            journal_mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+            if str(journal_mode).lower() != "delete":
+                connection.close()
+                raise PortfolioLedgerUnavailable("portfolio ledger requires rollback journal mode")
+            connection.execute("PRAGMA synchronous = FULL")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute(
                 f"""
@@ -114,8 +151,7 @@ class PortfolioLedger:
                     positions_json TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     recorded_at TEXT NOT NULL,
-                    PRIMARY KEY (as_of, revision),
-                    UNIQUE (as_of, content_hash)
+                    PRIMARY KEY (as_of, revision)
                 )
                 """
             )
@@ -125,6 +161,24 @@ class PortfolioLedger:
     def _connect_reader(self) -> sqlite3.Connection | None:
         if not self.path.is_file():
             return None
+        rollback_journal = self.path.with_name(f"{self.path.name}-journal")
+        try:
+            if rollback_journal.is_file() and rollback_journal.stat().st_size > 0:
+                raise PortfolioLedgerUnavailable(
+                    "portfolio ledger has an active or hot rollback journal"
+                )
+        except OSError as exc:
+            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+        try:
+            with self.path.open("rb") as database:
+                database.seek(18)
+                journal_header = database.read(2)
+        except OSError as exc:
+            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+        if journal_header != b"\x01\x01":
+            raise PortfolioLedgerUnavailable(
+                "portfolio ledger is not a checkpointed rollback-journal database"
+            )
         try:
             connection = sqlite3.connect(
                 f"file:{self.path.resolve()}?mode=ro",
@@ -186,20 +240,16 @@ class PortfolioLedger:
         try:
             connection = self._connect_writer()
             connection.execute("BEGIN IMMEDIATE")
-            matching = connection.execute(
-                f"SELECT * FROM {_TABLE} WHERE as_of = ? AND content_hash = ?",
-                [data.as_of.isoformat(), digest],
-            ).fetchone()
-            if matching is not None:
-                connection.commit()
-                return PortfolioSnapshotWriteResult(
-                    write_status="idempotent",
-                    snapshot=self._snapshot(matching),
-                )
             current = connection.execute(
                 f"SELECT * FROM {_TABLE} WHERE as_of = ? ORDER BY revision DESC LIMIT 1",
                 [data.as_of.isoformat()],
             ).fetchone()
+            if current is not None and current["content_hash"] == digest:
+                connection.commit()
+                return PortfolioSnapshotWriteResult(
+                    write_status="idempotent",
+                    snapshot=self._snapshot(current),
+                )
             if mode == "create" and current is not None:
                 raise PortfolioLedgerConflict(
                     "expected_revision is required to change an existing daily snapshot"
@@ -214,6 +264,7 @@ class PortfolioLedger:
             recorded_at = self.clock()
             if recorded_at.utcoffset() is None:
                 recorded_at = recorded_at.replace(tzinfo=UTC)
+            recorded_at = recorded_at.astimezone(UTC)
             canonical = _canonical_content(data)
             connection.execute(
                 f"""
@@ -263,23 +314,51 @@ class PortfolioLedger:
             if connection is not None:
                 connection.close()
 
-    def read_selected(self, as_of: date) -> PortfolioDailySnapshot | None:
+    @staticmethod
+    def _cutoff_parameter(cutoff: datetime) -> str:
+        return cutoff.astimezone(UTC).isoformat()
+
+    def read_selected(
+        self,
+        as_of: date,
+        *,
+        known_at: datetime | None = None,
+    ) -> PortfolioDailySnapshot | None:
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
         return self._read_one(
             f"""
             SELECT * FROM {_TABLE}
             WHERE as_of = (
-                SELECT max(as_of) FROM {_TABLE} WHERE as_of <= ?
+                SELECT max(as_of) FROM {_TABLE}
+                WHERE as_of <= ?
+                  AND julianday(recorded_at) <= julianday(?)
             )
+              AND julianday(recorded_at) <= julianday(?)
             ORDER BY revision DESC
             LIMIT 1
             """,
-            [as_of.isoformat()],
+            [
+                as_of.isoformat(),
+                self._cutoff_parameter(cutoff),
+                self._cutoff_parameter(cutoff),
+            ],
         )
 
-    def read_revision(self, as_of: date, revision: int) -> PortfolioDailySnapshot | None:
+    def read_revision(
+        self,
+        as_of: date,
+        revision: int,
+        *,
+        known_at: datetime | None = None,
+    ) -> PortfolioDailySnapshot | None:
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
         return self._read_one(
-            f"SELECT * FROM {_TABLE} WHERE as_of = ? AND revision = ?",
-            [as_of.isoformat(), revision],
+            f"""
+            SELECT * FROM {_TABLE}
+            WHERE as_of = ? AND revision = ?
+              AND julianday(recorded_at) <= julianday(?)
+            """,
+            [as_of.isoformat(), revision, self._cutoff_parameter(cutoff)],
         )
 
     def _read_one(
@@ -303,7 +382,13 @@ class PortfolioLedger:
         finally:
             connection.close()
 
-    def read_history(self, as_of: date) -> list[PortfolioDailySnapshot]:
+    def read_history(
+        self,
+        as_of: date,
+        *,
+        known_at: datetime | None = None,
+    ) -> list[PortfolioDailySnapshot]:
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
         connection = self._connect_reader()
         if connection is None:
             return []
@@ -319,18 +404,81 @@ class PortfolioLedger:
                     SELECT as_of, max(revision) AS revision
                     FROM {_TABLE}
                     WHERE as_of <= ?
+                      AND julianday(recorded_at) <= julianday(?)
                     GROUP BY as_of
                 ) AS selected
                   ON selected.as_of = snapshots.as_of
                  AND selected.revision = snapshots.revision
                 ORDER BY snapshots.as_of
                 """,
-                [as_of.isoformat()],
+                [as_of.isoformat(), self._cutoff_parameter(cutoff)],
             ).fetchall()
             return [self._snapshot(row) for row in rows]
         except PortfolioLedgerUnavailable:
             raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+        finally:
+            connection.close()
+
+    def read_risk_view(
+        self,
+        as_of: date,
+        *,
+        known_at: datetime | None = None,
+    ) -> PortfolioRiskReadView:
+        """Read selected snapshot and history from one rollback-journal view."""
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
+        connection = self._connect_reader()
+        if connection is None:
+            return PortfolioRiskReadView(None, [], cutoff)
+        cutoff_text = self._cutoff_parameter(cutoff)
+        try:
+            connection.execute("BEGIN")
+            if not self._table_exists(connection):
+                connection.commit()
+                return PortfolioRiskReadView(None, [], cutoff)
+            self._validate_schema(connection)
+            selected_row = connection.execute(
+                f"""
+                SELECT * FROM {_TABLE}
+                WHERE as_of = (
+                    SELECT max(as_of) FROM {_TABLE}
+                    WHERE as_of <= ?
+                      AND julianday(recorded_at) <= julianday(?)
+                )
+                  AND julianday(recorded_at) <= julianday(?)
+                ORDER BY revision DESC
+                LIMIT 1
+                """,
+                [as_of.isoformat(), cutoff_text, cutoff_text],
+            ).fetchone()
+            snapshot = self._snapshot(selected_row) if selected_row is not None else None
+            history_rows = connection.execute(
+                f"""
+                SELECT snapshots.*
+                FROM {_TABLE} AS snapshots
+                JOIN (
+                    SELECT as_of, max(revision) AS revision
+                    FROM {_TABLE}
+                    WHERE as_of <= ?
+                      AND julianday(recorded_at) <= julianday(?)
+                    GROUP BY as_of
+                ) AS selected
+                  ON selected.as_of = snapshots.as_of
+                 AND selected.revision = snapshots.revision
+                ORDER BY snapshots.as_of
+                """,
+                [as_of.isoformat(), cutoff_text],
+            ).fetchall()
+            history = [self._snapshot(row) for row in history_rows]
+            connection.commit()
+            return PortfolioRiskReadView(snapshot, history, cutoff)
+        except PortfolioLedgerUnavailable:
+            connection.rollback()
+            raise
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            connection.rollback()
             raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
         finally:
             connection.close()
@@ -357,6 +505,9 @@ class PortfolioLedger:
             recorded_at=row["recorded_at"],
             source=row["source"],
         )
+        if snapshot.recorded_at.utcoffset() is None:
+            raise PortfolioLedgerUnavailable("portfolio ledger recorded_at is timezone-naive")
+        snapshot = snapshot.model_copy(update={"recorded_at": snapshot.recorded_at.astimezone(UTC)})
         expected_hash = _content_hash(
             PortfolioDailySnapshotCreate(
                 as_of=snapshot.as_of,

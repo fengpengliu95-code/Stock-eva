@@ -106,9 +106,10 @@ def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
     assert backup["StartCalendarInterval"] == {"Hour": 2, "Minute": 30}
     assert backup.get("RunAtLoad") is None
     assert backup.get("KeepAlive") is None
-    assert backup["ProgramArguments"][-8:] == [
-        "--source",
-        str(DATA_ROOT / "user/stock_eva_user.sqlite3"),
+    assert backup["ProgramArguments"][-9:] == [
+        "-m",
+        "backend.app.cli",
+        "backup-private-data",
         "--backup-root",
         "/Users/test/Library/Application Support/Stock EVA/backups",
         "--keep-daily",
@@ -206,9 +207,7 @@ def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
     (project / "workspace/package.json").write_text(
         '{"scripts":{"build":"vite build"},"dependencies":{"klinecharts":"10.0.0"}}'
     )
-    (project / "workspace/package-lock.json").write_text(
-        '{"name":"synthetic","lockfileVersion":3}'
-    )
+    (project / "workspace/package-lock.json").write_text('{"name":"synthetic","lockfileVersion":3}')
     (project / "index.html").write_text("stock eva")
     (project / "pyproject.toml").write_text("[project]\nname='stock-eva-synthetic'\n")
     (project / "uv.lock").write_text("synthetic lock")
@@ -398,8 +397,7 @@ def stateful_install_environment(tmp_path: Path) -> dict[str, str]:
         lsof=stateful_fake_lsof(tmp_path),
     )
     runtime_current = (
-        Path(environment["HOME"])
-        / "Library/Application Support/Stock EVA/runtime/current"
+        Path(environment["HOME"]) / "Library/Application Support/Stock EVA/runtime/current"
     )
     launchctl_state = tmp_path / "launchctl-state"
     launchctl_state.touch()
@@ -473,6 +471,8 @@ def test_installer_uses_private_logs_and_succeeds_in_synthetic_home(
     runtime_env = (config / ".env").read_text()
     assert f"STOCK_EVA_MARKET_DATA_DIR={data / 'market'}" in runtime_env
     assert f"STOCK_EVA_USER_DATA_DIR={data / 'user'}" in runtime_env
+    assert "STOCK_EVA_USER_DATABASE_NAME=stock_eva_user.sqlite3" in runtime_env
+    assert "STOCK_EVA_PORTFOLIO_DATABASE_NAME=stock_eva_portfolio.sqlite3" in runtime_env
     assert f"STOCK_EVA_LOCAL_CONTROL_DIR={data / 'control'}" in runtime_env
     assert f"STOCK_EVA_LOCAL_MARKET_DATASET_ROOT={data / 'market-dataset'}" in runtime_env
     assert "STOCK_EVA_AKSHARE_SUPPLEMENTAL_ENABLED=false" in runtime_env
@@ -497,10 +497,7 @@ def test_installer_builds_workspace_from_locked_sources(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     calls = Path(environment["NPM_CALL_LOG"]).read_text().splitlines()
     assert calls == ["ci --ignore-scripts", "run build"]
-    current = (
-        Path(environment["HOME"])
-        / "Library/Application Support/Stock EVA/runtime/current"
-    )
+    current = Path(environment["HOME"]) / "Library/Application Support/Stock EVA/runtime/current"
     assert (
         current / "public/workspace/assets/security-cockpit.js"
     ).read_text() == "built from locked sources"
@@ -551,15 +548,9 @@ def test_installer_stops_web_and_releases_8080_before_current_handoff(
     new_target = str(current.readlink())
     assert new_target != old_target
     events = event_log.read_text().splitlines()
-    web_bootout = (
-        "launchctl|bootout|com.finlay.stock-eva.web|"
-        f"{old_target}"
-    )
+    web_bootout = f"launchctl|bootout|com.finlay.stock-eva.web|{old_target}"
     released_8080 = f"lsof|8080|{old_target}|0"
-    api_bootout = (
-        "launchctl|bootout|com.finlay.stock-eva.api|"
-        f"{new_target}"
-    )
+    api_bootout = f"launchctl|bootout|com.finlay.stock-eva.api|{new_target}"
     assert events.count(web_bootout) == 1
     assert events.index(web_bootout) < events.index(released_8080)
     assert events.index(released_8080) < events.index(api_bootout)
@@ -600,32 +591,21 @@ def test_installer_web_handoff_failure_restores_old_release_and_agents(
     assert (current / "backend/sentinel.txt").read_text() == "backend"
     assert previous_web_plist.read_text() == "previous-web-plist"
     releases = current.parent / "releases"
-    assert sorted(path.name for path in releases.iterdir()) == [
-        Path(old_target).name
-    ]
+    assert sorted(path.name for path in releases.iterdir()) == [Path(old_target).name]
     expected_labels = sorted(
-        path.name.removesuffix(".plist.in")
-        for path in LAUNCHD.glob("*.plist.in")
+        path.name.removesuffix(".plist.in") for path in LAUNCHD.glob("*.plist.in")
     )
-    loaded_labels = sorted(
-        Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines()
-    )
+    loaded_labels = sorted(Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines())
     assert loaded_labels == expected_labels
     events = event_log.read_text().splitlines()
-    assert (
-        f"launchctl|bootout|com.finlay.stock-eva.web|{old_target}"
-        in events
-    )
+    assert f"launchctl|bootout|com.finlay.stock-eva.web|{old_target}" in events
     observed_targets = {
         parts[3] if parts[0] == "launchctl" else parts[2]
         for event in events
         if (parts := event.split("|"))[0] in ("launchctl", "lsof")
     }
     assert observed_targets <= {"", old_target}
-    assert (
-        f"launchctl|bootstrap|com.finlay.stock-eva.web|{old_target}"
-        in events
-    )
+    assert f"launchctl|bootstrap|com.finlay.stock-eva.web|{old_target}" in events
 
 
 @pytest.mark.parametrize(
@@ -669,9 +649,7 @@ def test_installer_reports_incomplete_rollback_when_loaded_agent_is_missing(
 
     (project / "uv.lock").write_text("synthetic lock v2")
     (project / "backend/sentinel.txt").write_text("backend-v2")
-    (project / ".env").write_text(
-        (project / ".env").read_text() + "STOCK_EVA_TEST_MARKER=new\n"
-    )
+    (project / ".env").write_text((project / ".env").read_text() + "STOCK_EVA_TEST_MARKER=new\n")
     environment.update(faults)
     second = run_installer(project, environment)
 
@@ -684,16 +662,11 @@ def test_installer_reports_incomplete_rollback_when_loaded_agent_is_missing(
     assert config.read_text() == previous_config
     assert previous_calendar_plist.read_text() == "previous-calendar-plist"
     releases = app_support / "runtime/releases"
-    assert sorted(path.name for path in releases.iterdir()) == [
-        Path(old_target).name
-    ]
+    assert sorted(path.name for path in releases.iterdir()) == [Path(old_target).name]
     expected_loaded = {
-        path.name.removesuffix(".plist.in")
-        for path in LAUNCHD.glob("*.plist.in")
+        path.name.removesuffix(".plist.in") for path in LAUNCHD.glob("*.plist.in")
     } - {missing_label}
-    actual_loaded = set(
-        Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines()
-    )
+    actual_loaded = set(Path(environment["LAUNCHCTL_STATE"]).read_text().splitlines())
     assert actual_loaded == expected_loaded
 
 
@@ -776,6 +749,25 @@ def test_installer_rejects_backup_path_override_it_cannot_honor(
 
     assert result.returncode != 0
     assert "STOCK_EVA_USER_DATA_DIR=var/user" in result.stderr
+
+
+def test_installer_rejects_portfolio_database_name_override_before_install(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    with (project / ".env").open("a") as environment_file:
+        environment_file.write("STOCK_EVA_PORTFOLIO_DATABASE_NAME=elsewhere.sqlite3\n")
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+
+    result = run_installer(project, environment)
+
+    assert result.returncode != 0
+    assert "STOCK_EVA_PORTFOLIO_DATABASE_NAME=stock_eva_portfolio.sqlite3" in result.stderr
+    assert not (Path(environment["HOME"]) / "Library/LaunchAgents").exists()
 
 
 def test_uninstaller_removes_only_named_agents_and_preserves_data(

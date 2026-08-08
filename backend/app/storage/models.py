@@ -37,4 +37,5 @@ class LocalStoragePaths(BaseModel):
     temporary: Path
     market_database: Path
     user_database: Path
+    portfolio_database: Path
     factor_cache_database: Path

@@ -210,14 +210,44 @@ class MarketRegimeContext(PortfolioModel):
     can_support_full_a_share_conclusion: bool
 
 
+class MarketEvidenceLineage(PortfolioModel):
+    publication_id: None = None
+    logical_content_id: str = Field(pattern=r"^market-content-[0-9a-f]{24}$")
+    publication_visibility_status: Literal["unverifiable"] = "unverifiable"
+    source: Literal["baostock"]
+    source_version: str
+    data_as_of: date
+    earliest_input_date: date
+    latest_input_date: date
+    record_count: int = Field(ge=1)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ClassificationEvidenceLineage(PortfolioModel):
+    generation_id: str
+    schema_version: str
+    source: str
+    source_version: str
+    source_snapshot_date: date
+    observed_at: datetime
+    taxonomy_id: str
+    security_snapshot_date: date | None
+    sector_snapshot_date: date | None
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class PortfolioRiskResult(PortfolioModel):
     result_id: str = Field(pattern=r"^portfolio-risk-[0-9a-f]{24}$")
     formula_version: str
     status: Literal["empty", "ready", "degraded"]
     quality_status: Literal["empty", "ready", "degraded"]
     as_of: date
+    evidence_cutoff_at: datetime
+    computed_at: datetime
     data_as_of: date | None
     snapshot: SnapshotLineage | None
+    market_lineage: MarketEvidenceLineage | None
+    classification_lineage: ClassificationEvidenceLineage | None
     policy: RiskPolicyMetadata
     nav: PortfolioNav
     exposure: PortfolioExposure
@@ -236,10 +266,23 @@ class PortfolioRiskResult(PortfolioModel):
 
     @model_validator(mode="after")
     def validate_no_future_lineage(self) -> "PortfolioRiskResult":
+        if self.evidence_cutoff_at.utcoffset() is None:
+            raise ValueError("evidence_cutoff_at must be timezone-aware")
+        if self.evidence_cutoff_at.utcoffset().total_seconds() != 0:
+            raise ValueError("evidence_cutoff_at must be normalized to UTC")
+        if self.computed_at != self.evidence_cutoff_at:
+            raise ValueError("computed_at must equal the deterministic evidence cutoff")
         if self.data_as_of is not None and self.data_as_of > self.as_of:
             raise ValueError("data_as_of must not exceed as_of")
         if self.snapshot is not None and self.snapshot.as_of > self.as_of:
             raise ValueError("snapshot as_of must not exceed risk as_of")
+        if self.snapshot is not None and self.snapshot.recorded_at > self.evidence_cutoff_at:
+            raise ValueError("snapshot recorded_at must not exceed evidence cutoff")
+        if (
+            self.classification_lineage is not None
+            and self.classification_lineage.observed_at > self.evidence_cutoff_at
+        ):
+            raise ValueError("classification observed_at must not exceed evidence cutoff")
         if self.market_regime is not None:
             if self.market_regime.as_of > self.as_of:
                 raise ValueError("market regime as_of must not exceed risk as_of")

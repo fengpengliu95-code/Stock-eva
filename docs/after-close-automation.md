@@ -32,16 +32,18 @@ published pointer 和刷新成功状态不回滚。下一次闭环重入只重�
 
 ## 私有 SQLite 一致性备份
 
-持仓、自选、策略、预警及闭环审计都留在 Mac 本地 SQLite。备份使用 SQLite Backup
-API 读取包含 WAL 已提交事务的一致快照，再对候选文件执行 `PRAGMA integrity_check`，
-通过后才原子替换当天和当周文件。默认保留：
+持仓、自选、策略、预警及闭环审计留在 Mac 本地共享 SQLite；手工现金/NAV 日账本在
+独立本地 portfolio SQLite。备份使用 SQLite Backup API 为两库生成同一 manifest
+约束的候选 bundle，逐库校验 SHA-256 与 `PRAGMA integrity_check`，全部通过后才发布
+当天和当周 bundle。默认保留：
 
 - 最近 7 个日快照；
 - 最近 4 个周快照。
 
 源数据库和备份目标都拒绝 `/Volumes`、`/Network`、`/net` 下的网络卷；市场 NAS
 不保存私有数据库或私有备份。备份失败不会替换已有有效快照，输出只含安全错误码和
-快照文件名。
+bundle 文件名。尚未初始化 portfolio 库会产生明确 `partial/not_initialized`，不会
+伪装成完整备份。
 
 执行：
 
@@ -64,8 +66,8 @@ uv run python -m backend.app.cli backup-private-data \
   --keep-weekly 4
 ```
 
-`PrivateBackupService.run(now)` 是后续本机自动化可直接调用的窄接口；本阶段不创建
-launchd、cron，也不写 NAS。
+LaunchAgent 调用同一 root CLI；单库 `PrivateBackupService` 仅保留为旧备份兼容接口，
+新的自动备份使用 `PrivateBackupSetService`，且不写 NAS。
 
 ## 能力边界
 

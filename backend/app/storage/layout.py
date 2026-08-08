@@ -16,15 +16,13 @@ class StorageLayout:
             staging=self.settings.local_staging_dir,
             locks=self.settings.local_lock_dir,
             temporary=self.settings.local_temp_dir,
-            market_database=(
-                self.settings.market_data_dir / self.settings.market_database_name
-            ),
-            user_database=(
-                self.settings.user_data_dir / self.settings.user_database_name
+            market_database=(self.settings.market_data_dir / self.settings.market_database_name),
+            user_database=(self.settings.user_data_dir / self.settings.user_database_name),
+            portfolio_database=(
+                self.settings.user_data_dir / self.settings.portfolio_database_name
             ),
             factor_cache_database=(
-                self.settings.local_control_dir
-                / self.settings.factor_cache_database_name
+                self.settings.local_control_dir / self.settings.factor_cache_database_name
             ),
         )
 

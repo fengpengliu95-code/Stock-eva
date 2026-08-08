@@ -9,9 +9,8 @@
   <array>
     <string>__PYTHON__</string>
     <string>-m</string>
-    <string>backend.app.user.backup_cli</string>
-    <string>--source</string>
-    <string>__DATA_ROOT__/user/stock_eva_user.sqlite3</string>
+    <string>backend.app.cli</string>
+    <string>backup-private-data</string>
     <string>--backup-root</string>
     <string>__BACKUP_ROOT__</string>
     <string>--keep-daily</string>

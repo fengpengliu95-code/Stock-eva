@@ -2,7 +2,7 @@ import hashlib
 import json
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TypeVar
 
@@ -74,9 +74,7 @@ def actionability_reasons(row: SecurityMasterRecord) -> list[str]:
 
 def market_scope(rows: list[SecurityMasterRecord]) -> MarketScope:
     market_names = {"sh": "SSE", "sz": "SZSE", "bj": "BSE"}
-    covered_markets = sorted(
-        {market_names.get(row.exchange, row.exchange.upper()) for row in rows}
-    )
+    covered_markets = sorted({market_names.get(row.exchange, row.exchange.upper()) for row in rows})
     covered_boards = sorted({row.board for row in rows})
     price_values = [
         row.price_available
@@ -205,8 +203,7 @@ class ClassificationStore:
     def _audits_are_promotable(audits: list[CoverageAudit]) -> bool:
         return (
             bool(audits)
-            and TAXONOMY_BAOSTOCK_INDUSTRY
-            in {audit.taxonomy_id for audit in audits}
+            and TAXONOMY_BAOSTOCK_INDUSTRY in {audit.taxonomy_id for audit in audits}
             and all(audit.status == "ready" for audit in audits)
         )
 
@@ -221,10 +218,7 @@ class ClassificationStore:
         connection.begin()
         try:
             for generation_id, raw_audits in rows:
-                audits = [
-                    CoverageAudit.model_validate(item)
-                    for item in json.loads(raw_audits)
-                ]
+                audits = [CoverageAudit.model_validate(item) for item in json.loads(raw_audits)]
                 if self._audits_are_promotable(audits):
                     connection.execute(
                         """
@@ -287,10 +281,9 @@ class ClassificationStore:
             if current is None:
                 result[natural_key] = row
                 continue
-            if (
-                current.lineage_hash != row.lineage_hash
-                or cls._content_hash(current) != cls._content_hash(row)
-            ):
+            if current.lineage_hash != row.lineage_hash or cls._content_hash(
+                current
+            ) != cls._content_hash(row):
                 raise ClassificationConflictError(f"conflicting {label} in source snapshot")
         return sorted(result.values(), key=lambda row: row.record_id)
 
@@ -610,8 +603,7 @@ class ClassificationStore:
                     [pointer[1]],
                 ).fetchone()[0]
             should_advance_pointer = should_promote and (
-                pointer_date is None
-                or snapshot.source_snapshot_date >= pointer_date
+                pointer_date is None or snapshot.source_snapshot_date >= pointer_date
             )
             connection.begin()
             try:
@@ -823,10 +815,7 @@ class ClassificationStore:
             source_date_semantics=row[6],
             observed_at=row[7],
             row_counts=json.loads(row[8]),
-            coverage_audits=[
-                CoverageAudit.model_validate(item)
-                for item in json.loads(row[9])
-            ],
+            coverage_audits=[CoverageAudit.model_validate(item) for item in json.loads(row[9])],
             market_scope=MarketScope.model_validate_json(row[10]),
         )
 
@@ -864,20 +853,24 @@ class ClassificationStore:
         model,
         as_of: date,
         *,
+        known_at: datetime | None = None,
         filters: dict[str, str] | None = None,
         apply_effective_window: bool = True,
     ) -> tuple[list, date | None]:
+        observed_condition = (
+            "observed_at <= ?" if known_at is not None else "CAST(observed_at AS DATE) <= ?"
+        )
         conditions = [
             "generation_sequence = ?",
             "generation_id = ?",
             "source_snapshot_date <= ?",
-            "CAST(observed_at AS DATE) <= ?",
+            observed_condition,
         ]
         parameters: list[object] = [
             generation.sequence,
             generation.generation_id,
             as_of,
-            as_of,
+            known_at if known_at is not None else as_of,
         ]
         for column, value in (filters or {}).items():
             conditions.append(f"{column} = ?")
@@ -922,6 +915,7 @@ class ClassificationStore:
         self,
         as_of: date,
         *,
+        known_at: datetime | None = None,
         include_securities: bool = False,
         index_id: str | None = None,
         taxonomy_id: str | None = None,
@@ -952,20 +946,23 @@ class ClassificationStore:
                 )
             pointer = self._ready_pointer(connection)
             ready_generation_id = pointer[1] if pointer else None
+            observed_condition = (
+                "observed_at <= ?" if known_at is not None else "CAST(observed_at AS DATE) <= ?"
+            )
             row = self._execute(
                 connection,
-                """
+                f"""
                 SELECT sequence, generation_id, schema_version, source,
                        source_version, source_snapshot_date, source_date_semantics,
                        observed_at, row_counts, coverage_audits, market_scope
                 FROM classification_generations
                 WHERE promoted = TRUE
                   AND source_snapshot_date <= ?
-                  AND CAST(observed_at AS DATE) <= ?
+                  AND {observed_condition}
                 ORDER BY source_snapshot_date DESC, observed_at DESC, sequence DESC
                 LIMIT 1
                 """,
-                [as_of, as_of],
+                [as_of, known_at if known_at is not None else as_of],
             ).fetchone()
             generation = self._generation_from_row(row) if row is not None else None
             securities: list[SecurityMasterRecord] = []
@@ -981,6 +978,7 @@ class ClassificationStore:
                     "security_master_history",
                     SecurityMasterRecord,
                     as_of,
+                    known_at=known_at,
                     apply_effective_window=False,
                 )
             if generation is not None and index_id is not None:
@@ -990,6 +988,7 @@ class ClassificationStore:
                     "index_component_history",
                     IndexComponentRecord,
                     as_of,
+                    known_at=known_at,
                     filters={"index_id": index_id},
                 )
             if generation is not None and taxonomy_id is not None:
@@ -999,6 +998,7 @@ class ClassificationStore:
                     "sector_membership_history",
                     SectorMembershipRecord,
                     as_of,
+                    known_at=known_at,
                     filters={"taxonomy_id": taxonomy_id},
                 )
             return ClassificationReadSnapshot(

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -7,9 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from backend.app.classification.store import ClassificationStore
 from backend.app.config import Settings, get_settings
 from backend.app.portfolio.ledger import (
+    PortfolioEvidenceCutoffInvalid,
     PortfolioLedger,
     PortfolioLedgerConflict,
     PortfolioLedgerUnavailable,
+    portfolio_evidence_cutoff,
 )
 from backend.app.portfolio.models import (
     PortfolioDailySnapshot,
@@ -40,6 +42,10 @@ def get_portfolio_today() -> date:
     return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
 
+def get_portfolio_request_started_at() -> datetime:
+    return datetime.now(UTC)
+
+
 def _reject_future(as_of: date, today: date) -> None:
     if as_of > today:
         raise HTTPException(
@@ -53,10 +59,34 @@ def _reject_future(as_of: date, today: date) -> None:
         )
 
 
+def _resolve_cutoff(
+    as_of: date,
+    known_at: datetime | None,
+    request_started_at: datetime,
+) -> datetime:
+    try:
+        cutoff = portfolio_evidence_cutoff(as_of, known_at)
+    except PortfolioEvidenceCutoffInvalid as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_known_at", "reason": str(exc)},
+        ) from exc
+    request_time = request_started_at.astimezone(UTC)
+    if known_at is not None and cutoff > request_time:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "future_known_at",
+                "request_started_at": request_time.isoformat(),
+            },
+        )
+    return cutoff
+
+
 def get_portfolio_ledger(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> PortfolioLedger:
-    return PortfolioLedger(StorageLayout(settings).local_paths.user_database)
+    return PortfolioLedger(StorageLayout(settings).local_paths.portfolio_database)
 
 
 def get_portfolio_risk_service(
@@ -78,7 +108,7 @@ def get_portfolio_risk_service(
         temp_directory=settings.local_temp_dir / "classification-duckdb",
     )
     return PortfolioRiskService(
-        PortfolioLedger(layout.local_paths.user_database),
+        PortfolioLedger(layout.local_paths.portfolio_database),
         market_reader,
         classification,
         DeterministicRegimeReader(MarketRegimeStore(market_reader)),
@@ -169,17 +199,23 @@ def revise_daily_snapshot(
 )
 def read_daily_snapshot(
     as_of: date,
+    known_at: datetime | None = None,
     revision: Annotated[int | None, Query(ge=1)] = None,
     ledger: Annotated[PortfolioLedger, Depends(get_portfolio_ledger)] = None,
     today: Annotated[date, Depends(get_portfolio_today)] = None,
+    request_started_at: Annotated[
+        datetime,
+        Depends(get_portfolio_request_started_at),
+    ] = None,
 ) -> PortfolioDailySnapshot | None:
     """Read a point-in-time snapshot without initializing private storage."""
     _reject_future(as_of, today)
+    cutoff = _resolve_cutoff(as_of, known_at, request_started_at)
     try:
         return (
-            ledger.read_revision(as_of, revision)
+            ledger.read_revision(as_of, revision, known_at=cutoff)
             if revision is not None
-            else ledger.read_selected(as_of)
+            else ledger.read_selected(as_of, known_at=cutoff)
         )
     except PortfolioLedgerUnavailable as exc:
         raise _ledger_error(exc) from exc
@@ -197,11 +233,17 @@ def portfolio_risk(
         Depends(get_portfolio_risk_service),
     ],
     today: Annotated[date, Depends(get_portfolio_today)],
+    request_started_at: Annotated[
+        datetime,
+        Depends(get_portfolio_request_started_at),
+    ],
+    known_at: datetime | None = None,
 ) -> PortfolioRiskResult:
     """Evaluate deterministic local research risk from evidence visible at as_of."""
     _reject_future(as_of, today)
+    cutoff = _resolve_cutoff(as_of, known_at, request_started_at)
     try:
-        return service.evaluate(as_of)
+        return service.evaluate(as_of, known_at=cutoff)
     except PortfolioLedgerUnavailable as exc:
         raise _ledger_error(exc) from exc
     except MarketReadUnavailable as exc:
