@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.app.market.baostock import BaoStockError, BaoStockProvider
+from backend.app.market.baostock import (
+    BaoStockError,
+    BaoStockProvider,
+    BaoStockSessionStateError,
+)
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "baostock_daily.json"
 
@@ -207,7 +211,7 @@ def test_active_session_entry_fails_without_touching_existing_session(
     provider._session_usable = True
     original_socket = client.context.default_socket
 
-    with pytest.raises(BaoStockError, match="session is already active"):
+    with pytest.raises(BaoStockSessionStateError, match="session is already active"):
         if entrypoint == "login":
             provider._login()
         else:

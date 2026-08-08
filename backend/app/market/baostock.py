@@ -69,6 +69,14 @@ class BaoStockError(RuntimeError):
     pass
 
 
+class BaoStockTransportError(BaoStockError):
+    pass
+
+
+class BaoStockSessionStateError(BaoStockError):
+    pass
+
+
 class _OperationDeadlineExceeded(BaoStockError):
     pass
 
@@ -88,12 +96,9 @@ class _PreexistingTimerInterrupt(BaseException):
 @contextmanager
 def _wall_clock_deadline(seconds: float):
     if threading.current_thread() is not threading.main_thread():
-        raise _OperationDeadlineUnavailable(
-            "BaoStock wall-clock deadlines require the main thread"
-        )
+        raise _OperationDeadlineUnavailable("BaoStock wall-clock deadlines require the main thread")
     if not all(
-        hasattr(signal, name)
-        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+        hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
     ):
         raise _OperationDeadlineUnavailable(
             "BaoStock wall-clock deadlines require POSIX interval timers"
@@ -143,7 +148,7 @@ def _read_result(
     before_page_request: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
-        raise BaoStockError(result.error_msg or f"BaoStock error {result.error_code}")
+        raise BaoStockTransportError(result.error_msg or f"BaoStock error {result.error_code}")
     rows: list[list[str]] = []
     while True:
         if (
@@ -159,7 +164,9 @@ def _read_result(
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
-        raise BaoStockError(result.error_msg or f"BaoStock pagination error {result.error_code}")
+        raise BaoStockTransportError(
+            result.error_msg or f"BaoStock pagination error {result.error_code}"
+        )
     return list(result.fields), rows
 
 
@@ -206,7 +213,7 @@ class BaoStockProvider:
 
     def _login(self) -> None:
         if self._session_usable:
-            raise BaoStockError("BaoStock session is already active")
+            raise BaoStockSessionStateError("BaoStock session is already active")
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             try:
@@ -218,22 +225,22 @@ class BaoStockProvider:
                 last_error = exc
                 continue
             except (TimeoutError, OSError):
-                last_error = BaoStockError("BaoStock login transport failed")
+                last_error = BaoStockTransportError("BaoStock login transport failed")
                 self._discard_session()
                 continue
             if result.error_code != "0":
-                last_error = BaoStockError(result.error_msg or "BaoStock login failed")
+                last_error = BaoStockTransportError(result.error_msg or "BaoStock login failed")
                 self._discard_session()
                 continue
             try:
                 self._configure_socket_timeout()
             except (TimeoutError, OSError):
-                last_error = BaoStockError("BaoStock socket timeout configuration failed")
+                last_error = BaoStockTransportError("BaoStock socket timeout configuration failed")
                 self._discard_session()
                 continue
             self._session_usable = True
             return
-        raise last_error or BaoStockError("BaoStock login failed")
+        raise last_error or BaoStockTransportError("BaoStock login failed")
 
     def _call_login(self):
         """Bound the socket from connect through the initial login response."""
@@ -461,7 +468,7 @@ class BaoStockProvider:
                 last_error = (
                     exc
                     if isinstance(exc, BaoStockError)
-                    else BaoStockError("BaoStock transport failed")
+                    else BaoStockTransportError("BaoStock transport failed")
                 )
                 self._discard_session()
         raise last_error or BaoStockError("BaoStock request failed")

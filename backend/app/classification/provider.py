@@ -5,6 +5,8 @@ from importlib.metadata import version
 from time import monotonic
 from typing import Any
 
+from pydantic import ValidationError
+
 from backend.app.classification.failures import (
     ClassificationFailure,
     ClassificationProviderError,
@@ -18,8 +20,9 @@ from backend.app.classification.models import (
     SecurityMasterRecord,
 )
 from backend.app.market.baostock import (
-    BaoStockError,
     BaoStockProvider,
+    BaoStockSessionStateError,
+    BaoStockTransportError,
     _OperationDeadlineExceeded,
     _OperationDeadlineUnavailable,
 )
@@ -35,7 +38,12 @@ class _ClassificationDataQualityError(ValueError):
 
 
 def _date(value: str) -> date | None:
-    return date.fromisoformat(value) if value else None
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise _ClassificationSchemaError("classification date is invalid") from None
 
 
 def _hash(payload: dict[str, object]) -> str:
@@ -61,8 +69,8 @@ def _required_rows(
         raise _ClassificationDataQualityError(f"{label} returned no rows")
     try:
         return _row_dicts(fields, rows)
-    except ValueError as exc:
-        raise _ClassificationSchemaError(f"{label} row shape is invalid") from exc
+    except ValueError:
+        raise _ClassificationSchemaError(f"{label} row shape is invalid") from None
 
 
 def _looks_like_target_a_share(symbol: str) -> bool:
@@ -102,6 +110,7 @@ class BaoStockClassificationProvider:
         self._monotonic = monotonic_fn
         self.source_version = version("baostock")
         self.last_request_count = 0
+        self._metadata_operation_count = 0
         self.session = BaoStockProvider(
             client=client,
             min_request_interval_seconds=min_request_interval_seconds,
@@ -114,16 +123,13 @@ class BaoStockClassificationProvider:
         stage: str,
         failure_class: str,
         started_at: float,
-        initial_request_count: int,
     ) -> ClassificationProviderError:
         return ClassificationProviderError(
             ClassificationFailure(
                 failure_stage=stage,
                 failure_class=failure_class,
                 elapsed_seconds=round(max(0.0, self._monotonic() - started_at), 3),
-                provider_request_count=(
-                    self.session._provider_request_count - initial_request_count
-                ),
+                provider_request_count=self._metadata_operation_count,
                 configured_timeout_seconds=self.session.socket_timeout_seconds,
                 configured_max_attempts=self.session.max_attempts,
             )
@@ -135,9 +141,20 @@ class BaoStockClassificationProvider:
             return "deadline"
         if isinstance(exc, _OperationDeadlineUnavailable):
             return "internal"
-        return (
-            "transport" if isinstance(exc, (BaoStockError, TimeoutError, OSError)) else "internal"
-        )
+        if isinstance(exc, BaoStockSessionStateError):
+            return "internal"
+        if isinstance(exc, (BaoStockTransportError, TimeoutError, OSError)):
+            return "transport"
+        return "internal"
+
+    @staticmethod
+    def _schema_operation(operation):
+        try:
+            return operation()
+        except (_ClassificationSchemaError, _ClassificationDataQualityError):
+            raise
+        except (KeyError, TypeError, ValidationError):
+            raise _ClassificationSchemaError("classification metadata is invalid") from None
 
     def _network_stage(
         self,
@@ -145,7 +162,6 @@ class BaoStockClassificationProvider:
         operation,
         *,
         started_at: float,
-        initial_request_count: int,
     ):
         try:
             return operation()
@@ -154,8 +170,7 @@ class BaoStockClassificationProvider:
                 stage=stage,
                 failure_class=self._transport_failure_class(exc),
                 started_at=started_at,
-                initial_request_count=initial_request_count,
-            ) from exc
+            ) from None
 
     def _validation_stage(
         self,
@@ -163,14 +178,13 @@ class BaoStockClassificationProvider:
         operation,
         *,
         started_at: float,
-        initial_request_count: int,
     ):
         try:
             return operation()
         except Exception as exc:
             if isinstance(exc, _ClassificationDataQualityError):
                 failure_class = "data_quality"
-            elif isinstance(exc, (_ClassificationSchemaError, KeyError, TypeError, ValueError)):
+            elif isinstance(exc, _ClassificationSchemaError):
                 failure_class = "schema"
             else:
                 failure_class = "internal"
@@ -178,8 +192,7 @@ class BaoStockClassificationProvider:
                 stage=stage,
                 failure_class=failure_class,
                 started_at=started_at,
-                initial_request_count=initial_request_count,
-            ) from exc
+            ) from None
 
     @staticmethod
     def _usable_basics(
@@ -196,8 +209,8 @@ class BaoStockClassificationProvider:
         return basics
 
     def fetch(self, as_of: date) -> ClassificationSnapshot:
-        initial_request_count = self.session._provider_request_count
         started_at = self._monotonic()
+        self._metadata_operation_count = 0
         owns_session = False
 
         def network(stage: str, operation):
@@ -205,7 +218,6 @@ class BaoStockClassificationProvider:
                 stage,
                 operation,
                 started_at=started_at,
-                initial_request_count=initial_request_count,
             )
 
         def validate(stage: str, operation):
@@ -213,11 +225,17 @@ class BaoStockClassificationProvider:
                 stage,
                 operation,
                 started_at=started_at,
-                initial_request_count=initial_request_count,
             )
 
         def read(stage: str, operation):
-            return network(stage, lambda: self.session._read(operation))
+            def counted_operation():
+                self._metadata_operation_count += 1
+                return operation()
+
+            return network(stage, lambda: self.session._read(counted_operation))
+
+        def schema(stage: str, operation):
+            return validate(stage, lambda: self._schema_operation(operation))
 
         def required(stage: str, payload, *, label: str, fields: set[str]):
             result_fields, rows = payload
@@ -250,11 +268,11 @@ class BaoStockClassificationProvider:
                 label="query_stock_basic",
                 fields={"code", "code_name", "ipoDate", "outDate", "type", "status"},
             )
-            basics = validate(
+            basics = schema(
                 "validation",
                 lambda: self._usable_basics(all_records, basic_records),
             )
-            securities = validate(
+            securities = schema(
                 "validation",
                 lambda: [
                     self._security_record(row, basics.get(row["code"]), as_of, observed_at)
@@ -277,7 +295,7 @@ class BaoStockClassificationProvider:
                     "industryClassification",
                 },
             )
-            validate(
+            schema(
                 "industry",
                 lambda: _single_snapshot_date(
                     industry_records,
@@ -285,7 +303,7 @@ class BaoStockClassificationProvider:
                     requested_as_of=as_of,
                 ),
             )
-            memberships = validate(
+            memberships = schema(
                 "industry",
                 lambda: [
                     self._sector_record(row, observed_at)
@@ -306,7 +324,7 @@ class BaoStockClassificationProvider:
                     label=f"{index_id} component",
                     fields={"updateDate", "code", "code_name"},
                 )
-                validate(
+                schema(
                     index_id,
                     lambda records=records, index_id=index_id: _single_snapshot_date(
                         records,
@@ -328,8 +346,8 @@ class BaoStockClassificationProvider:
                         result.append(self._index_record(index_id, row, observed_at))
                     return result
 
-                components.extend(validate(index_id, validated_components))
-            return validate(
+                components.extend(schema(index_id, validated_components))
+            return schema(
                 "validation",
                 lambda: ClassificationSnapshot(
                     source="baostock",
@@ -345,7 +363,7 @@ class BaoStockClassificationProvider:
         finally:
             if owns_session:
                 self.session._logout()
-            self.last_request_count = self.session._provider_request_count - initial_request_count
+            self.last_request_count = self._metadata_operation_count
 
     def _security_record(
         self,

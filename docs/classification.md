@@ -162,6 +162,10 @@ discard socket 后 session 已不可用，finally 不再伪造 upstream logout�
   `configured_timeout_seconds`, `configured_max_attempts`。
 
 该 contract 不包含 upstream error message、payload、凭据、本地路径或 exception text。
+structured error 会在 provider/sync 脱敏边界抑制原始 exception cause，因此标准 traceback
+也不会带出这些原始内容。`provider_request_count` 只统计实际调用 metadata client query
+operation 的次数：每次真正执行的 retry 会计数，login、request pacing，以及在重登录失败后
+根本没有调用 client query 的 attempt 均不计数。
 失败 stage 是实际停止的边界，不暗示后续 stage 已执行。provider 成功返回前
 不初始化 classification DB，也不创建 market/staging/lock/temp/control 目录。
 这些字段只改善可观测性，没有改变 timeout、retry、quality gate 或 publication

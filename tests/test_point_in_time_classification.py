@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import threading
+import traceback
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -38,6 +39,7 @@ from backend.app.classification.sync import run_classification_sync
 from backend.app.cli import build_parser
 from backend.app.config import Settings
 from backend.app.main import app
+from backend.app.market.baostock import BaoStockError
 
 OBSERVED = datetime(2026, 7, 28, 12, tzinfo=UTC)
 SNAPSHOT_DATE = date(2026, 7, 28)
@@ -1653,6 +1655,7 @@ class BlockingClassificationClient(FakeClassificationClient):
     ("raised", "expected_class", "expected_requests", "expected_logout"),
     [
         (OSError("hostile transport /Users/private"), "transport", 2, False),
+        (BaoStockError("hostile generic /Users/private"), "internal", 2, False),
         (RuntimeError("hostile internal /Users/private"), "internal", 1, True),
     ],
 )
@@ -1681,7 +1684,127 @@ def test_provider_sanitizes_transport_and_internal_stage_failures(
     assert error.value.failure.provider_request_count == expected_requests
     assert provider.session._session_usable is False
     assert client.logged_out is expected_logout
-    assert "/Users/private" not in str(error.value)
+    assert error.value.__cause__ is None
+    formatted = "".join(traceback.format_exception(error.value))
+    assert "/Users/private" not in formatted
+    assert "hostile transport" not in formatted
+    assert "hostile generic" not in formatted
+    assert "hostile internal" not in formatted
+
+
+def test_provider_counts_only_metadata_operations_when_relogin_fails() -> None:
+    hostile = "token=do-not-leak /Users/private/relogin.sock"
+
+    class QueryThenReloginFailsClient(FakeClassificationClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.login_calls = 0
+            self.query_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            if self.login_calls == 1:
+                return super().login()
+            raise OSError(hostile)
+
+        def query_all_stock(self, **_kwargs):
+            self.query_calls += 1
+            raise OSError(hostile)
+
+    client = QueryThenReloginFailsClient()
+    provider = BaoStockClassificationProvider(
+        client=client,
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.failure.failure_stage == "security_universe"
+    assert error.value.failure.failure_class == "transport"
+    assert error.value.failure.provider_request_count == 1
+    assert provider.last_request_count == 1
+    assert client.query_calls == 1
+    assert client.login_calls == 3
+    assert error.value.__cause__ is None
+    assert hostile not in "".join(traceback.format_exception(error.value))
+
+
+def test_provider_maps_active_session_conflict_to_internal() -> None:
+    provider = BaoStockClassificationProvider(
+        client=FakeClassificationClient(),
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+    provider.session._session_usable = True
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
+    assert error.value.failure.failure_stage == "login"
+    assert error.value.failure.failure_class == "internal"
+    assert error.value.failure.provider_request_count == 0
+    assert "session is already active" not in "".join(traceback.format_exception(error.value))
+
+
+def test_provider_maps_arbitrary_clock_value_error_to_validation_internal() -> None:
+    hostile = "token=do-not-leak /Users/private/clock"
+
+    def invalid_clock():
+        raise ValueError(hostile)
+
+    provider = BaoStockClassificationProvider(
+        client=FakeClassificationClient(),
+        clock=invalid_clock,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.__cause__ is None
+    assert error.value.failure.failure_stage == "validation"
+    assert error.value.failure.failure_class == "internal"
+    assert error.value.failure.provider_request_count == 0
+    assert hostile not in "".join(traceback.format_exception(error.value))
+
+
+def test_provider_converts_invalid_source_date_to_typed_schema_failure() -> None:
+    hostile = "token=do-not-leak /Users/private/industry-date"
+    provider = BaoStockClassificationProvider(
+        client=FakeClassificationClient(industry_date=hostile),
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.__cause__ is None
+    assert error.value.failure.failure_stage == "industry"
+    assert error.value.failure.failure_class == "schema"
+    assert error.value.failure.provider_request_count == 3
+    assert hostile not in "".join(traceback.format_exception(error.value))
+
+
+def test_provider_converts_pydantic_record_error_to_typed_schema_failure() -> None:
+    provider = BaoStockClassificationProvider(
+        client=FakeClassificationClient(),
+        clock=lambda: "not-a-datetime",
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.__cause__ is None
+    assert error.value.failure.failure_stage == "validation"
+    assert error.value.failure.failure_class == "schema"
+    assert error.value.failure.provider_request_count == 2
+    assert "not-a-datetime" not in "".join(traceback.format_exception(error.value))
 
 
 @pytest.mark.parametrize(
@@ -1715,7 +1838,7 @@ def test_provider_deadline_failure_reports_exact_sanitized_stage(
 
     failure = getattr(error.value, "failure", None)
     assert failure is not None
-    assert error.value.__cause__ is not None
+    assert error.value.__cause__ is None
     assert failure.failure_stage == stage
     assert failure.failure_class == "deadline"
     assert failure.provider_request_count == expected_requests
@@ -1726,7 +1849,7 @@ def test_provider_deadline_failure_reports_exact_sanitized_stage(
     assert provider.session._session_usable is False
     assert client.login_calls == 2
     assert client.logged_out is False
-    assert "/Users/finlay/private" not in str(error.value)
+    assert "/Users/finlay/private" not in "".join(traceback.format_exception(error.value))
 
 
 class IncompleteClassificationClient(FakeClassificationClient):
@@ -1866,12 +1989,13 @@ def test_provider_rejects_empty_or_incomplete_required_metadata(
 
     assert error.value.failure.failure_stage == expected_stage
     assert error.value.failure.failure_class == expected_class
-    assert error.value.__cause__ is not None
+    assert error.value.__cause__ is None
     assert error.value.failure.provider_request_count == expected_requests
     assert error.value.failure.elapsed_seconds == 0.75
     assert provider.last_request_count == expected_requests
     assert provider.session._session_usable is False
     assert provider.session.client.logged_out is True
+    assert "query_" not in "".join(traceback.format_exception(error.value))
 
 
 @pytest.mark.parametrize(
@@ -2547,7 +2671,10 @@ def test_classification_sync_sanitizes_publication_failures(
     assert failure.elapsed_seconds >= 0
     assert failure.configured_timeout_seconds == 17
     assert failure.configured_max_attempts == 2
-    assert "/Users/private" not in str(error.value)
+    assert error.value.__cause__ is None
+    formatted = "".join(traceback.format_exception(error.value))
+    assert "/Users/private" not in formatted
+    assert "hostile" not in formatted
 
 
 def test_classification_sync_sanitizes_unstructured_provider_failure() -> None:
@@ -2571,7 +2698,46 @@ def test_classification_sync_sanitizes_unstructured_provider_failure() -> None:
     assert failure.failure_class == "internal"
     assert failure.provider_request_count == 6
     assert failure.configured_timeout_seconds == 17
-    assert "/Users/private" not in str(error.value)
+    assert error.value.__cause__ is None
+    formatted = "".join(traceback.format_exception(error.value))
+    assert "/Users/private" not in formatted
+    assert "token=do-not-leak" not in formatted
+
+
+def test_classification_sync_strips_raw_cause_from_structured_provider_failure() -> None:
+    hostile = "token=do-not-leak /Users/private/structured-provider.db"
+    provider = ObservableClassificationProvider(snapshot(securities=[security("sh.600000")]))
+
+    def hostile_fetch(_as_of: date) -> ClassificationSnapshot:
+        try:
+            raise ValueError(hostile)
+        except ValueError as raw_error:
+            raise ClassificationProviderError(
+                ClassificationFailure(
+                    failure_stage="security_basic",
+                    failure_class="schema",
+                    elapsed_seconds=1.25,
+                    provider_request_count=2,
+                    configured_timeout_seconds=17,
+                    configured_max_attempts=2,
+                )
+            ) from raw_error
+
+    provider.fetch = hostile_fetch
+
+    with pytest.raises(ClassificationSyncError) as error:
+        run_classification_sync(
+            as_of=SNAPSHOT_DATE,
+            execute=True,
+            store=object(),
+            provider=provider,
+        )
+
+    assert error.value.__cause__ is None
+    assert error.value.failure.failure_stage == "security_basic"
+    assert error.value.failure.failure_class == "schema"
+    assert error.value.failure.provider_request_count == 2
+    assert hostile not in "".join(traceback.format_exception(error.value))
 
 
 def test_classification_cli_deadline_failure_is_json_and_creates_no_database(

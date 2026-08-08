@@ -77,38 +77,38 @@ def run_classification_sync(
         )
     try:
         snapshot = provider.fetch(as_of)
-    except ClassificationFailureError:
-        raise
-    except Exception as exc:
+    except ClassificationFailureError as failure:
+        raise ClassificationSyncError(failure.failure) from None
+    except Exception:
         raise _sync_error(
             stage="validation",
             failure_class="internal",
             started_at=started_at,
             provider=provider,
-        ) from exc
+        ) from None
     try:
         outcome = store.publish(snapshot)
-    except ClassificationConflictError as exc:
+    except ClassificationConflictError:
         raise _sync_error(
             stage="publication",
             failure_class="conflict",
             started_at=started_at,
             provider=provider,
-        ) from exc
-    except (duckdb.Error, OSError) as exc:
+        ) from None
+    except (duckdb.Error, OSError):
         raise _sync_error(
             stage="publication",
             failure_class="storage",
             started_at=started_at,
             provider=provider,
-        ) from exc
-    except Exception as exc:
+        ) from None
+    except Exception:
         raise _sync_error(
             stage="publication",
             failure_class="internal",
             started_at=started_at,
             provider=provider,
-        ) from exc
+        ) from None
     generation = outcome.generation
     issues = sorted(
         {issue for audit in generation.coverage_audits for issue in audit.quality_issues}
