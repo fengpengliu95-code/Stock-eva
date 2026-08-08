@@ -88,7 +88,8 @@ uv run python -m backend.app.cli backup-private-data \
 
 只有 manifest identity、两个已存在数据库的 SHA-256 和 `integrity_check=ok` 都通过时，
 bundle 才可用于恢复。如果专库从未创建，manifest 会记录 `not_initialized` 且 bundle
-为 `partial`。备份根目录及 bundle 目录权限为 `0700`，manifest 与 SQLite 快照为
+为 `partial`；共享 user 数据库始终必备，只有 portfolio 可以是 `not_initialized`。
+备份根目录及 bundle 目录权限为 `0700`，manifest 与 SQLite 快照为
 `0600`；校验器拒绝弱权限和符号链接证据。恢复时停止全部 5 个 LaunchAgent 和所有
 写入，先备份当前状态，再把同一 bundle 中的两库作为一个集合恢复；恢复后先调用
 只读接口检查。旧单库备份只能表示

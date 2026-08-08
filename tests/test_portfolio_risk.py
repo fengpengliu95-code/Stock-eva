@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -480,6 +481,124 @@ def test_checkpointed_ledger_get_preserves_complete_source_tree(
     selected = ledger.read_selected(AS_OF)
 
     assert selected == created.snapshot
+    assert _filesystem_state(tmp_path) == before
+
+
+def test_ledger_get_rejects_loose_permissions_without_touching_tree(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    ledger.create(_create())
+    database.chmod(0o644)
+    before = _filesystem_state(tmp_path)
+    before_mode = stat.S_IMODE(database.stat().st_mode)
+
+    with pytest.raises(PortfolioLedgerUnavailable, match="permissions"):
+        ledger.read_selected(AS_OF)
+
+    assert stat.S_IMODE(database.stat().st_mode) == before_mode == 0o644
+    assert _filesystem_state(tmp_path) == before
+
+
+def test_ledger_writer_tightens_existing_loose_permissions(tmp_path: Path) -> None:
+    database = tmp_path / "portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    ledger.create(_create())
+    database.chmod(0o644)
+
+    revised = ledger.revise(_update(expected_revision=1))
+
+    assert revised.snapshot.revision == 2
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert ledger.read_selected(AS_OF) == revised.snapshot
+
+
+def test_ledger_writer_fails_closed_when_nofollow_chmod_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    ledger.create(_create())
+    before = _filesystem_state(tmp_path)
+    real_chmod = os.chmod
+
+    def unsupported_chmod(
+        path: str | bytes | int | Path,
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(path) == database and follow_symlinks is False:
+            raise NotImplementedError("nofollow chmod unavailable")
+        real_chmod(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "chmod", unsupported_chmod)
+
+    with pytest.raises(PortfolioLedgerUnavailable, match="permissions are unavailable"):
+        ledger.revise(_update(expected_revision=1))
+
+    assert _filesystem_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_ledger_rejects_unsafe_existing_target_without_mutation(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    target = tmp_path / "portfolio.sqlite3"
+    if kind == "symlink":
+        actual = tmp_path / "actual.sqlite3"
+        PortfolioLedger(actual, clock=lambda: RECORDED_AT).create(_create())
+        target.symlink_to(actual)
+    else:
+        target.mkdir()
+    before = _filesystem_state(tmp_path)
+    ledger = PortfolioLedger(target, clock=lambda: RECORDED_AT)
+
+    with pytest.raises(PortfolioLedgerUnavailable, match="regular non-symlink"):
+        ledger.read_selected(AS_OF)
+    with pytest.raises(PortfolioLedgerUnavailable, match="regular non-symlink"):
+        ledger.create(_create())
+
+    assert _filesystem_state(tmp_path) == before
+
+
+def test_existing_0600_portfolio_database_remains_compatible(tmp_path: Path) -> None:
+    database = tmp_path / "portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    created = ledger.create(_create())
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+    assert ledger.read_selected(AS_OF) == created.snapshot
+    assert ledger.revise(_update(expected_revision=1)).snapshot.revision == 2
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("kind", ["symlink", "loose_permissions"])
+def test_ledger_get_rejects_unsafe_rollback_journal_without_mutation(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    database = tmp_path / "portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    ledger.create(_create())
+    journal = database.with_name(f"{database.name}-journal")
+    if kind == "symlink":
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"")
+        decoy.chmod(0o600)
+        journal.symlink_to(decoy)
+    else:
+        journal.write_bytes(b"")
+        journal.chmod(0o644)
+    before = _filesystem_state(tmp_path)
+
+    with pytest.raises(PortfolioLedgerUnavailable, match="journal"):
+        ledger.read_selected(AS_OF)
+
     assert _filesystem_state(tmp_path) == before
 
 
@@ -1253,6 +1372,30 @@ def test_snapshot_get_api_preserves_checkpointed_database_tree(tmp_path: Path) -
 
     assert response.status_code == 200
     assert response.json()["snapshot_id"] == created.snapshot.snapshot_id
+    assert _filesystem_state(tmp_path) == before
+
+
+def test_snapshot_get_api_maps_unsafe_existing_target_to_read_only_503(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "stock_eva_portfolio.sqlite3"
+    ledger = PortfolioLedger(database, clock=lambda: RECORDED_AT)
+    ledger.create(_create())
+    database.chmod(0o644)
+    before = _filesystem_state(tmp_path)
+    app.dependency_overrides[portfolio_api.get_portfolio_ledger] = lambda: ledger
+    app.dependency_overrides[portfolio_api.get_portfolio_today] = lambda: AS_OF
+    try:
+        response = asyncio.run(_request("GET", f"/api/v1/portfolio/daily-snapshots?as_of={AS_OF}"))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "portfolio_ledger_unavailable",
+        "storage_status": "unavailable",
+    }
+    assert stat.S_IMODE(database.stat().st_mode) == 0o644
     assert _filesystem_state(tmp_path) == before
 
 

@@ -154,7 +154,6 @@ class PrivateBackupSetService:
         sources: dict[str, Path],
         backup_root: Path,
         *,
-        required_roles: frozenset[str] = frozenset({"user"}),
         keep_daily: int = 7,
         keep_weekly: int = 4,
     ) -> None:
@@ -162,8 +161,6 @@ class PrivateBackupSetService:
             raise ValueError("backup retention counts must be positive")
         if set(sources) != self.EXPECTED_ROLES:
             raise ValueError("backup set requires user and portfolio roles")
-        if not required_roles <= set(sources):
-            raise ValueError("required backup roles must have configured sources")
         if any(not role for role in sources):
             raise ValueError("backup roles must be unique and non-empty")
         resolved_root = backup_root.expanduser().resolve()
@@ -175,7 +172,6 @@ class PrivateBackupSetService:
         if any(self._is_network_path(source) for source in resolved_sources.values()):
             raise PrivateBackupError("private database must remain on a local filesystem")
         self.sources = resolved_sources
-        self.required_roles = required_roles
         self.backup_root = resolved_root
         self.keep_daily = keep_daily
         self.keep_weekly = keep_weekly
@@ -185,17 +181,14 @@ class PrivateBackupSetService:
         return any(path.is_relative_to(root) for root in cls.NETWORK_ROOTS)
 
     def run(self, now: datetime) -> PrivateBackupSetOutcome:
-        invalid_optional = [
+        invalid_sources = [
             role
             for role, source in sorted(self.sources.items())
             if source.exists() and not source.is_file()
         ]
-        if invalid_optional:
+        if invalid_sources:
             raise PrivateBackupError("configured private SQLite source is not a regular file")
-        missing_required = [
-            role for role in sorted(self.required_roles) if not self.sources[role].is_file()
-        ]
-        if missing_required:
+        if not self.sources["user"].is_file():
             raise PrivateBackupError("required private SQLite source is unavailable")
         self.backup_root.mkdir(parents=True, exist_ok=True)
         os.chmod(self.backup_root, 0o700)
@@ -381,6 +374,9 @@ class PrivateBackupSetService:
                 raise PrivateBackupError("backup bundle roles are invalid")
             if len(roles) != len(set(roles)):
                 raise PrivateBackupError("backup bundle roles are duplicated")
+            entries_by_role = {entry["role"]: entry for entry in entries}
+            if entries_by_role["user"].get("status") != "backed_up":
+                raise PrivateBackupError("backup required user database is unavailable")
             expected_files = {"manifest.json"}
             snapshot_files: set[str] = set()
             for entry in entries:

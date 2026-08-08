@@ -124,7 +124,9 @@ keeps `personalization_allowed=false`. A missing/future regime makes the band un
   classification, or published-market storage maps to a stable structured `503`.
 - The dedicated ledger uses SQLite rollback-journal (`DELETE`) mode and permission `0600`.
   GET opens `mode=ro`/`query_only`; risk snapshot plus history are read in one transaction.
-  Missing storage creates nothing, and a wrong WAL-mode/hot or corrupt file fails closed.
+  Missing storage creates nothing. GET fails closed without chmod or recovery when the target
+  is a symlink, non-regular file, not `0600`, wrong WAL-mode, hot or corrupt; a writer only
+  tightens an already validated regular non-symlink target to `0600` before use.
 
 ## Private backup lifecycle
 
@@ -133,10 +135,12 @@ portfolio ledger as one local atomic bundle. The bundle manifest binds both role
 time, per-database SHA-256 and `PRAGMA integrity_check`; daily and weekly bundles publish only
 after the whole candidate verifies. Failure in either existing database leaves prior complete
 bundles unchanged. A never-created portfolio ledger is recorded as `not_initialized` and the
-bundle is `partial`, not described as complete. Retention remains seven daily and four weekly
-bundles, and network-volume targets remain forbidden. Backup roots/bundle directories are
-`0700`; manifests and SQLite snapshots are `0600` and the verifier rejects weaker modes or
-symlinked evidence.
+bundle is `partial`, not described as complete. The shared user database is unconditionally
+required and the verifier rejects any bundle without a regular, hashed, integrity-checked
+`0600` `user.sqlite3`; only the portfolio role may be `not_initialized`. Retention remains
+seven daily and four weekly bundles, and network-volume targets remain forbidden. Backup
+roots/bundle directories are `0700`; manifests and SQLite snapshots are `0600` and the
+verifier rejects weaker modes or symlinked evidence.
 
 This branch does not silently migrate any experimental portfolio table from the shared user
 database. Such a database contains private user data and requires an explicit offline,
@@ -155,8 +159,8 @@ Focused GREEN after implementation and the publication/PIT integration case:
 
 ```text
 UV_OFFLINE=1 uv run --extra dev pytest -q tests/test_portfolio_risk.py
-.........................................                                [100%]
-41 passed
+..................................................                       [100%]
+50 passed
 ```
 
 The focused suite uses only `tmp_path` synthetic data and verifies:
@@ -164,7 +168,7 @@ The focused suite uses only `tmp_path` synthetic data and verifies:
 - idempotency, revisions, optimistic conflicts, concurrent writers, retained history and
   point-in-time selection by `recorded_at` cutoff;
 - physical GET no-write checks, separate DELETE-mode storage and a barrier-controlled
-  concurrent writer/read-view test;
+  concurrent writer/read-view test, including unsafe target/permission/sidecar rejection;
 - finite/negative/duplicate input rejection and absence of broker/order tables;
 - cash/cost/sector/ATR/price quality degradation;
 - concentration, ATR budget, drawdown and guardrail pass/breach behavior;

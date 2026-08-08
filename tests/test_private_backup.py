@@ -289,6 +289,19 @@ def test_backup_set_rejects_roles_resolving_to_the_same_database(tmp_path: Path)
         )
 
 
+def test_backup_set_cannot_make_user_role_optional(tmp_path: Path) -> None:
+    user = tmp_path / "user" / "stock_eva_user.sqlite3"
+    portfolio = tmp_path / "user" / "stock_eva_portfolio.sqlite3"
+    create_source(user)
+
+    with pytest.raises(TypeError, match="required_roles"):
+        PrivateBackupSetService(
+            {"user": user, "portfolio": portfolio},
+            tmp_path / "backups",
+            required_roles=frozenset(),
+        )
+
+
 def test_backup_set_rejects_non_regular_optional_source(tmp_path: Path) -> None:
     user = tmp_path / "user" / "stock_eva_user.sqlite3"
     portfolio = tmp_path / "user" / "stock_eva_portfolio.sqlite3"
@@ -358,6 +371,36 @@ def test_backup_bundle_verifier_rejects_symlinked_bundle_root(tmp_path: Path) ->
 
     with pytest.raises(PrivateBackupError, match="permissions"):
         PrivateBackupSetService.verify_bundle(alias)
+
+
+def test_backup_bundle_verifier_rejects_missing_required_user_snapshot(
+    tmp_path: Path,
+) -> None:
+    user = tmp_path / "user" / "stock_eva_user.sqlite3"
+    portfolio = tmp_path / "user" / "stock_eva_portfolio.sqlite3"
+    create_source(user)
+    create_source(portfolio)
+    outcome = PrivateBackupSetService(
+        {"user": user, "portfolio": portfolio},
+        tmp_path / "backups",
+    ).run(datetime(2026, 7, 29, 20, tzinfo=UTC))
+    manifest_path = outcome.daily_bundle / "manifest.json"
+    document = json.loads(manifest_path.read_text())
+    user_entry = next(entry for entry in document["databases"] if entry["role"] == "user")
+    user_entry.update(
+        status="not_initialized",
+        snapshot_file=None,
+        sha256=None,
+        integrity_check=None,
+    )
+    (outcome.daily_bundle / "user.sqlite3").unlink()
+    document["completeness_status"] = "partial"
+    core = {key: value for key, value in document.items() if key != "bundle_id"}
+    document["bundle_id"] = PrivateBackupSetService._bundle_id(core)
+    manifest_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(PrivateBackupError, match="required user"):
+        PrivateBackupSetService.verify_bundle(outcome.daily_bundle)
 
 
 def test_second_database_failure_preserves_prior_complete_bundles(

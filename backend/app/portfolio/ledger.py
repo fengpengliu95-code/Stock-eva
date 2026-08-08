@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
@@ -127,10 +128,31 @@ class PortfolioLedger:
     def _connect_writer(self) -> sqlite3.Connection:
         with user_database_initialization(self.path):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            existed = self.path.exists()
+            metadata = self._safe_target_metadata()
+            if metadata is None:
+                flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(self.path, flags, 0o600)
+                except FileExistsError:
+                    metadata = self._safe_target_metadata()
+                except OSError as exc:
+                    raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+                else:
+                    os.close(descriptor)
+                    metadata = self._safe_target_metadata()
+            if metadata is None:
+                raise PortfolioLedgerUnavailable("portfolio ledger is unavailable")
+            try:
+                os.chmod(self.path, 0o600, follow_symlinks=False)
+            except (OSError, NotImplementedError) as exc:
+                raise PortfolioLedgerUnavailable(
+                    "portfolio ledger permissions are unavailable"
+                ) from exc
+            metadata = self._safe_target_metadata()
+            if metadata is None or stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise PortfolioLedgerUnavailable("portfolio ledger permissions must be 0600")
             connection = sqlite3.connect(self.path, timeout=5)
-            if not existed:
-                os.chmod(self.path, 0o600)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             journal_mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
@@ -159,16 +181,31 @@ class PortfolioLedger:
         return connection
 
     def _connect_reader(self) -> sqlite3.Connection | None:
-        if not self.path.is_file():
+        metadata = self._safe_target_metadata()
+        if metadata is None:
             return None
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PortfolioLedgerUnavailable("portfolio ledger permissions must be 0600")
         rollback_journal = self.path.with_name(f"{self.path.name}-journal")
         try:
-            if rollback_journal.is_file() and rollback_journal.stat().st_size > 0:
+            journal_metadata = rollback_journal.lstat()
+        except FileNotFoundError:
+            journal_metadata = None
+        except OSError as exc:
+            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+        if journal_metadata is not None:
+            if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISREG(journal_metadata.st_mode):
+                raise PortfolioLedgerUnavailable(
+                    "portfolio ledger journal must be a regular non-symlink file"
+                )
+            if stat.S_IMODE(journal_metadata.st_mode) != 0o600:
+                raise PortfolioLedgerUnavailable(
+                    "portfolio ledger journal permissions must be 0600"
+                )
+            if journal_metadata.st_size > 0:
                 raise PortfolioLedgerUnavailable(
                     "portfolio ledger has an active or hot rollback journal"
                 )
-        except OSError as exc:
-            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
         try:
             with self.path.open("rb") as database:
                 database.seek(18)
@@ -191,6 +228,17 @@ class PortfolioLedger:
             return connection
         except sqlite3.Error as exc:
             raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+
+    def _safe_target_metadata(self) -> os.stat_result | None:
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PortfolioLedgerUnavailable("portfolio ledger is unavailable") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise PortfolioLedgerUnavailable("portfolio ledger must be a regular non-symlink file")
+        return metadata
 
     @staticmethod
     def _table_exists(connection: sqlite3.Connection) -> bool:
