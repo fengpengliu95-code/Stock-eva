@@ -144,9 +144,28 @@ client 前直接 fail closed。既有 signal handler/timer 会在 operation 后�
 login 与 request 各自最多执行 `max_attempts` 次；session 失效后的 request retry 也只会
 触发有限次 bounded login。总上界可由这些有限 attempt、每 operation deadline 及配置的
 request pace 相加推导，不存在后台清理 grace。Classification provider 的初始 login 与
-后续 metadata query 位于同一错误转换/cleanup 边界；CLI provider failure 只输出聚合
-error JSON、`writes_classification_data=false`，且在 provider 成功返回前不初始化
-classification DB。
+后续 metadata query 位于同一错误转换/cleanup 边界。deadline/transport 已关闭并
+discard socket 后 session 已不可用，finally 不再伪造 upstream logout；如果 login 已成功
+且失败发生在 schema/data-quality validation，finally 会执行真实 logout。
+
+### Sanitized failure contract
+
+`classification-sync` 失败仍 exit `1`，保留
+`quality_issues=["classification_sync_failed"]` 和
+`writes_classification_data=false`，并输出严格的诊断字段：
+
+- `failure_stage`: `login`, `security_universe`, `security_basic`, `industry`,
+  `hs300`, `sz50`, `csi500`, `validation`, `publication`；
+- `failure_class`: `deadline`, `transport`, `schema`, `data_quality`,
+  `conflict`, `storage`, `internal`；
+- `elapsed_seconds`, `provider_request_count`,
+  `configured_timeout_seconds`, `configured_max_attempts`。
+
+该 contract 不包含 upstream error message、payload、凭据、本地路径或 exception text。
+失败 stage 是实际停止的边界，不暗示后续 stage 已执行。provider 成功返回前
+不初始化 classification DB，也不创建 market/staging/lock/temp/control 目录。
+这些字段只改善可观测性，没有改变 timeout、retry、quality gate 或 publication
+语义。
 
 本次 R1-A recovery 只验证 synthetic contract。真实 BaoStock publication、live
 coverage、20-session history 和 browser acceptance 的状态见

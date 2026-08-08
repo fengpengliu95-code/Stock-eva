@@ -12,6 +12,10 @@ import pytest
 
 from backend.app import cli
 from backend.app.api.classification import get_classification_store
+from backend.app.classification.failures import (
+    ClassificationFailure,
+    ClassificationSyncError,
+)
 from backend.app.classification.models import (
     INDEX_CATALOG,
     TAXONOMY_BAOSTOCK_INDUSTRY,
@@ -37,6 +41,40 @@ from backend.app.main import app
 
 OBSERVED = datetime(2026, 7, 28, 12, tzinfo=UTC)
 SNAPSHOT_DATE = date(2026, 7, 28)
+CLASSIFICATION_FAILURE_KEYS = {
+    "status",
+    "as_of",
+    "quality_issues",
+    "writes_classification_data",
+    "failure_stage",
+    "failure_class",
+    "elapsed_seconds",
+    "provider_request_count",
+    "configured_timeout_seconds",
+    "configured_max_attempts",
+}
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"failure_stage": "unknown"},
+        {"raw_detail": "must-not-enter-contract"},
+    ],
+)
+def test_classification_failure_contract_rejects_unstable_fields(
+    override: dict[str, object],
+) -> None:
+    payload = {
+        "failure_stage": "validation",
+        "failure_class": "internal",
+        "elapsed_seconds": 0,
+        "provider_request_count": 0,
+        **override,
+    }
+
+    with pytest.raises(ValueError):
+        ClassificationFailure.model_validate(payload)
 
 
 def security(
@@ -1565,6 +1603,132 @@ class FakeClassificationClient:
         )
 
 
+class BlockingClassificationClient(FakeClassificationClient):
+    def __init__(self, failure_stage: str) -> None:
+        super().__init__()
+        self.failure_stage = failure_stage
+        self.login_calls = 0
+
+    def _block(self):
+        threading.Event().wait()
+
+    def login(self):
+        self.login_calls += 1
+        if self.failure_stage == "login":
+            self._block()
+        return super().login()
+
+    def query_all_stock(self, **kwargs):
+        if self.failure_stage == "security_universe":
+            self._block()
+        return super().query_all_stock(**kwargs)
+
+    def query_stock_basic(self, **kwargs):
+        if self.failure_stage == "security_basic":
+            self._block()
+        return super().query_stock_basic(**kwargs)
+
+    def query_stock_industry(self, **kwargs):
+        if self.failure_stage == "industry":
+            self._block()
+        return super().query_stock_industry(**kwargs)
+
+    def query_hs300_stocks(self, **kwargs):
+        if self.failure_stage == "hs300":
+            self._block()
+        return super().query_hs300_stocks(**kwargs)
+
+    def query_sz50_stocks(self, **kwargs):
+        if self.failure_stage == "sz50":
+            self._block()
+        return super().query_sz50_stocks(**kwargs)
+
+    def query_zz500_stocks(self, **kwargs):
+        if self.failure_stage == "csi500":
+            self._block()
+        return super().query_zz500_stocks(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_class", "expected_requests", "expected_logout"),
+    [
+        (OSError("hostile transport /Users/private"), "transport", 2, False),
+        (RuntimeError("hostile internal /Users/private"), "internal", 1, True),
+    ],
+)
+def test_provider_sanitizes_transport_and_internal_stage_failures(
+    raised: Exception,
+    expected_class: str,
+    expected_requests: int,
+    expected_logout: bool,
+) -> None:
+    class FailingClient(FakeClassificationClient):
+        def query_all_stock(self, **_kwargs):
+            raise raised
+
+    client = FailingClient()
+    provider = BaoStockClassificationProvider(
+        client=client,
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.failure.failure_stage == "security_universe"
+    assert error.value.failure.failure_class == expected_class
+    assert error.value.failure.provider_request_count == expected_requests
+    assert provider.session._session_usable is False
+    assert client.logged_out is expected_logout
+    assert "/Users/private" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_requests"),
+    [
+        ("login", 0),
+        ("security_universe", 2),
+        ("security_basic", 3),
+        ("industry", 4),
+        ("hs300", 5),
+        ("sz50", 6),
+        ("csi500", 7),
+    ],
+)
+def test_provider_deadline_failure_reports_exact_sanitized_stage(
+    stage: str,
+    expected_requests: int,
+) -> None:
+    client = BlockingClassificationClient(stage)
+    ticks = iter([10.0, 12.345])
+    provider = BaoStockClassificationProvider(
+        client=client,
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=0.02,
+        monotonic_fn=lambda: next(ticks),
+    )
+
+    with pytest.raises(ClassificationProviderError) as error:
+        provider.fetch(SNAPSHOT_DATE)
+
+    failure = getattr(error.value, "failure", None)
+    assert failure is not None
+    assert error.value.__cause__ is not None
+    assert failure.failure_stage == stage
+    assert failure.failure_class == "deadline"
+    assert failure.provider_request_count == expected_requests
+    assert failure.elapsed_seconds == 2.345
+    assert failure.configured_timeout_seconds == 0.02
+    assert failure.configured_max_attempts == 2
+    assert provider.last_request_count == expected_requests
+    assert provider.session._session_usable is False
+    assert client.login_calls == 2
+    assert client.logged_out is False
+    assert "/Users/finlay/private" not in str(error.value)
+
+
 class IncompleteClassificationClient(FakeClassificationClient):
     def __init__(self, failure: str) -> None:
         super().__init__()
@@ -1642,33 +1806,72 @@ class IncompleteClassificationClient(FakeClassificationClient):
             )
         return super().query_hs300_stocks(**kwargs)
 
+    def query_sz50_stocks(self, **kwargs):
+        if self.failure == "empty_sz50_component":
+            return self._index("query_sz50_stocks", [])
+        if self.failure == "missing_sz50_component_field":
+            self.calls.append("query_sz50_stocks")
+            return FakeResult(
+                ["updateDate", "code"],
+                [["2026-07-20", "sh.600000"]],
+            )
+        return super().query_sz50_stocks(**kwargs)
+
+    def query_zz500_stocks(self, **kwargs):
+        if self.failure == "empty_csi500_component":
+            return self._index("query_zz500_stocks", [])
+        if self.failure == "missing_csi500_component_field":
+            self.calls.append("query_zz500_stocks")
+            return FakeResult(
+                ["updateDate", "code"],
+                [["2026-07-20", "sz.300001"]],
+            )
+        return super().query_zz500_stocks(**kwargs)
+
 
 @pytest.mark.parametrize(
-    ("failure", "expected_error"),
+    ("failure", "expected_stage", "expected_class", "expected_requests"),
     [
-        ("empty_all", "query_all_stock returned no rows"),
-        ("missing_all_field", "query_all_stock missing required fields"),
-        ("empty_basic", "query_stock_basic returned no rows"),
-        ("missing_basic_field", "query_stock_basic missing required fields"),
-        ("missing_target_basic", "target A-share has no usable basic metadata"),
-        ("unusable_target_basic", "target A-share has no usable basic metadata"),
-        ("empty_industry", "query_stock_industry returned no rows"),
-        ("missing_industry_field", "query_stock_industry missing required fields"),
-        ("empty_component", "hs300 component returned no rows"),
-        ("missing_component_field", "hs300 component missing required fields"),
+        ("empty_all", "security_universe", "data_quality", 1),
+        ("missing_all_field", "security_universe", "schema", 1),
+        ("empty_basic", "security_basic", "data_quality", 2),
+        ("missing_basic_field", "security_basic", "schema", 2),
+        ("missing_target_basic", "validation", "data_quality", 2),
+        ("unusable_target_basic", "validation", "data_quality", 2),
+        ("empty_industry", "industry", "data_quality", 3),
+        ("missing_industry_field", "industry", "schema", 3),
+        ("empty_component", "hs300", "data_quality", 4),
+        ("missing_component_field", "hs300", "schema", 4),
+        ("empty_sz50_component", "sz50", "data_quality", 5),
+        ("missing_sz50_component_field", "sz50", "schema", 5),
+        ("empty_csi500_component", "csi500", "data_quality", 6),
+        ("missing_csi500_component_field", "csi500", "schema", 6),
     ],
 )
 def test_provider_rejects_empty_or_incomplete_required_metadata(
     failure: str,
-    expected_error: str,
+    expected_stage: str,
+    expected_class: str,
+    expected_requests: int,
 ) -> None:
+    ticks = iter([20.0, 20.75])
     provider = BaoStockClassificationProvider(
         client=IncompleteClassificationClient(failure),
         clock=lambda: OBSERVED,
+        monotonic_fn=lambda: next(ticks),
     )
 
-    with pytest.raises(ClassificationProviderError, match=expected_error):
+    with pytest.raises(ClassificationProviderError) as error:
         provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.failure.failure_stage == expected_stage
+    assert error.value.failure.failure_class == expected_class
+    assert error.value.__cause__ is not None
+    assert error.value.failure.provider_request_count == expected_requests
+    assert error.value.failure.elapsed_seconds == 0.75
+    assert provider.last_request_count == expected_requests
+    assert provider.session._session_usable is False
+    assert provider.session.client.logged_out is True
 
 
 @pytest.mark.parametrize(
@@ -1757,27 +1960,37 @@ def test_provider_fails_closed_on_mixed_source_snapshot_dates() -> None:
         clock=lambda: OBSERVED,
     )
 
-    with pytest.raises(ClassificationProviderError, match="mixed industry snapshot dates"):
+    with pytest.raises(ClassificationProviderError) as error:
         provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.failure.failure_stage == "industry"
+    assert error.value.failure.failure_class == "data_quality"
+    assert error.value.failure.provider_request_count == 3
 
 
 @pytest.mark.parametrize(
-    "client",
+    ("client", "expected_stage", "expected_requests"),
     [
-        FakeClassificationClient(industry_date="2026-07-29"),
-        FakeClassificationClient(index_date="2026-07-29"),
+        (FakeClassificationClient(industry_date="2026-07-29"), "industry", 3),
+        (FakeClassificationClient(index_date="2026-07-29"), "hs300", 4),
     ],
 )
 def test_provider_rejects_source_update_date_after_requested_as_of(
     client: FakeClassificationClient,
+    expected_stage: str,
+    expected_requests: int,
 ) -> None:
     provider = BaoStockClassificationProvider(
         client=client,
         clock=lambda: OBSERVED,
     )
 
-    with pytest.raises(ClassificationProviderError, match="after requested as_of"):
+    with pytest.raises(ClassificationProviderError) as error:
         provider.fetch(SNAPSHOT_DATE)
+
+    assert error.value.failure.failure_stage == expected_stage
+    assert error.value.failure.failure_class == "data_quality"
+    assert error.value.failure.provider_request_count == expected_requests
 
 
 def api_request(
@@ -2150,6 +2363,17 @@ class RecordingClassificationProvider:
         return self.payload
 
 
+class ObservableClassificationProvider(RecordingClassificationProvider):
+    def __init__(self, payload: ClassificationSnapshot) -> None:
+        super().__init__(payload)
+        self.last_request_count = 6
+        self.session = type(
+            "SessionDiagnostics",
+            (),
+            {"socket_timeout_seconds": 17.0, "max_attempts": 2},
+        )()
+
+
 def test_classification_sync_is_dry_run_by_default(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -2274,7 +2498,7 @@ def test_classification_sync_execute_rejects_future_as_of_before_provider_call(
         snapshot(securities=[security("sh.600000")])
     )
 
-    with pytest.raises(ValueError, match="future as_of"):
+    with pytest.raises(ClassificationSyncError) as error:
         run_classification_sync(
             as_of=date.max,
             execute=True,
@@ -2282,8 +2506,72 @@ def test_classification_sync_execute_rejects_future_as_of_before_provider_call(
             provider=provider,
         )
 
+    assert error.value.failure.failure_stage == "validation"
+    assert error.value.failure.failure_class == "data_quality"
+    assert error.value.failure.provider_request_count == 0
     assert provider.calls == []
     assert store.ready_generation() is None
+
+
+@pytest.mark.parametrize(
+    ("publication_error", "expected_stage", "expected_class"),
+    [
+        (ClassificationConflictError("hostile conflict /Users/private"), "publication", "conflict"),
+        (OSError("hostile storage /Users/private"), "publication", "storage"),
+        (RuntimeError("hostile internal /Users/private"), "publication", "internal"),
+    ],
+)
+def test_classification_sync_sanitizes_publication_failures(
+    publication_error: Exception,
+    expected_stage: str,
+    expected_class: str,
+) -> None:
+    provider = ObservableClassificationProvider(snapshot(securities=[security("sh.600000")]))
+
+    class FailingStore:
+        def publish(self, _snapshot: ClassificationSnapshot):
+            raise publication_error
+
+    with pytest.raises(ClassificationSyncError) as error:
+        run_classification_sync(
+            as_of=SNAPSHOT_DATE,
+            execute=True,
+            store=FailingStore(),
+            provider=provider,
+        )
+
+    failure = error.value.failure
+    assert failure.failure_stage == expected_stage
+    assert failure.failure_class == expected_class
+    assert failure.provider_request_count == 6
+    assert failure.elapsed_seconds >= 0
+    assert failure.configured_timeout_seconds == 17
+    assert failure.configured_max_attempts == 2
+    assert "/Users/private" not in str(error.value)
+
+
+def test_classification_sync_sanitizes_unstructured_provider_failure() -> None:
+    provider = ObservableClassificationProvider(snapshot(securities=[security("sh.600000")]))
+
+    def hostile_fetch(_as_of: date) -> ClassificationSnapshot:
+        raise RuntimeError("token=do-not-leak /Users/private/provider.db")
+
+    provider.fetch = hostile_fetch
+
+    with pytest.raises(ClassificationSyncError) as error:
+        run_classification_sync(
+            as_of=SNAPSHOT_DATE,
+            execute=True,
+            store=object(),
+            provider=provider,
+        )
+
+    failure = error.value.failure
+    assert failure.failure_stage == "validation"
+    assert failure.failure_class == "internal"
+    assert failure.provider_request_count == 6
+    assert failure.configured_timeout_seconds == 17
+    assert "/Users/private" not in str(error.value)
 
 
 def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
@@ -2296,7 +2584,12 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
     settings = Settings(
         _env_file=None,
         market_data_dir=market_dir,
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
         local_temp_dir=temp_dir,
+        local_market_dataset_root=tmp_path / "dataset",
     )
 
     class DeadlineProvider:
@@ -2305,7 +2598,14 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
 
         def fetch(self, _as_of: date) -> ClassificationSnapshot:
             raise ClassificationProviderError(
-                "BaoStock request wall-clock deadline exceeded"
+                ClassificationFailure(
+                    failure_stage="security_universe",
+                    failure_class="deadline",
+                    elapsed_seconds=120.25,
+                    provider_request_count=2,
+                    configured_timeout_seconds=120,
+                    configured_max_attempts=2,
+                )
             )
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
@@ -2331,10 +2631,68 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
         "as_of": SNAPSHOT_DATE.isoformat(),
         "quality_issues": ["classification_sync_failed"],
         "writes_classification_data": False,
+        "failure_stage": "security_universe",
+        "failure_class": "deadline",
+        "elapsed_seconds": 120.25,
+        "provider_request_count": 2,
+        "configured_timeout_seconds": 120.0,
+        "configured_max_attempts": 2,
     }
     assert not (market_dir / "classification.duckdb").exists()
     assert not market_dir.exists()
     assert not temp_dir.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_classification_cli_dry_run_output_remains_compatible_and_write_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        local_market_dataset_root=tmp_path / "dataset",
+    )
+
+    class RejectProviderConstruction:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("dry-run constructed provider")
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        cli,
+        "BaoStockClassificationProvider",
+        RejectProviderConstruction,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "dry-run",
+        "as_of": SNAPSHOT_DATE.isoformat(),
+        "network_requests": 0,
+        "writes_classification_data": False,
+        "new_generation": False,
+        "execute_requires": "--execute",
+        "generation": None,
+        "quality_issues": [],
+    }
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_classification_cli_initial_login_timeout_is_controlled_and_write_free(
@@ -2404,20 +2762,24 @@ def test_classification_cli_initial_login_timeout_is_controlled_and_write_free(
         assert cli.main() == 1
         assert perf_counter() - started < 0.5
         payload = json.loads(capsys.readouterr().out)
-        assert payload == {
-            "status": "error",
-            "as_of": SNAPSHOT_DATE.isoformat(),
-            "quality_issues": ["classification_sync_failed"],
-            "writes_classification_data": False,
-        }
+        assert set(payload) == CLASSIFICATION_FAILURE_KEYS
+        assert payload["status"] == "error"
+        assert payload["as_of"] == SNAPSHOT_DATE.isoformat()
+        assert payload["quality_issues"] == ["classification_sync_failed"]
+        assert payload["writes_classification_data"] is False
+        assert payload["failure_stage"] == "login"
+        assert payload["failure_class"] == "deadline"
+        assert payload["elapsed_seconds"] >= 0.04
+        assert payload["provider_request_count"] == 0
+        assert payload["configured_timeout_seconds"] == 0.02
+        assert payload["configured_max_attempts"] == 2
         assert client.continued is False
         assert client.login_calls == 2
         assert client.context.default_socket is None
         assert not [
             thread
             for thread in threading.enumerate()
-            if thread.name.startswith("stock-eva-baostock-operation-login")
-            and thread.is_alive()
+            if thread.name.startswith("stock-eva-baostock-operation-login") and thread.is_alive()
         ]
         assert not (market_dir / "classification.duckdb").exists()
         assert not market_dir.exists()
@@ -2427,6 +2789,174 @@ def test_classification_cli_initial_login_timeout_is_controlled_and_write_free(
         for thread in threading.enumerate():
             if thread.name.startswith("stock-eva-baostock-operation-login"):
                 thread.join(0.2)
+
+
+def test_classification_cli_unexpected_constructor_failure_is_sanitized_and_write_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        local_market_dataset_root=tmp_path / "dataset",
+    )
+    hostile = "token=do-not-leak /Users/private/secret.db"
+
+    class HostileProvider:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError(hostile)
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockClassificationProvider", HostileProvider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "17",
+        ],
+    )
+
+    assert cli.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert set(payload) == CLASSIFICATION_FAILURE_KEYS
+    assert payload["quality_issues"] == ["classification_sync_failed"]
+    assert payload["writes_classification_data"] is False
+    assert payload["failure_stage"] == "validation"
+    assert payload["failure_class"] == "internal"
+    assert payload["elapsed_seconds"] >= 0
+    assert payload["provider_request_count"] == 0
+    assert payload["configured_timeout_seconds"] == 17
+    assert payload["configured_max_attempts"] is None
+    assert hostile not in output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_classification_cli_settings_failure_is_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hostile = "token=do-not-leak /Users/private/settings.env"
+
+    def hostile_settings():
+        raise RuntimeError(hostile)
+
+    monkeypatch.setattr(cli, "get_settings", hostile_settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "19",
+        ],
+    )
+
+    assert cli.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert set(payload) == CLASSIFICATION_FAILURE_KEYS
+    assert payload["failure_stage"] == "validation"
+    assert payload["failure_class"] == "internal"
+    assert payload["provider_request_count"] == 0
+    assert payload["configured_timeout_seconds"] == 19
+    assert payload["configured_max_attempts"] is None
+    assert hostile not in output
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("publication_error", "expected_class"),
+    [
+        (ClassificationConflictError("hostile conflict /Users/private"), "conflict"),
+        (OSError("hostile storage /Users/private"), "storage"),
+    ],
+)
+def test_classification_cli_publication_failure_is_structured_and_write_free(
+    publication_error: Exception,
+    expected_class: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        local_market_dataset_root=tmp_path / "dataset",
+    )
+
+    class SuccessfulProvider:
+        def __init__(self, **kwargs) -> None:
+            self.last_request_count = 6
+            self.session = type(
+                "SessionDiagnostics",
+                (),
+                {
+                    "socket_timeout_seconds": kwargs["socket_timeout_seconds"],
+                    "max_attempts": 2,
+                },
+            )()
+
+        def fetch(self, _as_of: date) -> ClassificationSnapshot:
+            return snapshot(securities=[security("sh.600000")])
+
+    class FailingStore:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def publish(self, _snapshot: ClassificationSnapshot):
+            raise publication_error
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockClassificationProvider", SuccessfulProvider)
+    monkeypatch.setattr(cli, "ClassificationStore", FailingStore)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "11",
+        ],
+    )
+
+    assert cli.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert set(payload) == CLASSIFICATION_FAILURE_KEYS
+    assert payload["failure_stage"] == "publication"
+    assert payload["failure_class"] == expected_class
+    assert payload["provider_request_count"] == 6
+    assert payload["configured_timeout_seconds"] == 11
+    assert payload["configured_max_attempts"] == 2
+    assert "/Users/private" not in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_classification_fetch_does_not_logout_session_it_did_not_acquire() -> None:

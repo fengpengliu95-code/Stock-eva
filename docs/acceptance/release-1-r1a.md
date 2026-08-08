@@ -161,6 +161,37 @@ They did not publish a trusted classification generation:
    Taken together with the earlier `29.701s` success, this is evidence of
    unstable source response rather than a verified stable slow-query bound.
 
+### 2026-08-07 bounded diagnostic follow-up
+
+This follow-up was diagnostic evidence only. It used `as_of=2026-08-07`, one
+fresh explicit TEMP root, no classification store and no production/NAS/user
+database access:
+
+1. Login completed in roughly `0.4–4.3s`; the trading-calendar request completed
+   in `0.173s` and confirmed that `2026-08-07` was a trading day.
+2. `query_all_stock(2026-08-07)` exceeded both `10s` and `30s` single-attempt
+   deadlines. The `30s` probe recorded only one request boundary. The preceding
+   trading date, `2026-08-06`, also exceeded a `10s` deadline, ruling out a
+   latest-date-only explanation.
+3. `query_stock_basic` and `query_stock_industry` exceeded both `10s` and `30s`
+   total request deadlines. Their request counters advanced during some probes,
+   showing partial pagination progress but no complete result.
+4. The independent index probes succeeded: HS300 returned 300 rows in `0.894s`,
+   SZ50 returned 50 rows in `0.217s`, and CSI500 returned 500 rows in `1.606s`.
+   Each returned the expected three-field schema and a `2026-08-03` snapshot date.
+5. A real `BaoStockClassificationProvider.fetch` using a `10s` deadline and the
+   unchanged two attempts reproduced two successful logins followed by
+   `ClassificationProviderError -> deadline` in `21.929s`. It stopped at
+   `security_universe`; parser validation and publication never ran.
+
+The primary blocker remains unstable BaoStock full-universe/basic/industry
+metadata service response. A larger deadline is not a verified remedy: the
+earlier `120s` probes also failed. Parser/schema drift was not causal in the
+observed full fetch because no universe result reached parsing; complete live
+basic/industry schemas remain unverified. No TEMP publish canary, coverage audit,
+ready generation, production acceptance or Release 1 GO is claimed by this
+follow-up.
+
 No live run touched the production classification path, NAS, `stock_eva.duckdb`,
 or the user database. No threshold was lowered, no date was substituted, and
 no production publication was attempted.

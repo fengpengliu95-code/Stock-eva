@@ -2,8 +2,13 @@ import hashlib
 import json
 from datetime import UTC, date, datetime
 from importlib.metadata import version
+from time import monotonic
 from typing import Any
 
+from backend.app.classification.failures import (
+    ClassificationFailure,
+    ClassificationProviderError,
+)
 from backend.app.classification.models import (
     INDEX_CATALOG,
     TAXONOMY_BAOSTOCK_INDUSTRY,
@@ -12,11 +17,20 @@ from backend.app.classification.models import (
     SectorMembershipRecord,
     SecurityMasterRecord,
 )
-from backend.app.market.baostock import BaoStockError, BaoStockProvider
+from backend.app.market.baostock import (
+    BaoStockError,
+    BaoStockProvider,
+    _OperationDeadlineExceeded,
+    _OperationDeadlineUnavailable,
+)
 from backend.app.security_identity import derive_security_identity
 
 
-class ClassificationProviderError(RuntimeError):
+class _ClassificationSchemaError(ValueError):
+    pass
+
+
+class _ClassificationDataQualityError(ValueError):
     pass
 
 
@@ -42,23 +56,18 @@ def _required_rows(
 ) -> list[dict[str, str]]:
     missing = sorted(required_fields - set(fields))
     if missing:
-        raise ClassificationProviderError(
-            f"{label} missing required fields: {', '.join(missing)}"
-        )
+        raise _ClassificationSchemaError(f"{label} missing required fields: {', '.join(missing)}")
     if not rows:
-        raise ClassificationProviderError(f"{label} returned no rows")
+        raise _ClassificationDataQualityError(f"{label} returned no rows")
     try:
         return _row_dicts(fields, rows)
     except ValueError as exc:
-        raise ClassificationProviderError(f"{label} row shape is invalid") from exc
+        raise _ClassificationSchemaError(f"{label} row shape is invalid") from exc
 
 
 def _looks_like_target_a_share(symbol: str) -> bool:
     identity = derive_security_identity(symbol, "1")
-    return (
-        identity.exchange in {"sh", "sz"}
-        and identity.board in {"main", "chinext", "star"}
-    )
+    return identity.exchange in {"sh", "sz"} and identity.board in {"main", "chinext", "star"}
 
 
 def _single_snapshot_date(
@@ -70,12 +79,10 @@ def _single_snapshot_date(
     dates = {_date(row["updateDate"]) for row in rows}
     dates.discard(None)
     if len(dates) > 1:
-        raise ClassificationProviderError(f"mixed {label} snapshot dates")
+        raise _ClassificationDataQualityError(f"mixed {label} snapshot dates")
     snapshot_date = next(iter(dates), None)
     if snapshot_date is not None and snapshot_date > requested_as_of:
-        raise ClassificationProviderError(
-            f"{label} snapshot date is after requested as_of"
-        )
+        raise _ClassificationDataQualityError(f"{label} snapshot date is after requested as_of")
     return snapshot_date
 
 
@@ -89,8 +96,10 @@ class BaoStockClassificationProvider:
         clock=lambda: datetime.now(UTC),
         min_request_interval_seconds: float | None = None,
         socket_timeout_seconds: float = 30.0,
+        monotonic_fn=monotonic,
     ) -> None:
         self.clock = clock
+        self._monotonic = monotonic_fn
         self.source_version = version("baostock")
         self.last_request_count = 0
         self.session = BaoStockProvider(
@@ -99,135 +108,244 @@ class BaoStockClassificationProvider:
             socket_timeout_seconds=socket_timeout_seconds,
         )
 
-    def fetch(self, as_of: date) -> ClassificationSnapshot:
-        initial_request_count = self.session._provider_request_count
-        owns_session = False
-        try:
-            self.session._login()
-            owns_session = True
-            observed_at = self.clock()
-            all_fields, all_rows = self.session._read(
-                lambda: self.session.client.query_all_stock(day=as_of.isoformat())
-            )
-            basic_fields, basic_rows = self.session._read(
-                lambda: self.session.client.query_stock_basic()
-            )
-            industry_fields, industry_rows = self.session._read(
-                lambda: self.session.client.query_stock_industry(date=as_of.isoformat())
-            )
-            index_payloads = {
-                "hs300": self.session._read(
-                    lambda: self.session.client.query_hs300_stocks(date=as_of.isoformat())
+    def _error(
+        self,
+        *,
+        stage: str,
+        failure_class: str,
+        started_at: float,
+        initial_request_count: int,
+    ) -> ClassificationProviderError:
+        return ClassificationProviderError(
+            ClassificationFailure(
+                failure_stage=stage,
+                failure_class=failure_class,
+                elapsed_seconds=round(max(0.0, self._monotonic() - started_at), 3),
+                provider_request_count=(
+                    self.session._provider_request_count - initial_request_count
                 ),
-                "sz50": self.session._read(
-                    lambda: self.session.client.query_sz50_stocks(date=as_of.isoformat())
-                ),
-                "csi500": self.session._read(
-                    lambda: self.session.client.query_zz500_stocks(date=as_of.isoformat())
-                ),
-            }
-        except (BaoStockError, KeyError, ValueError) as exc:
-            raise ClassificationProviderError("BaoStock classification metadata failed") from exc
-        finally:
-            if owns_session:
-                self.session._logout()
-            self.last_request_count = (
-                self.session._provider_request_count - initial_request_count
+                configured_timeout_seconds=self.session.socket_timeout_seconds,
+                configured_max_attempts=self.session.max_attempts,
             )
+        )
 
-        all_records = _required_rows(
-            all_fields,
-            all_rows,
-            label="query_all_stock",
-            required_fields={"code", "tradeStatus", "code_name"},
+    @staticmethod
+    def _transport_failure_class(exc: Exception) -> str:
+        if isinstance(exc, _OperationDeadlineExceeded):
+            return "deadline"
+        if isinstance(exc, _OperationDeadlineUnavailable):
+            return "internal"
+        return (
+            "transport" if isinstance(exc, (BaoStockError, TimeoutError, OSError)) else "internal"
         )
-        basic_records = _required_rows(
-            basic_fields,
-            basic_rows,
-            label="query_stock_basic",
-            required_fields={
-                "code",
-                "code_name",
-                "ipoDate",
-                "outDate",
-                "type",
-                "status",
-            },
-        )
-        industry_records = _required_rows(
-            industry_fields,
-            industry_rows,
-            label="query_stock_industry",
-            required_fields={
-                "updateDate",
-                "code",
-                "code_name",
-                "industry",
-                "industryClassification",
-            },
-        )
-        index_records = {
-            index_id: _required_rows(
-                fields,
-                rows,
-                label=f"{index_id} component",
-                required_fields={"updateDate", "code", "code_name"},
-            )
-            for index_id, (fields, rows) in index_payloads.items()
-        }
+
+    def _network_stage(
+        self,
+        stage: str,
+        operation,
+        *,
+        started_at: float,
+        initial_request_count: int,
+    ):
+        try:
+            return operation()
+        except Exception as exc:
+            raise self._error(
+                stage=stage,
+                failure_class=self._transport_failure_class(exc),
+                started_at=started_at,
+                initial_request_count=initial_request_count,
+            ) from exc
+
+    def _validation_stage(
+        self,
+        stage: str,
+        operation,
+        *,
+        started_at: float,
+        initial_request_count: int,
+    ):
+        try:
+            return operation()
+        except Exception as exc:
+            if isinstance(exc, _ClassificationDataQualityError):
+                failure_class = "data_quality"
+            elif isinstance(exc, (_ClassificationSchemaError, KeyError, TypeError, ValueError)):
+                failure_class = "schema"
+            else:
+                failure_class = "internal"
+            raise self._error(
+                stage=stage,
+                failure_class=failure_class,
+                started_at=started_at,
+                initial_request_count=initial_request_count,
+            ) from exc
+
+    @staticmethod
+    def _usable_basics(
+        all_records: list[dict[str, str]],
+        basic_records: list[dict[str, str]],
+    ) -> dict[str, dict[str, str]]:
         basics = {row["code"]: row for row in basic_records}
         for row in all_records:
             if not _looks_like_target_a_share(row["code"]):
                 continue
             basic = basics.get(row["code"])
-            if (
-                basic is None
-                or basic["type"] != "1"
-                or basic["status"] not in {"0", "1"}
-            ):
-                raise ClassificationProviderError(
-                    "target A-share has no usable basic metadata: "
-                    f"{row['code']}"
-                )
-        securities = [
-            self._security_record(row, basics.get(row["code"]), as_of, observed_at)
-            for row in all_records
-        ]
-        security_ids = {row.security_id for row in securities}
+            if basic is None or basic["type"] != "1" or basic["status"] not in {"0", "1"}:
+                raise _ClassificationDataQualityError("target A-share has no usable basic metadata")
+        return basics
 
-        _single_snapshot_date(
-            industry_records,
-            label="industry",
-            requested_as_of=as_of,
-        )
-        memberships = [
-            self._sector_record(row, observed_at)
-            for row in industry_records
-            if f"baostock:{row['code']}" in security_ids
-        ]
-        components: list[IndexComponentRecord] = []
-        for index_id, records in index_records.items():
-            _single_snapshot_date(
-                records,
-                label=f"{index_id} component",
-                requested_as_of=as_of,
+    def fetch(self, as_of: date) -> ClassificationSnapshot:
+        initial_request_count = self.session._provider_request_count
+        started_at = self._monotonic()
+        owns_session = False
+
+        def network(stage: str, operation):
+            return self._network_stage(
+                stage,
+                operation,
+                started_at=started_at,
+                initial_request_count=initial_request_count,
             )
-            for row in records:
-                if f"baostock:{row['code']}" not in security_ids:
-                    raise ClassificationProviderError(
-                        f"{index_id} references unknown security"
-                    )
-                components.append(self._index_record(index_id, row, observed_at))
-        return ClassificationSnapshot(
-            source="baostock",
-            source_version=self.source_version,
-            source_snapshot_date=as_of,
-            source_date_semantics="requested_unverified",
-            observed_at=observed_at,
-            securities=securities,
-            index_components=components,
-            sector_memberships=memberships,
-        )
+
+        def validate(stage: str, operation):
+            return self._validation_stage(
+                stage,
+                operation,
+                started_at=started_at,
+                initial_request_count=initial_request_count,
+            )
+
+        def read(stage: str, operation):
+            return network(stage, lambda: self.session._read(operation))
+
+        def required(stage: str, payload, *, label: str, fields: set[str]):
+            result_fields, rows = payload
+            return validate(
+                stage,
+                lambda: _required_rows(
+                    result_fields,
+                    rows,
+                    label=label,
+                    required_fields=fields,
+                ),
+            )
+
+        try:
+            network("login", self.session._login)
+            owns_session = True
+            observed_at = validate("validation", self.clock)
+            all_records = required(
+                "security_universe",
+                read(
+                    "security_universe",
+                    lambda: self.session.client.query_all_stock(day=as_of.isoformat()),
+                ),
+                label="query_all_stock",
+                fields={"code", "tradeStatus", "code_name"},
+            )
+            basic_records = required(
+                "security_basic",
+                read("security_basic", lambda: self.session.client.query_stock_basic()),
+                label="query_stock_basic",
+                fields={"code", "code_name", "ipoDate", "outDate", "type", "status"},
+            )
+            basics = validate(
+                "validation",
+                lambda: self._usable_basics(all_records, basic_records),
+            )
+            securities = validate(
+                "validation",
+                lambda: [
+                    self._security_record(row, basics.get(row["code"]), as_of, observed_at)
+                    for row in all_records
+                ],
+            )
+            security_ids = {row.security_id for row in securities}
+            industry_records = required(
+                "industry",
+                read(
+                    "industry",
+                    lambda: self.session.client.query_stock_industry(date=as_of.isoformat()),
+                ),
+                label="query_stock_industry",
+                fields={
+                    "updateDate",
+                    "code",
+                    "code_name",
+                    "industry",
+                    "industryClassification",
+                },
+            )
+            validate(
+                "industry",
+                lambda: _single_snapshot_date(
+                    industry_records,
+                    label="industry",
+                    requested_as_of=as_of,
+                ),
+            )
+            memberships = validate(
+                "industry",
+                lambda: [
+                    self._sector_record(row, observed_at)
+                    for row in industry_records
+                    if f"baostock:{row['code']}" in security_ids
+                ],
+            )
+            index_operations = {
+                "hs300": lambda: self.session.client.query_hs300_stocks(date=as_of.isoformat()),
+                "sz50": lambda: self.session.client.query_sz50_stocks(date=as_of.isoformat()),
+                "csi500": lambda: self.session.client.query_zz500_stocks(date=as_of.isoformat()),
+            }
+            components: list[IndexComponentRecord] = []
+            for index_id, operation in index_operations.items():
+                records = required(
+                    index_id,
+                    read(index_id, operation),
+                    label=f"{index_id} component",
+                    fields={"updateDate", "code", "code_name"},
+                )
+                validate(
+                    index_id,
+                    lambda records=records, index_id=index_id: _single_snapshot_date(
+                        records,
+                        label=f"{index_id} component",
+                        requested_as_of=as_of,
+                    ),
+                )
+
+                def validated_components(
+                    records=records,
+                    index_id=index_id,
+                ) -> list[IndexComponentRecord]:
+                    result = []
+                    for row in records:
+                        if f"baostock:{row['code']}" not in security_ids:
+                            raise _ClassificationDataQualityError(
+                                f"{index_id} references unknown security"
+                            )
+                        result.append(self._index_record(index_id, row, observed_at))
+                    return result
+
+                components.extend(validate(index_id, validated_components))
+            return validate(
+                "validation",
+                lambda: ClassificationSnapshot(
+                    source="baostock",
+                    source_version=self.source_version,
+                    source_snapshot_date=as_of,
+                    source_date_semantics="requested_unverified",
+                    observed_at=observed_at,
+                    securities=securities,
+                    index_components=components,
+                    sector_memberships=memberships,
+                ),
+            )
+        finally:
+            if owns_session:
+                self.session._logout()
+            self.last_request_count = self.session._provider_request_count - initial_request_count
 
     def _security_record(
         self,
@@ -263,9 +381,7 @@ class BaoStockClassificationProvider:
             security_type=identity.security_type,
             list_date=list_date,
             delist_date=delist_date,
-            is_tradable=(
-                row["tradeStatus"] == "1"
-            ),
+            is_tradable=(row["tradeStatus"] == "1"),
             price_available=None,
             listing_status=raw["status"],
             daily_trade_status=row["tradeStatus"],
@@ -287,7 +403,7 @@ class BaoStockClassificationProvider:
     ) -> SectorMembershipRecord:
         snapshot_date = _date(row["updateDate"])
         if snapshot_date is None:
-            raise ClassificationProviderError("industry row has no updateDate")
+            raise _ClassificationDataQualityError("industry row has no updateDate")
         raw = {
             "updateDate": row["updateDate"],
             "code": row["code"],
@@ -302,10 +418,7 @@ class BaoStockClassificationProvider:
         )[:16]
         sector_id = f"baostock-industry-{sector_digest}"
         return SectorMembershipRecord(
-            record_id=(
-                f"sector:{TAXONOMY_BAOSTOCK_INDUSTRY}:"
-                f"{snapshot_date}:{row['code']}"
-            ),
+            record_id=(f"sector:{TAXONOMY_BAOSTOCK_INDUSTRY}:{snapshot_date}:{row['code']}"),
             taxonomy_id=TAXONOMY_BAOSTOCK_INDUSTRY,
             taxonomy_name="BaoStock industryClassification",
             sector_id=sector_id,
@@ -333,7 +446,7 @@ class BaoStockClassificationProvider:
     ) -> IndexComponentRecord:
         snapshot_date = _date(row["updateDate"])
         if snapshot_date is None:
-            raise ClassificationProviderError(f"{index_id} row has no updateDate")
+            raise _ClassificationDataQualityError(f"{index_id} row has no updateDate")
         raw = {
             "index_id": index_id,
             "updateDate": row["updateDate"],

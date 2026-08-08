@@ -6,11 +6,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter
 
-from backend.app.classification.provider import (
-    BaoStockClassificationProvider,
-    ClassificationProviderError,
+from backend.app.classification.failures import (
+    ClassificationFailure,
+    ClassificationFailureError,
 )
-from backend.app.classification.service import ClassificationConflictError
+from backend.app.classification.provider import BaoStockClassificationProvider
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.config import get_settings
@@ -59,6 +59,41 @@ def _socket_timeout_value(value: str) -> float:
     if not 1 <= seconds <= 120:
         raise argparse.ArgumentTypeError("socket timeout must be between 1 and 120 seconds")
     return seconds
+
+
+def _classification_failure_payload(
+    *,
+    as_of: date,
+    failure: ClassificationFailure,
+) -> dict[str, object]:
+    return {
+        "status": "error",
+        "as_of": as_of.isoformat(),
+        "quality_issues": ["classification_sync_failed"],
+        "writes_classification_data": False,
+        **failure.model_dump(),
+    }
+
+
+def _unexpected_classification_failure(
+    *,
+    started_at: float,
+    provider: object | None,
+    configured_timeout_seconds: float | None,
+) -> ClassificationFailure:
+    session = getattr(provider, "session", None)
+    return ClassificationFailure(
+        failure_stage="validation",
+        failure_class="internal",
+        elapsed_seconds=round(max(0.0, perf_counter() - started_at), 3),
+        provider_request_count=max(0, getattr(provider, "last_request_count", 0)),
+        configured_timeout_seconds=getattr(
+            session,
+            "socket_timeout_seconds",
+            configured_timeout_seconds,
+        ),
+        configured_max_attempts=getattr(session, "max_attempts", None),
+    )
 
 
 class _ProbeTimeoutInterrupt(BaseException):
@@ -257,44 +292,64 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    settings = get_settings()
     if args.command == "classification-sync":
-        store = ClassificationStore(
-            settings.market_data_dir / settings.classification_database_name,
-            temp_directory=settings.local_temp_dir / "classification-duckdb",
-        )
-        provider = (
-            BaoStockClassificationProvider(
-                min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
-                socket_timeout_seconds=(
-                    args.socket_timeout_seconds or settings.baostock_socket_timeout_seconds
-                ),
-            )
-            if args.execute
-            else None
-        )
+        started_at = perf_counter()
+        configured_timeout_seconds = args.socket_timeout_seconds
+        provider = None
         try:
+            settings = get_settings()
+            configured_timeout_seconds = (
+                args.socket_timeout_seconds or settings.baostock_socket_timeout_seconds
+            )
+            store = ClassificationStore(
+                settings.market_data_dir / settings.classification_database_name,
+                temp_directory=settings.local_temp_dir / "classification-duckdb",
+            )
+            provider = (
+                BaoStockClassificationProvider(
+                    min_request_interval_seconds=(
+                        settings.auto_refresh_min_request_interval_seconds
+                    ),
+                    socket_timeout_seconds=configured_timeout_seconds,
+                )
+                if args.execute
+                else None
+            )
             result = run_classification_sync(
                 as_of=args.as_of,
                 execute=args.execute,
                 store=store,
                 provider=provider,
             )
-        except (ClassificationProviderError, ClassificationConflictError, ValueError):
+        except ClassificationFailureError as exc:
             print(
                 json.dumps(
-                    {
-                        "status": "error",
-                        "as_of": args.as_of.isoformat(),
-                        "quality_issues": ["classification_sync_failed"],
-                        "writes_classification_data": False,
-                    },
+                    _classification_failure_payload(
+                        as_of=args.as_of,
+                        failure=exc.failure,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        except Exception:
+            print(
+                json.dumps(
+                    _classification_failure_payload(
+                        as_of=args.as_of,
+                        failure=_unexpected_classification_failure(
+                            started_at=started_at,
+                            provider=provider,
+                            configured_timeout_seconds=configured_timeout_seconds,
+                        ),
+                    ),
                     ensure_ascii=False,
                 )
             )
             return 1
         print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
         return 0 if result.status in {"dry-run", "ready"} else 1
+    settings = get_settings()
     if args.command == "backup-private-data":
         try:
             outcome = PrivateBackupSetService(
