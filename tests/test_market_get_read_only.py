@@ -1,9 +1,10 @@
 import asyncio
 import hashlib
 import json
+import shutil
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -502,6 +503,60 @@ def test_direct_analysis_readers_fail_closed_for_unavailable_dataset_metadata(
         assert not dataset_root.exists()
     else:
         assert _tree(dataset_root) == before
+
+
+@pytest.mark.parametrize(
+    "manifest_attack",
+    ["boolean_row_count", "duplicate_path", "duplicate_partition"],
+)
+@pytest.mark.parametrize(
+    "analysis_path",
+    [
+        f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        (
+            f"/api/v1/analysis/sector-rotation?as_of={AS_OF}"
+            f"&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}"
+        ),
+    ],
+)
+def test_direct_analysis_readers_reject_ambiguous_manifest_inventory(
+    tmp_path: Path,
+    manifest_attack: str,
+    analysis_path: str,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root)
+    control = _publish_fixture(settings, dataset_root)
+    manifest_path = dataset_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    original = manifest["files"][0]
+    duplicate = dict(original)
+    if manifest_attack == "boolean_row_count":
+        original["row_count"] = True
+    elif manifest_attack == "duplicate_path":
+        duplicate["trade_date"] = (AS_OF - timedelta(days=1)).isoformat()
+        manifest["files"].append(duplicate)
+    else:
+        source_path = dataset_root / original["path"]
+        duplicate_path = source_path.with_name(f"duplicate-{source_path.name}")
+        shutil.copyfile(source_path, duplicate_path)
+        duplicate["path"] = str(duplicate_path.relative_to(dataset_root))
+        manifest["files"].append(duplicate)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _fingerprint(control, dataset_root)
+
+    response = _api_get(
+        analysis_path,
+        settings,
+        raise_app_exceptions=False,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "market_storage_unavailable",
+        "storage_status": "unavailable",
+    }
+    assert _fingerprint(control, dataset_root) == before
 
 
 def test_local_mode_missing_and_corrupt_storage_never_initialize_on_get(

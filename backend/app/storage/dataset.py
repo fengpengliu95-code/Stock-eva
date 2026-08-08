@@ -225,20 +225,29 @@ class NasMarketStore:
             raise DatasetError("published dataset metadata is unavailable") from exc
         payload = manifest_payload
         files = payload["files"]
+        seen_paths: set[Path] = set()
+        seen_partitions: set[tuple[str, date]] = set()
         for item in files:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 raise DatasetError("published manifest has invalid file metadata")
-            _safe_relative(item["path"])
+            relative = _safe_relative(item["path"])
             if not isinstance(item.get("sha256"), str) or not _SHA256.fullmatch(item["sha256"]):
                 raise DatasetError("published manifest has invalid checksum metadata")
-            if not isinstance(item.get("row_count"), int) or item["row_count"] < 1:
+            if type(item.get("row_count")) is not int or item["row_count"] < 1:
                 raise DatasetError("published manifest has invalid row count metadata")
             if item.get("source") != "baostock" or not isinstance(item.get("trade_date"), str):
                 raise DatasetError("published manifest has invalid market partition metadata")
             try:
-                date.fromisoformat(item["trade_date"])
+                trade_date = date.fromisoformat(item["trade_date"])
             except ValueError as exc:
                 raise DatasetError("published manifest has invalid trade date metadata") from exc
+            partition = (item["source"], trade_date)
+            if relative in seen_paths:
+                raise DatasetError("published manifest contains a duplicate path")
+            if partition in seen_partitions:
+                raise DatasetError("published manifest contains a duplicate partition")
+            seen_paths.add(relative)
+            seen_partitions.add(partition)
         return payload
 
     @staticmethod

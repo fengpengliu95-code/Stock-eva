@@ -41,9 +41,11 @@ explained by the request dependency and read-method call graph, not by the immut
   anything, while missing schema, invalid payload and an exclusive lock return structured 503
   `calendar_control_read_failed` without changing bytes, mtime or schema.
 - Every dataset read validates both `DatasetSentinel` and `DatasetManifest`, then validates each
-  manifest item before consulting paths or Parquet. Missing/invalid metadata maps to the same
-  structured `market_storage_unavailable` 503 from direct regime and sector routes; only a fully
-  valid empty manifest returns HTTP 200 with an empty analysis.
+  manifest item before consulting paths or Parquet. `row_count` must be an exact positive integer
+  (not a boolean), normalized published paths must be unique, and each `(source, trade_date)`
+  partition may appear once. Missing, invalid or ambiguous metadata maps to the same structured
+  `market_storage_unavailable` 503 from direct regime and sector routes; only a fully valid empty
+  manifest returns HTTP 200 with an empty analysis.
 - Local regime and published-snapshot readers request DuckDB `read_only=True`.
 - A read-only dataset store rejects save, publication, export, scheduler-state, and reconciliation
   lifecycles before touching the dataset, staging directory, or control file.
@@ -94,6 +96,19 @@ states, legacy control-schema reconciliation in direct/lifespan/full-history/CLI
 schema initialization error mapping. The three calendar cases already passed because the preserved
 WIP had implemented the SQLite reader; review then aligned its public error code with the contract.
 
+A second independent re-review added a real temporary Parquet/manifest cross-product for boolean
+`row_count`, duplicate normalized path and duplicate partition key against both direct analysis
+routes. Before the inventory fix, all six cases returned HTTP 200:
+
+```text
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_get_read_only.py::test_direct_analysis_readers_reject_ambiguous_manifest_inventory
+6 failed in 0.77s
+```
+
+After enforcing the three inventory invariants, the same command produced `6 passed in 0.67s` and
+the frozen control/database and complete dataset-tree fingerprints remained unchanged.
+
 ### GREEN coverage
 
 `tests/test_market_get_read_only.py` covers:
@@ -111,6 +126,8 @@ WIP had implemented the SQLite reader; review then aligned its public error code
 - correct taxonomy `baostock.industry_classification` is used by sector GET coverage;
 - missing/invalid sentinel, manifest, generation and item metadata fail closed for both direct
   market-regime and sector readers, while a valid empty manifest remains HTTP 200/empty;
+- boolean row count, duplicate normalized path and duplicate source/date partition fail closed for
+  both direct analysis routes before Parquet can be double-counted;
 - normal local reads request DuckDB `read_only=True` and reject `_connect()` writer access;
 - exact configuration mismatch fallback, similar/non-matching error fail-closed behavior;
 - an independent read-only API store sees the previous committed value during an in-process writer
@@ -132,20 +149,20 @@ Final focused suite:
 
 ```text
 uv run --extra dev pytest -o addopts='' -q tests/test_market_get_read_only.py
-27 passed in 1.52s
+33 passed in 2.04s
 ```
 
-Related calendar/dataset/regime/sector/full-history/acceptance suite:
+Related dataset/regime/sector/full-history suite:
 
 ```text
-198 passed in 16.30s
+166 passed in 13.46s
 ```
 
-Final full suite after documentation:
+Final full suite:
 
 ```text
 uv run --extra dev pytest -o addopts='' -q
-640 passed in 64.87s
+646 passed in 65.62s
 ```
 
 Lint:
