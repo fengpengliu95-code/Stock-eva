@@ -1,7 +1,8 @@
 import hashlib
 import json
 import math
-from collections import defaultdict
+import threading
+from collections import OrderedDict, defaultdict
 from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import fmean, pstdev
@@ -33,6 +34,16 @@ _BAR_COLUMNS = """
     close, preclose, volume, amount, turnover_rate, pct_change,
     adjust_factor, price_adjustment, is_trading, is_suspended, is_st,
     source, source_record_id, ingested_at, quality_status, quality_issues
+"""
+
+# R1-B never consumes intraday OHLC, volume, turnover or price-adjustment
+# metadata. Keep immutable Parquet reads to the fields used by its formulas,
+# scope and PIT checks; published objects have already been schema/checksum
+# validated before this trusted projection is constructed.
+_REGIME_BAR_COLUMNS = """
+    trade_date, symbol, security_type, exchange, board, close, preclose,
+    amount, pct_change, adjust_factor, is_trading, is_suspended, is_st,
+    source_record_id, ingested_at, quality_status, quality_issues
 """
 
 _REFRESH_COLUMNS = """
@@ -303,7 +314,7 @@ class PublishedDatasetMarketReader:
         try:
             rows, _ = self.store._query(
                 f"""
-                SELECT {_BAR_COLUMNS}
+                SELECT {_REGIME_BAR_COLUMNS}
                 FROM daily_bars
                 WHERE source = 'baostock'
                   AND trade_date IN (
@@ -320,7 +331,45 @@ class PublishedDatasetMarketReader:
             )
         except DatasetError as exc:
             raise MarketReadUnavailable("market_storage_unavailable") from exc
-        return [MarketStore._daily_bar_from_row(row) for row in rows]
+        return [self._trusted_regime_bar_from_row(row) for row in rows]
+
+    @staticmethod
+    def _trusted_regime_bar_from_row(row) -> DailyBar:
+        """Avoid repeat model validation for checksum-verified immutable rows."""
+        return DailyBar.model_construct(
+            trade_date=row[0],
+            symbol=row[1],
+            security_type=row[2],
+            exchange=row[3],
+            board=row[4],
+            close=row[5],
+            preclose=row[6],
+            amount=row[7],
+            pct_change=row[8],
+            adjust_factor=row[9],
+            is_trading=row[10],
+            is_suspended=row[11],
+            is_st=row[12],
+            source_record_id=row[13],
+            ingested_at=row[14],
+            quality_status=row[15],
+            quality_issues=json.loads(row[16]),
+            # These fields are intentionally outside the R1-B projection.
+            open=0.0,
+            high=0.0,
+            low=0.0,
+            volume=0.0,
+            turnover_rate=None,
+            price_adjustment="none",
+            source="baostock",
+        )
+
+    def cache_identity(self) -> str:
+        """Preflight the current immutable publication before a cached read."""
+        try:
+            return self.store.read_identity()
+        except DatasetError as exc:
+            raise MarketReadUnavailable("market_storage_unavailable") from exc
 
 
 def market_regime_store_from_settings(settings: Settings) -> "MarketRegimeStore":
@@ -341,6 +390,10 @@ def market_regime_store_from_settings(settings: Settings) -> "MarketRegimeStore"
 class MarketRegimeStore:
     """Build deterministic inputs from canonical rows at or before one as-of date."""
 
+    _INPUT_CACHE_LIMIT = 128
+    _input_cache: OrderedDict[tuple[str, date, str | None], MarketRegimeInput] = OrderedDict()
+    _input_cache_lock = threading.Lock()
+
     def __init__(self, reader: MarketBarsReader) -> None:
         self.reader = reader
 
@@ -350,6 +403,11 @@ class MarketRegimeStore:
         *,
         known_at: datetime | None = None,
     ) -> MarketRegimeInput:
+        cache_key = self._cache_key(as_of, known_at)
+        if cache_key is not None:
+            cached = self._cached_input(cache_key)
+            if cached is not None:
+                return cached
         raw_bars = self.reader.bars_through(
             as_of,
             max_sessions=REGIME_LOOKBACK_SESSIONS,
@@ -384,13 +442,15 @@ class MarketRegimeStore:
         if post_cutoff_rows:
             quality_issues.append("post_cutoff_market_rows_discarded")
         if not bars:
-            return self._empty(as_of, quality_issues=quality_issues)
+            result = self._empty(as_of, quality_issues=quality_issues)
+            self._cache_input(cache_key, result)
+            return result
 
         data_as_of = dates[-1]
         current = [bar for bar in bars if bar.trade_date == data_as_of]
         lineage = self._lineage(bars)
         scope = self._scope(current)
-        return MarketRegimeInput(
+        result = MarketRegimeInput(
             as_of=as_of,
             data_as_of=data_as_of,
             trend=self._trend(bars, data_as_of, lineage),
@@ -402,6 +462,45 @@ class MarketRegimeStore:
             source_lineage=[lineage],
             quality_issues=quality_issues,
         )
+        self._cache_input(cache_key, result)
+        return result
+
+    def _cache_key(
+        self,
+        as_of: date,
+        known_at: datetime | None,
+    ) -> tuple[str, date, str | None] | None:
+        cache_identity = getattr(self.reader, "cache_identity", None)
+        if not callable(cache_identity):
+            return None
+        known_at_key = None if known_at is None else known_at.astimezone(UTC).isoformat()
+        return (str(cache_identity()), as_of, known_at_key)
+
+    @classmethod
+    def _cached_input(
+        cls,
+        key: tuple[str, date, str | None],
+    ) -> MarketRegimeInput | None:
+        with cls._input_cache_lock:
+            result = cls._input_cache.get(key)
+            if result is None:
+                return None
+            cls._input_cache.move_to_end(key)
+            return result.model_copy(deep=True)
+
+    @classmethod
+    def _cache_input(
+        cls,
+        key: tuple[str, date, str | None] | None,
+        result: MarketRegimeInput,
+    ) -> None:
+        if key is None:
+            return
+        with cls._input_cache_lock:
+            cls._input_cache[key] = result.model_copy(deep=True)
+            cls._input_cache.move_to_end(key)
+            while len(cls._input_cache) > cls._INPUT_CACHE_LIMIT:
+                cls._input_cache.popitem(last=False)
 
     def _empty(
         self,

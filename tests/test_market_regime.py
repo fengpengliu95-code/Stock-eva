@@ -378,6 +378,158 @@ def test_store_never_accepts_rows_after_requested_as_of() -> None:
     assert models.EXPECTED_BOARDS == ["sse_main", "szse_main", "chinext", "star"]
 
 
+def test_published_reader_projects_only_regime_fields_from_validated_parquet(
+    tmp_path: Path,
+) -> None:
+    _, _, store_module = _regime_modules()
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "temp",
+        dataset_root=tmp_path / "dataset",
+        staging_root=tmp_path / "staging",
+    )
+    bar = _bar(AS_OF, "sh.600000", close=12, preclose=10, pct_change=20)
+    captured: dict[str, str] = {}
+
+    def query(sql: str, _parameters: list[object]):
+        captured["sql"] = sql
+        return [
+            (
+                bar.trade_date,
+                bar.symbol,
+                bar.security_type,
+                bar.exchange,
+                bar.board,
+                bar.close,
+                bar.preclose,
+                bar.amount,
+                bar.pct_change,
+                bar.adjust_factor,
+                bar.is_trading,
+                bar.is_suspended,
+                bar.is_st,
+                bar.source_record_id,
+                bar.ingested_at,
+                bar.quality_status,
+                "[]",
+            )
+        ], []
+
+    reader.store._query = query  # type: ignore[method-assign]
+
+    rows = reader.bars_through(AS_OF, max_sessions=130)
+
+    assert "open" not in captured["sql"]
+    assert "volume" not in captured["sql"]
+    assert len(rows) == 1
+    assert rows[0].model_dump(
+        include={
+            "trade_date",
+            "symbol",
+            "security_type",
+            "exchange",
+            "board",
+            "close",
+            "preclose",
+            "amount",
+            "pct_change",
+            "adjust_factor",
+            "is_trading",
+            "is_suspended",
+            "is_st",
+            "source_record_id",
+            "ingested_at",
+            "quality_status",
+            "quality_issues",
+        }
+    ) == bar.model_dump(
+        include={
+            "trade_date",
+            "symbol",
+            "security_type",
+            "exchange",
+            "board",
+            "close",
+            "preclose",
+            "amount",
+            "pct_change",
+            "adjust_factor",
+            "is_trading",
+            "is_suspended",
+            "is_st",
+            "source_record_id",
+            "ingested_at",
+            "quality_status",
+            "quality_issues",
+        }
+    )
+
+
+def test_store_reuses_immutable_generation_input_and_reloads_on_pit_key_change() -> None:
+    """Avoid re-reading the same published generation for every overview refresh."""
+    _, _, store_module = _regime_modules()
+
+    class ImmutableGenerationReader:
+        def __init__(self) -> None:
+            self.generation = "generation-one"
+            self.bars_calls = 0
+            self.identity_calls = 0
+
+        def cache_identity(self) -> str:
+            # The real reader performs its manifest/filesystem availability
+            # preflight here before allowing a cached result to be returned.
+            self.identity_calls += 1
+            return f"fixture:{id(self)}:{self.generation}"
+
+        def bars_through(self, _as_of: date, *, max_sessions: int) -> list[DailyBar]:
+            assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
+            self.bars_calls += 1
+            return _market_bars(130)
+
+    reader = ImmutableGenerationReader()
+    store = store_module.MarketRegimeStore(reader)
+
+    first = store.read(AS_OF)
+    same_request = store.read(AS_OF)
+    pit_request = store.read(AS_OF, known_at=datetime(2026, 7, 30, tzinfo=UTC))
+    reader.generation = "generation-two"
+    republished = store.read(AS_OF)
+
+    assert first == same_request
+    assert reader.identity_calls == 4
+    assert reader.bars_calls == 3
+    assert pit_request == first
+    assert republished == first
+
+
+def test_store_never_returns_cached_input_when_immutable_preflight_fails() -> None:
+    _, _, store_module = _regime_modules()
+
+    class PreflightReader:
+        def __init__(self) -> None:
+            self.available = True
+            self.bars_calls = 0
+
+        def cache_identity(self) -> str:
+            if not self.available:
+                raise store_module.MarketReadUnavailable("market_storage_unavailable")
+            return f"fixture:{id(self)}:generation-one"
+
+        def bars_through(self, _as_of: date, *, max_sessions: int) -> list[DailyBar]:
+            assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
+            self.bars_calls += 1
+            return _market_bars(130)
+
+    reader = PreflightReader()
+    store = store_module.MarketRegimeStore(reader)
+    store.read(AS_OF)
+    reader.available = False
+
+    with pytest.raises(store_module.MarketReadUnavailable, match="market_storage_unavailable"):
+        store.read(AS_OF)
+    assert reader.bars_calls == 1
+
+
 def test_service_input_rejects_future_data_lineage() -> None:
     models, _, _ = _regime_modules()
     payload = _inputs(models, 20).model_dump()

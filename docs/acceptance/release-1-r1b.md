@@ -12,6 +12,44 @@ Release 1 verdict: **PENDING — do not claim GO**
 
 ## Scope verified in this worker
 
+### 2026-08-09 R1-B performance/coverage closure follow-up
+
+- The published-dataset path previously rebuilt the complete 130-session R1-B input on
+  every API request. `MarketRegimeStore` now reuses the evaluated input only when the
+  immutable manifest identity, `as_of` and UTC-normalized `known_at` are identical.
+  The reader still parses and validates the current manifest and checks every referenced
+  object exists before it may return a cache hit. A changed manifest generation/file
+  identity causes a reread; malformed/unavailable metadata remains a 503 and cannot be
+  masked by an earlier result. The cache is process-local, bounded (128 entries), does
+  not write storage, and returns a deep copy.
+- Focused regression evidence uses reader-call semantics rather than a machine-specific
+  timing threshold: one unchanged immutable/PIT request produces one expensive reader
+  call; changing either `known_at` or generation produces another; an availability
+  preflight failure after a cache fill raises rather than returns the cached value.
+- Cold reads now project only the 17 Parquet fields consumed by R1-B and construct the
+  in-memory bar without repeat Pydantic validation. This is safe only on the published
+  reader because the object has already passed the immutable manifest checksum/schema
+  validation; the normal DuckDB reader remains fully model-validated. The projection
+  test proves omitted fields (`open`, `volume`) are not read and every formula/PIT field
+  is retained. It does not replace Root's installed-dataset cold-latency measurement.
+- The R1-A ready classification generation is not evidence that R1-B has full-A price
+  coverage. In the current code, R1-B receives only `DailyBar` rows and derives scope
+  from their current-date symbol presence (`backend/app/regime/store.py:_scope`); it has
+  no classification-store dependency or classification generation lineage. Separately,
+  the R1-A provider persists `price_available=None` for its security records
+  (`backend/app/classification/provider.py:_security_record`), and its `MarketScope`
+  labels this `not_audited` rather than verified price coverage. Its coverage audit is
+  also taxonomy-membership coverage, not a same-date join against the immutable price
+  publication. Therefore the old wording that treated an R1-A artifact as entirely
+  future is stale, but promoting R1-B v1 from the ready classification pointer would be
+  an unsupported cross-store/full-A claim.
+- A future, separately reviewed formula/model v2 may add a read-only PIT adapter that
+  joins the selected classification generation (including observed/source dates and
+  generation id) to the immutable price manifest and reports eligible, observed and
+  missing-symbol counts. It must preserve the current narrow/degraded result unless that
+  explicit join proves the price coverage; that v2 contract is not silently introduced
+  by this R1-B performance closure.
+
 - `market-regime-v1` deterministically returns strategic bull/range/bear and tactical
   risk_on/neutral/risk_off.
 - Trend, breadth, liquidity, risk and leadership each carry their own formula version,
@@ -104,7 +142,26 @@ uv run --extra dev pytest -o addopts='' -q \
 # GREEN: 12 passed
 
 uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
-# Focused GREEN: 43 passed
+# Prior focused GREEN: 43 passed
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_store_reuses_immutable_generation_input_and_reloads_on_pit_key_change \
+  tests/test_market_regime.py::test_store_never_returns_cached_input_when_immutable_preflight_fails
+# 2026-08-09 RED before cache implementation: first test failed (identity_calls=0).
+# GREEN after implementation: 2 passed. The tests prove cache/PIT/generation/preflight
+# call semantics without accessing an installed dataset.
+
+uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
+# 2026-08-09 focused GREEN: 45 passed
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_published_reader_projects_only_regime_fields_from_validated_parquet
+# 2026-08-09 RED: 1 failed because the reader requested the full DailyBar projection
+# and attempted to decode the reduced fixture as a 24-column row.
+# GREEN: 1 passed after the trusted immutable 17-field projection was introduced.
+
+uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
+# 2026-08-09 final focused GREEN: 46 passed
 
 # Mainline fresh-suite isolation reproduction:
 uv run --extra dev pytest -o addopts='' -q \
@@ -240,6 +297,13 @@ user data, or a user-judgement comparison.
 
 - The 20-session local published-data replay above is verified, but no full-A coverage
   artifact exists.
+- R1-A now has a ready classification generation, but it has not been joined to the
+  immutable R1-B price publication under a shared PIT contract. It is therefore an
+  eligible-universe lead for a versioned R1-B v2 audit, not proof of current price
+  coverage or permission to remove the narrow-scope disclaimer.
+- Root must measure cold and warm installed-dataset/API latency and browser behavior.
+  This worker supplied only synthetic call-count regression evidence and did not open
+  the installed dataset, production database or browser.
 - Snapshot persistence for one result per ready trading day remains an R1-E gate; this
   acceptance evaluated results in memory and did not persist regime rows.
 - No authoritative point-in-time expected-universe denominator or board coverage audit is

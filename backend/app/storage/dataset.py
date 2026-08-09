@@ -333,6 +333,28 @@ class NasMarketStore:
             if connection is not None:
                 connection.close()
 
+    def read_identity(self) -> str:
+        """Return the checked immutable publication identity for read-result caches.
+
+        This deliberately runs the normal manifest and object-presence checks on
+        every call. A cache may skip a repeat query, but it must not turn a
+        missing/corrupt manifest or missing published object into a stale result.
+        """
+        paths = self._paths()
+        manifest = self._manifest()
+        entries = [
+            (str(item["path"]), str(item["sha256"]), int(item["row_count"]))
+            for item in manifest["files"]
+        ]
+        if len(paths) != len(entries):
+            raise DatasetError("published manifest identity is inconsistent")
+        content = json.dumps(
+            {"generation": manifest["generation"], "files": entries},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}"
+
     def exists(self) -> bool:
         return bool(self._paths())
 
