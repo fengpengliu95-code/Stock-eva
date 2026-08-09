@@ -11,6 +11,10 @@ Stock EVA 使用 5 个当前用户级 LaunchAgent，不需要管理员权限，�
 | `com.finlay.stock-eva.calendar` | 官方日历机器对账 | 登录启动、每日 16:30、每月 1 日 04:05 |
 | `com.finlay.stock-eva.backup` | 私有 SQLite 一致性备份 | 每日 02:30 |
 
+API 是用户发起的本机请求服务，因此模板使用 launchd `ProcessType=Interactive`。日终刷新、
+日历和备份仍使用 `Background`（并保留低优先级 I/O）；静态 Web 服务不因这一 API 调度
+修复而变更。这样不会把后台批处理提升为交互优先级。
+
 ## 运行时与行情镜像
 
 真实安装验证发现，交互式用户可以读取 `/Volumes/Stock`，但 macOS TCC 会拒绝
