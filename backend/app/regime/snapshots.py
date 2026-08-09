@@ -9,7 +9,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market.models import RefreshResult
 from backend.app.regime.models import MarketRegimeResult
+from backend.app.regime.service import MarketRegimeService
+from backend.app.regime.store import MarketRegimeStore
+from backend.app.storage.dataset import PublishedReadSnapshot
 
 CaptureMode = Literal["after_close", "post_hoc_backfill"]
 _SCHEMA = """
@@ -86,6 +90,20 @@ class SnapshotCaptureRequest(BaseModel):
         if self.evidence_cutoff_at.tzinfo is None:
             raise ValueError("evidence cutoff must be timezone-aware")
         return self
+
+
+class SnapshotBackfillPlan(BaseModel):
+    start: date
+    end: date
+    selected_dates: tuple[date, ...]
+    dataset_generation: str
+
+
+class SnapshotBackfillOutcome(SnapshotBackfillPlan):
+    inserted: int = 0
+    idempotent: int = 0
+    conflicts: int = 0
+    errors: int = 0
 
 
 def _canonical(payload: object) -> str:
@@ -282,3 +300,114 @@ class RegimeSnapshotStore:
             "content_hash": snapshot.content_hash,
             "result_payload": _canonical(snapshot.result.model_dump(mode="json")),
         }
+
+
+class RegimeSnapshotCaptureService:
+    """Capture backfills from one strict immutable market publication."""
+
+    def __init__(
+        self,
+        *,
+        regime_store: MarketRegimeStore,
+        snapshot_store: RegimeSnapshotStore,
+        service: MarketRegimeService | None = None,
+    ) -> None:
+        self.regime_store = regime_store
+        self.snapshot_store = snapshot_store
+        self.service = service or MarketRegimeService()
+
+    def plan(self, start: date, end: date) -> SnapshotBackfillPlan:
+        snapshot = self._capture_publication()
+        return self._plan(snapshot, start, end)
+
+    def capture_range(
+        self,
+        start: date,
+        end: date,
+        *,
+        evidence_cutoff_at: datetime,
+    ) -> SnapshotBackfillOutcome:
+        snapshot = self._capture_publication()
+        plan = self._plan(snapshot, start, end)
+        inserted = idempotent = conflicts = errors = 0
+        for as_of in plan.selected_dates:
+            try:
+                result = self.service.evaluate(self.regime_store.read_bound(as_of, snapshot))
+                _, created = self.snapshot_store.capture(
+                    SnapshotCaptureRequest(
+                        result=result,
+                        capture_mode="post_hoc_backfill",
+                        evidence_cutoff_at=evidence_cutoff_at,
+                        dataset_generation=snapshot.generation,
+                        dataset_identity=snapshot.identity,
+                    )
+                )
+                if created:
+                    inserted += 1
+                else:
+                    idempotent += 1
+            except RegimeSnapshotConflict:
+                conflicts += 1
+            except (RegimeSnapshotUnavailable, ValueError):
+                errors += 1
+        return SnapshotBackfillOutcome(
+            **plan.model_dump(),
+            inserted=inserted,
+            idempotent=idempotent,
+            conflicts=conflicts,
+            errors=errors,
+        )
+
+    def capture_after_close(self, result: RefreshResult) -> MarketRegimeSnapshot:
+        if result.status != "ready":
+            raise RegimeSnapshotUnavailable("published date is unavailable")
+        snapshot = self._capture_publication()
+        if result.requested_date not in snapshot.trade_dates:
+            raise RegimeSnapshotUnavailable("published date is unavailable")
+        regime_result = self.service.evaluate(
+            self.regime_store.read_bound(result.requested_date, snapshot)
+        )
+        captured, _ = self.snapshot_store.capture(
+            SnapshotCaptureRequest(
+                result=regime_result,
+                capture_mode="after_close",
+                evidence_cutoff_at=result.completed_at,
+                dataset_generation=snapshot.generation,
+                dataset_identity=snapshot.identity,
+            )
+        )
+        return captured
+
+    def _capture_publication(self) -> PublishedReadSnapshot:
+        capture = getattr(self.regime_store.reader, "cache_snapshot", None)
+        if not callable(capture):
+            raise RegimeSnapshotUnavailable("verified publication is unavailable")
+        try:
+            snapshot = capture()
+        except RuntimeError as exc:
+            raise RegimeSnapshotUnavailable("verified publication is unavailable") from exc
+        if not isinstance(snapshot, PublishedReadSnapshot):
+            raise RegimeSnapshotUnavailable("verified publication is unavailable")
+        if not snapshot.generation or not snapshot.trade_dates:
+            raise RegimeSnapshotUnavailable("verified publication is unavailable")
+        if tuple(sorted(set(snapshot.trade_dates))) != snapshot.trade_dates:
+            raise RegimeSnapshotUnavailable("verified publication is unavailable")
+        return snapshot
+
+    @staticmethod
+    def _plan(
+        snapshot: PublishedReadSnapshot,
+        start: date,
+        end: date,
+    ) -> SnapshotBackfillPlan:
+        if end < start:
+            raise ValueError("snapshot date range is inverted")
+        dates = tuple(item for item in snapshot.trade_dates if start <= item <= end)
+        if not dates:
+            raise ValueError("snapshot date range has no verified dates")
+        return SnapshotBackfillPlan(
+            start=start,
+            end=end,
+            selected_dates=dates,
+            dataset_generation=snapshot.generation,
+        )

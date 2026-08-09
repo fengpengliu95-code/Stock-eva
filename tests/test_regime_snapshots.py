@@ -16,11 +16,14 @@ from backend.app.regime.models import (
     SourceLineage,
 )
 from backend.app.regime.snapshots import (
+    RegimeSnapshotCaptureService,
     RegimeSnapshotConflict,
     RegimeSnapshotStore,
     RegimeSnapshotUnavailable,
     SnapshotCaptureRequest,
 )
+from backend.app.regime.store import MarketRegimeStore
+from backend.app.storage.dataset import PublishedReadSnapshot
 from backend.app.storage.layout import StorageLayout
 
 AS_OF = date(2026, 7, 29)
@@ -253,3 +256,51 @@ def test_snapshot_store_uses_explicit_canonical_result_payload_columns(
             separators=(",", ":"),
         ),
     )
+
+
+def test_backfill_binds_all_dates_to_one_strict_publication_snapshot(tmp_path: Path) -> None:
+    dates = (date(2026, 7, 28), AS_OF)
+
+    class ImmutableReader:
+        def __init__(self) -> None:
+            self.snapshots = 0
+            self.queries: list[tuple[PublishedReadSnapshot, date]] = []
+
+        def cache_snapshot(self) -> PublishedReadSnapshot:
+            self.snapshots += 1
+            return PublishedReadSnapshot(
+                identity="/private/dataset:fixture",
+                paths=(),
+                fingerprints=(),
+                generation="generation-fixture",
+                trade_dates=dates,
+            )
+
+        def bars_through_snapshot(
+            self,
+            snapshot: PublishedReadSnapshot,
+            as_of: date,
+            *,
+            max_sessions: int,
+        ) -> list[object]:
+            assert max_sessions == 130
+            self.queries.append((snapshot, as_of))
+            return []
+
+    reader = ImmutableReader()
+    service = RegimeSnapshotCaptureService(
+        regime_store=MarketRegimeStore(reader),
+        snapshot_store=_store(tmp_path),
+    )
+
+    outcome = service.capture_range(
+        dates[0],
+        dates[-1],
+        evidence_cutoff_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert outcome.inserted == 2
+    assert outcome.selected_dates == dates
+    assert reader.snapshots == 1
+    assert [as_of for _snapshot, as_of in reader.queries] == list(dates)
+    assert len({id(snapshot) for snapshot, _as_of in reader.queries}) == 1

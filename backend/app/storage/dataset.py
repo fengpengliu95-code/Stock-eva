@@ -78,6 +78,8 @@ class PublishedReadSnapshot:
     identity: str
     paths: tuple[Path, ...]
     fingerprints: tuple[tuple[int, int, int, int, int], ...]
+    generation: str = ""
+    trade_dates: tuple[date, ...] = ()
 
 
 class _ManifestLock:
@@ -354,6 +356,10 @@ class NasMarketStore:
                 identity=f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}",
                 paths=tuple(paths),
                 fingerprints=tuple(fingerprints),
+                generation=str(manifest["generation"]),
+                trade_dates=tuple(
+                    sorted({date.fromisoformat(item["trade_date"]) for item in items})
+                ),
             )
         except OSError as exc:
             raise DatasetError("published NAS dataset is unavailable") from exc

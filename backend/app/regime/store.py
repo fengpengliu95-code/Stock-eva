@@ -416,8 +416,13 @@ class MarketRegimeStore:
         as_of: date,
         *,
         known_at: datetime | None = None,
+        snapshot: PublishedReadSnapshot | None = None,
     ) -> MarketRegimeInput:
-        snapshot, cache_key = self._cache_key(as_of, known_at)
+        if snapshot is None:
+            snapshot, cache_key = self._cache_key(as_of, known_at)
+        else:
+            known_at_key = None if known_at is None else known_at.astimezone(UTC).isoformat()
+            cache_key = (str(snapshot.identity), as_of, known_at_key)
         if cache_key is not None:
             cached = self._cached_input(cache_key)
             if cached is not None:
@@ -485,6 +490,16 @@ class MarketRegimeStore:
         )
         self._cache_input(cache_key, result)
         return result
+
+    def read_bound(
+        self,
+        as_of: date,
+        snapshot: PublishedReadSnapshot,
+        *,
+        known_at: datetime | None = None,
+    ) -> MarketRegimeInput:
+        """Evaluate against a caller-captured immutable publication only."""
+        return self.read(as_of, known_at=known_at, snapshot=snapshot)
 
     def _cache_key(
         self,
