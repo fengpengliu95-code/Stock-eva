@@ -522,6 +522,7 @@ class SectorRotationService:
             )
         ]
         member_symbols = [item.symbol for item, _security in main_members]
+        target_count = len(member_symbols)
         current_scope_issues = {
             f"sector.{reason}"
             for item, security in main_members
@@ -565,13 +566,13 @@ class SectorRotationService:
             *current_scope_issues,
             *(value for metric in metrics for value in metric.quality_issues),
         }
-        if len(priced_symbols) < len(members):
+        if len(priced_symbols) < target_count:
             issues.add("sector.member_price_missing")
         if len(member_symbols) < len(members):
             issues.add("sector.member_outside_narrow_main_board_scope")
         confidence = _confidence(
             metrics,
-            coverage=(len(priced_symbols) / len(members) if members else 0),
+            coverage=(len(priced_symbols) / target_count if target_count else 0),
             cap=0.75,
             reasons=["narrow_main_board_scope", "fund_flow_evidence_missing"],
         )
@@ -594,7 +595,6 @@ class SectorRotationService:
         if len(priced_symbols) < self.sector_policy.minimum_rank_members:
             ranking_exclusion_reasons.append("insufficient_priced_members")
             issues.add("sector.insufficient_members_for_ranking")
-        target_count = len(member_symbols)
         priced_coverage = len(priced_symbols) / target_count if target_count else 0
         if target_count and priced_coverage < self.sector_policy.minimum_member_coverage:
             ranking_exclusion_reasons.append("insufficient_comparable_member_coverage")

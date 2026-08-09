@@ -747,6 +747,48 @@ def test_unknown_market_symbols_and_non_main_board_prices_do_not_expand_scope(
     assert "sector.member_outside_narrow_main_board_scope" in chinext.quality_issues
 
 
+def test_out_of_scope_members_do_not_reduce_in_scope_price_coverage_or_confidence(
+    tmp_path: Path,
+) -> None:
+    main_symbols = ["sh.600001", "sh.600002", "sz.000001"]
+    chinext_symbols = [f"sz.{300000 + index:06d}" for index in range(14)]
+    star_symbols = [f"sh.{688000 + index:06d}" for index in range(14)]
+    out_of_scope_symbols = [*chinext_symbols, *star_symbols]
+    symbols = [*main_symbols, *out_of_scope_symbols]
+    service, _, _ = _service(
+        tmp_path,
+        {symbol: "mixed-board" for symbol in symbols},
+        [
+            *(
+                bar
+                for symbol, drift in zip(main_symbols, (0.002, 0.003, 0.004), strict=True)
+                for bar in _bars(symbol, drift=drift, amount_drift=0.01)
+            ),
+            *(
+                bar
+                for symbol in chinext_symbols
+                for bar in _bars(symbol, drift=0.02, board="chinext")
+            ),
+            *(bar for symbol in star_symbols for bar in _bars(symbol, drift=0.02, board="star")),
+        ],
+        security_overrides={
+            **{symbol: {"board": "chinext"} for symbol in chinext_symbols},
+            **{symbol: {"board": "star"} for symbol in star_symbols},
+        },
+    )
+
+    result = service.rotation(AS_OF, TAXONOMY_BAOSTOCK_INDUSTRY)
+    ranking = result.rankings[0]
+
+    assert ranking.member_count == 31
+    assert ranking.priced_member_count == 3
+    assert ranking.ranking_eligible is True
+    assert "sector.member_price_missing" not in ranking.quality_issues
+    assert ranking.confidence.value == 0.75
+    assert "sector.member_outside_narrow_main_board_scope" in ranking.quality_issues
+    assert ranking.quality_status == "degraded"
+
+
 def test_api_future_date_is_rejected_before_sector_store_read() -> None:
     sector_api = import_module("backend.app.api.sector")
 
