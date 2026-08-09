@@ -358,15 +358,75 @@ dates: the only generation was actually observed on 2026-08-09 and the
 production HTTP contract correctly hides it from earlier `as_of` requests.
 Prospective historical visibility therefore remains distinct and unverified.
 
+### 2026-08-09 production installation and upstream publication hold
+
+After `/Volumes/Stock` was mounted, the canonical NAS check and its cleaned-up
+write/read/delete probe both passed. The NAS dataset validated at 260
+partitions and 829,494 rows; the installed local immutable mirror was newer at
+270 partitions and 861,430 rows. The official mirror therefore returned
+`destination_newer` with `copied_bytes=0` instead of replacing newer local
+data with the older NAS generation.
+
+The official installer built and atomically installed main
+`af1527b788dc8aa48f31a06c60d35a4842529639`. Runtime metadata recorded the same
+Git SHA and `built_at=2026-08-09T05:49:49Z`. All five LaunchAgents loaded, API
+and workspace health returned ready, storage remained `local_dataset/ready`,
+and the production OpenAPI contract exposed all five classification endpoint
+families.
+
+The first production classification publication did not pass. The installed
+runtime returned exactly one sanitized JSON stdout line, zero stderr bytes and
+no write:
+
+```text
+exit=1
+failure_stage=security_basic
+failure_class=deadline
+elapsed_seconds=208.255
+provider_request_count=4
+configured_timeout_seconds=60.0
+configured_max_attempts=2
+writes_classification_data=false
+```
+
+The classification database remained absent. A 120-second, one-attempt
+read-only canary against the same bulk `query_stock_basic()` operation also
+ended in `_OperationDeadlineExceeded`; a single-symbol `sh.600000` basic query
+succeeded in 0.952 seconds. A process-local 10,000-row page-size canary still
+timed out at 46.624 seconds. These observations isolate the current hold to the
+upstream bulk-basic operation rather than login, one-symbol metadata,
+classification storage or pagination size. No experimental override was used
+to publish production data and the completeness gate was not lowered.
+
+The installed workspace completed its missing-classification browser state
+without console errors. It displayed real 2026-08-07 market data and the
+`range/risk_off` narrow-sample result, while sector rotation explicitly showed
+`no_promoted_classification_generation`; it did not invent sectors or leaders.
+Fund-flow and portfolio guidance remained unavailable/non-actionable.
+
+A representative serial production GET pass covered health, storage,
+market status/summary/supplemental/history, security analysis, market regime,
+sector rotation, classification coverage, fund-flow evidence, portfolio
+valuation and strategies. Every request returned HTTP 200. The market control
+database and complete immutable dataset tree were identical before and after:
+
+```text
+control_sha256=31dbd6ff9db881bf9bf936156945efb79b898fee5016b4c9f0544ec4e671b84f
+control_size_mtime=3158016:1786097560
+dataset_tree_sha256=93416f3d956fb2738858db8123f84ce2d6f9a5a97a8d2d674821fb478d59adad
+dataset_file_count=272
+```
+
 ## Pending real acceptance gates
 
 - One real TEMP promoted generation and the eligible-universe 95% industry target are now
-  verified. Production installation and production readback remain pending on the NAS mount.
+  verified. Production installation is complete, but production classification publication
+  and ready-generation readback remain pending on BaoStock bulk-basic recovery.
 - The real 20-session post-hoc replay and its no-future membership/price assertions passed.
   Contemporaneous historical visibility is not claimed because the generation was observed
   after all replayed sessions.
-- Isolated real-data browser acceptance passed, but installed-runtime browser readback remains
-  pending with the production deployment.
+- Isolated real-data browser acceptance passed. Installed-runtime missing/degraded browser
+  readback passed; installed-runtime ready-classification drill-down remains pending publication.
 - Component history capability remains `unverified`, not `verified`.
 
 These pending gates prevent a Release 1 GO claim.
