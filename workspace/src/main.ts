@@ -11,7 +11,9 @@ import {
   bindSecurityEntrypoints,
   decisionHash,
   parseDecisionHash,
+  parseSectorHash,
   parseSecurityHash,
+  sectorHash,
   securityHash,
   type DecisionRoute,
 } from "./navigation";
@@ -24,6 +26,7 @@ import {
 } from "./state";
 import {
   renderDecisionFlow,
+  renderSectorWorkspace,
   type DecisionFlowState,
 } from "./views/decision-flow";
 import {
@@ -51,6 +54,7 @@ let securityEvidenceState: SecurityEvidenceState = { phase: "idle" };
 let abortController: AbortController | null = null;
 let evidenceController: AbortController | null = null;
 let decisionManager: DecisionRequestManager | null = null;
+let decisionView: "overview" | "sectors" = "overview";
 let chartCleanup: ChartCleanup | null = null;
 let restoredHash: string | null = null;
 let disposeBindings: (() => void) | null = null;
@@ -62,8 +66,10 @@ function cockpitRoot(): HTMLElement {
   return value;
 }
 
-function decisionRoot(): HTMLElement | null {
-  return document.querySelector<HTMLElement>("#decision-flow");
+function decisionRoot(view = decisionView): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    view === "sectors" ? "#sector-decision-flow" : "#decision-flow",
+  );
 }
 
 function securityEvidenceRoot(): HTMLElement | null {
@@ -81,7 +87,9 @@ function renderCockpit(): void {
 
 function renderDecision(): void {
   const root = decisionRoot();
-  if (root && decisionState) renderDecisionFlow(root, decisionState);
+  if (!root || !decisionState) return;
+  if (decisionView === "sectors") renderSectorWorkspace(root, decisionState);
+  else renderDecisionFlow(root, decisionState);
 }
 
 function renderEvidence(): void {
@@ -89,9 +97,12 @@ function renderEvidence(): void {
   if (root) renderSecurityEvidence(root, securityEvidenceState);
 }
 
-function focusDecisionSector(sectorId: string): void {
+function focusDecisionSector(
+  sectorId: string,
+  view = decisionView,
+): void {
   const control = Array.from(
-    decisionRoot()?.querySelectorAll<HTMLElement>("[data-decision-sector]") ?? [],
+    decisionRoot(view)?.querySelectorAll<HTMLElement>("[data-decision-sector]") ?? [],
   ).find((item) => item.dataset.decisionSector === sectorId);
   control?.focus();
 }
@@ -208,8 +219,11 @@ async function loadSecurityEvidence(
 function replaceDecisionHash(
   query: DecisionQuery,
   sectorId: string | null,
+  view: "overview" | "sectors",
 ): void {
-  const hash = decisionHash({ ...query, sectorId });
+  const hash = view === "sectors"
+    ? sectorHash({ ...query, sectorId })
+    : decisionHash({ ...query, sectorId });
   restoredHash = hash;
   window.history.replaceState(null, "", hash);
 }
@@ -217,6 +231,7 @@ function replaceDecisionHash(
 async function loadSelectedLeaders(
   query: DecisionQuery,
   sectorId: string,
+  view: "overview" | "sectors",
   preserveFocus = false,
 ): Promise<void> {
   if (!decisionManager || decisionState?.phase !== "ready") return;
@@ -229,7 +244,7 @@ async function loadSelectedLeaders(
     leaders: { phase: "loading" },
   };
   renderDecision();
-  if (preserveFocus) focusDecisionSector(sectorId);
+  if (preserveFocus) focusDecisionSector(sectorId, view);
   try {
     const response = await decisionManager.loadLeaders({
       ...query,
@@ -240,7 +255,8 @@ async function loadSelectedLeaders(
       decisionState?.phase !== "ready" ||
       decisionState.query.asOf !== query.asOf ||
       decisionState.query.taxonomyId !== query.taxonomyId ||
-      decisionState.selectedSectorId !== sectorId
+      decisionState.selectedSectorId !== sectorId ||
+      decisionView !== view
     ) {
       return;
     }
@@ -251,7 +267,8 @@ async function loadSelectedLeaders(
   } catch (error) {
     if (
       decisionState?.phase !== "ready" ||
-      decisionState.selectedSectorId !== sectorId
+      decisionState.selectedSectorId !== sectorId ||
+      decisionView !== view
     ) {
       return;
     }
@@ -261,15 +278,17 @@ async function loadSelectedLeaders(
     };
   }
   renderDecision();
-  if (preserveFocus) focusDecisionSector(sectorId);
+  if (preserveFocus) focusDecisionSector(sectorId, view);
 }
 
 async function loadDecisionOverview(
   query: DecisionQuery,
   preferredSectorId: string | null,
+  view: "overview" | "sectors" = "overview",
 ): Promise<void> {
-  const root = decisionRoot();
+  const root = decisionRoot(view);
   if (!root || !decisionManager) return;
+  decisionView = view;
   abortController?.abort();
   abortController = null;
   evidenceController?.abort();
@@ -278,7 +297,7 @@ async function loadDecisionOverview(
   renderEvidence();
   chartCleanup?.();
   chartCleanup = null;
-  window.stockEvaActivateView?.("overview", false);
+  window.stockEvaActivateView?.(view, false);
   decisionState = { phase: "loading", query };
   renderDecision();
   try {
@@ -297,10 +316,10 @@ async function loadDecisionOverview(
       selectedSectorId,
       leaders: { phase: "idle" },
     };
-    replaceDecisionHash(query, selectedSectorId);
+    replaceDecisionHash(query, selectedSectorId, view);
     renderDecision();
     if (selectedSectorId) {
-      await loadSelectedLeaders(query, selectedSectorId);
+      await loadSelectedLeaders(query, selectedSectorId, view);
     }
   } catch (error) {
     decisionState = {
@@ -380,10 +399,14 @@ function navigate(
   sourceView: SourceView,
   decisionContext?: DecisionContext,
 ): void {
-  const hash = securityHash(symbol, sourceView, decisionContext);
+  const context =
+    decisionContext && sourceView === "sectors" && decisionView === "sectors"
+      ? { ...decisionContext, returnView: "sectors" as const }
+      : decisionContext;
+  const hash = securityHash(symbol, sourceView, context);
   restoredHash = hash;
   window.history.pushState(null, "", hash);
-  void openSecurity(symbol, sourceView, decisionContext);
+  void openSecurity(symbol, sourceView, context);
 }
 
 function restoreFromHash(): void {
@@ -398,6 +421,9 @@ function restoreFromHash(): void {
             asOf: securityRoute.asOf,
             taxonomyId: securityRoute.taxonomyId,
             sectorId: securityRoute.sectorId,
+            ...(securityRoute.returnView
+              ? { returnView: securityRoute.returnView }
+              : {}),
           }
         : undefined;
     void openSecurity(
@@ -412,8 +438,21 @@ function restoreFromHash(): void {
     void loadDecisionOverview(routeQuery(decisionRoute), decisionRoute.sectorId);
     return;
   }
+  const sectorRoute = parseSectorHash(hash);
+  if (sectorRoute) {
+    void loadDecisionOverview(
+      routeQuery(sectorRoute),
+      sectorRoute.sectorId,
+      "sectors",
+    );
+    return;
+  }
   if (hash === "" || hash === "#overview") {
     void loadDecisionOverview(defaultDecisionQuery(), null);
+    return;
+  }
+  if (hash === "#sectors" || hash.startsWith("#sectors?")) {
+    void loadDecisionOverview(defaultDecisionQuery(), null, "sectors");
     return;
   }
   decisionManager?.dispose();
@@ -435,10 +474,12 @@ function onDecisionClick(event: Event): void {
   if (!sectorId || decisionState?.phase !== "ready") return;
   event.preventDefault();
   const query = decisionState.query;
-  const hash = decisionHash({ ...query, sectorId });
+  const hash = decisionView === "sectors"
+    ? sectorHash({ ...query, sectorId })
+    : decisionHash({ ...query, sectorId });
   restoredHash = hash;
   window.history.pushState(null, "", hash);
-  void loadSelectedLeaders(query, sectorId, true);
+  void loadSelectedLeaders(query, sectorId, decisionView, true);
 }
 
 function onDecisionBack(event: Event): void {
@@ -449,11 +490,17 @@ function onDecisionBack(event: Event): void {
   if (!back) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  const route = parseDecisionHash(back.hash);
+  const overviewRoute = parseDecisionHash(back.hash);
+  const sectorRoute = parseSectorHash(back.hash);
+  const route = overviewRoute ?? sectorRoute;
   if (!route) return;
   restoredHash = back.hash;
   window.history.pushState(null, "", back.hash);
-  void loadDecisionOverview(routeQuery(route), route.sectorId);
+  void loadDecisionOverview(
+    routeQuery(route),
+    route.sectorId,
+    sectorRoute ? "sectors" : "overview",
+  );
 }
 
 export function initializeSecurityCockpit(): void {
@@ -464,7 +511,8 @@ export function initializeSecurityCockpit(): void {
   restoredHash = null;
   decisionManager = new DecisionRequestManager(fetch);
   const unbindEntrypoints = bindSecurityEntrypoints(document, navigate);
-  decisionRoot()?.addEventListener("click", onDecisionClick);
+  decisionRoot("overview")?.addEventListener("click", onDecisionClick);
+  decisionRoot("sectors")?.addEventListener("click", onDecisionClick);
   document.addEventListener("click", onDecisionBack, true);
   window.addEventListener("popstate", restoreFromHash);
   window.addEventListener("hashchange", restoreFromHash);
@@ -472,7 +520,8 @@ export function initializeSecurityCockpit(): void {
   const cleanup = (): void => {
     if (disposeBindings !== cleanup) return;
     unbindEntrypoints();
-    decisionRoot()?.removeEventListener("click", onDecisionClick);
+    decisionRoot("overview")?.removeEventListener("click", onDecisionClick);
+    decisionRoot("sectors")?.removeEventListener("click", onDecisionClick);
     document.removeEventListener("click", onDecisionBack, true);
     window.removeEventListener("popstate", restoreFromHash);
     window.removeEventListener("hashchange", restoreFromHash);
@@ -487,6 +536,7 @@ export function initializeSecurityCockpit(): void {
     chartCleanup = null;
     cockpitState = initialCockpitState;
     decisionState = null;
+    decisionView = "overview";
     securityEvidenceState = { phase: "idle" };
     restoredHash = null;
     disposeBindings = null;

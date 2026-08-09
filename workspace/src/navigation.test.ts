@@ -6,7 +6,9 @@ import {
   bindSecurityEntrypoints,
   decisionHash,
   parseDecisionHash,
+  parseSectorHash,
   parseSecurityHash,
+  sectorHash,
   securityHash,
 } from "./navigation";
 
@@ -51,6 +53,41 @@ describe("security navigation", () => {
       taxonomyId: "baostock.industry_classification",
       sectorId: "sector/a b",
     });
+  });
+
+  it("round-trips the standalone sector route and fails closed on incomplete context", () => {
+    const route = {
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector/a b",
+    };
+
+    expect(sectorHash(route)).toBe(
+      "#sectors?as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector%2Fa+b",
+    );
+    expect(parseSectorHash(sectorHash(route))).toEqual(route);
+    expect(parseSectorHash("#sectors?as_of=tomorrow")).toBeNull();
+    expect(parseSectorHash("#sectors?as_of=2026-01-31")).toBeNull();
+  });
+
+  it("records a standalone-sector return target without changing legacy routes", () => {
+    const hash = securityHash("sh.600001", "sectors", {
+      asOf: "2026-01-31",
+      taxonomyId: "baostock.industry_classification",
+      sectorId: "sector-b",
+      returnView: "sectors",
+    });
+
+    expect(hash).toContain("return_view=sectors");
+    expect(parseSecurityHash(hash)).toMatchObject({ returnView: "sectors" });
+    expect(
+      parseSecurityHash(
+        "#security/sh.600001?from=sectors&as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector-b",
+      ),
+    ).not.toHaveProperty("returnView");
+    expect(
+      parseSecurityHash("#security/sh.600001?from=sectors&return_view=sectors"),
+    ).toBeNull();
   });
 
   it.each([

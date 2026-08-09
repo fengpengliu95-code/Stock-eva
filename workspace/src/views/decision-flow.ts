@@ -451,6 +451,91 @@ function renderLeaders(
   );
 }
 
+function workspacePanel(kicker: string, title: string): HTMLElement {
+  const panel = element("article", undefined, "panel");
+  panel.append(
+    element("p", kicker, "panel-kicker"),
+    element("h3", title),
+  );
+  return panel;
+}
+
+function renderSectorSelectionList(
+  body: HTMLElement,
+  sectors: SectorRotationResponse,
+  selectedSectorId: string | null,
+  query: DecisionQuery,
+): void {
+  if (!sectors.rankings.length) {
+    body.append(
+      element(
+        "p",
+        "板块数据为空不代表市场没有热点；当前没有足够、已发布的分类与行情证据。",
+        "decision-empty",
+      ),
+      tokens("缺失输入", sectors.missing_inputs),
+      tokens("质量问题", sectors.quality_issues),
+    );
+    return;
+  }
+  body.append(
+    status(`后端返回 ${sectors.rankings.length} 个板块；保持原始顺序`, sectors.quality_status),
+  );
+  const rankings = element("div", undefined, "decision-rankings");
+  rankings.dataset.sectorRankingList = "true";
+  for (const ranking of sectors.rankings) {
+    const article = element(
+      "article",
+      undefined,
+      `decision-ranking${ranking.sector_id === selectedSectorId ? " is-selected" : ""}`,
+    );
+    const heading = element("div", undefined, "decision-ranking-heading");
+    const title = element("div");
+    title.append(
+      element("span", `后端顺序 ${ranking.rank}`, "quiet-tag"),
+      element("h4", ranking.sector_name),
+      element(
+        "p",
+        `${ranking.sector_id} · 得分 ${value(ranking.total_score)} · 置信度 ${percent(ranking.confidence.value)}`,
+        "meta-line mono",
+      ),
+    );
+    const button = element("button", `查看 ${ranking.sector_name} 龙头`);
+    button.type = "button";
+    button.dataset.decisionSector = ranking.sector_id;
+    button.dataset.decisionAsOf = query.asOf;
+    button.dataset.decisionTaxonomy = query.taxonomyId;
+    button.setAttribute(
+      "aria-pressed",
+      ranking.sector_id === selectedSectorId ? "true" : "false",
+    );
+    if (ranking.sector_id === selectedSectorId) {
+      button.setAttribute("aria-current", "true");
+    }
+    heading.append(title, button);
+    article.append(
+      heading,
+      rows([
+        ["后端总分", value(ranking.total_score)],
+        ["质量", ranking.quality_status],
+        ["排名资格", ranking.ranking_eligible ? "eligible" : "excluded"],
+      ]),
+    );
+    rankings.append(article);
+  }
+  body.append(
+    rankings,
+    lineage(sectors),
+    rows([
+      ["响应公式", sectors.formula_version],
+      ["分类体系", sectors.taxonomy_id],
+      ["实际数据日", sectors.data_as_of ?? "—"],
+    ]),
+    tokens("缺失输入", sectors.missing_inputs),
+    tokens("质量问题", sectors.quality_issues),
+  );
+}
+
 function errorCopy(statusCode: number | null, message: string): string {
   if (statusCode === 422) return `日期不在可读取范围：${message}`;
   if (statusCode === 503) return `本地行情存储暂不可用：${message}`;
@@ -527,4 +612,59 @@ export function renderDecisionFlow(
     state.query,
     state.selectedSectorId,
   );
+}
+
+export function renderSectorWorkspace(
+  root: HTMLElement,
+  state: DecisionFlowState,
+): void {
+  root.replaceChildren();
+  const header = element("header", undefined, "decision-header");
+  const copy = element("div");
+  copy.append(
+    element("p", "SECTORS / EVIDENCE FIRST", "panel-kicker"),
+    element("h2", "板块证据工作区"),
+    element(
+      "p",
+      `请求时点 ${state.query.asOf} · 分类 ${state.query.taxonomyId} · 后端结论只读展示`,
+      "meta-line mono",
+    ),
+  );
+  header.append(copy);
+  root.append(header);
+  if (state.phase === "loading") {
+    root.append(status("正在读取市场状态与板块轮动…", "loading"));
+    return;
+  }
+  if (state.phase === "error") {
+    const alert = element("p", errorCopy(state.status, state.message), "decision-empty");
+    alert.setAttribute("role", "alert");
+    root.append(alert, scopeWarning());
+    return;
+  }
+
+  const market = workspacePanel("01 / REGIME", "市场状态（同一复盘上下文）");
+  renderMarket(market, state.overview.market);
+  const workspace = element("div", undefined, "sector-workspace sector-evidence-workspace");
+  const rankings = workspacePanel("02 / RANKING", "后端板块排名");
+  renderSectorSelectionList(
+    rankings,
+    state.overview.sectors,
+    state.selectedSectorId,
+    state.query,
+  );
+  const detail = workspacePanel("03 / DETAIL", "板块证据与龙头候选");
+  const selected = state.overview.sectors.rankings.find(
+    (item) => item.sector_id === state.selectedSectorId,
+  );
+  if (selected) {
+    detail.append(renderSector(selected, true, state.query));
+    renderLeaders(detail, state.leaders, state.query, selected.sector_id);
+  } else {
+    detail.append(
+      element("p", "尚无可选择的后端板块；不使用补充数据或虚构图表。", "decision-empty"),
+    );
+  }
+  workspace.append(rankings, detail);
+  root.append(market, workspace);
 }

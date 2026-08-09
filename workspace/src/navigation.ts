@@ -1,4 +1,4 @@
-import type { DecisionContext, SourceView } from "./state";
+import type { DecisionContext, DecisionReturnView, SourceView } from "./state";
 
 const SYMBOL_PATTERN = /^(sh|sz)\.[0-9]{6}$/;
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -9,6 +9,7 @@ export interface SecurityRoute {
   asOf?: string;
   taxonomyId?: string;
   sectorId?: string;
+  returnView?: DecisionReturnView;
 }
 
 export interface DecisionRoute {
@@ -17,10 +18,16 @@ export interface DecisionRoute {
   sectorId: string | null;
 }
 
+export interface SectorRoute extends DecisionRoute {}
+
 function isSourceView(value: string | null): value is SourceView {
   return (
     value === "portfolio" || value === "watchlists" || value === "sectors"
   );
+}
+
+function isDecisionReturnView(value: string | null): value is DecisionReturnView {
+  return value === "overview" || value === "sectors";
 }
 
 function validDecisionContext(
@@ -32,11 +39,14 @@ function validDecisionContext(
     typeof value.taxonomyId === "string" &&
     value.taxonomyId.length > 0 &&
     typeof value.sectorId === "string" &&
-    value.sectorId.length > 0
+    value.sectorId.length > 0 &&
+    (value.returnView === undefined ||
+      value.returnView === "overview" ||
+      value.returnView === "sectors")
   );
 }
 
-export function decisionHash(route: DecisionRoute): string {
+function routeHash(prefix: "overview" | "sectors", route: DecisionRoute): string {
   if (
     !ISO_DATE_PATTERN.test(route.asOf) ||
     !route.taxonomyId ||
@@ -49,11 +59,14 @@ export function decisionHash(route: DecisionRoute): string {
     taxonomy_id: route.taxonomyId,
   });
   if (route.sectorId !== null) query.set("sector_id", route.sectorId);
-  return `#overview?${query}`;
+  return `#${prefix}?${query}`;
 }
 
-export function parseDecisionHash(hash: string): DecisionRoute | null {
-  const match = /^#overview(?:\?(.*))?$/.exec(hash);
+function parseRouteHash(
+  prefix: "overview" | "sectors",
+  hash: string,
+): DecisionRoute | null {
+  const match = new RegExp(`^#${prefix}(?:\\?(.*))?$`).exec(hash);
   if (!match) return null;
   const query = new URLSearchParams(match[1] ?? "");
   const asOf = query.get("as_of");
@@ -71,6 +84,22 @@ export function parseDecisionHash(hash: string): DecisionRoute | null {
   return { asOf, taxonomyId, sectorId };
 }
 
+export function decisionHash(route: DecisionRoute): string {
+  return routeHash("overview", route);
+}
+
+export function parseDecisionHash(hash: string): DecisionRoute | null {
+  return parseRouteHash("overview", hash);
+}
+
+export function sectorHash(route: SectorRoute): string {
+  return routeHash("sectors", route);
+}
+
+export function parseSectorHash(hash: string): SectorRoute | null {
+  return parseRouteHash("sectors", hash);
+}
+
 export function securityHash(
   symbol: string,
   sourceView: SourceView,
@@ -85,6 +114,9 @@ export function securityHash(
     query.set("as_of", decisionContext.asOf);
     query.set("taxonomy_id", decisionContext.taxonomyId);
     query.set("sector_id", decisionContext.sectorId);
+    if (decisionContext.returnView) {
+      query.set("return_view", decisionContext.returnView);
+    }
   }
   return `#security/${encodeURIComponent(symbol)}?${query}`;
 }
@@ -105,9 +137,12 @@ export function parseSecurityHash(hash: string): SecurityRoute | null {
   const asOf = query.get("as_of");
   const taxonomyId = query.get("taxonomy_id");
   const sectorId = query.get("sector_id");
+  const returnView = query.get("return_view");
   const hasDecisionContext =
     asOf !== null || taxonomyId !== null || sectorId !== null;
-  if (!hasDecisionContext) return { symbol, sourceView };
+  if (!hasDecisionContext) {
+    return returnView === null ? { symbol, sourceView } : null;
+  }
   if (
     !validDecisionContext({
       asOf: asOf ?? undefined,
@@ -117,12 +152,14 @@ export function parseSecurityHash(hash: string): SecurityRoute | null {
   ) {
     return null;
   }
+  if (returnView !== null && !isDecisionReturnView(returnView)) return null;
   return {
     symbol,
     sourceView,
     asOf: asOf!,
     taxonomyId: taxonomyId!,
     sectorId: sectorId!,
+    ...(returnView ? { returnView } : {}),
   };
 }
 

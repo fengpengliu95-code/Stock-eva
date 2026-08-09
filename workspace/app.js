@@ -5,7 +5,6 @@ const ROUTE_CHANGE_EVENT = "stock-eva-route-change";
 
 const state = {
   market: null,
-  supplemental: null,
   positions: [],
   watchlists: [],
   strategies: [],
@@ -287,49 +286,6 @@ async function loadMarket() {
     byId("market-message").textContent = safeMessage(error);
     renderBreadthChart("market-primary-chart", {}, "error");
     renderBreadthChart("market-structure-chart", {}, "error");
-  }
-}
-
-function formatReportedFlow(value) {
-  if (value === null || value === undefined) return "—";
-  return `${formatNumber(Number(value) / 100000000)} 亿元`;
-}
-
-async function loadSupplementalMarket() {
-  const body = byId("sector-flow-body");
-  clear(body);
-  try {
-    const data = await api("/market/supplemental");
-    state.supplemental = data;
-    const ready = ["ready", "partial"].includes(data.status);
-    setBadge(byId("supplemental-status"), ready ? data.status : "empty");
-    byId("supplemental-status").textContent = ready
-      ? STATUS_TEXT[data.status]
-      : data.status === "not_configured" ? "未接入" : "暂无快照";
-    byId("supplemental-source").textContent = ready
-      ? `AKShare · 数据日 ${data.as_of || "未确认"}`
-      : "AKShare 可选适配层";
-    byId("market-flow-summary").textContent = data.market_flow
-      ? `大盘上游报告主力净流入 ${formatReportedFlow(data.market_flow.reported_main_net_inflow)} · 数据日 ${data.market_flow.trade_date}`
-      : "大盘资金流无已发布快照；不会从 OHLCV 推断主力方向。";
-    data.sector_flows.forEach((item) => {
-      const row = node("tr");
-      row.append(
-        node("td", item.scope_name),
-        node("td", formatReportedFlow(item.reported_main_net_inflow), "mono"),
-        node("td", item.trade_date, "mono")
-      );
-      body.append(row);
-    });
-    byId("supplemental-message").textContent = data.sector_flows.length
-      ? "数值为上游报告口径，不代表交易所认证资金流，也不是投资建议。"
-      : "仅接受带明确交易日的上游历史流数据；实时排名与无日期结果被拒绝。";
-  } catch (error) {
-    setBadge(byId("supplemental-status"), "error");
-    byId("supplemental-status").textContent = "不可用";
-    byId("supplemental-source").textContent = "补充数据 API 不可用";
-    byId("market-flow-summary").textContent = "未展示资金流数据。";
-    byId("supplemental-message").textContent = safeMessage(error);
   }
 }
 
@@ -776,7 +732,6 @@ async function loadWorkspace() {
   byId("global-status").textContent = "正在读取本地数据视图…";
   await Promise.all([
     loadMarket(),
-    loadSupplementalMarket(),
     loadPortfolio(),
     loadWatchlists(),
     loadStrategies(),
@@ -797,7 +752,8 @@ const VIEW_TITLES = {
 };
 
 function activateView(identifier, updateHash = true) {
-  const requested = identifier.startsWith("security/") ? "security" : identifier;
+  const requestedHash = identifier.split("?")[0];
+  const requested = requestedHash.startsWith("security/") ? "security" : requestedHash;
   const target = VIEW_TITLES[requested] ? requested : "overview";
   document.querySelectorAll("[data-view]").forEach((view) => {
     const active = view.dataset.view === target;

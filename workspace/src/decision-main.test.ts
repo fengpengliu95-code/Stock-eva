@@ -104,6 +104,7 @@ describe("decision-flow and technical-cockpit integration", () => {
     const module = (await import("./main")) as WorkspaceLifecycle;
     dispose = module.disposeSecurityCockpit;
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
+    module.initializeSecurityCockpit?.();
 
     let cockpit = await waitFor(() =>
       getByRole(document.body, "button", {
@@ -164,6 +165,87 @@ describe("decision-flow and technical-cockpit integration", () => {
         String(input).includes("/api/v1/analysis/"),
       ),
     ).toHaveLength(contextCallsBeforeOpen);
+  });
+
+  it("round-trips a standalone sector deep link through the technical cockpit", async () => {
+    installDocument();
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      '<section id="sectors" data-view="sectors"><section id="sector-decision-flow" aria-label="板块证据工作区"></section></section>',
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "#sectors?as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector-b",
+    );
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/analysis/market-regime")) return jsonResponse(marketFixture());
+      if (url.pathname.endsWith("/analysis/sector-rotation")) return jsonResponse(sectorsFixture());
+      if (url.pathname.includes("/analysis/sectors/sector-b/leaders")) return jsonResponse(leadersFixture());
+      if (url.pathname.endsWith("/market/history/dates")) return jsonResponse(["2026-01-30", "2026-01-31"]);
+      if (url.pathname.endsWith("/securities/sz.000002/analysis")) {
+        return jsonResponse({ symbol: "sz.000002", status: "empty", as_of: null, source: "baostock", price_adjustment: "qfq", formula_version: "sector-route-test", quality_issues: ["no_market_data"], series: [] });
+      }
+      return jsonResponse({ detail: "unexpected endpoint" }, 503);
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const module = (await import("./main")) as WorkspaceLifecycle;
+    dispose = module.disposeSecurityCockpit;
+    document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
+    module.initializeSecurityCockpit?.();
+
+    const cockpit = await waitFor(() => getByRole(document.body, "button", { name: "打开 sz.000002 技术驾驶舱" }));
+    expect(document.querySelector("#sector-decision-flow")?.textContent).toContain("板块证据工作区");
+    fireEvent.click(cockpit);
+    await waitFor(() => expect(window.location.hash).toContain("return_view=sectors"));
+    const back = getByRole(document.body, "link", { name: /返回盘后决策流/ });
+    expect(back.getAttribute("href")).toBe("#sectors?as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector-b");
+    fireEvent.click(back);
+    await waitFor(() => expect(window.location.hash).toBe("#sectors?as_of=2026-01-31&taxonomy_id=baostock.industry_classification&sector_id=sector-b"));
+  });
+
+  it("aborts a pending standalone-sector request when navigation leaves the decision views", async () => {
+    installDocument();
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      '<section id="sectors" data-view="sectors"><section id="sector-decision-flow" aria-label="板块证据工作区"></section></section>',
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "#sectors?as_of=2026-02-02&taxonomy_id=baostock.industry_classification",
+    );
+    const market = deferred<Response>();
+    const sectors = deferred<Response>();
+    const fetcher = vi.fn<typeof fetch>((input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/analysis/market-regime")) return market.promise;
+      if (url.pathname.endsWith("/analysis/sector-rotation")) return sectors.promise;
+      return Promise.resolve(jsonResponse({ detail: "unexpected endpoint" }, 503));
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const module = (await import("./main")) as WorkspaceLifecycle;
+    dispose = module.disposeSecurityCockpit;
+    module.initializeSecurityCockpit?.();
+    await waitFor(() =>
+      expect(fetcher.mock.calls.filter(([input]) => String(input).includes("/analysis/")).length).toBe(2),
+    );
+
+    window.history.pushState(null, "", "#watchlists");
+    window.dispatchEvent(new Event("stock-eva-route-change"));
+    const signals = fetcher.mock.calls
+      .filter(([input]) => String(input).includes("/analysis/"))
+      .map(([, init]) => init?.signal as AbortSignal);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+
+    market.resolve(jsonResponse(marketFixture()));
+    sectors.resolve(jsonResponse(sectorsFixture()));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(window.location.hash).toBe("#watchlists");
+    expect(document.querySelector("#sector-decision-flow")?.textContent).not.toContain("后端板块排名");
   });
 
   it.each([

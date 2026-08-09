@@ -9,6 +9,7 @@ import {
 } from "../__tests__/decision-fixtures";
 import {
   renderDecisionFlow,
+  renderSectorWorkspace,
   type DecisionFlowState,
 } from "./decision-flow";
 
@@ -202,5 +203,38 @@ describe("after-close decision flow view", () => {
     expect(details.length).toBeGreaterThan(2);
     expect(details[0].tagName).toBe("DETAILS");
     expect(details[0].textContent).toContain("查看");
+  });
+
+  it("renders a standalone backend-ranked sector workspace without unsupported visuals", () => {
+    renderSectorWorkspace(root(), readyState());
+
+    expect(getByRole(document.body, "heading", { name: "板块证据工作区" })).toBeTruthy();
+    const ranking = document.querySelector<HTMLElement>("[data-sector-ranking-list]")!;
+    expect(getAllByRole(ranking, "button", { name: /查看.*龙头/ }).map((item) => item.textContent)).toEqual([
+      expect.stringContaining("后端第二行"),
+      expect.stringContaining("后端第一名"),
+    ]);
+    expect(document.body.textContent).toContain("后端总分");
+    expect(document.body.textContent).toContain("classification-fixture");
+    expect(document.body.textContent).toContain("资金证据 missing / Release 2");
+    expect(document.body.textContent).toContain("不可作为操作首选");
+    expect(document.body.textContent).not.toContain("热力图");
+    expect(document.body.textContent).not.toContain("成分股数据");
+  });
+
+  it.each([
+    ["loading", null, null, "正在读取市场状态与板块轮动"],
+    ["error", 422, "future_as_of", "日期不在可读取范围"],
+    ["error", 503, "market_storage_unavailable", "本地行情存储暂不可用"],
+  ] as const)("renders standalone sector %s state truthfully", (phase, status, message, expected) => {
+    const state: DecisionFlowState =
+      phase === "loading"
+        ? { phase, query: decisionQuery }
+        : { phase, query: decisionQuery, status: status!, message: message! };
+
+    renderSectorWorkspace(root(), state);
+
+    expect(document.body.textContent).toContain(expected);
+    expect(document.body.textContent).not.toContain("主力净流入");
   });
 });

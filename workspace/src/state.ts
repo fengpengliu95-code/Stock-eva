@@ -1,12 +1,14 @@
 import type { SecurityAnalysisResponse } from "./api";
 
 export type SourceView = "portfolio" | "watchlists" | "sectors";
+export type DecisionReturnView = "overview" | "sectors";
 export type EmptyReason = "no_market_data" | "no_effective_trading_data";
 
 export interface DecisionContext {
   asOf: string;
   taxonomyId: string;
   sectorId: string;
+  returnView?: DecisionReturnView;
 }
 
 interface CockpitContext {

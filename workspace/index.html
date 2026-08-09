@@ -186,49 +186,14 @@
       <section id="sectors" class="workspace-view" data-view="sectors" aria-labelledby="sectors-title" hidden>
         <div class="view-intro">
           <div>
-            <p class="panel-kicker">SECTORS & TURNOVER</p>
+            <p class="panel-kicker">SECTORS / EVIDENCE FIRST</p>
             <h2 id="sectors-title">板块与成交</h2>
-            <p>板块排名、联动大图与成分股表采用独立工作区。当前不把成交额包装成资金净流入。</p>
+            <p>按后端已发布的分类、行情和龙头证据复盘；不把成交额包装成资金净流入。</p>
           </div>
-          <span id="supplemental-status" class="status-badge status-empty">数据未接入</span>
         </div>
-        <div class="sector-workspace">
-          <article class="panel sector-list-panel">
-            <div class="panel-heading">
-              <div><p class="panel-kicker">RANKING</p><h3>板块排名</h3></div>
-              <span id="supplemental-source" class="quiet-tag">暂无已发布快照</span>
-            </div>
-            <p id="market-flow-summary" class="meta-line">大盘资金流尚未接入；不会从 OHLCV 推断主力方向。</p>
-            <div id="sector-map" class="chart-frame chart-secondary" role="img" aria-label="板块涨跌热力图空态">
-              <p class="empty-chart-copy">板块分类与成分映射尚未接入<br><small>不会用随机色块代替真实热力图</small></p>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <caption class="sr-only">板块排名</caption>
-                <thead><tr><th scope="col">板块</th><th scope="col">上游报告主力净流入</th><th scope="col">数据日</th></tr></thead>
-                <tbody id="sector-flow-body"></tbody>
-              </table>
-            </div>
-            <p id="supplemental-message" class="state-message">仅接受带明确交易日的上游历史流数据。</p>
-          </article>
-          <article class="panel sector-detail-panel">
-            <div class="panel-heading">
-              <div><p class="panel-kicker">SECTOR DETAIL</p><h3>板块表现</h3></div>
-              <span class="quiet-tag">等待选择</span>
-            </div>
-            <div id="sector-detail-chart" class="chart-frame chart-primary" role="img" aria-label="板块表现大图空态">
-              <p class="empty-chart-copy">选择有真实数据的板块后显示走势<br><small>当前没有可绘制序列</small></p>
-            </div>
-            <div class="table-wrap component-table">
-              <table>
-                <caption class="sr-only">板块成分股</caption>
-                <thead><tr><th scope="col">证券</th><th scope="col">收盘</th><th scope="col">涨跌</th><th scope="col">成交额</th><th scope="col">数据状态</th></tr></thead>
-                <tbody></tbody>
-              </table>
-              <p class="state-message">暂无成分股数据。</p>
-            </div>
-          </article>
-        </div>
+        <section id="sector-decision-flow" class="decision-flow-shell" aria-label="板块证据工作区">
+          <p class="state-message" role="status">正在读取后端板块证据…</p>
+        </section>
       </section>
 
       <section id="portfolio" class="workspace-view" data-view="portfolio" aria-labelledby="positions-title" hidden>

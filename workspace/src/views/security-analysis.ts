@@ -1,4 +1,5 @@
 import type { SecurityAnalysisResponse, TechnicalAnalysisPoint } from "../api";
+import { decisionHash, sectorHash } from "../navigation";
 import type { CockpitState, SourceView } from "../state";
 
 export type ChartCleanup = () => void;
@@ -176,12 +177,10 @@ export function renderSecurityAnalysis(
     return null;
   }
   if (state.decisionContext) {
-    const query = new URLSearchParams({
-      as_of: state.decisionContext.asOf,
-      taxonomy_id: state.decisionContext.taxonomyId,
-      sector_id: state.decisionContext.sectorId,
-    });
-    back.href = `#overview?${query}`;
+    const context = state.decisionContext;
+    back.href = context.returnView === "sectors"
+      ? sectorHash(context)
+      : decisionHash(context);
     back.dataset.decisionReturn = "true";
     delete back.dataset.viewTarget;
   } else {

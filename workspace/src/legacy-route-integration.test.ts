@@ -2,6 +2,7 @@ import { fireEvent, getByRole, waitFor } from "@testing-library/dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  leadersFixture,
   marketFixture,
   sectorsFixture,
 } from "./__tests__/decision-fixtures";
@@ -189,5 +190,38 @@ describe("legacy and decision router integration", () => {
     window.history.pushState(null, "", "#overview");
     window.dispatchEvent(new Event("stock-eva-route-change"));
     expect(fetcher).toHaveBeenCalledTimes(callsBeforeDispose);
+  });
+
+  it("does not request the legacy supplemental endpoint for the canonical sector workspace", async () => {
+    installAssembledDocument();
+    window.history.replaceState(
+      null,
+      "",
+      "#sectors?as_of=2026-01-31&taxonomy_id=baostock.industry_classification",
+    );
+    vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/analysis/market-regime")) return jsonResponse(marketFixture());
+      if (url.pathname.endsWith("/analysis/sector-rotation")) return jsonResponse(sectorsFixture());
+      if (url.pathname.includes("/analysis/sectors/sector-b/leaders")) return jsonResponse(leadersFixture());
+      return jsonResponse({ detail: "unused route fixture" }, 503);
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    // @ts-expect-error app.js intentionally remains an untyped legacy script.
+    await import("../app.js");
+    const cockpitModule = await import("./main");
+    disposeSecurityCockpit = cockpitModule.disposeSecurityCockpit;
+    document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
+    cockpitModule.initializeSecurityCockpit();
+
+    await waitFor(() => expect(document.querySelector("#sector-decision-flow")?.textContent).toContain("板块证据工作区"));
+    expect(fetcher.mock.calls.some(([input]) => String(input).includes("/market/supplemental"))).toBe(false);
+    await waitFor(() =>
+      expect(document.querySelector("#global-status")?.textContent).toBe(
+        "本地数据视图读取完成。",
+      ),
+    );
   });
 });
