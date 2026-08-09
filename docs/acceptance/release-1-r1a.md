@@ -308,12 +308,63 @@ not establish the required canonical `/Volumes/Stock` SMB mount; the NAS check
 returned `not_mounted`. The installer therefore cannot execute its verified
 mirror and atomic runtime switch yet, and the release process was not bypassed.
 
+### 2026-08-09 real 20-session post-hoc replay
+
+An isolated historical classification fetch for `as_of=2026-07-13` included
+one controlled `security_basic/deadline` failure that reported no write. After
+the bounded retry sequence, the TEMP database contained exactly one promoted
+ready generation. A final 60-second run returned the same generation as an
+idempotent no-write result:
+
+```text
+generation_id=classification-0b8fd0f28b15beab26e1e726
+source_snapshot_date=2026-07-13
+source_date_semantics=requested_unverified
+observed_at=2026-08-09T12:02:26.975873+08:00
+security_master_history=7305
+index_component_history=850
+sector_membership_history=5203
+eligible_count=5202
+mapped_count=5202
+coverage_ratio=1.0
+quality_issues=[]
+```
+
+The promoted generation was then joined read-only to the installed immutable
+canonical price dataset for the 20 trading sessions from `2026-07-13` through
+`2026-08-07`. The replay used the explicit audit cutoff
+`known_at=2026-08-09T04:08:48.509336Z`. For every session it asserted that the
+selected generation, every security and membership source date, every
+membership effective window and every price row did not exceed the requested
+`as_of`. It recalculated market regime, all sector rankings and the leading
+sector's leader candidates for each date:
+
+```text
+status=verified_post_hoc_known_at
+session_count=20
+generation_count=1
+minimum_sector_count=83
+minimum_leader_count=3
+future_membership_reads=0
+future_price_reads=0
+```
+
+The strategic/tactical result changed from `bear/risk_off` to
+`range/risk_off`, and the leading sector and candidate counts also changed,
+showing that the matrix recalculated each session instead of repeating one
+result. This proves the no-future-date behavior for the real post-hoc replay.
+It does **not** prove that the classification was visible on those historical
+dates: the only generation was actually observed on 2026-08-09 and the
+production HTTP contract correctly hides it from earlier `as_of` requests.
+Prospective historical visibility therefore remains distinct and unverified.
+
 ## Pending real acceptance gates
 
 - One real TEMP promoted generation and the eligible-universe 95% industry target are now
   verified. Production installation and production readback remain pending on the NAS mount.
-- The required 20-session historical replay and no-future read acceptance is not yet run on
-  real published generations.
+- The real 20-session post-hoc replay and its no-future membership/price assertions passed.
+  Contemporaneous historical visibility is not claimed because the generation was observed
+  after all replayed sessions.
 - Isolated real-data browser acceptance passed, but installed-runtime browser readback remains
   pending with the production deployment.
 - Component history capability remains `unverified`, not `verified`.
