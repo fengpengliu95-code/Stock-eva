@@ -2,6 +2,8 @@ import asyncio
 import json
 import math
 import os
+import shutil
+import threading
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
@@ -13,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 import backend.app.market.normalize as normalize_module
+import backend.app.storage.dataset as dataset_module
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
 from backend.app.market.models import DailyBar, RefreshResult
@@ -472,7 +475,9 @@ def test_published_reader_projects_only_regime_fields_from_validated_parquet(
     )
 
 
-def test_published_cache_revalidates_same_generation_object_mutation(tmp_path: Path) -> None:
+def test_published_cache_revalidates_same_generation_object_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A cache hit must fail closed when a referenced immutable object changes."""
     _, _, store_module = _regime_modules()
     dataset_root = tmp_path / "dataset"
@@ -514,14 +519,69 @@ def test_published_cache_revalidates_same_generation_object_mutation(tmp_path: P
     )
     manifest = json.loads((dataset_root / "manifest.json").read_text(encoding="utf-8"))
     parquet = dataset_root / manifest["files"][0]["path"]
-    store = store_module.MarketRegimeStore(
-        store_module.PublishedDatasetMarketReader(
-            control_path=tmp_path / "control.duckdb",
-            control_temp=tmp_path / "reader-temp",
-            dataset_root=dataset_root,
-            staging_root=tmp_path / "staging",
-        )
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "reader-temp",
+        dataset_root=dataset_root,
+        staging_root=tmp_path / "staging",
     )
+    calls = 0
+    original_hash = dataset_module._sha256
+
+    def counted_hash(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path)
+
+    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    reader.store.ensure_readiness()
+    assert calls >= 1
+    calls = 0
+    reader.store._query("SELECT count(*) FROM daily_bars")
+    assert calls == 0
+    reader.cache_snapshot()
+    reader.cache_snapshot()
+    assert calls == 2
+    second_root = tmp_path / "dataset-second"
+    shutil.copytree(dataset_root, second_root)
+    second_reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control-second.duckdb",
+        control_temp=tmp_path / "reader-temp-second",
+        dataset_root=second_root,
+        staging_root=tmp_path / "staging-second",
+    )
+    barrier = threading.Barrier(2)
+    barrier_paths: set[Path] = set()
+    barrier_lock = threading.Lock()
+
+    def barrier_hash(path: Path) -> str:
+        with barrier_lock:
+            first_for_path = path not in barrier_paths
+            barrier_paths.add(path)
+        if first_for_path:
+            barrier.wait(timeout=2)
+        return original_hash(path)
+
+    monkeypatch.setattr(dataset_module, "_sha256", barrier_hash)
+    errors: list[BaseException] = []
+
+    def strict_snapshot(target) -> None:
+        try:
+            target.cache_snapshot()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=strict_snapshot, args=(reader,))
+    second_thread = threading.Thread(target=strict_snapshot, args=(second_reader,))
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=3)
+    second_thread.join(timeout=3)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    store = store_module.MarketRegimeStore(reader)
 
     store.read(AS_OF)
     original_stat = parquet.stat()
