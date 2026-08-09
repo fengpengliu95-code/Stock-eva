@@ -43,6 +43,7 @@ def test_api_and_workspace_agents_are_local_only_and_recoverable() -> None:
 
     assert api["RunAtLoad"] is True
     assert api["KeepAlive"] is True
+    assert api["ProcessType"] == "Interactive"
     assert api["WorkingDirectory"] == str(CONFIG_ROOT)
     assert api["ProgramArguments"][-4:] == [
         "--host",
@@ -85,11 +86,15 @@ def test_after_close_agent_uses_idempotent_backend_schedule() -> None:
         {"Hour": 7, "Minute": 15},
     ]
     assert "KeepAlive" not in refresh
+    assert refresh["ProcessType"] == "Background"
 
 
 def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
     calendar = rendered_plist("com.finlay.stock-eva.calendar.plist.in")
     backup = rendered_plist("com.finlay.stock-eva.backup.plist.in")
+
+    assert calendar["ProcessType"] == "Background"
+    assert backup["ProcessType"] == "Background"
 
     assert calendar["RunAtLoad"] is True
     assert calendar["StartCalendarInterval"] == [
