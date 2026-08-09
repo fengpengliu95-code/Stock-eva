@@ -250,16 +250,72 @@ its local market dataset reported `ready`, but its OpenAPI contract did not yet
 contain classification routes and no deployed `classification.duckdb` existed.
 No production service was restarted or replaced during this acceptance run.
 
+### 2026-08-09 successful real TEMP publication and browser follow-up
+
+A later readiness probe confirmed TCP access and completed one bounded BaoStock
+login in `0.666s`. A new explicit TEMP root then completed the full unchanged
+classification sync with one machine-readable stdout line and no stderr:
+
+```text
+exit=0
+status=ready
+network_requests=6
+writes_classification_data=true
+new_generation=true
+generation_id=classification-a5b8337d0da7e3a3594dfe95
+source_snapshot_date=2026-08-07
+source_date_semantics=requested_unverified
+security_master_history=7336
+index_component_history=850
+sector_membership_history=5203
+eligible_count=5205
+mapped_count=5202
+coverage_ratio=0.9994236311239193
+quality_issues=[]
+```
+
+The three unmapped eligible symbols were `sh.603468`, `sz.001232` and
+`sz.301707`. The promoted generation exceeded the 95% industry target without
+lowering the threshold. HTTP readback against the same real TEMP database
+returned the same generation for securities, 83 sectors, sector members and
+coverage at `as_of=2026-08-09`. Requests at `2026-08-07` and `2026-08-06`
+returned the truthful `no_classification_generation` empty state because the
+generation had not yet been observed; `2026-08-10` was rejected with HTTP 422
+before a store read. HS300 remained explicitly degraded with
+`component_history_unverified`.
+
+An isolated browser harness used the tracked mainline workspace with only its
+API origin mechanically redirected to the temporary API. It read the existing
+local canonical market dataset and the real TEMP classification generation.
+The market-to-sector-to-leader-to-security path rendered:
+
+- `range` / `risk_off`, low confidence and the narrow-scope disclaimer;
+- 83 backend-ranked sectors and explicit missing/unavailable fund-flow evidence;
+- a coal-sector deep link preserving `as_of`, taxonomy and sector identity;
+- 25 backend leader candidates, all retaining unavailable limit-lock risk and
+  non-actionable wording;
+- `sh.600403` with the same decision context plus 260 effective sessions,
+  qfq candles, volume, MA, MACD and RSI from backend values.
+
+The browser console had no warnings or errors. No production service, user
+database or NAS file was changed by this staging acceptance.
+
+The official LaunchAgent installer passed its read-only preflight for main
+`b2382ed` (`mutation=false`), but production installation was not attempted.
+The current installed runtime is still `07f38d58` and lacks classification
+routes. `DS220plus.local:445` was reachable, but the saved Finder connection did
+not establish the required canonical `/Volumes/Stock` SMB mount; the NAS check
+returned `not_mounted`. The installer therefore cannot execute its verified
+mirror and atomic runtime switch yet, and the release process was not bypassed.
+
 ## Pending real acceptance gates
 
-- No real BaoStock classification publication completed in this recovery.
-- No live TEMP run reached a promoted ready generation, so promotion and
-  production-readback acceptance remain pending.
-- The eligible-universe live industry mapping target of at least 95% is not yet measured.
+- One real TEMP promoted generation and the eligible-universe 95% industry target are now
+  verified. Production installation and production readback remain pending on the NAS mount.
 - The required 20-session historical replay and no-future read acceptance is not yet run on
   real published generations.
-- Browser acceptance for market to sector to leader to stock drill-down belongs to later
-  Release 1 work and remains pending.
+- Isolated real-data browser acceptance passed, but installed-runtime browser readback remains
+  pending with the production deployment.
 - Component history capability remains `unverified`, not `verified`.
 
 These pending gates prevent a Release 1 GO claim.
