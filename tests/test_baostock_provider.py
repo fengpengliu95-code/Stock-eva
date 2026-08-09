@@ -266,6 +266,50 @@ def test_generic_login_failure_discards_only_the_new_half_initialized_session(
     assert provider._session_usable is False
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [
+        RuntimeError("synthetic timeout configuration failure"),
+        BaoStockError("synthetic BaoStock timeout configuration failure"),
+    ],
+)
+def test_generic_timeout_configuration_failure_discards_the_new_session(
+    raised: Exception,
+) -> None:
+    class FailingTimeoutSocket(FakeSocket):
+        def settimeout(self, seconds) -> None:
+            self.timeout = seconds
+            raise raised
+
+    class SuccessfulLoginClient:
+        def __init__(self) -> None:
+            self.context = SimpleNamespace(default_socket=None)
+            self.socket = FailingTimeoutSocket()
+            self.login_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            self.context.default_socket = self.socket
+            return FakeResult([], [])
+
+    client = SuccessfulLoginClient()
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(type(raised)) as captured:
+        provider._login()
+
+    assert captured.value is raised
+    assert client.login_calls == 1
+    assert client.socket.shutdown_calls == 1
+    assert client.socket.closed is True
+    assert client.context.default_socket is None
+    assert provider._session_usable is False
+
+
 class CloseReleasedSocket(FakeSocket):
     def __init__(self) -> None:
         super().__init__()

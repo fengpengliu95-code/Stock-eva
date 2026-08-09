@@ -241,6 +241,9 @@ class BaoStockProvider:
                 last_error = BaoStockTransportError("BaoStock socket timeout configuration failed")
                 self._discard_session()
                 continue
+            except Exception:
+                self._discard_session()
+                raise
             self._session_usable = True
             return
         raise last_error or BaoStockTransportError("BaoStock login failed")

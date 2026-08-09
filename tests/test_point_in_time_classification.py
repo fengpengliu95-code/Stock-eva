@@ -1795,13 +1795,18 @@ def test_provider_counts_only_metadata_operations_when_relogin_fails() -> None:
     "exception_type",
     [RuntimeError, BaoStockError],
 )
-def test_provider_discards_half_initialized_login_before_sanitizing(
+def test_provider_discards_session_when_timeout_configuration_fails(
     exception_type: type[Exception],
 ) -> None:
     class HalfInitializedSocket:
         def __init__(self) -> None:
+            self.settimeout_calls = 0
             self.shutdown_calls = 0
             self.closed = False
+
+        def settimeout(self, _seconds: float) -> None:
+            self.settimeout_calls += 1
+            raise exception_type("HALF_LOGIN_SECRET /Users/private/login.sock")
 
         def shutdown(self, _how) -> None:
             self.shutdown_calls += 1
@@ -1817,7 +1822,7 @@ def test_provider_discards_half_initialized_login_before_sanitizing(
 
         def login(self):
             self.context.default_socket = self.socket
-            raise exception_type("HALF_LOGIN_SECRET /Users/private/login.sock")
+            return FakeResult([], [])
 
     client = HalfInitializedClient()
     provider = BaoStockClassificationProvider(
@@ -1834,6 +1839,7 @@ def test_provider_discards_half_initialized_login_before_sanitizing(
     assert error.value.failure.failure_stage == "login"
     assert error.value.failure.failure_class == "internal"
     assert error.value.failure.provider_request_count == 0
+    assert client.socket.settimeout_calls == 1
     assert client.socket.shutdown_calls == 1
     assert client.socket.closed is True
     assert client.context.default_socket is None
