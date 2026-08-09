@@ -14,12 +14,19 @@ from backend.app.regime.models import MarketRegimeResult
 CaptureMode = Literal["after_close", "post_hoc_backfill"]
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS regime_snapshots (
+    snapshot_id TEXT NOT NULL PRIMARY KEY,
     as_of TEXT NOT NULL,
     formula_version TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL,
+    result_id TEXT NOT NULL,
+    data_as_of TEXT,
+    capture_mode TEXT NOT NULL,
+    evidence_cutoff_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    dataset_generation TEXT NOT NULL,
+    dataset_identity_hash TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (as_of, formula_version)
+    result_payload TEXT NOT NULL,
+    UNIQUE (as_of, formula_version)
 )
 """
 
@@ -123,16 +130,12 @@ class RegimeSnapshotStore:
                 connection.execute(
                     """
                     INSERT INTO regime_snapshots
-                    (as_of, formula_version, snapshot_id, content_hash, payload)
-                    VALUES (?, ?, ?, ?, ?)
+                    (snapshot_id, as_of, formula_version, result_id, data_as_of, capture_mode,
+                     evidence_cutoff_at, recorded_at, dataset_generation, dataset_identity_hash,
+                     content_hash, result_payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        snapshot.as_of.isoformat(),
-                        snapshot.formula_version,
-                        snapshot.snapshot_id,
-                        snapshot.content_hash,
-                        snapshot.model_dump_json(),
-                    ),
+                    tuple(self._stored_fields(snapshot).values()),
                 )
             except sqlite3.IntegrityError as exc:
                 connection.execute("ROLLBACK")
@@ -168,7 +171,9 @@ class RegimeSnapshotStore:
             )
             row = connection.execute(
                 """
-                SELECT payload, content_hash
+                SELECT snapshot_id, as_of, formula_version, result_id, data_as_of, capture_mode,
+                       evidence_cutoff_at, recorded_at, dataset_generation, dataset_identity_hash,
+                       content_hash, result_payload
                 FROM regime_snapshots
                 WHERE as_of = ? AND formula_version = ?
                 """,
@@ -176,8 +181,36 @@ class RegimeSnapshotStore:
             ).fetchone()
             if row is None:
                 return None
-            payload, content_hash = row
-            snapshot = MarketRegimeSnapshot.model_validate_json(payload)
+            (
+                snapshot_id,
+                stored_as_of,
+                stored_formula_version,
+                result_id,
+                data_as_of,
+                capture_mode,
+                evidence_cutoff_at,
+                recorded_at,
+                dataset_generation,
+                dataset_identity_hash,
+                content_hash,
+                result_payload,
+            ) = row
+            snapshot = MarketRegimeSnapshot.model_validate(
+                {
+                    "snapshot_id": snapshot_id,
+                    "as_of": stored_as_of,
+                    "formula_version": stored_formula_version,
+                    "result_id": result_id,
+                    "data_as_of": data_as_of,
+                    "capture_mode": capture_mode,
+                    "evidence_cutoff_at": evidence_cutoff_at,
+                    "recorded_at": recorded_at,
+                    "dataset_generation": dataset_generation,
+                    "dataset_identity_hash": dataset_identity_hash,
+                    "content_hash": content_hash,
+                    "result": json.loads(result_payload),
+                }
+            )
             if (
                 snapshot.content_hash != content_hash
                 or self._content_hash(snapshot) != content_hash
@@ -227,4 +260,25 @@ class RegimeSnapshotStore:
 
     @staticmethod
     def _content_hash(snapshot: MarketRegimeSnapshot) -> str:
-        return _hash(snapshot.model_dump(mode="json", exclude={"content_hash"}))
+        fields = RegimeSnapshotStore._stored_fields(snapshot)
+        fields.pop("content_hash")
+        return _hash(fields)
+
+    @staticmethod
+    def _stored_fields(snapshot: MarketRegimeSnapshot) -> dict[str, str | None]:
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "as_of": snapshot.as_of.isoformat(),
+            "formula_version": snapshot.formula_version,
+            "result_id": snapshot.result_id,
+            "data_as_of": (
+                None if snapshot.data_as_of is None else snapshot.data_as_of.isoformat()
+            ),
+            "capture_mode": snapshot.capture_mode,
+            "evidence_cutoff_at": snapshot.evidence_cutoff_at.isoformat(),
+            "recorded_at": snapshot.recorded_at.isoformat(),
+            "dataset_generation": snapshot.dataset_generation,
+            "dataset_identity_hash": snapshot.dataset_identity_hash,
+            "content_hash": snapshot.content_hash,
+            "result_payload": _canonical(snapshot.result.model_dump(mode="json")),
+        }

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -159,7 +160,7 @@ def test_snapshot_reader_rejects_bad_schema_payload_hash_future_lineage_and_lock
         connection.close()
     elif mutation == "payload":
         connection = sqlite3.connect(store.path)
-        connection.execute("UPDATE regime_snapshots SET payload = ?", ["[]"])
+        connection.execute("UPDATE regime_snapshots SET result_payload = ?", ["[]"])
         connection.commit()
         connection.close()
     elif mutation == "hash":
@@ -171,7 +172,10 @@ def test_snapshot_reader_rejects_bad_schema_payload_hash_future_lineage_and_lock
         payload = _result().model_dump(mode="json")
         payload["source_lineage"][0]["latest_input_date"] = "2026-07-30"
         connection = sqlite3.connect(store.path)
-        connection.execute("UPDATE regime_snapshots SET payload = ?", [str(payload)])
+        connection.execute(
+            "UPDATE regime_snapshots SET result_payload = ?",
+            [json.dumps(payload)],
+        )
         connection.commit()
         connection.close()
     else:
@@ -196,3 +200,56 @@ def test_snapshot_metadata_never_contains_dataset_path(tmp_path: Path) -> None:
     assert snapshot.dataset_identity_hash == hashlib.sha256(
         b"/private/fixture/market.parquet"
     ).hexdigest()
+
+
+def test_snapshot_store_uses_explicit_canonical_result_payload_columns(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    snapshot, _ = store.capture(_request())
+
+    connection = sqlite3.connect(store.path)
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(regime_snapshots)")]
+    row = connection.execute(
+        """
+        SELECT snapshot_id, as_of, formula_version, result_id, data_as_of, capture_mode,
+               evidence_cutoff_at, recorded_at, dataset_generation, dataset_identity_hash,
+               content_hash, result_payload
+        FROM regime_snapshots
+        """
+    ).fetchone()
+    connection.close()
+
+    assert columns == [
+        "snapshot_id",
+        "as_of",
+        "formula_version",
+        "result_id",
+        "data_as_of",
+        "capture_mode",
+        "evidence_cutoff_at",
+        "recorded_at",
+        "dataset_generation",
+        "dataset_identity_hash",
+        "content_hash",
+        "result_payload",
+    ]
+    assert row == (
+        snapshot.snapshot_id,
+        snapshot.as_of.isoformat(),
+        snapshot.formula_version,
+        snapshot.result_id,
+        snapshot.data_as_of.isoformat(),
+        snapshot.capture_mode,
+        snapshot.evidence_cutoff_at.isoformat(),
+        snapshot.recorded_at.isoformat(),
+        snapshot.dataset_generation,
+        snapshot.dataset_identity_hash,
+        snapshot.content_hash,
+        json.dumps(
+            snapshot.result.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
