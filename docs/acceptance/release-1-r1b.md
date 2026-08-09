@@ -1,14 +1,55 @@
 # Release 1 R1-B acceptance
 
-Date: 2026-07-30 (Asia/Shanghai)
+Date: 2026-08-09 (Asia/Shanghai)
 
-R1-B review remediation: **LOCALLY VERIFIED — RE-REVIEW REQUIRED**
+R1-B verdict: **GO — installed production gate passed**
 
-Independent review: **SECOND CHANGES REQUIRED received; follow-up not yet re-reviewed**
+Independent review: **APPROVED after four cache-integrity rounds and one launchd follow-up**
 
-Mainline fresh-suite isolation follow-up: **LOCALLY VERIFIED**
+Mainline fresh-suite isolation follow-up: **VERIFIED — 768/768 tests collected and full run exited 0**
 
 Release 1 verdict: **PENDING — do not claim GO**
+
+## 2026-08-09 installed production gate
+
+- Main `2bf79872bbb26f4a342315601d8f1de906b3e7e1` was installed through the official
+  LaunchAgent installer. `RELEASE.json` reports that exact Git SHA; all five agents,
+  API, workspace and local dataset readiness read back ready. The dataset generation is
+  `generation-2374166120134660baba408ed01b7870`.
+- The first production probe exposed a product blocker that synthetic tests had not:
+  the API template classified the user-facing uvicorn process as launchd `Background`.
+  Cold/new-`as_of` calls took 33.93-40.45 seconds while the exact runtime and config in
+  a foreground uvicorn process took 6.646 seconds. A process sample placed the delay in
+  DuckDB result conversion under background resource limits, not in a different formula
+  or dataset.
+- The reviewed fix changes only the API to `ProcessType=Interactive`. launchd readback
+  now reports `spawn type = interactive`; refresh, calendar and backup remain background
+  jobs with their existing low-priority I/O behavior, and the static Web agent is
+  unchanged.
+- On a fresh installed API process, the first `2026-08-09` call returned HTTP 200 in
+  6.490 seconds. A second uncached date key returned in 5.551 seconds. Five identical
+  warm calls returned in 0.029-0.070 seconds. Every warm result retained
+  `regime-0d70e3d9f209e07387d1f366`, `range/risk_off`, score `-18.0407`, data date
+  `2026-08-07`, `narrow_provisional`, low confidence and `full_a_capable=false`.
+- The installed dataset path+content tree hash remained
+  `51f45fd204e4e510ab050e64578fb574fe8e200594bcb5b907c413e19778bc01`
+  before and after the API probes. The classification database remained
+  `45fd786ca80dd760e79b28432d3929de1b8da76111e265ea152ef5a8388f1941`, and the
+  supplemental control database remained
+  `45df0cfce85d8282a41feed7fae7b795f70df9a67e7d7b2e766dd6a2172c03dc`; their
+  sizes and timestamps were also unchanged.
+- Browser readback completed the overview decision flow with the same market state,
+  truthful narrow-scope disclaimer, 83 backend-returned sector rows and no browser
+  diagnostic logs. The whole overview was ready within the bounded 18.4-second
+  observation; that upper bound includes the current R1-C sector/leader calls and is not
+  reported as R1-B API latency.
+- The separate left-navigation `#sectors` workspace still reads the legacy supplemental/
+  optional-AKShare path and explicitly shows `未接入`. Connecting it to the reviewed
+  classification/rotation contracts is an R1-D acceptance item, not an R1-A or R1-B
+  regression. It must be closed before Release 1 GO.
+- Mainline verification after the launchd fix: full `pytest -q` reached 100% and exited
+  0; collect-only reports 768 tests; Ruff, shell syntax, plist lint and `git diff --check`
+  all passed.
 
 ## Scope verified in this worker
 
@@ -319,7 +360,7 @@ This is a deterministic replay of the observed main-board/two-index local datase
 full-A acceptance or a Release 1 GO. It does not include R1-C leadership implementation,
 user data, or a user-judgement comparison.
 
-## Pending real and Release 1 gates
+## Remaining Release 1 gates after R1-B GO
 
 - The 20-session local published-data replay above is verified, but no full-A coverage
   artifact exists.
@@ -327,9 +368,6 @@ user data, or a user-judgement comparison.
   immutable R1-B price publication under a shared PIT contract. It is therefore an
   eligible-universe lead for a versioned R1-B v2 audit, not proof of current price
   coverage or permission to remove the narrow-scope disclaimer.
-- Root must measure cold and warm installed-dataset/API latency and browser behavior.
-  This worker supplied only synthetic call-count regression evidence and did not open
-  the installed dataset, production database or browser.
 - Snapshot persistence for one result per ready trading day remains an R1-E gate; this
   acceptance evaluated results in memory and did not persist regime rows.
 - No authoritative point-in-time expected-universe denominator or board coverage audit is
@@ -340,8 +378,10 @@ user data, or a user-judgement comparison.
 - Leadership remains missing until R1-C supplies point-in-time sector persistence and leader
   diffusion.
 - Fund-flow evidence remains missing; price-volume turnover is not labeled as net flow.
-- R1-A live classification publication/coverage gates remain pending per its acceptance
-  record.
-- R1-C, R1-D browser drill-down and independent follow-up review remain pending.
+- R1-A classification publication is ready, but the separate price-coverage join described
+  above remains a future versioned model contract and does not authorize a full-A claim.
+- R1-C sector/leadership closure, R1-D browser drill-down and R1-E persistence/final
+  acceptance remain pending.
 
-These gates prevent an R1-B review GO or Release 1 GO claim.
+These gates do not reopen the truthful, deterministic R1-B narrow-scope engine. They do
+prevent a Release 1 GO claim.

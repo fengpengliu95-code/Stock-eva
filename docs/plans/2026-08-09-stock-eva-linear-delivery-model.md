@@ -54,19 +54,28 @@ Stock EVA 改为单版本、单切片线性交付。优先保证 point-in-time �
 
 ## 5. 当前执行队列
 
-### Paused for approval：R1-A GO
+### Completed：R1-A GO
 
 - R1-A 已完成独立复审、main 集成、串行全量测试、真实生产分类发布、API
   不可变性回读和浏览器决策路径验收。
 - `r1a-observability` clean worktree 在记录最终证据后移除，分支与 commit 保留审计。
+- 用户已确认进入 R1-B；R1-A 的分支与 commit 保留审计。
+
+### Paused for approval：R1-B GO
+
+- R1-B 已完成缓存完整性修复、独立复审、main 集成、768 项全量测试、真实生产
+  API 冷/热性能、只读数据哈希与浏览器总览验收。
+- 生产 API 的 launchd 分类已从后台批处理修正为用户交互服务；批处理 agent 保持后台。
 - 当前不启动开发子智能体，等待用户确认后才进入下一切片。
 - R1 未整体达到 GO 前，不继续任何 R2/R3 开发。
 
-### Next after approval：R1-B 状态引擎验收收口
+### Next after approval：R1-C 板块轮动与龙头验收收口
 
-- 先核对现有 R1-B 实现、acceptance 记录和 main 当前代码，不重复实现已存在功能。
+- 核对现有 sector-rotation/leaders 实现和 acceptance 记录，不重复实现已有的 83 板块结果。
+- 优先验收 point-in-time 成分、排名资格、缺失价格与受限主板范围；不得把成交额称为
+  主力净流入。
 - 如需修复，只启动一个开发子智能体；形成稳定 commit 后再串行启动一个 reviewer。
-- R1-B GO 后，按相同门禁依次处理 R1-C、R1-D 和最终 R1-E。
+- R1-C GO 后，按相同门禁依次处理 R1-D 和最终 R1-E。
 
 ### Parked：R2-C1 市场发布 provenance
 
