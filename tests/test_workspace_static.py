@@ -98,18 +98,21 @@ def test_workspace_has_no_expected_date_or_routine_refresh_control() -> None:
     assert "expected_date=" not in script
 
 
-def test_workspace_preserves_large_empty_chart_frames_and_390px_layout() -> None:
+def test_workspace_preserves_real_empty_chart_frames_and_390px_layout() -> None:
     html = (ROOT / "workspace" / "index.html").read_text()
     styles = (ROOT / "workspace" / "style.css").read_text()
 
     for identifier in (
         "market-primary-chart",
         "market-structure-chart",
-        "sector-map",
-        "sector-detail-chart",
         "portfolio-chart",
     ):
         assert f'id="{identifier}"' in html
+
+    assert 'id="sector-decision-flow"' in html
+    assert "正在读取后端板块证据" in html
+    assert 'id="sector-map"' not in html
+    assert 'id="sector-detail-chart"' not in html
 
     assert "--chart-primary-height: 420px" in styles
     assert "--chart-secondary-height: 280px" in styles

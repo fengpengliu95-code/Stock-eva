@@ -193,12 +193,18 @@ async def test_supplemental_api_never_fetches_on_get_and_is_explicitly_empty(
     assert capabilities["sector_fund_flow_rank"]["status"] == "rejected"
 
 
-def test_workspace_has_supplemental_empty_state_and_loader() -> None:
+def test_workspace_decouples_canonical_sector_flow_from_supplemental_loader() -> None:
     html = Path("workspace/index.html").read_text(encoding="utf-8")
     javascript = Path("workspace/app.js").read_text(encoding="utf-8")
 
-    assert 'id="supplemental-status"' in html
-    assert 'id="market-flow-summary"' in html
-    assert 'id="sector-flow-body"' in html
-    assert 'api("/market/supplemental")' in javascript
-    assert "reported_main_net_inflow" in javascript
+    assert 'id="sector-decision-flow"' in html
+    assert "正在读取后端板块证据" in html
+    assert "SECTORS / EVIDENCE FIRST" in html
+    for stale_identifier in (
+        "supplemental-status",
+        "market-flow-summary",
+        "sector-flow-body",
+    ):
+        assert f'id="{stale_identifier}"' not in html
+    assert 'api("/market/supplemental")' not in javascript
+    assert "loadSupplementalMarket" not in javascript
