@@ -271,6 +271,7 @@ def test_market_consuming_gets_do_not_change_control_or_dataset(tmp_path: Path) 
         f"/api/v1/market/history/sh.600000?start={AS_OF}&end={AS_OF}",
         f"/api/v1/securities/sh.600000/analysis?start={AS_OF}&end={AS_OF}",
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        f"/api/v1/analysis/market-regime/snapshots/{AS_OF}",
         f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
         f"/api/v1/classification/securities?as_of={AS_OF}&symbol=sh.600000",
         f"/api/v1/analysis/fund-flow-evidence?as_of={AS_OF}",
@@ -316,13 +317,14 @@ def test_missing_market_storage_gets_create_no_runtime_paths(tmp_path: Path) -> 
         "/api/v1/market/supplemental",
         "/api/v1/market/history/dates",
         f"/api/v1/analysis/market-regime?as_of={AS_OF}",
+        f"/api/v1/analysis/market-regime/snapshots/{AS_OF}",
         f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
     ]
     responses = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
 
     assert all(response.status_code < 500 for response in responses)
-    assert [response.status_code for response in responses[-2:]] == [200, 200]
-    assert [response.json()["status"] for response in responses[-2:]] == [
+    assert [response.status_code for response in responses[-3:]] == [200, 404, 200]
+    assert [response.json()["status"] for response in responses[-3::2]] == [
         "empty",
         "empty",
     ]

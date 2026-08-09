@@ -3,6 +3,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import threading
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -1252,6 +1253,65 @@ def test_snapshot_api_reads_exact_persisted_result_without_recomputation(
     assert response.status_code == 200
     assert response.json()["snapshot_id"] == persisted.snapshot_id
     assert response.json()["result"] == result.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("failure", ["schema", "payload", "hash", "lock"])
+def test_snapshot_api_failures_are_sanitized_and_read_only(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+    snapshots = import_module("backend.app.regime.snapshots")
+    result = import_module("backend.app.regime.service").MarketRegimeService().evaluate(
+        _inputs(import_module("backend.app.regime.models"), 0)
+    )
+    snapshot_store = snapshots.RegimeSnapshotStore(tmp_path / "control" / "snapshots.sqlite3")
+    snapshot_store.capture(
+        snapshots.SnapshotCaptureRequest(
+            result=result,
+            capture_mode="post_hoc_backfill",
+            evidence_cutoff_at=datetime(2026, 7, 29, tzinfo=UTC),
+            dataset_generation="fixture-generation",
+            dataset_identity="/private/dataset/fixture",
+        )
+    )
+    before = snapshot_store.path.read_bytes()
+    connection = sqlite3.connect(snapshot_store.path)
+    if failure == "schema":
+        connection.execute("DROP TABLE regime_snapshots")
+        connection.commit()
+        before = snapshot_store.path.read_bytes()
+    elif failure == "payload":
+        connection.execute("UPDATE regime_snapshots SET result_payload = '[]'")
+        connection.commit()
+        before = snapshot_store.path.read_bytes()
+    elif failure == "hash":
+        connection.execute("UPDATE regime_snapshots SET content_hash = ?", ["0" * 64])
+        connection.commit()
+        before = snapshot_store.path.read_bytes()
+    else:
+        connection.execute("BEGIN EXCLUSIVE")
+
+    try:
+        response = _api_request(
+            f"/api/v1/analysis/market-regime/snapshots/{AS_OF}",
+            {
+                analysis_api.get_regime_snapshot_store: lambda: snapshot_store,
+                analysis_api.get_regime_today: lambda: AS_OF,
+            },
+            raise_app_exceptions=False,
+        )
+    finally:
+        if failure == "lock":
+            connection.rollback()
+        connection.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "regime_snapshot_store_unavailable",
+        "storage_status": "unavailable",
+    }
+    assert snapshot_store.path.read_bytes() == before
 
 
 

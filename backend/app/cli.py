@@ -2,7 +2,7 @@ import argparse
 import json
 import signal
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from time import perf_counter
 from zoneinfo import ZoneInfo
@@ -407,7 +407,7 @@ def main() -> int:
                     outcome = service.capture_range(
                         args.start,
                         args.end,
-                        evidence_cutoff_at=datetime.now(UTC),
+                        evidence_cutoff_at=datetime.combine(args.end, time.max, UTC),
                     )
                     payload = {
                         "status": (
