@@ -2964,6 +2964,99 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected_exit", "expected_status"),
+    [
+        ("failure", 1, "error"),
+        ("success", 0, "ready"),
+    ],
+)
+def test_classification_cli_discards_untrusted_provider_output(
+    outcome: str,
+    expected_exit: int,
+    expected_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        local_market_dataset_root=tmp_path / "dataset",
+    )
+
+    class NoisyProvider:
+        def __init__(self, **kwargs) -> None:
+            self.last_request_count = 1
+            self.session = type(
+                "SessionDiagnostics",
+                (),
+                {
+                    "socket_timeout_seconds": kwargs["socket_timeout_seconds"],
+                    "max_attempts": 2,
+                },
+            )()
+
+        def fetch(self, _as_of: date) -> ClassificationSnapshot:
+            print("UPSTREAM_STDOUT_SECRET /Users/private/upstream.sock")
+            print(
+                "UPSTREAM_STDERR_SECRET /Users/private/upstream.err",
+                file=sys.stderr,
+            )
+            if outcome == "failure":
+                raise ClassificationProviderError(
+                    ClassificationFailure(
+                        failure_stage="security_universe",
+                        failure_class="transport",
+                        elapsed_seconds=1.5,
+                        provider_request_count=1,
+                        configured_timeout_seconds=30,
+                        configured_max_attempts=2,
+                    )
+                )
+            return snapshot(
+                securities=[security("sh.600000")],
+                memberships=[membership("sh.600000")],
+            )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockClassificationProvider", NoisyProvider)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "classification-sync",
+            "--as-of",
+            SNAPSHOT_DATE.isoformat(),
+            "--execute",
+            "--socket-timeout-seconds",
+            "30",
+        ],
+    )
+    stdout_before = sys.stdout
+    stderr_before = sys.stderr
+
+    assert cli.main() == expected_exit
+    assert sys.stdout is stdout_before
+    assert sys.stderr is stderr_before
+    captured = capsys.readouterr()
+    output_lines = captured.out.splitlines()
+    assert len(output_lines) == 1
+    payload = json.loads(output_lines[0])
+    assert payload["status"] == expected_status
+    assert captured.err == ""
+    assert "UPSTREAM_" not in captured.out
+    assert "UPSTREAM_" not in captured.err
+    assert "/Users/private" not in captured.out
+    assert "/Users/private" not in captured.err
+
+
 def test_classification_cli_dry_run_output_remains_compatible_and_write_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

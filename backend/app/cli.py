@@ -1,7 +1,7 @@
 import argparse
 import json
 import signal
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter
@@ -94,6 +94,14 @@ def _unexpected_classification_failure(
         ),
         configured_max_attempts=getattr(session, "max_attempts", None),
     )
+
+
+class _DiscardWriter:
+    def write(self, value: str) -> int:
+        return len(value)
+
+    def flush(self) -> None:
+        pass
 
 
 class _ProbeTimeoutInterrupt(BaseException):
@@ -315,12 +323,15 @@ def main() -> int:
                 if args.execute
                 else None
             )
-            result = run_classification_sync(
-                as_of=args.as_of,
-                execute=args.execute,
-                store=store,
-                provider=provider,
-            )
+            discard = _DiscardWriter()
+            # This command is a single-threaded CLI; these redirects are process-global.
+            with redirect_stdout(discard), redirect_stderr(discard):
+                result = run_classification_sync(
+                    as_of=args.as_of,
+                    execute=args.execute,
+                    store=store,
+                    provider=provider,
+                )
         except ClassificationFailureError as exc:
             print(
                 json.dumps(
