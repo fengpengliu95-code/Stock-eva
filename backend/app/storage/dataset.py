@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -29,7 +30,7 @@ MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
 SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_VALIDATED_DATASETS: set[tuple[str, str]] = set()
+_VALIDATED_OBJECTS: dict[tuple[str, str, int], tuple[int, int, int, int]] = {}
 _VALIDATION_LOCK = threading.Lock()
 _EXPECTED_PARQUET_TYPES = {
     "trade_date": "DATE",
@@ -65,6 +66,15 @@ class DatasetError(ValueError):
 
 class DatasetPublicationBusy(DatasetError):
     pass
+
+
+@dataclass(frozen=True)
+class PublishedReadSnapshot:
+    """One verified manifest/object view, safe to bind to a single read."""
+
+    identity: str
+    paths: tuple[Path, ...]
+    fingerprints: tuple[tuple[int, int, int, int], ...]
 
 
 class _ManifestLock:
@@ -277,7 +287,12 @@ class NasMarketStore:
         if rows != expected_rows:
             raise DatasetError("published parquet row count mismatch")
 
-    def _paths(self, *, force_validation: bool = False) -> list[Path]:
+    @staticmethod
+    def _fingerprint(path: Path) -> tuple[int, int, int, int]:
+        stat = path.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _read_snapshot(self, *, force_validation: bool = False) -> PublishedReadSnapshot:
         try:
             manifest = self._manifest()
             paths: list[Path] = []
@@ -288,23 +303,26 @@ class NasMarketStore:
                 if not path.is_file():
                     raise DatasetError("published manifest references a missing parquet file")
                 paths.append(path)
-            key = (str(self.root.resolve()), str(manifest["generation"]))
+            fingerprints = [self._fingerprint(path) for path in paths]
             with _VALIDATION_LOCK:
-                if force_validation or key not in _VALIDATED_DATASETS:
-                    for item, path in zip(items, paths, strict=True):
+                for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
+                    key = (str(path.resolve()), str(item["sha256"]), int(item["row_count"]))
+                    if force_validation or _VALIDATED_OBJECTS.get(key) != fingerprint:
                         if _sha256(path) != item["sha256"]:
                             raise DatasetError("published parquet checksum mismatch")
                         self._validate_parquet(path, item["row_count"])
-                    stale = {
-                        existing
-                        for existing in _VALIDATED_DATASETS
-                        if existing[0] == key[0]
-                    }
-                    _VALIDATED_DATASETS.difference_update(stale)
-                    _VALIDATED_DATASETS.add(key)
-            return paths
+                        _VALIDATED_OBJECTS[key] = fingerprint
+            content = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
+            return PublishedReadSnapshot(
+                identity=f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}",
+                paths=tuple(paths),
+                fingerprints=tuple(fingerprints),
+            )
         except OSError as exc:
             raise DatasetError("published NAS dataset is unavailable") from exc
+
+    def _paths(self, *, force_validation: bool = False) -> list[Path]:
+        return list(self._read_snapshot(force_validation=force_validation).paths)
 
     def validate_readiness(self) -> None:
         """Force manifest/hash/schema validation before exposing a NAS reader."""
@@ -315,23 +333,41 @@ class NasMarketStore:
         self._paths()
 
     def _query(self, sql: str, parameters: list[object] | None = None):
-        paths = self._paths()
-        if not paths:
+        snapshot = self._read_snapshot()
+        return self._query_snapshot(snapshot, sql, parameters)
+
+    def _query_snapshot(
+        self,
+        snapshot: PublishedReadSnapshot,
+        sql: str,
+        parameters: list[object] | None = None,
+    ):
+        if not snapshot.paths:
             return [], []
         connection: duckdb.DuckDBPyConnection | None = None
         try:
             connection = duckdb.connect(":memory:")
             cursor = connection.execute(
                 f"WITH daily_bars AS (SELECT * FROM read_parquet(?)) {sql}",
-                [[str(path) for path in paths], *(parameters or [])],
+                [[str(path) for path in snapshot.paths], *(parameters or [])],
             )
             columns = [item[0] for item in cursor.description]
-            return cursor.fetchall(), columns
+            rows = cursor.fetchall()
+            self._assert_snapshot_unchanged(snapshot)
+            return rows, columns
         except (duckdb.Error, OSError) as exc:
             raise DatasetError("published NAS dataset cannot be queried") from exc
         finally:
             if connection is not None:
                 connection.close()
+
+    def _assert_snapshot_unchanged(self, snapshot: PublishedReadSnapshot) -> None:
+        try:
+            current = tuple(self._fingerprint(path) for path in snapshot.paths)
+        except OSError as exc:
+            raise DatasetError("published snapshot changed during query") from exc
+        if current != snapshot.fingerprints:
+            raise DatasetError("published snapshot changed during query")
 
     def read_identity(self) -> str:
         """Return the checked immutable publication identity for read-result caches.
@@ -340,20 +376,11 @@ class NasMarketStore:
         every call. A cache may skip a repeat query, but it must not turn a
         missing/corrupt manifest or missing published object into a stale result.
         """
-        paths = self._paths()
-        manifest = self._manifest()
-        entries = [
-            (str(item["path"]), str(item["sha256"]), int(item["row_count"]))
-            for item in manifest["files"]
-        ]
-        if len(paths) != len(entries):
-            raise DatasetError("published manifest identity is inconsistent")
-        content = json.dumps(
-            {"generation": manifest["generation"], "files": entries},
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}"
+        return self._read_snapshot().identity
+
+    def read_snapshot(self) -> PublishedReadSnapshot:
+        """Capture one checked manifest/object view for a bound reader query."""
+        return self._read_snapshot()
 
     def exists(self) -> bool:
         return bool(self._paths())

@@ -17,11 +17,17 @@ Release 1 verdict: **PENDING — do not claim GO**
 - The published-dataset path previously rebuilt the complete 130-session R1-B input on
   every API request. `MarketRegimeStore` now reuses the evaluated input only when the
   immutable manifest identity, `as_of` and UTC-normalized `known_at` are identical.
-  The reader still parses and validates the current manifest and checks every referenced
-  object exists before it may return a cache hit. A changed manifest generation/file
-  identity causes a reread; malformed/unavailable metadata remains a 503 and cannot be
-  masked by an earlier result. The cache is process-local, bounded (128 entries), does
-  not write storage, and returns a deep copy.
+  Before a hit, the reader parses the current manifest and checks each referenced
+  object's device/inode/size/mtime fingerprint. A changed or previously unseen object
+  is checksum/schema/row-count validated before it can supply an identity. This corrects
+  the earlier overstatement that generation-only validation was sufficient: same-generation
+  object mutation now fails closed instead of serving a cached result. The cache is
+  process-local, bounded (128 entries), does not write storage, and returns a deep copy.
+- The reader now captures a `PublishedReadSnapshot` containing identity, paths and
+  fingerprints, then passes that same snapshot to the query. It does not read the
+  manifest again between cache identity and cold query; it also rejects a snapshot whose
+  object fingerprint changes during the query. Therefore an A manifest cannot key rows
+  selected from a later B manifest, including across separate `NasMarketStore` instances.
 - Focused regression evidence uses reader-call semantics rather than a machine-specific
   timing threshold: one unchanged immutable/PIT request produces one expensive reader
   call; changing either `known_at` or generation produces another; an availability
@@ -162,6 +168,15 @@ uv run --extra dev pytest -o addopts='' -q \
 
 uv run --extra dev pytest -o addopts='' -q tests/test_market_regime.py
 # 2026-08-09 final focused GREEN: 46 passed
+
+# Reviewer-requested cache safety RED: with the old generation-only validation cache,
+# append bytes to the manifest-referenced Parquet after cache fill and call read again;
+# the stale cached input was returned. The old identity-then-_query sequence also let a
+# publication switch bind a prior identity to later manifest rows.
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_market_regime.py::test_published_cache_revalidates_same_generation_object_mutation \
+  tests/test_market_regime.py::test_published_snapshot_binds_query_to_verified_manifest_view
+# GREEN after snapshot-bound query and object-fingerprint validation: 2 passed.
 
 # Mainline fresh-suite isolation reproduction:
 uv run --extra dev pytest -o addopts='' -q \

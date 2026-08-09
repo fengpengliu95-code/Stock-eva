@@ -1,9 +1,11 @@
 import asyncio
+import json
 import math
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,9 +14,10 @@ from pydantic import ValidationError
 import backend.app.market.normalize as normalize_module
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
-from backend.app.market.models import DailyBar
+from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore
+from backend.app.storage.dataset import NasMarketStore
 
 AS_OF = date(2026, 7, 29)
 
@@ -415,7 +418,10 @@ def test_published_reader_projects_only_regime_fields_from_validated_parquet(
             )
         ], []
 
-    reader.store._query = query  # type: ignore[method-assign]
+    reader.cache_snapshot = lambda: SimpleNamespace(identity="fixture")  # type: ignore[method-assign]
+    reader.store._query_snapshot = (  # type: ignore[method-assign]
+        lambda _snapshot, sql, parameters: query(sql, parameters)
+    )
 
     rows = reader.bars_through(AS_OF, max_sessions=130)
 
@@ -465,6 +471,117 @@ def test_published_reader_projects_only_regime_fields_from_validated_parquet(
     )
 
 
+def test_published_cache_revalidates_same_generation_object_mutation(tmp_path: Path) -> None:
+    """A cache hit must fail closed when a referenced immutable object changes."""
+    _, _, store_module = _regime_modules()
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
+        encoding="utf-8",
+    )
+    (dataset_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb", temp_directory=tmp_path / "writer-temp"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+    publisher.save_refresh(
+        [_bar(AS_OF, "sh.600000")],
+        RefreshResult(
+            run_id="r1b-cache-fixture",
+            requested_date=AS_OF,
+            source="baostock",
+            status="ready",
+            requested_count=1,
+            succeeded_count=1,
+            coverage_ratio=1,
+            started_at=datetime(2026, 7, 29, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 29, 1, tzinfo=UTC),
+        ),
+        publish=True,
+    )
+    manifest = json.loads((dataset_root / "manifest.json").read_text(encoding="utf-8"))
+    parquet = dataset_root / manifest["files"][0]["path"]
+    store = store_module.MarketRegimeStore(
+        store_module.PublishedDatasetMarketReader(
+            control_path=tmp_path / "control.duckdb",
+            control_temp=tmp_path / "reader-temp",
+            dataset_root=dataset_root,
+            staging_root=tmp_path / "staging",
+        )
+    )
+
+    store.read(AS_OF)
+    with parquet.open("ab") as handle:
+        handle.write(b"tampered")
+
+    with pytest.raises(store_module.MarketReadUnavailable, match="market_storage_unavailable"):
+        store.read(AS_OF)
+
+
+def test_published_snapshot_binds_query_to_verified_manifest_view(tmp_path: Path) -> None:
+    _, _, store_module = _regime_modules()
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}), encoding="utf-8"
+    )
+    (dataset_root / "manifest.json").write_text(
+        json.dumps(
+            {"dataset": "stock-eva-market", "schema_version": 2, "generation": "empty", "files": []}
+        ),
+        encoding="utf-8",
+    )
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb", temp_directory=tmp_path / "writer-temp"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+
+    def publish(close: float, run_id: str) -> None:
+        publisher.save_refresh(
+            [_bar(AS_OF, "sh.600000", close=close)],
+            RefreshResult(
+                run_id=run_id,
+                requested_date=AS_OF,
+                source="baostock",
+                status="ready",
+                requested_count=1,
+                succeeded_count=1,
+                coverage_ratio=1,
+                started_at=datetime(2026, 7, 29, tzinfo=UTC),
+                completed_at=datetime(2026, 7, 29, 1, tzinfo=UTC),
+            ),
+            publish=True,
+        )
+
+    publish(10, "snapshot-a")
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "reader-temp",
+        dataset_root=dataset_root,
+        staging_root=tmp_path / "staging",
+    )
+    snapshot_a = reader.cache_snapshot()
+    publish(20, "snapshot-b")
+
+    rows, _ = reader.store._query_snapshot(snapshot_a, "SELECT close FROM daily_bars")
+
+    assert rows == [(10.0,)]
+    assert snapshot_a.identity != reader.cache_snapshot().identity
+
+
 def test_store_reuses_immutable_generation_input_and_reloads_on_pit_key_change() -> None:
     """Avoid re-reading the same published generation for every overview refresh."""
     _, _, store_module = _regime_modules()
@@ -475,13 +592,15 @@ def test_store_reuses_immutable_generation_input_and_reloads_on_pit_key_change()
             self.bars_calls = 0
             self.identity_calls = 0
 
-        def cache_identity(self) -> str:
+        def cache_snapshot(self):
             # The real reader performs its manifest/filesystem availability
             # preflight here before allowing a cached result to be returned.
             self.identity_calls += 1
-            return f"fixture:{id(self)}:{self.generation}"
+            return SimpleNamespace(identity=f"fixture:{id(self)}:{self.generation}")
 
-        def bars_through(self, _as_of: date, *, max_sessions: int) -> list[DailyBar]:
+        def bars_through_snapshot(
+            self, _snapshot, _as_of: date, *, max_sessions: int
+        ) -> list[DailyBar]:
             assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
             self.bars_calls += 1
             return _market_bars(130)
@@ -510,12 +629,14 @@ def test_store_never_returns_cached_input_when_immutable_preflight_fails() -> No
             self.available = True
             self.bars_calls = 0
 
-        def cache_identity(self) -> str:
+        def cache_snapshot(self):
             if not self.available:
                 raise store_module.MarketReadUnavailable("market_storage_unavailable")
-            return f"fixture:{id(self)}:generation-one"
+            return SimpleNamespace(identity=f"fixture:{id(self)}:generation-one")
 
-        def bars_through(self, _as_of: date, *, max_sessions: int) -> list[DailyBar]:
+        def bars_through_snapshot(
+            self, _snapshot, _as_of: date, *, max_sessions: int
+        ) -> list[DailyBar]:
             assert max_sessions == store_module.REGIME_LOOKBACK_SESSIONS
             self.bars_calls += 1
             return _market_bars(130)

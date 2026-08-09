@@ -22,7 +22,7 @@ from backend.app.regime.models import (
     RegimeComponentInput,
     SourceLineage,
 )
-from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.dataset import DatasetError, NasMarketStore, PublishedReadSnapshot
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import configured_market_dataset_root
 
@@ -311,8 +311,25 @@ class PublishedDatasetMarketReader:
         *,
         max_sessions: int,
     ) -> list[DailyBar]:
+        return self.bars_through_snapshot(self.cache_snapshot(), as_of, max_sessions=max_sessions)
+
+    def cache_snapshot(self) -> PublishedReadSnapshot:
+        """Capture one checked immutable view for cache identity and query binding."""
         try:
-            rows, _ = self.store._query(
+            return self.store.read_snapshot()
+        except DatasetError as exc:
+            raise MarketReadUnavailable("market_storage_unavailable") from exc
+
+    def bars_through_snapshot(
+        self,
+        snapshot: PublishedReadSnapshot,
+        as_of: date,
+        *,
+        max_sessions: int,
+    ) -> list[DailyBar]:
+        try:
+            rows, _ = self.store._query_snapshot(
+                snapshot,
                 f"""
                 SELECT {_REGIME_BAR_COLUMNS}
                 FROM daily_bars
@@ -366,10 +383,7 @@ class PublishedDatasetMarketReader:
 
     def cache_identity(self) -> str:
         """Preflight the current immutable publication before a cached read."""
-        try:
-            return self.store.read_identity()
-        except DatasetError as exc:
-            raise MarketReadUnavailable("market_storage_unavailable") from exc
+        return self.cache_snapshot().identity
 
 
 def market_regime_store_from_settings(settings: Settings) -> "MarketRegimeStore":
@@ -403,15 +417,22 @@ class MarketRegimeStore:
         *,
         known_at: datetime | None = None,
     ) -> MarketRegimeInput:
-        cache_key = self._cache_key(as_of, known_at)
+        snapshot, cache_key = self._cache_key(as_of, known_at)
         if cache_key is not None:
             cached = self._cached_input(cache_key)
             if cached is not None:
                 return cached
-        raw_bars = self.reader.bars_through(
-            as_of,
-            max_sessions=REGIME_LOOKBACK_SESSIONS,
-        )
+        if snapshot is not None:
+            raw_bars = self.reader.bars_through_snapshot(
+                snapshot,
+                as_of,
+                max_sessions=REGIME_LOOKBACK_SESSIONS,
+            )
+        else:
+            raw_bars = self.reader.bars_through(
+                as_of,
+                max_sessions=REGIME_LOOKBACK_SESSIONS,
+            )
         future_rows = [bar for bar in raw_bars if bar.trade_date > as_of]
         post_cutoff_rows = []
         if known_at is not None:
@@ -469,12 +490,13 @@ class MarketRegimeStore:
         self,
         as_of: date,
         known_at: datetime | None,
-    ) -> tuple[str, date, str | None] | None:
-        cache_identity = getattr(self.reader, "cache_identity", None)
-        if not callable(cache_identity):
-            return None
+    ) -> tuple[object | None, tuple[str, date, str | None] | None]:
+        cache_snapshot = getattr(self.reader, "cache_snapshot", None)
+        if not callable(cache_snapshot):
+            return None, None
+        snapshot = cache_snapshot()
         known_at_key = None if known_at is None else known_at.astimezone(UTC).isoformat()
-        return (str(cache_identity()), as_of, known_at_key)
+        return snapshot, (str(snapshot.identity), as_of, known_at_key)
 
     @classmethod
     def _cached_input(
