@@ -70,6 +70,17 @@ describe("security navigation", () => {
     expect(parseSectorHash("#sectors?as_of=2026-01-31")).toBeNull();
   });
 
+  it.each([
+    "#sectors?as_of=2026-13-01&taxonomy_id=baostock.industry_classification",
+    "#sectors?as_of=2026-02-29&taxonomy_id=baostock.industry_classification",
+    "#sectors?as_of=2024-02-30&taxonomy_id=baostock.industry_classification",
+    "#sectors?as_of=2026-01-31&taxonomy_id=unreviewed.taxonomy",
+    "#sectors?as_of=2026-01-31&taxonomy_id=baostock%ZZindustry_classification",
+    "#sectors?as_of=2026-01-31&taxonomy_id=%E0%A4%A",
+  ])("rejects malformed sector query state without normalizing it: %s", (hash) => {
+    expect(parseSectorHash(hash)).toBeNull();
+  });
+
   it("records a standalone-sector return target without changing legacy routes", () => {
     const hash = securityHash("sh.600001", "sectors", {
       asOf: "2026-01-31",

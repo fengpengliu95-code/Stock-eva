@@ -2,6 +2,7 @@ import type { DecisionContext, DecisionReturnView, SourceView } from "./state";
 
 const SYMBOL_PATTERN = /^(sh|sz)\.[0-9]{6}$/;
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const CANONICAL_TAXONOMY = "baostock.industry_classification";
 
 export interface SecurityRoute {
   symbol: string;
@@ -30,14 +31,41 @@ function isDecisionReturnView(value: string | null): value is DecisionReturnView
   return value === "overview" || value === "sectors";
 }
 
+function isValidAsOf(value: string): boolean {
+  if (!ISO_DATE_PATTERN.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+function isCanonicalTaxonomy(value: string): boolean {
+  return value === CANONICAL_TAXONOMY;
+}
+
+function parseQuery(raw: string): URLSearchParams | null {
+  try {
+    // URLSearchParams replaces malformed percent sequences instead of rejecting
+    // them. Validate raw UTF-8 first so bad route input never reaches APIs.
+    decodeURIComponent(raw.replace(/\+/g, " "));
+    return new URLSearchParams(raw);
+  } catch (error) {
+    if (error instanceof URIError) return null;
+    throw error;
+  }
+}
+
 function validDecisionContext(
   value: Partial<DecisionContext>,
 ): value is DecisionContext {
   return (
     typeof value.asOf === "string" &&
-    ISO_DATE_PATTERN.test(value.asOf) &&
+    isValidAsOf(value.asOf) &&
     typeof value.taxonomyId === "string" &&
-    value.taxonomyId.length > 0 &&
+    isCanonicalTaxonomy(value.taxonomyId) &&
     typeof value.sectorId === "string" &&
     value.sectorId.length > 0 &&
     (value.returnView === undefined ||
@@ -48,8 +76,8 @@ function validDecisionContext(
 
 function routeHash(prefix: "overview" | "sectors", route: DecisionRoute): string {
   if (
-    !ISO_DATE_PATTERN.test(route.asOf) ||
-    !route.taxonomyId ||
+    !isValidAsOf(route.asOf) ||
+    !isCanonicalTaxonomy(route.taxonomyId) ||
     route.sectorId === ""
   ) {
     throw new TypeError("invalid decision route");
@@ -68,15 +96,16 @@ function parseRouteHash(
 ): DecisionRoute | null {
   const match = new RegExp(`^#${prefix}(?:\\?(.*))?$`).exec(hash);
   if (!match) return null;
-  const query = new URLSearchParams(match[1] ?? "");
+  const query = parseQuery(match[1] ?? "");
+  if (!query) return null;
   const asOf = query.get("as_of");
   const taxonomyId = query.get("taxonomy_id");
   const sectorId = query.get("sector_id");
   if (
     asOf === null ||
-    !ISO_DATE_PATTERN.test(asOf) ||
+    !isValidAsOf(asOf) ||
     taxonomyId === null ||
-    taxonomyId.length === 0 ||
+    !isCanonicalTaxonomy(taxonomyId) ||
     sectorId === ""
   ) {
     return null;
@@ -131,7 +160,8 @@ export function parseSecurityHash(hash: string): SecurityRoute | null {
     if (error instanceof URIError) return null;
     throw error;
   }
-  const query = new URLSearchParams(match[2] ?? "");
+  const query = parseQuery(match[2] ?? "");
+  if (!query) return null;
   const sourceView = query.get("from");
   if (!SYMBOL_PATTERN.test(symbol) || !isSourceView(sourceView)) return null;
   const asOf = query.get("as_of");

@@ -32,6 +32,17 @@ function jsonResponse(value: unknown, status = 200): Response {
   });
 }
 
+function currentShanghaiDate(): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
 function installDocument(): void {
   document.body.innerHTML = `
     <section id="overview" data-view="overview">
@@ -246,6 +257,47 @@ describe("decision-flow and technical-cockpit integration", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(window.location.hash).toBe("#watchlists");
     expect(document.querySelector("#sector-decision-flow")?.textContent).not.toContain("后端板块排名");
+  });
+
+  it("fails closed from malformed standalone-sector input before analysis requests", async () => {
+    installDocument();
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      '<section id="sectors" data-view="sectors"><section id="sector-decision-flow" aria-label="板块证据工作区"></section></section>',
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "#sectors?as_of=2026-13-40&taxonomy_id=unreviewed.taxonomy",
+    );
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/analysis/market-regime")) return jsonResponse(marketFixture());
+      if (url.pathname.endsWith("/analysis/sector-rotation")) return jsonResponse(sectorsFixture());
+      if (url.pathname.includes("/analysis/sectors/sector-b/leaders")) return jsonResponse(leadersFixture());
+      return jsonResponse({ detail: "unexpected endpoint" }, 503);
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const module = (await import("./main")) as WorkspaceLifecycle;
+    dispose = module.disposeSecurityCockpit;
+    module.initializeSecurityCockpit?.();
+
+    await waitFor(() => expect(document.querySelector("#sector-decision-flow")?.textContent).toContain("后端板块排名"));
+    const analysisCalls = fetcher.mock.calls.filter(([input]) => String(input).includes("/analysis/"));
+    expect(analysisCalls).not.toHaveLength(0);
+    for (const [input] of analysisCalls) {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("as_of")).toBe(currentShanghaiDate());
+      if (!url.pathname.endsWith("/analysis/market-regime")) {
+        expect(url.searchParams.get("taxonomy_id")).toBe("baostock.industry_classification");
+      }
+      expect(String(input)).not.toContain("2026-13-40");
+      expect(String(input)).not.toContain("unreviewed.taxonomy");
+    }
+    expect(window.location.hash).toBe(
+      `#sectors?as_of=${currentShanghaiDate()}&taxonomy_id=baostock.industry_classification&sector_id=sector-b`,
+    );
   });
 
   it.each([
