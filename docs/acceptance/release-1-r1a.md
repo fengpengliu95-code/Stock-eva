@@ -196,6 +196,60 @@ No live run touched the production classification path, NAS, `stock_eva.duckdb`,
 or the user database. No threshold was lowered, no date was substituted, and
 no production publication was attempted.
 
+### 2026-08-09 observability and mainline follow-up
+
+The cumulative R1-A observability repair was integrated into `main` through
+`3de2480`. It adds sanitized stage/class diagnostics, counts only metadata query
+operations that were actually invoked, removes raw exception cause/context from
+the provider and sync boundaries, and closes both initial-login and
+post-login socket-configuration cleanup gaps. An independent read-only review
+approved the cumulative change after four review/fix rounds.
+
+Mainline verification was serial and used no production, NAS or user data:
+
+```text
+uv run pytest -q --basetemp=/tmp/stock-eva-r1a-full-final
+# 763 passed; exit 0
+
+uv run ruff check backend tests
+# All checks passed!
+
+git diff --check
+# no output
+```
+
+The first fresh TEMP canary exposed BaoStock 0.9.3 printing raw socket exception
+text to stdout before the controlled JSON. The CLI boundary was repaired and
+independently re-reviewed so provider construction and execution both discard
+untrusted stdout/stderr without buffering it. The repeated real canary used
+`as_of=2026-08-07`, a fresh explicit TEMP data root and a 30-second per-attempt
+deadline. Its observed contract was:
+
+```text
+exit=1
+stdout_lines=1
+stderr_bytes=0
+failure_stage=login
+failure_class=transport
+provider_request_count=0
+writes_classification_data=false
+configured_timeout_seconds=30.0
+configured_max_attempts=2
+elapsed_seconds=60.01
+```
+
+The one stdout line was valid JSON. The TEMP data root remained empty: no
+classification database, DuckDB temp directory or other file was created, and
+no classification-sync or pytest process remained afterward. This verifies the
+failure/diagnostic boundary against the real third-party client, but it does not
+verify a successful source read or publication. BaoStock failed both login
+attempts before any metadata query invocation.
+
+The installed local service remained healthy for its already deployed scope and
+its local market dataset reported `ready`, but its OpenAPI contract did not yet
+contain classification routes and no deployed `classification.duckdb` existed.
+No production service was restarted or replaced during this acceptance run.
+
 ## Pending real acceptance gates
 
 - No real BaoStock classification publication completed in this recovery.
