@@ -18,10 +18,13 @@ Release 1 verdict: **PENDING — do not claim GO**
   every API request. `MarketRegimeStore` now reuses the evaluated input only when the
   immutable manifest identity, `as_of` and UTC-normalized `known_at` are identical.
   Before a hit, the reader parses the current manifest and checks each referenced
-  object's SHA-256 checksum against the manifest on every request; device/inode/size/
+  object's SHA-256 checksum against the manifest on every R1-B cache request; device/inode/size/
   mtime/ctime is retained for mutation diagnostics and query stability. Matching content
   reuses only the bounded (1024-object LRU) DuckDB schema/row-count proof, so cache hits
-  do not repeat hundreds of DuckDB validations. This corrects the earlier overstatement
+  do not repeat hundreds of DuckDB validations. Ordinary dataset queries retain the
+  existing first-seen/metadata-change checksum behavior, so this strict R1-B boundary
+  does not impose full-manifest hashes on market, security or sector requests. Hash and
+  DuckDB I/O execute outside the process-global LRU lock. This corrects the earlier overstatement
   that generation-only or metadata-only validation was sufficient: same-generation,
   same-size and restored-mtime mutation now fails closed instead of serving a cached
   result. The input cache is process-local, bounded (128 entries), does not write

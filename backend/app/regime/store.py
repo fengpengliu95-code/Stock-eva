@@ -316,7 +316,7 @@ class PublishedDatasetMarketReader:
     def cache_snapshot(self) -> PublishedReadSnapshot:
         """Capture one checked immutable view for cache identity and query binding."""
         try:
-            return self.store.read_snapshot()
+            return self.store.read_snapshot(verify_checksums=True)
         except DatasetError as exc:
             raise MarketReadUnavailable("market_storage_unavailable") from exc
 

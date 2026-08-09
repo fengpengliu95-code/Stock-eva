@@ -295,7 +295,12 @@ class NasMarketStore:
         stat = path.stat()
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
-    def _read_snapshot(self, *, force_validation: bool = False) -> PublishedReadSnapshot:
+    def _read_snapshot(
+        self,
+        *,
+        force_validation: bool = False,
+        verify_checksums: bool = False,
+    ) -> PublishedReadSnapshot:
         try:
             manifest = self._manifest()
             paths: list[Path] = []
@@ -307,20 +312,43 @@ class NasMarketStore:
                     raise DatasetError("published manifest references a missing parquet file")
                 paths.append(path)
             fingerprints = [self._fingerprint(path) for path in paths]
-            with _VALIDATION_LOCK:
+            validation_needed = []
+            for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
+                key = (str(path.resolve()), str(item["sha256"]), int(item["row_count"]))
+                with _VALIDATION_LOCK:
+                    cached = _VALIDATED_OBJECTS.get(key)
+                    if cached == fingerprint and not force_validation:
+                        _VALIDATED_OBJECTS.move_to_end(key)
+                if force_validation or cached != fingerprint:
+                    validation_needed.append((item, path, fingerprint, key))
+
+            # Hashing and DuckDB validation are deliberately outside the process-global
+            # LRU lock. Strict R1-B cache snapshots hash every object; ordinary readers
+            # hash only unseen or metadata-changed objects.
+            for item, path, fingerprint, key in validation_needed:
+                before = self._fingerprint(path)
+                checksum = _sha256(path)
+                after = self._fingerprint(path)
+                if before != fingerprint or after != fingerprint:
+                    raise DatasetError("published object changed during validation")
+                if checksum != item["sha256"]:
+                    raise DatasetError("published parquet checksum mismatch")
+                self._validate_parquet(path, item["row_count"])
+                with _VALIDATION_LOCK:
+                    _VALIDATED_OBJECTS[key] = fingerprint
+                    _VALIDATED_OBJECTS.move_to_end(key)
+                    while len(_VALIDATED_OBJECTS) > _VALIDATED_OBJECTS_LIMIT:
+                        _VALIDATED_OBJECTS.popitem(last=False)
+
+            if verify_checksums:
                 for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
-                    key = (str(path.resolve()), str(item["sha256"]), int(item["row_count"]))
+                    before = self._fingerprint(path)
                     checksum = _sha256(path)
+                    after = self._fingerprint(path)
+                    if before != fingerprint or after != fingerprint:
+                        raise DatasetError("published object changed during validation")
                     if checksum != item["sha256"]:
                         raise DatasetError("published parquet checksum mismatch")
-                    if force_validation or _VALIDATED_OBJECTS.get(key) != fingerprint:
-                        self._validate_parquet(path, item["row_count"])
-                        _VALIDATED_OBJECTS[key] = fingerprint
-                        _VALIDATED_OBJECTS.move_to_end(key)
-                        while len(_VALIDATED_OBJECTS) > _VALIDATED_OBJECTS_LIMIT:
-                            _VALIDATED_OBJECTS.popitem(last=False)
-                    else:
-                        _VALIDATED_OBJECTS.move_to_end(key)
             content = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
             return PublishedReadSnapshot(
                 identity=f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}",
@@ -385,11 +413,11 @@ class NasMarketStore:
         every call. A cache may skip a repeat query, but it must not turn a
         missing/corrupt manifest or missing published object into a stale result.
         """
-        return self._read_snapshot().identity
+        return self._read_snapshot(verify_checksums=True).identity
 
-    def read_snapshot(self) -> PublishedReadSnapshot:
+    def read_snapshot(self, *, verify_checksums: bool = False) -> PublishedReadSnapshot:
         """Capture one checked manifest/object view for a bound reader query."""
-        return self._read_snapshot()
+        return self._read_snapshot(verify_checksums=verify_checksums)
 
     def exists(self) -> bool:
         return bool(self._paths())
