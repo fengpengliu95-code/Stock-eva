@@ -61,21 +61,32 @@ Stock EVA 改为单版本、单切片线性交付。优先保证 point-in-time �
 - `r1a-observability` clean worktree 在记录最终证据后移除，分支与 commit 保留审计。
 - 用户已确认进入 R1-B；R1-A 的分支与 commit 保留审计。
 
-### Paused for approval：R1-B GO
+### Completed：R1-B GO
 
 - R1-B 已完成缓存完整性修复、独立复审、main 集成、768 项全量测试、真实生产
   API 冷/热性能、只读数据哈希与浏览器总览验收。
 - 生产 API 的 launchd 分类已从后台批处理修正为用户交互服务；批处理 agent 保持后台。
-- 当前不启动开发子智能体，等待用户确认后才进入下一切片。
+- 用户已确认进入 R1-C。
 - R1 未整体达到 GO 前，不继续任何 R2/R3 开发。
 
-### Next after approval：R1-C 板块轮动与龙头验收收口
+### Completed：R1-C GO
 
-- 核对现有 sector-rotation/leaders 实现和 acceptance 记录，不重复实现已有的 83 板块结果。
-- 优先验收 point-in-time 成分、排名资格、缺失价格与受限主板范围；不得把成交额称为
-  主力净流入。
-- 如需修复，只启动一个开发子智能体；形成稳定 commit 后再串行启动一个 reviewer。
-- R1-C GO 后，按相同门禁依次处理 R1-D 和最终 R1-E。
+- R1-C 已修复范围外成员污染价格覆盖分母的问题，完成独立复审、主线集成、全量测试、
+  真实 API/数据回读和浏览器验收。
+- 用户已确认进入 R1-D。
+
+### Paused for approval：R1-D GO
+
+- R1-D 已完成独立板块工作区、严格路由、上下文往返、迟到响应隔离和桌面排名控件
+  边界修复。
+- 已完成独立复审、主线全量测试、真实 API 回读、正式安装、浏览器验收和受保护数据
+  指纹比对。
+- 当前不启动开发子智能体，等待用户确认后才进入 R1-E。
+
+### Next after approval：R1-E Release 1 最终收口
+
+- 只在用户确认 R1-D 后启动；先冻结 R1-E 的产品验收范围，再进入单开发者切片。
+- R1-E 关闭前不恢复 R2 worktree，也不启动任何 R2/R3 测试或修改。
 
 ### Parked：R2-C1 市场发布 provenance
 
