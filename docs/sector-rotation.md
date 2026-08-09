@@ -39,8 +39,10 @@ checksum 承担同一信任边界。
 issue 精确为 `suspended_placeholder`。任何不一致在事务开始前拒绝，旧 pointer 和分区保持
 不变。
 
-当前 R1-A 尚无 live promoted classification generation，因此生产 readback 预期为
-`empty`。这不是用合成结果填充生产的理由。
+生产是否可计算只由请求 `as_of` 时可见的 promoted classification generation 和可信
+market publication 决定；缺任一输入时仍返回真实 `empty`，不能用合成结果填充。2026-08-09
+R1-C 验收时已存在 source snapshot date 为 2026-08-07 的 promoted BaoStock generation，
+生产 readback 因窄范围、请求日期后的休市间隔和缺失资金证据而真实返回 `degraded`。
 
 ## 真实范围
 
@@ -60,7 +62,9 @@ R1-C v1 强制 `narrow_main_board`：
 - `can_support_all_industry_conclusion=false`。
 
 返回结果会分别列出 classification eligible 数量、实际可观测主板证券数量、已有价格的
-分类证券数量和被范围排除的 classification boards。
+分类证券数量和被范围排除的 classification boards。板块的价格缺失与 confidence coverage
+只使用完成上述排除后的范围内成员作分母；`member_count` 仍保留完整 taxonomy 成员数，范围外
+成员继续通过 `sector.member_outside_narrow_main_board_scope` 披露。
 
 ## 板块公式
 

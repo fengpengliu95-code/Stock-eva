@@ -1,10 +1,10 @@
 # Release 1 R1-C acceptance
 
-Date: 2026-08-01 (Asia/Shanghai)
+Date: 2026-08-09 (Asia/Shanghai)
 
-R1-C synthetic contract: **LOCALLY VERIFIED — INDEPENDENT REVIEW REQUIRED**
+R1-C implementation and installed-runtime acceptance: **GO**
 
-Release 1 verdict: **PENDING — do not claim GO**
+Release 1 overall verdict: **not asserted by this slice**
 
 ## Verified local scope
 
@@ -19,6 +19,10 @@ Release 1 verdict: **PENDING — do not claim GO**
 - Unknown classification members are defensively excluded. Extra market symbols can
   contribute only to the actual observable main-board benchmark and cannot become a sector
   member or leader.
+- Members outside `narrow_main_board` are excluded before the price-coverage and confidence
+  denominator. The response still retains the complete taxonomy `member_count` and the
+  `sector.member_outside_narrow_main_board_scope` evidence, so scope loss is visible without
+  falsely reporting an in-scope price gap.
 - Sector ranking exposes score, raw value, weight, weighted score, formula version, quality,
   effective/target counts and missing inputs for 5/20/60-day relative strength, advancing
   breadth, MA20/60 breadth, turnover 5/20-day change, top-three turnover concentration,
@@ -74,8 +78,8 @@ Release 1 verdict: **PENDING — do not claim GO**
   or the research-leader qualification version changes.
 - A real temporary DuckDB classification store and canonical market store were read through
   both APIs without changing either database or creating reader temp state.
-- No frontend, R2 fund-flow, portfolio, order, broker, deployment, network, NAS or user-data
-  work was performed.
+- The installed runtime and existing overview UI were read back against the real local mirror.
+  No market, classification, NAS or user-data content changed during installation or acceptance.
 
 ## RED → GREEN evidence
 
@@ -147,37 +151,88 @@ uv run --extra dev pytest -o addopts='' -q \
   tests/test_sector_rotation.py::test_tradability_metric_formula_uses_contract_spelling
 # Repair GREEN: 7 passed in 0.74s. A separate regression also proves that classification and
 # market rows agreeing on the wrong exchange still fail against the symbol exchange prefix.
+
+# Acceptance-closure RED: a sector containing 3 fully priced main-board members plus 28
+# legal ChiNext/STAR members incorrectly returned sector.member_price_missing and reduced
+# confidence by 3/31.
+
+uv run --extra dev pytest -o addopts='' -q \
+  tests/test_sector_rotation.py::test_out_of_scope_members_do_not_reduce_in_scope_price_coverage_or_confidence
+# RED: 1 failed because sector.member_price_missing remained present.
+# GREEN: 1 passed in 0.51s after using the in-scope member denominator.
+
+uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py
+# Developer GREEN: 65 passed in 10.65s; independent reviewer: 65 passed in 10.96s.
 ```
 
 ## Fresh verification
 
 ```text
-uv run --extra dev pytest -o addopts='' -q
-# 556 passed in 67.93s.
+uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py
+# Integrated main: 65 passed in 11.05s.
 
-uv run --extra dev pytest -o addopts='' -q tests/test_sector_rotation.py --durations=5
-# 64 passed in 10.88s; the 3,000-symbol x 65-session representative-scale
-# leader-ranking case completed in 3.70s, below its 15s guardrail.
+uv run --extra dev pytest -q
+# Reached 100% and exited 0. A separate collect-only run reported 769 tests.
+# The 3,000-symbol x 65-session representative-scale leader case completed in
+# 3.77s during development, below its 15s guardrail.
 
 uv run --extra dev ruff check backend tests
 # All checks passed!
 
-git diff --check
+git diff --check HEAD^ HEAD
 # no output
+
+uv run --extra dev ruff format --check \
+  backend/app/sector/service.py tests/test_sector_rotation.py
+# Production file formatted. The test file still has three formatter findings at
+# historical lines introduced by 42e494e; none is in the R1-C closure hunk.
 ```
 
-## Pending real and Release 1 gates
+Independent review approved exact development commit
+`91f7d16e3154a531ecc9411a67625e7380714806` with no blocker. Main integrated the
+same tree as `1fe90a1621ec4d9b180dbc9d1409aa4605185f9d`.
 
-- R1-A did not produce a live promoted classification generation, so production R1-C
-  readback is expected to remain `empty`.
-- No real market dataset, NAS, production database or user database was opened in this
-  worker.
+## Installed-runtime acceptance
+
+- The official LaunchAgent installer built and installed release `1fe90a1`. `RELEASE.json`
+  reports that exact SHA; all five agents are loaded, API and workspace are ready, the API
+  remains `ProcessType=Interactive`, and storage reports
+  `local_dataset/ready/local` at generation
+  `generation-2374166120134660baba408ed01b7870`.
+- The NAS archive was older than the local mirror. The installer returned
+  `destination_newer`, 270 files, 861,430 rows and `copied_bytes=0`; it did not replace or
+  rewrite the local market generation.
+- The real sector endpoint returned HTTP 200 in 6.45s with 83 rankings, classification
+  generation `classification-a5b8337d0da7e3a3594dfe95`, mapping coverage 99.942%, and market
+  data through 2026-08-07. The result truthfully remains `degraded` because source-date
+  semantics are unverified, the universe is narrow main board, the requested date is later
+  than the last trading session, and R2 fund-flow evidence is missing.
+- Before installation, M73 reported 31 taxonomy members, 3 priced in-scope members,
+  confidence 0.0726 and a false `sector.member_price_missing`. After installation it reports
+  the same 31/3 membership and score, remains ranking-eligible, reports confidence 0.75,
+  removes only the false price issue, and retains
+  `sector.member_outside_narrow_main_board_scope`.
+- The real leader endpoint returned HTTP 200 in 4.75s with 3 candidates and 28 explicit
+  exclusions. The first research candidate is `sh.600721` 百花医药, but
+  `actionable_primary=false`, limit-lock input is unavailable, and fund-flow evidence is
+  explicitly `missing`; it is not presented as a buy/sell recommendation.
+- Browser acceptance rendered the existing overview with 83 backend sectors, M73 `3 / 31`
+  and 75% confidence, the real leader list, the non-actionable warning and Release 2 fund-flow
+  absence. No browser warning or error was recorded.
+- Pre/post SHA-256 checks were identical for the local immutable dataset tree
+  (`49a48b8580b2e12897725f14e47884a5bb0b34dc759f638f510257aecb94931d`), NAS archive tree
+  (`db94feda4088dbbbbd51dad90e26ca256852e51661a4499e6a01ebd312210309`), classification
+  DuckDB, market control DuckDB and private user SQLite database.
+
+## Remaining boundaries after R1-C GO
+
 - The required at-least-20-session replay over real promoted classification generations and
-  published canonical prices remains pending R1-E.
-- Live industry mapping coverage, real price completeness across the intended Release 1
-  universe and real leader continuity remain unverified.
-- R1-D market → sector → leader → stock browser drill-down remains pending.
-- Independent re-review of this repair commit remains pending; this worker does not declare
-  the R1-C slice approved.
+  published canonical prices remains R1-E work.
+- The standalone `#sectors` workspace, URL/state continuity and loading experience remain
+  R1-D work. R1-C acceptance covers the existing overview integration, not that standalone
+  page.
+- Full-A-share coverage, L1/L2/L3 fund-flow evidence, real limit-lock/abnormal-liquidity
+  inputs, position sizing and portfolio advice remain outside R1-C. Turnover must continue to
+  be described only as price-volume evidence.
 
-These gates prevent an R1-C review GO or Release 1 GO claim.
+These boundaries do not block R1-C GO and must not be presented as already delivered.
