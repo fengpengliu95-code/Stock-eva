@@ -54,13 +54,19 @@ Stock EVA 改为单版本、单切片线性交付。优先保证 point-in-time �
 
 ## 5. 当前执行队列
 
-### Active：R1-A 稳定化与真实分类闭环
+### Paused for approval：R1-A GO
 
-- 保留 worktree：`r1a-observability`。
-- 先完成异常脱敏和半初始化 BaoStock session 清理的未提交修复。
-- 独立复审通过后集成 main，运行串行全量测试。
-- 完成真实行业分类 coverage、PIT/known-at 证明和浏览器回读。
-- R1 未达到 GO 前，不继续任何 R2/R3 开发。
+- R1-A 已完成独立复审、main 集成、串行全量测试、真实生产分类发布、API
+  不可变性回读和浏览器决策路径验收。
+- `r1a-observability` clean worktree 在记录最终证据后移除，分支与 commit 保留审计。
+- 当前不启动开发子智能体，等待用户确认后才进入下一切片。
+- R1 未整体达到 GO 前，不继续任何 R2/R3 开发。
+
+### Next after approval：R1-B 状态引擎验收收口
+
+- 先核对现有 R1-B 实现、acceptance 记录和 main 当前代码，不重复实现已存在功能。
+- 如需修复，只启动一个开发子智能体；形成稳定 commit 后再串行启动一个 reviewer。
+- R1-B GO 后，按相同门禁依次处理 R1-C、R1-D 和最终 R1-E。
 
 ### Parked：R2-C1 市场发布 provenance
 

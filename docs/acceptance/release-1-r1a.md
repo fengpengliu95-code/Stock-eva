@@ -2,9 +2,9 @@
 
 Date: 2026-07-29 (Asia/Shanghai)
 
-R1-A synthetic contract: **VERIFIED**
+R1-A verdict: **GO — synthetic, production publication and browser path verified**
 
-Release 1 verdict: **PENDING — do not claim GO**
+Release 1 verdict: **PENDING — R1-A GO is not Release 1 GO**
 
 ## Verified synthetic scope
 
@@ -417,16 +417,78 @@ dataset_tree_sha256=93416f3d956fb2738858db8123f84ce2d6f9a5a97a8d2d674821fb478d59
 dataset_file_count=272
 ```
 
-## Pending real acceptance gates
+### 2026-08-09 production publication recovery and ready readback
 
-- One real TEMP promoted generation and the eligible-universe 95% industry target are now
-  verified. Production installation is complete, but production classification publication
-  and ready-generation readback remain pending on BaoStock bulk-basic recovery.
-- The real 20-session post-hoc replay and its no-future membership/price assertions passed.
-  Contemporaneous historical visibility is not claimed because the generation was observed
-  after all replayed sessions.
-- Isolated real-data browser acceptance passed. Installed-runtime missing/degraded browser
-  readback passed; installed-runtime ready-classification drill-down remains pending publication.
-- Component history capability remains `unverified`, not `verified`.
+A final retry from the installed runtime and production configuration recovered after the
+earlier upstream hold. The unchanged completeness threshold and source contract produced one
+sanitized stdout JSON line, no stderr and one promoted production generation:
 
-These pending gates prevent a Release 1 GO claim.
+```text
+exit=0
+status=ready
+network_requests=6
+writes_classification_data=true
+new_generation=true
+generation_id=classification-a5b8337d0da7e3a3594dfe95
+source_snapshot_date=2026-08-07
+source_date_semantics=requested_unverified
+observed_at=2026-08-09T06:10:17.881305Z
+security_master_history=7336
+index_component_history=850
+sector_membership_history=5203
+eligible_count=5205
+mapped_count=5202
+coverage_ratio=0.9994236311239193
+quality_issues=[]
+```
+
+Production HTTP readback at `as_of=2026-08-09` returned the same generation for 7,336
+securities, 83 sectors, the leading sector's 31 members and 99.942% industry coverage. The
+three unmapped eligible securities remained explicit. HS300 returned 300 components with
+the truthful `component_history_unverified` degraded reason. A historical request at
+`2026-08-07` returned `no_trusted_snapshot_at_as_of` because this generation was not observed
+until 2026-08-09; `2026-08-10` was rejected with HTTP 422 before store access.
+
+The production analysis path used the same classification generation. Sector rotation
+returned 83 backend rankings with explicit low confidence where price coverage was sparse.
+The leading M73 sector returned three candidates; `sh.600721` was qualified but remained
+non-actionable because risk inputs and limit-lock evidence were unavailable. Market regime
+remained the honest `range/risk_off` degraded narrow-scope result rather than a full-market or
+fund-flow claim.
+
+All five classification GET families plus sector rotation and sector leaders returned HTTP
+200 in a final serial readback. The production classification database was byte- and
+metadata-identical before and after the read-only pass:
+
+```text
+classification_sha256=45fd786ca80dd760e79b28432d3929de1b8da76111e265ea152ef5a8388f1941
+classification_size_mtime=8663040:1786256009
+```
+
+The installed workspace then completed the production overview-to-sector-to-leader-to-stock
+path. It preserved `as_of`, taxonomy and sector identity in the `sh.600721` deep link and
+rendered 250 valid qfq sessions with K-line, volume, MA5/10/20/60/120/250, MACD and RSI14
+from backend values. It retained the same degraded market, sector, leader-risk and missing
+fund-flow context; the browser console contained no warnings or errors.
+
+The installed code runtime remains the audited `af1527b788dc8aa48f31a06c60d35a4842529639`.
+Later main commits in this acceptance sequence only update evidence documents and do not
+change deployed code.
+
+## R1-A decision and remaining Release 1 gates
+
+R1-A is **GO**. Its implementation, independent review, full mainline tests, real
+publication, production API readback, production GET immutability and browser decision path
+all passed. The completed R1-A worktree may be removed while its branch and commits remain
+available for audit.
+
+This does not make Release 1 GO:
+
+- the real 20-session post-hoc replay passed its no-future membership and price assertions,
+  but contemporaneous historical visibility is not claimed because the generation was
+  observed after the replayed sessions;
+- component history capability remains explicitly `unverified`, not `verified`;
+- R1-B, R1-C, R1-D and final R1-E evidence must still be reconciled and accepted in linear
+  order before Release 1 can be declared GO.
+
+R2 remains locked until the remaining Release 1 queue is complete.
