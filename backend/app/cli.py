@@ -5,6 +5,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter
+from zoneinfo import ZoneInfo
 
 from backend.app.classification.failures import (
     ClassificationFailure,
@@ -379,33 +380,51 @@ def main() -> int:
         return 0 if result.status in {"dry-run", "ready"} else 1
     settings = get_settings()
     if args.command == "market-regime-snapshots":
-        try:
-            service = RegimeSnapshotCaptureService(
-                regime_store=market_regime_store_from_settings(settings),
-                snapshot_store=RegimeSnapshotStore(
-                    StorageLayout(settings).regime_snapshot_database
-                ),
-            )
-            if args.execute:
-                outcome = service.capture_range(
-                    args.start,
-                    args.end,
-                    evidence_cutoff_at=datetime.now(UTC),
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        if args.end < args.start or args.start > today or args.end > today:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "regime_snapshot_capture_unavailable",
+                        "writes_snapshot_data": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
                 )
-                payload = {
-                    "status": "ready" if not outcome.errors and not outcome.conflicts else "error",
-                    **outcome.model_dump(mode="json"),
-                    "writes_snapshot_data": outcome.inserted > 0,
-                }
-                exit_code = 0 if payload["status"] == "ready" else 1
-            else:
-                plan = service.plan(args.start, args.end)
-                payload = {
-                    "status": "dry-run",
-                    **plan.model_dump(mode="json"),
-                    "writes_snapshot_data": False,
-                }
-                exit_code = 0
+            )
+            return 1
+        try:
+            discard = _DiscardWriter()
+            with redirect_stdout(discard), redirect_stderr(discard):
+                service = RegimeSnapshotCaptureService(
+                    regime_store=market_regime_store_from_settings(settings),
+                    snapshot_store=RegimeSnapshotStore(
+                        StorageLayout(settings).regime_snapshot_database
+                    ),
+                )
+                if args.execute:
+                    outcome = service.capture_range(
+                        args.start,
+                        args.end,
+                        evidence_cutoff_at=datetime.now(UTC),
+                    )
+                    payload = {
+                        "status": (
+                            "ready" if not outcome.errors and not outcome.conflicts else "error"
+                        ),
+                        **outcome.model_dump(mode="json"),
+                        "writes_snapshot_data": outcome.inserted > 0,
+                    }
+                    exit_code = 0 if payload["status"] == "ready" else 1
+                else:
+                    plan = service.plan(args.start, args.end)
+                    payload = {
+                        "status": "dry-run",
+                        **plan.model_dump(mode="json"),
+                        "writes_snapshot_data": False,
+                    }
+                    exit_code = 0
         except (MarketReadUnavailable, RegimeSnapshotUnavailable, ValueError):
             payload = {
                 "status": "error",
