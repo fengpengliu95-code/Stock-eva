@@ -120,6 +120,17 @@ def test_workspace_preserves_real_empty_chart_frames_and_390px_layout() -> None:
     assert "overflow-x: clip" in styles
 
 
+def test_sector_ranking_controls_are_bounded_without_changing_detail_headings() -> None:
+    styles = (ROOT / "workspace" / "style.css").read_text()
+
+    assert "[data-sector-ranking-list] .decision-ranking-heading" in styles
+    assert "flex-direction: column" in styles
+    assert "[data-sector-ranking-list] .decision-ranking-heading button" in styles
+    assert "max-width: 100%" in styles
+    assert "white-space: normal" in styles
+    assert "overflow-wrap: anywhere" in styles
+
+
 def test_workspace_uses_native_controls_and_has_no_inline_event_handlers() -> None:
     parser = parse(ROOT / "workspace" / "index.html")
 

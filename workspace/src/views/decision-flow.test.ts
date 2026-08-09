@@ -222,6 +222,14 @@ describe("after-close decision flow view", () => {
     expect(document.body.textContent).not.toContain("成分股数据");
   });
 
+  it("keeps standalone ranking controls inside their own narrow layout rule", () => {
+    renderSectorWorkspace(root(), readyState());
+
+    const ranking = document.querySelector<HTMLElement>("[data-sector-ranking-list]")!;
+    expect(ranking.querySelectorAll(".decision-ranking-heading button")).toHaveLength(2);
+    expect(ranking.querySelectorAll(".decision-candidates")).toHaveLength(0);
+  });
+
   it.each([
     ["loading", null, null, "正在读取市场状态与板块轮动"],
     ["error", 422, "future_as_of", "日期不在可读取范围"],

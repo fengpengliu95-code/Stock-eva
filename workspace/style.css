@@ -300,6 +300,9 @@ small { color: var(--text-muted); }
 .decision-ranking-heading { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }
 .decision-ranking-heading h4 { margin: .7rem 0 .15rem; }
 .decision-ranking-heading button { flex: 0 0 auto; }
+[data-sector-ranking-list] .decision-ranking-heading { align-items: stretch; flex-direction: column; }
+[data-sector-ranking-list] .decision-ranking-heading > div { min-width: 0; }
+[data-sector-ranking-list] .decision-ranking-heading button { width: 100%; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .decision-metric-list { display: grid; gap: 8px; margin-top: 12px; }
 .market-primary { grid-column: span 8; }
 .index-panel { grid-column: span 4; }
