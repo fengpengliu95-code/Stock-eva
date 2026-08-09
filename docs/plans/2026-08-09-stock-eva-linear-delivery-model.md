@@ -93,4 +93,3 @@ Stock EVA 改为单版本、单切片线性交付。优先保证 point-in-time �
 - parked worktree 不代表任务运行，也不得被新智能体并行修改。
 - dirty worktree 永不强制删除；先提交、审核或明确放弃。
 - 完成并进入 main 的 clean worktree 当日移除，分支按审计需要保留。
-
