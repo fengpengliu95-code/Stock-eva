@@ -12,11 +12,17 @@ from backend.app.market.series import DataQualityError
 from backend.app.market.store import MarketStore
 from backend.app.regime.models import MarketRegimeResult
 from backend.app.regime.service import MarketRegimeService
+from backend.app.regime.snapshots import (
+    MarketRegimeSnapshot,
+    RegimeSnapshotStore,
+    RegimeSnapshotUnavailable,
+)
 from backend.app.regime.store import (
     MarketReadUnavailable,
     MarketRegimeStore,
     market_regime_store_from_settings,
 )
+from backend.app.storage.layout import StorageLayout
 
 router = APIRouter(prefix="/securities", tags=["analysis"])
 market_regime_router = APIRouter(prefix="/analysis", tags=["analysis"])
@@ -30,6 +36,12 @@ def get_market_regime_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> MarketRegimeStore:
     return market_regime_store_from_settings(settings)
+
+
+def get_regime_snapshot_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> RegimeSnapshotStore:
+    return RegimeSnapshotStore(StorageLayout(settings).regime_snapshot_database)
 
 
 @router.get("/{symbol}/analysis", response_model=SecurityAnalysisResponse)
@@ -80,3 +92,43 @@ def market_regime(
                 "storage_status": "unavailable",
             },
         ) from exc
+
+
+@market_regime_router.get(
+    "/market-regime/snapshots/{as_of}",
+    response_model=MarketRegimeSnapshot,
+)
+def market_regime_snapshot(
+    as_of: date,
+    store: Annotated[RegimeSnapshotStore, Depends(get_regime_snapshot_store)],
+    today: Annotated[date, Depends(get_regime_today)],
+) -> MarketRegimeSnapshot:
+    if as_of > today:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "future_as_of",
+                "as_of": as_of.isoformat(),
+                "today": today.isoformat(),
+                "timezone": "Asia/Shanghai",
+            },
+        )
+    try:
+        snapshot = store.read_exact(as_of, "market-regime-v1")
+    except RegimeSnapshotUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "regime_snapshot_store_unavailable",
+                "storage_status": "unavailable",
+            },
+        ) from exc
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "regime_snapshot_not_found",
+                "as_of": as_of.isoformat(),
+            },
+        )
+    return snapshot

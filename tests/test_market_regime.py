@@ -1222,6 +1222,38 @@ def test_api_rejects_future_shanghai_date_before_store_read() -> None:
     }
 
 
+def test_snapshot_api_reads_exact_persisted_result_without_recomputation(
+    tmp_path: Path,
+) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+    snapshots = import_module("backend.app.regime.snapshots")
+    result = import_module("backend.app.regime.service").MarketRegimeService().evaluate(
+        _inputs(import_module("backend.app.regime.models"), 0)
+    )
+    snapshot_store = snapshots.RegimeSnapshotStore(tmp_path / "control" / "snapshots.sqlite3")
+    persisted, _ = snapshot_store.capture(
+        snapshots.SnapshotCaptureRequest(
+            result=result,
+            capture_mode="post_hoc_backfill",
+            evidence_cutoff_at=datetime(2026, 7, 29, tzinfo=UTC),
+            dataset_generation="fixture-generation",
+            dataset_identity="/private/dataset/fixture",
+        )
+    )
+
+    response = _api_request(
+        f"/api/v1/analysis/market-regime/snapshots/{AS_OF}",
+        {
+            analysis_api.get_regime_snapshot_store: lambda: snapshot_store,
+            analysis_api.get_regime_today: lambda: AS_OF,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["snapshot_id"] == persisted.snapshot_id
+    assert response.json()["result"] == result.model_dump(mode="json")
+
+
 
 def test_api_missing_database_is_empty_and_creates_no_filesystem_state(
     tmp_path: Path,

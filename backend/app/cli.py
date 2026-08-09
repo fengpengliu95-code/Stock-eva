@@ -35,6 +35,12 @@ from backend.app.market.full_history import FullMarketHistoryService
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
+from backend.app.regime.snapshots import (
+    RegimeSnapshotCaptureService,
+    RegimeSnapshotStore,
+    RegimeSnapshotUnavailable,
+)
+from backend.app.regime.store import MarketReadUnavailable, market_regime_store_from_settings
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.initialize import (
     DatasetInitializationError,
@@ -295,6 +301,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     private_backup.add_argument("--keep-daily", type=int, default=7)
     private_backup.add_argument("--keep-weekly", type=int, default=4)
+    regime_snapshots = subparsers.add_parser(
+        "market-regime-snapshots",
+        help="plan or explicitly capture immutable market-regime snapshots",
+    )
+    regime_snapshots.add_argument("--start", required=True, type=date.fromisoformat)
+    regime_snapshots.add_argument("--end", required=True, type=date.fromisoformat)
+    regime_snapshots.add_argument(
+        "--execute",
+        action="store_true",
+        help="persist selected verified manifest dates; omitted means read-only plan",
+    )
     return parser
 
 
@@ -361,6 +378,43 @@ def main() -> int:
         print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
         return 0 if result.status in {"dry-run", "ready"} else 1
     settings = get_settings()
+    if args.command == "market-regime-snapshots":
+        try:
+            service = RegimeSnapshotCaptureService(
+                regime_store=market_regime_store_from_settings(settings),
+                snapshot_store=RegimeSnapshotStore(
+                    StorageLayout(settings).regime_snapshot_database
+                ),
+            )
+            if args.execute:
+                outcome = service.capture_range(
+                    args.start,
+                    args.end,
+                    evidence_cutoff_at=datetime.now(UTC),
+                )
+                payload = {
+                    "status": "ready" if not outcome.errors and not outcome.conflicts else "error",
+                    **outcome.model_dump(mode="json"),
+                    "writes_snapshot_data": outcome.inserted > 0,
+                }
+                exit_code = 0 if payload["status"] == "ready" else 1
+            else:
+                plan = service.plan(args.start, args.end)
+                payload = {
+                    "status": "dry-run",
+                    **plan.model_dump(mode="json"),
+                    "writes_snapshot_data": False,
+                }
+                exit_code = 0
+        except (MarketReadUnavailable, RegimeSnapshotUnavailable, ValueError):
+            payload = {
+                "status": "error",
+                "error_code": "regime_snapshot_capture_unavailable",
+                "writes_snapshot_data": False,
+            }
+            exit_code = 1
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return exit_code
     if args.command == "backup-private-data":
         try:
             outcome = PrivateBackupSetService(
