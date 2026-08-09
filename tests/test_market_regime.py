@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import os
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
@@ -523,8 +524,11 @@ def test_published_cache_revalidates_same_generation_object_mutation(tmp_path: P
     )
 
     store.read(AS_OF)
-    with parquet.open("ab") as handle:
-        handle.write(b"tampered")
+    original_stat = parquet.stat()
+    payload = bytearray(parquet.read_bytes())
+    payload[-1] ^= 1
+    parquet.write_bytes(payload)
+    os.utime(parquet, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     with pytest.raises(store_module.MarketReadUnavailable, match="market_storage_unavailable"):
         store.read(AS_OF)

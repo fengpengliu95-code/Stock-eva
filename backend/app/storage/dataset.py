@@ -12,7 +12,7 @@ import os
 import re
 import shutil
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -30,7 +30,10 @@ MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
 SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_VALIDATED_OBJECTS: dict[tuple[str, str, int], tuple[int, int, int, int]] = {}
+_VALIDATED_OBJECTS_LIMIT = 1024
+_VALIDATED_OBJECTS: OrderedDict[tuple[str, str, int], tuple[int, int, int, int, int]] = (
+    OrderedDict()
+)
 _VALIDATION_LOCK = threading.Lock()
 _EXPECTED_PARQUET_TYPES = {
     "trade_date": "DATE",
@@ -74,7 +77,7 @@ class PublishedReadSnapshot:
 
     identity: str
     paths: tuple[Path, ...]
-    fingerprints: tuple[tuple[int, int, int, int], ...]
+    fingerprints: tuple[tuple[int, int, int, int, int], ...]
 
 
 class _ManifestLock:
@@ -288,9 +291,9 @@ class NasMarketStore:
             raise DatasetError("published parquet row count mismatch")
 
     @staticmethod
-    def _fingerprint(path: Path) -> tuple[int, int, int, int]:
+    def _fingerprint(path: Path) -> tuple[int, int, int, int, int]:
         stat = path.stat()
-        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
     def _read_snapshot(self, *, force_validation: bool = False) -> PublishedReadSnapshot:
         try:
@@ -307,11 +310,17 @@ class NasMarketStore:
             with _VALIDATION_LOCK:
                 for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
                     key = (str(path.resolve()), str(item["sha256"]), int(item["row_count"]))
+                    checksum = _sha256(path)
+                    if checksum != item["sha256"]:
+                        raise DatasetError("published parquet checksum mismatch")
                     if force_validation or _VALIDATED_OBJECTS.get(key) != fingerprint:
-                        if _sha256(path) != item["sha256"]:
-                            raise DatasetError("published parquet checksum mismatch")
                         self._validate_parquet(path, item["row_count"])
                         _VALIDATED_OBJECTS[key] = fingerprint
+                        _VALIDATED_OBJECTS.move_to_end(key)
+                        while len(_VALIDATED_OBJECTS) > _VALIDATED_OBJECTS_LIMIT:
+                            _VALIDATED_OBJECTS.popitem(last=False)
+                    else:
+                        _VALIDATED_OBJECTS.move_to_end(key)
             content = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
             return PublishedReadSnapshot(
                 identity=f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}",

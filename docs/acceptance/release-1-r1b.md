@@ -18,11 +18,14 @@ Release 1 verdict: **PENDING — do not claim GO**
   every API request. `MarketRegimeStore` now reuses the evaluated input only when the
   immutable manifest identity, `as_of` and UTC-normalized `known_at` are identical.
   Before a hit, the reader parses the current manifest and checks each referenced
-  object's device/inode/size/mtime fingerprint. A changed or previously unseen object
-  is checksum/schema/row-count validated before it can supply an identity. This corrects
-  the earlier overstatement that generation-only validation was sufficient: same-generation
-  object mutation now fails closed instead of serving a cached result. The cache is
-  process-local, bounded (128 entries), does not write storage, and returns a deep copy.
+  object's SHA-256 checksum against the manifest on every request; device/inode/size/
+  mtime/ctime is retained for mutation diagnostics and query stability. Matching content
+  reuses only the bounded (1024-object LRU) DuckDB schema/row-count proof, so cache hits
+  do not repeat hundreds of DuckDB validations. This corrects the earlier overstatement
+  that generation-only or metadata-only validation was sufficient: same-generation,
+  same-size and restored-mtime mutation now fails closed instead of serving a cached
+  result. The input cache is process-local, bounded (128 entries), does not write
+  storage, and returns a deep copy.
 - The reader now captures a `PublishedReadSnapshot` containing identity, paths and
   fingerprints, then passes that same snapshot to the query. It does not read the
   manifest again between cache identity and cold query; it also rejects a snapshot whose
@@ -177,6 +180,11 @@ uv run --extra dev pytest -o addopts='' -q \
   tests/test_market_regime.py::test_published_cache_revalidates_same_generation_object_mutation \
   tests/test_market_regime.py::test_published_snapshot_binds_query_to_verified_manifest_view
 # GREEN after snapshot-bound query and object-fingerprint validation: 2 passed.
+
+# Second reviewer RED: rewrite one byte in the referenced Parquet, preserve its size and
+# restore mtime. Metadata-only validation returned the prior cached input.
+# GREEN: the same real temporary manifest/Parquet fixture now raises unavailable because
+# every cache-hit preflight recomputes and compares the referenced object's SHA-256.
 
 # Mainline fresh-suite isolation reproduction:
 uv run --extra dev pytest -o addopts='' -q \
