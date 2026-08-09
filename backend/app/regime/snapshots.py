@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.app.market.models import RefreshResult
 from backend.app.regime.models import MarketRegimeResult
 from backend.app.regime.service import MarketRegimeService
-from backend.app.regime.store import MarketRegimeStore
+from backend.app.regime.store import MarketReadUnavailable, MarketRegimeStore
 from backend.app.storage.dataset import PublishedReadSnapshot
 
 CaptureMode = Literal["after_close", "post_hoc_backfill"]
@@ -348,7 +348,7 @@ class RegimeSnapshotCaptureService:
                     idempotent += 1
             except RegimeSnapshotConflict:
                 conflicts += 1
-            except (RegimeSnapshotUnavailable, ValueError):
+            except (MarketReadUnavailable, RegimeSnapshotUnavailable, ValueError):
                 errors += 1
         return SnapshotBackfillOutcome(
             **plan.model_dump(),

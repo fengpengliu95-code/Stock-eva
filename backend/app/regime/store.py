@@ -417,13 +417,14 @@ class MarketRegimeStore:
         *,
         known_at: datetime | None = None,
         snapshot: PublishedReadSnapshot | None = None,
+        fail_on_future_input: bool = False,
     ) -> MarketRegimeInput:
         if snapshot is None:
             snapshot, cache_key = self._cache_key(as_of, known_at)
         else:
             known_at_key = None if known_at is None else known_at.astimezone(UTC).isoformat()
             cache_key = (str(snapshot.identity), as_of, known_at_key)
-        if cache_key is not None:
+        if cache_key is not None and not fail_on_future_input:
             cached = self._cached_input(cache_key)
             if cached is not None:
                 return cached
@@ -439,6 +440,8 @@ class MarketRegimeStore:
                 max_sessions=REGIME_LOOKBACK_SESSIONS,
             )
         future_rows = [bar for bar in raw_bars if bar.trade_date > as_of]
+        if future_rows and fail_on_future_input:
+            raise MarketReadUnavailable("market_storage_unavailable")
         post_cutoff_rows = []
         if known_at is not None:
             cutoff = known_at.astimezone(UTC)
@@ -499,7 +502,12 @@ class MarketRegimeStore:
         known_at: datetime | None = None,
     ) -> MarketRegimeInput:
         """Evaluate against a caller-captured immutable publication only."""
-        return self.read(as_of, known_at=known_at, snapshot=snapshot)
+        return self.read(
+            as_of,
+            known_at=known_at,
+            snapshot=snapshot,
+            fail_on_future_input=True,
+        )
 
     def _cache_key(
         self,

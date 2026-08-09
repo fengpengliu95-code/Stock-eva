@@ -327,6 +327,7 @@ class NasMarketStore:
             # Hashing and DuckDB validation are deliberately outside the process-global
             # LRU lock. Strict R1-B cache snapshots hash every object; ordinary readers
             # hash only unseen or metadata-changed objects.
+            validated_paths: set[Path] = set()
             for item, path, fingerprint, key in validation_needed:
                 before = self._fingerprint(path)
                 checksum = _sha256(path)
@@ -336,6 +337,7 @@ class NasMarketStore:
                 if checksum != item["sha256"]:
                     raise DatasetError("published parquet checksum mismatch")
                 self._validate_parquet(path, item["row_count"])
+                validated_paths.add(path)
                 with _VALIDATION_LOCK:
                     _VALIDATED_OBJECTS[key] = fingerprint
                     _VALIDATED_OBJECTS.move_to_end(key)
@@ -344,6 +346,8 @@ class NasMarketStore:
 
             if verify_checksums:
                 for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
+                    if path in validated_paths:
+                        continue
                     before = self._fingerprint(path)
                     checksum = _sha256(path)
                     after = self._fingerprint(path)

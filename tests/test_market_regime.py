@@ -646,6 +646,192 @@ def test_published_snapshot_binds_query_to_verified_manifest_view(tmp_path: Path
     assert snapshot_a.identity != reader.cache_snapshot().identity
 
 
+def test_snapshot_backfill_fails_closed_before_insert_on_future_bound_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capture must not turn discarded future rows into a persisted result."""
+    _, _, store_module = _regime_modules()
+    snapshots = import_module("backend.app.regime.snapshots")
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
+        encoding="utf-8",
+    )
+    (dataset_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb", temp_directory=tmp_path / "writer-temp"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+    publisher.upsert_bars([_bar(AS_OF, "sh.600000")])
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "reader-temp",
+        dataset_root=dataset_root,
+        staging_root=tmp_path / "staging",
+    )
+    future_bar = _bar(AS_OF + timedelta(days=1), "sh.600000")
+    monkeypatch.setattr(
+        reader,
+        "bars_through_snapshot",
+        lambda *_args, **_kwargs: [future_bar],
+    )
+    snapshot_database = tmp_path / "derived" / "snapshots.sqlite3"
+    service = snapshots.RegimeSnapshotCaptureService(
+        regime_store=store_module.MarketRegimeStore(reader),
+        snapshot_store=snapshots.RegimeSnapshotStore(snapshot_database),
+    )
+
+    outcome = service.capture_range(
+        AS_OF,
+        AS_OF,
+        evidence_cutoff_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert outcome.inserted == 0
+    assert outcome.errors == 1
+    assert not snapshot_database.exists()
+
+
+def test_snapshot_backfill_selects_twenty_manifest_dates_with_one_checksum_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, store_module = _regime_modules()
+    snapshots = import_module("backend.app.regime.snapshots")
+    dates = tuple(sorted(AS_OF - timedelta(days=offset) for offset in range(20)))
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
+        encoding="utf-8",
+    )
+    (dataset_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb", temp_directory=tmp_path / "writer-temp"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+    publisher.upsert_bars([_bar(trade_date, "sh.600000") for trade_date in dates])
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "reader-temp",
+        dataset_root=dataset_root,
+        staging_root=tmp_path / "staging",
+    )
+    original_hash = dataset_module._sha256
+    calls = 0
+
+    def counted_hash(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path)
+
+    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    service = snapshots.RegimeSnapshotCaptureService(
+        regime_store=store_module.MarketRegimeStore(reader),
+        snapshot_store=snapshots.RegimeSnapshotStore(tmp_path / "derived" / "snapshots.sqlite3"),
+    )
+
+    outcome = service.capture_range(
+        dates[0],
+        dates[-1],
+        evidence_cutoff_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert outcome.selected_dates == dates
+    assert outcome.inserted == 20
+    assert outcome.errors == 0
+    assert calls == len(dates)
+
+
+def test_snapshot_backfill_does_not_insert_when_bound_object_changes_during_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a captured object's drift invalidates a bound immutable view.
+
+    A later manifest pointer is intentionally not checked here: it may publish
+    a new generation while an in-flight capture safely reads its old objects.
+    """
+    _, _, store_module = _regime_modules()
+    snapshots = import_module("backend.app.regime.snapshots")
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
+        encoding="utf-8",
+    )
+    (dataset_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    publisher = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb", temp_directory=tmp_path / "writer-temp"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+    publisher.upsert_bars([_bar(AS_OF, "sh.600000")])
+    reader = store_module.PublishedDatasetMarketReader(
+        control_path=tmp_path / "control.duckdb",
+        control_temp=tmp_path / "reader-temp",
+        dataset_root=dataset_root,
+        staging_root=tmp_path / "staging",
+    )
+    original_assert = reader.store._assert_snapshot_unchanged
+
+    def mutate_then_assert(snapshot) -> None:
+        with snapshot.paths[0].open("ab") as handle:
+            handle.write(b"changed")
+        original_assert(snapshot)
+
+    monkeypatch.setattr(reader.store, "_assert_snapshot_unchanged", mutate_then_assert)
+    snapshot_database = tmp_path / "derived" / "snapshots.sqlite3"
+    service = snapshots.RegimeSnapshotCaptureService(
+        regime_store=store_module.MarketRegimeStore(reader),
+        snapshot_store=snapshots.RegimeSnapshotStore(snapshot_database),
+    )
+
+    outcome = service.capture_range(
+        AS_OF,
+        AS_OF,
+        evidence_cutoff_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert outcome.inserted == 0
+    assert outcome.errors == 1
+    assert not snapshot_database.exists()
+
+
 def test_store_reuses_immutable_generation_input_and_reloads_on_pit_key_change() -> None:
     """Avoid re-reading the same published generation for every overview refresh."""
     _, _, store_module = _regime_modules()
@@ -1034,6 +1220,7 @@ def test_api_rejects_future_shanghai_date_before_store_read() -> None:
         "today": "2026-07-29",
         "timezone": "Asia/Shanghai",
     }
+
 
 
 def test_api_missing_database_is_empty_and_creates_no_filesystem_state(
