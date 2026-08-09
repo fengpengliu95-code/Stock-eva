@@ -120,7 +120,7 @@ Each correction was observed RED before its production change:
     - direct login and fetch retried against, then discarded, a pre-existing active session
 ```
 
-Fresh final verification from the isolated worktree:
+2026-07-29 historical verification snapshot from the isolated worktree (before later observability follow-ups):
 
 ```text
 uv run --extra dev pytest tests/test_point_in_time_classification.py -q

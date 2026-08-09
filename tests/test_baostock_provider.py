@@ -227,6 +227,45 @@ def test_active_session_entry_fails_without_touching_existing_session(
     assert provider.client is client
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [
+        RuntimeError("synthetic login failure"),
+        BaoStockError("synthetic BaoStock login failure"),
+    ],
+)
+def test_generic_login_failure_discards_only_the_new_half_initialized_session(
+    raised: Exception,
+) -> None:
+    class HalfInitializedLoginClient:
+        def __init__(self) -> None:
+            self.context = SimpleNamespace(default_socket=None)
+            self.socket = FakeSocket()
+            self.login_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            self.context.default_socket = self.socket
+            raise raised
+
+    client = HalfInitializedLoginClient()
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(type(raised)) as captured:
+        provider._login()
+
+    assert captured.value is raised
+    assert client.login_calls == 1
+    assert client.socket.shutdown_calls == 1
+    assert client.socket.closed is True
+    assert client.context.default_socket is None
+    assert provider._session_usable is False
+
+
 class CloseReleasedSocket(FakeSocket):
     def __init__(self) -> None:
         super().__init__()

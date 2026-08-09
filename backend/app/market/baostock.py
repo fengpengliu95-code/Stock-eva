@@ -228,6 +228,9 @@ class BaoStockProvider:
                 last_error = BaoStockTransportError("BaoStock login transport failed")
                 self._discard_session()
                 continue
+            except Exception:
+                self._discard_session()
+                raise
             if result.error_code != "0":
                 last_error = BaoStockTransportError(result.error_msg or "BaoStock login failed")
                 self._discard_session()

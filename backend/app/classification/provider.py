@@ -128,12 +128,19 @@ class BaoStockClassificationProvider:
             ClassificationFailure(
                 failure_stage=stage,
                 failure_class=failure_class,
-                elapsed_seconds=round(max(0.0, self._monotonic() - started_at), 3),
+                elapsed_seconds=self._safe_elapsed_seconds(started_at),
                 provider_request_count=self._metadata_operation_count,
                 configured_timeout_seconds=self.session.socket_timeout_seconds,
                 configured_max_attempts=self.session.max_attempts,
             )
         )
+
+    def _safe_elapsed_seconds(self, started_at: float) -> float:
+        try:
+            elapsed = self._monotonic() - started_at
+        except Exception:
+            return 0.0
+        return round(max(0.0, elapsed), 3)
 
     @staticmethod
     def _transport_failure_class(exc: Exception) -> str:
@@ -156,6 +163,14 @@ class BaoStockClassificationProvider:
         except (KeyError, TypeError, ValidationError):
             raise _ClassificationSchemaError("classification metadata is invalid") from None
 
+    @staticmethod
+    def _stage_outcome(operation, failure_classifier):
+        try:
+            return True, operation()
+        except Exception as error:
+            failure_class = failure_classifier(error)
+            return False, failure_class
+
     def _network_stage(
         self,
         stage: str,
@@ -163,14 +178,17 @@ class BaoStockClassificationProvider:
         *,
         started_at: float,
     ):
-        try:
-            return operation()
-        except Exception as exc:
-            raise self._error(
-                stage=stage,
-                failure_class=self._transport_failure_class(exc),
-                started_at=started_at,
-            ) from None
+        succeeded, result = self._stage_outcome(
+            operation,
+            self._transport_failure_class,
+        )
+        if succeeded:
+            return result
+        raise self._error(
+            stage=stage,
+            failure_class=result,
+            started_at=started_at,
+        )
 
     def _validation_stage(
         self,
@@ -179,20 +197,23 @@ class BaoStockClassificationProvider:
         *,
         started_at: float,
     ):
-        try:
-            return operation()
-        except Exception as exc:
-            if isinstance(exc, _ClassificationDataQualityError):
+        def failure_classifier(error: Exception) -> str:
+            if isinstance(error, _ClassificationDataQualityError):
                 failure_class = "data_quality"
-            elif isinstance(exc, _ClassificationSchemaError):
+            elif isinstance(error, _ClassificationSchemaError):
                 failure_class = "schema"
             else:
                 failure_class = "internal"
-            raise self._error(
-                stage=stage,
-                failure_class=failure_class,
-                started_at=started_at,
-            ) from None
+            return failure_class
+
+        succeeded, result = self._stage_outcome(operation, failure_classifier)
+        if succeeded:
+            return result
+        raise self._error(
+            stage=stage,
+            failure_class=result,
+            started_at=started_at,
+        )
 
     @staticmethod
     def _usable_basics(
