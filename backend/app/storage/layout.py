@@ -34,6 +34,13 @@ class StorageLayout:
     def duckdb_temporary(self) -> Path:
         return self.settings.local_temp_dir / "duckdb"
 
+    @property
+    def regime_snapshot_database(self) -> Path:
+        return (
+            self.settings.local_control_dir
+            / self.settings.regime_snapshot_database_name
+        )
+
     def ensure_local_runtime_dirs(self) -> None:
         paths = self.local_paths
         for path in (

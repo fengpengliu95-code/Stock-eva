@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     local_control_dir: Path = Path("var/control")
     factor_cache_database_name: str = "baostock_back_factor_cache.sqlite3"
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
+    regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
@@ -62,6 +63,20 @@ class Settings(BaseSettings):
             or not value.endswith(".sqlite3")
         ):
             raise ValueError("private database name must be a local .sqlite3 basename")
+        return value
+
+    @field_validator("regime_snapshot_database_name")
+    @classmethod
+    def validate_regime_snapshot_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("regime snapshot database name must be a local .sqlite3 basename")
         return value
 
     @model_validator(mode="after")
