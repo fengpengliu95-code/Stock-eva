@@ -313,19 +313,19 @@ def main() -> int:
                 settings.market_data_dir / settings.classification_database_name,
                 temp_directory=settings.local_temp_dir / "classification-duckdb",
             )
-            provider = (
-                BaoStockClassificationProvider(
-                    min_request_interval_seconds=(
-                        settings.auto_refresh_min_request_interval_seconds
-                    ),
-                    socket_timeout_seconds=configured_timeout_seconds,
-                )
-                if args.execute
-                else None
-            )
             discard = _DiscardWriter()
-            # This command is a single-threaded CLI; these redirects are process-global.
+            # Provider construction/execution is single-threaded; redirects are process-global.
             with redirect_stdout(discard), redirect_stderr(discard):
+                provider = (
+                    BaoStockClassificationProvider(
+                        min_request_interval_seconds=(
+                            settings.auto_refresh_min_request_interval_seconds
+                        ),
+                        socket_timeout_seconds=configured_timeout_seconds,
+                    )
+                    if args.execute
+                    else None
+                )
                 result = run_classification_sync(
                     as_of=args.as_of,
                     execute=args.execute,

@@ -2965,16 +2965,18 @@ def test_classification_cli_deadline_failure_is_json_and_creates_no_database(
 
 
 @pytest.mark.parametrize(
-    ("outcome", "expected_exit", "expected_status"),
+    ("outcome", "expected_exit", "expected_status", "expected_failure_class"),
     [
-        ("failure", 1, "error"),
-        ("success", 0, "ready"),
+        ("controlled_failure", 1, "error", "transport"),
+        ("unexpected_failure", 1, "error", "internal"),
+        ("success", 0, "ready", None),
     ],
 )
 def test_classification_cli_discards_untrusted_provider_output(
     outcome: str,
     expected_exit: int,
     expected_status: str,
+    expected_failure_class: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3008,7 +3010,7 @@ def test_classification_cli_discards_untrusted_provider_output(
                 "UPSTREAM_STDERR_SECRET /Users/private/upstream.err",
                 file=sys.stderr,
             )
-            if outcome == "failure":
+            if outcome == "controlled_failure":
                 raise ClassificationProviderError(
                     ClassificationFailure(
                         failure_stage="security_universe",
@@ -3018,6 +3020,10 @@ def test_classification_cli_discards_untrusted_provider_output(
                         configured_timeout_seconds=30,
                         configured_max_attempts=2,
                     )
+                )
+            if outcome == "unexpected_failure":
+                raise RuntimeError(
+                    "UPSTREAM_FETCH_EXCEPTION_SECRET /Users/private/fetch.err"
                 )
             return snapshot(
                 securities=[security("sh.600000")],
@@ -3050,6 +3056,8 @@ def test_classification_cli_discards_untrusted_provider_output(
     assert len(output_lines) == 1
     payload = json.loads(output_lines[0])
     assert payload["status"] == expected_status
+    if expected_failure_class is not None:
+        assert payload["failure_class"] == expected_failure_class
     assert captured.err == ""
     assert "UPSTREAM_" not in captured.out
     assert "UPSTREAM_" not in captured.err
@@ -3219,14 +3227,27 @@ def test_classification_cli_unexpected_constructor_failure_is_sanitized_and_writ
         local_temp_dir=tmp_path / "temp",
         local_market_dataset_root=tmp_path / "dataset",
     )
-    hostile = "token=do-not-leak /Users/private/secret.db"
+    writer_calls = 0
+
+    def reject_writer(_store: ClassificationStore):
+        nonlocal writer_calls
+        writer_calls += 1
+        raise AssertionError("classification writer initialized")
 
     class HostileProvider:
         def __init__(self, **_kwargs) -> None:
-            raise RuntimeError(hostile)
+            print("CONSTRUCTOR_STDOUT_SECRET /Users/private/constructor.out")
+            print(
+                "CONSTRUCTOR_STDERR_SECRET /Users/private/constructor.err",
+                file=sys.stderr,
+            )
+            raise RuntimeError(
+                "CONSTRUCTOR_EXCEPTION_SECRET /Users/private/constructor.sock"
+            )
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "BaoStockClassificationProvider", HostileProvider)
+    monkeypatch.setattr(ClassificationStore, "_connect_writer", reject_writer)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -3241,9 +3262,16 @@ def test_classification_cli_unexpected_constructor_failure_is_sanitized_and_writ
         ],
     )
 
+    stdout_before = sys.stdout
+    stderr_before = sys.stderr
+
     assert cli.main() == 1
-    output = capsys.readouterr().out
-    payload = json.loads(output)
+    assert sys.stdout is stdout_before
+    assert sys.stderr is stderr_before
+    captured = capsys.readouterr()
+    output_lines = captured.out.splitlines()
+    assert len(output_lines) == 1
+    payload = json.loads(output_lines[0])
     assert set(payload) == CLASSIFICATION_FAILURE_KEYS
     assert payload["quality_issues"] == ["classification_sync_failed"]
     assert payload["writes_classification_data"] is False
@@ -3253,7 +3281,12 @@ def test_classification_cli_unexpected_constructor_failure_is_sanitized_and_writ
     assert payload["provider_request_count"] == 0
     assert payload["configured_timeout_seconds"] == 17
     assert payload["configured_max_attempts"] is None
-    assert hostile not in output
+    assert captured.err == ""
+    assert "CONSTRUCTOR_" not in captured.out
+    assert "CONSTRUCTOR_" not in captured.err
+    assert "/Users/private" not in captured.out
+    assert "/Users/private" not in captured.err
+    assert writer_calls == 0
     assert list(tmp_path.iterdir()) == []
 
 
