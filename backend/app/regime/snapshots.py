@@ -124,9 +124,7 @@ class RegimeSnapshotStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def capture(
-        self, request: SnapshotCaptureRequest
-    ) -> tuple[MarketRegimeSnapshot, bool]:
+    def capture(self, request: SnapshotCaptureRequest) -> tuple[MarketRegimeSnapshot, bool]:
         existing = self.read_exact(
             request.result.as_of,
             request.result.formula_version,
@@ -158,9 +156,11 @@ class RegimeSnapshotStore:
             except sqlite3.IntegrityError as exc:
                 connection.execute("ROLLBACK")
                 existing = self.read_exact(request.result.as_of, request.result.formula_version)
-                if existing is not None and self._build(
-                    request, recorded_at=existing.recorded_at
-                ).content_hash == existing.content_hash:
+                if (
+                    existing is not None
+                    and self._build(request, recorded_at=existing.recorded_at).content_hash
+                    == existing.content_hash
+                ):
                     return existing, False
                 raise RegimeSnapshotConflict("immutable regime snapshot conflict") from exc
             connection.execute("COMMIT")
@@ -175,9 +175,7 @@ class RegimeSnapshotStore:
             if connection is not None:
                 connection.close()
 
-    def read_exact(
-        self, as_of: date, formula_version: str
-    ) -> MarketRegimeSnapshot | None:
+    def read_exact(self, as_of: date, formula_version: str) -> MarketRegimeSnapshot | None:
         if not self.path.is_file():
             return None
         connection: sqlite3.Connection | None = None
@@ -255,9 +253,7 @@ class RegimeSnapshotStore:
             "as_of": result.as_of.isoformat(),
             "formula_version": result.formula_version,
             "result_id": result.result_id,
-            "data_as_of": (
-                None if result.data_as_of is None else result.data_as_of.isoformat()
-            ),
+            "data_as_of": (None if result.data_as_of is None else result.data_as_of.isoformat()),
             "capture_mode": request.capture_mode,
             "evidence_cutoff_at": _utc(request.evidence_cutoff_at).isoformat(),
             "dataset_generation": request.dataset_generation,

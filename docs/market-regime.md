@@ -119,3 +119,7 @@ read-only reader 返回空输入且不创建任何路径。已经发布的 manif
 R1-B 只生成按请求即时确定性结果，不持久化新的 regime 数据库。Release 1 的
 “每个 ready 交易日一份快照”及至少 20 个真实历史交易日验收由 R1-E 在受控真实
 数据上完成。
+
+R1-E 快照只存于本地 derived SQLite。回填记录为 `post_hoc_backfill`，不代表分类在
+当日已可见；release audit 必须单独报告 `post_hoc_verified` 与
+`contemporaneous_unverified`。

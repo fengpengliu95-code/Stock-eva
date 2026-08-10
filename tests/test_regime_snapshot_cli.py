@@ -57,8 +57,7 @@ def test_snapshot_cli_rejects_inverted_range_before_market_reader(
     assert cli.main() == 1
     assert calls == 0
     assert (
-        json.loads(capsys.readouterr().out)["error_code"]
-        == "regime_snapshot_capture_unavailable"
+        json.loads(capsys.readouterr().out)["error_code"] == "regime_snapshot_capture_unavailable"
     )
     assert not settings.local_control_dir.exists()
 
@@ -260,7 +259,6 @@ def test_snapshot_cli_rejects_outside_manifest_without_snapshot_store(
 
     assert cli.main() == 1
     assert (
-        json.loads(capsys.readouterr().out)["error_code"]
-        == "regime_snapshot_capture_unavailable"
+        json.loads(capsys.readouterr().out)["error_code"] == "regime_snapshot_capture_unavailable"
     )
     assert not (settings.local_control_dir / settings.regime_snapshot_database_name).exists()

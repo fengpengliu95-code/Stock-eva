@@ -745,7 +745,11 @@ def test_lifespan_writer_owner_repairs_legacy_control_schema(
     monkeypatch.setattr(main_module, "settings", settings)
     monkeypatch.setattr(main_module, "StoragePreflight", ReadyPreflight)
     monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
-    monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args: None)
+    monkeypatch.setattr(
+        main_module,
+        "build_after_close_pipeline",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
     monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
 

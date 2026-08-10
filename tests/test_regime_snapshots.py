@@ -200,9 +200,10 @@ def test_snapshot_metadata_never_contains_dataset_path(tmp_path: Path) -> None:
     serialized = snapshot.model_dump_json()
 
     assert "/private/fixture" not in serialized
-    assert snapshot.dataset_identity_hash == hashlib.sha256(
-        b"/private/fixture/market.parquet"
-    ).hexdigest()
+    assert (
+        snapshot.dataset_identity_hash
+        == hashlib.sha256(b"/private/fixture/market.parquet").hexdigest()
+    )
 
 
 def test_snapshot_store_uses_explicit_canonical_result_payload_columns(

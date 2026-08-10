@@ -36,6 +36,10 @@ from backend.app.market.full_history import FullMarketHistoryService
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
+from backend.app.regime.acceptance import (
+    MINIMUM_RELEASE_ONE_SESSIONS,
+    ReleaseOneAcceptanceService,
+)
 from backend.app.regime.snapshots import (
     RegimeSnapshotCaptureService,
     RegimeSnapshotStore,
@@ -313,6 +317,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="persist selected verified manifest dates; omitted means read-only plan",
     )
+    release_one_audit = subparsers.add_parser(
+        "release-one-audit",
+        help="read-only verification of persisted Release 1 replay evidence",
+    )
+    release_one_audit.add_argument(
+        "--sessions",
+        type=int,
+        default=MINIMUM_RELEASE_ONE_SESSIONS,
+    )
     return parser
 
 
@@ -378,6 +391,50 @@ def main() -> int:
             return 1
         print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
         return 0 if result.status in {"dry-run", "ready"} else 1
+    if args.command == "release-one-audit":
+        if args.sessions < MINIMUM_RELEASE_ONE_SESSIONS:
+            print(
+                json.dumps(
+                    {
+                        "status": "not_ready",
+                        "error_code": "release_one_audit_unavailable",
+                        "writes_snapshot_data": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        try:
+            discard = _DiscardWriter()
+            with redirect_stdout(discard), redirect_stderr(discard):
+                settings = get_settings()
+                layout = StorageLayout(settings)
+                report = ReleaseOneAcceptanceService(
+                    regime_store=market_regime_store_from_settings(settings),
+                    snapshot_store=RegimeSnapshotStore(layout.regime_snapshot_database),
+                    classification_store=ClassificationStore(
+                        settings.market_data_dir / settings.classification_database_name,
+                        temp_directory=settings.local_temp_dir / "classification-duckdb",
+                    ),
+                ).run(
+                    sessions=args.sessions,
+                    audit_cutoff_at=datetime.now(UTC),
+                )
+            payload = {
+                **report.model_dump(mode="json"),
+                "writes_snapshot_data": False,
+            }
+            exit_code = 0 if report.status == "ready" else 1
+        except Exception:
+            payload = {
+                "status": "not_ready",
+                "error_code": "release_one_audit_unavailable",
+                "writes_snapshot_data": False,
+            }
+            exit_code = 1
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return exit_code
     settings = get_settings()
     if args.command == "market-regime-snapshots":
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
