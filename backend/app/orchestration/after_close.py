@@ -44,7 +44,11 @@ class AlertWorkRunner(Protocol):
     ) -> str | None: ...
 
 
-TaskKind = Literal["strategy", "alert"]
+class RegimeSnapshotWorkRunner(Protocol):
+    def run(self, result: RefreshResult, *, idempotency_key: str) -> str | None: ...
+
+
+TaskKind = Literal["regime", "strategy", "alert"]
 TaskStatus = Literal["running", "completed", "error"]
 
 
@@ -301,7 +305,7 @@ class AfterCloseTaskStore:
                 """
                 SELECT * FROM after_close_tasks
                 WHERE trade_date = ?
-                ORDER BY CASE kind WHEN 'strategy' THEN 0 ELSE 1 END, work_key
+                ORDER BY CASE kind WHEN 'regime' THEN 0 WHEN 'strategy' THEN 1 ELSE 2 END, work_key
                 """,
                 [trade_date.isoformat()],
             ).fetchall()
@@ -322,6 +326,7 @@ class AfterClosePipelineService:
         strategy_runner: StrategyWorkRunner,
         list_alert_rules: Callable[[], Iterable[AlertWorkItem]],
         alert_runner: AlertWorkRunner,
+        regime_runner: RegimeSnapshotWorkRunner | None = None,
     ) -> None:
         self.market_store = market_store
         self.task_store = task_store
@@ -329,6 +334,7 @@ class AfterClosePipelineService:
         self.strategy_runner = strategy_runner
         self.list_alert_rules = list_alert_rules
         self.alert_runner = alert_runner
+        self.regime_runner = regime_runner
 
     def run_after_publication(
         self,
@@ -345,6 +351,15 @@ class AfterClosePipelineService:
         self.task_store.start_pipeline(result.requested_date, result.run_id)
         strategies = [item for item in self.list_strategies() if item.enabled]
         alerts = [item for item in self.list_alert_rules() if item.enabled]
+
+        if self.regime_runner is not None:
+            self._run_task(
+                trade_date=result.requested_date,
+                kind="regime",
+                work_key="market-regime-v1",
+                runner=lambda key: self.regime_runner.run(result, idempotency_key=key),
+                error_code="regime_snapshot_capture_failed",
+            )
 
         for item in strategies:
             self._run_task(

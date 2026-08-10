@@ -91,6 +91,18 @@ class RecordingAlertRunner:
         )
 
 
+class RecordingRegimeRunner:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[tuple[RefreshResult, str]] = []
+        self.fail = fail
+
+    def run(self, result: RefreshResult, *, idempotency_key: str) -> str:
+        self.calls.append((result, idempotency_key))
+        if self.fail:
+            raise RuntimeError("/private/snapshot failure")
+        return "regime-snapshot-fixture"
+
+
 def build_service(
     tmp_path: Path,
     *,
@@ -99,6 +111,7 @@ def build_service(
     alerts: list[AlertWorkItem] | None = None,
     strategy_runner: RecordingStrategyRunner | None = None,
     alert_runner: RecordingAlertRunner | None = None,
+    regime_runner: RecordingRegimeRunner | None = None,
 ) -> tuple[
     AfterClosePipelineService,
     AfterCloseTaskStore,
@@ -115,8 +128,57 @@ def build_service(
         strategy_runner=selected_strategy_runner,
         list_alert_rules=lambda: alerts or [],
         alert_runner=selected_alert_runner,
+        regime_runner=regime_runner,
     )
     return service, task_store, selected_strategy_runner, selected_alert_runner
+
+
+def test_ready_publication_runs_regime_before_private_tasks_and_restarts_idempotently(
+    tmp_path: Path,
+) -> None:
+    sequence: list[str] = []
+
+    class OrderedRegimeRunner(RecordingRegimeRunner):
+        def run(self, *args, **kwargs) -> str:
+            sequence.append("regime")
+            return super().run(*args, **kwargs)
+
+    class OrderedStrategyRunner(RecordingStrategyRunner):
+        def run(self, *args, **kwargs) -> str:
+            sequence.append("strategy")
+            return super().run(*args, **kwargs)
+
+    regime_runner = OrderedRegimeRunner()
+    service, task_store, _, _ = build_service(
+        tmp_path,
+        published=refresh_result(),
+        strategies=[StrategyWorkItem(strategy_id="s", version=1, version_id="s-v1")],
+        regime_runner=regime_runner,
+        strategy_runner=OrderedStrategyRunner(),
+    )
+
+    assert service.run_after_publication(refresh_result()).status == "completed"
+    assert service.run_after_publication(refresh_result()).status == "completed"
+    assert sequence == ["regime", "strategy"]
+    assert [task.kind for task in task_store.list_tasks(TRADE_DATE)] == ["regime", "strategy"]
+
+
+def test_regime_failure_is_sanitized_and_does_not_block_private_tasks(tmp_path: Path) -> None:
+    regime_runner = RecordingRegimeRunner(fail=True)
+    service, task_store, strategy_runner, _ = build_service(
+        tmp_path,
+        published=refresh_result(),
+        strategies=[StrategyWorkItem(strategy_id="s", version=1, version_id="s-v1")],
+        regime_runner=regime_runner,
+    )
+
+    outcome = service.run_after_publication(refresh_result())
+    tasks = task_store.list_tasks(TRADE_DATE)
+
+    assert outcome.status == "partial"
+    assert strategy_runner.calls
+    assert tasks[0].error_code == "regime_snapshot_capture_failed"
+    assert "/private" not in tasks[0].model_dump_json()
 
 
 def test_ready_published_snapshot_runs_strategies_before_alerts(tmp_path: Path) -> None:

@@ -9,6 +9,9 @@ from backend.app.orchestration.after_close import (
     AlertWorkItem,
     StrategyWorkItem,
 )
+from backend.app.regime.snapshots import RegimeSnapshotCaptureService, RegimeSnapshotStore
+from backend.app.regime.store import market_regime_store_from_settings
+from backend.app.storage.layout import StorageLayout
 
 
 class StrategyCatalogAdapter:
@@ -83,9 +86,20 @@ class AlertRunnerAdapter:
         return f"alert-evaluation:{item.rule_id}:{trade_date.isoformat()}"
 
 
+class RegimeSnapshotRunnerAdapter:
+    def __init__(self, capture_service: RegimeSnapshotCaptureService) -> None:
+        self.capture_service = capture_service
+
+    def run(self, result, *, idempotency_key: str) -> str:
+        del idempotency_key
+        return self.capture_service.capture_after_close(result).snapshot_id
+
+
 def build_after_close_pipeline(
     user_database: Path,
     market_store,
+    *,
+    settings=None,
 ) -> AfterClosePipelineService:
     from backend.app.alert.service import AlertService
     from backend.app.alert.store import AlertStore
@@ -96,6 +110,16 @@ def build_after_close_pipeline(
     strategy_store = StrategyStore(user_database)
     alert_store = AlertStore(user_database)
     user_store = UserStore(user_database)
+    regime_runner = None
+    if settings is not None:
+        regime_runner = RegimeSnapshotRunnerAdapter(
+            RegimeSnapshotCaptureService(
+                regime_store=market_regime_store_from_settings(settings),
+                snapshot_store=RegimeSnapshotStore(
+                    StorageLayout(settings).regime_snapshot_database
+                ),
+            )
+        )
     return AfterClosePipelineService(
         market_store=market_store,
         task_store=AfterCloseTaskStore(user_database),
@@ -110,4 +134,5 @@ def build_after_close_pipeline(
                 market_store,
             )
         ),
+        regime_runner=regime_runner,
     )

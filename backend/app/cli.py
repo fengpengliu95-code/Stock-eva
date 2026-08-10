@@ -832,6 +832,7 @@ def main() -> int:
             post_publish=build_after_close_pipeline(
                 layout.local_paths.user_database,
                 store,
+                settings=settings,
             ),
         )
         now = get_market_clock()()

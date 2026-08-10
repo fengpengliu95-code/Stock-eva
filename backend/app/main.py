@@ -78,6 +78,7 @@ async def lifespan(_: FastAPI):
         post_publish=build_after_close_pipeline(
             layout.local_paths.user_database,
             market_store,
+            settings=settings,
         ),
     )
     calendar_service = CalendarSyncService(
