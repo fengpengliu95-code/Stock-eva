@@ -349,9 +349,6 @@ class AfterClosePipelineService:
             return self._skipped(result, "not_current_publication")
 
         self.task_store.start_pipeline(result.requested_date, result.run_id)
-        strategies = [item for item in self.list_strategies() if item.enabled]
-        alerts = [item for item in self.list_alert_rules() if item.enabled]
-
         if self.regime_runner is not None:
             self._run_task(
                 trade_date=result.requested_date,
@@ -360,6 +357,9 @@ class AfterClosePipelineService:
                 runner=lambda key: self.regime_runner.run(result, idempotency_key=key),
                 error_code="regime_snapshot_capture_failed",
             )
+
+        strategies = [item for item in self.list_strategies() if item.enabled]
+        alerts = [item for item in self.list_alert_rules() if item.enabled]
 
         for item in strategies:
             self._run_task(

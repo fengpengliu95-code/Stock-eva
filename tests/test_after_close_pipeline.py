@@ -3,6 +3,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from backend.app.alert.store import AlertStore
 from backend.app.market.automation import MarketAutomationService
 from backend.app.market.models import RefreshResult
@@ -179,6 +181,25 @@ def test_regime_failure_is_sanitized_and_does_not_block_private_tasks(tmp_path: 
     assert strategy_runner.calls
     assert tasks[0].error_code == "regime_snapshot_capture_failed"
     assert "/private" not in tasks[0].model_dump_json()
+
+
+def test_regime_runs_before_private_catalog_enumeration(tmp_path: Path) -> None:
+    regime_runner = RecordingRegimeRunner()
+    task_store = AfterCloseTaskStore(tmp_path / "user.sqlite3")
+    service = AfterClosePipelineService(
+        market_store=PublishedStore(refresh_result()),
+        task_store=task_store,
+        list_strategies=lambda: (_ for _ in ()).throw(RuntimeError("private catalog failed")),
+        strategy_runner=RecordingStrategyRunner(),
+        list_alert_rules=lambda: [],
+        alert_runner=RecordingAlertRunner(),
+        regime_runner=regime_runner,
+    )
+
+    with pytest.raises(RuntimeError, match="private catalog failed"):
+        service.run_after_publication(refresh_result())
+
+    assert len(regime_runner.calls) == 1
 
 
 def test_ready_published_snapshot_runs_strategies_before_alerts(tmp_path: Path) -> None:
