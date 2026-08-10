@@ -258,6 +258,7 @@ def test_non_ready_or_unpublished_or_old_result_never_triggers(tmp_path: Path) -
         ),
     ]
     for index, (result, published, expected_reason) in enumerate(scenarios):
+        regime_runner = RecordingRegimeRunner()
         service, task_store, strategy_runner, alert_runner = build_service(
             tmp_path / str(index),
             published=published,
@@ -269,12 +270,14 @@ def test_non_ready_or_unpublished_or_old_result_never_triggers(tmp_path: Path) -
                 )
             ],
             alerts=[AlertWorkItem(rule_id="alert-rule-1")],
+            regime_runner=regime_runner,
         )
 
         outcome = service.run_after_publication(result)
 
         assert outcome.triggered is False
         assert outcome.reason == expected_reason
+        assert regime_runner.calls == []
         assert strategy_runner.calls == []
         assert alert_runner.calls == []
         assert task_store.list_tasks(result.requested_date) == []

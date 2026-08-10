@@ -17,6 +17,12 @@ from backend.app.market.baostock import ProviderBatch
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore
+from backend.app.orchestration.after_close import (
+    AfterClosePipelineService,
+    AfterCloseTaskStore,
+    StrategyWorkItem,
+)
+from backend.app.regime.snapshots import RegimeSnapshotUnavailable
 from tests.test_market_data import fixture_payload
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -367,6 +373,82 @@ def test_automation_publishes_once_and_does_not_repeat_success(
     assert second.decision.action == "none"
     assert provider.fetch_calls == 1
     assert provider.calendar_calls == 1
+
+
+def test_automation_keeps_ready_publication_when_typed_regime_capture_fails(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    task_store = AfterCloseTaskStore(tmp_path / "user.sqlite3")
+    regime_calls: list[str] = []
+    strategy_calls: list[str] = []
+
+    class FailingRegimeRunner:
+        def run(self, _result, *, idempotency_key: str) -> str:
+            regime_calls.append(idempotency_key)
+            raise RegimeSnapshotUnavailable("/private/market unexpected-regime-secret")
+
+    class RecordingStrategyRunner:
+        def run(self, item, *, trade_date, idempotency_key: str) -> str:
+            del trade_date
+            strategy_calls.append(idempotency_key)
+            return f"strategy-run:{item.strategy_id}"
+
+    pipeline = AfterClosePipelineService(
+        market_store=store,
+        task_store=task_store,
+        list_strategies=lambda: [
+            StrategyWorkItem(
+                strategy_id="strategy-1",
+                version=1,
+                version_id="strategy-version-1",
+            )
+        ],
+        strategy_runner=RecordingStrategyRunner(),
+        list_alert_rules=lambda: [],
+        alert_runner=object(),
+        regime_runner=FailingRegimeRunner(),
+    )
+    service = module.MarketAutomationService(
+        store,
+        CompleteProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        post_publish=pipeline,
+    )
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+
+    first = service.run_due_once(now)
+    second = service.run_due_once(now)
+
+    assert first.result is not None and first.result.status == "ready"
+    assert first.state.refresh_state == "success"
+    assert second.decision.action == "none"
+    assert store.published_refresh() is not None
+    assert store.published_refresh().run_id == first.result.run_id
+    assert len(regime_calls) == 2
+    assert len(strategy_calls) == 1
+    tasks = task_store.list_tasks(date(2026, 7, 23))
+    regime_task = next(item for item in tasks if item.kind == "regime")
+    strategy_task = next(item for item in tasks if item.kind == "strategy")
+    assert regime_task.status == "error"
+    assert regime_task.error_code == "regime_snapshot_capture_failed"
+    assert regime_task.result_reference is None
+    assert regime_task.attempt_count == 2
+    assert strategy_task.status == "completed"
+    assert strategy_task.attempt_count == 1
+
+    private_bytes = b"".join(
+        path.read_bytes()
+        for path in sorted(task_store.path.parent.glob(f"{task_store.path.name}*"))
+        if path.is_file()
+    )
+    assert b"unexpected-regime-secret" not in private_bytes
+    assert b"/private/market" not in private_bytes
+    assert b"result_payload" not in private_bytes
+    assert b"content_hash" not in private_bytes
+    assert b"dataset_identity_hash" not in private_bytes
 
 
 def test_partial_attempt_waits_then_catches_up_at_retry_slot(

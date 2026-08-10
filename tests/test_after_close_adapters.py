@@ -243,12 +243,46 @@ def test_factory_ready_manifest_captures_one_derived_snapshot_idempotently(tmp_p
         completed_at=datetime(2026, 7, 24, 1, tzinfo=UTC),
     )
     store.save_refresh([bar], result, publish=True)
-    pipeline = build_after_close_pipeline(
-        settings.user_data_dir / settings.user_database_name, store, settings=settings
-    )
+    user_database = settings.user_data_dir / settings.user_database_name
+    pipeline = build_after_close_pipeline(user_database, store, settings=settings)
     assert pipeline.run_after_publication(result).status == "completed"
     assert pipeline.run_after_publication(result).status == "completed"
     database = settings.local_control_dir / settings.regime_snapshot_database_name
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT count(*) FROM regime_snapshots").fetchone()[0] == 1
     connection.close()
+
+    connection = sqlite3.connect(user_database)
+    task = connection.execute(
+        """
+        SELECT kind, status, result_reference, error_code, attempt_count
+        FROM after_close_tasks WHERE kind = 'regime'
+        """
+    ).fetchone()
+    schema = "\n".join(
+        row[0]
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+        ).fetchall()
+    )
+    connection.close()
+
+    kind, status, result_reference, error_code, attempt_count = task
+    assert (kind, status, error_code, attempt_count) == (
+        "regime",
+        "completed",
+        None,
+        1,
+    )
+    assert result_reference.startswith("regime-snapshot-")
+    assert "result_payload" not in schema
+    assert "content_hash" not in schema
+    assert "dataset_identity_hash" not in schema
+    private_bytes = b"".join(
+        path.read_bytes()
+        for path in sorted(user_database.parent.glob(f"{user_database.name}*"))
+        if path.is_file()
+    )
+    assert str(root).encode() not in private_bytes
+    assert b"result_payload" not in private_bytes
+    assert b"dataset_identity_hash" not in private_bytes
