@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.app.config import Settings
 from backend.app.orchestration.adapters import (
     AlertCatalogAdapter,
     AlertRunnerAdapter,
@@ -154,3 +155,25 @@ def test_factory_builds_local_pipeline_around_shared_private_database(
 
     assert isinstance(pipeline, AfterClosePipelineService)
     assert pipeline.task_store.path == tmp_path / "user.sqlite3"
+
+
+def test_factory_with_snapshot_settings_does_not_create_derived_database(tmp_path) -> None:
+    settings = Settings(
+        local_control_dir=tmp_path / "control",
+        market_data_dir=tmp_path / "market",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+    )
+
+    pipeline = build_after_close_pipeline(
+        tmp_path / "user.sqlite3",
+        SimpleNamespace(),
+        settings=settings,
+    )
+
+    assert pipeline.regime_runner is not None
+    assert not (settings.local_control_dir / settings.regime_snapshot_database_name).exists()
