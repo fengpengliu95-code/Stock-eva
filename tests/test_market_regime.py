@@ -1255,7 +1255,7 @@ def test_snapshot_api_reads_exact_persisted_result_without_recomputation(
     assert response.json()["result"] == result.model_dump(mode="json")
 
 
-@pytest.mark.parametrize("failure", ["schema", "payload", "hash", "lock"])
+@pytest.mark.parametrize("failure", ["schema", "payload", "hash", "future_lineage", "lock"])
 def test_snapshot_api_failures_are_sanitized_and_read_only(
     tmp_path: Path,
     failure: str,
@@ -1289,6 +1289,17 @@ def test_snapshot_api_failures_are_sanitized_and_read_only(
         connection.execute("UPDATE regime_snapshots SET content_hash = ?", ["0" * 64])
         connection.commit()
         before = snapshot_store.path.read_bytes()
+    elif failure == "future_lineage":
+        payload = json.loads(
+            connection.execute("SELECT result_payload FROM regime_snapshots").fetchone()[0]
+        )
+        payload["source_lineage"][0]["latest_input_date"] = "2026-07-30"
+        connection.execute(
+            "UPDATE regime_snapshots SET result_payload = ?",
+            [json.dumps(payload)],
+        )
+        connection.commit()
+        before = snapshot_store.path.read_bytes()
     else:
         connection.execute("BEGIN EXCLUSIVE")
 
@@ -1312,6 +1323,25 @@ def test_snapshot_api_failures_are_sanitized_and_read_only(
         "storage_status": "unavailable",
     }
     assert snapshot_store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("path", ["not-a-date", "2026-07-30"])
+def test_snapshot_api_rejects_invalid_or_future_before_reader(path: str) -> None:
+    analysis_api = import_module("backend.app.api.analysis")
+
+    class RejectReader:
+        def read_exact(self, *_args):
+            raise AssertionError("invalid request reached snapshot reader")
+
+    response = _api_request(
+        f"/api/v1/analysis/market-regime/snapshots/{path}",
+        {
+            analysis_api.get_regime_snapshot_store: lambda: RejectReader(),
+            analysis_api.get_regime_today: lambda: AS_OF,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 

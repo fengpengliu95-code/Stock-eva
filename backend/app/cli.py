@@ -432,6 +432,13 @@ def main() -> int:
                 "writes_snapshot_data": False,
             }
             exit_code = 1
+        except Exception:
+            payload = {
+                "status": "error",
+                "error_code": "regime_snapshot_capture_unavailable",
+                "writes_snapshot_data": False,
+            }
+            exit_code = 1
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return exit_code
     if args.command == "backup-private-data":

@@ -95,6 +95,31 @@ def test_snapshot_cli_suppresses_constructor_noise_and_secrets(
     assert json.loads(captured.out)["error_code"] == "regime_snapshot_capture_unavailable"
 
 
+def test_snapshot_cli_sanitizes_unexpected_noisy_constructor_failure(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    settings = Settings(local_control_dir=tmp_path / "control")
+
+    def noisy_reader(_settings):
+        print("/private/query unexpected-secret")
+        raise RuntimeError("unexpected /private/query unexpected-secret")
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "market_regime_store_from_settings", noisy_reader)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stock-eva", "market-regime-snapshots", "--start", "2026-07-01", "--end", "2026-07-31"],
+    )
+
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "unexpected-secret" not in captured.out
+    assert "/private" not in captured.out
+    assert json.loads(captured.out)["error_code"] == "regime_snapshot_capture_unavailable"
+
+
 def _published_settings(tmp_path: Path) -> tuple[Settings, tuple[date, ...]]:
     dates = (date(2026, 7, 22), date(2026, 7, 23))
     dataset_root = tmp_path / "dataset"
@@ -196,6 +221,10 @@ def test_snapshot_cli_dry_run_and_repeat_execute_are_exact_and_idempotent(
     first = json.loads(capsys.readouterr().out)
     database = settings.local_control_dir / settings.regime_snapshot_database_name
     first_bytes = database.read_bytes()
+    first_inventory = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in database.parent.glob(f"{database.name}*")
+    }
     assert first["inserted"] == len(dates)
     assert first["writes_snapshot_data"] is True
 
@@ -205,3 +234,33 @@ def test_snapshot_cli_dry_run_and_repeat_execute_are_exact_and_idempotent(
     assert second["idempotent"] == len(dates)
     assert second["writes_snapshot_data"] is False
     assert database.read_bytes() == first_bytes
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in database.parent.glob(f"{database.name}*")
+    } == first_inventory
+
+
+def test_snapshot_cli_rejects_outside_manifest_without_snapshot_store(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    settings, _dates = _published_settings(tmp_path)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-regime-snapshots",
+            "--start",
+            "2026-07-01",
+            "--end",
+            "2026-07-02",
+        ],
+    )
+
+    assert cli.main() == 1
+    assert (
+        json.loads(capsys.readouterr().out)["error_code"]
+        == "regime_snapshot_capture_unavailable"
+    )
+    assert not (settings.local_control_dir / settings.regime_snapshot_database_name).exists()
