@@ -1,9 +1,12 @@
-from datetime import date
+import sqlite3
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
 
 from backend.app.config import Settings
+from backend.app.market.models import DailyBar, RefreshResult
+from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import (
     AlertCatalogAdapter,
     AlertRunnerAdapter,
@@ -16,6 +19,7 @@ from backend.app.orchestration.after_close import (
     AlertWorkItem,
     StrategyWorkItem,
 )
+from backend.app.storage.dataset import NasMarketStore
 
 
 def test_strategy_catalog_uses_each_saved_strategy_current_immutable_version() -> None:
@@ -177,3 +181,74 @@ def test_factory_with_snapshot_settings_does_not_create_derived_database(tmp_pat
 
     assert pipeline.regime_runner is not None
     assert not (settings.local_control_dir / settings.regime_snapshot_database_name).exists()
+
+
+def test_factory_ready_manifest_captures_one_derived_snapshot_idempotently(tmp_path) -> None:
+    as_of = date(2026, 7, 24)
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / ".stock-eva-dataset.json").write_text(
+        '{"dataset":"stock-eva-market","schema_version":2}'
+    )
+    (root / "manifest.json").write_text(
+        '{"dataset":"stock-eva-market","schema_version":2,"generation":"empty","files":[]}'
+    )
+    settings = Settings(
+        local_control_dir=tmp_path / "control",
+        market_data_dir=tmp_path / "market",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        user_data_dir=tmp_path / "user",
+        local_market_dataset_root=root,
+        nas_market_dataset_root=None,
+    )
+    store = NasMarketStore(
+        MarketStore(settings.market_data_dir / settings.market_database_name),
+        root,
+        settings.local_staging_dir,
+    )
+    bar = DailyBar(
+        trade_date=as_of,
+        symbol="sh.600000",
+        security_type="stock",
+        exchange="sh",
+        board="main",
+        open=10,
+        high=10,
+        low=10,
+        close=10,
+        preclose=10,
+        volume=1,
+        amount=1,
+        turnover_rate=1,
+        pct_change=0,
+        adjust_factor=1,
+        is_trading=True,
+        is_suspended=False,
+        is_st=False,
+        source_record_id="fixture",
+        ingested_at=datetime(2026, 7, 24, tzinfo=UTC),
+        quality_status="ready",
+    )
+    result = RefreshResult(
+        run_id="ready",
+        requested_date=as_of,
+        source="baostock",
+        status="ready",
+        requested_count=1,
+        succeeded_count=1,
+        coverage_ratio=1,
+        started_at=datetime(2026, 7, 24, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+    store.save_refresh([bar], result, publish=True)
+    pipeline = build_after_close_pipeline(
+        settings.user_data_dir / settings.user_database_name, store, settings=settings
+    )
+    assert pipeline.run_after_publication(result).status == "completed"
+    assert pipeline.run_after_publication(result).status == "completed"
+    database = settings.local_control_dir / settings.regime_snapshot_database_name
+    connection = sqlite3.connect(database)
+    assert connection.execute("SELECT count(*) FROM regime_snapshots").fetchone()[0] == 1
+    connection.close()
