@@ -17,7 +17,7 @@ from backend.app.regime.store import MarketReadUnavailable, MarketRegimeStore
 from backend.app.storage.dataset import PublishedReadSnapshot
 
 CaptureMode = Literal["after_close", "post_hoc_backfill"]
-DATASET_GENERATION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+DATASET_GENERATION_PATTERN = r"^generation-([0-9a-f]{32}|[0-9]{8}-[0-9]{6})$"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS regime_snapshots (
     snapshot_id TEXT NOT NULL PRIMARY KEY,

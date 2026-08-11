@@ -30,6 +30,17 @@ from backend.app.storage.layout import StorageLayout
 
 AS_OF = date(2026, 7, 29)
 HASH = "a" * 64
+VALID_GENERATION = "generation-" + "a" * 32
+FUTURE_RESULT_BOUNDARIES = (
+    "top_earliest_lineage",
+    "top_latest_lineage",
+    "component_earliest_lineage",
+    "component_latest_lineage",
+    "top_supporting_evidence",
+    "top_contrary_evidence",
+    "component_supporting_evidence",
+    "component_contrary_evidence",
+)
 
 
 def _result(*, as_of: date = AS_OF) -> MarketRegimeResult:
@@ -99,7 +110,7 @@ def _result(*, as_of: date = AS_OF) -> MarketRegimeResult:
 def _request(
     *,
     result: MarketRegimeResult | None = None,
-    dataset_generation: str = "fixture-generation",
+    dataset_generation: str = VALID_GENERATION,
 ) -> SnapshotCaptureRequest:
     return SnapshotCaptureRequest(
         result=result or _result(),
@@ -108,6 +119,64 @@ def _request(
         dataset_generation=dataset_generation,
         dataset_identity=Path("/private/fixture/market.parquet").as_posix(),
     )
+
+
+def _result_with_future_boundary(boundary: str) -> MarketRegimeResult:
+    result = _result()
+    future = AS_OF.replace(day=30)
+    if boundary in {"top_earliest_lineage", "top_latest_lineage"}:
+        field = "earliest_input_date" if "earliest" in boundary else "latest_input_date"
+        update = {field: future}
+        if field == "earliest_input_date":
+            update["latest_input_date"] = future
+        lineage = result.source_lineage[0].model_copy(update=update)
+        return result.model_copy(update={"source_lineage": [lineage]})
+    if boundary in {"component_earliest_lineage", "component_latest_lineage"}:
+        field = "earliest_input_date" if "earliest" in boundary else "latest_input_date"
+        update = {field: future}
+        if field == "earliest_input_date":
+            update["latest_input_date"] = future
+        lineage = result.component_scores[0].source_lineage[0].model_copy(update=update)
+        component = result.component_scores[0].model_copy(update={"source_lineage": [lineage]})
+        return result.model_copy(update={"component_scores": [component]})
+
+    evidence = result.supporting_evidence[0].model_copy(update={"as_of": future})
+    if boundary == "top_supporting_evidence":
+        return result.model_copy(update={"supporting_evidence": [evidence]})
+    if boundary == "top_contrary_evidence":
+        return result.model_copy(update={"contrary_evidence": [evidence]})
+    field = boundary.removeprefix("component_")
+    component = result.component_scores[0].model_copy(update={field: [evidence]})
+    return result.model_copy(update={"component_scores": [component]})
+
+
+def _mutate_payload_future_boundary(
+    payload: dict[str, object],
+    boundary: str,
+) -> None:
+    future = "2026-07-30"
+    if boundary in {"top_earliest_lineage", "top_latest_lineage"}:
+        field = "earliest_input_date" if "earliest" in boundary else "latest_input_date"
+        payload["source_lineage"][0][field] = future
+        if field == "earliest_input_date":
+            payload["source_lineage"][0]["latest_input_date"] = future
+        return
+    if boundary in {"component_earliest_lineage", "component_latest_lineage"}:
+        field = "earliest_input_date" if "earliest" in boundary else "latest_input_date"
+        payload["component_scores"][0]["source_lineage"][0][field] = future
+        if field == "earliest_input_date":
+            payload["component_scores"][0]["source_lineage"][0]["latest_input_date"] = future
+        return
+
+    evidence = dict(payload["supporting_evidence"][0])
+    evidence["as_of"] = future
+    if boundary == "top_supporting_evidence":
+        payload["supporting_evidence"] = [evidence]
+    elif boundary == "top_contrary_evidence":
+        payload["contrary_evidence"] = [evidence]
+    else:
+        field = boundary.removeprefix("component_")
+        payload["component_scores"][0][field] = [evidence]
 
 
 def _inventory(path: Path) -> dict[str, bytes]:
@@ -213,58 +282,33 @@ def test_snapshot_metadata_never_contains_dataset_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "dataset_generation",
+    [VALID_GENERATION, "generation-20260729-080000"],
+)
+def test_snapshot_accepts_only_real_publisher_generation_shapes(
+    tmp_path: Path,
+    dataset_generation: str,
+) -> None:
+    snapshot, created = _store(tmp_path).capture(_request(dataset_generation=dataset_generation))
+
+    assert created is True
+    assert snapshot.dataset_generation == dataset_generation
+
+
+@pytest.mark.parametrize(
     "boundary",
-    ["top_lineage", "component_lineage", "top_evidence", "component_evidence"],
+    FUTURE_RESULT_BOUNDARIES,
 )
 def test_snapshot_capture_rejects_future_nested_result_dates_without_writing(
     tmp_path: Path,
     boundary: str,
 ) -> None:
-    result = _result()
-    future = AS_OF.replace(day=30)
-    if boundary == "top_lineage":
-        result = result.model_copy(
-            update={
-                "source_lineage": [
-                    result.source_lineage[0].model_copy(update={"latest_input_date": future})
-                ]
-            }
-        )
-    elif boundary == "component_lineage":
-        component = result.component_scores[0].model_copy(
-            update={
-                "source_lineage": [
-                    result.component_scores[0]
-                    .source_lineage[0]
-                    .model_copy(update={"latest_input_date": future})
-                ]
-            }
-        )
-        result = result.model_copy(update={"component_scores": [component]})
-    elif boundary == "top_evidence":
-        result = result.model_copy(
-            update={
-                "supporting_evidence": [
-                    result.supporting_evidence[0].model_copy(update={"as_of": future})
-                ]
-            }
-        )
-    else:
-        component = result.component_scores[0].model_copy(
-            update={
-                "supporting_evidence": [
-                    result.component_scores[0]
-                    .supporting_evidence[0]
-                    .model_copy(update={"as_of": future})
-                ]
-            }
-        )
-        result = result.model_copy(update={"component_scores": [component]})
+    result = _result_with_future_boundary(boundary)
     request = SnapshotCaptureRequest.model_construct(
         result=result,
         capture_mode="post_hoc_backfill",
         evidence_cutoff_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
-        dataset_generation="fixture-generation",
+        dataset_generation=VALID_GENERATION,
         dataset_identity="/private/fixture/market.parquet",
     )
     store = _store(tmp_path)
@@ -275,7 +319,11 @@ def test_snapshot_capture_rejects_future_nested_result_dates_without_writing(
     assert not store.path.exists()
 
 
-def test_snapshot_reader_rejects_rehashed_future_lineage(tmp_path: Path) -> None:
+@pytest.mark.parametrize("boundary", FUTURE_RESULT_BOUNDARIES)
+def test_snapshot_reader_rejects_rehashed_future_nested_result_dates(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
     store = _store(tmp_path)
     store.capture(_request())
     connection = sqlite3.connect(store.path)
@@ -288,7 +336,7 @@ def test_snapshot_reader_rejects_rehashed_future_lineage(tmp_path: Path) -> None
         """
     ).fetchone()
     result_payload = json.loads(row[-1])
-    result_payload["source_lineage"][0]["latest_input_date"] = "2026-07-30"
+    _mutate_payload_future_boundary(result_payload, boundary)
     fields = dict(
         zip(
             (
@@ -319,13 +367,16 @@ def test_snapshot_reader_rejects_rehashed_future_lineage(tmp_path: Path) -> None
         store.read_exact(AS_OF, "market-regime-v1")
 
 
-def test_snapshot_rejects_path_shaped_dataset_generation_on_write_and_read(
+@pytest.mark.parametrize(
+    "unsafe_generation",
+    ["/private/generation secret", "credential-secret-token"],
+)
+def test_snapshot_rejects_non_publisher_dataset_generation_on_write_and_read(
     tmp_path: Path,
+    unsafe_generation: str,
 ) -> None:
     store = _store(tmp_path)
-    unsafe_request = _request().model_copy(
-        update={"dataset_generation": "/private/generation secret"}
-    )
+    unsafe_request = _request().model_copy(update={"dataset_generation": unsafe_generation})
     with pytest.raises(ValueError):
         store.capture(unsafe_request)
     assert not store.path.exists()
@@ -348,7 +399,7 @@ def test_snapshot_rejects_path_shaped_dataset_generation_on_write_and_read(
         "capture_mode": row[5],
         "evidence_cutoff_at": row[6],
         "recorded_at": row[7],
-        "dataset_generation": "/private/generation secret",
+        "dataset_generation": unsafe_generation,
         "dataset_identity_hash": row[8],
         "result_payload": row[9],
     }
@@ -430,7 +481,7 @@ def test_backfill_binds_all_dates_to_one_strict_publication_snapshot(tmp_path: P
                 identity="/private/dataset:fixture",
                 paths=(),
                 fingerprints=(),
-                generation="generation-fixture",
+                generation=VALID_GENERATION,
                 trade_dates=dates,
             )
 

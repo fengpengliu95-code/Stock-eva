@@ -1237,7 +1237,7 @@ def test_snapshot_api_reads_exact_persisted_result_without_recomputation(
             result=result,
             capture_mode="post_hoc_backfill",
             evidence_cutoff_at=datetime(2026, 7, 29, tzinfo=UTC),
-            dataset_generation="fixture-generation",
+            dataset_generation="generation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dataset_identity="/private/dataset/fixture",
         )
     )
@@ -1271,7 +1271,7 @@ def test_snapshot_api_failures_are_sanitized_and_read_only(
             result=result,
             capture_mode="post_hoc_backfill",
             evidence_cutoff_at=datetime(2026, 7, 29, tzinfo=UTC),
-            dataset_generation="fixture-generation",
+            dataset_generation="generation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dataset_identity="/private/dataset/fixture",
         )
     )

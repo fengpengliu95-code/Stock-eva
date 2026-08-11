@@ -23,6 +23,8 @@ from backend.app.regime.snapshots import (
 from backend.app.regime.store import MarketRegimeStore
 from backend.app.storage.dataset import PublishedReadSnapshot
 
+VALID_GENERATION = "generation-" + "a" * 32
+
 
 class EmptyBoundReader:
     def __init__(self, dates: tuple[date, ...]) -> None:
@@ -30,7 +32,7 @@ class EmptyBoundReader:
             identity="/private/verified-dataset:fixture",
             paths=(),
             fingerprints=(),
-            generation="generation-fixture",
+            generation=VALID_GENERATION,
             trade_dates=dates,
         )
         self.capture_calls = 0
@@ -348,13 +350,20 @@ def test_release_one_audit_fails_closed_on_recompute_drift(tmp_path, monkeypatch
     assert "/private" not in report.model_dump_json()
 
 
-def test_release_one_audit_does_not_publish_path_shaped_generation(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "unsafe_generation",
+    ["/private/generation audit-secret", "credential-secret-token"],
+)
+def test_release_one_audit_does_not_publish_untrusted_generation(
+    tmp_path,
+    unsafe_generation,
+) -> None:
     service, reader, *_ = _service(tmp_path)
     reader.snapshot = PublishedReadSnapshot(
         identity=reader.snapshot.identity,
         paths=(),
         fingerprints=(),
-        generation="/private/generation audit-secret",
+        generation=unsafe_generation,
         trade_dates=reader.snapshot.trade_dates,
     )
 
@@ -372,6 +381,7 @@ def test_release_one_audit_does_not_publish_path_shaped_generation(tmp_path) -> 
     ]
     assert "/private" not in report.model_dump_json()
     assert "audit-secret" not in report.model_dump_json()
+    assert "credential-secret-token" not in report.model_dump_json()
 
 
 def test_release_one_cli_rejects_small_session_count_before_settings(
