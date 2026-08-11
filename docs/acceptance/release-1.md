@@ -1,7 +1,7 @@
 # Release 1 Acceptance
 
-Status: **NO-GO — installed functionality passed, but the original AC-12 fingerprint window was
-confounded by the independent 18:10 refresh LaunchAgent write.**
+Status: **GO — installed functionality passed and a fresh quiet-window AC-12 rerun kept every
+protected store byte-for-byte and state-for-state identical.**
 
 R1-E adds immutable daily regime snapshots and a read-only replay audit. Historical
 `post_hoc_backfill` records prove deterministic results against the verified publication available
@@ -14,8 +14,12 @@ separately.
 - Main was fast-forwarded without touching the user-owned dirty roadmap, PDF or root package files.
 - The independent combined reviewer approved code commit
   `99c84d012ac1eacdd9291629ea737185f4a0fb3d` with no P0/P1 findings.
-- The official installer preflight reported `mutation=false`, then installed that exact commit.
-  `RELEASE.json` records the same Git SHA and `built_at=2026-08-11T09:38:13Z`.
+- The first official installer pass reported `mutation=false`, then installed that exact code
+  commit. `RELEASE.json` recorded the same Git SHA and `built_at=2026-08-11T09:38:13Z`.
+- The fresh AC-12 pass reran the official installer from current main after the first acceptance
+  evidence commit. Its preflight again reported `mutation=false`; the installed release is
+  `75c64e4364fadbeab8a1e4a964bfa208e91a7ff6`, with the reviewed code unchanged and
+  `built_at=2026-08-11T10:42:52Z`.
 - All five LaunchAgents are loaded. API, workspace and local dataset readiness are ready. The
   installed dataset generation is `generation-6c48729bea29429d86891b102f0c8e52`.
 - The installer reported the local mirror was newer than the mounted NAS archive and copied zero
@@ -60,6 +64,9 @@ The verified manifest covers 271 trading dates from `2025-07-01` through `2026-0
 4. Before and after the repeat, the only snapshot file had identical SHA-256
    `d7bc106b01cd73822d4443e916b9a20a7d5daeb65273c1919ccbd659a1b75093`, size
    2,912,256 bytes and mtime `1786442281677234721` ns. No sidecar appeared.
+5. The fresh AC-12 quiet-window repeat covered the same 271 dates and returned
+   `inserted=0`, `idempotent=271`, `conflicts=0`, `errors=0` and
+   `writes_snapshot_data=false` from the installed runtime. It ran from 18:43:24 to 19:02:27 CST.
 
 ## Twenty-session replay audit
 
@@ -86,6 +93,9 @@ path-free snapshot. Its result is honestly `degraded`, with `range / neutral`, r
 A-share bull/bear claim. Twenty serial warm HTTP reads had p95 2.797 ms and max 3.180 ms, below the
 500 ms budget.
 
+The fresh installed-runtime readback again returned HTTP 200, the same generation and a path-free
+`degraded` snapshot. Its twenty serial reads had p95 3.076 ms and max 23.192 ms.
+
 Installed-browser checks used real backend data:
 
 - At 1440×900, overview → sector workspace → `M73研究和试验发展` →
@@ -103,8 +113,41 @@ Installed-browser checks used real backend data:
   the asynchronously restored sector content was independently re-read on mobile; desktop real-data
   restoration and the full frontend route tests cover that content restoration, but this document
   does not claim a second independent mobile post-return content read.
+- After the fresh reinstall, a representative installed-browser pass again loaded the real overview,
+  opened `M73研究和试验发展`, entered `sh.603259`, observed 260 valid sessions with QFQ daily K,
+  volume, MA5/20/60/250, MACD and RSI14, and returned to the exact sector URL with the same sector,
+  leader and score restored. It found no buy/sell recommendation wording. This fresh pass does not
+  add a new console-log claim because that browser client's console-message API was unavailable;
+  the earlier full browser pass above retains its independently recorded clean-console evidence.
 
 ## Protected-store fingerprint result
+
+### Fresh quiet-window closure
+
+A new baseline was frozen at 18:42 CST, after the scheduled 18:40 refresh had completed and before
+the official reinstall. The final matrix was read at 19:11:52 CST, before the next scheduled refresh
+at 19:20. The window included the official reinstall, the full 271-date idempotent replay, the
+20-session audit, exact API reads and the representative installed-browser flow.
+
+Every protected target and same-name sidecar inventory was identical at both ends:
+
+- local immutable dataset tree: 292 entries, content
+  `9a1dbf35d0b018ed05c254bc9aebf0ab9f452a652708e4c10ebf80ac79f69bba`, state
+  `adfa1ab402550715f69bcb383faf1e4f3f87cd19b2b442094c76484c906f0f00`;
+- mounted NAS archive tree: 284 entries, content
+  `29032a7c32d5d29a291947e4694ab20d9b8ecb9ccfa42c38806efd375e0db9f1`, state
+  `6aa2198bab0843a4f6721b95ecfd557544bb960e9b91e1a215b8a72b1192d0d0`;
+- market control DB `099dae430c46598a4e13edda1642f120c0569d59cae79140c63de9906361f314`;
+- classification DB `45fd786ca80dd760e79b28432d3929de1b8da76111e265ea152ef5a8388f1941`;
+- supplemental audit DB `45df0cfce85d8282a41feed7fae7b795f70df9a67e7d7b2e766dd6a2172c03dc`;
+- private user DB `8adba0364d399a56270d3a051db5db8d04fd0243cdecb32bdb01a81384e57e32`;
+- regime snapshot DB `d7bc106b01cd73822d4443e916b9a20a7d5daeb65273c1919ccbd659a1b75093`,
+  size 2,912,256 bytes and unchanged mtime. No SQLite sidecar appeared.
+
+The installer again classified the local mirror as newer than the mounted NAS archive and copied
+zero data bytes. This fresh matrix closes AC-12 without suspending or modifying any LaunchAgent.
+
+### Historical confounded window
 
 The initial and final fingerprints were identical for:
 
@@ -142,11 +185,7 @@ does not make the original pre-install-to-final fingerprints identical.
 
 ## Verdict and next gate
 
-The code review, full tests, installation, complete backfill, idempotency, replay, API performance
-and browser evidence are accepted. **Release 1 is not declared GO because AC-12's literal original
-fingerprint equality was not obtained. R2 remains locked.**
-
-To close the remaining gate, rerun the frozen fingerprint matrix in a quiet interval with no
-scheduled refresh writer, or obtain explicit approval to temporarily suspend and later restore the
-refresh LaunchAgent during that bounded rerun. Do not weaken AC-12 and do not treat the controlled
-window as a replacement for the recorded original mismatch.
+The code review, full tests, installation, complete backfill, idempotency, replay, API performance,
+browser evidence and fresh protected-store matrix are accepted. **Release 1 is GO.** The historical
+18:10 mismatch remains documented as a scheduling-confounded attempt rather than being rewritten as
+a pass. R2 has not started and remains locked pending explicit user confirmation to continue.
