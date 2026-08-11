@@ -348,6 +348,32 @@ def test_release_one_audit_fails_closed_on_recompute_drift(tmp_path, monkeypatch
     assert "/private" not in report.model_dump_json()
 
 
+def test_release_one_audit_does_not_publish_path_shaped_generation(tmp_path) -> None:
+    service, reader, *_ = _service(tmp_path)
+    reader.snapshot = PublishedReadSnapshot(
+        identity=reader.snapshot.identity,
+        paths=(),
+        fingerprints=(),
+        generation="/private/generation audit-secret",
+        trade_dates=reader.snapshot.trade_dates,
+    )
+
+    report = service.run(
+        sessions=20,
+        audit_cutoff_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+
+    assert report.status == "not_ready"
+    assert report.dataset_generation is None
+    assert report.quality_issues == [
+        "classification_coverage_unavailable",
+        "dataset_unavailable",
+        "insufficient_sessions",
+    ]
+    assert "/private" not in report.model_dump_json()
+    assert "audit-secret" not in report.model_dump_json()
+
+
 def test_release_one_cli_rejects_small_session_count_before_settings(
     monkeypatch,
     capsys,

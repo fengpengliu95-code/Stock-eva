@@ -58,6 +58,15 @@ from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
 from backend.app.user.store import UserStore
 
 
+class _CliArgumentError(ValueError):
+    """An allowlisted parse failure that carries no user input."""
+
+
+class _SanitizedArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise _CliArgumentError("invalid CLI arguments")
+
+
 def _probe_timeout_value(value: str) -> int:
     seconds = int(value)
     if not 1 <= seconds <= 60:
@@ -137,7 +146,7 @@ def _probe_timeout(seconds: int):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Stock EVA after-close data tasks")
+    parser = _SanitizedArgumentParser(description="Stock EVA after-close data tasks")
     subparsers = parser.add_subparsers(dest="command", required=True)
     refresh = subparsers.add_parser("refresh", help="refresh one completed trading date")
     refresh.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
@@ -330,7 +339,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    try:
+        args = build_parser().parse_args()
+    except _CliArgumentError:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "invalid_cli_arguments",
+                    "writes_data": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
     if args.command == "classification-sync":
         started_at = perf_counter()
         configured_timeout_seconds = args.socket_timeout_seconds

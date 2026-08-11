@@ -28,6 +28,38 @@ def test_snapshot_cli_defaults_to_read_only_plan() -> None:
     assert args.execute is False
 
 
+def test_snapshot_cli_parser_error_is_one_sanitized_json_line(
+    monkeypatch,
+    capsys,
+) -> None:
+    secret = "/private/not-an-iso-date parser-secret"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-regime-snapshots",
+            "--start",
+            secret,
+            "--end",
+            "2026-07-31",
+        ],
+    )
+
+    assert cli.main() == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert secret not in captured.out
+    assert "/private" not in captured.out
+    assert "parser-secret" not in captured.out
+    assert json.loads(captured.out) == {
+        "error_code": "invalid_cli_arguments",
+        "status": "error",
+        "writes_data": False,
+    }
+
+
 def test_snapshot_cli_rejects_inverted_range_before_market_reader(
     tmp_path, monkeypatch, capsys
 ) -> None:

@@ -1,6 +1,7 @@
 """Read-only Release 1 replay and classification-coverage audit."""
 
 import hashlib
+import re
 from collections import Counter
 from datetime import UTC, date, datetime, time
 from typing import Literal, Protocol
@@ -12,7 +13,11 @@ from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
 from backend.app.classification.store import eligibility_reason
 from backend.app.regime.models import MarketRegimeResult
 from backend.app.regime.service import MarketRegimeService
-from backend.app.regime.snapshots import RegimeSnapshotStore, RegimeSnapshotUnavailable
+from backend.app.regime.snapshots import (
+    DATASET_GENERATION_PATTERN,
+    RegimeSnapshotStore,
+    RegimeSnapshotUnavailable,
+)
 from backend.app.storage.dataset import PublishedReadSnapshot
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -87,7 +92,10 @@ class ReleaseOneReplayReport(BaseModel):
     coverage: ReleaseOneCoverage
     capture_modes: dict[str, int]
     audit_cutoff_at: datetime
-    dataset_generation: str | None = None
+    dataset_generation: str | None = Field(
+        default=None,
+        pattern=DATASET_GENERATION_PATTERN,
+    )
     quality_issues: list[str] = Field(default_factory=list)
 
 
@@ -256,7 +264,8 @@ class ReleaseOneAcceptanceService:
             return None
         if (
             not isinstance(publication, PublishedReadSnapshot)
-            or not publication.generation
+            or not isinstance(publication.generation, str)
+            or re.fullmatch(DATASET_GENERATION_PATTERN, publication.generation) is None
             or tuple(sorted(set(publication.trade_dates))) != publication.trade_dates
         ):
             issues.add("dataset_unavailable")

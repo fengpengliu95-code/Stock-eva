@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from backend.app.regime.store import MarketReadUnavailable, MarketRegimeStore
 from backend.app.storage.dataset import PublishedReadSnapshot
 
 CaptureMode = Literal["after_close", "post_hoc_backfill"]
+DATASET_GENERATION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS regime_snapshots (
     snapshot_id TEXT NOT NULL PRIMARY KEY,
@@ -54,7 +56,7 @@ class MarketRegimeSnapshot(BaseModel):
     capture_mode: CaptureMode
     evidence_cutoff_at: datetime
     recorded_at: datetime
-    dataset_generation: str
+    dataset_generation: str = Field(pattern=DATASET_GENERATION_PATTERN)
     dataset_identity_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     result: MarketRegimeResult
@@ -71,6 +73,7 @@ class MarketRegimeSnapshot(BaseModel):
             raise ValueError("snapshot data_as_of must match result")
         if self.data_as_of is not None and self.data_as_of > self.as_of:
             raise ValueError("snapshot data_as_of must not exceed as_of")
+        _validate_result_dates(self.result, self.as_of)
         if self.evidence_cutoff_at.tzinfo is None or self.recorded_at.tzinfo is None:
             raise ValueError("snapshot timestamps must be timezone-aware")
         return self
@@ -82,13 +85,14 @@ class SnapshotCaptureRequest(BaseModel):
     result: MarketRegimeResult
     capture_mode: CaptureMode
     evidence_cutoff_at: datetime
-    dataset_generation: str = Field(min_length=1)
+    dataset_generation: str = Field(pattern=DATASET_GENERATION_PATTERN)
     dataset_identity: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_evidence_cutoff(self) -> "SnapshotCaptureRequest":
         if self.evidence_cutoff_at.tzinfo is None:
             raise ValueError("evidence cutoff must be timezone-aware")
+        _validate_result_dates(self.result, self.result.as_of)
         return self
 
 
@@ -96,7 +100,7 @@ class SnapshotBackfillPlan(BaseModel):
     start: date
     end: date
     selected_dates: tuple[date, ...]
-    dataset_generation: str
+    dataset_generation: str = Field(pattern=DATASET_GENERATION_PATTERN)
 
 
 class SnapshotBackfillOutcome(SnapshotBackfillPlan):
@@ -116,6 +120,19 @@ def _hash(payload: object) -> str:
 
 def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
+
+
+def _validate_result_dates(result: MarketRegimeResult, as_of: date) -> None:
+    lineages = list(result.source_lineage)
+    evidence = [*result.supporting_evidence, *result.contrary_evidence]
+    for component in result.component_scores:
+        lineages.extend(component.source_lineage)
+        evidence.extend(component.supporting_evidence)
+        evidence.extend(component.contrary_evidence)
+    if any(item.earliest_input_date > as_of or item.latest_input_date > as_of for item in lineages):
+        raise ValueError("snapshot result lineage must not exceed as_of")
+    if any(item.as_of > as_of for item in evidence):
+        raise ValueError("snapshot result evidence must not exceed as_of")
 
 
 class RegimeSnapshotStore:
@@ -384,7 +401,11 @@ class RegimeSnapshotCaptureService:
             raise RegimeSnapshotUnavailable("verified publication is unavailable") from exc
         if not isinstance(snapshot, PublishedReadSnapshot):
             raise RegimeSnapshotUnavailable("verified publication is unavailable")
-        if not snapshot.generation or not snapshot.trade_dates:
+        if (
+            not isinstance(snapshot.generation, str)
+            or re.fullmatch(DATASET_GENERATION_PATTERN, snapshot.generation) is None
+            or not snapshot.trade_dates
+        ):
             raise RegimeSnapshotUnavailable("verified publication is unavailable")
         if tuple(sorted(set(snapshot.trade_dates))) != snapshot.trade_dates:
             raise RegimeSnapshotUnavailable("verified publication is unavailable")

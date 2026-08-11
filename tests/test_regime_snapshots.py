@@ -21,6 +21,8 @@ from backend.app.regime.snapshots import (
     RegimeSnapshotStore,
     RegimeSnapshotUnavailable,
     SnapshotCaptureRequest,
+    _canonical,
+    _hash,
 )
 from backend.app.regime.store import MarketRegimeStore
 from backend.app.storage.dataset import PublishedReadSnapshot
@@ -94,12 +96,16 @@ def _result(*, as_of: date = AS_OF) -> MarketRegimeResult:
     )
 
 
-def _request(*, result: MarketRegimeResult | None = None) -> SnapshotCaptureRequest:
+def _request(
+    *,
+    result: MarketRegimeResult | None = None,
+    dataset_generation: str = "fixture-generation",
+) -> SnapshotCaptureRequest:
     return SnapshotCaptureRequest(
         result=result or _result(),
         capture_mode="post_hoc_backfill",
         evidence_cutoff_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
-        dataset_generation="fixture-generation",
+        dataset_generation=dataset_generation,
         dataset_identity=Path("/private/fixture/market.parquet").as_posix(),
     )
 
@@ -204,6 +210,157 @@ def test_snapshot_metadata_never_contains_dataset_path(tmp_path: Path) -> None:
         snapshot.dataset_identity_hash
         == hashlib.sha256(b"/private/fixture/market.parquet").hexdigest()
     )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["top_lineage", "component_lineage", "top_evidence", "component_evidence"],
+)
+def test_snapshot_capture_rejects_future_nested_result_dates_without_writing(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    result = _result()
+    future = AS_OF.replace(day=30)
+    if boundary == "top_lineage":
+        result = result.model_copy(
+            update={
+                "source_lineage": [
+                    result.source_lineage[0].model_copy(update={"latest_input_date": future})
+                ]
+            }
+        )
+    elif boundary == "component_lineage":
+        component = result.component_scores[0].model_copy(
+            update={
+                "source_lineage": [
+                    result.component_scores[0]
+                    .source_lineage[0]
+                    .model_copy(update={"latest_input_date": future})
+                ]
+            }
+        )
+        result = result.model_copy(update={"component_scores": [component]})
+    elif boundary == "top_evidence":
+        result = result.model_copy(
+            update={
+                "supporting_evidence": [
+                    result.supporting_evidence[0].model_copy(update={"as_of": future})
+                ]
+            }
+        )
+    else:
+        component = result.component_scores[0].model_copy(
+            update={
+                "supporting_evidence": [
+                    result.component_scores[0]
+                    .supporting_evidence[0]
+                    .model_copy(update={"as_of": future})
+                ]
+            }
+        )
+        result = result.model_copy(update={"component_scores": [component]})
+    request = SnapshotCaptureRequest.model_construct(
+        result=result,
+        capture_mode="post_hoc_backfill",
+        evidence_cutoff_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
+        dataset_generation="fixture-generation",
+        dataset_identity="/private/fixture/market.parquet",
+    )
+    store = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="must not exceed as_of"):
+        store.capture(request)
+
+    assert not store.path.exists()
+
+
+def test_snapshot_reader_rejects_rehashed_future_lineage(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.capture(_request())
+    connection = sqlite3.connect(store.path)
+    row = connection.execute(
+        """
+        SELECT snapshot_id, as_of, formula_version, result_id, data_as_of, capture_mode,
+               evidence_cutoff_at, recorded_at, dataset_generation, dataset_identity_hash,
+               result_payload
+        FROM regime_snapshots
+        """
+    ).fetchone()
+    result_payload = json.loads(row[-1])
+    result_payload["source_lineage"][0]["latest_input_date"] = "2026-07-30"
+    fields = dict(
+        zip(
+            (
+                "snapshot_id",
+                "as_of",
+                "formula_version",
+                "result_id",
+                "data_as_of",
+                "capture_mode",
+                "evidence_cutoff_at",
+                "recorded_at",
+                "dataset_generation",
+                "dataset_identity_hash",
+                "result_payload",
+            ),
+            (*row[:-1], _canonical(result_payload)),
+            strict=True,
+        )
+    )
+    connection.execute(
+        "UPDATE regime_snapshots SET result_payload = ?, content_hash = ?",
+        [fields["result_payload"], _hash(fields)],
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RegimeSnapshotUnavailable):
+        store.read_exact(AS_OF, "market-regime-v1")
+
+
+def test_snapshot_rejects_path_shaped_dataset_generation_on_write_and_read(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    unsafe_request = _request().model_copy(
+        update={"dataset_generation": "/private/generation secret"}
+    )
+    with pytest.raises(ValueError):
+        store.capture(unsafe_request)
+    assert not store.path.exists()
+
+    store.capture(_request())
+    connection = sqlite3.connect(store.path)
+    row = connection.execute(
+        """
+        SELECT snapshot_id, as_of, formula_version, result_id, data_as_of, capture_mode,
+               evidence_cutoff_at, recorded_at, dataset_identity_hash, result_payload
+        FROM regime_snapshots
+        """
+    ).fetchone()
+    fields = {
+        "snapshot_id": row[0],
+        "as_of": row[1],
+        "formula_version": row[2],
+        "result_id": row[3],
+        "data_as_of": row[4],
+        "capture_mode": row[5],
+        "evidence_cutoff_at": row[6],
+        "recorded_at": row[7],
+        "dataset_generation": "/private/generation secret",
+        "dataset_identity_hash": row[8],
+        "result_payload": row[9],
+    }
+    connection.execute(
+        "UPDATE regime_snapshots SET dataset_generation = ?, content_hash = ?",
+        [fields["dataset_generation"], _hash(fields)],
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RegimeSnapshotUnavailable):
+        store.read_exact(AS_OF, "market-regime-v1")
 
 
 def test_snapshot_store_uses_explicit_canonical_result_payload_columns(
