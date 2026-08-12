@@ -1,11 +1,16 @@
 import json
 import threading
 import zlib
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from pydantic import ValidationError
 
+import backend.app.market.provider_transport as provider_transport
+from backend.app.market.baostock import (
+    BaoStockProvider,
+    _OperationDeadlineExceeded,
+)
 from backend.app.market.baostock_vendor import (
     EXPECTED_BAOSTOCK_VERSION,
     EXPECTED_SOCKETUTIL_SHA256,
@@ -265,6 +270,7 @@ class FramedSocket:
         self.recv_calls = 0
         self.connect_calls = 0
         self.closed = False
+        self.timeout = None
 
     def connect(self, _address: tuple[str, int]) -> None:
         self.connect_calls += 1
@@ -286,6 +292,9 @@ class FramedSocket:
         if isinstance(chunk, BaseException):
             raise chunk
         return chunk
+
+    def settimeout(self, seconds: float) -> None:
+        self.timeout = seconds
 
     def close(self) -> None:
         self.closed = True
@@ -690,3 +699,104 @@ def test_patch_installation_is_idempotent_under_concurrency() -> None:
     assert all(worker.is_alive() is False for worker in workers)
     assert socketutil.SocketUtil.connect is checked_connect
     assert socketutil.send_msg is checked_send_msg
+
+
+@pytest.mark.parametrize(
+    "deadline_stage",
+    ["login-connect", "request-send", "request-recv"],
+)
+def test_provider_deadline_emits_exactly_one_terminal_observation_and_keeps_legacy_error(
+    monkeypatch,
+    deadline_stage: str,
+) -> None:
+    import baostock.common.context as context
+
+    import backend.app.market.baostock_vendor as vendor
+
+    interrupt_type = getattr(provider_transport, "OperationDeadlineInterrupt", None)
+    assert interrupt_type is not None
+    observations = []
+    previous = getattr(context, "default_socket", None)
+    context.default_socket = None
+
+    class Result:
+        error_code = "0"
+        error_msg = ""
+        fields = ["calendar_date", "is_trading_day"]
+
+        def __init__(self) -> None:
+            self.rows = iter([["2026-07-23", "1"]])
+            self.current = None
+
+        def next(self) -> bool:
+            self.current = next(self.rows, None)
+            return self.current is not None
+
+        def get_row_data(self):
+            return self.current
+
+    if deadline_stage == "login-connect":
+        connection = FramedSocket([], connect_error=interrupt_type())
+        monkeypatch.setattr(vendor.socket, "socket", lambda *_args: connection)
+
+        class Client:
+            def __init__(self) -> None:
+                self.context = context
+
+            def login(self):
+                checked_connect(object())
+                return Result()
+
+        expected_stage = ProtocolStage.CONNECT
+        expected_error = NormalizedTransportError.CONNECT_ERROR
+    else:
+        connection = (
+            FramedSocket([], send_error=interrupt_type())
+            if deadline_stage == "request-send"
+            else FramedSocket([interrupt_type()])
+        )
+
+        class Client:
+            def __init__(self) -> None:
+                self.context = context
+
+            def login(self):
+                context.default_socket = connection
+                return Result()
+
+            def query_trade_dates(self, **_kwargs):
+                checked_send_msg("private-token-deadline-request")
+                return Result()
+
+        expected_stage = (
+            ProtocolStage.SEND if deadline_stage == "request-send" else ProtocolStage.RECEIVE
+        )
+        expected_error = (
+            NormalizedTransportError.SEND_ERROR
+            if deadline_stage == "request-send"
+            else NormalizedTransportError.RECV_TIMEOUT
+        )
+
+    provider = BaoStockProvider(
+        client=Client(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    try:
+        with (
+            transport_observation_sink(observations.append),
+            pytest.raises(_OperationDeadlineExceeded) as caught,
+        ):
+            provider.trading_dates(date(2026, 7, 23), date(2026, 7, 23))
+    finally:
+        context.default_socket = previous
+
+    assert caught.value.failure is not None
+    assert caught.value.failure.failure_class == "transport_timeout"
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.protocol_stage == expected_stage
+    assert observation.normalized_error == expected_error
+    serialized = observation.model_dump_json() + str(caught.value)
+    assert "private-token-deadline-request" not in serialized
+    assert "raw exception" not in serialized

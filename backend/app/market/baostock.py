@@ -3,13 +3,16 @@ import signal
 import socket
 import threading
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic, sleep
 from typing import Any
 
-from backend.app.market.baostock_vendor import install_baostock_transport_patch
+from backend.app.market.baostock_vendor import (
+    emit_terminal_observation,
+    install_baostock_transport_patch,
+)
 from backend.app.market.factor_cache import AdjustmentFactorCache, FactorCacheError
 from backend.app.market.failures import (
     MarketFailure,
@@ -19,7 +22,11 @@ from backend.app.market.failures import (
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    OperationDeadlineInterrupt,
+    ProtocolStage,
     ProviderEndpoint,
+    TransportEndpoint,
     provider_session_scope,
     refresh_scope,
     request_scope,
@@ -101,15 +108,24 @@ class _OperationDeadlineUnavailable(BaoStockError):
     pass
 
 
-class _OperationDeadlineInterrupt(BaseException):
-    """Escape BaoStock's broad ``except Exception`` transport handling."""
-
-
 class _PreexistingTimerInterrupt(BaseException):
     pass
 
 
-def _pagination_protocol_error(message: str) -> BaoStockTransportError:
+def _pagination_protocol_error(
+    message: str,
+    *,
+    normalized_error: NormalizedTransportError = NormalizedTransportError.PROTOCOL_ERROR,
+) -> BaoStockTransportError:
+    emit_terminal_observation(
+        started_at=monotonic(),
+        protocol_stage=ProtocolStage.PAGINATION,
+        recv_calls=0,
+        response_bytes=0,
+        end_marker_seen=False,
+        provider_code=None,
+        normalized_error=normalized_error,
+    )
     return BaoStockTransportError(
         message,
         failure=MarketFailure(
@@ -161,7 +177,7 @@ def _wall_clock_deadline(seconds: float):
             raise _PreexistingTimerInterrupt(
                 "pre-existing wall-clock timer expired during BaoStock operation"
             )
-        raise _OperationDeadlineInterrupt
+        raise OperationDeadlineInterrupt
 
     signal.signal(signal.SIGALRM, raise_deadline)
     signal.setitimer(signal.ITIMER_REAL, timer_delay)
@@ -220,25 +236,31 @@ def _read_result(
             current_page = _page_number(result)
             current_fingerprint = _page_fingerprint(result)
             if current_fingerprint in page_fingerprints:
-                raise _pagination_protocol_error("BaoStock pagination protocol repeated page data")
+                raise _pagination_protocol_error(
+                    "BaoStock pagination protocol repeated page data",
+                    normalized_error=NormalizedTransportError.PAGINATION_STALLED,
+                )
             page_fingerprints.add(current_fingerprint)
             before_page_request()
             with next_page_scope(current_page + 1):
                 has_row = result.next()
-            if result.error_code != "0":
-                failure = baostock_status_failure(result.error_code)
-                raise BaoStockTransportError(
-                    f"BaoStock pagination failed ({failure.failure_class})",
-                    failure=failure,
-                )
-            if not has_row:
-                raise _pagination_protocol_error(
-                    "BaoStock pagination protocol ended after a full page"
-                )
-            next_page = _page_number(result)
-            next_fingerprint = _page_fingerprint(result)
-            if next_page != current_page + 1 or next_fingerprint in page_fingerprints:
-                raise _pagination_protocol_error("BaoStock pagination protocol did not advance")
+                if result.error_code != "0":
+                    failure = baostock_status_failure(result.error_code)
+                    raise BaoStockTransportError(
+                        f"BaoStock pagination failed ({failure.failure_class})",
+                        failure=failure,
+                    )
+                if not has_row:
+                    raise _pagination_protocol_error(
+                        "BaoStock pagination protocol ended after a full page"
+                    )
+                next_page = _page_number(result)
+                next_fingerprint = _page_fingerprint(result)
+                if next_page != current_page + 1 or next_fingerprint in page_fingerprints:
+                    raise _pagination_protocol_error(
+                        "BaoStock pagination protocol did not advance",
+                        normalized_error=NormalizedTransportError.PAGINATION_STALLED,
+                    )
         else:
             has_row = result.next()
         if not has_row:
@@ -328,6 +350,35 @@ def _require_unique_symbols(symbols: Sequence[str]) -> None:
         raise _candidate_integrity_error("BaoStock candidate contains duplicate symbols")
 
 
+def _require_expected_symbol_rows(
+    fields: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    *,
+    expected_symbol: str,
+    unique_date_points: bool = False,
+) -> None:
+    required = ["code"]
+    if unique_date_points:
+        required.append("date")
+    positions = _required_field_positions(fields, required)
+    try:
+        symbols = [row[positions["code"]] for row in rows]
+        dates = [row[positions["date"]] for row in rows] if unique_date_points else []
+    except IndexError:
+        raise BaoStockError(
+            "BaoStock response schema is invalid",
+            failure=MarketFailure(
+                failure_stage="normalize",
+                failure_class="schema",
+                retryable=False,
+            ),
+        ) from None
+    if any(symbol != expected_symbol for symbol in symbols):
+        raise _candidate_integrity_error("BaoStock candidate has universe divergence")
+    if unique_date_points and len(dates) != len(set(dates)):
+        raise _candidate_integrity_error("BaoStock candidate contains duplicate points")
+
+
 def _is_main_board(symbol: str) -> bool:
     return symbol.startswith(SH_MAIN_PREFIXES + SZ_MAIN_PREFIXES)
 
@@ -385,30 +436,25 @@ class BaoStockProvider:
                 self._refresh_scope_depth -= 1
 
     @contextmanager
-    def _request_scope(self, endpoint: ProviderEndpoint, *, attempt: int, page: int):
+    def _request_scope(self, endpoint: TransportEndpoint, *, attempt: int, page: int):
         if self._provider_session_id is None:
             raise BaoStockSessionStateError("BaoStock provider session is unavailable")
         with provider_session_scope(self._provider_session_id):
             with request_scope(endpoint, attempt=attempt, page=page) as context:
                 yield context
 
-    def _login(self, endpoint: ProviderEndpoint | None = None) -> None:
+    def _login(self, endpoint: TransportEndpoint) -> None:
         with self._refresh_operation():
             self._login_scoped(endpoint)
 
-    def _login_scoped(self, endpoint: ProviderEndpoint | None) -> None:
+    def _login_scoped(self, endpoint: TransportEndpoint) -> None:
         if self._session_usable:
             raise BaoStockSessionStateError("BaoStock session is already active")
         last_error: BaoStockError | None = None
         for attempt in range(1, self.max_attempts + 1):
             with provider_session_scope() as session:
                 self._provider_session_id = session.provider_session_id
-                transport_scope = (
-                    request_scope(endpoint, attempt=attempt, page=1)
-                    if endpoint is not None
-                    else nullcontext()
-                )
-                with transport_scope:
+                with request_scope(endpoint, attempt=attempt, page=1):
                     try:
                         result = self._run_with_deadline(
                             self._call_login,
@@ -507,7 +553,7 @@ class BaoStockProvider:
         try:
             with _wall_clock_deadline(self.socket_timeout_seconds):
                 return operation()
-        except _OperationDeadlineInterrupt:
+        except OperationDeadlineInterrupt:
             self._discard_session()
             raise _OperationDeadlineExceeded(
                 f"BaoStock {operation_name} wall-clock deadline exceeded",
@@ -539,7 +585,7 @@ class BaoStockProvider:
         finally:
             self._discard_session()
 
-    def _ensure_session(self, endpoint: ProviderEndpoint | None) -> None:
+    def _ensure_session(self, endpoint: TransportEndpoint) -> None:
         if not self._session_usable:
             self._login(endpoint)
 
@@ -694,9 +740,24 @@ class BaoStockProvider:
                             adjustflag="3",
                         ),
                     )
-                    if fields != daily_fields or not rows:
+                    if fields != daily_fields:
+                        raise BaoStockError(
+                            "BaoStock response schema is invalid",
+                            failure=MarketFailure(
+                                failure_stage="normalize",
+                                failure_class="schema",
+                                retryable=False,
+                            ),
+                        )
+                    if not rows:
                         failed.append(symbol)
                         continue
+                    _require_expected_symbol_rows(
+                        fields,
+                        rows,
+                        expected_symbol=symbol,
+                        unique_date_points=True,
+                    )
                     daily_rows.extend(rows)
                     if symbol not in INDEX_SYMBOLS:
                         current_fields, current_rows = self._read(
@@ -708,6 +769,11 @@ class BaoStockProvider:
                             ),
                         )
                         if current_rows:
+                            _require_expected_symbol_rows(
+                                current_fields,
+                                current_rows,
+                                expected_symbol=symbol,
+                            )
                             factor_fields = current_fields
                             factor_rows.extend(current_rows)
                 except BaoStockError as exc:
@@ -732,32 +798,28 @@ class BaoStockProvider:
 
     def _read(
         self,
-        endpoint: ProviderEndpoint | Callable[[], Any],
-        operation=None,
+        endpoint: TransportEndpoint,
+        operation: Callable[[], Any],
     ) -> tuple[list[str], list[list[str]]]:
-        if operation is None:
-            if not callable(endpoint):
-                raise TypeError("BaoStock read operation is required")
-            return self._read_legacy(endpoint)
         with self._refresh_operation():
             last_error: BaoStockError | None = None
             for attempt in range(1, self.max_attempts + 1):
-                self._pace_request()
                 self._ensure_session(endpoint)
+                self._pace_request()
                 try:
 
                     def read_attempt(attempt=attempt):
                         with self._request_scope(endpoint, attempt=attempt, page=1):
                             result = operation()
-                        return _read_result(
-                            result,
-                            before_page_request=self._pace_request,
-                            next_page_scope=lambda page: self._request_scope(
-                                endpoint,
-                                attempt=attempt,
-                                page=page,
-                            ),
-                        )
+                            return _read_result(
+                                result,
+                                before_page_request=self._pace_request,
+                                next_page_scope=lambda page: self._request_scope(
+                                    endpoint,
+                                    attempt=attempt,
+                                    page=page,
+                                ),
+                            )
 
                     return self._run_with_deadline(
                         read_attempt,
@@ -776,41 +838,6 @@ class BaoStockProvider:
                     )
                     self._discard_session()
             raise last_error or BaoStockError("BaoStock request failed")
-
-    def _read_legacy(self, operation) -> tuple[list[str], list[list[str]]]:
-        """Compatibility bridge for the non-market classification adapter.
-
-        Market data call sites always pass an allowlisted endpoint. Classification
-        metadata has a different endpoint vocabulary and must not be mislabeled,
-        so this path emits no R2-F0.1 endpoint observation. It must not be used by
-        market refreshes or canaries. The pinned SDK socket patch still enforces
-        checked send and fail-closed framing for real classification clients.
-        """
-        last_error: BaoStockError | None = None
-        for _attempt in range(self.max_attempts):
-            self._pace_request()
-            self._ensure_session(None)
-            try:
-                return self._run_with_deadline(
-                    lambda: _read_result(
-                        operation(),
-                        before_page_request=self._pace_request,
-                    ),
-                    operation_name="request",
-                )
-            except _OperationDeadlineUnavailable:
-                raise
-            except (BaoStockError, TimeoutError, OSError) as exc:
-                last_error = (
-                    exc
-                    if isinstance(exc, BaoStockError)
-                    else BaoStockTransportError(
-                        "BaoStock transport failed",
-                        failure=market_failure_from_exception(exc, stage="fetch"),
-                    )
-                )
-                self._discard_session()
-        raise last_error or BaoStockError("BaoStock request failed")
 
     def _pace_request(self) -> None:
         now = self._monotonic()

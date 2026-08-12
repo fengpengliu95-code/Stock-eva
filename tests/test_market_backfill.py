@@ -327,3 +327,72 @@ def test_backfill_calendar_failure_returns_safe_cli_error(
     assert '"status": "error"' in output
     assert '"quality_issues": ["calendar_or_plan_error"]' in output
     assert "private provider detail" not in output
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "expected-symbol-mismatch",
+        "unexpected-bar-symbol",
+        "duplicate-point",
+        "out-of-range-date",
+    ],
+)
+def test_backfill_rejects_corrupt_provider_batch_before_any_bar_write(
+    tmp_path: Path,
+    monkeypatch,
+    corruption: str,
+) -> None:
+    dates = trading_days(date(2026, 1, 1), 2)
+
+    class CorruptProvider(RangeProvider):
+        def fetch_range(self, start_date: date, end_date: date, *, symbols):
+            result = super().fetch_range(start_date, end_date, symbols=symbols)
+            bars = list(result.bars)
+            expected_symbols = list(result.expected_symbols)
+            if corruption == "expected-symbol-mismatch":
+                expected_symbols = ["sz.000001"]
+            elif corruption == "unexpected-bar-symbol":
+                bars[0] = bars[0].model_copy(update={"symbol": "sz.000001"})
+            elif corruption == "duplicate-point":
+                bars.append(bars[0])
+            elif corruption == "out-of-range-date":
+                bars[0] = bars[0].model_copy(update={"trade_date": end_date + timedelta(days=10)})
+            return ProviderRangeBatch(
+                bars=bars,
+                trading_dates=result.trading_dates,
+                expected_symbols=expected_symbols,
+                failed_symbols=result.failed_symbols,
+            )
+
+    store = MarketStore(tmp_path / "market.duckdb")
+    store.initialize_schema()
+    upserts = []
+    original_upsert = store.upsert_bars
+
+    def recording_upsert(bars):
+        upserts.append(list(bars))
+        return original_upsert(bars)
+
+    monkeypatch.setattr(store, "upsert_bars", recording_upsert)
+    service = backfill.BackfillService(
+        store,
+        CorruptProvider(dates),
+        sleep_fn=lambda _: None,
+    )
+    plan = service.plan(
+        start_date=dates[0],
+        end_date=dates[-1],
+        symbols=["sh.600000"],
+        symbol_batch_size=1,
+        date_batch_size=2,
+        max_batches=1,
+    )
+
+    result = service.execute(plan, min_request_interval_seconds=0)
+
+    assert result.status == "error"
+    assert result.failed_batches == 1
+    assert upserts == []
+    assert store.present_points(plan.trading_dates, plan.symbols) == set()
+    assert store.published_refresh() is None

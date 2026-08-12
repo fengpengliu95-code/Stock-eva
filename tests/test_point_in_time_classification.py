@@ -13,6 +13,7 @@ import duckdb
 import httpx
 import pytest
 
+import backend.app.market.provider_transport as provider_transport
 from backend.app import cli
 from backend.app.api.classification import get_classification_store
 from backend.app.classification.failures import (
@@ -42,6 +43,13 @@ from backend.app.cli import build_parser
 from backend.app.config import Settings
 from backend.app.main import app
 from backend.app.market.baostock import BaoStockError
+from backend.app.market.baostock_vendor import transport_observation_sink
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProtocolStage,
+    ProviderEndpoint,
+    current_request_context,
+)
 
 OBSERVED = datetime(2026, 7, 28, 12, tzinfo=UTC)
 SNAPSHOT_DATE = date(2026, 7, 28)
@@ -215,9 +223,7 @@ def snapshot(
         index_components=components or [],
         sector_memberships=memberships or [],
         declared_taxonomies=(
-            [TAXONOMY_BAOSTOCK_INDUSTRY]
-            if declared_taxonomies is None
-            else declared_taxonomies
+            [TAXONOMY_BAOSTOCK_INDUSTRY] if declared_taxonomies is None else declared_taxonomies
         ),
     )
 
@@ -247,13 +253,9 @@ def test_index_component_history_capabilities_are_truthful() -> None:
         "chinext_index": "not_supplied",
     }
     assert all(
-        metadata.component_history_capability != "verified"
-        for metadata in INDEX_CATALOG.values()
+        metadata.component_history_capability != "verified" for metadata in INDEX_CATALOG.values()
     )
-    assert (
-        "component_history_supported"
-        not in type(INDEX_CATALOG["hs300"]).model_fields
-    )
+    assert "component_history_supported" not in type(INDEX_CATALOG["hs300"]).model_fields
     assert (
         INDEX_CATALOG["csi1000"].symbol,
         INDEX_CATALOG["csi1000"].component_source,
@@ -532,9 +534,7 @@ def test_repeated_source_dates_select_only_the_latest_visible_generation(
 
     assert [row.symbol for row in components.components] == ["sh.600000"]
     assert components.generation_id == second.generation.generation_id
-    assert [(row.sector_id, row.member_count) for row in sectors.sectors] == [
-        ("bank", 1)
-    ]
+    assert [(row.sector_id, row.member_count) for row in sectors.sectors] == [("bank", 1)]
     assert sectors.generation_id == second.generation.generation_id
     assert [row.symbol for row in members.members] == ["sh.600000"]
     assert members.generation_id == second.generation.generation_id
@@ -733,15 +733,10 @@ def test_generation_identity_includes_source_date_semantics(tmp_path: Path) -> N
     base = snapshot(securities=[security("sh.600000")])
     observed = store.publish(base)
     request_only = store.publish(
-        base.model_copy(
-            update={"source_date_semantics": "requested_unverified"}
-        )
+        base.model_copy(update={"source_date_semantics": "requested_unverified"})
     )
 
-    assert (
-        request_only.generation.generation_id
-        != observed.generation.generation_id
-    )
+    assert request_only.generation.generation_id != observed.generation.generation_id
     assert store.generation_count() == 2
 
 
@@ -755,9 +750,7 @@ def test_generation_identity_includes_declared_taxonomies(
     )
 
     promoted = store.publish(payload)
-    candidate = store.publish(
-        payload.model_copy(update={"declared_taxonomies": []})
-    )
+    candidate = store.publish(payload.model_copy(update={"declared_taxonomies": []}))
 
     assert promoted.promoted is True
     assert promoted.generation.schema_version == "classification-v3"
@@ -829,9 +822,7 @@ def test_changed_record_content_with_same_lineage_reaches_conflict_guard(
         ClassificationConflictError,
         match="conflicting security master",
     ):
-        store.publish(
-            payload.model_copy(update={"securities": [changed_security]})
-        )
+        store.publish(payload.model_copy(update={"securities": [changed_security]}))
 
     assert store.generation_count() == 1
 
@@ -941,10 +932,13 @@ def test_atomic_failure_keeps_previous_ready_generation(
         )
 
     assert store.ready_generation() == ready_before
-    assert [item.sector_id for item in classification.sectors(
-        TAXONOMY_BAOSTOCK_INDUSTRY,
-        SNAPSHOT_DATE,
-    ).sectors] == ["bank"]
+    assert [
+        item.sector_id
+        for item in classification.sectors(
+            TAXONOMY_BAOSTOCK_INDUSTRY,
+            SNAPSHOT_DATE,
+        ).sectors
+    ] == ["bank"]
 
 
 def test_unknown_security_membership_fails_publication(tmp_path: Path) -> None:
@@ -1100,9 +1094,7 @@ def test_suspended_security_remains_coverage_eligible_with_actionability_reason(
     store, classification = service(tmp_path)
     store.publish(
         snapshot(
-            securities=[
-                security("sz.300001", board="chinext", tradable=False)
-            ],
+            securities=[security("sz.300001", board="chinext", tradable=False)],
             memberships=[membership("sz.300001")],
         )
     )
@@ -1200,9 +1192,7 @@ def test_coverage_threshold_boundary(
     store, classification = service(tmp_path)
     securities = [security(f"sh.{600000 + index:06d}") for index in range(100)]
     memberships = [membership(row.symbol) for row in securities[:mapped]]
-    outcome = store.publish(
-        snapshot(securities=securities, memberships=memberships)
-    )
+    outcome = store.publish(snapshot(securities=securities, memberships=memberships))
 
     audit = outcome.generation.coverage_audits[0]
 
@@ -1345,9 +1335,7 @@ def test_degraded_candidate_does_not_replace_existing_ready_generation(
 
     assert outcome.inserted is True
     assert outcome.promoted is False
-    assert outcome.generation.coverage_audits[0].coverage_ratio == pytest.approx(
-        0.94
-    )
+    assert outcome.generation.coverage_audits[0].coverage_ratio == pytest.approx(0.94)
     assert store.generation_count() == 2
     assert store.ready_generation() == trusted.generation.generation_id
 
@@ -1366,9 +1354,7 @@ def test_zero_denominator_candidate_never_becomes_ready(tmp_path: Path) -> None:
 
     assert outcome.inserted is True
     assert outcome.promoted is False
-    assert outcome.generation.coverage_audits[0].quality_issues == [
-        "no_eligible_securities"
-    ]
+    assert outcome.generation.coverage_audits[0].quality_issues == ["no_eligible_securities"]
     assert store.ready_generation() is None
 
 
@@ -2176,10 +2162,7 @@ def test_provider_builds_extended_security_and_classification_snapshot() -> None
     }
     assert all(row.effective_to is None for row in payload.index_components)
     assert all(row.effective_to is None for row in payload.sector_memberships)
-    assert {
-        (row.raw_industry, row.raw_classification)
-        for row in payload.sector_memberships
-    } == {
+    assert {(row.raw_industry, row.raw_classification) for row in payload.sector_memberships} == {
         ("银行", "证监会行业分类"),
         ("软件服务", "证监会行业分类"),
         ("半导体", "证监会行业分类"),
@@ -2317,9 +2300,7 @@ def test_api_ready_coverage_contract(tmp_path: Path) -> None:
     assert components.status_code == 200
     assert components.json()["status"] == "degraded"
     assert components.json()["index"]["component_history_capability"] == "unverified"
-    assert components.json()["quality_issues"] == [
-        "component_history_unverified"
-    ]
+    assert components.json()["quality_issues"] == ["component_history_unverified"]
     assert [row["symbol"] for row in components.json()["components"]] == ["sh.600000"]
     assert sectors.status_code == 200
     assert sectors.json()["sectors"][0]["sector_id"] == "bank"
@@ -2340,24 +2321,15 @@ def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
     )
     before_first = api_request(
         empty_store,
-        (
-            "/api/v1/classification/indexes/hs300/components"
-            f"?as_of={SNAPSHOT_DATE}"
-        ),
+        (f"/api/v1/classification/indexes/hs300/components?as_of={SNAPSHOT_DATE}"),
     )
     metadata_only = api_request(
         empty_store,
-        (
-            "/api/v1/classification/indexes/sse_composite/components"
-            f"?as_of={SNAPSHOT_DATE}"
-        ),
+        (f"/api/v1/classification/indexes/sse_composite/components?as_of={SNAPSHOT_DATE}"),
     )
     csi1000_metadata_only = api_request(
         empty_store,
-        (
-            "/api/v1/classification/indexes/csi1000/components"
-            f"?as_of={SNAPSHOT_DATE}"
-        ),
+        (f"/api/v1/classification/indexes/csi1000/components?as_of={SNAPSHOT_DATE}"),
     )
 
     assert empty.status_code == 200
@@ -2366,9 +2338,7 @@ def test_api_empty_and_not_available_states(tmp_path: Path) -> None:
     assert before_first.json()["status"] == "not_available"
     assert before_first.json()["quality_issues"] == ["no_trusted_snapshot_at_as_of"]
     assert metadata_only.status_code == 200
-    assert metadata_only.json()["quality_issues"] == [
-        "component_history_not_supplied_by_source"
-    ]
+    assert metadata_only.json()["quality_issues"] == ["component_history_not_supplied_by_source"]
     assert csi1000_metadata_only.status_code == 200
     assert csi1000_metadata_only.json()["index"]["symbol"] == "sh.000852"
     assert csi1000_metadata_only.json()["components"] == []
@@ -2429,9 +2399,7 @@ def test_existing_classification_database_get_executes_no_write_or_schema_ddl(
                 "UPDATE",
                 "DELETE",
             }:
-                raise AssertionError(
-                    f"read path executed write or schema DDL: {operation}"
-                )
+                raise AssertionError(f"read path executed write or schema DDL: {operation}")
             return self.connection.execute(sql, parameters or [])
 
         def close(self) -> None:
@@ -2505,9 +2473,7 @@ def test_legacy_schema_migration_is_writer_only(tmp_path: Path) -> None:
     assert reader is not None
     reader_columns = {
         row[1]
-        for row in reader.execute(
-            "PRAGMA table_info('classification_generations')"
-        ).fetchall()
+        for row in reader.execute("PRAGMA table_info('classification_generations')").fetchall()
     }
     reader.close()
 
@@ -2517,9 +2483,7 @@ def test_legacy_schema_migration_is_writer_only(tmp_path: Path) -> None:
     writer = store._connect_writer()
     writer_columns = {
         row[1]
-        for row in writer.execute(
-            "PRAGMA table_info('classification_generations')"
-        ).fetchall()
+        for row in writer.execute("PRAGMA table_info('classification_generations')").fetchall()
     }
     writer.close()
 
@@ -2559,9 +2523,7 @@ def test_classification_api_rejects_future_as_of_before_store_access(
     response = api_request(
         RejectReadStore(),
         path,
-        overrides={
-            classification_api.get_classification_today: lambda: date(2026, 7, 29)
-        },
+        overrides={classification_api.get_classification_today: lambda: date(2026, 7, 29)},
     )
 
     assert response.status_code == 422
@@ -2581,10 +2543,7 @@ def test_api_rejects_invalid_date_and_unknown_classifiers(tmp_path: Path) -> Non
     )
     unknown_taxonomy = api_request(
         store,
-        (
-            "/api/v1/classification/taxonomies/not-real/sectors"
-            f"?as_of={SNAPSHOT_DATE}"
-        ),
+        (f"/api/v1/classification/taxonomies/not-real/sectors?as_of={SNAPSHOT_DATE}"),
     )
 
     assert invalid_date.status_code == 422
@@ -2617,13 +2576,9 @@ class ObservableClassificationProvider(RecordingClassificationProvider):
 
 def test_classification_sync_is_dry_run_by_default(tmp_path: Path) -> None:
     parser = build_parser()
-    args = parser.parse_args(
-        ["classification-sync", "--as-of", SNAPSHOT_DATE.isoformat()]
-    )
+    args = parser.parse_args(["classification-sync", "--as-of", SNAPSHOT_DATE.isoformat()])
     store = ClassificationStore(tmp_path / "classification.duckdb")
-    provider = RecordingClassificationProvider(
-        snapshot(securities=[security("sh.600000")])
-    )
+    provider = RecordingClassificationProvider(snapshot(securities=[security("sh.600000")]))
 
     result = run_classification_sync(
         as_of=args.as_of,
@@ -2735,9 +2690,7 @@ def test_classification_sync_execute_rejects_future_as_of_before_provider_call(
     tmp_path: Path,
 ) -> None:
     store = ClassificationStore(tmp_path / "classification.duckdb")
-    provider = RecordingClassificationProvider(
-        snapshot(securities=[security("sh.600000")])
-    )
+    provider = RecordingClassificationProvider(snapshot(securities=[security("sh.600000")]))
 
     with pytest.raises(ClassificationSyncError) as error:
         run_classification_sync(
@@ -3022,9 +2975,7 @@ def test_classification_cli_discards_untrusted_provider_output(
                     )
                 )
             if outcome == "unexpected_failure":
-                raise RuntimeError(
-                    "UPSTREAM_FETCH_EXCEPTION_SECRET /Users/private/fetch.err"
-                )
+                raise RuntimeError("UPSTREAM_FETCH_EXCEPTION_SECRET /Users/private/fetch.err")
             return snapshot(
                 securities=[security("sh.600000")],
                 memberships=[membership("sh.600000")],
@@ -3241,9 +3192,7 @@ def test_classification_cli_unexpected_constructor_failure_is_sanitized_and_writ
                 "CONSTRUCTOR_STDERR_SECRET /Users/private/constructor.err",
                 file=sys.stderr,
             )
-            raise RuntimeError(
-                "CONSTRUCTOR_EXCEPTION_SECRET /Users/private/constructor.sock"
-            )
+            raise RuntimeError("CONSTRUCTOR_EXCEPTION_SECRET /Users/private/constructor.sock")
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "BaoStockClassificationProvider", HostileProvider)
@@ -3449,3 +3398,170 @@ def test_classification_fetch_does_not_logout_session_it_did_not_acquire() -> No
     assert provider.session._session_usable is True
     assert client.context.default_socket is original_socket
     assert provider.session.client is client
+
+
+class ScopedClassificationClient(FakeClassificationClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_scopes = []
+
+    def _capture_scope(self, operation: str) -> None:
+        self.request_scopes.append((operation, current_request_context()))
+
+    def login(self):
+        self._capture_scope("login")
+        return super().login()
+
+    def query_all_stock(self, **kwargs):
+        self._capture_scope("query_all_stock")
+        return super().query_all_stock(**kwargs)
+
+    def query_stock_basic(self, **kwargs):
+        self._capture_scope("query_stock_basic")
+        return super().query_stock_basic(**kwargs)
+
+    def query_stock_industry(self, **kwargs):
+        self._capture_scope("query_stock_industry")
+        return super().query_stock_industry(**kwargs)
+
+    def query_hs300_stocks(self, **kwargs):
+        self._capture_scope("query_hs300_stocks")
+        return super().query_hs300_stocks(**kwargs)
+
+    def query_sz50_stocks(self, **kwargs):
+        self._capture_scope("query_sz50_stocks")
+        return super().query_sz50_stocks(**kwargs)
+
+    def query_zz500_stocks(self, **kwargs):
+        self._capture_scope("query_zz500_stocks")
+        return super().query_zz500_stocks(**kwargs)
+
+
+def test_classification_uses_typed_non_market_endpoint_scopes() -> None:
+    endpoint_type = getattr(provider_transport, "ClassificationEndpoint", None)
+    assert endpoint_type is not None
+    client = ScopedClassificationClient()
+    provider = BaoStockClassificationProvider(
+        client=client,
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+
+    provider.fetch(SNAPSHOT_DATE)
+
+    expected = {
+        "query_all_stock": endpoint_type.SECURITY_UNIVERSE,
+        "query_stock_basic": endpoint_type.SECURITY_BASIC,
+        "query_stock_industry": endpoint_type.INDUSTRY,
+        "query_hs300_stocks": endpoint_type.HS300,
+        "query_sz50_stocks": endpoint_type.SZ50,
+        "query_zz500_stocks": endpoint_type.CSI500,
+    }
+    queries = [item for item in client.request_scopes if item[0] != "login"]
+    assert {operation for operation, _context in queries} == set(expected)
+    assert all(context.endpoint == expected[operation] for operation, context in queries)
+    assert not (
+        {endpoint.value for endpoint in endpoint_type} & {item.value for item in ProviderEndpoint}
+    )
+    assert len({context.refresh_id for _operation, context in client.request_scopes}) == 1
+    assert len({context.provider_session_id for _operation, context in client.request_scopes}) == 1
+    assert len({context.request_id for _operation, context in queries}) == len(queries)
+    login = next(context for operation, context in client.request_scopes if operation == "login")
+    assert login.endpoint == endpoint_type.SECURITY_UNIVERSE
+
+
+class ClassificationPagedResult:
+    error_code = "0"
+    error_msg = ""
+    per_page_count = 2000
+    fields = ["code", "tradeStatus", "code_name"]
+
+    def __init__(self, pages: list[list[list[str]]], page_numbers: list[str]) -> None:
+        self.pages = pages
+        self.page_numbers = page_numbers
+        self.page_index = 0
+        self.data = pages[0]
+        self.cur_page_num = page_numbers[0]
+        self.cur_row_num = 0
+
+    def next(self) -> bool:
+        if self.cur_row_num < len(self.data):
+            return True
+        if len(self.data) < self.per_page_count:
+            return False
+        self.page_index += 1
+        if self.page_index >= len(self.pages):
+            return False
+        self.data = self.pages[self.page_index]
+        self.cur_page_num = self.page_numbers[self.page_index]
+        self.cur_row_num = 0
+        return bool(self.data)
+
+    def get_row_data(self):
+        row = self.data[self.cur_row_num]
+        self.cur_row_num += 1
+        return row
+
+
+def _classification_full_page(prefix: str) -> list[list[str]]:
+    return [[f"bj.{prefix}{index:04d}", "1", f"name-{index}"] for index in range(2000)]
+
+
+@pytest.mark.parametrize(
+    ("pages", "page_numbers", "normalized_error"),
+    [
+        pytest.param(
+            [_classification_full_page("8"), []],
+            ["1", "2"],
+            NormalizedTransportError.PROTOCOL_ERROR,
+            id="full-page-then-empty",
+        ),
+        pytest.param(
+            [_classification_full_page("8"), _classification_full_page("9")],
+            ["1", "1"],
+            NormalizedTransportError.PAGINATION_STALLED,
+            id="stalled-page",
+        ),
+        pytest.param(
+            [_classification_full_page("8"), _classification_full_page("8")],
+            ["1", "2"],
+            NormalizedTransportError.PAGINATION_STALLED,
+            id="repeated-page",
+        ),
+    ],
+)
+def test_classification_pagination_is_paced_observed_and_fail_closed(
+    pages: list[list[list[str]]],
+    page_numbers: list[str],
+    normalized_error: NormalizedTransportError,
+) -> None:
+    endpoint_type = getattr(provider_transport, "ClassificationEndpoint", None)
+    assert endpoint_type is not None
+
+    class PagedClient(FakeClassificationClient):
+        def query_all_stock(self, **_kwargs):
+            return ClassificationPagedResult(pages, page_numbers)
+
+    provider = BaoStockClassificationProvider(
+        client=PagedClient(),
+        clock=lambda: OBSERVED,
+        min_request_interval_seconds=0,
+    )
+    provider.session.max_attempts = 1
+    observations = []
+
+    with (
+        transport_observation_sink(observations.append),
+        pytest.raises(ClassificationProviderError) as caught,
+    ):
+        provider.fetch(SNAPSHOT_DATE)
+
+    assert caught.value.failure.failure_stage == "security_universe"
+    assert provider.last_request_count == 2
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.endpoint == endpoint_type.SECURITY_UNIVERSE
+    assert observation.page == 2
+    assert observation.protocol_stage == ProtocolStage.PAGINATION
+    assert observation.normalized_error == normalized_error
+    assert "name-1999" not in observation.model_dump_json()

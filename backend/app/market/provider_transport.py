@@ -25,6 +25,18 @@ class ProviderEndpoint(StrEnum):
     INDEX_HISTORY = "index_history"
 
 
+class ClassificationEndpoint(StrEnum):
+    SECURITY_UNIVERSE = "classification_security_universe"
+    SECURITY_BASIC = "classification_security_basic"
+    INDUSTRY = "classification_industry"
+    HS300 = "classification_hs300"
+    SZ50 = "classification_sz50"
+    CSI500 = "classification_csi500"
+
+
+TransportEndpoint = ProviderEndpoint | ClassificationEndpoint
+
+
 class ProtocolStage(StrEnum):
     CONNECT = "connect"
     SEND = "send"
@@ -84,7 +96,7 @@ class ProviderSessionContext(RefreshTransportContext):
 
 class ProviderRequestContext(ProviderSessionContext):
     request_id: TransportId
-    endpoint: ProviderEndpoint
+    endpoint: TransportEndpoint
     attempt: int = Field(ge=1)
     page: int = Field(default=1, ge=1)
 
@@ -96,7 +108,7 @@ class TransportObservation(BaseModel):
     provider_session_id: TransportId
     request_id: TransportId
     provider_id: Literal["baostock"] = "baostock"
-    endpoint: ProviderEndpoint
+    endpoint: TransportEndpoint
     attempt: int = Field(ge=1)
     page: int = Field(ge=1)
     protocol_stage: ProtocolStage
@@ -127,6 +139,10 @@ class TransportObservation(BaseModel):
 
 class TransportScopeError(RuntimeError):
     pass
+
+
+class OperationDeadlineInterrupt(BaseException):
+    """Escape broad SDK exception handling while retaining request context."""
 
 
 _refresh_context: ContextVar[RefreshTransportContext | None] = ContextVar(
@@ -177,7 +193,7 @@ def provider_session_scope(
 
 @contextmanager
 def request_scope(
-    endpoint: ProviderEndpoint,
+    endpoint: TransportEndpoint,
     *,
     attempt: int,
     page: int = 1,

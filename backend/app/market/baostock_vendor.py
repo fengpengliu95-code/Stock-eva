@@ -15,6 +15,7 @@ from typing import Any
 from backend.app.market.failures import MarketFailure
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
+    OperationDeadlineInterrupt,
     ProtocolStage,
     TransportObservation,
     TransportOutcome,
@@ -81,7 +82,7 @@ def transport_observation_sink(sink: ObservationSink) -> Iterator[None]:
         _observation_sink.reset(token)
 
 
-def _emit_terminal_observation(
+def emit_terminal_observation(
     *,
     started_at: float,
     protocol_stage: ProtocolStage,
@@ -132,7 +133,7 @@ def _raise_transport_error(
     end_marker_seen: bool = False,
     failure: MarketFailure | None = None,
 ) -> None:
-    _emit_terminal_observation(
+    emit_terminal_observation(
         started_at=started_at,
         protocol_stage=protocol_stage,
         recv_calls=recv_calls,
@@ -161,6 +162,22 @@ def checked_connect(_socket_util: Any) -> None:
     try:
         connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         connection.connect((constants.BAOSTOCK_SERVER_IP, constants.BAOSTOCK_SERVER_PORT))
+    except OperationDeadlineInterrupt:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        emit_terminal_observation(
+            started_at=started_at,
+            protocol_stage=ProtocolStage.CONNECT,
+            recv_calls=0,
+            response_bytes=0,
+            end_marker_seen=False,
+            provider_code=None,
+            normalized_error=NormalizedTransportError.CONNECT_ERROR,
+        )
+        raise
     except Exception as exc:
         if connection is not None:
             try:
@@ -180,7 +197,7 @@ def checked_connect(_socket_util: Any) -> None:
             failure=failure,
         )
     context.default_socket = connection
-    _emit_terminal_observation(
+    emit_terminal_observation(
         started_at=started_at,
         protocol_stage=ProtocolStage.COMPLETE,
         recv_calls=0,
@@ -246,6 +263,17 @@ def checked_send_msg(message: str) -> str:
         )
     try:
         connection.sendall((message + "\n").encode("utf-8"))
+    except OperationDeadlineInterrupt:
+        emit_terminal_observation(
+            started_at=started_at,
+            protocol_stage=ProtocolStage.SEND,
+            recv_calls=0,
+            response_bytes=0,
+            end_marker_seen=False,
+            provider_code=None,
+            normalized_error=NormalizedTransportError.SEND_ERROR,
+        )
+        raise
     except Exception:
         _raise_transport_error(
             "BaoStock transport send failed",
@@ -272,6 +300,17 @@ def checked_send_msg(message: str) -> str:
         recv_calls += 1
         try:
             chunk = connection.recv(8192)
+        except OperationDeadlineInterrupt:
+            emit_terminal_observation(
+                started_at=started_at,
+                protocol_stage=ProtocolStage.RECEIVE,
+                recv_calls=recv_calls,
+                response_bytes=len(received),
+                end_marker_seen=received.endswith(PROTOCOL_MARKER),
+                provider_code=None,
+                normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+            )
+            raise
         except TimeoutError:
             _raise_transport_error(
                 "BaoStock transport receive timed out",
@@ -429,7 +468,7 @@ def checked_send_msg(message: str) -> str:
             end_marker_seen=True,
         )
     normalized_error = normalize_provider_code(provider_code) if provider_code is not None else None
-    _emit_terminal_observation(
+    emit_terminal_observation(
         started_at=started_at,
         protocol_stage=(
             ProtocolStage.PROVIDER_STATUS

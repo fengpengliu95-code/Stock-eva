@@ -92,8 +92,7 @@ def resolve_effective_window(
     trading_dates = provider.trading_dates(lookback_start, end_date)
     if len(trading_dates) < effective_days:
         raise ValueError(
-            f"calendar returned {len(trading_dates)} trading days; "
-            f"{effective_days} required"
+            f"calendar returned {len(trading_dates)} trading days; {effective_days} required"
         )
     return trading_dates[-effective_days:]
 
@@ -181,8 +180,7 @@ class BackfillAuditStore:
         connection = self._connect()
         try:
             connection.execute(
-                "UPDATE backfill_runs SET status = 'running', completed_at = NULL "
-                "WHERE run_id = ?",
+                "UPDATE backfill_runs SET status = 'running', completed_at = NULL WHERE run_id = ?",
                 [run_id],
             )
         finally:
@@ -243,11 +241,7 @@ class BackfillAuditStore:
     ) -> BackfillRunRecord:
         connection = self._connect()
         try:
-            coverage = (
-                loaded_points / plan.requested_points
-                if plan.requested_points
-                else 0.0
-            )
+            coverage = loaded_points / plan.requested_points if plan.requested_points else 0.0
             status = "ready" if coverage >= 1 else "partial" if loaded_points else "error"
             connection.execute(
                 """
@@ -290,9 +284,7 @@ class BackfillAuditStore:
             start_date=row[3],
             end_date=row[4],
             symbols=json.loads(row[5]),
-            trading_dates=[
-                date.fromisoformat(item) for item in json.loads(row[6])
-            ],
+            trading_dates=[date.fromisoformat(item) for item in json.loads(row[6])],
             total_batches=row[7],
             completed_batches=completed,
             failed_batches=row[7] - completed,
@@ -346,9 +338,7 @@ class BackfillService:
         symbol_batches = _chunks(normalized_symbols, symbol_batch_size)
         combinations = list(product(date_batches, symbol_batches))
         if len(combinations) > max_batches:
-            raise ValueError(
-                f"planned {len(combinations)} batches exceeds batch cap {max_batches}"
-            )
+            raise ValueError(f"planned {len(combinations)} batches exceeds batch cap {max_batches}")
         batches: list[BackfillBatchPlan] = []
         for index, (dates, batch_symbols) in enumerate(combinations):
             batches.append(
@@ -378,9 +368,7 @@ class BackfillService:
             date_batch_size=date_batch_size,
             total_batches=len(batches),
             requested_points=len(trading_dates) * len(normalized_symbols),
-            estimated_provider_requests=sum(
-                item.estimated_provider_requests for item in batches
-            ),
+            estimated_provider_requests=sum(item.estimated_provider_requests for item in batches),
             batches=batches,
         )
 
@@ -408,19 +396,18 @@ class BackfillService:
                     batch.end_date,
                     symbols=batch.symbols,
                 )
+                self._validate_provider_batch(batch, result)
                 self.store.upsert_bars(result.bars)
                 loaded = len(
                     {
                         (item.trade_date, item.symbol)
                         for item in result.bars
-                        if item.trade_date in batch.trading_dates
-                        and item.symbol in batch.symbols
+                        if item.trade_date in batch.trading_dates and item.symbol in batch.symbols
                     }
                 )
                 batch_status = (
                     "ready"
-                    if loaded == batch.requested_points
-                    and not result.failed_symbols
+                    if loaded == batch.requested_points and not result.failed_symbols
                     else "partial"
                 )
                 self.audit.record_batch(
@@ -440,20 +427,42 @@ class BackfillService:
                     loaded_points=0,
                     error_code="provider_error",
                 )
-        loaded_points = len(
-            self.store.present_points(plan.trading_dates, plan.symbols)
-        )
+        loaded_points = len(self.store.present_points(plan.trading_dates, plan.symbols))
         self._save_daily_audits(plan)
         return self.audit.finalize(plan, loaded_points=loaded_points)
+
+    @staticmethod
+    def _validate_provider_batch(batch: BackfillBatchPlan, result) -> None:
+        expected_symbols = tuple(batch.symbols)
+        result_symbols = tuple(result.expected_symbols)
+        expected_dates = tuple(batch.trading_dates)
+        result_dates = tuple(result.trading_dates)
+        if (
+            len(result_symbols) != len(set(result_symbols))
+            or set(result_symbols) != set(expected_symbols)
+            or len(result_dates) != len(set(result_dates))
+            or set(result_dates) != set(expected_dates)
+            or len(result.failed_symbols) != len(set(result.failed_symbols))
+            or not set(result.failed_symbols).issubset(expected_symbols)
+        ):
+            raise ValueError("provider backfill batch identity is invalid")
+        points: set[tuple[date, str]] = set()
+        for item in result.bars:
+            point = (item.trade_date, item.symbol)
+            if (
+                item.symbol not in expected_symbols
+                or item.trade_date not in expected_dates
+                or point in points
+            ):
+                raise ValueError("provider backfill batch identity is invalid")
+            points.add(point)
 
     def _save_daily_audits(self, plan: BackfillPlan) -> None:
         present = self.store.present_points(plan.trading_dates, plan.symbols)
         now = datetime.now(UTC)
         for trade_date in plan.trading_dates:
             loaded_symbols = {
-                symbol
-                for stored_date, symbol in present
-                if stored_date == trade_date
+                symbol for stored_date, symbol in present if stored_date == trade_date
             }
             failures = sorted(set(plan.symbols) - loaded_symbols)
             loaded = len(loaded_symbols)

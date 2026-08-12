@@ -26,6 +26,7 @@ from backend.app.market.baostock import (
     _OperationDeadlineExceeded,
     _OperationDeadlineUnavailable,
 )
+from backend.app.market.provider_transport import ClassificationEndpoint
 from backend.app.security_identity import derive_security_identity
 
 
@@ -230,6 +231,19 @@ class BaoStockClassificationProvider:
         return basics
 
     def fetch(self, as_of: date) -> ClassificationSnapshot:
+        with self.session._refresh_operation():
+            return self._fetch_scoped(as_of)
+
+    def _read_metadata(self, endpoint: ClassificationEndpoint, operation):
+        request_count_before = self.session._provider_request_count
+        try:
+            return self.session._read(endpoint, operation)
+        finally:
+            self._metadata_operation_count += (
+                self.session._provider_request_count - request_count_before
+            )
+
+    def _fetch_scoped(self, as_of: date) -> ClassificationSnapshot:
         started_at = self._monotonic()
         self._metadata_operation_count = 0
         owns_session = False
@@ -248,12 +262,8 @@ class BaoStockClassificationProvider:
                 started_at=started_at,
             )
 
-        def read(stage: str, operation):
-            def counted_operation():
-                self._metadata_operation_count += 1
-                return operation()
-
-            return network(stage, lambda: self.session._read(counted_operation))
+        def read(stage: str, endpoint: ClassificationEndpoint, operation):
+            return network(stage, lambda: self._read_metadata(endpoint, operation))
 
         def schema(stage: str, operation):
             return validate(stage, lambda: self._schema_operation(operation))
@@ -271,13 +281,17 @@ class BaoStockClassificationProvider:
             )
 
         try:
-            network("login", self.session._login)
+            network(
+                "login",
+                lambda: self.session._login(ClassificationEndpoint.SECURITY_UNIVERSE),
+            )
             owns_session = True
             observed_at = validate("validation", self.clock)
             all_records = required(
                 "security_universe",
                 read(
                     "security_universe",
+                    ClassificationEndpoint.SECURITY_UNIVERSE,
                     lambda: self.session.client.query_all_stock(day=as_of.isoformat()),
                 ),
                 label="query_all_stock",
@@ -285,7 +299,11 @@ class BaoStockClassificationProvider:
             )
             basic_records = required(
                 "security_basic",
-                read("security_basic", lambda: self.session.client.query_stock_basic()),
+                read(
+                    "security_basic",
+                    ClassificationEndpoint.SECURITY_BASIC,
+                    lambda: self.session.client.query_stock_basic(),
+                ),
                 label="query_stock_basic",
                 fields={"code", "code_name", "ipoDate", "outDate", "type", "status"},
             )
@@ -305,6 +323,7 @@ class BaoStockClassificationProvider:
                 "industry",
                 read(
                     "industry",
+                    ClassificationEndpoint.INDUSTRY,
                     lambda: self.session.client.query_stock_industry(date=as_of.isoformat()),
                 ),
                 label="query_stock_industry",
@@ -333,15 +352,24 @@ class BaoStockClassificationProvider:
                 ],
             )
             index_operations = {
-                "hs300": lambda: self.session.client.query_hs300_stocks(date=as_of.isoformat()),
-                "sz50": lambda: self.session.client.query_sz50_stocks(date=as_of.isoformat()),
-                "csi500": lambda: self.session.client.query_zz500_stocks(date=as_of.isoformat()),
+                "hs300": (
+                    ClassificationEndpoint.HS300,
+                    lambda: self.session.client.query_hs300_stocks(date=as_of.isoformat()),
+                ),
+                "sz50": (
+                    ClassificationEndpoint.SZ50,
+                    lambda: self.session.client.query_sz50_stocks(date=as_of.isoformat()),
+                ),
+                "csi500": (
+                    ClassificationEndpoint.CSI500,
+                    lambda: self.session.client.query_zz500_stocks(date=as_of.isoformat()),
+                ),
             }
             components: list[IndexComponentRecord] = []
-            for index_id, operation in index_operations.items():
+            for index_id, (endpoint, operation) in index_operations.items():
                 records = required(
                     index_id,
-                    read(index_id, operation),
+                    read(index_id, endpoint, operation),
                     label=f"{index_id} component",
                     fields={"updateDate", "code", "code_name"},
                 )
