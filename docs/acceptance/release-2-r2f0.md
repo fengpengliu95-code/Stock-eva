@@ -153,12 +153,55 @@ After the failed repair and again after runtime rollback:
 
 ## Continuation gate
 
-The single production attempt authorized for this incident has been consumed.
-Do not retry it automatically or manually, and do not edit the manifest,
-objects, pointer or control database to simulate success. A later attempt
-requires new user authorization, a fresh live pre-state, confirmation that the
-target remains missing, and a separately reviewed provider-availability
+The first production attempt authorized for this incident was consumed. A
+second window was authorized later on 2026-08-12, but its mandatory read-only
+provider health gate failed before candidate installation or any real repair.
+That window therefore consumed no guarded refresh attempt and created no
+additional repair run. Do not retry automatically or manually, and do not edit
+the manifest, objects, pointer or control database to simulate success. A later
+attempt requires new user authorization, a fresh live pre-state, confirmation
+that the target remains missing, and a separately reviewed provider-availability
 window. R2-F1 must not start while this R2-F0 production gate is NO-GO.
+
+### Second authorized window: stopped at provider health gate
+
+At 18:26-18:36 Asia/Shanghai, live state had advanced independently of the
+first repair attempt:
+
+- the expected latest session was 2026-08-12 while the pointer still referenced
+  2026-08-10;
+- the scheduled 18:10 run had added one 2026-08-12 provider-error row, bringing
+  `refresh_runs` to 286, and had scheduled an 18:40 retry;
+- the manifest was still SHA-256
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`,
+  generation `generation-6c48729bea29429d86891b102f0c8e52`, with 271
+  entries and neither 2026-08-11 nor 2026-08-12 published.
+
+A no-write 2026-08-12 universe inspection succeeded once with 3,195 expected
+symbols and five metadata requests. The immediately following 2026-08-11
+inspection failed with `universe_inspection_failed` after the SDK reported a
+response-receive error. Both probes left the control database and manifest byte
+hashes unchanged.
+
+Independent review allowed only a reversible freeze of the refresh LaunchAgent
+to prevent the 18:40 scheduled retry from racing the controlled window. Before
+the freeze, there was no active refresh process. Only the refresh agent was
+unloaded; API, web, calendar and backup remained loaded, API/workspace/market
+returned 200, `refresh_runs` stayed at 286, and protected hashes did not change.
+
+Local read-only evidence showed complete 2026-08-11 factor snapshots for 3,193
+stocks with no missing back factor. Nevertheless, the first required full-chain
+canary for that exact date failed after 63.463 seconds with typed
+`fetch/transport_timeout/retryable=true`. It covered the universe plus a normal
+stock, both incident suspensions, both required indexes and factor endpoints.
+No production refresh ran, no candidate release was installed, and the run
+count, control database, manifest and factor-cache hashes remained unchanged.
+
+The provider health policy required three consistent successes over at least
+five minutes, so the first-round failure closed the window. The refresh
+LaunchAgent was restored from its unchanged plist; it was loaded again with the
+run count still exactly 286. The production runtime remained the prior release
+`75c64e4364fadbeab8a1e4a964bfa208e91a7ff6` throughout this second window.
 
 ## Rollback and NO-GO boundary
 
