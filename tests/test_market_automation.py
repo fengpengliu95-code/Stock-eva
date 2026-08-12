@@ -1,9 +1,14 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import sys
-from datetime import UTC, date, datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,9 +19,24 @@ from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
 from backend.app.market.baostock import ProviderBatch
+from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
+from backend.app.market.provider_health import (
+    CircuitState,
+    InMemoryProviderHealthStore,
+    ProviderHealthError,
+    SQLiteProviderHealthStore,
+)
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProtocolStage,
+    ProviderEndpoint,
+    provider_session_scope,
+    refresh_scope,
+    request_scope,
+)
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.after_close import (
     AfterClosePipelineService,
@@ -189,6 +209,114 @@ class CompleteProvider:
 
     def fetch(self, trade_date: date, symbols=None) -> ProviderBatch:
         self.fetch_calls += 1
+        return ProviderBatch(
+            bars=self.bars,
+            expected_symbols=[item.symbol for item in self.bars],
+            failed_symbols=[],
+        )
+
+
+class HealthClock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def open_health_endpoint(health_store, endpoint: ProviderEndpoint, *, prefix: str) -> None:
+    for index in range(health_store.failure_threshold):
+        health_store.record_terminal_failure(
+            f"{prefix}-{index}",
+            endpoint,
+            NormalizedTransportError.RECV_TIMEOUT,
+        )
+
+
+class RecordingProbeRunner:
+    def __init__(
+        self,
+        *,
+        error: NormalizedTransportError | None = None,
+        entered: threading.Event | None = None,
+        release: threading.Event | None = None,
+    ) -> None:
+        self.error = error
+        self.entered = entered
+        self.release = release
+        self.calls: list[tuple[ProviderEndpoint, date, str]] = []
+
+    def run(self, endpoint: ProviderEndpoint, *, trade_date: date, refresh_id: str) -> None:
+        self.calls.append((endpoint, trade_date, refresh_id))
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None:
+            assert self.release.wait(timeout=2)
+        if self.error is not None:
+            failure = RuntimeError("sanitized provider probe failure")
+            failure.normalized_error = self.error
+            raise failure
+
+
+class ScopedObservationProvider(CompleteProvider):
+    def __init__(
+        self,
+        bars,
+        *,
+        fetch_error: NormalizedTransportError | None = None,
+    ) -> None:
+        super().__init__(bars)
+        self.fetch_error = fetch_error
+
+    @contextmanager
+    def refresh_operation(self, refresh_id: str):
+        with refresh_scope(refresh_id):
+            yield
+
+    @staticmethod
+    def _observe(
+        endpoint: ProviderEndpoint,
+        *,
+        request_id: str,
+        provider_session_id: str | None = None,
+        attempt: int = 1,
+        error: NormalizedTransportError | None = None,
+        stage: ProtocolStage = ProtocolStage.COMPLETE,
+    ) -> None:
+        with provider_session_scope(provider_session_id or f"session-{request_id}"):
+            with request_scope(endpoint, attempt=attempt, request_id=request_id):
+                emit_terminal_observation(
+                    started_at=monotonic(),
+                    protocol_stage=stage,
+                    recv_calls=1,
+                    response_bytes=32,
+                    end_marker_seen=error is None,
+                    provider_code="0" if error is None else None,
+                    normalized_error=error,
+                )
+
+    def trading_dates(self, start_date: date, end_date: date) -> list[date]:
+        self.calendar_calls += 1
+        self._observe(ProviderEndpoint.TRADE_DATES, request_id="calendar")
+        return [start_date]
+
+    def fetch(self, trade_date: date, symbols=None) -> ProviderBatch:
+        self.fetch_calls += 1
+        self._observe(ProviderEndpoint.ALL_STOCK, request_id="fetch-connect")
+        if self.fetch_error is not None:
+            self._observe(
+                ProviderEndpoint.ALL_STOCK,
+                request_id="fetch-failure",
+                error=self.fetch_error,
+                stage=ProtocolStage.PAGINATION,
+            )
+            raise MarketFailureError(
+                MarketFailure(
+                    failure_stage="fetch",
+                    failure_class="transport_connect",
+                    retryable=True,
+                )
+            )
         return ProviderBatch(
             bars=self.bars,
             expected_symbols=[item.symbol for item in self.bars],
@@ -374,6 +502,456 @@ def test_automation_publishes_once_and_does_not_repeat_success(
     assert second.decision.action == "none"
     assert provider.fetch_calls == 1
     assert provider.calendar_calls == 1
+
+
+def test_open_provider_skips_multiple_existing_slots_without_provider_or_publication_calls(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    first_slot = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    health_clock = HealthClock(first_slot)
+    health_store = InMemoryProviderHealthStore(
+        failure_threshold=1,
+        cooldown_seconds=7_200,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    open_health_endpoint(health_store, ProviderEndpoint.ALL_STOCK, prefix="open")
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    probe_runner = RecordingProbeRunner()
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+        probe_runner=probe_runner,
+    )
+
+    first = service.run_due_once(first_slot)
+    second_slot = datetime(2026, 7, 23, 18, 40, tzinfo=SHANGHAI)
+    health_clock.now = second_slot
+    second = service.run_due_once(second_slot)
+
+    assert first.state.error_code == "SKIPPED_CIRCUIT_OPEN"
+    assert second.state.error_code == "SKIPPED_CIRCUIT_OPEN"
+    assert first.state.attempt_count == second.state.attempt_count == 0
+    assert first.state.last_attempt_at == first_slot
+    assert first.state.next_retry_at == second_slot
+    assert second.state.next_retry_at == datetime(2026, 7, 23, 19, 20, tzinfo=SHANGHAI)
+    assert provider.calendar_calls == 0
+    assert provider.fetch_calls == 0
+    assert probe_runner.calls == []
+    assert store.list_refreshes() == []
+    assert store.published_refresh() is None
+
+
+def test_circuit_skip_after_final_existing_slot_stays_delayed_without_new_retry(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    final_slot = datetime(2026, 7, 24, 7, 15, tzinfo=SHANGHAI)
+    health_store = InMemoryProviderHealthStore(
+        failure_threshold=1,
+        cooldown_seconds=86_400,
+        clock=HealthClock(final_slot),
+    )
+    open_health_endpoint(health_store, ProviderEndpoint.ALL_STOCK, prefix="open")
+    provider = CompleteProvider(fixture_bars())
+    service = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        provider,
+        synthetic_calendar(),
+        required_symbols=set,
+        health_store=health_store,
+    )
+
+    skipped = service.run_due_once(final_slot)
+    later = service.run_due_once(final_slot + timedelta(minutes=1))
+
+    assert skipped.state.refresh_state == "delayed"
+    assert skipped.state.next_retry_at is None
+    assert later.decision.action == "none"
+    assert provider.calendar_calls == provider.fetch_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("probe_error", "expected_state", "expected_code"),
+    [
+        (None, CircuitState.CLOSED, "PROVIDER_PROBE_SUCCEEDED"),
+        (
+            NormalizedTransportError.RECV_TIMEOUT,
+            CircuitState.OPEN,
+            "PROVIDER_PROBE_FAILED",
+        ),
+    ],
+)
+def test_elapsed_cooldown_runs_only_one_endpoint_probe_and_never_refreshes_same_slot(
+    tmp_path: Path,
+    probe_error: NormalizedTransportError | None,
+    expected_state: CircuitState,
+    expected_code: str,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    health_clock = HealthClock(now)
+    health_store = InMemoryProviderHealthStore(
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    open_health_endpoint(health_store, ProviderEndpoint.DAILY_ASTOCK, prefix="open")
+    health_clock.now += timedelta(seconds=60)
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    runner = RecordingProbeRunner(error=probe_error)
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+        probe_runner=runner,
+    )
+
+    outcome = service.run_due_once(now)
+
+    assert [(endpoint, trade_date) for endpoint, trade_date, _ in runner.calls] == [
+        (ProviderEndpoint.DAILY_ASTOCK, date(2026, 7, 23))
+    ]
+    assert runner.calls[0][2].startswith("probe-")
+    assert health_store.endpoint_health(ProviderEndpoint.DAILY_ASTOCK).state == expected_state
+    assert outcome.state.error_code == expected_code
+    assert outcome.state.attempt_count == 0
+    assert outcome.state.next_retry_at == datetime(2026, 7, 23, 18, 40, tzinfo=SHANGHAI)
+    assert provider.calendar_calls == 0
+    assert provider.fetch_calls == 0
+    assert outcome.result is None
+    assert store.list_refreshes() == []
+
+
+def test_successful_probe_waits_until_next_existing_slot_before_full_refresh(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    health_clock = HealthClock(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    health_store = InMemoryProviderHealthStore(
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    open_health_endpoint(health_store, ProviderEndpoint.TRADE_DATES, prefix="open")
+    health_clock.now += timedelta(seconds=60)
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    runner = RecordingProbeRunner()
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+        probe_runner=runner,
+    )
+
+    probe = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    waiting = service.run_due_once(datetime(2026, 7, 23, 18, 30, tzinfo=SHANGHAI))
+    refreshed = service.run_due_once(datetime(2026, 7, 23, 18, 40, tzinfo=SHANGHAI))
+
+    assert probe.state.error_code == "PROVIDER_PROBE_SUCCEEDED"
+    assert waiting.decision.action == "wait"
+    assert refreshed.result is not None and refreshed.result.status == "ready"
+    assert provider.calendar_calls == provider.fetch_calls == 1
+    assert len(runner.calls) == 1
+
+
+def test_formal_calendar_and_fetch_share_refresh_id_and_resolve_each_touched_endpoint_once(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    health_path = tmp_path / "control" / "provider-health.sqlite3"
+    health_store = SQLiteProviderHealthStore(health_path)
+    health_store.initialize()
+    provider = ScopedObservationProvider(fixture_bars())
+    store = MarketStore(tmp_path / "market.duckdb")
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None and outcome.result.status == "ready"
+    request_key = "daily:baostock:2026-07-23:all-main-board"
+    assert outcome.result.request_key == request_key
+    assert outcome.result.run_id.startswith(
+        f"{hashlib.sha256(request_key.encode()).hexdigest()[:12]}-"
+    )
+    observations = health_store.list_observations()
+    assert {item.refresh_id for item in observations} == {outcome.result.run_id}
+    assert {item.endpoint for item in observations} == {
+        ProviderEndpoint.TRADE_DATES,
+        ProviderEndpoint.ALL_STOCK,
+    }
+    assert health_store.endpoint_health(ProviderEndpoint.TRADE_DATES).consecutive_failures == 0
+    assert health_store.endpoint_health(ProviderEndpoint.ALL_STOCK).consecutive_failures == 0
+    restarted = SQLiteProviderHealthStore(health_path)
+    restarted.initialize()
+    assert restarted.list_observations() == observations
+
+
+def test_socket_complete_cannot_override_later_terminal_endpoint_error(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    health_store = InMemoryProviderHealthStore(failure_threshold=3)
+    provider = ScopedObservationProvider(
+        fixture_bars(),
+        fetch_error=NormalizedTransportError.PAGINATION_STALLED,
+    )
+    store = MarketStore(tmp_path / "market.duckdb")
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None and outcome.result.status == "error"
+    assert health_store.endpoint_health(ProviderEndpoint.ALL_STOCK).consecutive_failures == 1
+    assert health_store.endpoint_health(ProviderEndpoint.TRADE_DATES).consecutive_failures == 0
+    assert (
+        len(
+            [
+                item
+                for item in health_store.list_observations()
+                if item.endpoint == ProviderEndpoint.ALL_STOCK
+            ]
+        )
+        == 2
+    )
+
+
+def test_recovered_internal_retry_records_one_final_endpoint_success(tmp_path: Path) -> None:
+    module = load_module("backend.app.market.automation")
+
+    class RecoveredProvider(ScopedObservationProvider):
+        def fetch(self, trade_date: date, symbols=None) -> ProviderBatch:
+            del trade_date, symbols
+            self.fetch_calls += 1
+            self._observe(
+                ProviderEndpoint.ALL_STOCK,
+                request_id="failed-attempt",
+                provider_session_id="failed-session",
+                attempt=1,
+                error=NormalizedTransportError.RECV_TIMEOUT,
+            )
+            self._observe(
+                ProviderEndpoint.ALL_STOCK,
+                request_id="successful-attempt",
+                provider_session_id="successful-session",
+                attempt=2,
+            )
+            return ProviderBatch(
+                bars=self.bars,
+                expected_symbols=[item.symbol for item in self.bars],
+                failed_symbols=[],
+            )
+
+    health_store = InMemoryProviderHealthStore()
+    service = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        RecoveredProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None and outcome.result.status == "ready"
+    assert health_store.endpoint_health(ProviderEndpoint.ALL_STOCK).consecutive_failures == 0
+
+
+def test_provider_audit_write_failure_is_sanitized_and_prevents_publication(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    secret = "token=health-secret /private/control.sqlite3 SELECT raw_payload"
+
+    class FailingAuditStore(InMemoryProviderHealthStore):
+        def record_observation(self, observation) -> None:
+            del observation
+            raise ProviderHealthError(secret)
+
+    health_store = FailingAuditStore()
+    provider = ScopedObservationProvider(fixture_bars())
+    store = MarketStore(tmp_path / "market.duckdb")
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=health_store,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is None
+    assert outcome.state.refresh_state == "error"
+    assert store.published_refresh() is None
+    assert store.list_refreshes() == []
+    assert secret not in caplog.text
+
+
+def test_real_probe_runner_constructs_one_attempt_independent_provider_per_probe() -> None:
+    module = load_module("backend.app.market.automation")
+    providers = []
+
+    class FakeProbeProvider:
+        def __init__(self, max_attempts: int) -> None:
+            self.max_attempts = max_attempts
+            self.refresh_ids: list[str] = []
+            self.calls = []
+
+        @contextmanager
+        def refresh_operation(self, refresh_id: str):
+            self.refresh_ids.append(refresh_id)
+            yield
+
+        def probe_endpoint(self, endpoint, **kwargs) -> None:
+            self.calls.append((endpoint, kwargs))
+
+    def factory(*, max_attempts: int):
+        provider = FakeProbeProvider(max_attempts)
+        providers.append(provider)
+        return provider
+
+    runner = module.BaoStockProbeRunner(factory)
+    runner.run(
+        ProviderEndpoint.ALL_STOCK,
+        trade_date=date(2026, 7, 23),
+        refresh_id="probe-first",
+    )
+    runner.run(
+        ProviderEndpoint.DAILY_FACTOR,
+        trade_date=date(2026, 7, 23),
+        refresh_id="probe-second",
+    )
+
+    assert len(providers) == 2
+    assert [provider.max_attempts for provider in providers] == [1, 1]
+    assert [provider.refresh_ids for provider in providers] == [
+        ["probe-first"],
+        ["probe-second"],
+    ]
+    assert [provider.calls[0][0] for provider in providers] == [
+        ProviderEndpoint.ALL_STOCK,
+        ProviderEndpoint.DAILY_FACTOR,
+    ]
+
+
+def test_two_scheduler_services_share_one_global_probe_lease(tmp_path: Path) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    health_clock = HealthClock(now)
+    health_path = tmp_path / "control" / "provider-health.sqlite3"
+    health_first = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    health_second = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    health_first.initialize()
+    health_second.initialize()
+    open_health_endpoint(health_first, ProviderEndpoint.ALL_STOCK, prefix="open")
+    health_clock.now += timedelta(seconds=60)
+    entered = threading.Event()
+    release = threading.Event()
+    runner = RecordingProbeRunner(entered=entered, release=release)
+    services = [
+        module.MarketAutomationService(
+            MarketStore(tmp_path / f"market-{index}.duckdb"),
+            CompleteProvider(fixture_bars()),
+            synthetic_calendar(),
+            required_symbols=lambda: {"sh.600000"},
+            health_store=health,
+            probe_runner=runner,
+        )
+        for index, health in enumerate((health_first, health_second))
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(services[0].run_due_once, now)
+        assert entered.wait(timeout=2)
+        second_future = executor.submit(services[1].run_due_once, now)
+        second = second_future.result(timeout=2)
+        release.set()
+        first = first_future.result(timeout=2)
+
+    assert len(runner.calls) == 1
+    assert {first.state.error_code, second.state.error_code} == {
+        "PROVIDER_PROBE_SUCCEEDED",
+        "SKIPPED_CIRCUIT_OPEN",
+    }
+    assert all(service.provider.calendar_calls == 0 for service in services)
+    assert all(service.provider.fetch_calls == 0 for service in services)
+
+
+def test_scheduler_restart_reads_persisted_open_health_and_skips_provider(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    clock = HealthClock(now)
+    health_path = tmp_path / "control" / "provider-health.sqlite3"
+    first = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=3_600,
+        clock=clock,
+    )
+    first.initialize()
+    open_health_endpoint(first, ProviderEndpoint.ALL_STOCK, prefix="open")
+    restarted = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=3_600,
+        clock=clock,
+    )
+    restarted.initialize()
+    provider = CompleteProvider(fixture_bars())
+    service = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        health_store=restarted,
+        probe_runner=RecordingProbeRunner(),
+    )
+
+    outcome = service.run_due_once(now)
+
+    assert outcome.state.error_code == "SKIPPED_CIRCUIT_OPEN"
+    assert provider.calendar_calls == provider.fetch_calls == 0
 
 
 def test_automation_keeps_ready_publication_when_typed_regime_capture_fails(
@@ -690,6 +1268,59 @@ def test_auto_refresh_once_defaults_to_network_free_plan(
     assert payload["writes_market_data"] is False
     assert payload["execute_requires"] == "--execute"
     assert "target_session" in payload
+
+
+def test_auto_refresh_dry_run_reports_sanitized_provider_health_without_constructing_provider(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "user_data_dir": tmp_path / "user",
+            "local_control_dir": tmp_path / "control",
+            "local_staging_dir": tmp_path / "staging",
+            "local_lock_dir": tmp_path / "locks",
+            "local_temp_dir": tmp_path / "tmp",
+            "nas_market_dataset_root": None,
+            "local_market_dataset_root": None,
+        }
+    )
+    health_store = SQLiteProviderHealthStore(
+        settings.local_control_dir / settings.provider_health_database_name,
+        failure_threshold=1,
+        cooldown_seconds=3_600,
+    )
+    health_store.initialize()
+    open_health_endpoint(health_store, ProviderEndpoint.ALL_STOCK, prefix="open")
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        cli,
+        "BaoStockProvider",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dry-run must not construct a provider")
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once"])
+
+    assert cli.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry-run"
+    assert payload["provider_health"] == {
+        "state": "OPEN",
+        "blocking_endpoints": ["all_stock"],
+        "probe_endpoints": [],
+        "cooldown_until": {
+            "all_stock": health_store.endpoint_health(
+                ProviderEndpoint.ALL_STOCK
+            ).cooldown_until.isoformat()
+        },
+    }
+    serialized = json.dumps(payload).lower()
+    for forbidden in ("lease_id", "owner", "token", "raw", str(tmp_path).lower()):
+        assert forbidden not in serialized
 
 
 def test_market_status_api_is_read_only_and_reports_capability(

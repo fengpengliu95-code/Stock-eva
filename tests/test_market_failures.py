@@ -10,11 +10,14 @@ import pytest
 from pydantic import ValidationError
 
 import backend.app.cli as cli
-from backend.app.market.automation import run_publication_refresh
+import backend.app.market.baostock as baostock_module
+import backend.app.market.baostock_vendor as baostock_vendor
+from backend.app.market.automation import BaoStockProbeRunner, run_publication_refresh
 from backend.app.market.baostock import (
     DAILY_FIELDS,
     BaoStockError,
     BaoStockProvider,
+    BaoStockSessionStateError,
     BaoStockTransportError,
     ProviderBatch,
     _read_result,
@@ -25,6 +28,7 @@ from backend.app.market.failures import (
     market_failure_from_exception,
 )
 from backend.app.market.models import RefreshResult
+from backend.app.market.provider_transport import ProviderEndpoint, current_request_context
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 
@@ -67,6 +71,44 @@ class AdapterFailureClient:
 
     def query_adjust_factor(self, *_args, **_kwargs):
         return Result([], [])
+
+
+class ProbeClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.contexts = []
+
+    def _capture(self, name: str) -> Result:
+        self.calls.append(name)
+        self.contexts.append(current_request_context())
+        return Result([], [])
+
+    def login(self):
+        return self._capture("login")
+
+    def logout(self):
+        self.calls.append("logout")
+        return Result([], [])
+
+    def query_trade_dates(self, **_kwargs):
+        self.calls.append("query_trade_dates")
+        self.contexts.append(current_request_context())
+        return Result(["calendar_date", "is_trading_day"], [])
+
+    def query_all_stock(self, **_kwargs):
+        return self._capture("query_all_stock")
+
+    def query_daily_history_k_AStock(self, **_kwargs):
+        return self._capture("query_daily_history_k_AStock")
+
+    def query_daily_adjust_factor(self, **_kwargs):
+        return self._capture("query_daily_adjust_factor")
+
+    def query_adjust_factor(self, *_args, **_kwargs):
+        return self._capture("query_adjust_factor")
+
+    def query_history_k_data_plus(self, *_args, **_kwargs):
+        return self._capture("query_history_k_data_plus")
 
 
 def refresh_result(**updates) -> RefreshResult:
@@ -636,6 +678,142 @@ def test_baostock_calendar_schema_drift_is_typed_non_retryable_schema_failure(
     assert captured.value.failure.failure_stage == "normalize"
     assert captured.value.failure.failure_class == "schema"
     assert captured.value.failure.retryable is False
+
+
+def test_explicit_refresh_operation_reuses_one_id_and_rejects_invalid_or_nested_replacement() -> (
+    None
+):
+    client = ProbeClient()
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with provider.refresh_operation("scheduled-refresh-1"):
+        assert provider.trading_dates(date(2026, 7, 23), date(2026, 7, 23)) == []
+        with provider.refresh_operation("scheduled-refresh-1"):
+            assert provider.trading_dates(date(2026, 7, 24), date(2026, 7, 24)) == []
+        with pytest.raises(BaoStockSessionStateError, match="refresh scope"):
+            with provider.refresh_operation("scheduled-refresh-2"):
+                pass
+
+    assert {context.refresh_id for context in client.contexts} == {"scheduled-refresh-1"}
+    with pytest.raises(BaoStockSessionStateError, match="refresh identifier"):
+        with provider.refresh_operation(""):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_call"),
+    [
+        (ProviderEndpoint.TRADE_DATES, "query_trade_dates"),
+        (ProviderEndpoint.ALL_STOCK, "query_all_stock"),
+        (ProviderEndpoint.DAILY_ASTOCK, "query_daily_history_k_AStock"),
+        (ProviderEndpoint.DAILY_FACTOR, "query_daily_adjust_factor"),
+        (ProviderEndpoint.ADJUST_FACTOR, "query_adjust_factor"),
+        (ProviderEndpoint.INDEX_HISTORY, "query_history_k_data_plus"),
+    ],
+)
+def test_single_endpoint_probe_uses_new_session_and_no_normalization_or_disk_cache(
+    tmp_path: Path,
+    monkeypatch,
+    endpoint: ProviderEndpoint,
+    expected_call: str,
+) -> None:
+    client = ProbeClient()
+    monkeypatch.setattr(
+        baostock_module,
+        "normalize_baostock_rows",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("probe must not normalize")),
+    )
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    provider.probe_endpoint(
+        endpoint,
+        trade_date=date(2026, 7, 23),
+        stock_symbol="sh.600000",
+        index_symbol="sh.000001",
+    )
+    provider.probe_endpoint(
+        endpoint,
+        trade_date=date(2026, 7, 23),
+        stock_symbol="sh.600000",
+        index_symbol="sh.000001",
+    )
+
+    assert provider.max_attempts == 1
+    assert client.calls == ["login", expected_call, "logout"] * 2
+    assert {context.endpoint for context in client.contexts} == {endpoint}
+    session_ids = [context.provider_session_id for context in client.contexts]
+    assert session_ids[0] == session_ids[1]
+    assert session_ids[2] == session_ids[3]
+    assert session_ids[0] != session_ids[2]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "stock_symbol", "index_symbol"),
+    [
+        (ProviderEndpoint.ADJUST_FACTOR, None, "sh.000001"),
+        (ProviderEndpoint.INDEX_HISTORY, "sh.600000", None),
+    ],
+)
+def test_symbol_specific_probe_requires_explicit_safe_symbol(
+    endpoint: ProviderEndpoint,
+    stock_symbol: str | None,
+    index_symbol: str | None,
+) -> None:
+    provider = BaoStockProvider(
+        client=ProbeClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(BaoStockSessionStateError, match="probe symbol"):
+        provider.probe_endpoint(
+            endpoint,
+            trade_date=date(2026, 7, 23),
+            stock_symbol=stock_symbol,
+            index_symbol=index_symbol,
+        )
+
+
+def test_real_probe_runner_is_guarded_offline_and_never_falls_through_to_full_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    connect_attempts = []
+
+    class OfflineSocket:
+        def connect(self, address) -> None:
+            connect_attempts.append(address)
+            raise OSError("offline socket guard")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(baostock_vendor.socket, "socket", lambda *_args, **_kwargs: OfflineSocket())
+    runner = BaoStockProbeRunner(
+        lambda *, max_attempts: BaoStockProvider(
+            max_attempts=max_attempts,
+            min_request_interval_seconds=0,
+        )
+    )
+
+    with pytest.raises(BaoStockError):
+        runner.run(
+            ProviderEndpoint.TRADE_DATES,
+            trade_date=date(2026, 7, 23),
+            refresh_id="offline-probe",
+        )
+
+    assert len(connect_attempts) == 1
+    assert list(tmp_path.iterdir()) == []
 
 
 class MainBoardFactorFailureClient:

@@ -1,4 +1,5 @@
 import logging
+import re
 import signal
 import socket
 import threading
@@ -26,6 +27,7 @@ from backend.app.market.provider_transport import (
     OperationDeadlineInterrupt,
     ProtocolStage,
     ProviderEndpoint,
+    RefreshTransportContext,
     TransportEndpoint,
     provider_session_scope,
     refresh_scope,
@@ -40,6 +42,7 @@ SH_MAIN_PREFIXES = ("sh.600", "sh.601", "sh.603", "sh.605")
 SZ_MAIN_PREFIXES = ("sz.000", "sz.001", "sz.002", "sz.003")
 logger = logging.getLogger("stock_eva.market.baostock")
 _LOGIN_SOCKET_TIMEOUT_LOCK = threading.Lock()
+_SAFE_PROBE_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
 
 
 class _EofAwareSocket:
@@ -383,6 +386,10 @@ def _is_main_board(symbol: str) -> bool:
     return symbol.startswith(SH_MAIN_PREFIXES + SZ_MAIN_PREFIXES)
 
 
+def _safe_probe_symbol(symbol: str | None) -> bool:
+    return isinstance(symbol, str) and _SAFE_PROBE_SYMBOL.fullmatch(symbol) is not None
+
+
 class BaoStockProvider:
     def __init__(
         self,
@@ -422,17 +429,40 @@ class BaoStockProvider:
         self._session_usable = False
         self._provider_session_id: str | None = None
         self._refresh_scope_depth = 0
+        self._active_refresh_id: str | None = None
+
+    @contextmanager
+    def refresh_operation(self, refresh_id: str):
+        try:
+            validated = RefreshTransportContext(refresh_id=refresh_id).refresh_id
+        except ValueError:
+            raise BaoStockSessionStateError("BaoStock refresh identifier is invalid") from None
+        if self._refresh_scope_depth > 0:
+            if validated != self._active_refresh_id:
+                raise BaoStockSessionStateError("BaoStock refresh scope cannot be replaced")
+            yield
+            return
+        with refresh_scope(validated):
+            self._refresh_scope_depth += 1
+            self._active_refresh_id = validated
+            try:
+                yield
+            finally:
+                self._active_refresh_id = None
+                self._refresh_scope_depth -= 1
 
     @contextmanager
     def _refresh_operation(self):
         if self._refresh_scope_depth > 0:
             yield
             return
-        with refresh_scope():
+        with refresh_scope() as context:
             self._refresh_scope_depth += 1
+            self._active_refresh_id = context.refresh_id
             try:
                 yield
             finally:
+                self._active_refresh_id = None
                 self._refresh_scope_depth -= 1
 
     @contextmanager
@@ -623,6 +653,54 @@ class BaoStockProvider:
             self._login(ProviderEndpoint.TRADE_DATES)
             try:
                 return self._trading_dates(start_date, end_date)
+            finally:
+                self._logout()
+
+    def probe_endpoint(
+        self,
+        endpoint: ProviderEndpoint,
+        *,
+        trade_date: date,
+        stock_symbol: str | None = None,
+        index_symbol: str | None = None,
+    ) -> None:
+        if not isinstance(endpoint, ProviderEndpoint):
+            raise BaoStockSessionStateError("BaoStock probe endpoint is invalid")
+        if endpoint == ProviderEndpoint.ADJUST_FACTOR and not _safe_probe_symbol(stock_symbol):
+            raise BaoStockSessionStateError("BaoStock probe symbol is invalid")
+        if endpoint == ProviderEndpoint.INDEX_HISTORY and not _safe_probe_symbol(index_symbol):
+            raise BaoStockSessionStateError("BaoStock probe symbol is invalid")
+        iso_date = trade_date.isoformat()
+        operations = {
+            ProviderEndpoint.TRADE_DATES: lambda: self.client.query_trade_dates(
+                start_date=iso_date,
+                end_date=iso_date,
+            ),
+            ProviderEndpoint.ALL_STOCK: lambda: self.client.query_all_stock(day=iso_date),
+            ProviderEndpoint.DAILY_ASTOCK: lambda: self.client.query_daily_history_k_AStock(
+                date=iso_date
+            ),
+            ProviderEndpoint.DAILY_FACTOR: lambda: self.client.query_daily_adjust_factor(
+                date=iso_date
+            ),
+            ProviderEndpoint.ADJUST_FACTOR: lambda: self.client.query_adjust_factor(
+                stock_symbol,
+                start_date="1990-01-01",
+                end_date=iso_date,
+            ),
+            ProviderEndpoint.INDEX_HISTORY: lambda: self.client.query_history_k_data_plus(
+                index_symbol,
+                DAILY_FIELDS,
+                start_date=iso_date,
+                end_date=iso_date,
+                frequency="d",
+                adjustflag="3",
+            ),
+        }
+        with self._refresh_operation():
+            self._login(endpoint)
+            try:
+                self._read(endpoint, operations[endpoint])
             finally:
                 self._logout()
 

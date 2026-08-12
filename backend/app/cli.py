@@ -16,6 +16,7 @@ from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.config import get_settings
 from backend.app.market.automation import (
+    BaoStockProbeRunner,
     MarketAutomationService,
     RefreshAlreadyRunning,
     RefreshRunLock,
@@ -40,6 +41,11 @@ from backend.app.market.failures import (
     public_failure_message,
 )
 from backend.app.market.full_history import FullMarketHistoryService
+from backend.app.market.provider_health import (
+    InMemoryProviderHealthStore,
+    ProviderHealth,
+    SQLiteProviderHealthStore,
+)
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
@@ -72,6 +78,19 @@ class _CliArgumentError(ValueError):
 class _SanitizedArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         raise _CliArgumentError("invalid CLI arguments")
+
+
+def _provider_health_payload(health: ProviderHealth) -> dict[str, object]:
+    return {
+        "state": health.state.value,
+        "blocking_endpoints": [endpoint.value for endpoint in health.blocking_endpoints],
+        "probe_endpoints": [endpoint.value for endpoint in health.probe_endpoints],
+        "cooldown_until": {
+            item.endpoint.value: item.cooldown_until.isoformat()
+            for item in health.endpoints
+            if item.cooldown_until is not None
+        },
+    }
 
 
 def _probe_timeout_value(value: str) -> int:
@@ -950,28 +969,43 @@ def main() -> int:
         return 0
     if args.command == "auto-refresh-once":
         calendar = get_trading_calendar()
-        provider = BaoStockProvider(
-            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
-            factor_cache_path=str(layout.local_paths.factor_cache_database),
-            socket_timeout_seconds=socket_timeout_seconds,
-        )
-        user_store = UserStore(layout.local_paths.user_database)
-        service = MarketAutomationService(
-            store,
-            provider,
-            calendar,
-            required_symbols=lambda: collect_required_symbols(user_store),
-            lock_path=layout.market_refresh_lock,
-            post_publish=build_after_close_pipeline(
-                layout.local_paths.user_database,
-                store,
-                settings=settings,
-            ),
-        )
         now = get_market_clock()()
+        health_options = {
+            "failure_threshold": settings.provider_circuit_failure_threshold,
+            "cooldown_seconds": settings.provider_circuit_cooldown_seconds,
+            "probe_lease_seconds": settings.provider_circuit_probe_lease_seconds,
+        }
         if not args.execute:
+            try:
+                if layout.provider_health_database.exists():
+                    health_store = SQLiteProviderHealthStore(
+                        layout.provider_health_database,
+                        **health_options,
+                    )
+                    provider_health = health_store.provider_health()
+                else:
+                    provider_health = InMemoryProviderHealthStore(
+                        **health_options
+                    ).provider_health()
+            except Exception:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "PROVIDER_HEALTH_UNAVAILABLE",
+                            "writes_market_data": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
             published = store.published_refresh()
-            decision = service.policy.decide(
+            decision = MarketAutomationService(
+                store,
+                object(),
+                calendar,
+                required_symbols=set,
+            ).policy.decide(
                 now,
                 published_as_of=(published.requested_date if published is not None else None),
                 state=store.scheduler_state(),
@@ -992,6 +1026,7 @@ def main() -> int:
                             if decision.next_run_at is not None
                             else None
                         ),
+                        "provider_health": _provider_health_payload(provider_health),
                         "writes_market_data": False,
                         "execute_requires": "--execute",
                     },
@@ -1000,7 +1035,41 @@ def main() -> int:
             )
             return 0
         try:
+            health_store = SQLiteProviderHealthStore(
+                layout.provider_health_database,
+                **health_options,
+            )
+            health_store.initialize()
+            provider = BaoStockProvider(
+                min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+                factor_cache_path=str(layout.local_paths.factor_cache_database),
+                socket_timeout_seconds=socket_timeout_seconds,
+            )
+            user_store = UserStore(layout.local_paths.user_database)
+            service = MarketAutomationService(
+                store,
+                provider,
+                calendar,
+                required_symbols=lambda: collect_required_symbols(user_store),
+                lock_path=layout.market_refresh_lock,
+                post_publish=build_after_close_pipeline(
+                    layout.local_paths.user_database,
+                    store,
+                    settings=settings,
+                ),
+                health_store=health_store,
+                probe_runner=BaoStockProbeRunner(
+                    lambda *, max_attempts: BaoStockProvider(
+                        max_attempts=max_attempts,
+                        min_request_interval_seconds=(
+                            settings.auto_refresh_min_request_interval_seconds
+                        ),
+                        socket_timeout_seconds=socket_timeout_seconds,
+                    )
+                ),
+            )
             outcome = service.run_due_once(now)
+            provider_health = health_store.provider_health()
         except Exception as error:
             failure = market_failure_from_exception(error, stage="fetch")
             print(
@@ -1010,7 +1079,17 @@ def main() -> int:
                 )
             )
             return 1
-        print(json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    **outcome.model_dump(mode="json"),
+                    "provider_health": _provider_health_payload(provider_health),
+                },
+                ensure_ascii=False,
+            )
+        )
+        if outcome.state.error_code == "PROVIDER_PROBE_SUCCEEDED":
+            return 0
         return 1 if outcome.state.refresh_state in {"retry_wait", "delayed", "error"} else 0
     if args.command == "backfill":
         if (args.start is None) == (args.effective_days is None):

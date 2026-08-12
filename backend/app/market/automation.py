@@ -11,11 +11,12 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel
 
 from backend.app.market.baostock import INDEX_SYMBOLS
+from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.failures import (
     MarketFailure,
@@ -24,9 +25,39 @@ from backend.app.market.failures import (
     public_failure_message,
 )
 from backend.app.market.models import RefreshResult
+from backend.app.market.provider_health import (
+    CircuitState,
+    InMemoryProviderHealthStore,
+    ProviderHealthError,
+)
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProviderEndpoint,
+    TransportObservation,
+)
 from backend.app.market.store import MarketStore
 
 logger = logging.getLogger("stock_eva.market.automation")
+
+AUTOMATION_PROBE_STOCK_SYMBOL = "sh.600000"
+AUTOMATION_PROBE_INDEX_SYMBOL = "sh.000001"
+_TRANSPORT_ERROR_PRIORITY = {
+    error: position
+    for position, error in enumerate(
+        (
+            NormalizedTransportError.RATE_LIMIT,
+            NormalizedTransportError.CONNECT_ERROR,
+            NormalizedTransportError.SEND_ERROR,
+            NormalizedTransportError.RECV_TIMEOUT,
+            NormalizedTransportError.EOF,
+            NormalizedTransportError.SHORT_HEADER,
+            NormalizedTransportError.BAD_COMPRESSION,
+            NormalizedTransportError.PAGINATION_STALLED,
+            NormalizedTransportError.UNKNOWN_PROVIDER_PROTOCOL_ERROR,
+            NormalizedTransportError.PROTOCOL_ERROR,
+        )
+    )
+}
 
 
 def _log_event(level: int, event: str, **fields) -> None:
@@ -104,6 +135,86 @@ class AutomationOutcome(BaseModel):
     result: RefreshResult | None = None
 
 
+class ProviderProbeRunner(Protocol):
+    def run(self, endpoint: ProviderEndpoint, *, trade_date: date, refresh_id: str) -> None: ...
+
+
+class BaoStockProbeRunner:
+    """Construct one write-free, one-attempt provider for a leased endpoint probe."""
+
+    def __init__(
+        self,
+        provider_factory,
+        *,
+        stock_symbol: str = AUTOMATION_PROBE_STOCK_SYMBOL,
+        index_symbol: str = AUTOMATION_PROBE_INDEX_SYMBOL,
+    ) -> None:
+        self.provider_factory = provider_factory
+        self.stock_symbol = stock_symbol
+        self.index_symbol = index_symbol
+
+    def run(self, endpoint: ProviderEndpoint, *, trade_date: date, refresh_id: str) -> None:
+        provider = self.provider_factory(max_attempts=1)
+        if getattr(provider, "max_attempts", None) != 1:
+            raise ProviderHealthError("provider probe retry policy is invalid")
+        with provider.refresh_operation(refresh_id):
+            provider.probe_endpoint(
+                endpoint,
+                trade_date=trade_date,
+                stock_symbol=self.stock_symbol,
+                index_symbol=self.index_symbol,
+            )
+
+
+class _RefreshObservationCollector:
+    def __init__(self, health_store, refresh_id: str) -> None:
+        self.health_store = health_store
+        self.refresh_id = refresh_id
+        self.observations: list[TransportObservation] = []
+        self._resolved = False
+
+    def record(self, observation: TransportObservation) -> None:
+        if observation.refresh_id != self.refresh_id:
+            raise ProviderHealthError("provider observation refresh scope does not match")
+        self.health_store.record_observation(observation)
+        self.observations.append(observation)
+
+    def terminal_error(
+        self,
+        endpoint: ProviderEndpoint,
+    ) -> NormalizedTransportError | None:
+        endpoint_observations = [item for item in self.observations if item.endpoint == endpoint]
+        if not endpoint_observations:
+            return None
+        final_session_id = endpoint_observations[-1].provider_session_id
+        errors = [
+            item.normalized_error
+            for item in endpoint_observations
+            if item.provider_session_id == final_session_id and item.normalized_error is not None
+        ]
+        if not errors:
+            return None
+        return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
+
+    def resolve_touched_endpoints(self) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        touched = {
+            item.endpoint
+            for item in self.observations
+            if isinstance(item.endpoint, ProviderEndpoint)
+        }
+        for endpoint in ProviderEndpoint:
+            if endpoint not in touched:
+                continue
+            error = self.terminal_error(endpoint)
+            if error is None:
+                self.health_store.record_terminal_success(self.refresh_id, endpoint)
+            else:
+                self.health_store.record_terminal_failure(self.refresh_id, endpoint, error)
+
+
 class SchedulePolicy:
     RETRY_TIMES = (time(18, 40), time(19, 20), time(20, 10), time(21, 0))
     CORRECTION_TIME = time(7, 15)
@@ -156,7 +267,7 @@ class SchedulePolicy:
                 refresh_state="scheduled",
                 next_run_at=available_at,
             )
-        if state is None or state.target_session != target or state.attempt_count == 0:
+        if state is None or state.target_session != target:
             return ScheduleDecision(
                 action="run",
                 target_session=target,
@@ -174,6 +285,12 @@ class SchedulePolicy:
                 target_session=target,
                 refresh_state="retry_wait",
                 next_run_at=state.next_retry_at,
+            )
+        if state.attempt_count == 0 and state.refresh_state != "delayed":
+            return ScheduleDecision(
+                action="run",
+                target_session=target,
+                refresh_state="running",
             )
         return ScheduleDecision(
             action="none",
@@ -217,6 +334,7 @@ def run_publication_refresh(
     request_key: str | None = None,
     run_id: str | None = None,
     run_kind: Literal["daily", "backfill"] = "daily",
+    before_store: Callable[[], None] | None = None,
 ) -> RefreshResult:
     """Fetch to canonical staging, validate all gates, then move the pointer."""
     started_at = datetime.now(UTC)
@@ -233,6 +351,14 @@ def run_publication_refresh(
     requested_count = 0
     succeeded_count = 0
     failures: list[str] = []
+    before_store_called = False
+
+    def finalize_provider_audit() -> None:
+        nonlocal before_store_called
+        if before_store_called or before_store is None:
+            return
+        before_store_called = True
+        before_store()
 
     def failed_result(failure: MarketFailure) -> RefreshResult:
         result = RefreshResult(
@@ -256,6 +382,7 @@ def run_publication_refresh(
         )
         if failure.failure_stage != "publish":
             try:
+                finalize_provider_audit()
                 store.save_refresh([], result, publish=False)
             except Exception as error:
                 storage_failure = market_failure_from_exception(
@@ -348,6 +475,7 @@ def run_publication_refresh(
         # A failed validation remains auditable, but cannot mutate the canonical
         # rows behind an existing published pointer for the same session.
         failure_stage = "publish"
+        finalize_provider_audit()
         store.save_refresh(
             batch.bars if status == "ready" else [],
             result,
@@ -383,6 +511,8 @@ class MarketAutomationService:
         required_symbols: Callable[[], set[str]],
         lock_path: Path | None = None,
         post_publish=None,
+        health_store=None,
+        probe_runner: ProviderProbeRunner | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -390,6 +520,8 @@ class MarketAutomationService:
         self.required_symbols = required_symbols
         self.lock_path = lock_path
         self.post_publish = post_publish
+        self.health_store = health_store or InMemoryProviderHealthStore()
+        self.probe_runner = probe_runner
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -467,6 +599,25 @@ class MarketAutomationService:
             self.store.save_scheduler_state(state)
             return AutomationOutcome(decision=decision, state=state)
 
+        try:
+            provider_health = self.health_store.provider_health()
+        except ProviderHealthError:
+            state = self._circuit_wait_state(
+                decision,
+                current,
+                local,
+                error_code="PROVIDER_HEALTH_UNAVAILABLE",
+            )
+            self.store.save_scheduler_state(state)
+            return AutomationOutcome(decision=decision, state=state)
+        if provider_health.state != CircuitState.CLOSED:
+            return self._handle_open_circuit(
+                decision,
+                current,
+                local,
+                provider_health,
+            )
+
         attempt_count = (
             current.attempt_count + 1
             if current is not None and current.target_session == target
@@ -481,43 +632,58 @@ class MarketAutomationService:
         )
         self.store.save_scheduler_state(running)
 
-        try:
-            provider_sessions = self.provider.trading_dates(target, target)
-        except Exception as error:
-            failure = market_failure_from_exception(error, stage="validate")
-            state = self._failed_state(
-                running,
-                local,
-                error_code=failure.failure_class,
-                calendar_status="unavailable",
-                retryable=failure.retryable,
-            )
-            self.store.save_scheduler_state(state)
-            _log_event(
-                logging.ERROR,
-                "market_calendar_validation_failed",
-                failure_stage=failure.failure_stage,
-                failure_class=failure.failure_class,
-                retryable=failure.retryable,
-            )
-            return AutomationOutcome(decision=decision, state=state)
-        if provider_sessions != [target]:
-            state = running.model_copy(
-                update={
-                    "refresh_state": "error",
-                    "calendar_status": "conflict",
-                    "error_code": "calendar_provider_conflict",
-                }
-            )
-            self.store.save_scheduler_state(state)
-            return AutomationOutcome(decision=decision, state=state)
-
-        result = run_publication_refresh(
-            self.store,
-            self.provider,
-            trade_date=target,
-            required_symbols=self.required_symbols(),
+        request_key = f"daily:baostock:{target.isoformat()}:all-main-board"
+        request_prefix = hashlib.sha256(request_key.encode()).hexdigest()[:12]
+        refresh_id = f"{request_prefix}-{uuid.uuid4().hex[:12]}"
+        collector = _RefreshObservationCollector(self.health_store, refresh_id)
+        refresh_operation = getattr(self.provider, "refresh_operation", None)
+        provider_scope = (
+            refresh_operation(refresh_id) if callable(refresh_operation) else nullcontext()
         )
+
+        with transport_observation_sink(collector.record), provider_scope:
+            try:
+                provider_sessions = self.provider.trading_dates(target, target)
+            except Exception as error:
+                collector.resolve_touched_endpoints()
+                failure = market_failure_from_exception(error, stage="validate")
+                state = self._failed_state(
+                    running,
+                    local,
+                    error_code=failure.failure_class,
+                    calendar_status="unavailable",
+                    retryable=failure.retryable,
+                )
+                self.store.save_scheduler_state(state)
+                _log_event(
+                    logging.ERROR,
+                    "market_calendar_validation_failed",
+                    failure_stage=failure.failure_stage,
+                    failure_class=failure.failure_class,
+                    retryable=failure.retryable,
+                )
+                return AutomationOutcome(decision=decision, state=state)
+            if provider_sessions != [target]:
+                collector.resolve_touched_endpoints()
+                state = running.model_copy(
+                    update={
+                        "refresh_state": "error",
+                        "calendar_status": "conflict",
+                        "error_code": "calendar_provider_conflict",
+                    }
+                )
+                self.store.save_scheduler_state(state)
+                return AutomationOutcome(decision=decision, state=state)
+
+            result = run_publication_refresh(
+                self.store,
+                self.provider,
+                trade_date=target,
+                required_symbols=self.required_symbols(),
+                request_key=request_key,
+                run_id=refresh_id,
+                before_store=collector.resolve_touched_endpoints,
+            )
         if result.status == "ready":
             state = running.model_copy(
                 update={
@@ -540,6 +706,112 @@ class MarketAutomationService:
             )
         self.store.save_scheduler_state(state)
         return AutomationOutcome(decision=decision, state=state, result=result)
+
+    def _handle_open_circuit(
+        self,
+        decision: ScheduleDecision,
+        current: SchedulerState | None,
+        local: datetime,
+        provider_health,
+    ) -> AutomationOutcome:
+        target = decision.target_session
+        assert target is not None
+        lease = None
+        if provider_health.state == CircuitState.OPEN:
+            for endpoint in provider_health.blocking_endpoints:
+                lease = self.health_store.acquire_probe(
+                    endpoint,
+                    owner=f"scheduler-{uuid.uuid4().hex}",
+                )
+                if lease is not None:
+                    break
+        if lease is None:
+            state = self._circuit_wait_state(
+                decision,
+                current,
+                local,
+                error_code="SKIPPED_CIRCUIT_OPEN",
+            )
+            self.store.save_scheduler_state(state)
+            return AutomationOutcome(decision=decision, state=state)
+
+        refresh_id = f"probe-{uuid.uuid4().hex}"
+        collector = _RefreshObservationCollector(self.health_store, refresh_id)
+        normalized_error = None
+        try:
+            if self.probe_runner is None:
+                raise ProviderHealthError("provider probe runner is unavailable")
+            with transport_observation_sink(collector.record):
+                self.probe_runner.run(
+                    lease.endpoint,
+                    trade_date=target,
+                    refresh_id=refresh_id,
+                )
+            normalized_error = collector.terminal_error(lease.endpoint)
+        except Exception as error:
+            candidate = getattr(error, "normalized_error", None)
+            normalized_error = (
+                candidate
+                if isinstance(candidate, NormalizedTransportError)
+                else collector.terminal_error(lease.endpoint)
+                or NormalizedTransportError.PROTOCOL_ERROR
+            )
+
+        if normalized_error is None:
+            self.health_store.resolve_probe(
+                lease.lease_id,
+                owner=lease.owner,
+                success=True,
+            )
+            error_code = "PROVIDER_PROBE_SUCCEEDED"
+        else:
+            self.health_store.resolve_probe(
+                lease.lease_id,
+                owner=lease.owner,
+                success=False,
+                normalized_error=normalized_error,
+            )
+            error_code = "PROVIDER_PROBE_FAILED"
+        state = self._circuit_wait_state(
+            decision,
+            current,
+            local,
+            error_code=error_code,
+        )
+        self.store.save_scheduler_state(state)
+        _log_event(
+            logging.INFO if normalized_error is None else logging.WARNING,
+            "market_provider_probe_finished",
+            endpoint=lease.endpoint,
+            outcome="success" if normalized_error is None else "error",
+            normalized_error=normalized_error,
+        )
+        return AutomationOutcome(decision=decision, state=state)
+
+    def _circuit_wait_state(
+        self,
+        decision: ScheduleDecision,
+        current: SchedulerState | None,
+        now: datetime,
+        *,
+        error_code: str,
+    ) -> SchedulerState:
+        target = decision.target_session
+        next_retry = self.policy.next_retry_after(target, now) if target is not None else None
+        return SchedulerState(
+            target_session=target,
+            refresh_state="retry_wait" if next_retry is not None else "delayed",
+            attempt_count=(
+                current.attempt_count
+                if current is not None and current.target_session == target
+                else 0
+            ),
+            last_attempt_at=now,
+            last_success_at=current.last_success_at if current is not None else None,
+            next_retry_at=next_retry,
+            calendar_status="confirmed",
+            error_code=error_code,
+        )
 
     def _run_post_publish(self, result: RefreshResult) -> None:
         if self.post_publish is None:

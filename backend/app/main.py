@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from backend.app.api.router import api_router
 from backend.app.config import get_settings
 from backend.app.market.automation import (
+    BaoStockProbeRunner,
     MarketAutomationService,
     RefreshAlreadyRunning,
     RefreshRunLock,
@@ -22,6 +23,7 @@ from backend.app.market.calendar_sync import (
     CalendarSyncStore,
     run_calendar_sync_loop,
 )
+from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
@@ -43,6 +45,13 @@ async def lifespan(_: FastAPI):
         return
     layout = StorageLayout(settings)
     layout.ensure_local_runtime_dirs()
+    health_store = SQLiteProviderHealthStore(
+        layout.provider_health_database,
+        failure_threshold=settings.provider_circuit_failure_threshold,
+        cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+        probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+    )
+    health_store.initialize()
     control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
@@ -79,6 +88,14 @@ async def lifespan(_: FastAPI):
             layout.local_paths.user_database,
             market_store,
             settings=settings,
+        ),
+        health_store=health_store,
+        probe_runner=BaoStockProbeRunner(
+            lambda *, max_attempts: BaoStockProvider(
+                max_attempts=max_attempts,
+                min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+                socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+            )
         ),
     )
     calendar_service = CalendarSyncService(

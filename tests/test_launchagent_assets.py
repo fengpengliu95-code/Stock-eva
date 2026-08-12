@@ -1,3 +1,4 @@
+import asyncio
 import plistlib
 import shutil
 import stat
@@ -8,8 +9,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import backend.app.main as main_module
 from backend.app.config import Settings
 from backend.app.market.calendar_sync import CalendarSyncPolicy
+from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupService
 
 ROOT = Path(__file__).parents[1]
@@ -87,6 +90,63 @@ def test_after_close_agent_uses_idempotent_backend_schedule() -> None:
     ]
     assert "KeepAlive" not in refresh
     assert refresh["ProcessType"] == "Background"
+
+
+def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base = Settings(
+        _env_file=None,
+        auto_refresh_enabled=False,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    health_path = base.local_control_dir / base.provider_health_database_name
+    monkeypatch.setattr(main_module, "settings", base)
+
+    async def disabled_lifespan() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(disabled_lifespan())
+    assert health_path.exists() is False
+
+    captured = {}
+
+    class CapturingAutomationService:
+        def __init__(self, *_args, **kwargs) -> None:
+            captured.update(kwargs)
+
+    async def idle_loop(_service, stop, **_kwargs) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        base.model_copy(update={"auto_refresh_enabled": True}),
+    )
+    monkeypatch.setattr(main_module, "MarketAutomationService", CapturingAutomationService)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def enabled_lifespan() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(enabled_lifespan())
+
+    assert health_path.exists()
+    assert isinstance(captured["health_store"], SQLiteProviderHealthStore)
+    assert captured["probe_runner"] is not None
 
 
 def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
