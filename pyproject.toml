@@ -9,7 +9,7 @@ description = "A lightweight after-close A-share research workspace."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "baostock>=0.9.3,<1",
+  "baostock==0.9.3",
   "duckdb>=1.4,<2",
   "fastapi>=0.115,<1",
   "numpy>=2,<3",

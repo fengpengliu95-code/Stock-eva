@@ -752,7 +752,7 @@ supplemental = [
 [package.metadata]
 requires-dist = [
     { name = "akshare", marker = "extra == 'supplemental'", specifier = "==1.18.78" },
-    { name = "baostock", specifier = ">=0.9.3,<1" },
+    { name = "baostock", specifier = "==0.9.3" },
     { name = "duckdb", specifier = ">=1.4,<2" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
