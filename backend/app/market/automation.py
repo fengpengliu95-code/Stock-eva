@@ -216,8 +216,9 @@ class _RefreshObservationCollector:
         if errors:
             return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
         if (
-            len({item.provider_session_id for item in operations}) != 1
-            or any(item.attempt != 1 for item in operations)
+            len({item.provider_session_id for item in endpoint_observations}) != 1
+            or any(item.attempt != 1 for item in endpoint_observations)
+            or any(item.outcome == TransportOutcome.ERROR for item in endpoint_observations)
             or not any(item.outcome == TransportOutcome.SUCCESS for item in operations)
         ):
             return NormalizedTransportError.PROTOCOL_ERROR

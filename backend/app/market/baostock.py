@@ -29,6 +29,7 @@ from backend.app.market.provider_transport import (
     ProviderEndpoint,
     RefreshTransportContext,
     TransportEndpoint,
+    normalize_provider_code,
     provider_session_scope,
     refresh_scope,
     request_scope,
@@ -509,6 +510,11 @@ class BaoStockProvider:
     def _login_scoped(self, endpoint: TransportEndpoint) -> None:
         if self._session_usable:
             raise BaoStockSessionStateError("BaoStock session is already active")
+
+        def emit_final_failure(error: BaseException, *, attempt: int) -> None:
+            if attempt == self.max_attempts and isinstance(endpoint, ProviderEndpoint):
+                _emit_operation_outcome(error)
+
         last_error: BaoStockError | None = None
         for attempt in range(1, self.max_attempts + 1):
             with provider_session_scope() as session:
@@ -521,6 +527,7 @@ class BaoStockProvider:
                         )
                     except _OperationDeadlineExceeded as exc:
                         last_error = exc
+                        emit_final_failure(exc, attempt=attempt)
                         continue
                     except (TimeoutError, OSError) as exc:
                         last_error = BaoStockTransportError(
@@ -528,9 +535,12 @@ class BaoStockProvider:
                             failure=market_failure_from_exception(exc, stage="fetch"),
                         )
                         self._discard_session()
+                        emit_final_failure(exc, attempt=attempt)
                         continue
-                    except Exception:
+                    except Exception as exc:
                         self._discard_session()
+                        if isinstance(endpoint, ProviderEndpoint):
+                            _emit_operation_outcome(exc)
                         raise
                     if result.error_code != "0":
                         failure = baostock_status_failure(result.error_code)
@@ -538,7 +548,9 @@ class BaoStockProvider:
                             f"BaoStock login failed ({failure.failure_class})",
                             failure=failure,
                         )
+                        last_error.normalized_error = normalize_provider_code(result.error_code)
                         self._discard_session()
+                        emit_final_failure(last_error, attempt=attempt)
                         continue
                     try:
                         self._configure_socket_timeout()
@@ -548,9 +560,12 @@ class BaoStockProvider:
                             failure=market_failure_from_exception(exc, stage="fetch"),
                         )
                         self._discard_session()
+                        emit_final_failure(exc, attempt=attempt)
                         continue
-                    except Exception:
+                    except Exception as exc:
                         self._discard_session()
+                        if isinstance(endpoint, ProviderEndpoint):
+                            _emit_operation_outcome(exc)
                         raise
                     self._session_usable = True
                     return
@@ -938,8 +953,9 @@ class BaoStockProvider:
                                 operation_name="request",
                             )
                         except (BaoStockError, TimeoutError, OSError) as exc:
-                            if attempt == self.max_attempts and isinstance(
-                                endpoint, ProviderEndpoint
+                            if isinstance(endpoint, ProviderEndpoint) and (
+                                attempt == self.max_attempts
+                                or isinstance(exc, _OperationDeadlineUnavailable)
                             ):
                                 _emit_operation_outcome(exc)
                             raise

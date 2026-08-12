@@ -290,14 +290,15 @@ def _endpoint_report(
     )
     if error is not None and normalized_error is None:
         normalized_error = _normalized_exception(error)
-    session_ids = _unique_values([item.provider_session_id for item in operation_observations])
-    request_ids = _unique_values([item.request_id for item in operation_observations])
+    session_ids = _unique_values([item.provider_session_id for item in observations])
+    request_ids = _unique_values([item.request_id for item in observations])
     valid_success = (
         error is None
         and normalized_error is None
         and bool(operation_observations)
         and len(session_ids) == 1
-        and all(item.attempt == 1 for item in operation_observations)
+        and all(item.attempt == 1 for item in observations)
+        and all(item.outcome == TransportOutcome.SUCCESS for item in observations)
         and any(item.outcome == TransportOutcome.SUCCESS for item in operation_observations)
     )
     if valid_success:

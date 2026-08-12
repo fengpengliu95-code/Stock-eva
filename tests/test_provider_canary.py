@@ -285,6 +285,57 @@ def test_endpoint_failure_is_sanitized_and_does_not_stop_independent_diagnostics
     assert report.refresh_triggered is False
 
 
+@pytest.mark.parametrize("invalid_evidence", ["second-session", "attempt-two", "socket-error"])
+def test_canary_rejects_inconsistent_non_operation_evidence(
+    tmp_path: Path,
+    invalid_evidence: str,
+) -> None:
+    control, data = _create_roots(tmp_path)
+
+    class InconsistentProvider(EmittingProvider):
+        def probe_endpoint(self, endpoint: ProviderEndpoint, **kwargs) -> None:
+            if endpoint == ProviderEndpoint.ALL_STOCK:
+                with provider_session_scope("extra-session"):
+                    with request_scope(
+                        endpoint,
+                        attempt=2 if invalid_evidence == "attempt-two" else 1,
+                        request_id="extra-request",
+                    ):
+                        emit_terminal_observation(
+                            started_at=0,
+                            protocol_stage=ProtocolStage.RECEIVE,
+                            recv_calls=1,
+                            response_bytes=0,
+                            end_marker_seen=False,
+                            provider_code=None,
+                            normalized_error=(
+                                NormalizedTransportError.RECV_TIMEOUT
+                                if invalid_evidence == "socket-error"
+                                else None
+                            ),
+                        )
+            super().probe_endpoint(endpoint, **kwargs)
+
+    report = run_provider_canary(
+        trade_date=TRADE_DATE,
+        stock_symbol=STOCK_SYMBOL,
+        index_symbol=INDEX_SYMBOL,
+        control_root=control,
+        data_root=data,
+        provider_factory=lambda *, max_attempts: InconsistentProvider(max_attempts=max_attempts),
+    )
+
+    assert report.status == "error"
+    endpoint = next(
+        item for item in report.endpoints if item.endpoint == ProviderEndpoint.ALL_STOCK
+    )
+    assert endpoint.outcome == TransportOutcome.ERROR
+    assert endpoint.normalized_error in {
+        NormalizedTransportError.PROTOCOL_ERROR,
+        NormalizedTransportError.RECV_TIMEOUT,
+    }
+
+
 @pytest.mark.parametrize("unsafe", ["missing", "overlap", "symlink", "root"])
 def test_unsafe_roots_fail_before_provider_construction(
     tmp_path: Path,

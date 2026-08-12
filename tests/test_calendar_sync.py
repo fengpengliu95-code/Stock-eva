@@ -497,6 +497,7 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
     capsys,
     tmp_path: Path,
 ) -> None:
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
     monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync"])
     settings = Settings(
         _env_file=None,
@@ -522,6 +523,7 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
     assert payload["execute_requires"] == "--execute"
     assert not (settings.local_control_dir / settings.calendar_sync_database_name).exists()
     assert not (settings.local_control_dir / settings.provider_health_database_name).exists()
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
 
 
 def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_call(

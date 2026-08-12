@@ -847,6 +847,8 @@ def test_real_provider_exhausted_first_index_call_opens_breaker_despite_later_su
         "multiple-session",
         "attempt-two",
         "terminal-error-then-success",
+        "second-session-complete",
+        "attempt-two-complete",
     ],
 )
 def test_probe_without_exact_matching_operation_success_reopens_circuit(
@@ -876,6 +878,21 @@ def test_probe_without_exact_matching_operation_success_reopens_circuit(
             )
             observed_refresh = "wrong-refresh" if mode == "wrong-refresh" else refresh_id
             sessions = ("one", "two") if mode == "multiple-session" else ("one",)
+            if mode in {"second-session-complete", "attempt-two-complete"}:
+                with refresh_scope(observed_refresh), provider_session_scope("extra-session"):
+                    with request_scope(
+                        observed_endpoint,
+                        attempt=2 if mode == "attempt-two-complete" else 1,
+                    ):
+                        emit_terminal_observation(
+                            started_at=monotonic(),
+                            protocol_stage=ProtocolStage.COMPLETE,
+                            recv_calls=1,
+                            response_bytes=32,
+                            end_marker_seen=True,
+                            provider_code="0",
+                            normalized_error=None,
+                        )
             for session in sessions:
                 with refresh_scope(observed_refresh), provider_session_scope(session):
                     with request_scope(
@@ -1443,6 +1460,35 @@ def test_auto_refresh_once_defaults_to_network_free_plan(
     assert payload["writes_market_data"] is False
     assert payload["execute_requires"] == "--execute"
     assert "target_session" in payload
+
+
+def test_auto_refresh_dry_run_does_not_create_empty_runtime_tree(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "user_data_dir": tmp_path / "user",
+            "local_control_dir": tmp_path / "control",
+            "local_staging_dir": tmp_path / "staging",
+            "local_lock_dir": tmp_path / "locks",
+            "local_temp_dir": tmp_path / "tmp",
+            "nas_market_dataset_root": None,
+            "local_market_dataset_root": None,
+        }
+    )
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once"])
+
+    assert cli.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry-run"
+    assert payload["writes_market_data"] is False
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
 
 
 def test_auto_refresh_dry_run_reports_sanitized_provider_health_without_constructing_provider(

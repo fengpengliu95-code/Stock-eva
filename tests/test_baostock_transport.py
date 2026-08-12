@@ -803,14 +803,13 @@ def test_provider_deadline_emits_exactly_one_terminal_observation_and_keeps_lega
     observation = socket_terminals[0]
     assert observation.protocol_stage == expected_stage
     assert observation.normalized_error == expected_error
-    if deadline_stage == "login-connect":
-        assert operation_terminals == []
-    else:
-        assert len(operation_terminals) == 1
-        operation = operation_terminals[0]
-        assert operation.normalized_error == NormalizedTransportError.RECV_TIMEOUT
-        assert operation.request_id == observation.request_id
-        assert operation.provider_session_id == observation.provider_session_id
+    assert len(operation_terminals) == 1
+    operation = operation_terminals[0]
+    assert operation.normalized_error == NormalizedTransportError.RECV_TIMEOUT
+    assert operation.refresh_id == observation.refresh_id
+    assert operation.endpoint == observation.endpoint
+    assert operation.request_id == observation.request_id
+    assert operation.provider_session_id == observation.provider_session_id
     serialized = "".join(item.model_dump_json() for item in observations) + str(caught.value)
     assert "private-token-deadline-request" not in serialized
     assert "raw exception" not in serialized

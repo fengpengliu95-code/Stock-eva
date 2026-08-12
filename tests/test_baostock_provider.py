@@ -19,6 +19,7 @@ from backend.app.market.baostock_vendor import (
     transport_observation_sink,
 )
 from backend.app.market.provider_transport import (
+    ClassificationEndpoint,
     NormalizedTransportError,
     ProtocolStage,
     ProviderEndpoint,
@@ -735,6 +736,100 @@ class RecoveringSocketClient(FakeBaoStock):
             self.fail_once.remove(code)
             raise TimeoutError("synthetic socket timeout")
         return super().query_history_k_data_plus(code, fields, **kwargs)
+
+
+class ExhaustedLoginClient(RecoveringSocketClient):
+    def __init__(self, payload, *, successful_initial_login: bool) -> None:
+        super().__init__(payload)
+        self.fail_once.clear()
+        self.successful_initial_login = successful_initial_login
+        self.query_failures = {"sh.600000"}
+        self.login_scopes = []
+
+    def login(self):
+        self.login_calls += 1
+        self.login_scopes.append(current_request_context())
+        connection = FakeSocket()
+        self.sockets.append(connection)
+        self.context.default_socket = connection
+        if not self.successful_initial_login or self.login_calls in {2, 3}:
+            raise TimeoutError("private-token exhausted login")
+        return FakeResult([], [])
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.history_calls[code] = self.history_calls.get(code, 0) + 1
+        if code in self.query_failures:
+            self.query_failures.remove(code)
+            raise TimeoutError("private-token initial query failure")
+        return FakeBaoStock.query_history_k_data_plus(self, code, fields, **kwargs)
+
+
+def test_initial_login_exhaustion_emits_one_market_operation_failure() -> None:
+    client = ExhaustedLoginClient(
+        json.loads(FIXTURE_PATH.read_text()),
+        successful_initial_login=False,
+    )
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+
+    with (
+        transport_observation_sink(observations.append),
+        pytest.raises(BaoStockError),
+    ):
+        provider.trading_dates(date(2026, 7, 23), date(2026, 7, 23))
+
+    operations = [item for item in observations if item.protocol_stage == ProtocolStage.OPERATION]
+    assert len(operations) == 1
+    assert operations[0].endpoint == ProviderEndpoint.TRADE_DATES
+    assert operations[0].attempt == 2
+    assert operations[0].normalized_error == NormalizedTransportError.RECV_TIMEOUT
+    assert operations[0].provider_session_id == client.login_scopes[-1].provider_session_id
+    assert "private-token" not in operations[0].model_dump_json()
+
+
+def test_classification_login_exhaustion_emits_no_market_operation() -> None:
+    client = ExhaustedLoginClient(
+        json.loads(FIXTURE_PATH.read_text()),
+        successful_initial_login=False,
+    )
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+
+    with (
+        transport_observation_sink(observations.append),
+        pytest.raises(BaoStockError),
+    ):
+        provider._login(ClassificationEndpoint.SECURITY_UNIVERSE)
+
+    assert all(item.protocol_stage != ProtocolStage.OPERATION for item in observations)
+
+
+def test_retry_relogin_exhaustion_emits_failure_before_later_same_endpoint_success() -> None:
+    client = ExhaustedLoginClient(
+        json.loads(FIXTURE_PATH.read_text()),
+        successful_initial_login=True,
+    )
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+
+    with transport_observation_sink(observations.append):
+        batch = provider.fetch(
+            date(2026, 7, 23),
+            symbols=["sh.600000", "sz.000001"],
+        )
+
+    assert batch.failed_symbols == ["sh.600000"]
+    operations = [
+        item
+        for item in observations
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert [(item.attempt, item.normalized_error) for item in operations] == [
+        (2, NormalizedTransportError.RECV_TIMEOUT),
+        (1, None),
+    ]
+    assert operations[0].provider_session_id == client.login_scopes[2].provider_session_id
 
 
 def test_timeout_closes_socket_relogs_and_retries_with_same_bound() -> None:

@@ -810,7 +810,11 @@ def main() -> int:
         )
         return 1
     layout = StorageLayout(settings)
-    layout.ensure_local_runtime_dirs()
+    if getattr(args, "execute", False) or args.command not in {
+        "calendar-sync",
+        "auto-refresh-once",
+    }:
+        layout.ensure_local_runtime_dirs()
     socket_timeout_seconds = (
         getattr(args, "socket_timeout_seconds", None) or settings.baostock_socket_timeout_seconds
     )
