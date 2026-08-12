@@ -71,6 +71,11 @@ LABELS=(
   com.finlay.stock-eva.backup
 )
 WEB_LABEL=com.finlay.stock-eva.web
+MARKET_CONTROL_LABELS=(
+  com.finlay.stock-eva.api
+  com.finlay.stock-eva.refresh
+  com.finlay.stock-eva.calendar
+)
 
 if [[ ! -x "$SOURCE_PYTHON" ]]; then
   echo "error: missing project Python at $SOURCE_PYTHON; run 'uv sync --extra dev' first" >&2
@@ -259,7 +264,8 @@ PREVIOUS_CURRENT_TARGET=""
 RELEASE_CREATED=0
 CONFIG_CHANGED=0
 rollback() {
-  status=$?
+  prior_status=$?
+  status="${1:-$prior_status}"
   local -a restore_failures=()
   trap - ERR
   set +e
@@ -451,6 +457,37 @@ for name in market user control staging locks tmp; do
 done
 /bin/chmod 0700 "$DATA_ROOT"
 
+for label in "${MARKET_CONTROL_LABELS[@]}"; do
+  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
+    "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
+  fi
+done
+for label in "${MARKET_CONTROL_LABELS[@]}"; do
+  if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]] \
+    && ! wait_for_unloaded "$label"; then
+    echo "error: market control service remained loaded before schema migration" >&2
+    false
+  fi
+done
+if ! wait_for_port_release 8000; then
+  echo "error: market API port remained occupied before schema migration" >&2
+  false
+fi
+
+set +e
+(
+  cd "$CONFIG_ROOT"
+  "$RELEASE_ROOT/.venv/bin/python" \
+    -m backend.app.cli market-schema-migrate \
+    >/dev/null 2>&1
+)
+SCHEMA_MIGRATION_STATUS=$?
+set -e
+if [[ "$SCHEMA_MIGRATION_STATUS" -ne 0 ]]; then
+  echo "error: market control schema migration failed" >&2
+  rollback "$SCHEMA_MIGRATION_STATUS"
+fi
+
 "$RELEASE_ROOT/.venv/bin/python" \
   -m backend.app.storage.mirror \
   --source /Volumes/Stock/stock-eva-market \
@@ -497,12 +534,18 @@ done
 
 for label in "${LABELS[@]}"; do
   if [[ "$label" != "$WEB_LABEL" \
+    && "$label" != "com.finlay.stock-eva.api" \
+    && "$label" != "com.finlay.stock-eva.refresh" \
+    && "$label" != "com.finlay.stock-eva.calendar" \
     && -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
     "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
   fi
 done
 for label in "${LABELS[@]}"; do
   if [[ "$label" != "$WEB_LABEL" \
+    && "$label" != "com.finlay.stock-eva.api" \
+    && "$label" != "com.finlay.stock-eva.refresh" \
+    && "$label" != "com.finlay.stock-eva.calendar" \
     && -f "$PREVIOUS_ROOT/loaded.$label" ]] \
     && ! wait_for_unloaded "$label"; then
     echo "error: $label remained loaded after bootout" >&2

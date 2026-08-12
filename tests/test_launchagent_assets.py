@@ -349,7 +349,25 @@ def fake_uv(tmp_path: Path) -> Path:
 set -e
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
 cat >"$UV_PROJECT_ENVIRONMENT/bin/python" <<'PY'
-#!/bin/sh
+#!/bin/bash
+if [[ -n "${RUNTIME_PYTHON_CALL_LOG:-}" ]]; then
+  echo "$0|$*" >> "$RUNTIME_PYTHON_CALL_LOG"
+fi
+if [[ "$*" == *"market-schema-migrate"* ]]; then
+  target="$(/usr/bin/readlink "${RUNTIME_CURRENT_PATH:-/nonexistent}" 2>/dev/null || true)"
+  configured_market_dir="$(
+    /usr/bin/sed -n 's/^STOCK_EVA_MARKET_DATA_DIR=//p' "$PWD/.env" 2>/dev/null
+  )"
+  if [[ -n "${HANDOFF_EVENT_LOG:-}" ]]; then
+    echo \
+      "runtime|market-schema-migrate|$target|$0|$PWD|$configured_market_dir" \
+      >> "$HANDOFF_EVENT_LOG"
+  fi
+  if [[ "${FAIL_SCHEMA_MIGRATION:-0}" == "1" ]]; then
+    echo 'synthetic migration failure'
+    exit 7
+  fi
+fi
 exit 0
 PY
 chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"
@@ -391,6 +409,7 @@ def install_environment(
         "STOCK_EVA_UV": str(fake_uv(tmp_path)),
         "STOCK_EVA_NPM": str(fake_npm(tmp_path)),
         "NPM_CALL_LOG": str(tmp_path / "npm.log"),
+        "RUNTIME_PYTHON_CALL_LOG": str(tmp_path / "runtime-python.log"),
         "STOCK_EVA_UNAME": "Darwin",
     }
 
@@ -421,11 +440,13 @@ def stateful_install_environment(tmp_path: Path) -> dict[str, str]:
 def run_installer(
     project: Path,
     environment: dict[str, str],
+    *,
+    mode: str = "--install",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             str(SCRIPTS / "stock_eva_launchagents_install.sh"),
-            "--install",
+            mode,
             "--project-root",
             str(project),
         ],
@@ -434,6 +455,115 @@ def run_installer(
         text=True,
         capture_output=True,
         check=False,
+    )
+
+
+def test_installer_check_does_not_run_market_schema_migration(tmp_path: Path) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+
+    result = run_installer(project, environment, mode="--check")
+
+    assert result.returncode == 0, result.stderr
+    assert "mutation=false" in result.stdout
+    runtime_log = Path(environment["RUNTIME_PYTHON_CALL_LOG"])
+    assert not runtime_log.exists() or "market-schema-migrate" not in runtime_log.read_text()
+
+
+def test_installer_runs_release_schema_migration_before_current_handoff(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    event_log = Path(environment["HANDOFF_EVENT_LOG"])
+    event_log.write_text("")
+    runtime_log = Path(environment["RUNTIME_PYTHON_CALL_LOG"])
+    runtime_log.write_text("")
+
+    (project / "uv.lock").write_text("synthetic lock schema migration")
+    second = run_installer(project, environment)
+
+    assert second.returncode == 0, second.stderr
+    events = event_log.read_text().splitlines()
+    migration = next(item for item in events if item.startswith("runtime|market-schema-migrate|"))
+    web_bootout = next(
+        item for item in events if item.startswith("launchctl|bootout|com.finlay.stock-eva.web|")
+    )
+    assert migration.split("|")[2] == old_target
+    assert "/runtime/releases/" in migration.split("|")[3]
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    assert migration.split("|")[4] == str(app_support / "config")
+    assert migration.split("|")[5] == str(app_support / "data/market")
+    for label in (
+        "com.finlay.stock-eva.api",
+        "com.finlay.stock-eva.refresh",
+        "com.finlay.stock-eva.calendar",
+    ):
+        bootout = f"launchctl|bootout|{label}|{old_target}"
+        assert events.index(bootout) < events.index(migration)
+    assert events.index(migration) < events.index(web_bootout)
+    runtime_calls = runtime_log.read_text().splitlines()
+    migration_call = next(
+        index for index, item in enumerate(runtime_calls) if "market-schema-migrate" in item
+    )
+    mirror_call = next(
+        index for index, item in enumerate(runtime_calls) if "backend.app.storage.mirror" in item
+    )
+    assert migration_call < mirror_call
+
+
+def test_schema_migration_failure_stops_before_handoff_and_restores_install_state(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    config = app_support / "config/.env"
+    previous_config = config.read_bytes()
+    previous_plists = {
+        path.name: path.read_bytes()
+        for path in (Path(environment["HOME"]) / "Library/LaunchAgents").glob("*.plist")
+    }
+    event_log = Path(environment["HANDOFF_EVENT_LOG"])
+    event_log.write_text("")
+    runtime_log = Path(environment["RUNTIME_PYTHON_CALL_LOG"])
+    runtime_log.write_text("")
+
+    (project / "uv.lock").write_text("synthetic lock failing migration")
+    (project / ".env").write_text(
+        (project / ".env").read_text() + "STOCK_EVA_TEST_MARKER=must-rollback\n"
+    )
+    environment["FAIL_SCHEMA_MIGRATION"] = "1"
+    failed = run_installer(project, environment)
+
+    assert failed.returncode == 7
+    assert failed.stdout == ""
+    assert failed.stderr.count("market control schema migration failed") == 1
+    assert failed.stderr.count("rollback: restored previous LaunchAgent state") == 1
+    assert current.is_symlink() and str(current.readlink()) == old_target
+    assert config.read_bytes() == previous_config
+    assert {
+        path.name: path.read_bytes()
+        for path in (Path(environment["HOME"]) / "Library/LaunchAgents").glob("*.plist")
+    } == previous_plists
+    events = event_log.read_text().splitlines()
+    migration = next(item for item in events if item.startswith("runtime|market-schema-migrate|"))
+    assert migration.split("|")[2] == old_target
+    assert "backend.app.storage.mirror" not in runtime_log.read_text()
+    assert all(
+        item.split("|")[3] in {"", old_target} for item in events if item.startswith("launchctl|")
     )
 
 
@@ -555,18 +685,22 @@ def test_installer_stops_web_and_releases_8080_before_current_handoff(
     events = event_log.read_text().splitlines()
     web_bootout = f"launchctl|bootout|com.finlay.stock-eva.web|{old_target}"
     released_8080 = f"lsof|8080|{old_target}|0"
-    api_bootout = f"launchctl|bootout|com.finlay.stock-eva.api|{new_target}"
+    migration = next(item for item in events if item.startswith("runtime|market-schema-migrate|"))
     assert events.count(web_bootout) == 1
     assert events.index(web_bootout) < events.index(released_8080)
-    assert events.index(released_8080) < events.index(api_bootout)
+    assert events.index(migration) < events.index(web_bootout)
     for label in (
         "com.finlay.stock-eva.api",
         "com.finlay.stock-eva.refresh",
         "com.finlay.stock-eva.calendar",
-        "com.finlay.stock-eva.backup",
     ):
-        assert events.count(f"launchctl|bootout|{label}|{new_target}") == 1
+        bootout = f"launchctl|bootout|{label}|{old_target}"
+        assert events.count(bootout) == 1
+        assert events.index(bootout) < events.index(migration)
         assert events.count(f"launchctl|bootstrap|{label}|{new_target}") == 1
+    backup = "com.finlay.stock-eva.backup"
+    assert events.count(f"launchctl|bootout|{backup}|{new_target}") == 1
+    assert events.count(f"launchctl|bootstrap|{backup}|{new_target}") == 1
 
 
 def test_installer_web_handoff_failure_restores_old_release_and_agents(

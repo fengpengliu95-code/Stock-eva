@@ -248,6 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
         "refresh-runs",
         help="list auditable daily refresh run records",
     )
+    subparsers.add_parser(
+        "market-schema-migrate",
+        help=argparse.SUPPRESS,
+    )
     automation_once = subparsers.add_parser(
         "auto-refresh-once",
         help="evaluate the backend schedule once without a client-provided date",
@@ -370,6 +374,39 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "market-schema-migrate":
+        try:
+            settings = get_settings()
+            layout = StorageLayout(settings)
+            MarketStore(
+                layout.local_paths.market_database,
+                temp_directory=layout.duckdb_temporary,
+            ).initialize_schema()
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "market_control_schema_migration_failed",
+                        "writes_market_control_schema": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "migration": "market_control_schema",
+                    "writes_market_control_schema": True,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "classification-sync":
         started_at = perf_counter()
         configured_timeout_seconds = args.socket_timeout_seconds

@@ -216,6 +216,135 @@ def test_existing_refresh_schema_migrates_failure_fields_as_null(tmp_path: Path)
     assert legacy.retryable is None
 
 
+def test_market_schema_migration_cli_upgrades_legacy_control_store(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    path = tmp_path / "market" / "stock_eva.duckdb"
+    path.parent.mkdir()
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE refresh_runs (
+                run_id VARCHAR PRIMARY KEY, request_key VARCHAR,
+                run_kind VARCHAR NOT NULL DEFAULT 'daily', requested_date DATE NOT NULL,
+                source VARCHAR NOT NULL, status VARCHAR NOT NULL,
+                requested_count INTEGER NOT NULL, succeeded_count INTEGER NOT NULL,
+                coverage_ratio DOUBLE, failed_symbols JSON NOT NULL,
+                quality_issues JSON NOT NULL, error_message VARCHAR,
+                started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO refresh_runs VALUES (
+                'legacy-cli', NULL, 'daily', '2026-07-23', 'baostock', 'error',
+                1, 0, 0, '["sh.600000"]', '["provider_error"]',
+                'provider request failed', '2026-07-23T10:00:00Z',
+                '2026-07-23T10:01:00Z'
+            )
+            """
+        )
+    finally:
+        connection.close()
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": path.parent,
+            "market_database_name": path.name,
+            "local_temp_dir": tmp_path / "tmp",
+        }
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "migration": "market_control_schema",
+        "status": "ready",
+        "writes_market_control_schema": True,
+    }
+    migrated = MarketStore(path).latest_refresh()
+    assert migrated is not None and migrated.run_id == "legacy-cli"
+    assert migrated.failure_stage is None
+    assert migrated.failure_class is None
+    assert migrated.retryable is None
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        legacy_projection = connection.execute(
+            """
+            SELECT run_id, requested_date, source, status, requested_count,
+                   succeeded_count, coverage_ratio, failed_symbols, quality_issues,
+                   error_message, started_at, completed_at, request_key, run_kind
+            FROM refresh_runs WHERE run_id = 'legacy-cli'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert legacy_projection is not None
+    assert MarketStore._refresh_result_from_row(legacy_projection).run_id == "legacy-cli"
+
+
+def test_market_schema_migration_cli_is_idempotent_for_empty_and_current_store(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "local_temp_dir": tmp_path / "tmp",
+        }
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 0
+    first = json.loads(capsys.readouterr().out)
+    assert cli.main() == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert first == second
+    store = MarketStore(settings.market_data_dir / settings.market_database_name)
+    connection = duckdb.connect(str(store.path), read_only=True)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(refresh_runs)").fetchall()
+        }
+    finally:
+        connection.close()
+    assert {"failure_stage", "failure_class", "retryable"} <= columns
+    assert store.list_refreshes() == []
+
+
+def test_market_schema_migration_cli_sanitizes_failure_output(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    secret = "token=migration-secret /private/stock_eva.duckdb SELECT * FROM private"
+    settings = cli.get_settings().model_copy(update={"market_data_dir": tmp_path / "market"})
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        MarketStore,
+        "initialize_schema",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "error_code": "market_control_schema_migration_failed",
+        "status": "error",
+        "writes_market_control_schema": False,
+    }
+    assert secret not in captured.out + captured.err
+
+
 def test_legacy_fourteen_column_refresh_projection_defaults_failure_fields() -> None:
     legacy_row = (
         "legacy-projection",
