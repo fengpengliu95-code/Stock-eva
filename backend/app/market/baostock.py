@@ -3,7 +3,7 @@ import signal
 import socket
 import threading
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic, sleep
@@ -18,6 +18,12 @@ from backend.app.market.failures import (
 )
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
+from backend.app.market.provider_transport import (
+    ProviderEndpoint,
+    provider_session_scope,
+    refresh_scope,
+    request_scope,
+)
 
 DAILY_FIELDS = (
     "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
@@ -103,6 +109,31 @@ class _PreexistingTimerInterrupt(BaseException):
     pass
 
 
+def _pagination_protocol_error(message: str) -> BaoStockTransportError:
+    return BaoStockTransportError(
+        message,
+        failure=MarketFailure(
+            failure_stage="fetch",
+            failure_class="transport_connect",
+            retryable=True,
+        ),
+    )
+
+
+def _page_number(result: Any) -> int:
+    try:
+        page = int(result.cur_page_num)
+    except (AttributeError, TypeError, ValueError):
+        raise _pagination_protocol_error("BaoStock pagination protocol is invalid") from None
+    if page < 1:
+        raise _pagination_protocol_error("BaoStock pagination protocol is invalid")
+    return page
+
+
+def _page_fingerprint(result: Any) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(str(value) for value in row) for row in result.data)
+
+
 @contextmanager
 def _wall_clock_deadline(seconds: float):
     if threading.current_thread() is not threading.main_thread():
@@ -156,6 +187,7 @@ def _read_result(
     result: Any,
     *,
     before_page_request: Callable[[], None] | None = None,
+    next_page_scope: Callable[[int], Any] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
         failure = baostock_status_failure(result.error_code)
@@ -164,17 +196,52 @@ def _read_result(
             failure=failure,
         )
     rows: list[list[str]] = []
+    page_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
     while True:
-        if (
+        page_request_required = (
             before_page_request is not None
+            and next_page_scope is not None
             and hasattr(result, "data")
             and hasattr(result, "cur_row_num")
             and hasattr(result, "per_page_count")
             and result.cur_row_num >= len(result.data)
-            and len(result.data) == int(result.per_page_count)
-        ):
+        )
+        if page_request_required:
+            try:
+                per_page_count = int(result.per_page_count)
+            except (TypeError, ValueError):
+                raise _pagination_protocol_error(
+                    "BaoStock pagination protocol is invalid"
+                ) from None
+            if per_page_count < 1 or len(result.data) > per_page_count:
+                raise _pagination_protocol_error("BaoStock pagination protocol is invalid")
+            page_request_required = len(result.data) == per_page_count
+        if page_request_required:
+            current_page = _page_number(result)
+            current_fingerprint = _page_fingerprint(result)
+            if current_fingerprint in page_fingerprints:
+                raise _pagination_protocol_error("BaoStock pagination protocol repeated page data")
+            page_fingerprints.add(current_fingerprint)
             before_page_request()
-        if not result.next():
+            with next_page_scope(current_page + 1):
+                has_row = result.next()
+            if result.error_code != "0":
+                failure = baostock_status_failure(result.error_code)
+                raise BaoStockTransportError(
+                    f"BaoStock pagination failed ({failure.failure_class})",
+                    failure=failure,
+                )
+            if not has_row:
+                raise _pagination_protocol_error(
+                    "BaoStock pagination protocol ended after a full page"
+                )
+            next_page = _page_number(result)
+            next_fingerprint = _page_fingerprint(result)
+            if next_page != current_page + 1 or next_fingerprint in page_fingerprints:
+                raise _pagination_protocol_error("BaoStock pagination protocol did not advance")
+        else:
+            has_row = result.next()
+        if not has_row:
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
@@ -245,6 +312,22 @@ def _required_field_positions(
     return {field: fields.index(field) for field in required}
 
 
+def _candidate_integrity_error(message: str) -> BaoStockError:
+    return BaoStockError(
+        message,
+        failure=MarketFailure(
+            failure_stage="validate",
+            failure_class="reconciliation",
+            retryable=False,
+        ),
+    )
+
+
+def _require_unique_symbols(symbols: Sequence[str]) -> None:
+    if len(symbols) != len(set(symbols)):
+        raise _candidate_integrity_error("BaoStock candidate contains duplicate symbols")
+
+
 def _is_main_board(symbol: str) -> bool:
     return symbol.startswith(SH_MAIN_PREFIXES + SZ_MAIN_PREFIXES)
 
@@ -286,52 +369,86 @@ class BaoStockProvider:
             raise ValueError("socket timeout must be positive")
         self.socket_timeout_seconds = socket_timeout_seconds
         self._session_usable = False
+        self._provider_session_id: str | None = None
+        self._refresh_scope_depth = 0
 
-    def _login(self) -> None:
+    @contextmanager
+    def _refresh_operation(self):
+        if self._refresh_scope_depth > 0:
+            yield
+            return
+        with refresh_scope():
+            self._refresh_scope_depth += 1
+            try:
+                yield
+            finally:
+                self._refresh_scope_depth -= 1
+
+    @contextmanager
+    def _request_scope(self, endpoint: ProviderEndpoint, *, attempt: int, page: int):
+        if self._provider_session_id is None:
+            raise BaoStockSessionStateError("BaoStock provider session is unavailable")
+        with provider_session_scope(self._provider_session_id):
+            with request_scope(endpoint, attempt=attempt, page=page) as context:
+                yield context
+
+    def _login(self, endpoint: ProviderEndpoint | None = None) -> None:
+        with self._refresh_operation():
+            self._login_scoped(endpoint)
+
+    def _login_scoped(self, endpoint: ProviderEndpoint | None) -> None:
         if self._session_usable:
             raise BaoStockSessionStateError("BaoStock session is already active")
         last_error: BaoStockError | None = None
-        for _attempt in range(self.max_attempts):
-            try:
-                result = self._run_with_deadline(
-                    self._call_login,
-                    operation_name="login",
+        for attempt in range(1, self.max_attempts + 1):
+            with provider_session_scope() as session:
+                self._provider_session_id = session.provider_session_id
+                transport_scope = (
+                    request_scope(endpoint, attempt=attempt, page=1)
+                    if endpoint is not None
+                    else nullcontext()
                 )
-            except _OperationDeadlineExceeded as exc:
-                last_error = exc
-                continue
-            except (TimeoutError, OSError) as exc:
-                last_error = BaoStockTransportError(
-                    "BaoStock login transport failed",
-                    failure=market_failure_from_exception(exc, stage="fetch"),
-                )
-                self._discard_session()
-                continue
-            except Exception:
-                self._discard_session()
-                raise
-            if result.error_code != "0":
-                failure = baostock_status_failure(result.error_code)
-                last_error = BaoStockTransportError(
-                    f"BaoStock login failed ({failure.failure_class})",
-                    failure=failure,
-                )
-                self._discard_session()
-                continue
-            try:
-                self._configure_socket_timeout()
-            except (TimeoutError, OSError) as exc:
-                last_error = BaoStockTransportError(
-                    "BaoStock socket timeout configuration failed",
-                    failure=market_failure_from_exception(exc, stage="fetch"),
-                )
-                self._discard_session()
-                continue
-            except Exception:
-                self._discard_session()
-                raise
-            self._session_usable = True
-            return
+                with transport_scope:
+                    try:
+                        result = self._run_with_deadline(
+                            self._call_login,
+                            operation_name="login",
+                        )
+                    except _OperationDeadlineExceeded as exc:
+                        last_error = exc
+                        continue
+                    except (TimeoutError, OSError) as exc:
+                        last_error = BaoStockTransportError(
+                            "BaoStock login transport failed",
+                            failure=market_failure_from_exception(exc, stage="fetch"),
+                        )
+                        self._discard_session()
+                        continue
+                    except Exception:
+                        self._discard_session()
+                        raise
+                    if result.error_code != "0":
+                        failure = baostock_status_failure(result.error_code)
+                        last_error = BaoStockTransportError(
+                            f"BaoStock login failed ({failure.failure_class})",
+                            failure=failure,
+                        )
+                        self._discard_session()
+                        continue
+                    try:
+                        self._configure_socket_timeout()
+                    except (TimeoutError, OSError) as exc:
+                        last_error = BaoStockTransportError(
+                            "BaoStock socket timeout configuration failed",
+                            failure=market_failure_from_exception(exc, stage="fetch"),
+                        )
+                        self._discard_session()
+                        continue
+                    except Exception:
+                        self._discard_session()
+                        raise
+                    self._session_usable = True
+                    return
         raise last_error or BaoStockTransportError("BaoStock login failed")
 
     def _call_login(self):
@@ -384,6 +501,7 @@ class BaoStockProvider:
             except Exception:
                 pass
         self._session_usable = False
+        self._provider_session_id = None
 
     def _run_with_deadline(self, operation, *, operation_name: str):
         try:
@@ -421,9 +539,9 @@ class BaoStockProvider:
         finally:
             self._discard_session()
 
-    def _ensure_session(self) -> None:
+    def _ensure_session(self, endpoint: ProviderEndpoint | None) -> None:
         if not self._session_usable:
-            self._login()
+            self._login(endpoint)
 
     def fetch(self, trade_date: date, symbols: Sequence[str] | None = None) -> ProviderBatch:
         if symbols is not None and len(set(symbols)) > self.max_explicit_symbols:
@@ -435,14 +553,15 @@ class BaoStockProvider:
                     retryable=False,
                 ),
             )
-        self._login()
-        try:
-            self._ensure_trading_day(trade_date)
-            if symbols is None:
-                return self._fetch_main_board(trade_date)
-            return self._fetch_symbols(trade_date, symbols)
-        finally:
-            self._logout()
+        with self._refresh_operation():
+            self._login(ProviderEndpoint.TRADE_DATES)
+            try:
+                self._ensure_trading_day(trade_date)
+                if symbols is None:
+                    return self._fetch_main_board(trade_date)
+                return self._fetch_symbols(trade_date, symbols)
+            finally:
+                self._logout()
 
     def trading_dates(self, start_date: date, end_date: date) -> list[date]:
         if start_date > end_date:
@@ -454,43 +573,51 @@ class BaoStockProvider:
                     retryable=False,
                 ),
             )
-        self._login()
-        try:
-            return self._trading_dates(start_date, end_date)
-        finally:
-            self._logout()
+        with self._refresh_operation():
+            self._login(ProviderEndpoint.TRADE_DATES)
+            try:
+                return self._trading_dates(start_date, end_date)
+            finally:
+                self._logout()
 
     def inspect_main_board(self, trade_date: date) -> MainBoardInspection:
         """Read only the calendar and security universe; never request OHLCV."""
-        initial_request_count = self._provider_request_count
-        self._login()
-        try:
-            self._ensure_trading_day(trade_date)
-            fields, rows = self._read(
-                lambda: self.client.query_all_stock(day=trade_date.isoformat())
-            )
-            code_index = fields.index("code")
-            symbols = {row[code_index] for row in rows if _is_main_board(row[code_index])}
-            shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
-            shenzhen = sum(symbol.startswith("sz.") for symbol in symbols)
-            return MainBoardInspection(
-                trade_date=trade_date,
-                main_board_count=len(symbols),
-                shanghai_count=shanghai,
-                shenzhen_count=shenzhen,
-                total_expected_count=len(symbols) + len(INDEX_SYMBOLS),
-                metadata_provider_requests=(self._provider_request_count - initial_request_count),
-                main_board_symbols=tuple(sorted(symbols)),
-            )
-        finally:
-            self._logout()
+        with self._refresh_operation():
+            initial_request_count = self._provider_request_count
+            self._login(ProviderEndpoint.TRADE_DATES)
+            try:
+                self._ensure_trading_day(trade_date)
+                fields, rows = self._read(
+                    ProviderEndpoint.ALL_STOCK,
+                    lambda: self.client.query_all_stock(day=trade_date.isoformat()),
+                )
+                code_index = fields.index("code")
+                symbol_rows = [row[code_index] for row in rows if _is_main_board(row[code_index])]
+                _require_unique_symbols(symbol_rows)
+                symbols = set(symbol_rows)
+                shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
+                shenzhen = sum(symbol.startswith("sz.") for symbol in symbols)
+                return MainBoardInspection(
+                    trade_date=trade_date,
+                    main_board_count=len(symbols),
+                    shanghai_count=shanghai,
+                    shenzhen_count=shenzhen,
+                    total_expected_count=len(symbols) + len(INDEX_SYMBOLS),
+                    metadata_provider_requests=(
+                        self._provider_request_count - initial_request_count
+                    ),
+                    main_board_symbols=tuple(sorted(symbols)),
+                )
+            finally:
+                self._logout()
 
     def _trading_dates(self, start_date: date, end_date: date) -> list[date]:
         fields, rows = self._read(
+            ProviderEndpoint.TRADE_DATES,
             lambda: self.client.query_trade_dates(
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
-            )
+            ),
         )
         positions = _required_field_positions(
             fields,
@@ -501,6 +628,16 @@ class BaoStockProvider:
         return [date.fromisoformat(row[date_index]) for row in rows if row[trading_index] == "1"]
 
     def fetch_range(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        symbols: Sequence[str],
+    ) -> ProviderRangeBatch:
+        with self._refresh_operation():
+            return self._fetch_range(start_date, end_date, symbols=symbols)
+
+    def _fetch_range(
         self,
         start_date: date,
         end_date: date,
@@ -526,7 +663,7 @@ class BaoStockProvider:
                     retryable=False,
                 ),
             )
-        self._login()
+        self._login(ProviderEndpoint.TRADE_DATES)
         try:
             trading_dates = self._trading_dates(start_date, end_date)
             if not trading_dates:
@@ -547,6 +684,7 @@ class BaoStockProvider:
             for symbol in expected_symbols:
                 try:
                     fields, rows = self._read(
+                        ProviderEndpoint.INDEX_HISTORY,
                         lambda symbol=symbol: self.client.query_history_k_data_plus(
                             symbol,
                             DAILY_FIELDS,
@@ -554,7 +692,7 @@ class BaoStockProvider:
                             end_date=end_date.isoformat(),
                             frequency="d",
                             adjustflag="3",
-                        )
+                        ),
                     )
                     if fields != daily_fields or not rows:
                         failed.append(symbol)
@@ -562,11 +700,12 @@ class BaoStockProvider:
                     daily_rows.extend(rows)
                     if symbol not in INDEX_SYMBOLS:
                         current_fields, current_rows = self._read(
+                            ProviderEndpoint.ADJUST_FACTOR,
                             lambda symbol=symbol: self.client.query_adjust_factor(
                                 symbol,
                                 start_date="1990-01-01",
                                 end_date=end_date.isoformat(),
-                            )
+                            ),
                         )
                         if current_rows:
                             factor_fields = current_fields
@@ -591,11 +730,66 @@ class BaoStockProvider:
         finally:
             self._logout()
 
-    def _read(self, operation) -> tuple[list[str], list[list[str]]]:
+    def _read(
+        self,
+        endpoint: ProviderEndpoint | Callable[[], Any],
+        operation=None,
+    ) -> tuple[list[str], list[list[str]]]:
+        if operation is None:
+            if not callable(endpoint):
+                raise TypeError("BaoStock read operation is required")
+            return self._read_legacy(endpoint)
+        with self._refresh_operation():
+            last_error: BaoStockError | None = None
+            for attempt in range(1, self.max_attempts + 1):
+                self._pace_request()
+                self._ensure_session(endpoint)
+                try:
+
+                    def read_attempt(attempt=attempt):
+                        with self._request_scope(endpoint, attempt=attempt, page=1):
+                            result = operation()
+                        return _read_result(
+                            result,
+                            before_page_request=self._pace_request,
+                            next_page_scope=lambda page: self._request_scope(
+                                endpoint,
+                                attempt=attempt,
+                                page=page,
+                            ),
+                        )
+
+                    return self._run_with_deadline(
+                        read_attempt,
+                        operation_name="request",
+                    )
+                except _OperationDeadlineUnavailable:
+                    raise
+                except (BaoStockError, TimeoutError, OSError) as exc:
+                    last_error = (
+                        exc
+                        if isinstance(exc, BaoStockError)
+                        else BaoStockTransportError(
+                            "BaoStock transport failed",
+                            failure=market_failure_from_exception(exc, stage="fetch"),
+                        )
+                    )
+                    self._discard_session()
+            raise last_error or BaoStockError("BaoStock request failed")
+
+    def _read_legacy(self, operation) -> tuple[list[str], list[list[str]]]:
+        """Compatibility bridge for the non-market classification adapter.
+
+        Market data call sites always pass an allowlisted endpoint. Classification
+        metadata has a different endpoint vocabulary and must not be mislabeled,
+        so this path emits no R2-F0.1 endpoint observation. It must not be used by
+        market refreshes or canaries. The pinned SDK socket patch still enforces
+        checked send and fail-closed framing for real classification clients.
+        """
         last_error: BaoStockError | None = None
         for _attempt in range(self.max_attempts):
             self._pace_request()
-            self._ensure_session()
+            self._ensure_session(None)
             try:
                 return self._run_with_deadline(
                     lambda: _read_result(
@@ -630,10 +824,11 @@ class BaoStockProvider:
 
     def _ensure_trading_day(self, trade_date: date) -> None:
         fields, rows = self._read(
+            ProviderEndpoint.TRADE_DATES,
             lambda: self.client.query_trade_dates(
                 start_date=trade_date.isoformat(),
                 end_date=trade_date.isoformat(),
-            )
+            ),
         )
         trading_index = _required_field_positions(fields, ("is_trading_day",))["is_trading_day"]
         if len(rows) != 1 or rows[0][trading_index] != "1":
@@ -659,6 +854,7 @@ class BaoStockProvider:
         for symbol in expected_symbols:
             try:
                 fields, rows = self._read(
+                    ProviderEndpoint.INDEX_HISTORY,
                     lambda symbol=symbol: self.client.query_history_k_data_plus(
                         symbol,
                         DAILY_FIELDS,
@@ -666,7 +862,7 @@ class BaoStockProvider:
                         end_date=iso_date,
                         frequency="d",
                         adjustflag="3",
-                    )
+                    ),
                 )
                 if fields != daily_fields:
                     raise BaoStockError(
@@ -680,14 +876,20 @@ class BaoStockProvider:
                 if not rows:
                     failed.append(symbol)
                     continue
+                code_index = daily_fields.index("code")
+                row_symbols = [row[code_index] for row in rows]
+                _require_unique_symbols(row_symbols)
+                if any(row_symbol != symbol for row_symbol in row_symbols):
+                    raise _candidate_integrity_error("BaoStock candidate has universe divergence")
                 daily_rows.extend(rows)
                 if symbol not in INDEX_SYMBOLS:
                     current_factor_fields, current_factor_rows = self._read(
+                        ProviderEndpoint.ADJUST_FACTOR,
                         lambda symbol=symbol: self.client.query_adjust_factor(
                             symbol,
                             start_date="1990-01-01",
                             end_date=iso_date,
-                        )
+                        ),
                     )
                     if current_factor_rows:
                         factor_fields = current_factor_fields
@@ -698,13 +900,15 @@ class BaoStockProvider:
                 batch_failure = batch_failure or exc.failure
                 failed.append(symbol)
 
+        bars = _normalize_provider_rows(
+            fields=daily_fields,
+            rows=daily_rows,
+            factor_fields=factor_fields,
+            factor_rows=factor_rows,
+        )
+        _require_unique_symbols([bar.symbol for bar in bars])
         return ProviderBatch(
-            bars=_normalize_provider_rows(
-                fields=daily_fields,
-                rows=daily_rows,
-                factor_fields=factor_fields,
-                factor_rows=factor_rows,
-            ),
+            bars=bars,
             expected_symbols=expected_symbols,
             failed_symbols=failed,
             failure=batch_failure,
@@ -713,22 +917,30 @@ class BaoStockProvider:
     def _fetch_main_board(self, trade_date: date) -> ProviderBatch:
         iso_date = trade_date.isoformat()
         universe_fields, universe_rows = self._read(
-            lambda: self.client.query_all_stock(day=iso_date)
+            ProviderEndpoint.ALL_STOCK, lambda: self.client.query_all_stock(day=iso_date)
         )
-        universe_code_index = universe_fields.index("code")
-        main_symbols = {
+        universe_code_index = _required_field_positions(universe_fields, ("code",))["code"]
+        main_symbol_rows = [
             row[universe_code_index]
             for row in universe_rows
             if _is_main_board(row[universe_code_index])
-        }
+        ]
+        _require_unique_symbols(main_symbol_rows)
+        main_symbols = set(main_symbol_rows)
         daily_fields, daily_rows = self._read(
-            lambda: self.client.query_daily_history_k_AStock(date=iso_date)
+            ProviderEndpoint.DAILY_ASTOCK,
+            lambda: self.client.query_daily_history_k_AStock(date=iso_date),
         )
-        daily_rows = [row for row in daily_rows if row[daily_fields.index("code")] in main_symbols]
+        daily_positions = _required_field_positions(daily_fields, ("code", "tradestatus"))
+        daily_code_index = daily_positions["code"]
+        daily_status_index = daily_positions["tradestatus"]
+        daily_rows = [row for row in daily_rows if _is_main_board(row[daily_code_index])]
+        daily_symbols = [row[daily_code_index] for row in daily_rows]
+        _require_unique_symbols(daily_symbols)
+        if set(daily_symbols) != main_symbols:
+            raise _candidate_integrity_error("BaoStock candidate has universe divergence")
         active_symbols = sorted(
-            row[daily_fields.index("code")]
-            for row in daily_rows
-            if row[daily_fields.index("tradestatus")] == "1"
+            row[daily_code_index] for row in daily_rows if row[daily_status_index] == "1"
         )
         factor_fields, factor_rows, factor_failure = self._main_board_factor_snapshot(
             trade_date,
@@ -741,8 +953,10 @@ class BaoStockProvider:
             factor_fields=factor_fields,
             factor_rows=factor_rows,
         )
+        combined_bars = bars + explicit_indexes.bars
+        _require_unique_symbols([bar.symbol for bar in combined_bars])
         return ProviderBatch(
-            bars=bars + explicit_indexes.bars,
+            bars=combined_bars,
             expected_symbols=sorted(main_symbols) + list(INDEX_SYMBOLS),
             failed_symbols=sorted(
                 (main_symbols - {bar.symbol for bar in bars}) | set(explicit_indexes.failed_symbols)
@@ -771,9 +985,10 @@ class BaoStockProvider:
             )
         for session in sessions:
             fields, rows = self._read(
+                ProviderEndpoint.DAILY_FACTOR,
                 lambda session=session: self.client.query_daily_adjust_factor(
                     date=session.isoformat()
-                )
+                ),
             )
             self.factor_cache.record_daily_events(
                 session,
@@ -792,11 +1007,12 @@ class BaoStockProvider:
         for position, symbol in enumerate(missing, start=1):
             try:
                 fields, rows = self._read(
+                    ProviderEndpoint.ADJUST_FACTOR,
                     lambda symbol=symbol: self.client.query_adjust_factor(
                         symbol,
                         start_date="1990-01-01",
                         end_date=trade_date.isoformat(),
-                    )
+                    ),
                 )
                 factor = self.factor_cache.record_bootstrap(
                     symbol,

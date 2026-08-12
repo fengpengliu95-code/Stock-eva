@@ -14,6 +14,10 @@ from backend.app.market.baostock import (
     BaoStockProvider,
     BaoStockSessionStateError,
 )
+from backend.app.market.provider_transport import (
+    ProviderEndpoint,
+    current_request_context,
+)
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "baostock_daily.json"
 
@@ -336,6 +340,7 @@ class BlockingPaginationResult:
     error_msg = ""
     data = [["sh.600000"]]
     per_page_count = 1
+    cur_page_num = "1"
 
     def __init__(self, connection: CloseReleasedSocket, continued: list[str]) -> None:
         self.connection = connection
@@ -455,7 +460,7 @@ def test_wall_clock_deadline_closes_blocking_baostock_operation(mode: str) -> No
         provider._login()
 
         def operation():
-            return provider._read(client.blocking_query)
+            return provider._read(ProviderEndpoint.INDEX_HISTORY, client.blocking_query)
 
     assert_fails_within_deadline(
         operation,
@@ -476,7 +481,7 @@ def test_retry_attempts_have_a_derived_total_wall_clock_bound() -> None:
     provider._login()
 
     assert_fails_within_deadline(
-        lambda: provider._read(client.blocking_query),
+        lambda: provider._read(ProviderEndpoint.INDEX_HISTORY, client.blocking_query),
         client,
         expected_seconds=(provider.max_attempts * timeout) + 0.15,
     )
@@ -497,7 +502,7 @@ def test_deadline_never_leaves_uncancellable_request_workers() -> None:
     try:
         started_at = time.monotonic()
         with pytest.raises(BaoStockError, match="wall-clock deadline exceeded"):
-            provider._read(client.blocking_query)
+            provider._read(ProviderEndpoint.INDEX_HISTORY, client.blocking_query)
         assert (
             time.monotonic() - started_at
             <= (provider.max_attempts * provider.socket_timeout_seconds) + 0.1
@@ -936,3 +941,364 @@ def test_provider_installs_pinned_transport_only_for_real_client(monkeypatch) ->
 
     BaoStockProvider()
     assert installed == ["installed"]
+
+
+class ScopedBaoStock(FakeBaoStock):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.scopes = []
+
+    def _capture(self, operation: str) -> None:
+        self.scopes.append((operation, current_request_context()))
+
+    def login(self):
+        self._capture("login")
+        return super().login()
+
+    def query_trade_dates(self, **kwargs):
+        self._capture("query_trade_dates")
+        return super().query_trade_dates(**kwargs)
+
+    def query_all_stock(self, **kwargs):
+        self._capture("query_all_stock")
+        return super().query_all_stock(**kwargs)
+
+    def query_daily_history_k_AStock(self, **kwargs):
+        self._capture("query_daily_history_k_AStock")
+        return super().query_daily_history_k_AStock(**kwargs)
+
+    def query_daily_adjust_factor(self, **kwargs):
+        self._capture("query_daily_adjust_factor")
+        return super().query_daily_adjust_factor(**kwargs)
+
+    def query_adjust_factor(self, code, **kwargs):
+        self._capture("query_adjust_factor")
+        return super().query_adjust_factor(code, **kwargs)
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self._capture("query_history_k_data_plus")
+        return super().query_history_k_data_plus(code, fields, **kwargs)
+
+
+def test_public_fetch_tags_all_six_endpoints_with_one_refresh_and_session() -> None:
+    client = ScopedBaoStock(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, min_request_interval_seconds=0)
+
+    provider.fetch(date(2026, 7, 23))
+
+    endpoint_by_operation = {
+        "query_trade_dates": ProviderEndpoint.TRADE_DATES,
+        "query_all_stock": ProviderEndpoint.ALL_STOCK,
+        "query_daily_history_k_AStock": ProviderEndpoint.DAILY_ASTOCK,
+        "query_daily_adjust_factor": ProviderEndpoint.DAILY_FACTOR,
+        "query_adjust_factor": ProviderEndpoint.ADJUST_FACTOR,
+        "query_history_k_data_plus": ProviderEndpoint.INDEX_HISTORY,
+    }
+    query_scopes = [item for item in client.scopes if item[0] != "login"]
+    assert {operation for operation, _context in query_scopes} == set(endpoint_by_operation)
+    assert all(
+        context.endpoint == endpoint_by_operation[operation] for operation, context in query_scopes
+    )
+    assert len({context.refresh_id for _operation, context in client.scopes}) == 1
+    assert len({context.provider_session_id for _operation, context in client.scopes}) == 1
+    assert len({context.request_id for _operation, context in query_scopes}) == len(query_scopes)
+    assert {context.attempt for _operation, context in query_scopes} == {1}
+    assert {context.page for _operation, context in query_scopes} == {1}
+    login_context = next(context for operation, context in client.scopes if operation == "login")
+    assert login_context.endpoint == ProviderEndpoint.TRADE_DATES
+    assert (login_context.attempt, login_context.page) == (1, 1)
+    assert login_context.request_id not in {
+        context.request_id for _operation, context in query_scopes
+    }
+
+
+def test_each_public_operation_owns_one_fresh_refresh_scope() -> None:
+    client = ScopedBaoStock(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, min_request_interval_seconds=0)
+    operation_scopes = []
+
+    for operation in (
+        lambda: provider.trading_dates(date(2026, 7, 23), date(2026, 7, 23)),
+        lambda: provider.inspect_main_board(date(2026, 7, 23)),
+        lambda: provider.fetch_range(
+            date(2026, 7, 23),
+            date(2026, 7, 23),
+            symbols=["sh.600000"],
+        ),
+    ):
+        start = len(client.scopes)
+        operation()
+        current = [context for _name, context in client.scopes[start:]]
+        assert len({context.refresh_id for context in current}) == 1
+        assert len({context.provider_session_id for context in current}) == 1
+        operation_scopes.append(current)
+
+    assert len({scopes[0].refresh_id for scopes in operation_scopes}) == 3
+    assert len({scopes[0].provider_session_id for scopes in operation_scopes}) == 3
+
+
+class ScopedRetryClient(RecoveringSocketClient):
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self.login_scopes = []
+        self.query_scopes = []
+
+    def login(self):
+        self.login_scopes.append(current_request_context())
+        return super().login()
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self.query_scopes.append(current_request_context())
+        return super().query_history_k_data_plus(code, fields, **kwargs)
+
+
+def test_retry_keeps_refresh_id_but_rotates_session_and_request_ids() -> None:
+    client = ScopedRetryClient(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+
+    provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    history_scopes = [
+        context
+        for context in client.query_scopes
+        if context.endpoint == ProviderEndpoint.INDEX_HISTORY
+    ]
+    assert [context.attempt for context in history_scopes] == [1, 2]
+    assert len({context.refresh_id for context in client.login_scopes + history_scopes}) == 1
+    assert len({context.provider_session_id for context in client.login_scopes}) == 2
+    assert history_scopes[0].provider_session_id != history_scopes[1].provider_session_id
+    assert history_scopes[0].request_id != history_scopes[1].request_id
+    assert [context.endpoint for context in client.login_scopes] == [
+        ProviderEndpoint.TRADE_DATES,
+        ProviderEndpoint.INDEX_HISTORY,
+    ]
+
+
+class ProtocolPageResult:
+    fields = ["code"]
+    error_code = "0"
+    error_msg = ""
+    per_page_count = 2000
+
+    def __init__(
+        self,
+        pages: list[list[list[str]]],
+        *,
+        page_numbers: list[str] | None = None,
+        fail_on_transition: bool = False,
+    ) -> None:
+        self.pages = pages
+        self.page_numbers = page_numbers or [str(index + 1) for index in range(len(pages))]
+        self.fail_on_transition = fail_on_transition
+        self.page_index = 0
+        self.data = pages[0]
+        self.cur_page_num = self.page_numbers[0]
+        self.cur_row_num = 0
+        self.transition_scopes = []
+
+    def next(self) -> bool:
+        if self.cur_row_num < len(self.data):
+            return True
+        if len(self.data) < self.per_page_count:
+            return False
+        self.transition_scopes.append(current_request_context())
+        if self.fail_on_transition:
+            raise TimeoutError("private-token page two transport failure")
+        self.page_index += 1
+        if self.page_index >= len(self.pages):
+            return False
+        self.data = self.pages[self.page_index]
+        self.cur_page_num = self.page_numbers[self.page_index]
+        self.cur_row_num = 0
+        return bool(self.data)
+
+    def get_row_data(self) -> list[str]:
+        row = self.data[self.cur_row_num]
+        self.cur_row_num += 1
+        return row
+
+
+def _full_page(prefix: str = "row") -> list[list[str]]:
+    return [[f"{prefix}-{index:04d}"] for index in range(2000)]
+
+
+def test_pagination_advances_page_scope_and_request_id() -> None:
+    client = ScopedBaoStock(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+    result = ProtocolPageResult([_full_page(), [["last-row"]]])
+    initial_scopes = []
+
+    def operation():
+        initial_scopes.append(current_request_context())
+        return result
+
+    fields, rows = provider._read(ProviderEndpoint.ALL_STOCK, operation)
+
+    assert fields == ["code"]
+    assert len(rows) == 2001
+    assert len(initial_scopes) == 1
+    assert len(result.transition_scopes) == 1
+    first = initial_scopes[0]
+    second = result.transition_scopes[0]
+    assert (first.attempt, first.page) == (1, 1)
+    assert (second.attempt, second.page) == (1, 2)
+    assert second.refresh_id == first.refresh_id
+    assert second.provider_session_id == first.provider_session_id
+    assert second.request_id != first.request_id
+
+
+def test_pagination_accepts_three_advancing_unique_pages() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    result = ProtocolPageResult([_full_page("first"), _full_page("second"), [["last-row"]]])
+
+    _fields, rows = provider._read(ProviderEndpoint.ALL_STOCK, lambda: result)
+
+    assert len(rows) == 4001
+    assert [context.page for context in result.transition_scopes] == [2, 3]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        pytest.param(
+            ProtocolPageResult([_full_page(), []]),
+            id="exact-full-page-followed-by-empty-page",
+        ),
+        pytest.param(
+            ProtocolPageResult([_full_page()]),
+            id="exact-full-page-with-missing-next-page",
+        ),
+        pytest.param(
+            ProtocolPageResult([_full_page(), _full_page("next")], page_numbers=["1", "1"]),
+            id="stalled-page-number",
+        ),
+        pytest.param(
+            ProtocolPageResult([_full_page(), _full_page()], page_numbers=["1", "2"]),
+            id="repeated-page-data",
+        ),
+        pytest.param(
+            ProtocolPageResult([_full_page(), [["last-row"]]], page_numbers=["invalid", "2"]),
+            id="abnormal-page-number",
+        ),
+    ],
+)
+def test_pagination_protocol_gaps_fail_the_complete_read(result: ProtocolPageResult) -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(BaoStockError, match="pagination protocol"):
+        provider._read(ProviderEndpoint.ALL_STOCK, lambda: result)
+
+
+def test_page_two_transport_failure_never_returns_first_page_rows() -> None:
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    result = ProtocolPageResult([_full_page()], fail_on_transition=True)
+
+    with pytest.raises(BaoStockError) as exc_info:
+        provider._read(ProviderEndpoint.ALL_STOCK, lambda: result)
+
+    assert len(result.transition_scopes) == 1
+    assert result.transition_scopes[0].page == 2
+    assert "private-token" not in str(exc_info.value)
+
+
+def test_exact_full_universe_page_cannot_be_returned_as_partial_candidate() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class PrematureUniverseClient(FakeBaoStock):
+        def query_all_stock(self, **kwargs):
+            return ProtocolPageResult([_full_page("sh.601"), []])
+
+    provider = BaoStockProvider(
+        client=PrematureUniverseClient(payload),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(BaoStockError, match="pagination protocol"):
+        provider.fetch(date(2026, 7, 23))
+
+
+def test_duplicate_universe_symbol_fails_the_complete_candidate() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class DuplicateUniverseClient(FakeBaoStock):
+        def query_all_stock(self, **kwargs):
+            result = super().query_all_stock(**kwargs)
+            rows = list(result.rows)
+            return FakeResult(result.fields, rows + [rows[0]])
+
+    provider = BaoStockProvider(client=DuplicateUniverseClient(payload))
+
+    with pytest.raises(BaoStockError, match="duplicate symbols"):
+        provider.fetch(date(2026, 7, 23))
+
+
+def test_duplicate_daily_symbol_fails_the_complete_candidate() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class DuplicateDailyClient(FakeBaoStock):
+        def query_all_stock(self, **kwargs):
+            result = super().query_all_stock(**kwargs)
+            rows = list(result.rows)
+            unique = list({row[0]: row for row in rows}.values())
+            return FakeResult(result.fields, unique)
+
+        def query_daily_history_k_AStock(self, **kwargs):
+            rows = self.payload["daily_rows"]
+            return FakeResult(self.payload["daily_fields"], rows + [rows[0]])
+
+    provider = BaoStockProvider(client=DuplicateDailyClient(payload))
+
+    with pytest.raises(BaoStockError, match="duplicate symbols"):
+        provider.fetch(date(2026, 7, 23))
+
+
+@pytest.mark.parametrize("divergence", ["missing", "unexpected"])
+def test_all_stock_daily_universe_divergence_fails_candidate(divergence: str) -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class DivergentUniverseClient(FakeBaoStock):
+        def query_all_stock(self, **kwargs):
+            result = super().query_all_stock(**kwargs)
+            rows = list(result.rows)
+            if divergence == "missing":
+                rows.append(["sh.600099", "1", "sh.600099"])
+            else:
+                rows = [row for row in rows if row[0] != "sh.600000"]
+            return FakeResult(result.fields, rows)
+
+    provider = BaoStockProvider(client=DivergentUniverseClient(payload))
+
+    with pytest.raises(BaoStockError, match="universe divergence"):
+        provider.fetch(date(2026, 7, 23))
+
+
+def test_duplicate_explicit_symbol_rows_fail_instead_of_returning_partial_batch() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+
+    class DuplicateExplicitClient(FakeBaoStock):
+        def query_history_k_data_plus(self, code, fields, **kwargs):
+            result = super().query_history_k_data_plus(code, fields, **kwargs)
+            rows = list(result.rows)
+            return FakeResult(result.fields, rows + rows)
+
+    provider = BaoStockProvider(client=DuplicateExplicitClient(payload))
+
+    with pytest.raises(BaoStockError, match="duplicate symbols"):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
