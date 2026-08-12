@@ -231,7 +231,13 @@ class MarketStore:
             return None
         if not bar.is_suspended:
             return "non_trading_bar_not_suspended"
-        if bar.quality_status != "partial" or bar.quality_issues != ["suspended_placeholder"]:
+        if (
+            bar.security_type != "stock"
+            or bar.volume != 0
+            or bar.amount != 0
+            or bar.quality_status != "partial"
+            or bar.quality_issues != ["suspended_placeholder"]
+        ):
             return "invalid_suspended_placeholder"
         return None
 

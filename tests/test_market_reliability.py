@@ -453,6 +453,67 @@ def test_suspended_rows_without_factor_can_form_a_complete_publication(
     assert store.published_refresh().run_id == result.run_id
 
 
+@pytest.mark.parametrize("field", ["volume", "amount"])
+def test_suspended_placeholder_with_nonzero_activity_is_rejected(field: str) -> None:
+    suspended = next(bar for bar in fixture_bars() if bar.symbol == "sh.600001").model_copy(
+        update={field: 1.0}
+    )
+
+    assert MarketStore.publication_bar_quality_issue(suspended) == "invalid_suspended_placeholder"
+
+
+def test_suspended_index_placeholder_is_rejected() -> None:
+    suspended_index = next(bar for bar in fixture_bars() if bar.symbol == "sh.000001").model_copy(
+        update={
+            "is_trading": False,
+            "is_suspended": True,
+            "quality_status": "partial",
+            "quality_issues": ["suspended_placeholder"],
+            "volume": 0.0,
+            "amount": 0.0,
+        }
+    )
+
+    assert (
+        MarketStore.publication_bar_quality_issue(suspended_index)
+        == "invalid_suspended_placeholder"
+    )
+
+
+def test_factor_is_required_for_every_non_suspended_stock(tmp_path: Path) -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    active_without_factor = normalize_baostock_rows(
+        fields=payload["daily_fields"],
+        rows=[payload["daily_rows"][0]],
+        ingested_at=datetime(2026, 7, 24, 10, 0, tzinfo=UTC),
+    )[0]
+    assert active_without_factor.quality_issues == ["missing_adjust_factor"]
+
+    bars = [
+        active_without_factor if bar.symbol == active_without_factor.symbol else bar
+        for bar in fixture_bars()
+    ]
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=bars,
+            expected_symbols=[bar.symbol for bar in bars],
+            failed_symbols=[],
+        )
+    )
+
+    result = run_publication_refresh(
+        store,
+        provider,
+        trade_date=date(2026, 7, 23),
+        required_symbols={"sh.600000"},
+    )
+
+    assert result.status == "partial"
+    assert "missing_adjust_factor:sh.600000" in result.quality_issues
+    assert store.published_refresh() is None
+
+
 def test_active_row_without_factor_still_blocks_publication(
     tmp_path: Path,
     incident_provider: FixedBatchProvider,
@@ -563,6 +624,8 @@ def test_qfq_series_multiplies_prices_and_excludes_suspensions(tmp_path: Path) -
             "is_trading": False,
             "is_suspended": True,
             "adjust_factor": None,
+            "volume": 0.0,
+            "amount": 0.0,
             "quality_status": "partial",
             "quality_issues": ["suspended_placeholder"],
         }
@@ -591,6 +654,8 @@ def test_qfq_series_returns_empty_when_all_rows_are_suspended(
             "is_trading": False,
             "is_suspended": True,
             "adjust_factor": 1.0,
+            "volume": 0.0,
+            "amount": 0.0,
             "quality_status": "partial",
             "quality_issues": ["suspended_placeholder"],
         }

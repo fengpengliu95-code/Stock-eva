@@ -92,7 +92,7 @@ def normalize_baostock_rows(
         issues: list[str] = []
         if suspended:
             issues.append("suspended_placeholder")
-        if security_type == "stock" and factor is None:
+        elif security_type == "stock" and factor is None:
             issues.append("missing_adjust_factor")
 
         normalized.append(

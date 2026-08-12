@@ -88,6 +88,21 @@ def test_baostock_active_bar_rejects_blank_activity_fields() -> None:
         )
 
 
+def test_active_blank_ohlcv_is_not_a_suspended_placeholder() -> None:
+    payload = fixture_payload()
+    fields = payload["daily_fields"]
+    row = list(payload["daily_rows"][0])
+    row[fields.index("open")] = ""
+
+    with pytest.raises(ValueError):
+        normalize_baostock_rows(
+            fields=fields,
+            rows=[row],
+            factor_fields=payload["factor_fields"],
+            factor_rows=payload["factor_rows"],
+        )
+
+
 def test_duckdb_upsert_is_idempotent(tmp_path: Path) -> None:
     store = MarketStore(tmp_path / "market.duckdb")
     rows = canonical_fixture()
