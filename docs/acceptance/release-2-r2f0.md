@@ -1,7 +1,7 @@
 # Release 2 — R2-F0 Incident Closure
 
 **Date:** 2026-08-12
-**Status:** CODE GO / PRODUCTION REPAIR PENDING
+**Status:** CODE GO / CONTROLLED REPAIR FAILED / RUNTIME ROLLED BACK / PRODUCTION NO-GO
 
 ## Scope and evidence boundary
 
@@ -17,9 +17,11 @@ values, blank suspended activity, and absent suspension factors. It is not a
 byte-for-byte copy of a live provider payload, and this record makes no raw
 payload claim.
 
-This status is a code-stage decision only. The installed runtime and live
-dataset have not been changed or verified, so this is not an R2-F0 production
-GO.
+The code gate remains GO. The one authorized production repair was attempted
+exactly once and failed closed during provider fetch with a typed
+`transport_timeout`. No candidate dataset was published. The installed runtime
+was then rolled back to the prior reviewed release. This is not an R2-F0
+production GO.
 
 ## Code acceptance gates
 
@@ -32,7 +34,9 @@ GO.
 | Structured failure contract | PASS | Public results expose `failure_stage`, `failure_class`, and `retryable`; the legacy `provider_error` quality issue remains compatible. CLI output, logs, and public model serialization are sanitized. |
 | Persistence and retry behavior | PASS | `refresh_runs` adds three columns through a compatibility migration with round-trip coverage; scheduler retries are driven by the structured retryability field. |
 | Main-board factor bootstrap failures | PASS | Transport and semantic failures are classified without collapsing the publication gates. |
-| Controlled production repair | PENDING | Installed-state readback, runtime installation, live repair, and post-repair verification were deliberately not performed in the code phase. |
+| Install-time schema compatibility | PASS | The first candidate install exposed a legacy 14-column `refresh_runs` database to the new 17-column read path and `/market/status` returned 503. The runtime was rolled back before repair. Commit `b2a860a` adds a fail-closed, pre-handoff writer migration; independent review returned `INSTALL GO`, and the second install migrated only the three nullable failure fields while retaining 284 historical runs. |
+| Controlled production repair | FAIL SAFE | The only authorized 2026-08-11 guarded refresh produced run `07d5d268c5f3-be43af03f909`: `status=error`, `failure_stage=fetch`, `failure_class=transport_timeout`, `retryable=true`, and 0/0 fetched. It was not retried. The pointer and immutable dataset remained unchanged. |
+| Production rollback | PASS | The same reviewed installer restored exact release `75c64e4364fadbeab8a1e4a964bfa208e91a7ff6`; five LaunchAgents, API, workspace and storage returned ready. Candidate release `b2a860a` and the failed-run evidence were retained. |
 
 ## Implemented rules
 
@@ -65,6 +69,7 @@ bootstrap distinguishes transport failures from semantic failures.
 | `2bd4e50` | Correct suspended-row normalization and publication validation. |
 | `1db5403` | Add structured provider/publication failure classification and persistence. |
 | `377e157` | Align the sector-rotation suspended fixture with the stricter publication contract. |
+| `b2a860a` | Migrate the market control schema before runtime handoff and fail closed on migration errors. |
 
 ## Fresh verification
 
@@ -77,6 +82,8 @@ All code-stage verification below completed on the reviewed R2-F0 branch:
 | `ruff check backend tests` | PASS |
 | `git diff --check 14529c8 HEAD` | PASS |
 | Changed production and Task 2 file format check | PASS |
+| Install migration and failure tests | PASS — 55 tests in the combined market-failure and LaunchAgent gate; independent focused review passed 10 tests |
+| Install script syntax | PASS — `bash -n` |
 
 The repository-wide `ruff format --check backend tests` is not universally
 green: it reports 22 historical unformatted files and 113 formatted files.
@@ -85,35 +92,79 @@ this is not treated as a new R2-F0 formatting regression. In particular,
 `tests/test_sector_rotation.py` was already historical-unformatted; its
 two-line fixture adjustment passes diff and lint checks.
 
-## Production work not executed
+## Controlled production execution
 
-The code phase did not perform any of the following:
+The production pre-state confirmed `latest_expected_session=2026-08-11`,
+`published_as_of=2026-08-10`, 271 manifest entries, and no 2026-08-11
+partition. The latest pre-existing attempt had fetched 3,195/3,195 symbols and
+was blocked only by the two legal suspended-placeholder rows reproduced by the
+regression fixture. The published pointer referenced ready run
+`cbd8d7c8d23c-b9a34e19a586` for 2026-08-10.
 
-- read the installed pre-state;
-- install or replace the runtime;
-- run the supervised 2026-08-11 production repair;
-- verify the live manifest, pointer, API response, or user-store state after a
-  repair.
+The first installation of the code-gated runtime found an unhandled deployment
+compatibility condition: the production `refresh_runs` table still had 14
+columns, while the new read path selected 17. `/api/v1/market/status` failed
+closed with `market_control_read_failed`. No refresh ran. The prior runtime was
+restored, after which the endpoint returned 200. A local RED-to-GREEN repair
+added a candidate-release migration before runtime handoff, with rollback,
+idempotency, legacy-row and sanitized-failure coverage. Independent review
+authorized only the exact corrected release `b2a860a` for reinstallation.
 
-Production data repair is therefore unknown and pending. This record does not
-claim production GO.
+The corrected installer reported `destination_newer` and `copied_bytes=0`,
+then migrated only `failure_stage`, `failure_class` and `retryable`. Historical
+rows retained NULL for these fields, the run count stayed 284, the API returned
+200, and all install-after checks passed before the data repair began.
 
-## Production continuation gate
+The existing guarded CLI was then executed once from the installed runtime and
+production config root:
 
-Production work may begin only after explicit user authorization. The operator
-must first read the live state and confirm that the target remains missing and
-has not been repaired by another run. If the target is already repaired or the
-state has otherwise changed, stop and recalculate the repair plan.
+```text
+python -m backend.app.cli refresh --date 2026-08-11 \
+  --all-main-board --execute-all-main-board
+```
 
-If the preconditions still hold, use the reviewed installer and the existing
-guarded CLI exactly once. Do not hand-edit Parquet objects, manifests, or the
-published pointer.
+It ended with a provider fetch timeout and persisted exactly one additional
+sanitized audit row, `07d5d268c5f3-be43af03f909`. No second attempt was made,
+and no manual Parquet, manifest, pointer or DuckDB publication edit was made.
+
+## Post-failure protection and rollback evidence
+
+After the failed repair and again after runtime rollback:
+
+- `refresh_runs` contained exactly 285 rows and retained the one new typed
+  failure row; the schema remained at 17 columns.
+- The published pointer remained run `cbd8d7c8d23c-b9a34e19a586`, date
+  2026-08-10.
+- The manifest remained SHA-256
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`,
+  generation `generation-6c48729bea29429d86891b102f0c8e52`, with 271
+  entries, latest date 2026-08-10 and no 2026-08-11 partition. Every referenced
+  object matched its manifest SHA-256.
+- The user database remained SHA-256
+  `8adba0364d399a56270d3a051db5db8d04fd0243cdecb32bdb01a81384e57e32`.
+  The source and installed config hashes also remained unchanged.
+- The installer again reported `destination_newer`, `copied_bytes=0`; no NAS
+  data was copied over the local dataset.
+- Runtime `current` and `RELEASE.json` returned to exact release
+  `75c64e4364fadbeab8a1e4a964bfa208e91a7ff6`. Candidate release `b2a860a`
+  remained available for audit. All five LaunchAgents were loaded, API,
+  workspace and storage were ready, and `/api/v1/market/status` returned 200
+  with expected 2026-08-11, published 2026-08-10 and delayed state.
+
+## Continuation gate
+
+The single production attempt authorized for this incident has been consumed.
+Do not retry it automatically or manually, and do not edit the manifest,
+objects, pointer or control database to simulate success. A later attempt
+requires new user authorization, a fresh live pre-state, confirmation that the
+target remains missing, and a separately reviewed provider-availability
+window. R2-F1 must not start while this R2-F0 production gate is NO-GO.
 
 ## Rollback and NO-GO boundary
 
 Production acceptance requires 100% required-symbol coverage, zero recorded
 failures, matching object hashes and manifest references, correct live pointer
-and API readback, and unchanged protected fingerprints. If any condition is
-not satisfied, the result remains NO-GO: preserve the prior published pointer
-and installed release, retain the failure evidence, and do not promote the
-candidate.
+and API readback, and unchanged protected fingerprints. The authorized attempt
+did not satisfy these conditions, so R2-F0 remains production NO-GO. The prior
+published pointer and installed release were preserved, the failed-run evidence
+was retained, and the candidate was not promoted.
