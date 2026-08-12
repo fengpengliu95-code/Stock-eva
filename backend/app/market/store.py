@@ -82,6 +82,9 @@ class MarketStore:
                 failed_symbols JSON NOT NULL,
                 quality_issues JSON NOT NULL,
                 error_message VARCHAR,
+                failure_stage VARCHAR,
+                failure_class VARCHAR,
+                retryable BOOLEAN,
                 started_at TIMESTAMPTZ NOT NULL,
                 completed_at TIMESTAMPTZ NOT NULL
             )
@@ -156,6 +159,13 @@ class MarketStore:
         connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS quality_issues JSON DEFAULT '[]'"
         )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS failure_stage VARCHAR"
+        )
+        connection.execute(
+            "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS failure_class VARCHAR"
+        )
+        connection.execute("ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS retryable BOOLEAN")
         return connection
 
     def initialize_schema(self) -> None:
@@ -291,8 +301,9 @@ class MarketStore:
                 INSERT INTO refresh_runs (
                     run_id, request_key, run_kind, requested_date, source, status, requested_count,
                     succeeded_count, coverage_ratio, failed_symbols, quality_issues,
-                    error_message, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_message, failure_stage, failure_class, retryable,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     result.run_id,
@@ -307,6 +318,9 @@ class MarketStore:
                     json.dumps(result.failed_symbols, ensure_ascii=False),
                     json.dumps(result.quality_issues, ensure_ascii=False),
                     result.error_message,
+                    result.failure_stage,
+                    result.failure_class,
+                    result.retryable,
                     result.started_at,
                     result.completed_at,
                 ],
@@ -495,7 +509,8 @@ class MarketStore:
                 """
                 SELECT run_id, requested_date, source, status, requested_count,
                        succeeded_count, coverage_ratio, failed_symbols, quality_issues,
-                       error_message, started_at, completed_at, request_key, run_kind
+                       error_message, started_at, completed_at, request_key, run_kind,
+                       failure_stage, failure_class, retryable
                 FROM refresh_runs
                 ORDER BY completed_at DESC
                 LIMIT 1
@@ -522,6 +537,11 @@ class MarketStore:
             completed_at=row[11],
             request_key=row[12],
             run_kind=row[13],
+            # Compatibility for read-only consumers that still project the
+            # pre-R2-F0 fourteen-column refresh audit shape.
+            failure_stage=row[14] if len(row) > 14 else None,
+            failure_class=row[15] if len(row) > 15 else None,
+            retryable=row[16] if len(row) > 16 else None,
         )
 
     def published_refresh(self) -> RefreshResult | None:
@@ -534,7 +554,8 @@ class MarketStore:
                 SELECT r.run_id, r.requested_date, r.source, r.status,
                        r.requested_count, r.succeeded_count, r.coverage_ratio,
                        r.failed_symbols, r.quality_issues, r.error_message,
-                       r.started_at, r.completed_at, r.request_key, r.run_kind
+                       r.started_at, r.completed_at, r.request_key, r.run_kind,
+                       r.failure_stage, r.failure_class, r.retryable
                 FROM published_snapshots p
                 JOIN refresh_runs r ON r.run_id = p.run_id
                 WHERE p.singleton = 1
@@ -608,7 +629,8 @@ class MarketStore:
                 """
                 SELECT run_id, requested_date, source, status, requested_count,
                        succeeded_count, coverage_ratio, failed_symbols, quality_issues,
-                       error_message, started_at, completed_at, request_key, run_kind
+                       error_message, started_at, completed_at, request_key, run_kind,
+                       failure_stage, failure_class, retryable
                 FROM refresh_runs
                 ORDER BY completed_at DESC, run_id
                 LIMIT ?

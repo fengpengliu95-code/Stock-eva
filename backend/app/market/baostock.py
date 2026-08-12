@@ -10,6 +10,11 @@ from time import monotonic, sleep
 from typing import Any
 
 from backend.app.market.factor_cache import AdjustmentFactorCache, FactorCacheError
+from backend.app.market.failures import (
+    MarketFailure,
+    baostock_status_failure,
+    market_failure_from_exception,
+)
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
 
@@ -44,6 +49,7 @@ class ProviderBatch:
     bars: list[DailyBar]
     expected_symbols: list[str]
     failed_symbols: list[str]
+    failure: MarketFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,7 @@ class ProviderRangeBatch:
     trading_dates: list[date]
     expected_symbols: list[str]
     failed_symbols: list[str]
+    failure: MarketFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -66,7 +73,9 @@ class MainBoardInspection:
 
 
 class BaoStockError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, failure: MarketFailure | None = None) -> None:
+        self.failure = failure
+        super().__init__(message)
 
 
 class BaoStockTransportError(BaoStockError):
@@ -148,7 +157,11 @@ def _read_result(
     before_page_request: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
-        raise BaoStockTransportError(result.error_msg or f"BaoStock error {result.error_code}")
+        failure = baostock_status_failure(result.error_code)
+        raise BaoStockTransportError(
+            f"BaoStock request failed ({failure.failure_class})",
+            failure=failure,
+        )
     rows: list[list[str]] = []
     while True:
         if (
@@ -164,10 +177,71 @@ def _read_result(
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
+        failure = baostock_status_failure(result.error_code)
         raise BaoStockTransportError(
-            result.error_msg or f"BaoStock pagination error {result.error_code}"
+            f"BaoStock pagination failed ({failure.failure_class})",
+            failure=failure,
         )
     return list(result.fields), rows
+
+
+def _normalize_provider_rows(
+    *,
+    fields: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    factor_fields: Sequence[str],
+    factor_rows: Sequence[Sequence[str]],
+) -> list[DailyBar]:
+    required_daily_fields = set(DAILY_FIELDS.split(","))
+    factor_required_fields = {"code", "dividOperateDate", "backAdjustFactor"}
+    malformed_shape = required_daily_fields - set(fields) or any(
+        len(row) != len(fields) for row in rows
+    )
+    malformed_factor_shape = bool(factor_rows) and (
+        factor_required_fields - set(factor_fields)
+        or any(len(row) != len(factor_fields) for row in factor_rows)
+    )
+    if malformed_shape or malformed_factor_shape:
+        raise BaoStockError(
+            "BaoStock response schema is invalid",
+            failure=MarketFailure(
+                failure_stage="normalize",
+                failure_class="schema",
+                retryable=False,
+            ),
+        )
+    try:
+        return normalize_baostock_rows(
+            fields=fields,
+            rows=rows,
+            factor_fields=factor_fields,
+            factor_rows=factor_rows,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise BaoStockError(
+            "BaoStock response semantics are invalid",
+            failure=MarketFailure(
+                failure_stage="normalize",
+                failure_class="semantic",
+                retryable=False,
+            ),
+        ) from None
+
+
+def _required_field_positions(
+    fields: Sequence[str],
+    required: Sequence[str],
+) -> dict[str, int]:
+    if any(field not in fields for field in required):
+        raise BaoStockError(
+            "BaoStock response schema is invalid",
+            failure=MarketFailure(
+                failure_stage="normalize",
+                failure_class="schema",
+                retryable=False,
+            ),
+        )
+    return {field: fields.index(field) for field in required}
 
 
 def _is_main_board(symbol: str) -> bool:
@@ -224,21 +298,31 @@ class BaoStockProvider:
             except _OperationDeadlineExceeded as exc:
                 last_error = exc
                 continue
-            except (TimeoutError, OSError):
-                last_error = BaoStockTransportError("BaoStock login transport failed")
+            except (TimeoutError, OSError) as exc:
+                last_error = BaoStockTransportError(
+                    "BaoStock login transport failed",
+                    failure=market_failure_from_exception(exc, stage="fetch"),
+                )
                 self._discard_session()
                 continue
             except Exception:
                 self._discard_session()
                 raise
             if result.error_code != "0":
-                last_error = BaoStockTransportError(result.error_msg or "BaoStock login failed")
+                failure = baostock_status_failure(result.error_code)
+                last_error = BaoStockTransportError(
+                    f"BaoStock login failed ({failure.failure_class})",
+                    failure=failure,
+                )
                 self._discard_session()
                 continue
             try:
                 self._configure_socket_timeout()
-            except (TimeoutError, OSError):
-                last_error = BaoStockTransportError("BaoStock socket timeout configuration failed")
+            except (TimeoutError, OSError) as exc:
+                last_error = BaoStockTransportError(
+                    "BaoStock socket timeout configuration failed",
+                    failure=market_failure_from_exception(exc, stage="fetch"),
+                )
                 self._discard_session()
                 continue
             except Exception:
@@ -306,12 +390,22 @@ class BaoStockProvider:
         except _OperationDeadlineInterrupt:
             self._discard_session()
             raise _OperationDeadlineExceeded(
-                f"BaoStock {operation_name} wall-clock deadline exceeded"
+                f"BaoStock {operation_name} wall-clock deadline exceeded",
+                failure=MarketFailure(
+                    failure_stage="fetch",
+                    failure_class="transport_timeout",
+                    retryable=True,
+                ),
             ) from None
         except _PreexistingTimerInterrupt:
             self._discard_session()
             raise _OperationDeadlineUnavailable(
-                "pre-existing timer expired during BaoStock operation"
+                "pre-existing timer expired during BaoStock operation",
+                failure=MarketFailure(
+                    failure_stage="fetch",
+                    failure_class="internal",
+                    retryable=False,
+                ),
             ) from None
 
     def _logout(self) -> None:
@@ -332,7 +426,12 @@ class BaoStockProvider:
     def fetch(self, trade_date: date, symbols: Sequence[str] | None = None) -> ProviderBatch:
         if symbols is not None and len(set(symbols)) > self.max_explicit_symbols:
             raise BaoStockError(
-                f"explicit refresh accepts at most {self.max_explicit_symbols} symbols"
+                f"explicit refresh accepts at most {self.max_explicit_symbols} symbols",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="universe",
+                    retryable=False,
+                ),
             )
         self._login()
         try:
@@ -345,7 +444,14 @@ class BaoStockProvider:
 
     def trading_dates(self, start_date: date, end_date: date) -> list[date]:
         if start_date > end_date:
-            raise BaoStockError("start date must not be after end date")
+            raise BaoStockError(
+                "start date must not be after end date",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="calendar",
+                    retryable=False,
+                ),
+            )
         self._login()
         try:
             return self._trading_dates(start_date, end_date)
@@ -384,8 +490,12 @@ class BaoStockProvider:
                 end_date=end_date.isoformat(),
             )
         )
-        date_index = fields.index("calendar_date")
-        trading_index = fields.index("is_trading_day")
+        positions = _required_field_positions(
+            fields,
+            ("calendar_date", "is_trading_day"),
+        )
+        date_index = positions["calendar_date"]
+        trading_index = positions["is_trading_day"]
         return [date.fromisoformat(row[date_index]) for row in rows if row[trading_index] == "1"]
 
     def fetch_range(
@@ -397,21 +507,41 @@ class BaoStockProvider:
     ) -> ProviderRangeBatch:
         expected_symbols = list(dict.fromkeys(symbols))
         if not expected_symbols:
-            raise BaoStockError("historical backfill requires explicit symbols")
+            raise BaoStockError(
+                "historical backfill requires explicit symbols",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="universe",
+                    retryable=False,
+                ),
+            )
         if len(expected_symbols) > self.max_explicit_symbols:
             raise BaoStockError(
-                f"explicit refresh accepts at most {self.max_explicit_symbols} symbols"
+                f"explicit refresh accepts at most {self.max_explicit_symbols} symbols",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="universe",
+                    retryable=False,
+                ),
             )
         self._login()
         try:
             trading_dates = self._trading_dates(start_date, end_date)
             if not trading_dates:
-                raise BaoStockError("date range contains no trading days")
+                raise BaoStockError(
+                    "date range contains no trading days",
+                    failure=MarketFailure(
+                        failure_stage="validate",
+                        failure_class="calendar",
+                        retryable=False,
+                    ),
+                )
             daily_fields = DAILY_FIELDS.split(",")
             daily_rows: list[list[str]] = []
             factor_fields: list[str] = []
             factor_rows: list[list[str]] = []
             failed: list[str] = []
+            batch_failure: MarketFailure | None = None
             for symbol in expected_symbols:
                 try:
                     fields, rows = self._read(
@@ -439,10 +569,13 @@ class BaoStockProvider:
                         if current_rows:
                             factor_fields = current_fields
                             factor_rows.extend(current_rows)
-                except BaoStockError:
+                except BaoStockError as exc:
+                    if exc.failure is not None and not exc.failure.retryable:
+                        raise
+                    batch_failure = batch_failure or exc.failure
                     failed.append(symbol)
             return ProviderRangeBatch(
-                bars=normalize_baostock_rows(
+                bars=_normalize_provider_rows(
                     fields=daily_fields,
                     rows=daily_rows,
                     factor_fields=factor_fields,
@@ -451,6 +584,7 @@ class BaoStockProvider:
                 trading_dates=trading_dates,
                 expected_symbols=expected_symbols,
                 failed_symbols=failed,
+                failure=batch_failure,
             )
         finally:
             self._logout()
@@ -474,7 +608,10 @@ class BaoStockProvider:
                 last_error = (
                     exc
                     if isinstance(exc, BaoStockError)
-                    else BaoStockTransportError("BaoStock transport failed")
+                    else BaoStockTransportError(
+                        "BaoStock transport failed",
+                        failure=market_failure_from_exception(exc, stage="fetch"),
+                    )
                 )
                 self._discard_session()
         raise last_error or BaoStockError("BaoStock request failed")
@@ -496,9 +633,16 @@ class BaoStockProvider:
                 end_date=trade_date.isoformat(),
             )
         )
-        trading_index = fields.index("is_trading_day")
+        trading_index = _required_field_positions(fields, ("is_trading_day",))["is_trading_day"]
         if len(rows) != 1 or rows[0][trading_index] != "1":
-            raise BaoStockError(f"{trade_date.isoformat()} is not a trading day")
+            raise BaoStockError(
+                f"{trade_date.isoformat()} is not a trading day",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="calendar",
+                    retryable=False,
+                ),
+            )
 
     def _fetch_symbols(self, trade_date: date, symbols: Sequence[str]) -> ProviderBatch:
         daily_fields = DAILY_FIELDS.split(",")
@@ -506,6 +650,7 @@ class BaoStockProvider:
         factor_fields: list[str] = []
         factor_rows: list[list[str]] = []
         failed: list[str] = []
+        batch_failure: MarketFailure | None = None
         iso_date = trade_date.isoformat()
 
         expected_symbols = list(dict.fromkeys(symbols))
@@ -521,7 +666,16 @@ class BaoStockProvider:
                         adjustflag="3",
                     )
                 )
-                if fields != daily_fields or not rows:
+                if fields != daily_fields:
+                    raise BaoStockError(
+                        "BaoStock response schema is invalid",
+                        failure=MarketFailure(
+                            failure_stage="normalize",
+                            failure_class="schema",
+                            retryable=False,
+                        ),
+                    )
+                if not rows:
                     failed.append(symbol)
                     continue
                 daily_rows.extend(rows)
@@ -536,11 +690,14 @@ class BaoStockProvider:
                     if current_factor_rows:
                         factor_fields = current_factor_fields
                         factor_rows.extend(current_factor_rows)
-            except BaoStockError:
+            except BaoStockError as exc:
+                if exc.failure is not None and not exc.failure.retryable:
+                    raise
+                batch_failure = batch_failure or exc.failure
                 failed.append(symbol)
 
         return ProviderBatch(
-            bars=normalize_baostock_rows(
+            bars=_normalize_provider_rows(
                 fields=daily_fields,
                 rows=daily_rows,
                 factor_fields=factor_fields,
@@ -548,6 +705,7 @@ class BaoStockProvider:
             ),
             expected_symbols=expected_symbols,
             failed_symbols=failed,
+            failure=batch_failure,
         )
 
     def _fetch_main_board(self, trade_date: date) -> ProviderBatch:
@@ -570,12 +728,12 @@ class BaoStockProvider:
             for row in daily_rows
             if row[daily_fields.index("tradestatus")] == "1"
         )
-        factor_fields, factor_rows = self._main_board_factor_snapshot(
+        factor_fields, factor_rows, factor_failure = self._main_board_factor_snapshot(
             trade_date,
             active_symbols,
         )
         explicit_indexes = self._fetch_symbols(trade_date, INDEX_SYMBOLS)
-        bars = normalize_baostock_rows(
+        bars = _normalize_provider_rows(
             fields=daily_fields,
             rows=daily_rows,
             factor_fields=factor_fields,
@@ -587,13 +745,14 @@ class BaoStockProvider:
             failed_symbols=sorted(
                 (main_symbols - {bar.symbol for bar in bars}) | set(explicit_indexes.failed_symbols)
             ),
+            failure=factor_failure or explicit_indexes.failure,
         )
 
     def _main_board_factor_snapshot(
         self,
         trade_date: date,
         main_symbols: Sequence[str],
-    ) -> tuple[list[str], list[list[str]]]:
+    ) -> tuple[list[str], list[list[str]], MarketFailure | None]:
         """Resolve an exact factor for every stock without guessing a default.
 
         The BaoStock daily endpoint is an event feed, not a full-universe
@@ -627,6 +786,7 @@ class BaoStockProvider:
         self.factor_cache.materialize_from_stream(main_symbols, trade_date)
         resolved = self.factor_cache.exact_snapshots(main_symbols, trade_date)
         missing = [symbol for symbol in main_symbols if symbol not in resolved]
+        bootstrap_failure: MarketFailure | None = None
         for position, symbol in enumerate(missing, start=1):
             try:
                 fields, rows = self._read(
@@ -645,9 +805,19 @@ class BaoStockProvider:
                 )
                 if factor is not None:
                     resolved[symbol] = factor
-            except (BaoStockError, FactorCacheError, ValueError):
+            except BaoStockError as exc:
                 # The quality gate below remains authoritative.  A single
                 # failed bootstrap must not discard already persisted progress.
+                if exc.failure is None or not exc.failure.retryable:
+                    raise
+                bootstrap_failure = bootstrap_failure or exc.failure
+                continue
+            except (FactorCacheError, ValueError):
+                bootstrap_failure = bootstrap_failure or MarketFailure(
+                    failure_stage="normalize",
+                    failure_class="semantic",
+                    retryable=False,
+                )
                 continue
             if position % 100 == 0 or position == len(missing):
                 logger.info(
@@ -655,4 +825,5 @@ class BaoStockProvider:
                     position,
                     len(missing),
                 )
-        return self.factor_cache.normalized_rows(main_symbols, trade_date)
+        fields, rows = self.factor_cache.normalized_rows(main_symbols, trade_date)
+        return fields, rows, bootstrap_failure

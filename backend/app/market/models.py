@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from backend.app.market.failures import MarketFailureClass, MarketFailureStage
+
 DataStatus = Literal["empty", "ready", "partial", "stale", "error"]
 
 
@@ -46,6 +48,9 @@ class RefreshResult(BaseModel):
     failed_symbols: list[str] = Field(default_factory=list)
     quality_issues: list[str] = Field(default_factory=list)
     error_message: str | None = None
+    failure_stage: MarketFailureStage | None = None
+    failure_class: MarketFailureClass | None = None
+    retryable: bool | None = None
     started_at: datetime
     completed_at: datetime
 
@@ -60,6 +65,9 @@ class RefreshResult(BaseModel):
             or self.failed_symbols
             or self.quality_issues
             or self.error_message is not None
+            or self.failure_stage is not None
+            or self.failure_class is not None
+            or self.retryable is not None
         ):
             raise ValueError("ready refresh must be complete")
         return self

@@ -17,6 +17,12 @@ from pydantic import BaseModel
 
 from backend.app.market.baostock import INDEX_SYMBOLS
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
+from backend.app.market.failures import (
+    MarketFailure,
+    legacy_failure_quality_issues,
+    market_failure_from_exception,
+    public_failure_message,
+)
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
 
@@ -223,11 +229,61 @@ def run_publication_refresh(
         run_id=run_id,
         trade_date=trade_date,
     )
+    failure_stage: Literal["fetch", "normalize", "validate", "publish"] = "fetch"
+    requested_count = 0
+    succeeded_count = 0
+    failures: list[str] = []
+
+    def failed_result(failure: MarketFailure) -> RefreshResult:
+        result = RefreshResult(
+            run_id=run_id,
+            request_key=request_key,
+            run_kind=run_kind,
+            requested_date=trade_date,
+            source="baostock",
+            status="error",
+            requested_count=requested_count,
+            succeeded_count=succeeded_count,
+            coverage_ratio=0,
+            failed_symbols=failures,
+            quality_issues=legacy_failure_quality_issues(failure),
+            error_message=public_failure_message(failure),
+            failure_stage=failure.failure_stage,
+            failure_class=failure.failure_class,
+            retryable=failure.retryable,
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+        )
+        if failure.failure_stage != "publish":
+            try:
+                store.save_refresh([], result, publish=False)
+            except Exception as error:
+                storage_failure = market_failure_from_exception(
+                    error,
+                    stage="publish",
+                    default_class="storage",
+                    default_retryable=False,
+                )
+                return failed_result(storage_failure)
+        _log_event(
+            logging.ERROR,
+            "market_publication_failed",
+            run_id=run_id,
+            failure_stage=failure.failure_stage,
+            failure_class=failure.failure_class,
+            retryable=failure.retryable,
+        )
+        return result
+
     try:
         batch = provider.fetch(trade_date, symbols=None)
+        failure_stage = "validate"
         loaded = {bar.symbol for bar in batch.bars}
         expected = set(batch.expected_symbols)
         issues = _publication_issues(batch, required_symbols)
+        batch_failure = getattr(batch, "failure", None)
+        if batch_failure is not None:
+            issues.extend(legacy_failure_quality_issues(batch_failure))
         failures = sorted((expected - loaded) | set(batch.failed_symbols))
         requested_count = len(expected)
         succeeded_count = len(expected & loaded)
@@ -235,6 +291,38 @@ def run_publication_refresh(
         if coverage < 1:
             issues.append("incomplete_symbol_coverage")
         status = "ready" if requested_count and not issues else "partial"
+        publication_failure = None
+        if status == "partial":
+            if batch_failure is not None:
+                publication_failure = batch_failure
+            elif requested_count == 0:
+                publication_failure = MarketFailure(
+                    failure_stage="validate",
+                    failure_class="universe",
+                    retryable=True,
+                )
+            elif failures or any(
+                issue.startswith(
+                    (
+                        "missing_symbol:",
+                        "required_index_missing:",
+                        "required_symbol_missing:",
+                        "incomplete_symbol_coverage",
+                    )
+                )
+                for issue in issues
+            ):
+                publication_failure = MarketFailure(
+                    failure_stage="validate",
+                    failure_class="coverage",
+                    retryable=True,
+                )
+            else:
+                publication_failure = MarketFailure(
+                    failure_stage="validate",
+                    failure_class="semantic",
+                    retryable=False,
+                )
         result = RefreshResult(
             run_id=run_id,
             request_key=request_key,
@@ -247,11 +335,19 @@ def run_publication_refresh(
             coverage_ratio=coverage,
             failed_symbols=failures,
             quality_issues=list(dict.fromkeys(issues)),
+            failure_stage=(
+                publication_failure.failure_stage if publication_failure is not None else None
+            ),
+            failure_class=(
+                publication_failure.failure_class if publication_failure is not None else None
+            ),
+            retryable=(publication_failure.retryable if publication_failure is not None else None),
             started_at=started_at,
             completed_at=datetime.now(UTC),
         )
         # A failed validation remains auditable, but cannot mutate the canonical
         # rows behind an existing published pointer for the same session.
+        failure_stage = "publish"
         store.save_refresh(
             batch.bars if status == "ready" else [],
             result,
@@ -267,30 +363,14 @@ def run_publication_refresh(
             coverage_ratio=coverage,
         )
         return result
-    except Exception:
-        result = RefreshResult(
-            run_id=run_id,
-            request_key=request_key,
-            run_kind=run_kind,
-            requested_date=trade_date,
-            source="baostock",
-            status="error",
-            requested_count=0,
-            succeeded_count=0,
-            coverage_ratio=0,
-            quality_issues=["provider_error"],
-            error_message="provider request failed",
-            started_at=started_at,
-            completed_at=datetime.now(UTC),
+    except Exception as error:
+        failure = market_failure_from_exception(
+            error,
+            stage=failure_stage,
+            default_class="storage" if failure_stage == "publish" else "internal",
+            default_retryable=False,
         )
-        store.save_refresh([], result, publish=False)
-        _log_event(
-            logging.ERROR,
-            "market_publication_failed",
-            run_id=run_id,
-            error_code="provider_error",
-        )
-        return result
+        return failed_result(failure)
 
 
 class MarketAutomationService:
@@ -403,14 +483,23 @@ class MarketAutomationService:
 
         try:
             provider_sessions = self.provider.trading_dates(target, target)
-        except Exception:
+        except Exception as error:
+            failure = market_failure_from_exception(error, stage="validate")
             state = self._failed_state(
                 running,
                 local,
-                error_code="calendar_validation_unavailable",
+                error_code=failure.failure_class,
                 calendar_status="unavailable",
+                retryable=failure.retryable,
             )
             self.store.save_scheduler_state(state)
+            _log_event(
+                logging.ERROR,
+                "market_calendar_validation_failed",
+                failure_stage=failure.failure_stage,
+                failure_class=failure.failure_class,
+                retryable=failure.retryable,
+            )
             return AutomationOutcome(decision=decision, state=state)
         if provider_sessions != [target]:
             state = running.model_copy(
@@ -444,10 +533,10 @@ class MarketAutomationService:
             state = self._failed_state(
                 running,
                 local,
-                error_code=(
-                    "publication_incomplete" if result.status == "partial" else "provider_error"
-                ),
+                error_code=result.failure_class
+                or ("publication_incomplete" if result.status == "partial" else "internal"),
                 calendar_status="confirmed",
+                retryable=result.retryable is True,
             )
         self.store.save_scheduler_state(state)
         return AutomationOutcome(decision=decision, state=state, result=result)
@@ -473,11 +562,16 @@ class MarketAutomationService:
         *,
         error_code: str,
         calendar_status: Literal["confirmed", "conflict", "unavailable"],
+        retryable: bool,
     ) -> SchedulerState:
-        next_retry = self.policy.next_retry_after(running.target_session, now)
+        next_retry = (
+            self.policy.next_retry_after(running.target_session, now) if retryable else None
+        )
         return running.model_copy(
             update={
-                "refresh_state": "retry_wait" if next_retry else "delayed",
+                "refresh_state": (
+                    "retry_wait" if next_retry else ("delayed" if retryable else "error")
+                ),
                 "next_retry_at": next_retry,
                 "calendar_status": calendar_status,
                 "error_code": error_code,

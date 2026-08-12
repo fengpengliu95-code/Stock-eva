@@ -32,6 +32,13 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.calendar_sync import CalendarSyncService, CalendarSyncStore
 from backend.app.market.factor_cache import AdjustmentFactorCache
+from backend.app.market.failures import (
+    MarketFailure,
+    MarketFailureError,
+    legacy_failure_quality_issues,
+    market_failure_from_exception,
+    public_failure_message,
+)
 from backend.app.market.full_history import FullMarketHistoryService
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
@@ -91,6 +98,15 @@ def _classification_failure_payload(
         "as_of": as_of.isoformat(),
         "quality_issues": ["classification_sync_failed"],
         "writes_classification_data": False,
+        **failure.model_dump(),
+    }
+
+
+def _market_failure_payload(failure: MarketFailure) -> dict[str, object]:
+    return {
+        "status": "error",
+        "quality_issues": legacy_failure_quality_issues(failure),
+        "error_message": public_failure_message(failure),
         **failure.model_dump(),
     }
 
@@ -946,7 +962,17 @@ def main() -> int:
                 )
             )
             return 0
-        outcome = service.run_due_once(now)
+        try:
+            outcome = service.run_due_once(now)
+        except Exception as error:
+            failure = market_failure_from_exception(error, stage="fetch")
+            print(
+                json.dumps(
+                    _market_failure_payload(failure),
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         print(json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False))
         return 1 if outcome.state.refresh_state in {"retry_wait", "delayed", "error"} else 0
     if args.command == "backfill":
@@ -1219,7 +1245,13 @@ def main() -> int:
                     socket_timeout_seconds=socket_timeout_seconds,
                 )
                 if provider.trading_dates(args.trade_date, args.trade_date) != [args.trade_date]:
-                    raise ValueError("calendar conflict")
+                    raise MarketFailureError(
+                        MarketFailure(
+                            failure_stage="validate",
+                            failure_class="calendar",
+                            retryable=False,
+                        )
+                    )
                 user_store = UserStore(layout.local_paths.user_database)
                 result = run_publication_refresh(
                     store,
@@ -1238,22 +1270,30 @@ def main() -> int:
                 )
             )
             return 1
-        except Exception:
+        except Exception as error:
+            failure = market_failure_from_exception(error, stage="validate")
             print(
                 json.dumps(
-                    {
-                        "status": "error",
-                        "quality_issues": ["calendar_provider_conflict"],
-                    },
+                    _market_failure_payload(failure),
                     ensure_ascii=False,
                 )
             )
             return 1
     else:
-        result = MarketRefreshService(
-            store,
-            BaoStockProvider(socket_timeout_seconds=socket_timeout_seconds),
-        ).refresh(args.trade_date, symbols=args.symbols)
+        try:
+            result = MarketRefreshService(
+                store,
+                BaoStockProvider(socket_timeout_seconds=socket_timeout_seconds),
+            ).refresh(args.trade_date, symbols=args.symbols)
+        except Exception as error:
+            failure = market_failure_from_exception(error, stage="fetch")
+            print(
+                json.dumps(
+                    _market_failure_payload(failure),
+                    ensure_ascii=False,
+                )
+            )
+            return 1
     print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
     return 0 if result.status in {"ready", "partial"} else 1
 

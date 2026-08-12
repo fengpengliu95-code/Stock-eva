@@ -14,6 +14,7 @@ from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
 from backend.app.market.baostock import ProviderBatch
+from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore
@@ -476,6 +477,79 @@ def test_partial_attempt_waits_then_catches_up_at_retry_slot(
     assert retried.state.attempt_count == 2
     assert retried.state.next_retry_at == datetime(2026, 7, 23, 19, 20, tzinfo=SHANGHAI)
     assert provider.fetch_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "retryable", "expected_state"),
+    [
+        ("transport_timeout", True, "retry_wait"),
+        ("semantic", False, "error"),
+    ],
+)
+def test_automation_retry_policy_uses_structured_retryable_failure(
+    tmp_path: Path,
+    failure_class: str,
+    retryable: bool,
+    expected_state: str,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+
+    class FailingProvider(CompleteProvider):
+        def fetch(self, trade_date: date, symbols=None) -> ProviderBatch:
+            raise MarketFailureError(
+                MarketFailure(
+                    failure_stage="fetch",
+                    failure_class=failure_class,
+                    retryable=retryable,
+                )
+            )
+
+    service = module.MarketAutomationService(
+        store,
+        FailingProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None
+    assert outcome.result.failure_class == failure_class
+    assert outcome.result.retryable is retryable
+    assert outcome.state.refresh_state == expected_state
+    assert (outcome.state.next_retry_at is not None) is retryable
+
+
+def test_calendar_failure_is_not_scheduled_when_structured_failure_is_not_retryable(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+
+    class FailingCalendarProvider(CompleteProvider):
+        def trading_dates(self, start_date: date, end_date: date) -> list[date]:
+            raise MarketFailureError(
+                MarketFailure(
+                    failure_stage="validate",
+                    failure_class="calendar",
+                    retryable=False,
+                )
+            )
+
+    service = module.MarketAutomationService(
+        store,
+        FailingCalendarProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is None
+    assert outcome.state.refresh_state == "error"
+    assert outcome.state.next_retry_at is None
+    assert outcome.state.error_code == "calendar"
 
 
 def test_required_symbols_include_positions_and_all_watchlists() -> None:
