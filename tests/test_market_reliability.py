@@ -9,6 +9,7 @@ import pytest
 
 from backend.app.api.market import get_market_store
 from backend.app.main import app
+from backend.app.market.automation import run_publication_refresh
 from backend.app.market.baostock import BaoStockError, BaoStockProvider, ProviderBatch
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
@@ -16,6 +17,7 @@ from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
+from backend.app.storage.dataset import NasMarketStore
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "baostock_daily.json"
 
@@ -28,6 +30,172 @@ def fixture_bars():
         factor_fields=payload["factor_fields"],
         factor_rows=payload["factor_rows"],
         ingested_at=datetime(2026, 7, 24, 10, 0, tzinfo=UTC),
+    )
+
+
+class FixedBatchProvider:
+    """A provider-shaped fixture that always returns one captured batch."""
+
+    def __init__(self, batch: ProviderBatch) -> None:
+        trade_dates = {bar.trade_date for bar in batch.bars}
+        if not trade_dates:
+            raise ValueError("fixed provider batch must contain bars")
+        if len(trade_dates) != 1:
+            raise ValueError("fixed provider batch must contain one trade date")
+        self.batch = batch
+        self.trade_date = trade_dates.pop()
+
+    def fetch(self, trade_date, symbols=None):
+        assert trade_date == self.trade_date
+        assert symbols is None
+        return self.batch
+
+
+def immutable_dataset_store(tmp_path: Path) -> tuple[NasMarketStore, Path]:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}),
+        encoding="utf-8",
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": "generation-empty",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return (
+        NasMarketStore(
+            MarketStore(tmp_path / "control" / "market.duckdb"),
+            root,
+            tmp_path / "staging",
+        ),
+        root,
+    )
+
+
+@pytest.fixture
+def incident_provider() -> FixedBatchProvider:
+    """Reproduce the 2026-08-11 full-universe suspension-factor incident shape."""
+    fields = [
+        "date",
+        "code",
+        "open",
+        "high",
+        "low",
+        "close",
+        "preclose",
+        "volume",
+        "amount",
+        "adjustflag",
+        "turn",
+        "tradestatus",
+        "pctChg",
+        "isST",
+    ]
+    rows = [
+        [
+            "2026-08-11",
+            "sh.600984",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            "",
+            "3",
+            "",
+            "0",
+            "",
+            "0",
+        ],
+        [
+            "2026-08-11",
+            "sh.603221",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            "",
+            "3",
+            "",
+            "0",
+            "",
+            "0",
+        ],
+        [
+            "2026-08-11",
+            "sh.600000",
+            "10.00",
+            "10.60",
+            "9.90",
+            "10.50",
+            "10.00",
+            "1000",
+            "10200",
+            "3",
+            "1.20",
+            "1",
+            "5.00",
+            "0",
+        ],
+        [
+            "2026-08-11",
+            "sh.000001",
+            "3500.00",
+            "3520.00",
+            "3480.00",
+            "3510.00",
+            "3490.00",
+            "300000",
+            "450000000",
+            "3",
+            "",
+            "1",
+            "0.57",
+            "0",
+        ],
+        [
+            "2026-08-11",
+            "sz.399001",
+            "11000.00",
+            "11050.00",
+            "10800.00",
+            "10900.00",
+            "11020.00",
+            "400000",
+            "550000000",
+            "3",
+            "",
+            "1",
+            "-1.09",
+            "0",
+        ],
+    ]
+    bars = normalize_baostock_rows(
+        fields=fields,
+        rows=rows,
+        factor_fields=[
+            "code",
+            "dividOperateDate",
+            "foreAdjustFactor",
+            "backAdjustFactor",
+            "adjustFactor",
+        ],
+        factor_rows=[["sh.600000", "2026-01-01", "1", "1", "1"]],
+        ingested_at=datetime(2026, 8, 11, 20, 0, tzinfo=UTC),
+    )
+    expected_symbols = [bar.symbol for bar in bars]
+    return FixedBatchProvider(
+        ProviderBatch(bars=bars, expected_symbols=expected_symbols, failed_symbols=[])
     )
 
 
@@ -265,6 +433,111 @@ def save_fixture(store: MarketStore, bars, run_id: str, trade_date: date) -> Non
             completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
         ),
     )
+
+
+def test_suspended_rows_without_factor_can_form_a_complete_publication(
+    tmp_path: Path,
+    incident_provider: FixedBatchProvider,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+
+    result = run_publication_refresh(
+        store,
+        incident_provider,
+        trade_date=date(2026, 8, 11),
+        required_symbols={"sh.600000"},
+    )
+
+    assert result.quality_issues == []
+    assert result.status == "ready"
+    assert store.published_refresh().run_id == result.run_id
+
+
+def test_active_row_without_factor_still_blocks_publication(
+    tmp_path: Path,
+    incident_provider: FixedBatchProvider,
+) -> None:
+    store = MarketStore(tmp_path / "market.duckdb")
+    active_missing_factor = [
+        bar.model_copy(update={"adjust_factor": None})
+        if bar.is_trading and bar.security_type == "stock"
+        else bar
+        for bar in incident_provider.batch.bars
+    ]
+    provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=active_missing_factor,
+            expected_symbols=incident_provider.batch.expected_symbols,
+            failed_symbols=[],
+        )
+    )
+
+    result = run_publication_refresh(
+        store,
+        provider,
+        trade_date=date(2026, 8, 11),
+        required_symbols={"sh.600000"},
+    )
+
+    assert result.status == "partial"
+    assert "missing_adjust_factor:sh.600000" in result.quality_issues
+    assert store.published_refresh() is None
+
+
+def test_failed_incident_candidate_preserves_existing_pointer_and_objects(
+    tmp_path: Path,
+    incident_provider: FixedBatchProvider,
+) -> None:
+    store, dataset_root = immutable_dataset_store(tmp_path)
+    baseline = fixture_bars()
+    baseline_provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=baseline,
+            expected_symbols=[bar.symbol for bar in baseline],
+            failed_symbols=[],
+        )
+    )
+    published = run_publication_refresh(
+        store,
+        baseline_provider,
+        trade_date=date(2026, 7, 23),
+        required_symbols={"sh.600000"},
+    )
+    assert published.status == "ready"
+    pointer_before = store.published_refresh().model_dump(mode="json")
+    manifest_before = (dataset_root / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_before)
+    objects_before = {
+        item["path"]: (dataset_root / item["path"]).read_bytes() for item in manifest["files"]
+    }
+    assert objects_before
+    assert set(objects_before) == {item["path"] for item in manifest["files"]}
+    active_missing_factor = [
+        bar.model_copy(update={"adjust_factor": None})
+        if bar.is_trading and bar.security_type == "stock"
+        else bar
+        for bar in incident_provider.batch.bars
+    ]
+    failed_provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=active_missing_factor,
+            expected_symbols=incident_provider.batch.expected_symbols,
+            failed_symbols=[],
+        )
+    )
+
+    failed = run_publication_refresh(
+        store,
+        failed_provider,
+        trade_date=date(2026, 8, 11),
+        required_symbols={"sh.600000"},
+    )
+
+    assert failed.status == "partial"
+    assert "missing_adjust_factor:sh.600000" in failed.quality_issues
+    assert store.published_refresh().model_dump(mode="json") == pointer_before
+    assert (dataset_root / "manifest.json").read_bytes() == manifest_before
+    assert {path: (dataset_root / path).read_bytes() for path in objects_before} == objects_before
 
 
 def test_history_is_queryable_by_date_and_exports_one_parquet_partition(tmp_path: Path) -> None:
