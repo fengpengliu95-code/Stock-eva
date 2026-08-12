@@ -10,6 +10,30 @@
 
 ---
 
+## Delivery status
+
+**Status:** OFFLINE CODE GO at exact code HEAD
+`b0b643fd78b1b0be27279cbd3380268577408c85`. Real provider canary, installation and
+production execution remain blocked. See
+[the R2-F0.1 acceptance record](../acceptance/release-2-r2f0-1.md).
+
+| Task | Status | Commit/evidence boundary |
+| --- | --- | --- |
+| 1 — Transport contracts | Complete | `38cd048` |
+| 2 — Pinned checked transport | Complete | `f1a4b68` |
+| 3 — Endpoint/pagination integrity | Complete | `954a5eb`; review closure `5307645` |
+| 4 — Persistent circuit state | Complete | `fd2011a` |
+| 5 — Health-aware scheduler | Complete | `40fdd3d` |
+| 6 — Write-free diagnostic canary | Complete | `577421c` |
+| Review remediation | Complete | `23f8d1c`, `50df62c`, `3db5d64`, `2e289d1`, `b0b643f` |
+| 7 — Offline acceptance | Complete | This documentation closure; evaluated code HEAD is the exact `b0b643f…` above. |
+
+The next implementation stage is **Gap Scanner + Health-aware Repair Queue**, and it may begin
+only after a new explicit user confirmation. The later provider-neutral RAW Evidence Framework,
+second-source shadow qualification and failover work remain deferred.
+
+---
+
 ### Task 1: Freeze transport contracts and reproduce unsafe SDK behavior
 
 **Files:**

@@ -19,8 +19,18 @@ Ruff, macOS LaunchAgents, optional provider SDK/HTTP adapters selected only afte
 **Authoritative roadmap:**
 `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-roadmap.md`
 
-**Planning status:** Approved plan only. No R2-F implementation, deployment, provider purchase,
-credential creation, network canary or production repair is authorized by this document alone.
+**Planning status:** R2-F0.1 is OFFLINE CODE GO at exact code HEAD
+`b0b643fd78b1b0be27279cbd3380268577408c85`; this document still authorizes no deployment,
+provider purchase, credential creation, network canary or production repair. R2-F0 remains
+production NO-GO. See
+[R2-F0.1 acceptance](../acceptance/release-2-r2f0-1.md) and
+[R2-F0 incident acceptance](../acceptance/release-2-r2f0.md).
+
+**Next confirmation gate:** Gap Scanner + Health-aware Repair Queue is the next code stage and may
+start only after explicit user confirmation. Provider-neutral RAW Evidence Framework follows it;
+then a second source must pass at least 20 consecutive trading sessions of whole-session shadow
+qualification. Do not mix providers by symbol, and keep automatic failover disabled until shadow,
+qualification and a separately approved manual failover stage are complete.
 
 ---
 

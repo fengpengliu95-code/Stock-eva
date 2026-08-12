@@ -2,7 +2,8 @@
 
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
-**Status:** Approved for implementation planning; implementation has not started  
+**Status:** R2-F0.1 offline code gate complete; deployment and R2-F0 production gate remain closed
+
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
 **Detailed execution plan:**
@@ -26,6 +27,21 @@ but it does not erase completed work or rewrite old acceptance evidence.
   independently re-accepted against the reliable-data foundation.
 - This document supersedes only the Release 2 sequencing in
   `docs/plans/2026-07-29-stock-eva-roadmap-execution-plan.md`.
+
+### 2026-08-13 status checkpoint
+
+- R2-F0.1 provider transport stabilization is **OFFLINE CODE GO** only at exact code HEAD
+  `b0b643fd78b1b0be27279cbd3380268577408c85`; see
+  [its acceptance record](../acceptance/release-2-r2f0-1.md).
+- This does not close the R2-F0 production incident. R2-F0 remains production NO-GO under
+  [the incident record](../acceptance/release-2-r2f0.md).
+- Installation, real provider canary, production refresh, NAS/pointer mutation and restoration of
+  automatic refresh all require separate approval and fresh live-state evidence.
+- The next code stage is **Gap Scanner + Health-aware Repair Queue**, only after explicit user
+  confirmation. It precedes the provider-neutral RAW Evidence Framework and second-source work.
+- Multi-provider failover stays disabled. A second source must first complete at least 20
+  consecutive trading sessions of whole-session shadow qualification; symbol-level mixing remains
+  prohibited, and failover requires a separately approved manual qualification/failover stage.
 
 ## 2. Verified baseline on 2026-08-12
 
