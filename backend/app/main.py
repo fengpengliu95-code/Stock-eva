@@ -105,6 +105,7 @@ async def lifespan(_: FastAPI):
             min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
             socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
         ),
+        health_store=health_store,
     )
 
     def execute_calendar_plan(plan):

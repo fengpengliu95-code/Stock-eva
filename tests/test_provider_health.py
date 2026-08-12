@@ -150,6 +150,16 @@ def test_sqlite_audit_round_trip_uses_only_explicit_safe_columns(tmp_path: Path)
         assert forbidden not in serialized_schema
 
 
+def test_operation_stage_round_trips_without_a_schema_change(tmp_path: Path) -> None:
+    store = SQLiteProviderHealthStore(tmp_path / "provider-health.sqlite3")
+    store.initialize()
+    item = observation(stage=ProtocolStage.OPERATION, error=None)
+
+    store.record_observation(item)
+
+    assert store.list_observations() == [item]
+
+
 def test_sqlite_initialize_is_additive_idempotent_and_restart_safe(tmp_path: Path) -> None:
     path = tmp_path / "provider-health.sqlite3"
     connection = sqlite3.connect(path)
@@ -415,6 +425,78 @@ def test_provider_allows_only_one_cross_endpoint_probe_and_releases_expired_leas
     assert replacement.endpoint == loser_endpoint
     assert replacement.lease_id != winner.lease_id
     assert first.endpoint_health(winner.endpoint).state == CircuitState.OPEN
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_health_read_atomically_reaps_expired_probe_before_next_acquire(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    first = make_store(
+        kind,
+        tmp_path,
+        clock,
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=10,
+    )
+    endpoint = ProviderEndpoint.ALL_STOCK
+    open_endpoint(first, endpoint)
+    clock.advance(60)
+    assert first.acquire_probe(endpoint, owner="crashed-worker") is not None
+    clock.advance(11)
+    restarted = (
+        SQLiteProviderHealthStore(
+            tmp_path / "provider-health.sqlite3",
+            failure_threshold=1,
+            cooldown_seconds=60,
+            probe_lease_seconds=10,
+            clock=clock,
+        )
+        if kind == "sqlite"
+        else first
+    )
+    restarted.initialize()
+
+    assert restarted.provider_health().state == CircuitState.OPEN
+    assert restarted.endpoint_health(endpoint).state == CircuitState.OPEN
+    lease = restarted.acquire_probe(endpoint, owner="replacement-worker")
+    assert lease is not None
+    assert lease.owner == "replacement-worker"
+
+
+def test_sqlite_restart_reclaims_expired_probe_with_one_concurrent_winner(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    path = tmp_path / "provider-health.sqlite3"
+    options = {
+        "failure_threshold": 1,
+        "cooldown_seconds": 60,
+        "probe_lease_seconds": 10,
+        "clock": clock,
+    }
+    crashed = SQLiteProviderHealthStore(path, **options)
+    crashed.initialize()
+    endpoint = ProviderEndpoint.INDEX_HISTORY
+    open_endpoint(crashed, endpoint)
+    clock.advance(60)
+    assert crashed.acquire_probe(endpoint, owner="crashed-process") is not None
+    clock.advance(11)
+    stores = [SQLiteProviderHealthStore(path, **options) for _ in range(2)]
+    for store in stores:
+        store.initialize()
+    barrier = threading.Barrier(2)
+
+    def acquire(index: int):
+        barrier.wait()
+        return stores[index].acquire_probe(endpoint, owner=f"replacement-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leases = list(executor.map(acquire, range(2)))
+
+    assert len([lease for lease in leases if lease is not None]) == 1
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])

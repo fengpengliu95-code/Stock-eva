@@ -70,7 +70,7 @@ class EmittingProvider:
                 if endpoint == type(self).fail_endpoint:
                     emit_terminal_observation(
                         started_at=0.0,
-                        protocol_stage=ProtocolStage.RECEIVE,
+                        protocol_stage=ProtocolStage.OPERATION,
                         recv_calls=1,
                         response_bytes=0,
                         end_marker_seen=False,
@@ -82,7 +82,7 @@ class EmittingProvider:
                     raise RuntimeError("raw provider failure SELECT * FROM secrets")
                 emit_terminal_observation(
                     started_at=0.0,
-                    protocol_stage=ProtocolStage.COMPLETE,
+                    protocol_stage=ProtocolStage.OPERATION,
                     recv_calls=1,
                     response_bytes=32,
                     end_marker_seen=True,
@@ -168,6 +168,33 @@ def test_plan_is_fixed_order_and_does_not_inspect_roots_or_construct_provider(
     assert report.refresh_triggered is False
     assert not control.exists()
     assert not data.exists()
+
+
+@pytest.mark.parametrize(
+    ("stock_symbol", "index_symbol"),
+    [
+        ("sh.000001", "sh.000001"),
+        ("sz.399001", "sh.000001"),
+        ("sh.600000", "sh.600000"),
+        ("sh.600000", "sz.000001"),
+    ],
+)
+def test_plan_rejects_swapped_or_unsupported_symbol_roles_without_exposing_values(
+    tmp_path: Path,
+    stock_symbol: str,
+    index_symbol: str,
+) -> None:
+    with pytest.raises(ProviderCanaryError) as captured:
+        plan_provider_canary(
+            trade_date=TRADE_DATE,
+            stock_symbol=stock_symbol,
+            index_symbol=index_symbol,
+            control_root=tmp_path / "control",
+            data_root=tmp_path / "data",
+        )
+
+    assert stock_symbol not in str(captured.value)
+    assert index_symbol not in str(captured.value)
 
 
 def test_complete_canary_uses_independent_single_attempt_providers_and_changes_nothing(
@@ -484,6 +511,40 @@ def test_cli_provider_failure_and_invalid_arguments_never_leak_input_or_sdk_outp
     }
     assert "private-token" not in invalid.out
     assert invalid.err == ""
+
+
+def test_cli_help_describes_six_probes_actual_requests_and_snapshot_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "provider-canary", "--help"])
+
+    with pytest.raises(SystemExit) as captured:
+        cli.main()
+
+    assert captured.value.code == 0
+    help_text = capsys.readouterr().out.lower()
+    normalized_help = " ".join(help_text.split())
+    assert "six independent endpoint probes" in normalized_help
+    assert "actual requests" in normalized_help
+    assert "before/after snapshot equality" in normalized_help
+    assert "not an os proof" in normalized_help
+
+
+def test_manual_refresh_help_declares_operator_override_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "refresh", "--help"])
+
+    with pytest.raises(SystemExit) as captured:
+        cli.main()
+
+    assert captured.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.lower().split())
+    assert "manual operator override" in help_text
+    assert "not provider-health-gated" in help_text
+    assert "audit the circuit state" in help_text
 
 
 def test_transport_report_contains_only_allowlisted_fields(tmp_path: Path) -> None:

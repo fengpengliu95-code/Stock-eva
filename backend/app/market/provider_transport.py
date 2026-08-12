@@ -45,6 +45,7 @@ class ProtocolStage(StrEnum):
     DECOMPRESS = "decompress"
     PAGINATION = "pagination"
     PROVIDER_STATUS = "provider_status"
+    OPERATION = "operation"
     COMPLETE = "complete"
 
 

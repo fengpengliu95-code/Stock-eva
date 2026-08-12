@@ -12,10 +12,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market.baostock import INDEX_SYMBOLS, _is_main_board
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.provider_health import InMemoryProviderHealthStore
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
+    ProtocolStage,
     ProviderEndpoint,
     TransportObservation,
     TransportOutcome,
@@ -125,7 +127,9 @@ def _validate_request(
         raise ProviderCanaryError("FILESYSTEM_UNSAFE")
     if _SAFE_SYMBOL.fullmatch(stock_symbol) is None:
         raise ProviderCanaryError("FILESYSTEM_UNSAFE")
-    if _SAFE_SYMBOL.fullmatch(index_symbol) is None:
+    if stock_symbol in INDEX_SYMBOLS or not _is_main_board(stock_symbol):
+        raise ProviderCanaryError("FILESYSTEM_UNSAFE")
+    if _SAFE_SYMBOL.fullmatch(index_symbol) is None or index_symbol not in INDEX_SYMBOLS:
         raise ProviderCanaryError("FILESYSTEM_UNSAFE")
 
 
@@ -277,19 +281,26 @@ def _endpoint_report(
     observations: tuple[TransportObservation, ...],
     error: Exception | None,
 ) -> ProviderCanaryEndpointReport:
+    operation_observations = tuple(
+        item for item in observations if item.protocol_stage == ProtocolStage.OPERATION
+    )
     normalized_error = next(
-        (
-            item.normalized_error
-            for item in reversed(observations)
-            if item.outcome == TransportOutcome.ERROR and item.normalized_error is not None
-        ),
+        (item.normalized_error for item in reversed(observations) if item.normalized_error),
         None,
     )
     if error is not None and normalized_error is None:
         normalized_error = _normalized_exception(error)
-    session_ids = _unique_values([item.provider_session_id for item in observations])
-    request_ids = _unique_values([item.request_id for item in observations])
-    if error is None and normalized_error is None and observations and len(session_ids) == 1:
+    session_ids = _unique_values([item.provider_session_id for item in operation_observations])
+    request_ids = _unique_values([item.request_id for item in operation_observations])
+    valid_success = (
+        error is None
+        and normalized_error is None
+        and bool(operation_observations)
+        and len(session_ids) == 1
+        and all(item.attempt == 1 for item in operation_observations)
+        and any(item.outcome == TransportOutcome.SUCCESS for item in operation_observations)
+    )
+    if valid_success:
         outcome: EndpointCanaryOutcome = TransportOutcome.SUCCESS
     else:
         outcome = TransportOutcome.ERROR

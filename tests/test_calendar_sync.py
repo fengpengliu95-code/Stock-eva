@@ -1,22 +1,39 @@
 import asyncio
 import json
 import sys
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 
 import backend.app.cli as cli
 from backend.app.api.market import get_calendar_sync_store, get_market_store
 from backend.app.config import Settings
 from backend.app.main import app
+from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.calendar_sync import (
     CalendarSyncPolicy,
     CalendarSyncService,
     CalendarSyncStore,
     run_calendar_sync_loop,
+)
+from backend.app.market.provider_health import (
+    CircuitState,
+    InMemoryProviderHealthStore,
+    ProviderHealthError,
+    SQLiteProviderHealthStore,
+)
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProtocolStage,
+    ProviderEndpoint,
+    provider_session_scope,
+    refresh_scope,
+    request_scope,
 )
 from backend.app.market.store import MarketStore
 
@@ -50,6 +67,27 @@ class CalendarProvider:
     def trading_dates(self, start_date: date, end_date: date) -> list[date]:
         self.calls.append((start_date, end_date))
         return [item for item in self.sessions if start_date <= item <= end_date]
+
+
+class ObservedCalendarProvider(CalendarProvider):
+    @contextmanager
+    def refresh_operation(self, refresh_id: str):
+        with refresh_scope(refresh_id):
+            yield
+
+    def trading_dates(self, start_date: date, end_date: date) -> list[date]:
+        with provider_session_scope("calendar-session"):
+            with request_scope(ProviderEndpoint.TRADE_DATES, attempt=1):
+                emit_terminal_observation(
+                    started_at=0,
+                    protocol_stage=ProtocolStage.OPERATION,
+                    recv_calls=1,
+                    response_bytes=32,
+                    end_marker_seen=True,
+                    provider_code="0",
+                    normalized_error=None,
+                )
+        return super().trading_dates(start_date, end_date)
 
 
 def test_calendar_sync_schedule_has_monthly_full_startup_and_1630_light() -> None:
@@ -290,6 +328,134 @@ def test_provider_failure_is_audited_once_and_preserves_last_known_good(
     )
 
 
+def test_calendar_execute_is_skipped_while_provider_circuit_is_not_closed(
+    tmp_path: Path,
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    provider = ObservedCalendarProvider([date(2026, 7, 24)])
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    health.record_terminal_failure(
+        "open-calendar",
+        ProviderEndpoint.TRADE_DATES,
+        NormalizedTransportError.RECV_TIMEOUT,
+    )
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        provider,
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "skipped_circuit_open"
+    assert provider.calls == []
+    assert store.state().last_attempt_at is None
+
+
+def test_calendar_terminal_observation_updates_breaker_before_calendar_state_save(
+    tmp_path: Path,
+) -> None:
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    provider = ObservedCalendarProvider([date(2026, 7, 24)])
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        provider,
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    assert service.execute(plan).status == "ready"
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).consecutive_failures == 0
+    assert len(health.list_observations()) == 1
+
+    class FailingObservedProvider(ObservedCalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            with provider_session_scope("failed-calendar-session"):
+                with request_scope(ProviderEndpoint.TRADE_DATES, attempt=2):
+                    emit_terminal_observation(
+                        started_at=0,
+                        protocol_stage=ProtocolStage.OPERATION,
+                        recv_calls=1,
+                        response_bytes=0,
+                        end_marker_seen=False,
+                        provider_code=None,
+                        normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+                    )
+            raise OSError("private-token raw calendar failure")
+
+    failed_store = CalendarSyncStore(tmp_path / "failed-calendar.sqlite3")
+    failed_service = CalendarSyncService(
+        failed_store,
+        synthetic_calendar(),
+        FailingObservedProvider([]),
+        health_store=health,
+    )
+    failed = failed_service.execute(
+        failed_service.plan(
+            now=datetime(2026, 7, 25, 16, 30, tzinfo=SHANGHAI),
+            mode="light",
+        )
+    )
+    assert failed.status == "error"
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+    assert failed_store.run(failed.run_id).status == "error"
+
+
+def test_calendar_health_audit_failure_prevents_calendar_state_write(tmp_path: Path) -> None:
+    class FailingAudit(InMemoryProviderHealthStore):
+        def record_observation(self, observation) -> None:
+            del observation
+            raise ProviderHealthError("token=/private/provider-health.sqlite3")
+
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        ObservedCalendarProvider([date(2026, 7, 24)]),
+        health_store=FailingAudit(),
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    with pytest.raises(ProviderHealthError):
+        service.execute(plan)
+
+    assert store.state().last_attempt_at is None
+
+
+def test_calendar_success_without_operation_observation_fails_closed(tmp_path: Path) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        CalendarProvider([date(2026, 7, 24)]),
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    with pytest.raises(ProviderHealthError, match="audit is incomplete"):
+        service.execute(plan)
+
+    assert store.state().last_attempt_at is None
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+
+
 def test_calendar_loop_checks_startup_then_daily_slot(tmp_path: Path) -> None:
     store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
     provider = CalendarProvider([date(2026, 7, 24)])
@@ -355,6 +521,77 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
     assert payload["network_requests"] == 0
     assert payload["execute_requires"] == "--execute"
     assert not (settings.local_control_dir / settings.calendar_sync_database_name).exists()
+    assert not (settings.local_control_dir / settings.provider_health_database_name).exists()
+
+
+def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+        provider_circuit_failure_threshold=1,
+    )
+    health = SQLiteProviderHealthStore(
+        settings.local_control_dir / settings.provider_health_database_name,
+        failure_threshold=1,
+        cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+        probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+    )
+    health.initialize()
+    health.record_terminal_failure(
+        "open-cli-calendar",
+        ProviderEndpoint.TRADE_DATES,
+        NormalizedTransportError.RECV_TIMEOUT,
+    )
+    calls = 0
+
+    class NoCallProvider:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def trading_dates(self, *_args) -> list[date]:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("open circuit must skip calendar provider")
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "BaoStockProvider", NoCallProvider)
+    monkeypatch.setattr(
+        cli,
+        "get_market_clock",
+        lambda: lambda: datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "calendar-sync",
+            "--mode",
+            "light",
+            "--start",
+            "2026-07-24",
+            "--end",
+            "2026-07-24",
+            "--execute",
+        ],
+    )
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "skipped_circuit_open"
+    assert payload["writes_calendar_state"] is False
+    assert calls == 0
 
 
 def test_market_status_exposes_calendar_maintenance_without_client_input(

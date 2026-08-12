@@ -757,6 +757,25 @@ def test_timeout_closes_socket_relogs_and_retries_with_same_bound() -> None:
     assert client.sockets[0].shutdown_calls == 1
 
 
+def test_logical_read_emits_only_final_operation_success_after_recovered_retry() -> None:
+    client = RecoveringSocketClient(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+
+    with transport_observation_sink(observations.append):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
+
+    operations = [
+        item
+        for item in observations
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert len(operations) == 1
+    assert operations[0].attempt == 2
+    assert operations[0].normalized_error is None
+
+
 class ContinueAfterFailureClient(RecoveringSocketClient):
     def __init__(self, payload) -> None:
         super().__init__(payload)
@@ -796,6 +815,26 @@ def test_exhausted_symbol_is_missing_and_next_symbol_uses_fresh_session() -> Non
     assert all(item.timeout == 9 for item in client.sockets)
     assert all(item.closed for item in client.sockets)
     assert client.logout_calls == 1
+
+
+def test_exhausted_logical_read_error_survives_later_same_endpoint_success() -> None:
+    client = ContinueAfterFailureClient(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+
+    with transport_observation_sink(observations.append):
+        provider.fetch(date(2026, 7, 23), symbols=["sh.600000", "sz.000001"])
+
+    operations = [
+        item
+        for item in observations
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert [(item.attempt, item.normalized_error) for item in operations] == [
+        (2, NormalizedTransportError.PROTOCOL_ERROR),
+        (1, None),
+    ]
 
 
 class InterruptingClient(RecoveringSocketClient):
@@ -1041,6 +1080,34 @@ def test_each_public_operation_owns_one_fresh_refresh_scope() -> None:
 
     assert len({scopes[0].refresh_id for scopes in operation_scopes}) == 3
     assert len({scopes[0].provider_session_id for scopes in operation_scopes}) == 3
+
+
+@pytest.mark.parametrize("stock_symbol", ["sh.000001", "sz.399001"])
+def test_probe_endpoint_enforces_distinct_supported_stock_and_index_roles(
+    stock_symbol: str,
+) -> None:
+    provider = BaoStockProvider(client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())))
+
+    with pytest.raises(BaoStockSessionStateError, match="symbol is invalid"):
+        provider.probe_endpoint(
+            ProviderEndpoint.ADJUST_FACTOR,
+            trade_date=date(2026, 7, 23),
+            stock_symbol=stock_symbol,
+            index_symbol="sh.000001",
+        )
+
+
+@pytest.mark.parametrize("index_symbol", ["sh.600000", "sz.000001"])
+def test_probe_endpoint_rejects_unsupported_index_symbol(index_symbol: str) -> None:
+    provider = BaoStockProvider(client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())))
+
+    with pytest.raises(BaoStockSessionStateError, match="symbol is invalid"):
+        provider.probe_endpoint(
+            ProviderEndpoint.INDEX_HISTORY,
+            trade_date=date(2026, 7, 23),
+            stock_symbol="sh.600000",
+            index_symbol=index_symbol,
+        )
 
 
 class ScopedRetryClient(RecoveringSocketClient):
@@ -1403,12 +1470,17 @@ def test_pagination_guard_emits_one_sanitized_terminal_observation(
     ):
         provider._read(ProviderEndpoint.ALL_STOCK, lambda: result)
 
-    assert len(observations) == 1
+    assert [item.protocol_stage for item in observations] == [
+        ProtocolStage.PAGINATION,
+        ProtocolStage.OPERATION,
+    ]
     observation = observations[0]
     assert observation.endpoint == ProviderEndpoint.ALL_STOCK
     assert observation.page == expected_page
     assert observation.protocol_stage == ProtocolStage.PAGINATION
     assert observation.normalized_error == normalized_error
+    assert observations[1].page == 1
+    assert observations[1].normalized_error == normalized_error
     serialized = observation.model_dump_json()
     assert "private-token" not in serialized
     assert "raw-provider-response" not in serialized
@@ -1464,10 +1536,12 @@ def test_successful_page_socket_observation_is_distinct_from_pagination_failure(
     assert [item.protocol_stage for item in observations] == [
         ProtocolStage.COMPLETE,
         ProtocolStage.PAGINATION,
+        ProtocolStage.OPERATION,
     ]
     assert observations[0].request_id == observations[1].request_id
     assert observations[0].page == observations[1].page == 2
     assert observations[1].normalized_error == NormalizedTransportError.PAGINATION_STALLED
+    assert observations[2].normalized_error == NormalizedTransportError.PAGINATION_STALLED
     assert "private-token-pagination-request" not in json.dumps(
         [item.model_dump(mode="json") for item in observations]
     )

@@ -13,6 +13,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
@@ -20,11 +21,42 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field
 
 from backend.app.market.baostock import BaoStockError
+from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
+from backend.app.market.provider_health import CircuitState, ProviderHealthError
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProtocolStage,
+    ProviderEndpoint,
+    TransportObservation,
+)
 
 SyncMode = Literal["full", "light"]
 SyncAction = Literal["full", "light", "none"]
-SyncStatus = Literal["ready", "observed_only", "quarantined", "error"]
+SyncStatus = Literal[
+    "ready",
+    "observed_only",
+    "quarantined",
+    "error",
+    "skipped_circuit_open",
+]
+_TRANSPORT_ERROR_PRIORITY = {
+    error: position
+    for position, error in enumerate(
+        (
+            NormalizedTransportError.RATE_LIMIT,
+            NormalizedTransportError.CONNECT_ERROR,
+            NormalizedTransportError.SEND_ERROR,
+            NormalizedTransportError.RECV_TIMEOUT,
+            NormalizedTransportError.EOF,
+            NormalizedTransportError.SHORT_HEADER,
+            NormalizedTransportError.BAD_COMPRESSION,
+            NormalizedTransportError.PAGINATION_STALLED,
+            NormalizedTransportError.UNKNOWN_PROVIDER_PROTOCOL_ERROR,
+            NormalizedTransportError.PROTOCOL_ERROR,
+        )
+    )
+}
 
 
 class TradingDateProvider(Protocol):
@@ -433,11 +465,13 @@ class CalendarSyncService:
         provider: TradingDateProvider | None,
         *,
         clock: Callable[[], datetime] | None = None,
+        health_store=None,
     ) -> None:
         self.store = store
         self.calendar = calendar
         self.provider = provider
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.health_store = health_store
         self.policy = CalendarSyncPolicy()
 
     def plan(
@@ -518,12 +552,51 @@ class CalendarSyncService:
         if self.provider is None:
             raise RuntimeError("calendar sync execution requires a provider")
         fetched_at = self.clock().astimezone(UTC)
+        run_id = uuid.uuid4().hex
+        if (
+            self.health_store is not None
+            and self.health_store.provider_health().state != CircuitState.CLOSED
+        ):
+            return CalendarSyncResult(
+                run_id=run_id,
+                mode=plan.mode,
+                status="skipped_circuit_open",
+                range_start=plan.range_start,
+                range_end=plan.range_end,
+                fetched_at=fetched_at,
+                completed_at=self.clock().astimezone(UTC),
+                observed_open_count=0,
+                authority_checksum=plan.authority_checksum,
+            )
+        observations: list[TransportObservation] = []
+
+        def record_observation(observation: TransportObservation) -> None:
+            if observation.refresh_id != run_id:
+                raise ProviderHealthError("calendar provider observation scope does not match")
+            assert self.health_store is not None
+            self.health_store.record_observation(observation)
+            observations.append(observation)
+
+        refresh_operation = getattr(self.provider, "refresh_operation", None)
+        provider_scope = refresh_operation(run_id) if callable(refresh_operation) else nullcontext()
         try:
-            provider_open = set(self.provider.trading_dates(plan.range_start, plan.range_end))
+            if self.health_store is None:
+                provider_open = set(self.provider.trading_dates(plan.range_start, plan.range_end))
+            else:
+                with transport_observation_sink(record_observation), provider_scope:
+                    provider_open = set(
+                        self.provider.trading_dates(plan.range_start, plan.range_end)
+                    )
         except (BaoStockError, TimeoutError, OSError):
+            if self.health_store is not None:
+                self._resolve_calendar_transport(
+                    run_id,
+                    observations,
+                    provider_succeeded=False,
+                )
             completed_at = self.clock().astimezone(UTC)
             result = CalendarSyncResult(
-                run_id=uuid.uuid4().hex,
+                run_id=run_id,
                 mode=plan.mode,
                 status="error",
                 range_start=plan.range_start,
@@ -541,6 +614,12 @@ class CalendarSyncService:
                 next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
             )
             return result
+        if self.health_store is not None:
+            self._resolve_calendar_transport(
+                run_id,
+                observations,
+                provider_succeeded=True,
+            )
         invalid = [
             item for item in provider_open if item < plan.range_start or item > plan.range_end
         ]
@@ -576,7 +655,7 @@ class CalendarSyncService:
             "quarantined" if conflicts else "ready" if confirmed_count else "observed_only"
         )
         result = CalendarSyncResult(
-            run_id=uuid.uuid4().hex,
+            run_id=run_id,
             mode=plan.mode,
             status=status,
             range_start=plan.range_start,
@@ -595,6 +674,38 @@ class CalendarSyncService:
             next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
         )
         return result
+
+    def _resolve_calendar_transport(
+        self,
+        run_id: str,
+        observations: list[TransportObservation],
+        *,
+        provider_succeeded: bool,
+    ) -> None:
+        assert self.health_store is not None
+        operations = [
+            item
+            for item in observations
+            if item.endpoint == ProviderEndpoint.TRADE_DATES
+            and item.protocol_stage == ProtocolStage.OPERATION
+        ]
+        errors = [item.normalized_error for item in operations if item.normalized_error is not None]
+        if errors:
+            self.health_store.record_terminal_failure(
+                run_id,
+                ProviderEndpoint.TRADE_DATES,
+                max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__),
+            )
+        elif operations:
+            self.health_store.record_terminal_success(run_id, ProviderEndpoint.TRADE_DATES)
+        else:
+            self.health_store.record_terminal_failure(
+                run_id,
+                ProviderEndpoint.TRADE_DATES,
+                NormalizedTransportError.PROTOCOL_ERROR,
+            )
+            if provider_succeeded:
+                raise ProviderHealthError("calendar provider audit is incomplete")
 
 
 async def run_calendar_sync_loop(

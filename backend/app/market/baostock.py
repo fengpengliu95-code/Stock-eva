@@ -129,13 +129,42 @@ def _pagination_protocol_error(
         provider_code=None,
         normalized_error=normalized_error,
     )
-    return BaoStockTransportError(
+    error = BaoStockTransportError(
         message,
         failure=MarketFailure(
             failure_stage="fetch",
             failure_class="transport_connect",
             retryable=True,
         ),
+    )
+    error.normalized_error = normalized_error
+    return error
+
+
+def _normalized_operation_error(error: BaseException) -> NormalizedTransportError:
+    candidate = getattr(error, "normalized_error", None)
+    if isinstance(candidate, NormalizedTransportError):
+        return candidate
+    if isinstance(error, TimeoutError):
+        return NormalizedTransportError.RECV_TIMEOUT
+    failure = getattr(error, "failure", None)
+    failure_class = getattr(failure, "failure_class", None)
+    if failure_class == "transport_timeout":
+        return NormalizedTransportError.RECV_TIMEOUT
+    if failure_class == "rate_limit":
+        return NormalizedTransportError.RATE_LIMIT
+    return NormalizedTransportError.PROTOCOL_ERROR
+
+
+def _emit_operation_outcome(error: BaseException | None = None) -> None:
+    emit_terminal_observation(
+        started_at=monotonic(),
+        protocol_stage=ProtocolStage.OPERATION,
+        recv_calls=0,
+        response_bytes=0,
+        end_marker_seen=False,
+        provider_code=None,
+        normalized_error=(_normalized_operation_error(error) if error is not None else None),
     )
 
 
@@ -666,9 +695,13 @@ class BaoStockProvider:
     ) -> None:
         if not isinstance(endpoint, ProviderEndpoint):
             raise BaoStockSessionStateError("BaoStock probe endpoint is invalid")
-        if endpoint == ProviderEndpoint.ADJUST_FACTOR and not _safe_probe_symbol(stock_symbol):
+        if endpoint == ProviderEndpoint.ADJUST_FACTOR and not (
+            _safe_probe_symbol(stock_symbol)
+            and stock_symbol not in INDEX_SYMBOLS
+            and _is_main_board(stock_symbol)
+        ):
             raise BaoStockSessionStateError("BaoStock probe symbol is invalid")
-        if endpoint == ProviderEndpoint.INDEX_HISTORY and not _safe_probe_symbol(index_symbol):
+        if endpoint == ProviderEndpoint.INDEX_HISTORY and index_symbol not in INDEX_SYMBOLS:
             raise BaoStockSessionStateError("BaoStock probe symbol is invalid")
         iso_date = trade_date.isoformat()
         operations = {
@@ -885,9 +918,9 @@ class BaoStockProvider:
                 self._ensure_session(endpoint)
                 self._pace_request()
                 try:
+                    with self._request_scope(endpoint, attempt=attempt, page=1):
 
-                    def read_attempt(attempt=attempt):
-                        with self._request_scope(endpoint, attempt=attempt, page=1):
+                        def read_attempt(attempt=attempt):
                             result = operation()
                             return _read_result(
                                 result,
@@ -899,10 +932,20 @@ class BaoStockProvider:
                                 ),
                             )
 
-                    return self._run_with_deadline(
-                        read_attempt,
-                        operation_name="request",
-                    )
+                        try:
+                            result = self._run_with_deadline(
+                                read_attempt,
+                                operation_name="request",
+                            )
+                        except (BaoStockError, TimeoutError, OSError) as exc:
+                            if attempt == self.max_attempts and isinstance(
+                                endpoint, ProviderEndpoint
+                            ):
+                                _emit_operation_outcome(exc)
+                            raise
+                        if isinstance(endpoint, ProviderEndpoint):
+                            _emit_operation_outcome()
+                        return result
                 except _OperationDeadlineUnavailable:
                     raise
                 except (BaoStockError, TimeoutError, OSError) as exc:

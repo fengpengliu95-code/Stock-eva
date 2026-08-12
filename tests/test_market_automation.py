@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +19,7 @@ import backend.app.cli as cli
 from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
-from backend.app.market.baostock import ProviderBatch
+from backend.app.market.baostock import BaoStockProvider, ProviderBatch
 from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
@@ -44,6 +45,7 @@ from backend.app.orchestration.after_close import (
     StrategyWorkItem,
 )
 from backend.app.regime.snapshots import RegimeSnapshotUnavailable
+from tests.test_baostock_provider import FIXTURE_PATH, ContinueAfterFailureClient, FakeBaoStock
 from tests.test_market_data import fixture_payload
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -256,6 +258,17 @@ class RecordingProbeRunner:
             failure = RuntimeError("sanitized provider probe failure")
             failure.normalized_error = self.error
             raise failure
+        with refresh_scope(refresh_id), provider_session_scope("probe-session"):
+            with request_scope(endpoint, attempt=1, request_id="probe-request"):
+                emit_terminal_observation(
+                    started_at=monotonic(),
+                    protocol_stage=ProtocolStage.OPERATION,
+                    recv_calls=1,
+                    response_bytes=32,
+                    end_marker_seen=True,
+                    provider_code="0",
+                    normalized_error=None,
+                )
 
 
 class ScopedObservationProvider(CompleteProvider):
@@ -281,7 +294,7 @@ class ScopedObservationProvider(CompleteProvider):
         provider_session_id: str | None = None,
         attempt: int = 1,
         error: NormalizedTransportError | None = None,
-        stage: ProtocolStage = ProtocolStage.COMPLETE,
+        stage: ProtocolStage = ProtocolStage.OPERATION,
     ) -> None:
         with provider_session_scope(provider_session_id or f"session-{request_id}"):
             with request_scope(endpoint, attempt=attempt, request_id=request_id):
@@ -308,7 +321,7 @@ class ScopedObservationProvider(CompleteProvider):
                 ProviderEndpoint.ALL_STOCK,
                 request_id="fetch-failure",
                 error=self.fetch_error,
-                stage=ProtocolStage.PAGINATION,
+                stage=ProtocolStage.OPERATION,
             )
             raise MarketFailureError(
                 MarketFailure(
@@ -668,6 +681,51 @@ def test_successful_probe_waits_until_next_existing_slot_before_full_refresh(
     assert len(runner.calls) == 1
 
 
+def test_expired_half_open_from_crashed_process_is_reprobed_on_next_existing_slot(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    health_clock = HealthClock(now)
+    health_path = tmp_path / "provider-health.sqlite3"
+    crashed = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=10,
+        clock=health_clock,
+    )
+    crashed.initialize()
+    endpoint = ProviderEndpoint.TRADE_DATES
+    open_health_endpoint(crashed, endpoint, prefix="open")
+    health_clock.now += timedelta(seconds=60)
+    assert crashed.acquire_probe(endpoint, owner="crashed-process") is not None
+    health_clock.now += timedelta(seconds=11)
+    restarted = SQLiteProviderHealthStore(
+        health_path,
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=10,
+        clock=health_clock,
+    )
+    restarted.initialize()
+    runner = RecordingProbeRunner()
+    service = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        CompleteProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=set,
+        health_store=restarted,
+        probe_runner=runner,
+    )
+
+    outcome = service.run_due_once(now)
+
+    assert outcome.state.error_code == "PROVIDER_PROBE_SUCCEEDED"
+    assert len(runner.calls) == 1
+    assert restarted.endpoint_health(endpoint).state == CircuitState.CLOSED
+
+
 def test_formal_calendar_and_fetch_share_refresh_id_and_resolve_each_touched_endpoint_once(
     tmp_path: Path,
 ) -> None:
@@ -741,6 +799,122 @@ def test_socket_complete_cannot_override_later_terminal_endpoint_error(
     )
 
 
+def test_real_provider_exhausted_first_index_call_opens_breaker_despite_later_success(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+
+    class FirstIndexFails(ContinueAfterFailureClient):
+        def query_history_k_data_plus(self, code, fields, **kwargs):
+            self.history_calls[code] = self.history_calls.get(code, 0) + 1
+            if code == "sh.000001":
+                raise TimeoutError("synthetic exhausted first index")
+            return FakeBaoStock.query_history_k_data_plus(self, code, fields, **kwargs)
+
+    client = FirstIndexFails(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    health_store = InMemoryProviderHealthStore(failure_threshold=1)
+    service = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        provider,
+        synthetic_calendar(),
+        required_symbols=set,
+        health_store=health_store,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None and outcome.result.status == "partial"
+    assert health_store.endpoint_health(ProviderEndpoint.INDEX_HISTORY).state == CircuitState.OPEN
+    operations = [
+        item
+        for item in health_store.list_observations()
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert [(item.attempt, item.normalized_error) for item in operations] == [
+        (2, NormalizedTransportError.RECV_TIMEOUT),
+        (1, None),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "zero",
+        "wrong-endpoint",
+        "wrong-refresh",
+        "multiple-session",
+        "attempt-two",
+        "terminal-error-then-success",
+    ],
+)
+def test_probe_without_exact_matching_operation_success_reopens_circuit(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI)
+    health_clock = HealthClock(now)
+    health_store = InMemoryProviderHealthStore(
+        failure_threshold=1,
+        cooldown_seconds=60,
+        probe_lease_seconds=30,
+        clock=health_clock,
+    )
+    endpoint = ProviderEndpoint.ALL_STOCK
+    open_health_endpoint(health_store, endpoint, prefix="open")
+    health_clock.now += timedelta(seconds=60)
+
+    class InvalidRunner:
+        def run(self, leased_endpoint, *, trade_date, refresh_id) -> None:
+            del trade_date
+            if mode == "zero":
+                return
+            observed_endpoint = (
+                ProviderEndpoint.TRADE_DATES if mode == "wrong-endpoint" else leased_endpoint
+            )
+            observed_refresh = "wrong-refresh" if mode == "wrong-refresh" else refresh_id
+            sessions = ("one", "two") if mode == "multiple-session" else ("one",)
+            for session in sessions:
+                with refresh_scope(observed_refresh), provider_session_scope(session):
+                    with request_scope(
+                        observed_endpoint,
+                        attempt=2 if mode == "attempt-two" else 1,
+                    ):
+                        if mode == "terminal-error-then-success":
+                            emit_terminal_observation(
+                                started_at=monotonic(),
+                                protocol_stage=ProtocolStage.RECEIVE,
+                                recv_calls=1,
+                                response_bytes=0,
+                                end_marker_seen=False,
+                                provider_code=None,
+                                normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+                            )
+                        emit_terminal_observation(
+                            started_at=monotonic(),
+                            protocol_stage=ProtocolStage.OPERATION,
+                            recv_calls=1,
+                            response_bytes=32,
+                            end_marker_seen=True,
+                            provider_code="0",
+                            normalized_error=None,
+                        )
+
+    outcome = module.MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        CompleteProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=set,
+        health_store=health_store,
+        probe_runner=InvalidRunner(),
+    ).run_due_once(now)
+
+    assert outcome.state.error_code == "PROVIDER_PROBE_FAILED"
+    assert health_store.endpoint_health(endpoint).state == CircuitState.OPEN
+
+
 def test_recovered_internal_retry_records_one_final_endpoint_success(tmp_path: Path) -> None:
     module = load_module("backend.app.market.automation")
 
@@ -754,6 +928,7 @@ def test_recovered_internal_retry_records_one_final_endpoint_success(tmp_path: P
                 provider_session_id="failed-session",
                 attempt=1,
                 error=NormalizedTransportError.RECV_TIMEOUT,
+                stage=ProtocolStage.RECEIVE,
             )
             self._observe(
                 ProviderEndpoint.ALL_STOCK,
@@ -1321,6 +1496,58 @@ def test_auto_refresh_dry_run_reports_sanitized_provider_health_without_construc
     serialized = json.dumps(payload).lower()
     for forbidden in ("lease_id", "owner", "token", "raw", str(tmp_path).lower()):
         assert forbidden not in serialized
+
+
+def test_auto_refresh_dry_run_does_not_reap_or_write_expired_probe_lease(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "user_data_dir": tmp_path / "user",
+            "local_control_dir": tmp_path / "control",
+            "local_staging_dir": tmp_path / "staging",
+            "local_lock_dir": tmp_path / "locks",
+            "local_temp_dir": tmp_path / "tmp",
+            "nas_market_dataset_root": None,
+            "local_market_dataset_root": None,
+            "provider_circuit_failure_threshold": 1,
+            "provider_circuit_cooldown_seconds": 1,
+            "provider_circuit_probe_lease_seconds": 1,
+        }
+    )
+    old_clock = HealthClock(datetime(2020, 1, 1, tzinfo=UTC))
+    path = settings.local_control_dir / settings.provider_health_database_name
+    health = SQLiteProviderHealthStore(
+        path,
+        failure_threshold=1,
+        cooldown_seconds=1,
+        probe_lease_seconds=1,
+        clock=old_clock,
+    )
+    health.initialize()
+    open_health_endpoint(health, ProviderEndpoint.ALL_STOCK, prefix="expired")
+    old_clock.now += timedelta(seconds=1)
+    assert health.acquire_probe(ProviderEndpoint.ALL_STOCK, owner="crashed") is not None
+    before = path.read_bytes()
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once"])
+
+    assert cli.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["provider_health"]["state"] == "HALF_OPEN"
+    assert path.read_bytes() == before
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        state = connection.execute(
+            "SELECT state FROM endpoint_circuits WHERE endpoint = 'all_stock'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert state == "HALF_OPEN"
 
 
 def test_market_status_api_is_read_only_and_reports_capability(

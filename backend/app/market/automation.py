@@ -32,8 +32,10 @@ from backend.app.market.provider_health import (
 )
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
+    ProtocolStage,
     ProviderEndpoint,
     TransportObservation,
+    TransportOutcome,
 )
 from backend.app.market.store import MarketStore
 
@@ -183,18 +185,43 @@ class _RefreshObservationCollector:
         self,
         endpoint: ProviderEndpoint,
     ) -> NormalizedTransportError | None:
-        endpoint_observations = [item for item in self.observations if item.endpoint == endpoint]
+        endpoint_observations = [
+            item
+            for item in self.observations
+            if item.endpoint == endpoint and item.protocol_stage == ProtocolStage.OPERATION
+        ]
         if not endpoint_observations:
-            return None
-        final_session_id = endpoint_observations[-1].provider_session_id
+            return NormalizedTransportError.PROTOCOL_ERROR
         errors = [
             item.normalized_error
             for item in endpoint_observations
-            if item.provider_session_id == final_session_id and item.normalized_error is not None
+            if item.normalized_error is not None
         ]
         if not errors:
             return None
         return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
+
+    def probe_error(self, endpoint: ProviderEndpoint) -> NormalizedTransportError | None:
+        endpoint_observations = [item for item in self.observations if item.endpoint == endpoint]
+        operations = [
+            item for item in endpoint_observations if item.protocol_stage == ProtocolStage.OPERATION
+        ]
+        if not operations:
+            return NormalizedTransportError.PROTOCOL_ERROR
+        errors = [
+            item.normalized_error
+            for item in endpoint_observations
+            if item.normalized_error is not None
+        ]
+        if errors:
+            return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
+        if (
+            len({item.provider_session_id for item in operations}) != 1
+            or any(item.attempt != 1 for item in operations)
+            or not any(item.outcome == TransportOutcome.SUCCESS for item in operations)
+        ):
+            return NormalizedTransportError.PROTOCOL_ERROR
+        return None
 
     def resolve_touched_endpoints(self) -> None:
         if self._resolved:
@@ -747,13 +774,13 @@ class MarketAutomationService:
                     trade_date=target,
                     refresh_id=refresh_id,
                 )
-            normalized_error = collector.terminal_error(lease.endpoint)
+            normalized_error = collector.probe_error(lease.endpoint)
         except Exception as error:
             candidate = getattr(error, "normalized_error", None)
             normalized_error = (
                 candidate
                 if isinstance(candidate, NormalizedTransportError)
-                else collector.terminal_error(lease.endpoint)
+                else collector.probe_error(lease.endpoint)
                 or NormalizedTransportError.PROTOCOL_ERROR
             )
 

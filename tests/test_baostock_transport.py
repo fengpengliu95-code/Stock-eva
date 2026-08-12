@@ -793,10 +793,24 @@ def test_provider_deadline_emits_exactly_one_terminal_observation_and_keeps_lega
 
     assert caught.value.failure is not None
     assert caught.value.failure.failure_class == "transport_timeout"
-    assert len(observations) == 1
-    observation = observations[0]
+    socket_terminals = [
+        item for item in observations if item.protocol_stage != ProtocolStage.OPERATION
+    ]
+    operation_terminals = [
+        item for item in observations if item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert len(socket_terminals) == 1
+    observation = socket_terminals[0]
     assert observation.protocol_stage == expected_stage
     assert observation.normalized_error == expected_error
-    serialized = observation.model_dump_json() + str(caught.value)
+    if deadline_stage == "login-connect":
+        assert operation_terminals == []
+    else:
+        assert len(operation_terminals) == 1
+        operation = operation_terminals[0]
+        assert operation.normalized_error == NormalizedTransportError.RECV_TIMEOUT
+        assert operation.request_id == observation.request_id
+        assert operation.provider_session_id == observation.provider_session_id
+    serialized = "".join(item.model_dump_json() for item in observations) + str(caught.value)
     assert "private-token-deadline-request" not in serialized
     assert "raw exception" not in serialized

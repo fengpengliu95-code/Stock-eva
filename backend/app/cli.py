@@ -196,7 +196,14 @@ def _probe_timeout(seconds: int):
 def build_parser() -> argparse.ArgumentParser:
     parser = _SanitizedArgumentParser(description="Stock EVA after-close data tasks")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    refresh = subparsers.add_parser("refresh", help="refresh one completed trading date")
+    refresh = subparsers.add_parser(
+        "refresh",
+        help="refresh one completed trading date",
+        description=(
+            "Manual operator override for one completed trading date. This command is not "
+            "provider-health-gated; audit the circuit state before deployment use."
+        ),
+    )
     refresh.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
     target = refresh.add_mutually_exclusive_group(required=True)
     target.add_argument(
@@ -300,7 +307,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_canary = subparsers.add_parser(
         "provider-canary",
-        help="plan or explicitly run a write-free BaoStock endpoint diagnostic",
+        help=(
+            "plan or run six independent endpoint probes; reports actual requests and "
+            "before/after snapshot equality as zero-write evidence, not an OS proof"
+        ),
+        description=(
+            "Run six independent endpoint probes and report actual requests. Zero-write "
+            "evidence is before/after snapshot equality plus a static no-write path, not "
+            "an OS proof."
+        ),
     )
     provider_canary.add_argument(
         "--date",
@@ -328,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_canary.add_argument(
         "--acknowledge-provider-requests",
         action="store_true",
-        help="acknowledge six independent single-attempt provider requests",
+        help="acknowledge six independent endpoint probes and their reported actual requests",
     )
     calendar_sync = subparsers.add_parser(
         "calendar-sync",
@@ -865,16 +880,24 @@ def main() -> int:
                 )
             )
             return 0
-        provider = BaoStockProvider(
-            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
-            socket_timeout_seconds=socket_timeout_seconds,
-        )
         try:
+            calendar_health_store = SQLiteProviderHealthStore(
+                layout.provider_health_database,
+                failure_threshold=settings.provider_circuit_failure_threshold,
+                cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+                probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+            )
+            calendar_health_store.initialize()
+            provider = BaoStockProvider(
+                min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+                socket_timeout_seconds=socket_timeout_seconds,
+            )
             with RefreshRunLock(layout.market_refresh_lock):
                 result = CalendarSyncService(
                     calendar_store,
                     get_trading_calendar(),
                     provider,
+                    health_store=calendar_health_store,
                 ).execute(plan)
         except RefreshAlreadyRunning:
             print(
@@ -904,12 +927,12 @@ def main() -> int:
             json.dumps(
                 {
                     **result.model_dump(mode="json"),
-                    "writes_calendar_state": True,
+                    "writes_calendar_state": result.status != "skipped_circuit_open",
                 },
                 ensure_ascii=False,
             )
         )
-        return 1 if result.status == "quarantined" else 0
+        return 0 if result.status in {"ready", "observed_only"} else 1
     control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
@@ -1078,11 +1101,11 @@ def main() -> int:
                         layout.provider_health_database,
                         **health_options,
                     )
-                    provider_health = health_store.provider_health()
+                    provider_health = health_store.provider_health_snapshot()
                 else:
                     provider_health = InMemoryProviderHealthStore(
                         **health_options
-                    ).provider_health()
+                    ).provider_health_snapshot()
             except Exception:
                 print(
                     json.dumps(

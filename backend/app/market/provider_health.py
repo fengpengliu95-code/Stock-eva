@@ -226,6 +226,10 @@ class _ProviderHealthStore:
         endpoints = tuple(self.endpoint_health(endpoint) for endpoint in ProviderEndpoint)
         return _provider_health(endpoints)
 
+    def provider_health_snapshot(self) -> ProviderHealth:
+        """Return persisted state without reclaiming an expired probe lease."""
+        raise NotImplementedError
+
     def acquire_probe(self, endpoint: ProviderEndpoint, *, owner: str) -> ProbeLease | None:
         raise NotImplementedError
 
@@ -304,9 +308,18 @@ class InMemoryProviderHealthStore(_ProviderHealthStore):
     def endpoint_health(self, endpoint: ProviderEndpoint) -> EndpointHealth:
         endpoint = _require_market_endpoint(endpoint)
         with self._lock:
+            self._reap_expired_probes(_require_aware(self._clock()))
             return _health(endpoint, self._circuits[endpoint])
 
     def provider_health(self) -> ProviderHealth:
+        with self._lock:
+            self._reap_expired_probes(_require_aware(self._clock()))
+            endpoints = tuple(
+                _health(endpoint, self._circuits[endpoint]) for endpoint in ProviderEndpoint
+            )
+            return _provider_health(endpoints)
+
+    def provider_health_snapshot(self) -> ProviderHealth:
         with self._lock:
             endpoints = tuple(
                 _health(endpoint, self._circuits[endpoint]) for endpoint in ProviderEndpoint
@@ -318,16 +331,7 @@ class InMemoryProviderHealthStore(_ProviderHealthStore):
         owner = _require_safe_id(owner)
         now = _require_aware(self._clock())
         with self._lock:
-            for circuit in self._circuits.values():
-                if (
-                    circuit.state == CircuitState.HALF_OPEN
-                    and circuit.probe_expires_at is not None
-                    and circuit.probe_expires_at <= now
-                ):
-                    circuit.state = CircuitState.OPEN
-                    circuit.probe_lease_id = None
-                    circuit.probe_owner = None
-                    circuit.probe_expires_at = None
+            self._reap_expired_probes(now)
             if any(circuit.state == CircuitState.HALF_OPEN for circuit in self._circuits.values()):
                 return None
             circuit = self._circuits[endpoint]
@@ -350,6 +354,18 @@ class InMemoryProviderHealthStore(_ProviderHealthStore):
                 owner=owner,
                 expires_at=expires_at,
             )
+
+    def _reap_expired_probes(self, now: datetime) -> None:
+        for circuit in self._circuits.values():
+            if (
+                circuit.state == CircuitState.HALF_OPEN
+                and circuit.probe_expires_at is not None
+                and circuit.probe_expires_at <= now
+            ):
+                circuit.state = CircuitState.OPEN
+                circuit.probe_lease_id = None
+                circuit.probe_owner = None
+                circuit.probe_expires_at = None
 
     def resolve_probe(
         self,
@@ -694,10 +710,19 @@ class SQLiteProviderHealthStore(_ProviderHealthStore):
 
     def endpoint_health(self, endpoint: ProviderEndpoint) -> EndpointHealth:
         endpoint = _require_market_endpoint(endpoint)
-        with self._database() as connection:
+        with self._database(write=True) as connection:
+            self._reap_expired_probes(connection, _require_aware(self._clock()))
             return self._health_from_connection(connection, endpoint)
 
     def provider_health(self) -> ProviderHealth:
+        with self._database(write=True) as connection:
+            self._reap_expired_probes(connection, _require_aware(self._clock()))
+            endpoints = tuple(
+                self._health_from_connection(connection, endpoint) for endpoint in ProviderEndpoint
+            )
+        return _provider_health(endpoints)
+
+    def provider_health_snapshot(self) -> ProviderHealth:
         with self._database() as connection:
             endpoints = tuple(
                 self._health_from_connection(connection, endpoint) for endpoint in ProviderEndpoint
@@ -709,23 +734,7 @@ class SQLiteProviderHealthStore(_ProviderHealthStore):
         owner = _require_safe_id(owner)
         now = _require_aware(self._clock())
         with self._database(write=True) as connection:
-            rows = connection.execute("SELECT * FROM endpoint_circuits").fetchall()
-            for row in rows:
-                circuit = self._circuit_from_row(row)
-                if (
-                    circuit.state == CircuitState.HALF_OPEN
-                    and circuit.probe_expires_at is not None
-                    and circuit.probe_expires_at <= now
-                ):
-                    circuit.state = CircuitState.OPEN
-                    circuit.probe_lease_id = None
-                    circuit.probe_owner = None
-                    circuit.probe_expires_at = None
-                    self._save_circuit(
-                        connection,
-                        ProviderEndpoint(row["endpoint"]),
-                        circuit,
-                    )
+            self._reap_expired_probes(connection, now)
             active_probe = connection.execute(
                 "SELECT 1 FROM endpoint_circuits WHERE state = ? LIMIT 1",
                 [CircuitState.HALF_OPEN.value],
@@ -753,6 +762,28 @@ class SQLiteProviderHealthStore(_ProviderHealthStore):
                 owner=owner,
                 expires_at=expires_at,
             )
+
+    def _reap_expired_probes(
+        self,
+        connection: sqlite3.Connection,
+        now: datetime,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT * FROM endpoint_circuits WHERE state = ?",
+            [CircuitState.HALF_OPEN.value],
+        ).fetchall()
+        for row in rows:
+            circuit = self._circuit_from_row(row)
+            if circuit.probe_expires_at is not None and circuit.probe_expires_at <= now:
+                circuit.state = CircuitState.OPEN
+                circuit.probe_lease_id = None
+                circuit.probe_owner = None
+                circuit.probe_expires_at = None
+                self._save_circuit(
+                    connection,
+                    ProviderEndpoint(row["endpoint"]),
+                    circuit,
+                )
 
     def resolve_probe(
         self,

@@ -119,10 +119,15 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
     assert health_path.exists() is False
 
     captured = {}
+    calendar_captured = {}
 
     class CapturingAutomationService:
         def __init__(self, *_args, **kwargs) -> None:
             captured.update(kwargs)
+
+    class CapturingCalendarService:
+        def __init__(self, *_args, **kwargs) -> None:
+            calendar_captured.update(kwargs)
 
     async def idle_loop(_service, stop, **_kwargs) -> None:
         await stop.wait()
@@ -133,6 +138,7 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
         base.model_copy(update={"auto_refresh_enabled": True}),
     )
     monkeypatch.setattr(main_module, "MarketAutomationService", CapturingAutomationService)
+    monkeypatch.setattr(main_module, "CalendarSyncService", CapturingCalendarService)
     monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
     monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
@@ -146,6 +152,7 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
 
     assert health_path.exists()
     assert isinstance(captured["health_store"], SQLiteProviderHealthStore)
+    assert calendar_captured["health_store"] is captured["health_store"]
     assert captured["probe_runner"] is not None
 
 
