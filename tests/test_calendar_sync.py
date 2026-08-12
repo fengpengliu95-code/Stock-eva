@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import sys
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -114,6 +115,13 @@ class RecordingHealthStore(InMemoryProviderHealthStore):
             normalized_error=normalized_error,
             observed_at=observed_at,
         )
+
+
+def _calendar_control_counts(path: Path) -> tuple[int, int]:
+    with sqlite3.connect(path) as connection:
+        runs = connection.execute("SELECT COUNT(*) FROM calendar_sync_runs").fetchone()[0]
+        state = connection.execute("SELECT COUNT(*) FROM calendar_sync_state").fetchone()[0]
+    return runs, state
 
 
 def test_calendar_sync_schedule_has_monthly_full_startup_and_1630_light() -> None:
@@ -458,11 +466,18 @@ def test_calendar_complete_success_evidence_records_terminal_success(tmp_path: P
     assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.CLOSED
 
 
-def test_real_provider_calendar_parse_failure_trips_circuit_without_state_write(
+@pytest.mark.parametrize("malformation", ["invalid-date", "missing-schema"])
+def test_real_provider_calendar_high_level_failure_trips_circuit_without_state_write(
     tmp_path: Path,
+    malformation: str,
 ) -> None:
     class MalformedCalendarClient(FakeBaoStock):
         def query_trade_dates(self, **_kwargs):
+            if malformation == "missing-schema":
+                return FakeResult(
+                    ["is_trading_day"],
+                    [["1"]],
+                )
             return FakeResult(
                 ["calendar_date", "is_trading_day"],
                 [["private-token-not-a-date", "1"]],
@@ -485,6 +500,9 @@ def test_real_provider_calendar_parse_failure_trips_circuit_without_state_write(
         now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
         mode="light",
     )
+    before_bytes = store.path.read_bytes()
+    before_state = store.state()
+    before_counts = _calendar_control_counts(store.path)
 
     result = service.execute(plan)
 
@@ -503,10 +521,80 @@ def test_real_provider_calendar_parse_failure_trips_circuit_without_state_write(
     ]
     assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
     assert health.provider_health().state == CircuitState.OPEN
-    assert store.state().last_attempt_at is None
+    assert store.path.read_bytes() == before_bytes
+    assert store.state() == before_state
+    assert _calendar_control_counts(store.path) == before_counts
     with pytest.raises(KeyError):
         store.run(result.run_id)
     assert "private-token" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    ["second-session", "attempt-two", "multiple-operation"],
+)
+def test_calendar_rejects_inconsistent_success_evidence_without_state_write(
+    tmp_path: Path,
+    invalid_evidence: str,
+) -> None:
+    class InvalidEvidenceProvider(ObservedCalendarProvider):
+        def trading_dates(self, start_date: date, end_date: date) -> list[date]:
+            stage = (
+                ProtocolStage.OPERATION
+                if invalid_evidence == "multiple-operation"
+                else ProtocolStage.COMPLETE
+            )
+            session = (
+                "extra-session" if invalid_evidence == "second-session" else "calendar-session"
+            )
+            with provider_session_scope(session):
+                with request_scope(
+                    ProviderEndpoint.TRADE_DATES,
+                    attempt=2 if invalid_evidence == "attempt-two" else 1,
+                ):
+                    emit_terminal_observation(
+                        started_at=0,
+                        protocol_stage=stage,
+                        recv_calls=1,
+                        response_bytes=32,
+                        end_marker_seen=True,
+                        provider_code="0",
+                        normalized_error=None,
+                    )
+            return super().trading_dates(start_date, end_date)
+
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    before_bytes = store.path.read_bytes()
+    before_state = store.state()
+    before_counts = _calendar_control_counts(store.path)
+    health = RecordingHealthStore(failure_threshold=1)
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        InvalidEvidenceProvider([date(2026, 7, 24)]),
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "error"
+    assert health.terminal_outcomes == [
+        (
+            result.run_id,
+            ProviderEndpoint.TRADE_DATES,
+            False,
+            NormalizedTransportError.PROTOCOL_ERROR,
+        )
+    ]
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+    assert health.provider_health().state == CircuitState.OPEN
+    assert store.path.read_bytes() == before_bytes
+    assert store.state() == before_state
+    assert _calendar_control_counts(store.path) == before_counts
 
 
 def test_calendar_health_audit_failure_prevents_calendar_state_write(tmp_path: Path) -> None:

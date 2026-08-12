@@ -611,13 +611,20 @@ class CalendarSyncService:
                     provider_succeeded=False,
                 )
             result = failed_result()
-            self.store.save(
-                plan=plan,
-                result=result,
-                observations=[],
-                authority_payload=self.authority_payload(),
-                next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
+            successful_operation = any(
+                item.endpoint == ProviderEndpoint.TRADE_DATES
+                and item.protocol_stage == ProtocolStage.OPERATION
+                and item.normalized_error is None
+                for item in observations
             )
+            if not successful_operation:
+                self.store.save(
+                    plan=plan,
+                    result=result,
+                    observations=[],
+                    authority_payload=self.authority_payload(),
+                    next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
+                )
             return result
         except Exception:
             if self.health_store is not None:
@@ -628,11 +635,13 @@ class CalendarSyncService:
                 )
             return failed_result()
         if self.health_store is not None:
-            self._resolve_calendar_transport(
+            evidence_valid = self._resolve_calendar_transport(
                 run_id,
                 observations,
                 provider_succeeded=True,
             )
+            if not evidence_valid:
+                return failed_result()
         invalid = [
             item for item in provider_open if item < plan.range_start or item > plan.range_end
         ]
@@ -694,7 +703,7 @@ class CalendarSyncService:
         observations: list[TransportObservation],
         *,
         provider_succeeded: bool,
-    ) -> None:
+    ) -> bool:
         assert self.health_store is not None
         endpoint_observations = [
             item for item in observations if item.endpoint == ProviderEndpoint.TRADE_DATES
@@ -713,22 +722,31 @@ class CalendarSyncService:
                 ProviderEndpoint.TRADE_DATES,
                 max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__),
             )
+            return False
         elif not provider_succeeded:
             self.health_store.record_terminal_failure(
                 run_id,
                 ProviderEndpoint.TRADE_DATES,
                 NormalizedTransportError.PROTOCOL_ERROR,
             )
-        elif operations:
+            return False
+        evidence_valid = (
+            len(operations) == 1
+            and len({item.provider_session_id for item in endpoint_observations}) == 1
+            and all(item.attempt == 1 for item in endpoint_observations)
+        )
+        if evidence_valid:
             self.health_store.record_terminal_success(run_id, ProviderEndpoint.TRADE_DATES)
+            return True
         else:
             self.health_store.record_terminal_failure(
                 run_id,
                 ProviderEndpoint.TRADE_DATES,
                 NormalizedTransportError.PROTOCOL_ERROR,
             )
-            if provider_succeeded:
+            if not endpoint_observations:
                 raise ProviderHealthError("calendar provider audit is incomplete")
+            return False
 
 
 async def run_calendar_sync_loop(
