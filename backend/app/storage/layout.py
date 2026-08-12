@@ -24,6 +24,9 @@ class StorageLayout:
             factor_cache_database=(
                 self.settings.local_control_dir / self.settings.factor_cache_database_name
             ),
+            provider_health_database=(
+                self.settings.local_control_dir / self.settings.provider_health_database_name
+            ),
         )
 
     @property
@@ -36,10 +39,11 @@ class StorageLayout:
 
     @property
     def regime_snapshot_database(self) -> Path:
-        return (
-            self.settings.local_control_dir
-            / self.settings.regime_snapshot_database_name
-        )
+        return self.settings.local_control_dir / self.settings.regime_snapshot_database_name
+
+    @property
+    def provider_health_database(self) -> Path:
+        return self.local_paths.provider_health_database
 
     def ensure_local_runtime_dirs(self) -> None:
         paths = self.local_paths

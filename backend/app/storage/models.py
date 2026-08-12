@@ -39,3 +39,4 @@ class LocalStoragePaths(BaseModel):
     user_database: Path
     portfolio_database: Path
     factor_cache_database: Path
+    provider_health_database: Path

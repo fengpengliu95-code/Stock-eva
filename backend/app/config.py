@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     factor_cache_database_name: str = "baostock_back_factor_cache.sqlite3"
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
     regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
+    provider_health_database_name: str = "provider_health.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
@@ -50,6 +51,9 @@ class Settings(BaseSettings):
         ge=1.0,
         le=120.0,
     )
+    provider_circuit_failure_threshold: int = Field(default=3, gt=0)
+    provider_circuit_cooldown_seconds: float = Field(default=900.0, gt=0)
+    provider_circuit_probe_lease_seconds: float = Field(default=120.0, gt=0)
 
     @field_validator("user_database_name", "portfolio_database_name")
     @classmethod
@@ -77,6 +81,20 @@ class Settings(BaseSettings):
             or not value.endswith(".sqlite3")
         ):
             raise ValueError("regime snapshot database name must be a local .sqlite3 basename")
+        return value
+
+    @field_validator("provider_health_database_name")
+    @classmethod
+    def validate_provider_health_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("provider health database name must be a local .sqlite3 basename")
         return value
 
     @model_validator(mode="after")
