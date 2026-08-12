@@ -25,6 +25,11 @@ Ruff, TypeScript/Vite, KLineChart, browser-based acceptance.
   `docs/plans/2026-07-29-stock-eva-strategy-review-roadmap.md`
 - This document controls implementation order and evidence, but cannot narrow the Product
   Roadmap.
+- Release 2 sequencing is amended by the approved R2-F Data Reliability Foundation:
+  `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-roadmap.md`. Its detailed task plan is
+  `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-implementation.md`. Existing R2-A/R2-B
+  acceptance records are preserved, but R2-C/R2-D/R2-E remain blocked until R2-F5 GO and renewed
+  independent R2-A/R2-B acceptance.
 - Market data remains local and deterministic. LLM components, when reached, are read-only
   consumers of redacted structured evidence.
 - No work package may introduce real-time quotes, broker credentials, order APIs, automatic
@@ -73,8 +78,16 @@ R1-A Point-in-time security/index/sector master
   -> R1-D Market/sector workspace
   -> R1-E Release 1 historical and browser acceptance
 
-R2-A Evidence-tier fund-flow ingestion
-R2-B Portfolio daily ledger and risk engine
+R2-F0 Incident closure
+  -> R2-F1 Continuity controller
+  -> R2-F2 Provider evidence framework
+  -> R2-F3 Shadow provider bake-off
+  -> R2-F4 Controlled whole-session failover and operations
+  -> R2-F5 20-session production soak
+
+Existing R2-A Evidence-tier fund-flow artifacts
+Existing R2-B Portfolio daily ledger/risk artifacts
+R2-F5 + renewed independent R2-A/R2-B acceptance
   -> R2-C EvidencePack and daily review
   -> R2-D Flow-enhanced sector/stock/portfolio workspace
   -> R2-E Release 2 continuity and browser acceptance
@@ -270,6 +283,20 @@ Release 0 is GO only when every Product Roadmap Release 0 acceptance item has di
 - Record evidence in `docs/acceptance/release-1.md`.
 
 ## 5. Release 2 — capital evidence and position decisions
+
+### Blocking prerequisite: R2-F Data Reliability Foundation
+
+- Execute R2-F0 through R2-F5 in the approved dependency order before adding R2-C/R2-D/R2-E
+  features.
+- Keep the current immutable market publication chain and upgrade it with automatic gap repair,
+  immutable provider evidence, provider qualification, whole-session failover, exact universe and
+  calendar contracts, asynchronous backup state and a 20-session production soak.
+- R2-F GO is necessary but not sufficient for Release 2 GO. R2-A and R2-B retain independent
+  acceptance gates.
+- Authoritative version roadmap:
+  `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-roadmap.md`.
+- Task-by-task RED/GREEN plan:
+  `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-implementation.md`.
 
 ### R2-A: Evidence-tier fund-flow ingestion
 
