@@ -169,6 +169,16 @@ def _emit_operation_outcome(error: BaseException | None = None) -> None:
     )
 
 
+def _provider_status_error(provider_code: str, *, operation: str) -> BaoStockTransportError:
+    failure = baostock_status_failure(provider_code)
+    error = BaoStockTransportError(
+        f"BaoStock {operation} failed ({failure.failure_class})",
+        failure=failure,
+    )
+    error.normalized_error = normalize_provider_code(provider_code)
+    return error
+
+
 def _page_number(result: Any) -> int:
     try:
         page = int(result.cur_page_num)
@@ -239,10 +249,9 @@ def _read_result(
     next_page_scope: Callable[[int], Any] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
-        failure = baostock_status_failure(result.error_code)
-        raise BaoStockTransportError(
-            f"BaoStock request failed ({failure.failure_class})",
-            failure=failure,
+        raise _provider_status_error(
+            result.error_code,
+            operation="request",
         )
     rows: list[list[str]] = []
     page_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
@@ -278,10 +287,9 @@ def _read_result(
             with next_page_scope(current_page + 1):
                 has_row = result.next()
                 if result.error_code != "0":
-                    failure = baostock_status_failure(result.error_code)
-                    raise BaoStockTransportError(
-                        f"BaoStock pagination failed ({failure.failure_class})",
-                        failure=failure,
+                    raise _provider_status_error(
+                        result.error_code,
+                        operation="pagination",
                     )
                 if not has_row:
                     raise _pagination_protocol_error(
@@ -300,10 +308,9 @@ def _read_result(
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
-        failure = baostock_status_failure(result.error_code)
-        raise BaoStockTransportError(
-            f"BaoStock pagination failed ({failure.failure_class})",
-            failure=failure,
+        raise _provider_status_error(
+            result.error_code,
+            operation="pagination",
         )
     return list(result.fields), rows
 
@@ -543,12 +550,10 @@ class BaoStockProvider:
                             _emit_operation_outcome(exc)
                         raise
                     if result.error_code != "0":
-                        failure = baostock_status_failure(result.error_code)
-                        last_error = BaoStockTransportError(
-                            f"BaoStock login failed ({failure.failure_class})",
-                            failure=failure,
+                        last_error = _provider_status_error(
+                            result.error_code,
+                            operation="login",
                         )
-                        last_error.normalized_error = normalize_provider_code(result.error_code)
                         self._discard_session()
                         emit_final_failure(last_error, attempt=attempt)
                         continue
@@ -957,6 +962,10 @@ class BaoStockProvider:
                                 attempt == self.max_attempts
                                 or isinstance(exc, _OperationDeadlineUnavailable)
                             ):
+                                _emit_operation_outcome(exc)
+                            raise
+                        except Exception as exc:
+                            if isinstance(endpoint, ProviderEndpoint):
                                 _emit_operation_outcome(exc)
                             raise
                         if isinstance(endpoint, ProviderEndpoint):

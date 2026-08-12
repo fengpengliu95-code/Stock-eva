@@ -579,6 +579,20 @@ class CalendarSyncService:
 
         refresh_operation = getattr(self.provider, "refresh_operation", None)
         provider_scope = refresh_operation(run_id) if callable(refresh_operation) else nullcontext()
+
+        def failed_result() -> CalendarSyncResult:
+            return CalendarSyncResult(
+                run_id=run_id,
+                mode=plan.mode,
+                status="error",
+                range_start=plan.range_start,
+                range_end=plan.range_end,
+                fetched_at=fetched_at,
+                completed_at=self.clock().astimezone(UTC),
+                observed_open_count=0,
+                authority_checksum=plan.authority_checksum,
+            )
+
         try:
             if self.health_store is None:
                 provider_open = set(self.provider.trading_dates(plan.range_start, plan.range_end))
@@ -587,6 +601,8 @@ class CalendarSyncService:
                     provider_open = set(
                         self.provider.trading_dates(plan.range_start, plan.range_end)
                     )
+        except ProviderHealthError:
+            raise
         except (BaoStockError, TimeoutError, OSError):
             if self.health_store is not None:
                 self._resolve_calendar_transport(
@@ -594,18 +610,7 @@ class CalendarSyncService:
                     observations,
                     provider_succeeded=False,
                 )
-            completed_at = self.clock().astimezone(UTC)
-            result = CalendarSyncResult(
-                run_id=run_id,
-                mode=plan.mode,
-                status="error",
-                range_start=plan.range_start,
-                range_end=plan.range_end,
-                fetched_at=fetched_at,
-                completed_at=completed_at,
-                observed_open_count=0,
-                authority_checksum=plan.authority_checksum,
-            )
+            result = failed_result()
             self.store.save(
                 plan=plan,
                 result=result,
@@ -614,6 +619,14 @@ class CalendarSyncService:
                 next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
             )
             return result
+        except Exception:
+            if self.health_store is not None:
+                self._resolve_calendar_transport(
+                    run_id,
+                    observations,
+                    provider_succeeded=False,
+                )
+            return failed_result()
         if self.health_store is not None:
             self._resolve_calendar_transport(
                 run_id,

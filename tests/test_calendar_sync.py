@@ -435,6 +435,135 @@ def test_calendar_health_audit_failure_prevents_calendar_state_write(tmp_path: P
     assert store.state().last_attempt_at is None
 
 
+def test_calendar_unclassified_failure_resolves_breaker_without_state_write(
+    tmp_path: Path,
+) -> None:
+    class UnclassifiedProvider(ObservedCalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            del start_date, end_date
+            with provider_session_scope("runtime-calendar-session"):
+                with request_scope(ProviderEndpoint.TRADE_DATES, attempt=1):
+                    emit_terminal_observation(
+                        started_at=0,
+                        protocol_stage=ProtocolStage.OPERATION,
+                        recv_calls=0,
+                        response_bytes=0,
+                        end_marker_seen=False,
+                        provider_code=None,
+                        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+                    )
+            raise RuntimeError("private-token /private/calendar provider failure")
+
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        UnclassifiedProvider([]),
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "error"
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+    assert health.provider_health().state == CircuitState.OPEN
+    assert store.state().last_attempt_at is None
+    with pytest.raises(KeyError):
+        store.run(result.run_id)
+    serialized = result.model_dump_json()
+    assert "private-token" not in serialized
+    assert "/private/calendar" not in serialized
+
+
+def test_calendar_unclassified_zero_observation_failure_does_not_kill_loop(
+    tmp_path: Path,
+) -> None:
+    class ZeroObservationFailure(CalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            self.calls.append((start_date, end_date))
+            raise AssertionError("private-token zero-observation failure")
+
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    provider = ZeroObservationFailure([])
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        provider,
+        clock=lambda: datetime(2026, 7, 24, 8, tzinfo=UTC),
+        health_store=health,
+    )
+    stop = asyncio.Event()
+    clock_calls = 0
+
+    def loop_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls >= 2:
+            stop.set()
+        return datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI)
+
+    asyncio.run(
+        run_calendar_sync_loop(
+            service,
+            stop,
+            clock=loop_clock,
+            poll_seconds=0.001,
+        )
+    )
+
+    assert len(provider.calls) == 1
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+    assert store.state().last_attempt_at is None
+
+
+def test_calendar_unclassified_failure_propagates_health_outcome_write_error(
+    tmp_path: Path,
+) -> None:
+    class FailingOutcome(InMemoryProviderHealthStore):
+        def record_terminal_failure(self, *args, **kwargs):
+            del args, kwargs
+            raise ProviderHealthError("token=/private/provider-health.sqlite3")
+
+    class UnclassifiedProvider(ObservedCalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            del start_date, end_date
+            with provider_session_scope("runtime-calendar-session"):
+                with request_scope(ProviderEndpoint.TRADE_DATES, attempt=1):
+                    emit_terminal_observation(
+                        started_at=0,
+                        protocol_stage=ProtocolStage.OPERATION,
+                        recv_calls=0,
+                        response_bytes=0,
+                        end_marker_seen=False,
+                        provider_code=None,
+                        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+                    )
+            raise RuntimeError("private-token provider failure")
+
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        UnclassifiedProvider([]),
+        health_store=FailingOutcome(failure_threshold=1),
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    with pytest.raises(ProviderHealthError):
+        service.execute(plan)
+
+    assert store.state().last_attempt_at is None
+
+
 def test_calendar_success_without_operation_observation_fails_closed(tmp_path: Path) -> None:
     store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
     health = InMemoryProviderHealthStore(failure_threshold=1)

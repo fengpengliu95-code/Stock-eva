@@ -950,10 +950,19 @@ def test_process_interrupt_is_not_converted_into_a_retry(interrupt_type) -> None
         min_request_interval_seconds=0,
     )
 
-    with pytest.raises(interrupt_type):
+    observations = []
+    with (
+        transport_observation_sink(observations.append),
+        pytest.raises(interrupt_type),
+    ):
         provider.fetch(date(2026, 7, 23), symbols=["sh.600000"])
 
     assert client.login_calls == 1
+    assert not any(
+        item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+        for item in observations
+    )
 
 
 class LoginRecoveryClient(FakeBaoStock):
@@ -1064,6 +1073,76 @@ def test_programming_error_fails_fast_without_retry_or_relogin() -> None:
 
     assert client.history_calls == {"sh.600000": 1}
     assert client.login_calls == 1
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AssertionError])
+def test_unclassified_read_error_emits_one_sanitized_operation_and_rethrows(
+    error_type: type[Exception],
+) -> None:
+    client = RecoveringSocketClient(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+    failed_contexts = []
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        failed_contexts.append(current_request_context())
+        raise error_type("private-token unclassified provider error")
+
+    with (
+        transport_observation_sink(observations.append),
+        provider.refresh_operation("runtime-error-refresh"),
+    ):
+        with pytest.raises(error_type):
+            provider._read(ProviderEndpoint.INDEX_HISTORY, fail)
+        provider._read(
+            ProviderEndpoint.INDEX_HISTORY,
+            lambda: FakeResult(["code"], [["sh.000001"]]),
+        )
+
+    operations = [
+        item
+        for item in observations
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert [(item.attempt, item.normalized_error) for item in operations] == [
+        (1, NormalizedTransportError.PROTOCOL_ERROR),
+        (1, None),
+    ]
+    failed = operations[0]
+    context = failed_contexts[0]
+    assert failed.refresh_id == context.refresh_id
+    assert failed.provider_session_id == context.provider_session_id
+    assert failed.request_id == context.request_id
+    assert calls == 1
+    assert client.login_calls == 1
+    assert "private-token" not in failed.model_dump_json()
+
+
+def test_unclassified_classification_read_error_emits_no_market_operation() -> None:
+    client = RecoveringSocketClient(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(client=client, max_attempts=2, min_request_interval_seconds=0)
+    observations = []
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("private-token classification failure")
+
+    with (
+        transport_observation_sink(observations.append),
+        provider.refresh_operation("classification-runtime-error"),
+        pytest.raises(RuntimeError),
+    ):
+        provider._read(ClassificationEndpoint.SECURITY_UNIVERSE, fail)
+
+    assert calls == 1
+    assert client.login_calls == 1
+    assert all(item.protocol_stage != ProtocolStage.OPERATION for item in observations)
 
 
 def test_provider_installs_pinned_transport_only_for_real_client(monkeypatch) -> None:
@@ -1292,6 +1371,65 @@ class ProtocolPageResult:
 
 def _full_page(prefix: str = "row") -> list[list[str]]:
     return [[f"{prefix}-{index:04d}"] for index in range(2000)]
+
+
+@pytest.mark.parametrize(
+    ("status_location", "provider_code", "expected"),
+    [
+        ("request", "10002001", NormalizedTransportError.CONNECT_ERROR),
+        ("page-transition", "10002001", NormalizedTransportError.CONNECT_ERROR),
+        ("page-terminal", "777777", NormalizedTransportError.UNKNOWN_PROVIDER_PROTOCOL_ERROR),
+    ],
+)
+def test_provider_status_preserves_code_only_normalized_transport_error(
+    status_location: str,
+    provider_code: str,
+    expected: NormalizedTransportError,
+) -> None:
+    class TransitionStatusResult(ProtocolPageResult):
+        def next(self) -> bool:
+            if self.cur_row_num >= len(self.data):
+                self.error_code = provider_code
+                return False
+            return super().next()
+
+    class TerminalStatusResult(FakeResult):
+        def next(self) -> bool:
+            has_row = super().next()
+            if not has_row:
+                self.error_code = provider_code
+            return has_row
+
+    if status_location == "request":
+        result = FakeResult(
+            ["code"],
+            [],
+            error_code=provider_code,
+            error_msg="private-token provider message",
+        )
+    elif status_location == "page-transition":
+        result = TransitionStatusResult([_full_page()])
+    else:
+        result = TerminalStatusResult(["code"], [["sh.000001"]])
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    observations = []
+
+    with (
+        transport_observation_sink(observations.append),
+        pytest.raises(BaoStockError) as caught,
+    ):
+        provider._read(ProviderEndpoint.INDEX_HISTORY, lambda: result)
+
+    operations = [item for item in observations if item.protocol_stage == ProtocolStage.OPERATION]
+    assert len(operations) == 1
+    assert operations[0].normalized_error == expected
+    assert getattr(caught.value, "normalized_error", None) == expected
+    serialized = operations[0].model_dump_json() + str(caught.value)
+    assert "private-token" not in serialized
 
 
 def test_pagination_advances_page_scope_and_request_id() -> None:

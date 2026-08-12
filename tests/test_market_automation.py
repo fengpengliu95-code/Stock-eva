@@ -20,7 +20,10 @@ from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
 from backend.app.market.baostock import BaoStockProvider, ProviderBatch
-from backend.app.market.baostock_vendor import emit_terminal_observation
+from backend.app.market.baostock_vendor import (
+    emit_terminal_observation,
+    transport_observation_sink,
+)
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
@@ -835,6 +838,51 @@ def test_real_provider_exhausted_first_index_call_opens_breaker_despite_later_su
     assert [(item.attempt, item.normalized_error) for item in operations] == [
         (2, NormalizedTransportError.RECV_TIMEOUT),
         (1, None),
+    ]
+
+
+def test_unclassified_operation_failure_survives_later_same_endpoint_success() -> None:
+    module = load_module("backend.app.market.automation")
+    provider = BaoStockProvider(
+        client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=2,
+        min_request_interval_seconds=0,
+    )
+    health = InMemoryProviderHealthStore(failure_threshold=1)
+    collector = module._RefreshObservationCollector(health, "runtime-error-refresh")
+
+    with (
+        transport_observation_sink(collector.record),
+        provider.refresh_operation("runtime-error-refresh"),
+    ):
+        with pytest.raises(RuntimeError):
+            provider._read(
+                ProviderEndpoint.INDEX_HISTORY,
+                lambda: (_ for _ in ()).throw(
+                    RuntimeError("private-token unclassified provider error")
+                ),
+            )
+        provider._read(
+            ProviderEndpoint.INDEX_HISTORY,
+            lambda: FakeBaoStock(json.loads(FIXTURE_PATH.read_text())).query_history_k_data_plus(
+                "sh.000001",
+                "date,code",
+                start_date="2026-07-23",
+                end_date="2026-07-23",
+            ),
+        )
+    collector.resolve_touched_endpoints()
+
+    assert health.endpoint_health(ProviderEndpoint.INDEX_HISTORY).state == CircuitState.OPEN
+    operations = [
+        item
+        for item in health.list_observations()
+        if item.endpoint == ProviderEndpoint.INDEX_HISTORY
+        and item.protocol_stage == ProtocolStage.OPERATION
+    ]
+    assert [item.normalized_error for item in operations] == [
+        NormalizedTransportError.PROTOCOL_ERROR,
+        None,
     ]
 
 
