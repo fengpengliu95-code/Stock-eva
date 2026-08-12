@@ -13,6 +13,7 @@ import backend.app.cli as cli
 from backend.app.api.market import get_calendar_sync_store, get_market_store
 from backend.app.config import Settings
 from backend.app.main import app
+from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.calendar_sync import (
@@ -36,6 +37,7 @@ from backend.app.market.provider_transport import (
     request_scope,
 )
 from backend.app.market.store import MarketStore
+from tests.test_baostock_provider import FIXTURE_PATH, FakeBaoStock, FakeResult
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -88,6 +90,30 @@ class ObservedCalendarProvider(CalendarProvider):
                     normalized_error=None,
                 )
         return super().trading_dates(start_date, end_date)
+
+
+class RecordingHealthStore(InMemoryProviderHealthStore):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.terminal_outcomes = []
+
+    def record_endpoint_outcome(
+        self,
+        refresh_id,
+        endpoint,
+        *,
+        success,
+        normalized_error=None,
+        observed_at=None,
+    ):
+        self.terminal_outcomes.append((refresh_id, endpoint, success, normalized_error))
+        return super().record_endpoint_outcome(
+            refresh_id,
+            endpoint,
+            success=success,
+            normalized_error=normalized_error,
+            observed_at=observed_at,
+        )
 
 
 def test_calendar_sync_schedule_has_monthly_full_startup_and_1630_light() -> None:
@@ -411,6 +437,78 @@ def test_calendar_terminal_observation_updates_breaker_before_calendar_state_sav
     assert failed_store.run(failed.run_id).status == "error"
 
 
+def test_calendar_complete_success_evidence_records_terminal_success(tmp_path: Path) -> None:
+    health = RecordingHealthStore(failure_threshold=1)
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        ObservedCalendarProvider([date(2026, 7, 24)]),
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "ready"
+    assert health.terminal_outcomes == [(result.run_id, ProviderEndpoint.TRADE_DATES, True, None)]
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.CLOSED
+
+
+def test_real_provider_calendar_parse_failure_trips_circuit_without_state_write(
+    tmp_path: Path,
+) -> None:
+    class MalformedCalendarClient(FakeBaoStock):
+        def query_trade_dates(self, **_kwargs):
+            return FakeResult(
+                ["calendar_date", "is_trading_day"],
+                [["private-token-not-a-date", "1"]],
+            )
+
+    health = RecordingHealthStore(failure_threshold=1)
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    provider = BaoStockProvider(
+        client=MalformedCalendarClient(json.loads(FIXTURE_PATH.read_text())),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        provider,
+        health_store=health,
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "error"
+    observations = health.list_observations()
+    assert len(observations) == 1
+    assert observations[0].protocol_stage == ProtocolStage.OPERATION
+    assert observations[0].normalized_error is None
+    assert health.terminal_outcomes == [
+        (
+            result.run_id,
+            ProviderEndpoint.TRADE_DATES,
+            False,
+            NormalizedTransportError.PROTOCOL_ERROR,
+        )
+    ]
+    assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
+    assert health.provider_health().state == CircuitState.OPEN
+    assert store.state().last_attempt_at is None
+    with pytest.raises(KeyError):
+        store.run(result.run_id)
+    assert "private-token" not in result.model_dump_json()
+
+
 def test_calendar_health_audit_failure_prevents_calendar_state_write(tmp_path: Path) -> None:
     class FailingAudit(InMemoryProviderHealthStore):
         def record_observation(self, observation) -> None:
@@ -446,16 +544,16 @@ def test_calendar_unclassified_failure_resolves_breaker_without_state_write(
                     emit_terminal_observation(
                         started_at=0,
                         protocol_stage=ProtocolStage.OPERATION,
-                        recv_calls=0,
-                        response_bytes=0,
-                        end_marker_seen=False,
-                        provider_code=None,
-                        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+                        recv_calls=1,
+                        response_bytes=32,
+                        end_marker_seen=True,
+                        provider_code="0",
+                        normalized_error=None,
                     )
             raise RuntimeError("private-token /private/calendar provider failure")
 
     store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
-    health = InMemoryProviderHealthStore(failure_threshold=1)
+    health = RecordingHealthStore(failure_threshold=1)
     service = CalendarSyncService(
         store,
         synthetic_calendar(),
@@ -472,6 +570,14 @@ def test_calendar_unclassified_failure_resolves_breaker_without_state_write(
     assert result.status == "error"
     assert health.endpoint_health(ProviderEndpoint.TRADE_DATES).state == CircuitState.OPEN
     assert health.provider_health().state == CircuitState.OPEN
+    assert health.terminal_outcomes == [
+        (
+            result.run_id,
+            ProviderEndpoint.TRADE_DATES,
+            False,
+            NormalizedTransportError.PROTOCOL_ERROR,
+        )
+    ]
     assert store.state().last_attempt_at is None
     with pytest.raises(KeyError):
         store.run(result.run_id)

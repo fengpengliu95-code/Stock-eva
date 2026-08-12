@@ -696,18 +696,28 @@ class CalendarSyncService:
         provider_succeeded: bool,
     ) -> None:
         assert self.health_store is not None
-        operations = [
-            item
-            for item in observations
-            if item.endpoint == ProviderEndpoint.TRADE_DATES
-            and item.protocol_stage == ProtocolStage.OPERATION
+        endpoint_observations = [
+            item for item in observations if item.endpoint == ProviderEndpoint.TRADE_DATES
         ]
-        errors = [item.normalized_error for item in operations if item.normalized_error is not None]
+        operations = [
+            item for item in endpoint_observations if item.protocol_stage == ProtocolStage.OPERATION
+        ]
+        errors = [
+            item.normalized_error
+            for item in endpoint_observations
+            if item.normalized_error is not None
+        ]
         if errors:
             self.health_store.record_terminal_failure(
                 run_id,
                 ProviderEndpoint.TRADE_DATES,
                 max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__),
+            )
+        elif not provider_succeeded:
+            self.health_store.record_terminal_failure(
+                run_id,
+                ProviderEndpoint.TRADE_DATES,
+                NormalizedTransportError.PROTOCOL_ERROR,
             )
         elif operations:
             self.health_store.record_terminal_success(run_id, ProviderEndpoint.TRADE_DATES)
