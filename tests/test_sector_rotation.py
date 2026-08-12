@@ -1640,6 +1640,8 @@ def test_ready_publication_allows_explicit_suspended_placeholder(
             "is_trading": False,
             "is_suspended": True,
             "adjust_factor": None,
+            "volume": 0.0,
+            "amount": 0.0,
             "quality_status": "partial",
             "quality_issues": ["suspended_placeholder"],
         }
