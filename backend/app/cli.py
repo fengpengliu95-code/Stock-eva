@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import signal
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, date, datetime, time
@@ -41,6 +42,12 @@ from backend.app.market.failures import (
     public_failure_message,
 )
 from backend.app.market.full_history import FullMarketHistoryService
+from backend.app.market.provider_canary import (
+    ProviderCanaryError,
+    confirmation_required_report,
+    plan_provider_canary,
+    run_provider_canary,
+)
 from backend.app.market.provider_health import (
     InMemoryProviderHealthStore,
     ProviderHealth,
@@ -105,6 +112,12 @@ def _socket_timeout_value(value: str) -> float:
     if not 1 <= seconds <= 120:
         raise argparse.ArgumentTypeError("socket timeout must be between 1 and 120 seconds")
     return seconds
+
+
+def _provider_canary_symbol(value: str) -> str:
+    if re.fullmatch(r"(?:sh|sz)\.\d{6}", value) is None:
+        raise argparse.ArgumentTypeError("provider canary symbol is invalid")
+    return value
 
 
 def _classification_failure_payload(
@@ -285,6 +298,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=_socket_timeout_value,
         help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
     )
+    provider_canary = subparsers.add_parser(
+        "provider-canary",
+        help="plan or explicitly run a write-free BaoStock endpoint diagnostic",
+    )
+    provider_canary.add_argument(
+        "--date",
+        required=True,
+        type=date.fromisoformat,
+        dest="trade_date",
+    )
+    provider_canary.add_argument(
+        "--stock-symbol",
+        required=True,
+        type=_provider_canary_symbol,
+    )
+    provider_canary.add_argument(
+        "--index-symbol",
+        required=True,
+        type=_provider_canary_symbol,
+    )
+    provider_canary.add_argument("--control-root", required=True, type=Path)
+    provider_canary.add_argument("--data-root", required=True, type=Path)
+    provider_canary.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform provider requests only with the separate acknowledgement",
+    )
+    provider_canary.add_argument(
+        "--acknowledge-provider-requests",
+        action="store_true",
+        help="acknowledge six independent single-attempt provider requests",
+    )
     calendar_sync = subparsers.add_parser(
         "calendar-sync",
         help="plan or execute versioned BaoStock checks of the official calendar",
@@ -393,6 +438,57 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "provider-canary":
+        report_arguments = {
+            "trade_date": args.trade_date,
+            "stock_symbol": args.stock_symbol,
+            "index_symbol": args.index_symbol,
+            "control_root": args.control_root,
+            "data_root": args.data_root,
+        }
+        try:
+            if args.execute != args.acknowledge_provider_requests:
+                report = confirmation_required_report(**report_arguments)
+                exit_code = 2
+            elif not args.execute:
+                report = plan_provider_canary(**report_arguments)
+                exit_code = 0
+            else:
+                # The probe path never reads factors. Supplying a sentinel prevents the
+                # provider's normal in-memory SQLite factor-cache initialization.
+                report = run_provider_canary(
+                    **report_arguments,
+                    provider_factory=lambda *, max_attempts: BaoStockProvider(
+                        max_attempts=max_attempts,
+                        factor_cache=object(),
+                    ),
+                )
+                exit_code = 0 if report.status == "ready" else 1
+            payload = report.model_dump(mode="json")
+        except ProviderCanaryError as error:
+            payload = {
+                "status": "error",
+                "error_code": error.error_code,
+                "writes_database": False,
+                "writes_parquet": False,
+                "writes_manifest": False,
+                "writes_pointer": False,
+                "refresh_triggered": False,
+            }
+            exit_code = 1
+        except Exception:
+            payload = {
+                "status": "error",
+                "error_code": "PROVIDER_ENDPOINT_FAILED",
+                "writes_database": False,
+                "writes_parquet": False,
+                "writes_manifest": False,
+                "writes_pointer": False,
+                "refresh_triggered": False,
+            }
+            exit_code = 1
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return exit_code
     if args.command == "market-schema-migrate":
         try:
             settings = get_settings()
