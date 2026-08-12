@@ -9,6 +9,7 @@ from datetime import date
 from time import monotonic, sleep
 from typing import Any
 
+from backend.app.market.baostock_vendor import install_baostock_transport_patch
 from backend.app.market.factor_cache import AdjustmentFactorCache, FactorCacheError
 from backend.app.market.failures import (
     MarketFailure,
@@ -264,6 +265,7 @@ class BaoStockProvider:
     ) -> None:
         is_real_client = client is None
         if client is None:
+            install_baostock_transport_patch()
             import baostock as client_module
 
             client = client_module

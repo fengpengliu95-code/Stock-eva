@@ -432,8 +432,7 @@ def assert_fails_within_deadline(
     assert not [
         thread
         for thread in threading.enumerate()
-        if thread.name.startswith("stock-eva-baostock-operation-")
-        and thread.is_alive()
+        if thread.name.startswith("stock-eva-baostock-operation-") and thread.is_alive()
     ]
 
 
@@ -449,6 +448,7 @@ def test_wall_clock_deadline_closes_blocking_baostock_operation(mode: str) -> No
     )
 
     if mode == "login":
+
         def operation():
             return provider._login()
     else:
@@ -498,9 +498,10 @@ def test_deadline_never_leaves_uncancellable_request_workers() -> None:
         started_at = time.monotonic()
         with pytest.raises(BaoStockError, match="wall-clock deadline exceeded"):
             provider._read(client.blocking_query)
-        assert time.monotonic() - started_at <= (
-            provider.max_attempts * provider.socket_timeout_seconds
-        ) + 0.1
+        assert (
+            time.monotonic() - started_at
+            <= (provider.max_attempts * provider.socket_timeout_seconds) + 0.1
+        )
 
         leaked_workers = [
             thread
@@ -516,9 +517,8 @@ def test_deadline_never_leaves_uncancellable_request_workers() -> None:
     finally:
         client.release.set()
         for thread in threading.enumerate():
-            if (
-                thread.ident not in existing_threads
-                and thread.name.startswith("stock-eva-baostock-operation-request")
+            if thread.ident not in existing_threads and thread.name.startswith(
+                "stock-eva-baostock-operation-request"
             ):
                 thread.join(0.2)
 
@@ -589,10 +589,7 @@ def test_deadline_restores_existing_signal_handler_and_timer() -> None:
     signal.signal(signal.SIGALRM, existing_handler)
     signal.setitimer(signal.ITIMER_REAL, 0.5)
     try:
-        assert (
-            provider._run_with_deadline(lambda: "ok", operation_name="request")
-            == "ok"
-        )
+        assert provider._run_with_deadline(lambda: "ok", operation_name="request") == "ok"
         restored_delay, restored_interval = signal.getitimer(signal.ITIMER_REAL)
         assert signal.getsignal(signal.SIGALRM) is existing_handler
         assert 0 < restored_delay <= 0.5
@@ -922,3 +919,20 @@ def test_programming_error_fails_fast_without_retry_or_relogin() -> None:
 
     assert client.history_calls == {"sh.600000": 1}
     assert client.login_calls == 1
+
+
+def test_provider_installs_pinned_transport_only_for_real_client(monkeypatch) -> None:
+    import backend.app.market.baostock as provider_module
+
+    installed: list[str] = []
+    monkeypatch.setattr(
+        provider_module,
+        "install_baostock_transport_patch",
+        lambda: installed.append("installed"),
+    )
+
+    BaoStockProvider(client=FakeBaoStock(json.loads(FIXTURE_PATH.read_text())))
+    assert installed == []
+
+    BaoStockProvider()
+    assert installed == ["installed"]

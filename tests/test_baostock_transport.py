@@ -1,9 +1,21 @@
 import json
+import threading
+import zlib
 from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
+from backend.app.market.baostock_vendor import (
+    EXPECTED_BAOSTOCK_VERSION,
+    EXPECTED_SOCKETUTIL_SHA256,
+    BaoStockTransportPatchError,
+    checked_connect,
+    checked_send_msg,
+    install_baostock_transport_patch,
+    socketutil_source_sha256,
+    transport_observation_sink,
+)
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
     ProtocolStage,
@@ -225,3 +237,456 @@ def test_upstream_send_msg_accepts_partial_send_while_patch_must_use_sendall() -
     patched_connection.sendall(outbound)
     assert patched_connection.sent == outbound
     assert patched_connection.sendall_calls == 1
+
+
+PROTOCOL_MARKER = b"<![CDATA[]]>\n"
+
+
+def _frame(body: bytes, *, message_type: str = "34") -> bytes:
+    import baostock.data.messageheader as messageheader
+
+    header = messageheader.to_message_header(message_type, len(body)).encode()
+    return header + body + PROTOCOL_MARKER
+
+
+class FramedSocket:
+    def __init__(
+        self,
+        chunks: list[bytes | BaseException],
+        *,
+        send_error: BaseException | None = None,
+        connect_error: BaseException | None = None,
+    ) -> None:
+        self.chunks = iter(chunks)
+        self.send_error = send_error
+        self.connect_error = connect_error
+        self.sent = b""
+        self.sendall_calls = 0
+        self.recv_calls = 0
+        self.connect_calls = 0
+        self.closed = False
+
+    def connect(self, _address: tuple[str, int]) -> None:
+        self.connect_calls += 1
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def send(self, _payload: bytes) -> int:
+        raise AssertionError("the pinned patch must not call send")
+
+    def sendall(self, payload: bytes) -> None:
+        self.sendall_calls += 1
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent += payload
+
+    def recv(self, _size: int) -> bytes:
+        self.recv_calls += 1
+        chunk = next(self.chunks, b"")
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _invoke_checked_send(
+    connection: FramedSocket,
+) -> tuple[str | None, BaoStockTransportPatchError | None, list[TransportObservation]]:
+    import baostock.common.context as context
+
+    observations: list[TransportObservation] = []
+    result: str | None = None
+    error: BaoStockTransportPatchError | None = None
+    previous = getattr(context, "default_socket", None)
+    context.default_socket = connection
+    try:
+        with (
+            refresh_scope("refresh-safe"),
+            provider_session_scope("session-safe"),
+            request_scope(ProviderEndpoint.TRADE_DATES, attempt=1),
+            transport_observation_sink(observations.append),
+        ):
+            try:
+                result = checked_send_msg("request-token-secret")
+            except BaoStockTransportPatchError as exc:
+                error = exc
+    finally:
+        context.default_socket = previous
+    return result, error, observations
+
+
+def _assert_sanitized_terminal(
+    error: BaoStockTransportPatchError,
+    observations: list[TransportObservation],
+    *,
+    normalized_error: NormalizedTransportError,
+    protocol_stage: ProtocolStage,
+    recv_calls: int,
+    response_bytes: int,
+    end_marker_seen: bool,
+) -> None:
+    assert error.normalized_error == normalized_error
+    assert error.protocol_stage == protocol_stage
+    assert error.recv_calls == recv_calls
+    assert error.response_bytes == response_bytes
+    assert error.end_marker_seen is end_marker_seen
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.normalized_error == normalized_error
+    assert observation.protocol_stage == protocol_stage
+    assert observation.recv_calls == recv_calls
+    assert observation.response_bytes == response_bytes
+    assert observation.end_marker_seen is end_marker_seen
+    serialized = observation.model_dump_json() + str(error)
+    for forbidden in (
+        "request-token-secret",
+        "private-token",
+        "https://provider.invalid/private",
+        "/Users/private/provider.log",
+        "synthetic raw exception",
+    ):
+        assert forbidden not in serialized
+
+
+def test_checked_send_uses_sendall_and_emits_socket_counters() -> None:
+    response = _frame(b"0\1ok")
+    connection = FramedSocket([response[:7], response[7:]])
+
+    result, error, observations = _invoke_checked_send(connection)
+
+    assert error is None
+    assert result == response.decode()
+    assert connection.sendall_calls == 1
+    assert connection.sent == b"request-token-secret\n"
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.protocol_stage == ProtocolStage.COMPLETE
+    assert observation.outcome == TransportOutcome.SUCCESS
+    assert observation.provider_code == "0"
+    assert observation.recv_calls == 2
+    assert observation.response_bytes == len(response)
+    assert observation.end_marker_seen is True
+
+
+def test_checked_send_classifies_provider_status_without_persisting_message() -> None:
+    response = _frame(
+        b"10001005\1private-token https://provider.invalid/private synthetic raw exception"
+    )
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result == response.decode()
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.protocol_stage == ProtocolStage.PROVIDER_STATUS
+    assert observation.outcome == TransportOutcome.ERROR
+    assert observation.provider_code == "10001005"
+    assert observation.normalized_error == NormalizedTransportError.RATE_LIMIT
+    serialized = observation.model_dump_json()
+    assert "private-token" not in serialized
+    assert "https://provider.invalid/private" not in serialized
+    assert "synthetic raw exception" not in serialized
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(_frame(b""), id="empty-noncompressed-body"),
+        pytest.param(
+            _frame(
+                zlib.compress(b"unsafe code\1private-token https://provider.invalid/private"),
+                message_type="96",
+            ),
+            id="unsafe-compressed-provider-code",
+        ),
+    ],
+)
+def test_checked_send_rejects_missing_or_unsafe_provider_code(response: bytes) -> None:
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+        protocol_stage=ProtocolStage.PROVIDER_STATUS,
+        recv_calls=1,
+        response_bytes=len(response),
+        end_marker_seen=True,
+    )
+    assert observations[0].provider_code is None
+
+
+def test_checked_send_retains_safe_unknown_provider_code_without_message_guessing() -> None:
+    response = _frame(b"vendor-new-code\1private-token https://provider.invalid/private rate limit")
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result == response.decode()
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.protocol_stage == ProtocolStage.PROVIDER_STATUS
+    assert observation.outcome == TransportOutcome.ERROR
+    assert observation.provider_code == "vendor-new-code"
+    assert observation.normalized_error == (
+        NormalizedTransportError.UNKNOWN_PROVIDER_PROTOCOL_ERROR
+    )
+    serialized = observation.model_dump_json()
+    assert "private-token" not in serialized
+    assert "https://provider.invalid/private" not in serialized
+    assert "rate limit" not in serialized
+
+
+def test_checked_connect_converts_error_before_exposing_raw_exception(monkeypatch) -> None:
+    import backend.app.market.baostock_vendor as vendor
+
+    connection = FramedSocket(
+        [],
+        connect_error=OSError(
+            "synthetic raw exception private-token https://provider.invalid/private"
+        ),
+    )
+    observations: list[TransportObservation] = []
+    monkeypatch.setattr(vendor.socket, "socket", lambda *_args: connection)
+
+    with (
+        refresh_scope("refresh-safe"),
+        provider_session_scope("session-safe"),
+        request_scope(ProviderEndpoint.TRADE_DATES, attempt=1),
+        transport_observation_sink(observations.append),
+        pytest.raises(BaoStockTransportPatchError) as caught,
+    ):
+        checked_connect(object())
+
+    _assert_sanitized_terminal(
+        caught.value,
+        observations,
+        normalized_error=NormalizedTransportError.CONNECT_ERROR,
+        protocol_stage=ProtocolStage.CONNECT,
+        recv_calls=0,
+        response_bytes=0,
+        end_marker_seen=False,
+    )
+    assert connection.connect_calls == 1
+    assert connection.closed is True
+
+
+def test_checked_send_converts_send_error_without_reading() -> None:
+    connection = FramedSocket(
+        [],
+        send_error=OSError("synthetic raw exception /Users/private/provider.log private-token"),
+    )
+
+    result, error, observations = _invoke_checked_send(connection)
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.SEND_ERROR,
+        protocol_stage=ProtocolStage.SEND,
+        recv_calls=0,
+        response_bytes=0,
+        end_marker_seen=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_error", "expected_stage", "recv_calls", "response_bytes", "marker"),
+    [
+        (
+            [TimeoutError("synthetic raw exception private-token")],
+            NormalizedTransportError.RECV_TIMEOUT,
+            ProtocolStage.RECEIVE,
+            1,
+            0,
+            False,
+        ),
+        (
+            [b""],
+            NormalizedTransportError.EOF,
+            ProtocolStage.RECEIVE,
+            1,
+            0,
+            False,
+        ),
+        (
+            [b"bad" + PROTOCOL_MARKER],
+            NormalizedTransportError.SHORT_HEADER,
+            ProtocolStage.FRAME,
+            1,
+            len(b"bad" + PROTOCOL_MARKER),
+            True,
+        ),
+        (
+            [_frame(b"0\1ok")[: -len(PROTOCOL_MARKER)] + b"invalid-marker"],
+            NormalizedTransportError.PROTOCOL_ERROR,
+            ProtocolStage.FRAME,
+            1,
+            len(_frame(b"0\1ok")[: -len(PROTOCOL_MARKER)] + b"invalid-marker"),
+            False,
+        ),
+        (
+            [b"00.9.30\1AA\1notdigits!" + PROTOCOL_MARKER],
+            NormalizedTransportError.PROTOCOL_ERROR,
+            ProtocolStage.FRAME,
+            1,
+            len(b"00.9.30\1AA\1notdigits!" + PROTOCOL_MARKER),
+            True,
+        ),
+    ],
+)
+def test_checked_receive_fails_closed_with_exact_socket_counters(
+    chunks: list[bytes | BaseException],
+    expected_error: NormalizedTransportError,
+    expected_stage: ProtocolStage,
+    recv_calls: int,
+    response_bytes: int,
+    marker: bool,
+) -> None:
+    result, error, observations = _invoke_checked_send(FramedSocket(chunks))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=expected_error,
+        protocol_stage=expected_stage,
+        recv_calls=recv_calls,
+        response_bytes=response_bytes,
+        end_marker_seen=marker,
+    )
+
+
+def test_checked_receive_rejects_bad_compression_with_raw_byte_counters() -> None:
+    response = _frame(b"not-zlib", message_type="96")
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.BAD_COMPRESSION,
+        protocol_stage=ProtocolStage.DECOMPRESS,
+        recv_calls=1,
+        response_bytes=len(response),
+        end_marker_seen=True,
+    )
+
+
+def test_checked_receive_rejects_trailing_compressed_payload_bytes() -> None:
+    compressed = zlib.compress(b"0\1ok\n") + b"private-token"
+    response = _frame(compressed, message_type="96")
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.BAD_COMPRESSION,
+        protocol_stage=ProtocolStage.DECOMPRESS,
+        recv_calls=1,
+        response_bytes=len(response),
+        end_marker_seen=True,
+    )
+
+
+def test_checked_receive_returns_decompressed_body_only_after_complete_frame() -> None:
+    body = b"0\1ok\n"
+    compressed = zlib.compress(body)
+    response = _frame(compressed, message_type="96")
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result == response[:21].decode() + body.decode()
+    assert observations[0].recv_calls == 1
+    assert observations[0].response_bytes == len(response)
+    assert observations[0].end_marker_seen is True
+
+
+@pytest.mark.parametrize(
+    ("version", "source_sha"),
+    [
+        ("0.9.4", EXPECTED_SOCKETUTIL_SHA256),
+        (EXPECTED_BAOSTOCK_VERSION, "0" * 64),
+    ],
+)
+def test_patch_refuses_wrong_version_or_source_before_replacing_sdk_calls(
+    monkeypatch,
+    version: str,
+    source_sha: str,
+) -> None:
+    import baostock.util.socketutil as socketutil
+
+    import backend.app.market.baostock_vendor as vendor
+
+    original_connect = socketutil.SocketUtil.connect
+    original_send_msg = socketutil.send_msg
+    monkeypatch.setattr(vendor, "installed_baostock_version", lambda: version)
+    monkeypatch.setattr(vendor, "socketutil_source_sha256", lambda: source_sha)
+
+    with pytest.raises(BaoStockTransportPatchError, match="pinned source verification failed"):
+        install_baostock_transport_patch()
+
+    assert socketutil.SocketUtil.connect is original_connect
+    assert socketutil.send_msg is original_send_msg
+
+
+def test_patch_sanitizes_source_verification_read_failure(monkeypatch) -> None:
+    import backend.app.market.baostock_vendor as vendor
+
+    monkeypatch.setattr(
+        vendor,
+        "socketutil_source_sha256",
+        lambda: (_ for _ in ()).throw(
+            OSError("synthetic raw exception /Users/private/provider.log private-token")
+        ),
+    )
+
+    with pytest.raises(BaoStockTransportPatchError) as caught:
+        install_baostock_transport_patch()
+
+    assert str(caught.value) == "BaoStock pinned source verification failed"
+
+
+def test_local_baostock_source_matches_the_pinned_patch_contract() -> None:
+    assert EXPECTED_BAOSTOCK_VERSION == "0.9.3"
+    assert EXPECTED_SOCKETUTIL_SHA256 == (
+        "248591168ad087fb9c91b64e8c909608082528ecbecf25541dcbce0fe9cfcd25"
+    )
+    assert socketutil_source_sha256() == EXPECTED_SOCKETUTIL_SHA256
+
+
+def test_patch_installation_is_idempotent_under_concurrency() -> None:
+    import baostock.util.socketutil as socketutil
+
+    errors: list[BaseException] = []
+
+    def install() -> None:
+        try:
+            install_baostock_transport_patch()
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=install) for _ in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(1)
+
+    assert errors == []
+    assert all(worker.is_alive() is False for worker in workers)
+    assert socketutil.SocketUtil.connect is checked_connect
+    assert socketutil.send_msg is checked_send_msg
