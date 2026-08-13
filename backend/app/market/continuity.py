@@ -158,6 +158,8 @@ class RepairJob(BaseModel):
         if self.state == "published":
             if self.published_at is None:
                 raise ValueError("published repair job requires publication time")
+            if self.published_at != self.updated_at:
+                raise ValueError("repair publication time must match its transition")
         elif self.published_at is not None:
             raise ValueError("only a published repair job may carry publication time")
         if self.abandoned_attempt_count > self.attempt_count:

@@ -1527,7 +1527,11 @@ def test_manifest_reconciliation_publishes_failed_job_without_rewriting_attempt(
     ("corruption", "mutation"),
     [
         (corruption, mutation)
-        for corruption in ("leased_transition_mismatch", "terminal_after_job_update")
+        for corruption in (
+            "leased_transition_mismatch",
+            "terminal_after_job_update",
+            "published_transition_mismatch",
+        )
         for mutation in ("enqueue", "claim", "reconcile", "finalize", "reap")
     ],
 )
@@ -1585,10 +1589,17 @@ def test_time_corrupt_snapshot_blocks_every_mutation_without_writes(
                 "WHERE job_id = ?",
                 [active_job.job_id],
             )
-        else:
+        elif corruption == "terminal_after_job_update":
             connection.execute(
                 "UPDATE repair_attempts SET completed_at = completed_at + INTERVAL 1 SECOND "
                 "WHERE job_id = ?",
+                [terminal_job.job_id],
+            )
+        else:
+            connection.execute(
+                "UPDATE repair_jobs SET state = 'published', next_attempt_at = NULL, "
+                "last_failure_stage = NULL, last_failure_class = NULL, "
+                "published_at = updated_at + INTERVAL 1 SECOND WHERE job_id = ?",
                 [terminal_job.job_id],
             )
         before_jobs = connection.execute("SELECT * FROM repair_jobs ORDER BY job_id").fetchall()

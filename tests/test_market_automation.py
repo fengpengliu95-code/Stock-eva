@@ -1825,7 +1825,7 @@ def test_writer_schema_migration_target_collision_preserves_external_file(
     assert list(staging.iterdir()) == []
 
 
-def test_writer_schema_migration_secures_modes_and_preserves_existing_inode(
+def test_writer_schema_migration_secures_modes_and_replaces_existing_with_cow_inode(
     tmp_path: Path,
 ) -> None:
     staging = tmp_path / "staging"
@@ -1842,7 +1842,7 @@ def test_writer_schema_migration_secures_modes_and_preserves_existing_inode(
 
     existing.initialize_all_writer_schema(staging_directory=staging)
 
-    assert existing_path.stat().st_ino == inode_before
+    assert existing_path.stat().st_ino != inode_before
     assert stat.S_IMODE(existing_path.stat().st_mode) == 0o600
 
 

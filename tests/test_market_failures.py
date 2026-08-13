@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import subprocess
 import sys
 from datetime import UTC, date, datetime
@@ -531,6 +532,12 @@ def test_writer_schema_duckdb_open_is_bound_to_inherited_directory_fd(
         assert kwargs["close_fds"] is True
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
+        assert set(kwargs["env"]) == {
+            "LC_ALL",
+            "PYTHONDONTWRITEBYTECODE",
+            "PYTHONNOUSERSITE",
+            "PYTHONPATH",
+        }
         assert args[0][-1] in {"initialize", "migrate"}
         assert str(target) not in args[0]
         if race_count == 0:
@@ -567,6 +574,218 @@ def test_writer_schema_duckdb_open_is_bound_to_inherited_directory_fd(
     } == external_before
 
 
+@pytest.mark.parametrize("database_kind", ["new", "existing"])
+def test_writer_schema_rejects_basename_symlink_before_child_open_without_external_write(
+    tmp_path: Path,
+    monkeypatch,
+    database_kind: str,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target_parent = tmp_path / "market"
+    target_parent.mkdir()
+    target = target_parent / "stock_eva.duckdb"
+    if database_kind == "existing":
+        with duckdb.connect(str(target)) as connection:
+            connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+    external = tmp_path / f"external-{database_kind}.duckdb"
+    with duckdb.connect(str(external)) as connection:
+        connection.execute("CREATE TABLE external_evidence(value INTEGER)")
+        connection.execute("INSERT INTO external_evidence VALUES (11)")
+    external_before = (external.stat().st_ino, external.read_bytes())
+    real_run = subprocess.run
+
+    def replace_basename_with_symlink(*args, **kwargs):
+        if args[0][-1] != "migrate":
+            return real_run(*args, **kwargs)
+        private_roots = [
+            item for item in staging.iterdir() if item.is_dir() and item.name.endswith(".migration")
+        ]
+        assert len(private_roots) == 1
+        basename = private_roots[0] / "market.duckdb"
+        if basename.exists():
+            basename.unlink()
+        basename.symlink_to(external)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", replace_basename_with_symlink)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert (external.stat().st_ino, external.read_bytes()) == external_before
+
+
+def test_existing_writer_schema_child_failure_preserves_original_bytes_and_schema(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    target.parent.mkdir()
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+        connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    before = (target.stat().st_ino, target.read_bytes())
+    real_run = subprocess.run
+
+    def fail_child(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        return subprocess.CompletedProcess(
+            result.args,
+            9,
+            result.stdout.replace('"status": "ready"', '"status": "error"'),
+            "raw failure",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_child)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert (target.stat().st_ino, target.read_bytes()) == before
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM existing_evidence").fetchall() == [(7,)]
+        assert "repair_jobs" not in {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "flag_set",
+        "flag_clear",
+        "capability",
+        "swap",
+        "source_race",
+        "target_race",
+        "swapback_race",
+    ],
+)
+def test_existing_writer_schema_secure_publish_failures_preserve_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    failure_mode: str,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    target.parent.mkdir()
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+        connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    original = (target.stat().st_ino, target.read_bytes())
+    foreign = b"foreign target race"
+
+    if failure_mode in {"flag_set", "flag_clear"}:
+        real_flags = MarketStore._set_bound_directory_flags
+        calls = 0
+
+        def fail_flags(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if (failure_mode == "flag_set" and calls == 1) or (
+                failure_mode == "flag_clear" and calls == 2
+            ):
+                raise module.RepairQueueError("synthetic flag failure")
+            return real_flags(*args, **kwargs)
+
+        monkeypatch.setattr(
+            MarketStore,
+            "_set_bound_directory_flags",
+            staticmethod(fail_flags),
+        )
+    elif failure_mode == "capability":
+        monkeypatch.setattr(
+            MarketStore,
+            "_atomic_exchange_bound_files",
+            staticmethod(
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    module.RepairQueueError("synthetic capability unavailable")
+                )
+            ),
+        )
+    else:
+        real_exchange = MarketStore._atomic_exchange_bound_files
+        calls = 0
+
+        def race_exchange(source_fd, source_name, target_fd, target_name):
+            nonlocal calls
+            calls += 1
+            if failure_mode == "swap":
+                raise module.RepairQueueError("synthetic swap failure")
+            if failure_mode == "source_race" and calls == 1:
+                os.rename(
+                    source_name,
+                    "preserved-migrated.duckdb",
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=source_fd,
+                )
+                descriptor = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_fd,
+                )
+                try:
+                    os.write(descriptor, foreign)
+                finally:
+                    os.close(descriptor)
+            if failure_mode == "target_race" and calls == 1:
+                target.rename(target.with_name("displaced-original.duckdb"))
+                target.write_bytes(foreign)
+            result = real_exchange(source_fd, source_name, target_fd, target_name)
+            if failure_mode == "swapback_race" and calls == 1:
+                os.rename(
+                    source_name,
+                    "preserved-original.duckdb",
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=source_fd,
+                )
+                descriptor = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_fd,
+                )
+                try:
+                    os.write(descriptor, foreign)
+                finally:
+                    os.close(descriptor)
+            return result
+
+        monkeypatch.setattr(
+            MarketStore,
+            "_atomic_exchange_bound_files",
+            staticmethod(race_exchange),
+        )
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    if failure_mode == "source_race":
+        assert (target.stat().st_ino, target.read_bytes()) == original
+    elif target.exists() and target.stat().st_ino == original[0]:
+        assert target.read_bytes() == original[1]
+    elif target.exists():
+        assert target.read_bytes() == foreign
+    originals = [
+        item for item in tmp_path.rglob("*") if item.is_file() and item.stat().st_ino == original[0]
+    ]
+    assert len(originals) == 1
+    assert originals[0].read_bytes() == original[1]
+    if failure_mode == "flag_clear":
+        protected_roots = [
+            item for item in staging.iterdir() if item.is_dir() and item.name.endswith(".migration")
+        ]
+        assert len(protected_roots) == 1
+        assert protected_roots[0].stat().st_flags & stat.UF_APPEND
+        os.chflags(protected_roots[0], 0, follow_symlinks=False)
+
+
 @pytest.mark.parametrize("registered", [False, True])
 def test_writer_schema_cleanup_only_removes_registered_wal_inode(
     tmp_path: Path,
@@ -581,6 +800,12 @@ def test_writer_schema_cleanup_only_removes_registered_wal_inode(
     wal_inode: list[int] = []
     real_run = subprocess.run
 
+    if registered:
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+        assert list(staging.iterdir()) == []
+        assert target.is_file()
+        return
+
     def inject_wal_after_child(*args, **kwargs):
         result = real_run(*args, **kwargs)
         private_roots = [
@@ -592,14 +817,6 @@ def test_writer_schema_cleanup_only_removes_registered_wal_inode(
         wal_stat = wal.stat()
         wal_inode.append(wal_stat.st_ino)
         payload = json.loads(result.stdout)
-        if registered:
-            payload["artifacts"].append(
-                {
-                    "device": wal_stat.st_dev,
-                    "inode": wal_stat.st_ino,
-                    "name": wal.name,
-                }
-            )
         return subprocess.CompletedProcess(
             result.args,
             result.returncode,
@@ -613,13 +830,9 @@ def test_writer_schema_cleanup_only_removes_registered_wal_inode(
         MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
 
     remaining_wals = list(staging.glob(".*.migration/market.duckdb.wal"))
-    if registered:
-        assert remaining_wals == []
-        assert list(staging.iterdir()) == []
-    else:
-        assert len(remaining_wals) == 1
-        assert remaining_wals[0].read_bytes() == sentinel
-        assert remaining_wals[0].stat().st_ino == wal_inode[0]
+    assert len(remaining_wals) == 1
+    assert remaining_wals[0].read_bytes() == sentinel
+    assert remaining_wals[0].stat().st_ino == wal_inode[0]
     assert not target.parent.exists()
 
 
