@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -176,7 +178,6 @@ def _continuity_schema_signature(connection: duckdb.DuckDBPyConnection) -> tuple
                        constraint_column_names
                 FROM duckdb_constraints()
                 WHERE table_name IN ('continuity_schema_meta', 'repair_attempts', 'repair_jobs')
-                  AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'CHECK')
                 """
             ).fetchall()
         )
@@ -378,40 +379,141 @@ class MarketStore:
         """Atomically migrate base and continuity schema under the caller-owned lock."""
         if self.read_only:
             raise RepairQueueError("read-only market store cannot migrate writer schema")
-        if not staging_directory.is_dir():
-            raise RepairQueueError("market schema migration staging is unavailable")
-        if self.path.exists():
-            self._initialize_all_existing_writer_schema(staging_directory)
-            return
-        self._initialize_all_new_writer_schema(staging_directory)
+        try:
+            self._require_real_directory(staging_directory)
+            target_directories = self._planned_directory_creation(self.path.parent)
+            if os.path.lexists(self.path):
+                target_stat = os.lstat(self.path)
+                if not stat.S_ISREG(target_stat.st_mode):
+                    raise RepairQueueError("market schema target is not a regular file")
+                self._initialize_all_existing_writer_schema(
+                    staging_directory,
+                    expected_inode=(target_stat.st_dev, target_stat.st_ino),
+                    original_mode=stat.S_IMODE(target_stat.st_mode),
+                )
+                return
+            self._initialize_all_new_writer_schema(
+                staging_directory,
+                target_directories=target_directories,
+            )
+        except RepairQueueError:
+            raise
+        except (duckdb.Error, OSError, TypeError, ValueError):
+            raise RepairQueueError("market schema migration failed") from None
 
-    def _initialize_all_existing_writer_schema(self, staging_directory: Path) -> None:
+    @staticmethod
+    def _require_real_directory(path: Path) -> None:
+        try:
+            directory_stat = os.lstat(path)
+        except FileNotFoundError:
+            raise RepairQueueError("market schema migration directory is unavailable") from None
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise RepairQueueError("market schema migration directory is unsafe")
+
+    @classmethod
+    def _planned_directory_creation(cls, path: Path) -> tuple[Path, ...]:
+        missing: list[Path] = []
+        current = path
+        while not os.path.lexists(current):
+            if current == current.parent:
+                raise RepairQueueError("market schema target parent is unavailable")
+            missing.append(current)
+            current = current.parent
+        cls._require_real_directory(current)
+        return tuple(reversed(missing))
+
+    @staticmethod
+    def _require_inode(path: Path, expected_inode: tuple[int, int]) -> None:
+        try:
+            target_stat = os.lstat(path)
+        except FileNotFoundError:
+            raise RepairQueueConflictError(
+                "market schema target changed during migration"
+            ) from None
+        if (
+            not stat.S_ISREG(target_stat.st_mode)
+            or (target_stat.st_dev, target_stat.st_ino) != expected_inode
+        ):
+            raise RepairQueueConflictError("market schema target changed during migration")
+
+    @classmethod
+    def _chmod_inode(
+        cls,
+        path: Path,
+        expected_inode: tuple[int, int],
+        mode: int,
+    ) -> None:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            target_stat = os.fstat(descriptor)
+            if (target_stat.st_dev, target_stat.st_ino) != expected_inode:
+                raise RepairQueueConflictError("market schema target changed during migration")
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
+        cls._require_inode(path, expected_inode)
+
+    def _initialize_all_existing_writer_schema(
+        self,
+        staging_directory: Path,
+        *,
+        expected_inode: tuple[int, int],
+        original_mode: int,
+    ) -> None:
         connection = None
+        mode_changed = False
+        committed = False
         try:
             connection = self._open_writer_connection(
                 temp_directory=staging_directory,
                 create_directories=False,
             )
+            self._require_inode(self.path, expected_inode)
             connection.begin()
             self._initialize_base_schema_on_connection(connection)
             self._initialize_continuity_schema_on_connection(connection)
+            self._require_inode(self.path, expected_inode)
+            self._chmod_inode(self.path, expected_inode, 0o600)
+            mode_changed = True
             connection.commit()
+            committed = True
+            self._require_inode(self.path, expected_inode)
         except Exception:
             if connection is not None:
                 try:
                     connection.rollback()
                 except duckdb.Error:
                     pass
+            if mode_changed and not committed:
+                self._chmod_inode(self.path, expected_inode, original_mode)
             raise
         finally:
             if connection is not None:
                 connection.close()
 
-    def _initialize_all_new_writer_schema(self, staging_directory: Path) -> None:
-        staging_path = staging_directory / f".{self.path.name}.{uuid4().hex}.migration"
+    def _initialize_all_new_writer_schema(
+        self,
+        staging_directory: Path,
+        *,
+        target_directories: tuple[Path, ...],
+    ) -> None:
+        staging_root: Path | None = None
+        staging_owned = False
+        staging_path: Path | None = None
+        target_owned = False
+        target_inode: tuple[int, int] | None = None
         connection = None
         created_directories: list[Path] = []
         try:
+            staging_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{self.path.name}.",
+                    suffix=".migration",
+                    dir=staging_directory,
+                )
+            )
+            staging_owned = True
+            staging_path = staging_root / "market.duckdb"
             connection = self._open_writer_connection(
                 path=staging_path,
                 temp_directory=staging_directory,
@@ -423,14 +525,28 @@ class MarketStore:
             connection.commit()
             connection.close()
             connection = None
-            current = self.path.parent
-            while not current.exists():
-                created_directories.append(current)
-                current = current.parent
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists():
+            os.chmod(staging_path, 0o600, follow_symlinks=False)
+            for directory in target_directories:
+                os.mkdir(directory, mode=0o700)
+                created_directories.append(directory)
+            if os.path.lexists(self.path):
                 raise RepairQueueConflictError("market schema target appeared during migration")
+            target_fd = os.open(
+                self.path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                target_stat = os.fstat(target_fd)
+                target_inode = (target_stat.st_dev, target_stat.st_ino)
+            finally:
+                os.close(target_fd)
+            target_owned = True
+            assert target_inode is not None
+            self._require_inode(self.path, target_inode)
             os.replace(staging_path, self.path)
+            target_owned = False
+            staging_path = None
         except Exception:
             if connection is not None:
                 try:
@@ -441,17 +557,32 @@ class MarketStore:
         finally:
             if connection is not None:
                 connection.close()
-            for candidate in (staging_path, Path(f"{staging_path}.wal")):
-                try:
-                    candidate.unlink()
-                except FileNotFoundError:
-                    pass
-            if not self.path.exists():
-                for directory in created_directories:
+            if staging_path is not None:
+                for candidate in (staging_path, Path(f"{staging_path}.wal")):
                     try:
-                        directory.rmdir()
-                    except OSError:
-                        break
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
+            if target_owned and target_inode is not None:
+                try:
+                    self._require_inode(self.path, target_inode)
+                except RepairQueueError:
+                    pass
+                else:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+            if staging_owned and staging_root is not None:
+                try:
+                    staging_root.rmdir()
+                except OSError:
+                    pass
+            for directory in reversed(created_directories):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    break
 
     def _connect_continuity_writer(self) -> duckdb.DuckDBPyConnection:
         if self.read_only:
@@ -519,6 +650,7 @@ class MarketStore:
             [_CONTINUITY_SCHEMA_HASH],
         )
         cls._require_continuity_schema(connection)
+        cls._validate_queue_on_connection(connection)
 
     @staticmethod
     def _repair_job_from_row(row) -> RepairJob:
@@ -609,6 +741,27 @@ class MarketStore:
         )
         RepairQueueSnapshot(status="ready", jobs=(job,), attempts=attempts)
 
+    @classmethod
+    def _validate_queue_on_connection(
+        cls,
+        connection: duckdb.DuckDBPyConnection,
+    ) -> None:
+        jobs = tuple(
+            cls._repair_job_from_row(row)
+            for row in connection.execute(
+                f"SELECT {', '.join(_REPAIR_JOB_COLUMNS)} FROM repair_jobs "
+                "ORDER BY trade_date, universe_id"
+            ).fetchall()
+        )
+        attempts = tuple(
+            cls._repair_attempt_from_row(row)
+            for row in connection.execute(
+                f"SELECT {', '.join(_REPAIR_ATTEMPT_COLUMNS)} FROM repair_attempts "
+                "ORDER BY job_id, attempt_number"
+            ).fetchall()
+        )
+        RepairQueueSnapshot(status="ready", jobs=jobs, attempts=attempts)
+
     def repair_queue_snapshot(self) -> RepairQueueSnapshot:
         """Read queue evidence without creating or migrating any file or table."""
         unavailable = RepairQueueSnapshot(
@@ -664,6 +817,7 @@ class MarketStore:
         try:
             connection.begin()
             self._require_continuity_schema(connection)
+            self._validate_queue_on_connection(connection)
             for trade_date in dates:
                 job_id = repair_job_id(trade_date, universe_id)
                 existing = connection.execute(
@@ -734,6 +888,7 @@ class MarketStore:
         try:
             connection.begin()
             self._require_continuity_schema(connection)
+            self._validate_queue_on_connection(connection)
             row = connection.execute(
                 f"SELECT {', '.join(_REPAIR_JOB_COLUMNS)} FROM repair_jobs WHERE job_id = ?",
                 [job_id],
@@ -863,6 +1018,7 @@ class MarketStore:
         try:
             connection.begin()
             self._require_continuity_schema(connection)
+            self._validate_queue_on_connection(connection)
             row = connection.execute(
                 f"SELECT {', '.join(_REPAIR_JOB_COLUMNS)} FROM repair_jobs "
                 "WHERE job_id = ? AND state = 'leased' AND state_version = ? "
@@ -901,8 +1057,15 @@ class MarketStore:
                 or timestamp < attempt.started_at
             ):
                 raise RepairQueueError("repair queue finalization time is invalid")
-            if outcome == "succeeded" and refresh_result.request_key != job.job_id:
+            if refresh_result.request_key != job.job_id:
                 raise RepairQueueError("repair publication request key does not match job")
+            if (
+                refresh_result.started_at < job.created_at
+                or refresh_result.started_at < job.updated_at
+                or refresh_result.started_at < attempt.started_at
+                or refresh_result.completed_at > timestamp
+            ):
+                raise RepairQueueError("repair refresh evidence time is invalid")
             if outcome == "failed":
                 if retryable and job.attempt_count < retry_policy.max_attempts:
                     next_attempt_at = timestamp + retry_policy.delay_after(job.attempt_count)
@@ -992,6 +1155,7 @@ class MarketStore:
         try:
             connection.begin()
             self._require_continuity_schema(connection)
+            self._validate_queue_on_connection(connection)
             rows = connection.execute(
                 f"SELECT {', '.join(_REPAIR_JOB_COLUMNS)} FROM repair_jobs "
                 "WHERE state = 'leased' AND lease_expires_at <= ? ORDER BY trade_date",
@@ -1106,6 +1270,7 @@ class MarketStore:
         try:
             connection.begin()
             self._require_continuity_schema(connection)
+            self._validate_queue_on_connection(connection)
             rows = connection.execute(
                 f"SELECT {', '.join(_REPAIR_JOB_COLUMNS)} FROM repair_jobs "
                 "WHERE trade_date = ANY(?) AND state <> 'published' "

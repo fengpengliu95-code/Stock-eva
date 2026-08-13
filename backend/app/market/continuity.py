@@ -283,7 +283,9 @@ class RepairQueueSnapshot(BaseModel):
                     raise ValueError("repair attempt references an unknown job")
                 attempts_by_job[attempt.job_id].append(attempt)
             for job in self.jobs:
-                job_attempts = attempts_by_job[job.job_id]
+                job_attempts = sorted(
+                    attempts_by_job[job.job_id], key=lambda item: item.attempt_number
+                )
                 attempt_numbers = sorted(item.attempt_number for item in job_attempts)
                 if len(attempt_numbers) != job.attempt_count or any(
                     number != expected for expected, number in enumerate(attempt_numbers, start=1)
@@ -292,6 +294,13 @@ class RepairQueueSnapshot(BaseModel):
                 abandoned = sum(item.outcome == "abandoned" for item in job_attempts)
                 if abandoned != job.abandoned_attempt_count:
                     raise ValueError("repair job abandoned count does not match attempts")
+                for previous, current in zip(job_attempts, job_attempts[1:], strict=False):
+                    if previous.completed_at is None or previous.completed_at > current.started_at:
+                        raise ValueError("repair attempt time lineage overlaps")
+                    if previous.outcome == "succeeded" or (
+                        previous.outcome == "failed" and previous.retryable is False
+                    ):
+                        raise ValueError("terminal repair attempt cannot have a successor")
                 if job.last_attempt_id is None:
                     continue
                 attempt = attempts.get(job.last_attempt_id)
@@ -314,6 +323,26 @@ class RepairQueueSnapshot(BaseModel):
                     raise ValueError("failed repair job lacks a terminal failure attempt")
                 if job.state == "published" and attempt.outcome == "running":
                     raise ValueError("published repair job cannot have a running attempt")
+                succeeded = [item for item in job_attempts if item.outcome == "succeeded"]
+                if succeeded and (
+                    len(succeeded) != 1
+                    or succeeded[0].attempt_id != job.last_attempt_id
+                    or job.state != "published"
+                ):
+                    raise ValueError("successful repair attempt lineage is invalid")
+                nonretryable_failures = [
+                    item
+                    for item in job_attempts
+                    if item.outcome == "failed" and item.retryable is False
+                ]
+                if nonretryable_failures and (
+                    len(nonretryable_failures) != 1
+                    or nonretryable_failures[0].attempt_id != job.last_attempt_id
+                    or job.state != "dead_letter"
+                ):
+                    raise ValueError("non-retryable repair attempt lineage is invalid")
+                if job.state == "published" and attempt.outcome != "succeeded":
+                    raise ValueError("published repair job lacks successful attempt evidence")
             for attempt in self.attempts:
                 if attempt.outcome == "running":
                     job = jobs.get(attempt.job_id)

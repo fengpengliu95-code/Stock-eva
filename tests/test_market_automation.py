@@ -2,8 +2,11 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import sqlite3
+import stat
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1555,6 +1558,7 @@ def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
             )
             """
         )
+    path.chmod(0o640)
     settings = cli.get_settings().model_copy(
         update={
             "market_data_dir": path.parent,
@@ -1597,6 +1601,7 @@ def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
         hashlib.sha256(path.read_bytes()).hexdigest(),
     )
     assert after == before
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
     with duckdb.connect(str(path), read_only=True) as connection:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(refresh_runs)").fetchall()
@@ -1655,6 +1660,178 @@ def test_market_schema_migration_new_database_failure_leaves_tree_unchanged(
     }
     assert tree_fingerprint() == before
     assert not settings.market_data_dir.exists()
+
+
+@pytest.mark.parametrize("link_kind", ["live", "broken"])
+def test_writer_schema_migration_rejects_symlink_database_targets(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    target_parent = tmp_path / "market"
+    target_parent.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = target_parent / "stock_eva.duckdb"
+    external = tmp_path / "external.duckdb"
+    if link_kind == "live":
+        with duckdb.connect(str(external)) as connection:
+            connection.execute("CREATE TABLE external_evidence (value INTEGER)")
+        external_before = (
+            external.stat().st_size,
+            external.stat().st_mtime_ns,
+            hashlib.sha256(external.read_bytes()).hexdigest(),
+        )
+        target.symlink_to(external)
+    else:
+        target.symlink_to(external)
+        external_before = None
+    link_before = os.readlink(target)
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert target.is_symlink()
+    assert os.readlink(target) == link_before
+    if external_before is None:
+        assert not external.exists()
+    else:
+        assert (
+            external.stat().st_size,
+            external.stat().st_mtime_ns,
+            hashlib.sha256(external.read_bytes()).hexdigest(),
+        ) == external_before
+
+
+def test_writer_schema_migration_rejects_nonregular_target(tmp_path: Path) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market.duckdb"
+    target.mkdir()
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize("symlink_scope", ["target_parent", "staging_parent"])
+def test_writer_schema_migration_rejects_symlink_parent_scope(
+    tmp_path: Path,
+    symlink_scope: str,
+) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    external = tmp_path / "external"
+    external.mkdir()
+    target_parent = tmp_path / "market"
+    staging = tmp_path / "staging"
+    if symlink_scope == "target_parent":
+        target_parent.symlink_to(external, target_is_directory=True)
+        staging.mkdir()
+    else:
+        target_parent.mkdir()
+        staging.symlink_to(external, target_is_directory=True)
+    target = target_parent / "stock_eva.duckdb"
+    before = tuple(external.iterdir())
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert tuple(external.iterdir()) == before
+    assert not os.path.lexists(target)
+
+
+def test_writer_schema_migration_refuses_staging_allocation_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    marker = staging / "foreign-collision"
+    marker.write_bytes(b"foreign staging evidence")
+    target = tmp_path / "market" / "stock_eva.duckdb"
+
+    def collide(*_args, **_kwargs):
+        raise FileExistsError("synthetic staging collision")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", collide)
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert marker.read_bytes() == b"foreign staging evidence"
+    assert not target.parent.exists()
+
+
+def test_writer_schema_migration_replace_failure_cleans_only_owned_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    marker = staging / "foreign-marker"
+    marker.write_bytes(b"foreign staging evidence")
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    before = {item.name: item.read_bytes() for item in staging.iterdir()}
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("synthetic atomic replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert {item.name: item.read_bytes() for item in staging.iterdir()} == before
+    assert not target.parent.exists()
+
+
+def test_writer_schema_migration_target_collision_preserves_external_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    continuity = load_module("backend.app.market.continuity")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    collision_bytes = b"external collision evidence"
+
+    def collide_at_replace(_source, destination):
+        Path(destination).unlink()
+        Path(destination).write_bytes(collision_bytes)
+        raise FileExistsError("synthetic target collision")
+
+    monkeypatch.setattr(os, "replace", collide_at_replace)
+
+    with pytest.raises(continuity.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert target.read_bytes() == collision_bytes
+    assert list(staging.iterdir()) == []
+
+
+def test_writer_schema_migration_secures_modes_and_preserves_existing_inode(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    new_path = tmp_path / "new" / "stock_eva.duckdb"
+    MarketStore(new_path).initialize_all_writer_schema(staging_directory=staging)
+    assert stat.S_IMODE(new_path.stat().st_mode) == 0o600
+
+    existing_path = tmp_path / "existing.duckdb"
+    existing = MarketStore(existing_path)
+    existing.initialize_schema()
+    existing_path.chmod(0o664)
+    inode_before = existing_path.stat().st_ino
+
+    existing.initialize_all_writer_schema(staging_directory=staging)
+
+    assert existing_path.stat().st_ino == inode_before
+    assert stat.S_IMODE(existing_path.stat().st_mode) == 0o600
 
 
 def test_automation_defers_without_fetching_when_refresh_lock_is_busy(

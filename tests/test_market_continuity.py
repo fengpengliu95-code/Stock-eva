@@ -45,11 +45,46 @@ def enqueue(
         )
 
 
+def create_two_retryable_failed_attempts(
+    store: MarketStore,
+    lock_path: Path,
+    job,
+):
+    module = continuity_module()
+    policy = module.RepairRetryPolicy(max_attempts=4, base_seconds=900)
+    due = NOW
+    for attempt_number in (1, 2):
+        with RefreshRunLock(lock_path):
+            lease = store.claim_repair_job(
+                job.job_id,
+                owner="worker-a",
+                expected_version=job.state_version,
+                now=due,
+                lease_seconds=1800,
+            )
+            assert lease is not None
+            job = store.finalize_repair_attempt(
+                lease,
+                outcome="failed",
+                refresh_result=error_refresh(
+                    job.trade_date,
+                    attempt=attempt_number,
+                    started_at=due,
+                ),
+                now=due + timedelta(minutes=1),
+                retry_policy=policy,
+            )
+        assert job.next_attempt_at is not None
+        due = job.next_attempt_at
+    return job
+
+
 def error_refresh(
     trade_date: date,
     *,
     attempt: int,
     retryable: bool = True,
+    started_at: datetime = NOW,
 ) -> RefreshResult:
     return RefreshResult(
         run_id=f"repair-run-{trade_date}-{attempt}",
@@ -67,12 +102,12 @@ def error_refresh(
         failure_stage="fetch",
         failure_class="transport_timeout" if retryable else "auth",
         retryable=retryable,
-        started_at=NOW,
-        completed_at=NOW + timedelta(minutes=1),
+        started_at=started_at,
+        completed_at=started_at + timedelta(minutes=1),
     )
 
 
-def ready_refresh(trade_date: date) -> RefreshResult:
+def ready_refresh(trade_date: date, *, started_at: datetime = NOW) -> RefreshResult:
     return RefreshResult(
         run_id=f"repair-run-{trade_date}-ready",
         request_key=f"repair:{trade_date}:{UNIVERSE_ID}",
@@ -83,8 +118,8 @@ def ready_refresh(trade_date: date) -> RefreshResult:
         requested_count=1,
         succeeded_count=1,
         coverage_ratio=1,
-        started_at=NOW,
-        completed_at=NOW + timedelta(minutes=1),
+        started_at=started_at,
+        completed_at=started_at + timedelta(minutes=1),
     )
 
 
@@ -97,6 +132,7 @@ def create_task2_continuity_tables(
     connection: duckdb.DuckDBPyConnection,
     *,
     fake_checks: bool = False,
+    attempt_foreign_key: bool = False,
 ) -> None:
     job_checks = (
         ["CHECK (TRUE)"] * 6
@@ -174,6 +210,7 @@ def create_task2_continuity_tables(
             completed_at TIMESTAMPTZ,
             UNIQUE (job_id, attempt_number),
             {", ".join(attempt_checks)}
+            {", FOREIGN KEY (job_id) REFERENCES repair_jobs(job_id)" if attempt_foreign_key else ""}
         )
         """
     )
@@ -396,6 +433,31 @@ def test_schema_with_fake_check_constraints_is_unavailable_even_with_claimed_met
     path = tmp_path / "market.duckdb"
     with duckdb.connect(str(path)) as connection:
         create_task2_continuity_tables(connection, fake_checks=True)
+        connection.execute(
+            """
+            CREATE TABLE continuity_schema_meta (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                schema_hash VARCHAR NOT NULL,
+                CHECK (singleton = 1),
+                CHECK (schema_version = 1)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO continuity_schema_meta VALUES (1, 1, ?)",
+            [getattr(market_store_module, "_CONTINUITY_SCHEMA_HASH", "pending-schema-hash")],
+        )
+
+    assert MarketStore(path).repair_queue_snapshot().status == "unavailable"
+
+
+def test_schema_with_extra_foreign_key_is_unavailable_even_with_claimed_meta(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "market.duckdb"
+    with duckdb.connect(str(path)) as connection:
+        create_task2_continuity_tables(connection, attempt_foreign_key=True)
         connection.execute(
             """
             CREATE TABLE continuity_schema_meta (
@@ -656,6 +718,106 @@ def test_success_finalize_requires_deterministic_job_request_key(tmp_path: Path)
     assert store.repair_queue_snapshot().jobs[0].state == "leased"
 
 
+@pytest.mark.parametrize("outcome", ["succeeded", "failed"])
+@pytest.mark.parametrize(
+    "evidence_mutation",
+    ["request_key", "requested_date", "started_before_attempt", "completed_after_finalize"],
+)
+def test_finalize_requires_bound_and_monotonic_refresh_evidence_for_every_outcome(
+    tmp_path: Path,
+    outcome: str,
+    evidence_mutation: str,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / f"{outcome}-{evidence_mutation}.duckdb"
+    lock_path = tmp_path / f"{outcome}-{evidence_mutation}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    claimed_at = NOW + timedelta(minutes=10)
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=claimed_at,
+            lease_seconds=1800,
+        )
+    assert lease is not None
+    finalize_at = claimed_at + timedelta(minutes=2)
+    if outcome == "succeeded":
+        result = ready_refresh(job.trade_date, started_at=claimed_at)
+    else:
+        result = error_refresh(job.trade_date, attempt=1, started_at=claimed_at)
+    if evidence_mutation == "request_key":
+        result = result.model_copy(update={"request_key": "unrelated-request"})
+    elif evidence_mutation == "requested_date":
+        result = result.model_copy(update={"requested_date": date(2026, 8, 11)})
+    elif evidence_mutation == "started_before_attempt":
+        result = result.model_copy(
+            update={
+                "started_at": claimed_at - timedelta(seconds=1),
+                "completed_at": claimed_at + timedelta(minutes=1),
+            }
+        )
+    else:
+        result = result.model_copy(update={"completed_at": finalize_at + timedelta(seconds=1)})
+    before = store.repair_queue_snapshot()
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                lease,
+                outcome=outcome,
+                refresh_result=result,
+                now=finalize_at,
+                retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+            )
+
+    assert store.repair_queue_snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_state"),
+    [("succeeded", "published"), ("failed", "retry_wait")],
+)
+def test_finalize_accepts_exact_bound_monotonic_refresh_evidence(
+    tmp_path: Path,
+    outcome: str,
+    expected_state: str,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / f"valid-{outcome}.duckdb"
+    lock_path = tmp_path / f"valid-{outcome}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    claimed_at = NOW + timedelta(minutes=10)
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=claimed_at,
+            lease_seconds=1800,
+        )
+        assert lease is not None
+        result = (
+            ready_refresh(job.trade_date, started_at=claimed_at)
+            if outcome == "succeeded"
+            else error_refresh(job.trade_date, attempt=1, started_at=claimed_at)
+        )
+        finalized = store.finalize_repair_attempt(
+            lease,
+            outcome=outcome,
+            refresh_result=result,
+            now=claimed_at + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+
+    assert finalized.state == expected_state
+
+
 def test_naive_datetime_is_rejected_and_persisted_times_are_utc(tmp_path: Path) -> None:
     module = continuity_module()
     path = tmp_path / "market.duckdb"
@@ -894,7 +1056,11 @@ def test_retry_is_exponential_capped_and_budgeted(tmp_path: Path) -> None:
             job = store.finalize_repair_attempt(
                 lease,
                 outcome="failed",
-                refresh_result=error_refresh(job.trade_date, attempt=attempt_number),
+                refresh_result=error_refresh(
+                    job.trade_date,
+                    attempt=attempt_number,
+                    started_at=due,
+                ),
                 now=completed_at,
                 retry_policy=policy,
             )
@@ -914,7 +1080,7 @@ def test_retry_is_exponential_capped_and_budgeted(tmp_path: Path) -> None:
         job = store.finalize_repair_attempt(
             lease,
             outcome="failed",
-            refresh_result=error_refresh(job.trade_date, attempt=7),
+            refresh_result=error_refresh(job.trade_date, attempt=7, started_at=due),
             now=due + timedelta(minutes=1),
             retry_policy=policy,
         )
@@ -1104,6 +1270,108 @@ def test_snapshot_checks_attempt_sequence_without_allocating_attempt_count_range
 
     monkeypatch.setattr(module, "range", forbidden_range, raising=False)
     assert store.repair_queue_snapshot().status == "unavailable"
+
+
+@pytest.mark.parametrize("first_outcome", ["succeeded", "nonretryable_failed"])
+def test_snapshot_rejects_terminal_attempt_followed_by_another_attempt(
+    tmp_path: Path,
+    first_outcome: str,
+) -> None:
+    path = tmp_path / f"terminal-lineage-{first_outcome}.duckdb"
+    lock_path = tmp_path / f"terminal-lineage-{first_outcome}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    create_two_retryable_failed_attempts(store, lock_path, job)
+    with duckdb.connect(str(path)) as connection:
+        if first_outcome == "succeeded":
+            connection.execute(
+                """
+                UPDATE repair_attempts
+                SET outcome = 'succeeded', failure_stage = NULL, failure_class = NULL,
+                    retryable = FALSE
+                WHERE job_id = ? AND attempt_number = 1
+                """,
+                [job.job_id],
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE repair_attempts
+                SET retryable = FALSE
+                WHERE job_id = ? AND attempt_number = 1
+                """,
+                [job.job_id],
+            )
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_snapshot_rejects_overlapping_attempt_time_lineage(tmp_path: Path) -> None:
+    path = tmp_path / "overlapping-lineage.duckdb"
+    lock_path = tmp_path / "overlapping-lineage.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    create_two_retryable_failed_attempts(store, lock_path, job)
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            """
+            UPDATE repair_attempts
+            SET started_at = ?
+            WHERE job_id = ? AND attempt_number = 2
+            """,
+            [NOW + timedelta(seconds=30), job.job_id],
+        )
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_claim_validates_existing_full_lineage_before_mutation(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "pre-mutation-lineage.duckdb"
+    lock_path = tmp_path / "pre-mutation-lineage.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        assert lease is not None
+        retry_wait = store.finalize_repair_attempt(
+            lease,
+            outcome="failed",
+            refresh_result=error_refresh(job.trade_date, attempt=1),
+            now=NOW + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+        )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            "UPDATE repair_attempts SET retryable = FALSE WHERE job_id = ?",
+            [job.job_id],
+        )
+        before_jobs = connection.execute("SELECT * FROM repair_jobs").fetchall()
+        before_attempts = connection.execute("SELECT * FROM repair_attempts").fetchall()
+    assert retry_wait.next_attempt_at is not None
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.claim_repair_job(
+                job.job_id,
+                owner="worker-b",
+                expected_version=retry_wait.state_version,
+                now=retry_wait.next_attempt_at,
+                lease_seconds=1800,
+            )
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM repair_jobs").fetchall() == before_jobs
+        assert connection.execute("SELECT * FROM repair_attempts").fetchall() == before_attempts
 
 
 def test_dead_letter_does_not_block_a_newer_pending_job(tmp_path: Path) -> None:
