@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -149,13 +150,7 @@ _CONTINUITY_SCHEMA_HASH = hashlib.sha256(
 ).hexdigest()
 _CONTINUITY_TABLES = ("continuity_schema_meta", "repair_attempts", "repair_jobs")
 _SCHEMA_MIGRATION_DATABASE = "market.duckdb"
-_SCHEMA_MIGRATION_WAL = f"{_SCHEMA_MIGRATION_DATABASE}.wal"
-_SCHEMA_MIGRATION_VALIDATION = "validated.duckdb"
-_SCHEMA_MIGRATION_ARTIFACTS = {
-    _SCHEMA_MIGRATION_DATABASE,
-    _SCHEMA_MIGRATION_WAL,
-    _SCHEMA_MIGRATION_VALIDATION,
-}
+_SCHEMA_MIGRATION_RANDOM_DATABASE_PATTERN = re.compile(r"market\.[0-9a-f]{32}\.duckdb")
 _RENAME_SWAP = 0x00000002
 _RENAME_NOFOLLOW_ANY = 0x00000010
 _RENAME_RESOLVE_BENEATH = 0x00000020
@@ -164,7 +159,7 @@ import os
 import sys
 os.fchdir(int(sys.argv[1]))
 from backend.app.market.store import _bound_schema_migration_child
-raise SystemExit(_bound_schema_migration_child(sys.argv[2]))
+raise SystemExit(_bound_schema_migration_child(sys.argv[2:]))
 """
 
 
@@ -216,51 +211,138 @@ def _expected_continuity_schema_signature() -> tuple:
         connection.close()
 
 
-def _bound_schema_artifacts() -> list[dict[str, int | str]]:
+def _schema_migration_database_name_is_safe(name: str) -> bool:
+    return name == _SCHEMA_MIGRATION_DATABASE or bool(
+        _SCHEMA_MIGRATION_RANDOM_DATABASE_PATTERN.fullmatch(name)
+    )
+
+
+def _schema_migration_artifact_names(database_name: str) -> set[str]:
+    if not _schema_migration_database_name_is_safe(database_name):
+        raise ValueError("invalid schema migration database name")
+    return {database_name, f"{database_name}.wal"}
+
+
+def _fingerprint_descriptor(descriptor: int) -> tuple[int, int, int, int, str]:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("schema migration input is not regular")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < before.st_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
+        if not chunk:
+            raise ValueError("schema migration input changed")
+        digest.update(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError("schema migration input changed")
+    return (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        digest.hexdigest(),
+    )
+
+
+def _portable_fingerprint(
+    fingerprint: tuple[int, int, int, int, str],
+) -> tuple[int, int, int, str]:
+    return fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[4]
+
+
+def _bound_schema_artifacts(database_name: str) -> list[dict[str, int | str]]:
     artifacts: list[dict[str, int | str]] = []
-    for name in sorted(_SCHEMA_MIGRATION_ARTIFACTS):
+    for name in sorted(_schema_migration_artifact_names(database_name)):
         try:
-            artifact = os.stat(name, follow_symlinks=False)
+            descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
             continue
-        if stat.S_ISREG(artifact.st_mode):
+        try:
+            fingerprint = _portable_fingerprint(_fingerprint_descriptor(descriptor))
             artifacts.append(
                 {
                     "name": name,
-                    "device": artifact.st_dev,
-                    "inode": artifact.st_ino,
+                    "device": fingerprint[0],
+                    "inode": fingerprint[1],
+                    "size": fingerprint[2],
+                    "sha256": fingerprint[3],
                 }
             )
+        finally:
+            os.close(descriptor)
     return artifacts
 
 
-def _bound_schema_migration_child(action: str) -> int:
+def _bound_schema_migration_child(arguments: list[str]) -> int:
     """Run only after the child has fchdir'd to the inherited private directory fd."""
     connection = None
+    database_name: str | None = None
     status = "error"
     try:
-        if action not in {"initialize", "migrate"}:
+        if not arguments or arguments[0] not in {"initialize_and_migrate", "migrate"}:
             raise ValueError("invalid schema migration action")
-        connection = duckdb.connect(_SCHEMA_MIGRATION_DATABASE)
+        action = arguments[0]
+        if action == "initialize_and_migrate":
+            if len(arguments) != 1 or os.listdir("."):
+                raise ValueError("invalid new schema migration input")
+            database_name = f"market.{secrets.token_hex(16)}.duckdb"
+        else:
+            if len(arguments) != 6:
+                raise ValueError("invalid schema migration input")
+            database_name = arguments[1]
+            if not _schema_migration_database_name_is_safe(database_name):
+                raise ValueError("invalid schema migration database name")
+            if any(not re.fullmatch(r"0|[1-9][0-9]*", value) for value in arguments[2:5]):
+                raise ValueError("invalid schema migration fingerprint")
+            expected = (
+                int(arguments[2]),
+                int(arguments[3]),
+                int(arguments[4]),
+                arguments[5],
+            )
+            if (
+                expected[0] < 0
+                or expected[1] <= 0
+                or expected[2] < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", expected[3])
+            ):
+                raise ValueError("invalid schema migration fingerprint")
+            # The parent protects this private directory entry against replacement.
+            # An actively malicious same-UID writer to the already-open inode is
+            # outside the isolation that this writer lock can provide.
+            input_descriptor = os.open(
+                database_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                if _portable_fingerprint(_fingerprint_descriptor(input_descriptor)) != expected:
+                    raise ValueError("schema migration input changed")
+                entry = os.stat(database_name, follow_symlinks=False)
+                if (entry.st_dev, entry.st_ino) != expected[:2]:
+                    raise ValueError("schema migration input changed")
+            finally:
+                os.close(input_descriptor)
+        connection = duckdb.connect(database_name)
         connection.execute("SET temp_directory = '.'")
-        if action == "migrate":
-            connection.begin()
-            MarketStore._initialize_base_schema_on_connection(connection)
-            MarketStore._initialize_continuity_schema_on_connection(connection)
-            connection.commit()
+        connection.begin()
+        MarketStore._initialize_base_schema_on_connection(connection)
+        MarketStore._initialize_continuity_schema_on_connection(connection)
+        connection.commit()
         connection.close()
         connection = None
-        if action == "migrate":
-            os.link(
-                _SCHEMA_MIGRATION_DATABASE,
-                _SCHEMA_MIGRATION_VALIDATION,
-                follow_symlinks=False,
-            )
-            validation = duckdb.connect(_SCHEMA_MIGRATION_VALIDATION, read_only=True)
-            try:
-                MarketStore._require_continuity_schema(validation)
-            finally:
-                validation.close()
+        validation = duckdb.connect(database_name, read_only=True)
+        try:
+            MarketStore._require_continuity_schema(validation)
+        finally:
+            validation.close()
         status = "ready"
     except Exception:
         if connection is not None:
@@ -276,7 +358,13 @@ def _bound_schema_migration_child(action: str) -> int:
                 pass
     print(
         json.dumps(
-            {"artifacts": _bound_schema_artifacts(), "status": status},
+            {
+                "artifacts": (
+                    _bound_schema_artifacts(database_name) if database_name is not None else []
+                ),
+                "database_name": database_name,
+                "status": status,
+            },
             sort_keys=True,
         ),
         flush=True,
@@ -635,9 +723,28 @@ class MarketStore:
     def _run_bound_schema_migration_child(
         directory_fd: int,
         action: str,
-    ) -> tuple[bool, dict[str, tuple[int, int]]]:
-        if action not in {"initialize", "migrate"}:
+        *,
+        database_name: str | None = None,
+        expected_fingerprint: tuple[int, int, int, str] | None = None,
+    ) -> tuple[bool, str | None, dict[str, tuple[int, int, int, str]]]:
+        if action not in {"initialize_and_migrate", "migrate"}:
             raise RepairQueueError("market schema migration action is invalid")
+        if action == "initialize_and_migrate":
+            if database_name is not None or expected_fingerprint is not None:
+                raise RepairQueueError("market schema migration input is invalid")
+            child_arguments = [action]
+        else:
+            if (
+                database_name is None
+                or expected_fingerprint is None
+                or not _schema_migration_database_name_is_safe(database_name)
+            ):
+                raise RepairQueueError("market schema migration input is invalid")
+            child_arguments = [
+                action,
+                database_name,
+                *(str(value) for value in expected_fingerprint),
+            ]
         project_root = str(Path(__file__).resolve().parents[3])
         environment = {
             "LC_ALL": "C",
@@ -647,7 +754,13 @@ class MarketStore:
         }
         try:
             result = subprocess.run(
-                [sys.executable, "-c", _SCHEMA_MIGRATION_CHILD, str(directory_fd), action],
+                [
+                    sys.executable,
+                    "-c",
+                    _SCHEMA_MIGRATION_CHILD,
+                    str(directory_fd),
+                    *child_arguments,
+                ],
                 pass_fds=(directory_fd,),
                 close_fds=True,
                 capture_output=True,
@@ -660,24 +773,35 @@ class MarketStore:
             raise RepairQueueError("market schema migration child failed") from None
         try:
             payload = json.loads(result.stdout)
-            if set(payload) != {"artifacts", "status"}:
+            if set(payload) != {"artifacts", "database_name", "status"}:
                 raise ValueError
             status = payload["status"]
+            observed_database_name = payload["database_name"]
             if status not in {"ready", "error"} or not isinstance(payload["artifacts"], list):
                 raise ValueError
-            artifacts: dict[str, tuple[int, int]] = {}
+            if observed_database_name is not None and (
+                not isinstance(observed_database_name, str)
+                or not _schema_migration_database_name_is_safe(observed_database_name)
+            ):
+                raise ValueError
+            artifacts: dict[str, tuple[int, int, int, str]] = {}
             for artifact in payload["artifacts"]:
                 if not isinstance(artifact, dict) or set(artifact) != {
                     "device",
                     "inode",
                     "name",
+                    "sha256",
+                    "size",
                 }:
                     raise ValueError
                 name = artifact["name"]
                 device = artifact["device"]
                 inode = artifact["inode"]
+                size = artifact["size"]
+                sha256 = artifact["sha256"]
                 if (
-                    name not in _SCHEMA_MIGRATION_ARTIFACTS
+                    observed_database_name is None
+                    or name not in _schema_migration_artifact_names(observed_database_name)
                     or name in artifacts
                     or not isinstance(device, int)
                     or isinstance(device, bool)
@@ -685,15 +809,33 @@ class MarketStore:
                     or not isinstance(inode, int)
                     or isinstance(inode, bool)
                     or inode <= 0
+                    or not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size < 0
+                    or not isinstance(sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", sha256)
                 ):
                     raise ValueError
-                artifacts[name] = (device, inode)
+                artifacts[name] = (device, inode, size, sha256)
         except (json.JSONDecodeError, TypeError, ValueError):
             raise RepairQueueError("market schema migration child failed") from None
         ready = result.returncode == 0 and status == "ready"
         if result.returncode == 0 and status != "ready":
             raise RepairQueueError("market schema migration child failed")
-        return ready, artifacts
+        if ready and observed_database_name is None:
+            raise RepairQueueError("market schema migration child failed")
+        if (
+            ready
+            and action == "initialize_and_migrate"
+            and not (
+                isinstance(observed_database_name, str)
+                and _SCHEMA_MIGRATION_RANDOM_DATABASE_PATTERN.fullmatch(observed_database_name)
+            )
+        ):
+            raise RepairQueueError("market schema migration child failed")
+        if ready and action == "migrate" and observed_database_name != database_name:
+            raise RepairQueueError("market schema migration child failed")
+        return ready, observed_database_name, artifacts
 
     @staticmethod
     def _set_bound_directory_flags(
@@ -727,7 +869,7 @@ class MarketStore:
         target_name: str,
     ) -> None:
         if (
-            source_name not in _SCHEMA_MIGRATION_ARTIFACTS
+            not _schema_migration_database_name_is_safe(source_name)
             or target_name in {"", ".", ".."}
             or "/" in target_name
             or "\x00" in target_name
@@ -757,51 +899,43 @@ class MarketStore:
     def _bound_file_fingerprint(
         descriptor: int,
     ) -> tuple[int, int, int, int, str]:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise RepairQueueError("market schema source is not a regular file")
-        digest = hashlib.sha256()
-        offset = 0
-        while offset < file_stat.st_size:
-            chunk = os.pread(
-                descriptor,
-                min(1024 * 1024, file_stat.st_size - offset),
-                offset,
-            )
-            if not chunk:
-                raise RepairQueueConflictError("market schema source changed during copy")
-            digest.update(chunk)
-            offset += len(chunk)
-        return (
-            file_stat.st_dev,
-            file_stat.st_ino,
-            file_stat.st_size,
-            file_stat.st_mtime_ns,
-            digest.hexdigest(),
+        try:
+            return _fingerprint_descriptor(descriptor)
+        except ValueError:
+            raise RepairQueueConflictError("market schema file changed") from None
+
+    @classmethod
+    def _bound_path_fingerprint(
+        cls,
+        parent_fd: int,
+        name: str,
+    ) -> tuple[int, int, int, int, str]:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
         )
+        try:
+            return cls._bound_file_fingerprint(descriptor)
+        finally:
+            os.close(descriptor)
 
     @classmethod
     def _copy_bound_regular_file(
         cls,
-        source_parent_fd: int,
-        source_name: str,
-        expected_inode: tuple[int, int],
+        source_fd: int,
+        expected_fingerprint: tuple[int, int, int, int, str],
         destination_parent_fd: int,
         destination_name: str,
-    ) -> tuple[int, int]:
-        source_fd = os.open(
-            source_name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=source_parent_fd,
-        )
+    ) -> tuple[int, int, int, str]:
         destination_fd = -1
         try:
             before = cls._bound_file_fingerprint(source_fd)
-            if before[:2] != expected_inode:
+            if before != expected_fingerprint:
                 raise RepairQueueConflictError("market schema source changed during copy")
             destination_fd = os.open(
                 destination_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=destination_parent_fd,
             )
@@ -822,20 +956,26 @@ class MarketStore:
             after = cls._bound_file_fingerprint(source_fd)
             if before != after:
                 raise RepairQueueConflictError("market schema source changed during copy")
-            return destination_stat.st_dev, destination_stat.st_ino
+            copied = cls._bound_file_fingerprint(destination_fd)
+            if copied[0:3] != (
+                destination_stat.st_dev,
+                destination_stat.st_ino,
+                destination_stat.st_size,
+            ):
+                raise RepairQueueConflictError("market schema copy changed")
+            return _portable_fingerprint(copied)
         finally:
             if destination_fd >= 0:
                 os.close(destination_fd)
-            os.close(source_fd)
 
     @staticmethod
     def _merge_registered_artifacts(
-        registered: dict[str, tuple[int, int]],
-        observed: dict[str, tuple[int, int]],
+        registered: dict[str, tuple[int, int, int, str]],
+        observed: dict[str, tuple[int, int, int, str]],
     ) -> None:
         for name, identity in observed.items():
             prior = registered.get(name)
-            if prior is not None and prior != identity:
+            if prior is not None and prior[:2] != identity[:2]:
                 raise RepairQueueConflictError("market schema artifact identity changed")
             registered[name] = identity
 
@@ -843,27 +983,34 @@ class MarketStore:
     def _require_registered_artifacts(
         cls,
         directory_fd: int,
-        registered: dict[str, tuple[int, int]],
-        *,
-        migrated: bool,
+        registered: dict[str, tuple[int, int, int, str]],
+        database_name: str,
     ) -> None:
         names = set(os.listdir(directory_fd))
-        if names != set(registered) or _SCHEMA_MIGRATION_DATABASE not in names:
+        if names != set(registered) or database_name not in names:
             raise RepairQueueConflictError("market schema staging artifacts changed")
-        if migrated and _SCHEMA_MIGRATION_VALIDATION not in names:
-            raise RepairQueueError("market schema validation artifact is unavailable")
-        for name, identity in registered.items():
-            cls._require_bound_regular_file(directory_fd, name, identity)
+        if names - _schema_migration_artifact_names(database_name):
+            raise RepairQueueConflictError("market schema staging artifacts changed")
+        for name, fingerprint in registered.items():
+            cls._require_bound_regular_file(directory_fd, name, fingerprint[:2])
+            observed = _portable_fingerprint(cls._bound_path_fingerprint(directory_fd, name))
+            if observed != fingerprint:
+                raise RepairQueueConflictError("market schema staging artifact changed")
 
     @classmethod
     def _remove_registered_artifacts(
         cls,
         directory_fd: int,
-        registered: dict[str, tuple[int, int]],
+        registered: dict[str, tuple[int, int, int, str]],
     ) -> None:
-        for name, identity in sorted(registered.items(), reverse=True):
+        for name, fingerprint in sorted(registered.items(), reverse=True):
             try:
-                cls._require_bound_regular_file(directory_fd, name, identity)
+                cls._require_bound_regular_file(directory_fd, name, fingerprint[:2])
+                if (
+                    _portable_fingerprint(cls._bound_path_fingerprint(directory_fd, name))
+                    != fingerprint
+                ):
+                    continue
             except RepairQueueError:
                 continue
             try:
@@ -906,6 +1053,52 @@ class MarketStore:
             except OSError:
                 pass
 
+    @classmethod
+    def _rollback_uncommitted_exchange(
+        cls,
+        *,
+        staging_root_fd: int,
+        database_name: str,
+        target_parent_fd: int,
+        target_name: str,
+        source_fd: int,
+        source_fingerprint: tuple[int, int, int, int, str],
+        migrated_fingerprint: tuple[int, int, int, str],
+    ) -> None:
+        source_portable = _portable_fingerprint(source_fingerprint)
+        try:
+            if cls._bound_file_fingerprint(source_fd) != source_fingerprint:
+                raise RepairQueueConflictError("market schema original evidence changed")
+            if (
+                _portable_fingerprint(cls._bound_path_fingerprint(target_parent_fd, target_name))
+                != migrated_fingerprint
+                or _portable_fingerprint(
+                    cls._bound_path_fingerprint(staging_root_fd, database_name)
+                )
+                != source_portable
+            ):
+                raise RepairQueueConflictError("market schema exchange cannot be rolled back")
+            cls._atomic_exchange_bound_files(
+                staging_root_fd,
+                database_name,
+                target_parent_fd,
+                target_name,
+            )
+            if cls._bound_file_fingerprint(source_fd) != source_fingerprint:
+                raise RepairQueueConflictError("market schema original evidence changed")
+            if (
+                _portable_fingerprint(cls._bound_path_fingerprint(target_parent_fd, target_name))
+                != source_portable
+                or _portable_fingerprint(
+                    cls._bound_path_fingerprint(staging_root_fd, database_name)
+                )
+                != migrated_fingerprint
+            ):
+                raise RepairQueueConflictError("market schema exchange rollback changed")
+            os.fsync(target_parent_fd)
+        except (OSError, RepairQueueError):
+            raise RepairQueueConflictError("market schema exchange recovery is uncertain") from None
+
     def _initialize_all_existing_writer_schema(
         self,
         staging_directory: Path,
@@ -919,10 +1112,11 @@ class MarketStore:
         staging_root_fd = -1
         staging_name: str | None = None
         staging_root_identity: tuple[int, int] | None = None
-        registered: dict[str, tuple[int, int]] = {}
+        registered: dict[str, tuple[int, int, int, str]] = {}
         original_flags = 0
         flags_may_be_protected = False
         flag_restore_failed = False
+        source_fd = -1
         try:
             staging_parent_fd, current_staging_identity, _ = self._open_directory_chain(
                 staging_directory, create=False
@@ -942,20 +1136,38 @@ class MarketStore:
             self._require_directory_path_identity(staging_directory, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
-            copied_inode = self._copy_bound_regular_file(
-                target_parent_fd,
+            source_fd = os.open(
                 self.path.name,
-                expected_inode,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=target_parent_fd,
+            )
+            source_fingerprint = self._bound_file_fingerprint(source_fd)
+            if source_fingerprint[:2] != expected_inode:
+                raise RepairQueueConflictError("market schema source changed before copy")
+            copied_fingerprint = self._copy_bound_regular_file(
+                source_fd,
+                source_fingerprint,
                 staging_root_fd,
                 _SCHEMA_MIGRATION_DATABASE,
             )
-            registered[_SCHEMA_MIGRATION_DATABASE] = copied_inode
-            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "migrate")
+            registered[_SCHEMA_MIGRATION_DATABASE] = copied_fingerprint
+            ready, database_name, observed = self._run_bound_schema_migration_child(
+                staging_root_fd,
+                "migrate",
+                database_name=_SCHEMA_MIGRATION_DATABASE,
+                expected_fingerprint=copied_fingerprint,
+            )
+            if database_name != _SCHEMA_MIGRATION_DATABASE:
+                raise RepairQueueError("market schema migration child failed")
             self._merge_registered_artifacts(registered, observed)
             if not ready:
                 raise RepairQueueError("market schema migration child failed")
-            self._require_registered_artifacts(staging_root_fd, registered, migrated=True)
-            migrated_inode = registered[_SCHEMA_MIGRATION_DATABASE]
+            self._require_registered_artifacts(
+                staging_root_fd,
+                registered,
+                _SCHEMA_MIGRATION_DATABASE,
+            )
+            migrated_fingerprint = registered[_SCHEMA_MIGRATION_DATABASE]
             self._require_directory_path_identity(staging_directory, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
@@ -977,11 +1189,15 @@ class MarketStore:
             self._remove_registered_artifacts(staging_root_fd, removable)
             for name in removable:
                 registered.pop(name, None)
-            self._require_registered_artifacts(staging_root_fd, registered, migrated=False)
+            self._require_registered_artifacts(
+                staging_root_fd,
+                registered,
+                _SCHEMA_MIGRATION_DATABASE,
+            )
             self._chmod_bound_file(
                 staging_root_fd,
                 _SCHEMA_MIGRATION_DATABASE,
-                migrated_inode,
+                migrated_fingerprint[:2],
                 0o600,
             )
             migrated_fd = os.open(
@@ -990,7 +1206,10 @@ class MarketStore:
                 dir_fd=staging_root_fd,
             )
             try:
-                if self._bound_file_fingerprint(migrated_fd)[:2] != migrated_inode:
+                if (
+                    _portable_fingerprint(self._bound_file_fingerprint(migrated_fd))
+                    != migrated_fingerprint
+                ):
                     raise RepairQueueConflictError("market schema staging artifact changed")
                 os.fsync(migrated_fd)
             finally:
@@ -998,99 +1217,55 @@ class MarketStore:
             os.fsync(staging_root_fd)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
-            self._atomic_exchange_bound_files(
-                staging_root_fd,
-                _SCHEMA_MIGRATION_DATABASE,
-                target_parent_fd,
-                self.path.name,
-            )
-            target_after = os.stat(
-                self.path.name,
-                dir_fd=target_parent_fd,
-                follow_symlinks=False,
-            )
-            staging_after = os.stat(
-                _SCHEMA_MIGRATION_DATABASE,
-                dir_fd=staging_root_fd,
-                follow_symlinks=False,
-            )
-            target_after_identity = (target_after.st_dev, target_after.st_ino)
-            staging_after_identity = (staging_after.st_dev, staging_after.st_ino)
-            if target_after_identity != migrated_inode or staging_after_identity != expected_inode:
-                if staging_after_identity == expected_inode:
+            if self._bound_file_fingerprint(source_fd) != source_fingerprint:
+                raise RepairQueueConflictError("market schema original evidence changed")
+            if _portable_fingerprint(
+                self._bound_path_fingerprint(target_parent_fd, self.path.name)
+            ) != _portable_fingerprint(source_fingerprint):
+                raise RepairQueueConflictError("market schema original evidence changed")
+            exchange_completed = False
+            try:
+                self._atomic_exchange_bound_files(
+                    staging_root_fd,
+                    _SCHEMA_MIGRATION_DATABASE,
+                    target_parent_fd,
+                    self.path.name,
+                )
+                exchange_completed = True
+                if (
+                    _portable_fingerprint(
+                        self._bound_path_fingerprint(target_parent_fd, self.path.name)
+                    )
+                    != migrated_fingerprint
+                    or _portable_fingerprint(
+                        self._bound_path_fingerprint(
+                            staging_root_fd,
+                            _SCHEMA_MIGRATION_DATABASE,
+                        )
+                    )
+                    != _portable_fingerprint(source_fingerprint)
+                    or self._bound_file_fingerprint(source_fd) != source_fingerprint
+                ):
+                    raise RepairQueueConflictError("market schema exchange result changed")
+                os.fsync(target_parent_fd)
+            except (OSError, RepairQueueError):
+                if exchange_completed:
                     try:
-                        self._require_bound_regular_file(
-                            staging_root_fd,
-                            _SCHEMA_MIGRATION_DATABASE,
-                            expected_inode,
-                        )
-                        self._require_bound_regular_file(
-                            target_parent_fd,
-                            self.path.name,
-                            target_after_identity,
-                        )
-                        self._atomic_exchange_bound_files(
-                            staging_root_fd,
-                            _SCHEMA_MIGRATION_DATABASE,
-                            target_parent_fd,
-                            self.path.name,
-                        )
-                        self._require_bound_regular_file(
-                            target_parent_fd,
-                            self.path.name,
-                            expected_inode,
-                        )
-                        self._require_bound_regular_file(
-                            staging_root_fd,
-                            _SCHEMA_MIGRATION_DATABASE,
-                            target_after_identity,
+                        self._rollback_uncommitted_exchange(
+                            staging_root_fd=staging_root_fd,
+                            database_name=_SCHEMA_MIGRATION_DATABASE,
+                            target_parent_fd=target_parent_fd,
+                            target_name=self.path.name,
+                            source_fd=source_fd,
+                            source_fingerprint=source_fingerprint,
+                            migrated_fingerprint=migrated_fingerprint,
                         )
                     except RepairQueueError:
                         registered.clear()
-                        raise RepairQueueConflictError(
-                            "market schema exchange recovery is uncertain"
-                        ) from None
-                    registered.clear()
-                    raise RepairQueueConflictError("market schema source changed during exchange")
-                if target_after_identity != migrated_inode:
-                    registered.clear()
-                    raise RepairQueueConflictError("market schema exchange result is uncertain")
-                try:
-                    self._require_bound_regular_file(
-                        staging_root_fd,
-                        _SCHEMA_MIGRATION_DATABASE,
-                        staging_after_identity,
-                    )
-                    self._require_bound_regular_file(
-                        target_parent_fd,
-                        self.path.name,
-                        migrated_inode,
-                    )
-                    self._atomic_exchange_bound_files(
-                        staging_root_fd,
-                        _SCHEMA_MIGRATION_DATABASE,
-                        target_parent_fd,
-                        self.path.name,
-                    )
-                    self._require_bound_regular_file(
-                        target_parent_fd,
-                        self.path.name,
-                        staging_after_identity,
-                    )
-                    self._require_bound_regular_file(
-                        staging_root_fd,
-                        _SCHEMA_MIGRATION_DATABASE,
-                        migrated_inode,
-                    )
-                except RepairQueueError:
-                    registered.clear()
-                    raise RepairQueueConflictError(
-                        "market schema exchange recovery is uncertain"
-                    ) from None
-                registered[_SCHEMA_MIGRATION_DATABASE] = migrated_inode
-                raise RepairQueueConflictError("market schema target changed during exchange")
-            registered[_SCHEMA_MIGRATION_DATABASE] = expected_inode
-            os.fsync(target_parent_fd)
+                        raise
+                    registered[_SCHEMA_MIGRATION_DATABASE] = migrated_fingerprint
+                raise
+            registered[_SCHEMA_MIGRATION_DATABASE] = _portable_fingerprint(source_fingerprint)
         finally:
             if flags_may_be_protected and not flag_restore_failed and staging_root_fd >= 0:
                 try:
@@ -1116,6 +1291,8 @@ class MarketStore:
                 )
             if staging_parent_fd >= 0:
                 os.close(staging_parent_fd)
+            if source_fd >= 0:
+                os.close(source_fd)
 
     def _initialize_all_new_writer_schema(
         self,
@@ -1134,7 +1311,7 @@ class MarketStore:
         staging_owned = False
         target_published = False
         publication_complete = False
-        registered: dict[str, tuple[int, int]] = {}
+        registered: dict[str, tuple[int, int, int, str]] = {}
         original_flags = 0
         flags_may_be_protected = False
         flag_restore_failed = False
@@ -1155,17 +1332,20 @@ class MarketStore:
             assert staging_root is not None
             self._require_directory_path_identity(staging_root, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
-            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "initialize")
+            ready, database_name, observed = self._run_bound_schema_migration_child(
+                staging_root_fd,
+                "initialize_and_migrate",
+            )
             self._merge_registered_artifacts(registered, observed)
-            if not ready:
+            if not ready or database_name is None:
                 raise RepairQueueError("market schema migration child failed")
-            self._require_registered_artifacts(staging_root_fd, registered, migrated=False)
-            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "migrate")
-            self._merge_registered_artifacts(registered, observed)
-            if not ready:
-                raise RepairQueueError("market schema migration child failed")
-            self._require_registered_artifacts(staging_root_fd, registered, migrated=True)
-            published_inode = registered[_SCHEMA_MIGRATION_DATABASE]
+            self._require_registered_artifacts(
+                staging_root_fd,
+                registered,
+                database_name,
+            )
+            published_fingerprint = registered[database_name]
+            published_inode = published_fingerprint[:2]
             self._require_directory_path_identity(staging_directory, staging_parent_identity)
             self._require_directory_path_identity(staging_root, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
@@ -1180,22 +1360,35 @@ class MarketStore:
                 raise
             flags_may_be_protected = False
             removable = {
-                name: identity
-                for name, identity in registered.items()
-                if name != _SCHEMA_MIGRATION_DATABASE
+                name: identity for name, identity in registered.items() if name != database_name
             }
             self._remove_registered_artifacts(staging_root_fd, removable)
             for name in removable:
                 registered.pop(name, None)
-            self._require_registered_artifacts(staging_root_fd, registered, migrated=False)
+            self._require_registered_artifacts(staging_root_fd, registered, database_name)
             self._chmod_bound_file(
                 staging_root_fd,
-                _SCHEMA_MIGRATION_DATABASE,
+                database_name,
                 published_inode,
                 0o600,
             )
+            published_fd = os.open(
+                database_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=staging_root_fd,
+            )
+            try:
+                if (
+                    _portable_fingerprint(self._bound_file_fingerprint(published_fd))
+                    != published_fingerprint
+                ):
+                    raise RepairQueueConflictError("market schema staging artifact changed")
+                os.fsync(published_fd)
+            finally:
+                os.close(published_fd)
+            os.fsync(staging_root_fd)
             os.link(
-                _SCHEMA_MIGRATION_DATABASE,
+                database_name,
                 self.path.name,
                 src_dir_fd=staging_root_fd,
                 dst_dir_fd=target_parent_fd,

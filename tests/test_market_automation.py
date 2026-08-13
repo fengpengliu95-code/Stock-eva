@@ -1634,10 +1634,10 @@ def test_market_schema_migration_new_database_failure_leaves_tree_unchanged(
 
     real_child = cli.MarketStore._run_bound_schema_migration_child
 
-    def fail_migration_stage(directory_fd: int, action: str):
-        if action == "migrate":
-            return False, {}
-        return real_child(directory_fd, action)
+    def fail_migration_stage(directory_fd: int, action: str, **kwargs):
+        if action == "initialize_and_migrate":
+            return False, None, {}
+        return real_child(directory_fd, action, **kwargs)
 
     monkeypatch.setattr(
         cli.MarketStore,
