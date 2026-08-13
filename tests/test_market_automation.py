@@ -6,7 +6,6 @@ import os
 import sqlite3
 import stat
 import sys
-import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -20,6 +19,7 @@ import httpx
 import pytest
 
 import backend.app.cli as cli
+import backend.app.market.store as market_store_module
 from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
@@ -1752,20 +1752,25 @@ def test_writer_schema_migration_refuses_staging_allocation_collision(
     marker = staging / "foreign-collision"
     marker.write_bytes(b"foreign staging evidence")
     target = tmp_path / "market" / "stock_eva.duckdb"
+    collision = staging / f".{target.name}.collision.migration"
+    collision.mkdir()
+    collision_marker = collision / "marker"
+    collision_marker.write_bytes(b"foreign collision evidence")
 
-    def collide(*_args, **_kwargs):
-        raise FileExistsError("synthetic staging collision")
+    class CollisionId:
+        hex = "collision"
 
-    monkeypatch.setattr(tempfile, "mkdtemp", collide)
+    monkeypatch.setattr(market_store_module, "uuid4", lambda: CollisionId())
 
     with pytest.raises(continuity.RepairQueueError):
         MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
 
     assert marker.read_bytes() == b"foreign staging evidence"
+    assert collision_marker.read_bytes() == b"foreign collision evidence"
     assert not target.parent.exists()
 
 
-def test_writer_schema_migration_replace_failure_cleans_only_owned_artifacts(
+def test_writer_schema_migration_link_failure_cleans_only_owned_artifacts(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1777,10 +1782,10 @@ def test_writer_schema_migration_replace_failure_cleans_only_owned_artifacts(
     target = tmp_path / "market" / "stock_eva.duckdb"
     before = {item.name: item.read_bytes() for item in staging.iterdir()}
 
-    def fail_replace(*_args, **_kwargs):
-        raise OSError("synthetic atomic replace failure")
+    def fail_link(*_args, **_kwargs):
+        raise OSError("synthetic atomic link failure")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "link", fail_link)
 
     with pytest.raises(continuity.RepairQueueError):
         MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
@@ -1798,18 +1803,30 @@ def test_writer_schema_migration_target_collision_preserves_external_file(
     staging.mkdir()
     target = tmp_path / "market" / "stock_eva.duckdb"
     collision_bytes = b"external collision evidence"
+    collision_inode: list[int] = []
+    real_link = os.link
 
-    def collide_at_replace(_source, destination):
-        Path(destination).unlink()
-        Path(destination).write_bytes(collision_bytes)
-        raise FileExistsError("synthetic target collision")
+    def collide_at_link(source, destination, *args, **kwargs):
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=kwargs.get("dst_dir_fd"),
+        )
+        try:
+            os.write(descriptor, collision_bytes)
+            collision_inode.append(os.fstat(descriptor).st_ino)
+        finally:
+            os.close(descriptor)
+        return real_link(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(os, "replace", collide_at_replace)
+    monkeypatch.setattr(os, "link", collide_at_link)
 
     with pytest.raises(continuity.RepairQueueError):
         MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
 
     assert target.read_bytes() == collision_bytes
+    assert target.stat().st_ino == collision_inode[0]
     assert list(staging.iterdir()) == []
 
 

@@ -1441,6 +1441,107 @@ def test_strict_published_reconciliation_finalizes_leased_attempt_consistently(
     assert snapshot.attempts[0].completed_at == NOW + timedelta(minutes=2)
 
 
+@pytest.mark.parametrize("failed_state", ["retry_wait", "dead_letter"])
+def test_manifest_reconciliation_publishes_failed_job_without_rewriting_attempt(
+    tmp_path: Path,
+    failed_state: str,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / f"{failed_state}.duckdb"
+    lock_path = tmp_path / f"{failed_state}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        assert lease is not None
+        failed = store.finalize_repair_attempt(
+            lease,
+            outcome="failed",
+            refresh_result=error_refresh(
+                job.trade_date,
+                attempt=1,
+                retryable=failed_state == "retry_wait",
+            ),
+            now=NOW + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+    assert failed.state == failed_state
+    before_attempt = store.repair_queue_snapshot().attempts[0]
+
+    with RefreshRunLock(lock_path):
+        reconciled = store.reconcile_published_repair_jobs(
+            [job.trade_date], now=NOW + timedelta(minutes=2)
+        )
+        repeated = store.reconcile_published_repair_jobs(
+            [job.trade_date], now=NOW + timedelta(minutes=3)
+        )
+
+    snapshot = store.repair_queue_snapshot()
+    assert [item.state for item in reconciled] == ["published"]
+    assert repeated == []
+    assert snapshot.status == "ready"
+    assert snapshot.jobs[0].state == "published"
+    assert snapshot.jobs[0].last_failure_stage is None
+    assert snapshot.jobs[0].last_failure_class is None
+    assert snapshot.attempts == (before_attempt,)
+
+
+@pytest.mark.parametrize("corruption", ["attempt_before_job", "invalid_lease_expiry"])
+def test_corrupt_queue_time_lineage_blocks_reap_without_mutation(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / f"{corruption}.duckdb"
+    lock_path = tmp_path / f"{corruption}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    claimed_at = NOW + timedelta(minutes=1)
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=claimed_at,
+            lease_seconds=60,
+        )
+    assert lease is not None
+    with duckdb.connect(str(path)) as connection:
+        if corruption == "attempt_before_job":
+            connection.execute(
+                "UPDATE repair_attempts SET started_at = ? WHERE job_id = ?",
+                [NOW - timedelta(seconds=1), job.job_id],
+            )
+        else:
+            connection.execute(
+                "UPDATE repair_jobs SET lease_expires_at = updated_at WHERE job_id = ?",
+                [job.job_id],
+            )
+        before_jobs = connection.execute("SELECT * FROM repair_jobs").fetchall()
+        before_attempts = connection.execute("SELECT * FROM repair_attempts").fetchall()
+    before_bytes = path.read_bytes()
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.reap_expired_repair_leases(
+                now=claimed_at + timedelta(seconds=61),
+                retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+            )
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM repair_jobs").fetchall() == before_jobs
+        assert connection.execute("SELECT * FROM repair_attempts").fetchall() == before_attempts
+    assert path.read_bytes() == before_bytes
+
+
 def test_repair_run_kind_is_additive_and_legacy_values_remain_readable(tmp_path: Path) -> None:
     path = tmp_path / "market.duckdb"
     store = MarketStore(path)

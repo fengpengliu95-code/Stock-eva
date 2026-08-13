@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import socket
 import sys
 from datetime import UTC, date, datetime
@@ -385,6 +386,118 @@ def test_market_schema_migration_cli_sanitizes_failure_output(
         "writes_market_control_schema": False,
     }
     assert secret not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("symlink_scope", ["target", "staging"])
+def test_writer_schema_migration_rejects_ancestor_symlinks_before_external_write(
+    tmp_path: Path,
+    symlink_scope: str,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_bytes(b"external evidence")
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    symlink_ancestor = safe / "linked"
+    symlink_ancestor.symlink_to(external, target_is_directory=True)
+    real_staging = tmp_path / "staging"
+    real_staging.mkdir()
+    external_target = external / "target-parent"
+    external_target.mkdir()
+    external_staging = external / "staging-parent"
+    external_staging.mkdir()
+    target = (
+        symlink_ancestor / external_target.name / "stock_eva.duckdb"
+        if symlink_scope == "target"
+        else tmp_path / "market" / "stock_eva.duckdb"
+    )
+    staging = (
+        real_staging if symlink_scope == "target" else symlink_ancestor / external_staging.name
+    )
+    before = {
+        item.relative_to(external): item.read_bytes()
+        for item in external.rglob("*")
+        if item.is_file()
+    }
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert {
+        item.relative_to(external): item.read_bytes()
+        for item in external.rglob("*")
+        if item.is_file()
+    } == before
+    assert not any(external_target.iterdir())
+    assert not any(external_staging.iterdir())
+
+
+def test_writer_schema_migration_publish_race_preserves_foreign_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    sentinel = b"foreign race evidence"
+    real_link = os.link
+
+    def collide_at_publish(source, destination, *args, **kwargs):
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=kwargs.get("dst_dir_fd"),
+        )
+        try:
+            os.write(descriptor, sentinel)
+        finally:
+            os.close(descriptor)
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", collide_at_publish)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert target.read_bytes() == sentinel
+    assert list(staging.iterdir()) == []
+
+
+def test_writer_schema_migration_parent_replacement_race_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target_parent = tmp_path / "market"
+    target_parent.mkdir()
+    target = target_parent / "stock_eva.duckdb"
+    displaced = tmp_path / "displaced-market"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_bytes(b"external evidence")
+    real_link = os.link
+
+    def replace_parent_then_publish(source, destination, *args, **kwargs):
+        target_parent.rename(displaced)
+        target_parent.symlink_to(external, target_is_directory=True)
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", replace_parent_then_publish)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert marker.read_bytes() == b"external evidence"
+    assert list(external.iterdir()) == [marker]
+    assert not (displaced / target.name).exists()
+    assert list(staging.iterdir()) == []
 
 
 def test_legacy_fourteen_column_refresh_projection_defaults_failure_fields() -> None:

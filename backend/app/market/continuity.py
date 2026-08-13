@@ -135,6 +135,8 @@ class RepairJob(BaseModel):
                 raise ValueError("leased repair job requires a complete lease")
             if self.last_attempt_id is None or self.attempt_count < 1:
                 raise ValueError("leased repair job requires a claimed attempt")
+            if self.lease_expires_at <= self.updated_at:
+                raise ValueError("repair lease must expire after the job update")
         elif any(value is not None for value in lease_fields):
             raise ValueError("only a leased repair job may carry a lease")
         if (self.attempt_count == 0) != (self.last_attempt_id is None):
@@ -294,6 +296,11 @@ class RepairQueueSnapshot(BaseModel):
                 abandoned = sum(item.outcome == "abandoned" for item in job_attempts)
                 if abandoned != job.abandoned_attempt_count:
                     raise ValueError("repair job abandoned count does not match attempts")
+                if any(
+                    item.started_at < job.created_at or item.started_at > job.updated_at
+                    for item in job_attempts
+                ):
+                    raise ValueError("repair attempt time falls outside its job lineage")
                 for previous, current in zip(job_attempts, job_attempts[1:], strict=False):
                     if previous.completed_at is None or previous.completed_at > current.started_at:
                         raise ValueError("repair attempt time lineage overlaps")
@@ -314,6 +321,8 @@ class RepairQueueSnapshot(BaseModel):
                     attempt.outcome != "running"
                     or attempt.lease_id != job.lease_id
                     or attempt.lease_owner != job.lease_owner
+                    or job.lease_expires_at is None
+                    or job.lease_expires_at <= attempt.started_at
                 ):
                     raise ValueError("repair lease attempt reference is invalid")
                 if job.state in {"retry_wait", "dead_letter"} and attempt.outcome not in {
@@ -338,11 +347,9 @@ class RepairQueueSnapshot(BaseModel):
                 if nonretryable_failures and (
                     len(nonretryable_failures) != 1
                     or nonretryable_failures[0].attempt_id != job.last_attempt_id
-                    or job.state != "dead_letter"
+                    or job.state not in {"dead_letter", "published"}
                 ):
                     raise ValueError("non-retryable repair attempt lineage is invalid")
-                if job.state == "published" and attempt.outcome != "succeeded":
-                    raise ValueError("published repair job lacks successful attempt evidence")
             for attempt in self.attempts:
                 if attempt.outcome == "running":
                     job = jobs.get(attempt.job_id)

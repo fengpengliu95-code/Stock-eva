@@ -3,7 +3,6 @@ import json
 import os
 import re
 import stat
-import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -379,53 +378,139 @@ class MarketStore:
         """Atomically migrate base and continuity schema under the caller-owned lock."""
         if self.read_only:
             raise RepairQueueError("read-only market store cannot migrate writer schema")
+        staging_fd = -1
+        target_parent_fd = -1
+        created_directories: list[tuple[int, str, tuple[int, int]]] = []
+        succeeded = False
         try:
-            self._require_real_directory(staging_directory)
-            target_directories = self._planned_directory_creation(self.path.parent)
-            if os.path.lexists(self.path):
-                target_stat = os.lstat(self.path)
+            staging_fd, staging_identity, _ = self._open_directory_chain(
+                staging_directory, create=False
+            )
+            target_parent_fd, target_parent_identity, created_directories = (
+                self._open_directory_chain(self.path.parent, create=True)
+            )
+            self._require_directory_path_identity(staging_directory, staging_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            try:
+                target_stat = os.stat(
+                    self.path.name,
+                    dir_fd=target_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                target_stat = None
+            if target_stat is not None:
                 if not stat.S_ISREG(target_stat.st_mode):
                     raise RepairQueueError("market schema target is not a regular file")
                 self._initialize_all_existing_writer_schema(
                     staging_directory,
+                    staging_identity=staging_identity,
+                    target_parent_fd=target_parent_fd,
+                    target_parent_identity=target_parent_identity,
                     expected_inode=(target_stat.st_dev, target_stat.st_ino),
                     original_mode=stat.S_IMODE(target_stat.st_mode),
                 )
-                return
-            self._initialize_all_new_writer_schema(
-                staging_directory,
-                target_directories=target_directories,
-            )
+            else:
+                self._initialize_all_new_writer_schema(
+                    staging_directory,
+                    staging_parent_fd=staging_fd,
+                    staging_parent_identity=staging_identity,
+                    target_parent_fd=target_parent_fd,
+                    target_parent_identity=target_parent_identity,
+                )
+            succeeded = True
         except RepairQueueError:
             raise
         except (duckdb.Error, OSError, TypeError, ValueError):
             raise RepairQueueError("market schema migration failed") from None
-
-    @staticmethod
-    def _require_real_directory(path: Path) -> None:
-        try:
-            directory_stat = os.lstat(path)
-        except FileNotFoundError:
-            raise RepairQueueError("market schema migration directory is unavailable") from None
-        if not stat.S_ISDIR(directory_stat.st_mode):
-            raise RepairQueueError("market schema migration directory is unsafe")
+        finally:
+            if target_parent_fd >= 0:
+                os.close(target_parent_fd)
+            if staging_fd >= 0:
+                os.close(staging_fd)
+            self._finish_created_directories(created_directories, remove=not succeeded)
 
     @classmethod
-    def _planned_directory_creation(cls, path: Path) -> tuple[Path, ...]:
-        missing: list[Path] = []
-        current = path
-        while not os.path.lexists(current):
-            if current == current.parent:
-                raise RepairQueueError("market schema target parent is unavailable")
-            missing.append(current)
-            current = current.parent
-        cls._require_real_directory(current)
-        return tuple(reversed(missing))
+    def _open_directory_chain(
+        cls,
+        path: Path,
+        *,
+        create: bool,
+    ) -> tuple[int, tuple[int, int], list[tuple[int, str, tuple[int, int]]]]:
+        absolute = Path(os.path.abspath(path))
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(absolute.anchor, flags)
+        created: list[tuple[int, str, tuple[int, int]]] = []
+        try:
+            for component in absolute.parts[1:]:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    child_stat = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                    identity = (child_stat.st_dev, child_stat.st_ino)
+                    created.append((os.dup(descriptor), component, identity))
+                    child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            directory_stat = os.fstat(descriptor)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise RepairQueueError("market schema migration directory is unsafe")
+            return descriptor, (directory_stat.st_dev, directory_stat.st_ino), created
+        except Exception:
+            os.close(descriptor)
+            cls._finish_created_directories(created, remove=True)
+            raise
+
+    @classmethod
+    def _require_directory_path_identity(
+        cls,
+        path: Path,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        descriptor = -1
+        try:
+            descriptor, identity, _ = cls._open_directory_chain(path, create=False)
+            if identity != expected_identity:
+                raise RepairQueueConflictError("market schema directory changed during migration")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     @staticmethod
-    def _require_inode(path: Path, expected_inode: tuple[int, int]) -> None:
+    def _finish_created_directories(
+        created: list[tuple[int, str, tuple[int, int]]],
+        *,
+        remove: bool,
+    ) -> None:
+        for parent_fd, name, expected_identity in reversed(created):
+            try:
+                if remove:
+                    try:
+                        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if (
+                        stat.S_ISDIR(current.st_mode)
+                        and (current.st_dev, current.st_ino) == expected_identity
+                    ):
+                        try:
+                            os.rmdir(name, dir_fd=parent_fd)
+                        except OSError:
+                            pass
+            finally:
+                os.close(parent_fd)
+
+    @staticmethod
+    def _require_bound_regular_file(
+        parent_fd: int,
+        name: str,
+        expected_inode: tuple[int, int],
+    ) -> None:
         try:
-            target_stat = os.lstat(path)
+            target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             raise RepairQueueConflictError(
                 "market schema target changed during migration"
@@ -437,13 +522,18 @@ class MarketStore:
             raise RepairQueueConflictError("market schema target changed during migration")
 
     @classmethod
-    def _chmod_inode(
+    def _chmod_bound_file(
         cls,
-        path: Path,
+        parent_fd: int,
+        name: str,
         expected_inode: tuple[int, int],
         mode: int,
     ) -> None:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
         try:
             target_stat = os.fstat(descriptor)
             if (target_stat.st_dev, target_stat.st_ino) != expected_inode:
@@ -451,12 +541,15 @@ class MarketStore:
             os.fchmod(descriptor, mode)
         finally:
             os.close(descriptor)
-        cls._require_inode(path, expected_inode)
+        cls._require_bound_regular_file(parent_fd, name, expected_inode)
 
     def _initialize_all_existing_writer_schema(
         self,
         staging_directory: Path,
         *,
+        staging_identity: tuple[int, int],
+        target_parent_fd: int,
+        target_parent_identity: tuple[int, int],
         expected_inode: tuple[int, int],
         original_mode: int,
     ) -> None:
@@ -468,16 +561,20 @@ class MarketStore:
                 temp_directory=staging_directory,
                 create_directories=False,
             )
-            self._require_inode(self.path, expected_inode)
+            self._require_directory_path_identity(staging_directory, staging_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
             connection.begin()
             self._initialize_base_schema_on_connection(connection)
             self._initialize_continuity_schema_on_connection(connection)
-            self._require_inode(self.path, expected_inode)
-            self._chmod_inode(self.path, expected_inode, 0o600)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
+            self._chmod_bound_file(target_parent_fd, self.path.name, expected_inode, 0o600)
             mode_changed = True
             connection.commit()
             committed = True
-            self._require_inode(self.path, expected_inode)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
         except Exception:
             if connection is not None:
                 try:
@@ -485,7 +582,12 @@ class MarketStore:
                 except duckdb.Error:
                     pass
             if mode_changed and not committed:
-                self._chmod_inode(self.path, expected_inode, original_mode)
+                self._chmod_bound_file(
+                    target_parent_fd,
+                    self.path.name,
+                    expected_inode,
+                    original_mode,
+                )
             raise
         finally:
             if connection is not None:
@@ -495,58 +597,75 @@ class MarketStore:
         self,
         staging_directory: Path,
         *,
-        target_directories: tuple[Path, ...],
+        staging_parent_fd: int,
+        staging_parent_identity: tuple[int, int],
+        target_parent_fd: int,
+        target_parent_identity: tuple[int, int],
     ) -> None:
-        staging_root: Path | None = None
+        staging_name = f".{self.path.name}.{uuid4().hex}.migration"
+        staging_root = staging_directory / staging_name
+        staging_root_fd = -1
+        staging_identity: tuple[int, int] | None = None
+        staging_inode: tuple[int, int] | None = None
+        published_inode: tuple[int, int] | None = None
         staging_owned = False
-        staging_path: Path | None = None
-        target_owned = False
-        target_inode: tuple[int, int] | None = None
+        target_published = False
+        publication_complete = False
         connection = None
-        created_directories: list[Path] = []
         try:
-            staging_root = Path(
-                tempfile.mkdtemp(
-                    prefix=f".{self.path.name}.",
-                    suffix=".migration",
-                    dir=staging_directory,
-                )
-            )
+            os.mkdir(staging_name, mode=0o700, dir_fd=staging_parent_fd)
+            root_stat = os.stat(staging_name, dir_fd=staging_parent_fd, follow_symlinks=False)
+            staging_identity = (root_stat.st_dev, root_stat.st_ino)
             staging_owned = True
-            staging_path = staging_root / "market.duckdb"
+            staging_root_fd = os.open(
+                staging_name,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=staging_parent_fd,
+            )
+            self._require_directory_path_identity(staging_directory, staging_parent_identity)
+            self._require_directory_path_identity(staging_root, staging_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
             connection = self._open_writer_connection(
-                path=staging_path,
+                path=staging_root / "market.duckdb",
                 temp_directory=staging_directory,
                 create_directories=False,
             )
+            stage_stat = os.stat("market.duckdb", dir_fd=staging_root_fd, follow_symlinks=False)
+            if not stat.S_ISREG(stage_stat.st_mode):
+                raise RepairQueueError("market schema staging artifact is invalid")
+            staging_inode = (stage_stat.st_dev, stage_stat.st_ino)
             connection.begin()
             self._initialize_base_schema_on_connection(connection)
             self._initialize_continuity_schema_on_connection(connection)
             connection.commit()
             connection.close()
             connection = None
-            os.chmod(staging_path, 0o600, follow_symlinks=False)
-            for directory in target_directories:
-                os.mkdir(directory, mode=0o700)
-                created_directories.append(directory)
-            if os.path.lexists(self.path):
-                raise RepairQueueConflictError("market schema target appeared during migration")
-            target_fd = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+            self._require_directory_path_identity(staging_directory, staging_parent_identity)
+            self._require_directory_path_identity(staging_root, staging_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(staging_root_fd, "market.duckdb", staging_inode)
+            self._chmod_bound_file(staging_root_fd, "market.duckdb", staging_inode, 0o600)
+            os.link(
+                "market.duckdb",
+                self.path.name,
+                src_dir_fd=staging_root_fd,
+                dst_dir_fd=target_parent_fd,
+                follow_symlinks=False,
             )
-            try:
-                target_stat = os.fstat(target_fd)
-                target_inode = (target_stat.st_dev, target_stat.st_ino)
-            finally:
-                os.close(target_fd)
-            target_owned = True
-            assert target_inode is not None
-            self._require_inode(self.path, target_inode)
-            os.replace(staging_path, self.path)
-            target_owned = False
-            staging_path = None
+            target_published = True
+            published_inode = staging_inode
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(target_parent_fd, self.path.name, staging_inode)
+            os.unlink("market.duckdb", dir_fd=staging_root_fd)
+            staging_inode = None
+            os.close(staging_root_fd)
+            staging_root_fd = -1
+            os.rmdir(staging_name, dir_fd=staging_parent_fd)
+            staging_owned = False
+            self._require_directory_path_identity(staging_directory, staging_parent_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            self._require_bound_regular_file(target_parent_fd, self.path.name, published_inode)
+            publication_complete = True
         except Exception:
             if connection is not None:
                 try:
@@ -557,32 +676,64 @@ class MarketStore:
         finally:
             if connection is not None:
                 connection.close()
-            if staging_path is not None:
-                for candidate in (staging_path, Path(f"{staging_path}.wal")):
-                    try:
-                        candidate.unlink()
-                    except FileNotFoundError:
-                        pass
-            if target_owned and target_inode is not None:
+            if target_published and not publication_complete and published_inode is not None:
                 try:
-                    self._require_inode(self.path, target_inode)
+                    self._require_bound_regular_file(
+                        target_parent_fd, self.path.name, published_inode
+                    )
                 except RepairQueueError:
                     pass
                 else:
                     try:
-                        self.path.unlink()
+                        os.unlink(self.path.name, dir_fd=target_parent_fd)
                     except FileNotFoundError:
                         pass
-            if staging_owned and staging_root is not None:
+            if staging_root_fd >= 0:
+                if staging_inode is not None:
+                    try:
+                        self._require_bound_regular_file(
+                            staging_root_fd, "market.duckdb", staging_inode
+                        )
+                    except RepairQueueError:
+                        pass
+                    else:
+                        try:
+                            os.unlink("market.duckdb", dir_fd=staging_root_fd)
+                        except FileNotFoundError:
+                            pass
                 try:
-                    staging_root.rmdir()
-                except OSError:
+                    wal_stat = os.stat(
+                        "market.duckdb.wal",
+                        dir_fd=staging_root_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
                     pass
-            for directory in reversed(created_directories):
+                else:
+                    if stat.S_ISREG(wal_stat.st_mode):
+                        try:
+                            os.unlink("market.duckdb.wal", dir_fd=staging_root_fd)
+                        except FileNotFoundError:
+                            pass
+                os.close(staging_root_fd)
+            if staging_owned and staging_identity is not None:
                 try:
-                    directory.rmdir()
-                except OSError:
-                    break
+                    current = os.stat(
+                        staging_name,
+                        dir_fd=staging_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (
+                        stat.S_ISDIR(current.st_mode)
+                        and (current.st_dev, current.st_ino) == staging_identity
+                    ):
+                        try:
+                            os.rmdir(staging_name, dir_fd=staging_parent_fd)
+                        except OSError:
+                            pass
 
     def _connect_continuity_writer(self) -> duckdb.DuckDBPyConnection:
         if self.read_only:
