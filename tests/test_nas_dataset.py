@@ -166,6 +166,34 @@ def _dataset_fingerprint(root: Path) -> tuple[tuple[str, str, int, int], ...]:
     return tuple(entries)
 
 
+def _replace_manifest_partition_from_query(
+    root: Path,
+    *,
+    name: str,
+    query: str,
+) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    published = root / manifest["files"][0]["path"]
+    replacement = root / "bars" / f"{name}.parquet"
+    escaped_replacement = str(replacement).replace("'", "''")
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute(
+            f"COPY ({query}) TO '{escaped_replacement}' (FORMAT PARQUET)",
+            [str(published)],
+        )
+    finally:
+        connection.close()
+    manifest["files"][0].update(
+        {
+            "path": f"bars/{name}.parquet",
+            "sha256": _sha256(replacement),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def test_verified_ready_inventory_enumerates_all_current_manifest_partitions(
     tmp_path: Path,
 ) -> None:
@@ -407,6 +435,161 @@ def test_verified_ready_inventory_rejects_path_like_generation_without_writes(
     assert _dataset_fingerprint(root) == before
 
 
+def test_verified_ready_inventory_rejects_atomic_symlink_swap_after_containment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    published = root / manifest["files"][0]["path"]
+    outside = tmp_path / "outside-hardlink.parquet"
+    os.link(published, outside)
+    original_fingerprint = NasMarketStore._fingerprint
+    original_sha256 = _sha256
+    swapped = False
+    followed_symlink = False
+
+    def swap_after_containment(path: Path) -> tuple[int, int, int, int, int]:
+        nonlocal swapped
+        fingerprint = original_fingerprint(path)
+        if path == published and not swapped:
+            swapped = True
+            symlink = published.with_name("atomic-swap.parquet")
+            symlink.symlink_to(outside)
+            os.replace(symlink, published)
+        return fingerprint
+
+    def record_symlink_follow(path: Path) -> str:
+        nonlocal followed_symlink
+        followed_symlink = followed_symlink or path.is_symlink()
+        return original_sha256(path)
+
+    monkeypatch.setattr(
+        NasMarketStore,
+        "_fingerprint",
+        staticmethod(swap_after_containment),
+    )
+    monkeypatch.setattr("backend.app.storage.dataset._sha256", record_symlink_follow)
+
+    with pytest.raises(DatasetError):
+        store.verified_ready_session_inventory()
+
+    assert swapped is True
+    assert published.is_symlink()
+    assert followed_symlink is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        """SELECT * REPLACE (
+               CASE WHEN symbol = 'sh.600000' THEN 'other' ELSE source END AS source
+               ) FROM read_parquet(?, hive_partitioning=false)""",
+        """SELECT * REPLACE (
+               CASE WHEN symbol = 'sh.600000' THEN DATE '2026-07-22'
+                    ELSE trade_date END AS trade_date
+               ) FROM read_parquet(?, hive_partitioning=false)""",
+    ],
+    ids=["mixed-source", "mixed-trade-date"],
+)
+def test_verified_ready_inventory_rejects_rows_outside_manifest_partition(
+    tmp_path: Path,
+    query: str,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    _replace_manifest_partition_from_query(
+        root,
+        name="mixed-partition",
+        query=query,
+    )
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match="does not match manifest"):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT *, 1 AS extra_column FROM read_parquet(?, hive_partitioning=false)",
+        "SELECT * EXCLUDE (quality_issues) FROM read_parquet(?, hive_partitioning=false)",
+        """SELECT * REPLACE (CAST(close AS VARCHAR) AS close)
+           FROM read_parquet(?, hive_partitioning=false)""",
+        """SELECT * EXCLUDE (trade_date), trade_date
+           FROM read_parquet(?, hive_partitioning=false)""",
+    ],
+    ids=["extra", "missing", "wrong-type", "reordered"],
+)
+def test_verified_ready_inventory_requires_exact_canonical_schema(
+    tmp_path: Path,
+    query: str,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    _replace_manifest_partition_from_query(
+        root,
+        name="wrong-schema",
+        query=query,
+    )
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match="incompatible schema"):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
+def test_verified_ready_inventory_rejects_oversized_manifest_before_json_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["padding"] = "x" * (1024 * 1024)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert manifest_path.stat().st_size > 1024 * 1024
+    manifest_inode = manifest_path.stat().st_ino
+    original_read = os.read
+
+    def reject_manifest_read(descriptor: int, size: int) -> bytes:
+        if os.fstat(descriptor).st_ino == manifest_inode:
+            raise AssertionError("oversized manifest bytes must not be read")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr("backend.app.storage.dataset.os.read", reject_manifest_read)
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match="size limit"):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
 def test_verified_local_mirror_is_idempotent_and_manifest_readable(tmp_path: Path) -> None:
     source = _root(tmp_path)
     source_store = NasMarketStore(
@@ -571,10 +754,10 @@ def test_reader_reuses_a_validated_generation_across_requests(
     original = NasMarketStore._validate_parquet
     calls = 0
 
-    def counted(path: Path, expected_rows: int) -> None:
+    def counted(path: Path, expected_rows: int, **partition) -> None:
         nonlocal calls
         calls += 1
-        original(path, expected_rows)
+        original(path, expected_rows, **partition)
 
     monkeypatch.setattr(NasMarketStore, "_validate_parquet", staticmethod(counted))
     first = store.bars_for(date(2026, 7, 23), "baostock")

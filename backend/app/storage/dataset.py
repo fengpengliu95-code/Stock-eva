@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -35,6 +36,8 @@ MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
 SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_METADATA_BYTES = 1024 * 1024
+_READ_CHUNK_BYTES = 1024 * 1024
 _VALIDATED_OBJECTS_LIMIT = 1024
 _VALIDATED_OBJECTS: OrderedDict[tuple[str, str, int], tuple[int, int, int, int, int]] = (
     OrderedDict()
@@ -120,6 +123,40 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _read_bounded_json(path: Path) -> object:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise DatasetError("published dataset metadata cannot be opened safely")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise DatasetError("published dataset metadata cannot be opened safely")
+        if before.st_size > _MAX_METADATA_BYTES:
+            raise DatasetError("published dataset metadata exceeds size limit")
+        chunks: list[bytes] = []
+        remaining = _MAX_METADATA_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _MAX_METADATA_BYTES:
+            raise DatasetError("published dataset metadata exceeds size limit")
+        after = os.fstat(descriptor)
+        if _stat_fingerprint(before) != _stat_fingerprint(after):
+            raise DatasetError("published dataset metadata changed during read")
+    finally:
+        os.close(descriptor)
+    return json.loads(payload.decode("utf-8"))
 
 
 def _atomic_json(path: Path, payload: dict[str, object]) -> None:
@@ -227,8 +264,8 @@ class NasMarketStore:
 
     def _manifest(self) -> dict[str, object]:
         try:
-            sentinel_payload = json.loads((self.root / SENTINEL_NAME).read_text(encoding="utf-8"))
-            manifest_payload = json.loads((self.root / MANIFEST_NAME).read_text(encoding="utf-8"))
+            sentinel_payload = _read_bounded_json(self.root / SENTINEL_NAME)
+            manifest_payload = _read_bounded_json(self.root / MANIFEST_NAME)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise DatasetError("published dataset metadata is unavailable") from exc
         if not isinstance(sentinel_payload, dict) or not isinstance(manifest_payload, dict):
@@ -273,36 +310,124 @@ class NasMarketStore:
         return payload
 
     @staticmethod
-    def _validate_parquet(path: Path, expected_rows: int) -> None:
+    def _validate_parquet(
+        path: Path,
+        expected_rows: int,
+        *,
+        expected_source: str | None = None,
+        expected_trade_date: date | None = None,
+    ) -> None:
         connection = duckdb.connect(":memory:")
         try:
-            schema = {
-                row[0]: row[1]
+            schema = tuple(
+                (row[0], row[1])
                 for row in connection.execute(
-                    "DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]
+                    "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false)",
+                    [str(path)],
                 ).fetchall()
-            }
-            if any(
-                schema.get(column) != data_type
-                for column, data_type in _EXPECTED_PARQUET_TYPES.items()
-            ):
+            )
+            if schema != tuple(_EXPECTED_PARQUET_TYPES.items()):
                 raise DatasetError("published parquet has an incompatible schema")
             rows = int(
-                connection.execute("SELECT count(*) FROM read_parquet(?)", [str(path)]).fetchone()[
-                    0
-                ]
+                connection.execute(
+                    "SELECT count(*) FROM read_parquet(?, hive_partitioning=false)",
+                    [str(path)],
+                ).fetchone()[0]
             )
+            if (expected_source is None) != (expected_trade_date is None):
+                raise DatasetError("published parquet validation contract is invalid")
+            invalid_partition_rows = 0
+            if expected_source is not None and expected_trade_date is not None:
+                invalid_partition_rows = int(
+                    connection.execute(
+                        """SELECT count(*)
+                           FROM read_parquet(?, hive_partitioning=false)
+                           WHERE source IS DISTINCT FROM ?
+                              OR trade_date IS DISTINCT FROM ?""",
+                        [str(path), expected_source, expected_trade_date],
+                    ).fetchone()[0]
+                )
         except duckdb.Error as exc:
             raise DatasetError("published parquet cannot be read") from exc
         finally:
             connection.close()
         if rows != expected_rows:
             raise DatasetError("published parquet row count mismatch")
+        if invalid_partition_rows:
+            raise DatasetError("published parquet partition does not match manifest")
 
     @staticmethod
     def _fingerprint(path: Path) -> tuple[int, int, int, int, int]:
-        stat = path.stat()
-        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        value = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(value.st_mode):
+            raise DatasetError("published object cannot be opened safely")
+        return _stat_fingerprint(value)
+
+    def _open_published_object(self, relative: Path) -> int:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise DatasetError("published object cannot be opened safely")
+        flags = os.O_RDONLY | os.O_CLOEXEC | nofollow
+        directory_descriptor: int | None = None
+        try:
+            directory_descriptor = os.open(
+                self.root.resolve(strict=True),
+                flags | directory,
+            )
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(
+                    component,
+                    flags | directory,
+                    dir_fd=directory_descriptor,
+                )
+                os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            descriptor = os.open(
+                relative.name,
+                flags,
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError as exc:
+            raise DatasetError("published manifest references a missing parquet file") from exc
+        except OSError as exc:
+            raise DatasetError("published object cannot be opened safely") from exc
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(descriptor)
+            raise DatasetError("published object cannot be opened safely")
+        return descriptor
+
+    def _validate_published_object(
+        self,
+        descriptor: int,
+        item: dict[str, object],
+        expected_fingerprint: tuple[int, int, int, int, int],
+    ) -> None:
+        before = os.fstat(descriptor)
+        if _stat_fingerprint(before) != expected_fingerprint:
+            raise DatasetError("published object changed during validation")
+        digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        for chunk in iter(lambda: os.read(descriptor, _READ_CHUNK_BYTES), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != item["sha256"]:
+            raise DatasetError("published parquet checksum mismatch")
+        descriptor_path = Path("/dev/fd") / str(descriptor)
+        if not descriptor_path.exists():
+            raise DatasetError("published object descriptor validation is unavailable")
+        self._validate_parquet(
+            descriptor_path,
+            int(item["row_count"]),
+            expected_source=str(item["source"]),
+            expected_trade_date=date.fromisoformat(str(item["trade_date"])),
+        )
+        after = os.fstat(descriptor)
+        if _stat_fingerprint(before) != _stat_fingerprint(after):
+            raise DatasetError("published object changed during validation")
 
     def _read_snapshot(
         self,
@@ -317,15 +442,22 @@ class NasMarketStore:
             for item in items:
                 relative = _safe_relative(item["path"])
                 path = self.root / relative
-                if not path.is_file():
-                    raise DatasetError("published manifest references a missing parquet file")
-                if path.resolve(strict=True) != self.root.resolve() / relative:
-                    raise DatasetError("manifest contains unsafe file path")
+                try:
+                    if path.resolve(strict=True) != self.root.resolve() / relative:
+                        raise DatasetError("manifest contains unsafe file path")
+                except FileNotFoundError as exc:
+                    raise DatasetError(
+                        "published manifest references a missing parquet file"
+                    ) from exc
                 paths.append(path)
             fingerprints = [self._fingerprint(path) for path in paths]
             validation_needed = []
             for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
-                key = (str(path.resolve()), str(item["sha256"]), int(item["row_count"]))
+                key = (
+                    str(self.root.resolve() / _safe_relative(str(item["path"]))),
+                    str(item["sha256"]),
+                    int(item["row_count"]),
+                )
                 with _VALIDATION_LOCK:
                     cached = _VALIDATED_OBJECTS.get(key)
                     if cached == fingerprint and not force_validation:
@@ -336,15 +468,12 @@ class NasMarketStore:
             # Hashing and DuckDB validation are deliberately outside the process-global
             # LRU lock. Strict snapshots revalidate every object; ordinary readers
             # validate only unseen or metadata-changed objects.
-            for item, path, fingerprint, key in validation_needed:
-                before = self._fingerprint(path)
-                checksum = _sha256(path)
-                if checksum != item["sha256"]:
-                    raise DatasetError("published parquet checksum mismatch")
-                self._validate_parquet(path, item["row_count"])
-                after = self._fingerprint(path)
-                if before != fingerprint or after != fingerprint:
-                    raise DatasetError("published object changed during validation")
+            for item, _path, fingerprint, key in validation_needed:
+                descriptor = self._open_published_object(_safe_relative(str(item["path"])))
+                try:
+                    self._validate_published_object(descriptor, item, fingerprint)
+                finally:
+                    os.close(descriptor)
                 with _VALIDATION_LOCK:
                     _VALIDATED_OBJECTS[key] = fingerprint
                     _VALIDATED_OBJECTS.move_to_end(key)
