@@ -1240,6 +1240,10 @@ class MarketStore:
                     or self._bound_file_fingerprint(source_fd) != source_fingerprint
                 ):
                     raise RepairQueueConflictError("market schema exchange result changed")
+                self._require_directory_path_identity(
+                    self.path.parent,
+                    target_parent_identity,
+                )
                 os.fsync(target_parent_fd)
             except (OSError, RepairQueueError):
                 if exchange_completed:

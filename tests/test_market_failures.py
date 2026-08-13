@@ -913,6 +913,71 @@ def test_existing_writer_schema_rolls_back_foreign_entry_during_exchange_window(
     assert list(staging.iterdir()) == []
 
 
+def test_existing_writer_schema_rolls_back_when_configured_parent_changes_during_exchange(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target_parent = tmp_path / "market"
+    target_parent.mkdir()
+    target = target_parent / "stock_eva.duckdb"
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+        connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    original = (target.stat().st_ino, target.read_bytes())
+    displaced = tmp_path / "displaced-market"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_bytes(b"external parent evidence")
+    external_before = {
+        item.relative_to(external): (item.stat().st_ino, item.read_bytes())
+        for item in external.rglob("*")
+        if item.is_file()
+    }
+    real_exchange = MarketStore._atomic_exchange_bound_files
+    exchange_count = 0
+
+    def replace_configured_parent_before_first_exchange(*args, **kwargs):
+        nonlocal exchange_count
+        if exchange_count == 0:
+            target_parent.rename(displaced)
+            target_parent.symlink_to(external, target_is_directory=True)
+        result = real_exchange(*args, **kwargs)
+        exchange_count += 1
+        return result
+
+    monkeypatch.setattr(
+        MarketStore,
+        "_atomic_exchange_bound_files",
+        staticmethod(replace_configured_parent_before_first_exchange),
+    )
+
+    with pytest.raises(
+        module.RepairQueueConflictError,
+        match="market schema target changed during exchange",
+    ) as exc_info:
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert "uncertain" not in str(exc_info.value)
+    assert exchange_count == 2
+    displaced_target = displaced / target.name
+    assert (displaced_target.stat().st_ino, displaced_target.read_bytes()) == original
+    with duckdb.connect(str(displaced_target), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM existing_evidence").fetchall() == [(7,)]
+        assert "repair_jobs" not in {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+    assert target_parent.is_symlink()
+    assert target_parent.resolve() == external.resolve()
+    assert {
+        item.relative_to(external): (item.stat().st_ino, item.read_bytes())
+        for item in external.rglob("*")
+        if item.is_file()
+    } == external_before
+    assert list(staging.iterdir()) == []
+
+
 def test_existing_writer_schema_child_failure_preserves_original_bytes_and_schema(
     tmp_path: Path,
     monkeypatch,
