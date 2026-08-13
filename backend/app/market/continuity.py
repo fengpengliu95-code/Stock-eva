@@ -139,6 +139,15 @@ class RepairJob(BaseModel):
             raise ValueError("only a leased repair job may carry a lease")
         if (self.attempt_count == 0) != (self.last_attempt_id is None):
             raise ValueError("repair job attempt count and reference do not match")
+        if self.state == "pending" and (
+            self.attempt_count != 0
+            or self.abandoned_attempt_count != 0
+            or self.last_failure_stage is not None
+            or self.last_failure_class is not None
+        ):
+            raise ValueError("pending repair job must be unattempted")
+        if self.state in {"retry_wait", "dead_letter"} and self.attempt_count < 1:
+            raise ValueError("failed repair job requires attempt evidence")
         if self.state == "retry_wait":
             if self.next_attempt_at is None:
                 raise ValueError("retry-wait repair job requires a due time")
@@ -275,10 +284,14 @@ class RepairQueueSnapshot(BaseModel):
                 attempts_by_job[attempt.job_id].append(attempt)
             for job in self.jobs:
                 job_attempts = attempts_by_job[job.job_id]
-                if sorted(item.attempt_number for item in job_attempts) != list(
-                    range(1, job.attempt_count + 1)
+                attempt_numbers = sorted(item.attempt_number for item in job_attempts)
+                if len(attempt_numbers) != job.attempt_count or any(
+                    number != expected for expected, number in enumerate(attempt_numbers, start=1)
                 ):
                     raise ValueError("repair job attempt sequence is incomplete")
+                abandoned = sum(item.outcome == "abandoned" for item in job_attempts)
+                if abandoned != job.abandoned_attempt_count:
+                    raise ValueError("repair job abandoned count does not match attempts")
                 if job.last_attempt_id is None:
                     continue
                 attempt = attempts.get(job.last_attempt_id)
@@ -294,6 +307,13 @@ class RepairQueueSnapshot(BaseModel):
                     or attempt.lease_owner != job.lease_owner
                 ):
                     raise ValueError("repair lease attempt reference is invalid")
+                if job.state in {"retry_wait", "dead_letter"} and attempt.outcome not in {
+                    "failed",
+                    "abandoned",
+                }:
+                    raise ValueError("failed repair job lacks a terminal failure attempt")
+                if job.state == "published" and attempt.outcome == "running":
+                    raise ValueError("published repair job cannot have a running attempt")
             for attempt in self.attempts:
                 if attempt.outcome == "running":
                     job = jobs.get(attempt.job_id)

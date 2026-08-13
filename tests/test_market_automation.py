@@ -1536,6 +1536,127 @@ def test_market_schema_migration_adds_continuity_tables_under_shared_lock(
         }
 
 
+def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    path = tmp_path / "market" / "stock_eva.duckdb"
+    path.parent.mkdir()
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE refresh_runs (
+                run_id VARCHAR PRIMARY KEY, requested_date DATE NOT NULL,
+                source VARCHAR NOT NULL, status VARCHAR NOT NULL,
+                requested_count INTEGER NOT NULL, succeeded_count INTEGER NOT NULL,
+                failed_symbols JSON NOT NULL, error_message VARCHAR,
+                started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": path.parent,
+            "market_database_name": path.name,
+            "local_temp_dir": tmp_path / "tmp",
+            "local_lock_dir": tmp_path / "locks",
+        }
+    )
+    lock_path = settings.local_lock_dir / "market-refresh.lock"
+    with cli.RefreshRunLock(lock_path):
+        pass
+    before = (
+        path.stat().st_size,
+        path.stat().st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+    def fail_continuity(*_args, **_kwargs):
+        raise RuntimeError("token=secret /private/path raw failure")
+
+    monkeypatch.setattr(
+        cli.MarketStore,
+        "_initialize_continuity_schema_on_connection",
+        fail_continuity,
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "error_code": "market_control_schema_migration_failed",
+        "status": "error",
+        "writes_market_control_schema": False,
+    }
+    after = (
+        path.stat().st_size,
+        path.stat().st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    assert after == before
+    with duckdb.connect(str(path), read_only=True) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(refresh_runs)").fetchall()
+        }
+        tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+    assert "coverage_ratio" not in columns
+    assert "repair_jobs" not in tables
+
+
+def test_market_schema_migration_new_database_failure_leaves_tree_unchanged(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "local_temp_dir": tmp_path / "tmp",
+            "local_lock_dir": tmp_path / "locks",
+        }
+    )
+    lock_path = settings.local_lock_dir / "market-refresh.lock"
+    with cli.RefreshRunLock(lock_path):
+        pass
+
+    def tree_fingerprint() -> dict[Path, tuple[int, int, str]]:
+        return {
+            item.relative_to(tmp_path): (
+                item.stat().st_size,
+                item.stat().st_mtime_ns,
+                hashlib.sha256(item.read_bytes()).hexdigest(),
+            )
+            for item in tmp_path.rglob("*")
+            if item.is_file()
+        }
+
+    before = tree_fingerprint()
+
+    def fail_continuity(*_args, **_kwargs):
+        raise RuntimeError("token=secret /private/path raw failure")
+
+    monkeypatch.setattr(
+        cli.MarketStore,
+        "_initialize_continuity_schema_on_connection",
+        fail_continuity,
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error_code": "market_control_schema_migration_failed",
+        "status": "error",
+        "writes_market_control_schema": False,
+    }
+    assert tree_fingerprint() == before
+    assert not settings.market_data_dir.exists()
+
+
 def test_automation_defers_without_fetching_when_refresh_lock_is_busy(
     tmp_path: Path,
 ) -> None:

@@ -513,8 +513,9 @@ def main() -> int:
                 temp_directory=layout.duckdb_temporary,
             )
             with RefreshRunLock(layout.market_refresh_lock):
-                store.initialize_schema()
-                store.initialize_continuity_schema()
+                store.initialize_all_writer_schema(
+                    staging_directory=layout.market_refresh_lock.parent,
+                )
         except RefreshAlreadyRunning:
             print(
                 json.dumps(

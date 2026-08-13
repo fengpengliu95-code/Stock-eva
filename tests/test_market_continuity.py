@@ -93,6 +93,92 @@ def file_fingerprint(path: Path) -> tuple[int, int, str]:
     return stat.st_size, stat.st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def create_task2_continuity_tables(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    fake_checks: bool = False,
+) -> None:
+    job_checks = (
+        ["CHECK (TRUE)"] * 6
+        if fake_checks
+        else [
+            "CHECK (state IN ('pending', 'leased', 'retry_wait', 'published', 'dead_letter'))",
+            "CHECK (state_version >= 1)",
+            "CHECK (attempt_count >= 0)",
+            "CHECK (abandoned_attempt_count >= 0 AND abandoned_attempt_count <= attempt_count)",
+            """CHECK (
+                (state = 'leased' AND lease_id IS NOT NULL AND lease_owner IS NOT NULL
+                 AND lease_expires_at IS NOT NULL)
+                OR
+                (state <> 'leased' AND lease_id IS NULL AND lease_owner IS NULL
+                 AND lease_expires_at IS NULL)
+            )""",
+            """CHECK (
+                (state = 'published' AND published_at IS NOT NULL)
+                OR (state <> 'published' AND published_at IS NULL)
+            )""",
+        ]
+    )
+    attempt_checks = (
+        ["CHECK (TRUE)"] * 3
+        if fake_checks
+        else [
+            "CHECK (attempt_number > 0)",
+            "CHECK (outcome IN ('running', 'succeeded', 'failed', 'abandoned'))",
+            """CHECK (
+                (outcome = 'running' AND completed_at IS NULL AND retryable IS NULL)
+                OR
+                (outcome <> 'running' AND completed_at IS NOT NULL AND retryable IS NOT NULL)
+            )""",
+        ]
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE repair_jobs (
+            job_id VARCHAR PRIMARY KEY,
+            trade_date DATE NOT NULL,
+            universe_id VARCHAR NOT NULL,
+            state VARCHAR NOT NULL,
+            state_version BIGINT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            abandoned_attempt_count INTEGER NOT NULL,
+            next_attempt_at TIMESTAMPTZ,
+            lease_id VARCHAR UNIQUE,
+            lease_owner VARCHAR,
+            lease_expires_at TIMESTAMPTZ,
+            last_attempt_id VARCHAR,
+            last_failure_stage VARCHAR,
+            last_failure_class VARCHAR,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            published_at TIMESTAMPTZ,
+            UNIQUE (trade_date, universe_id),
+            {", ".join(job_checks)}
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE repair_attempts (
+            attempt_id VARCHAR PRIMARY KEY,
+            job_id VARCHAR NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            lease_id VARCHAR NOT NULL UNIQUE,
+            lease_owner VARCHAR NOT NULL,
+            outcome VARCHAR NOT NULL,
+            refresh_run_id VARCHAR,
+            failure_stage VARCHAR,
+            failure_class VARCHAR,
+            retryable BOOLEAN,
+            started_at TIMESTAMPTZ NOT NULL,
+            completed_at TIMESTAMPTZ,
+            UNIQUE (job_id, attempt_number),
+            {", ".join(attempt_checks)}
+        )
+        """
+    )
+
+
 def _claim_in_process(
     database_path: str,
     lock_path: str,
@@ -289,6 +375,46 @@ def test_repair_schema_has_no_payload_url_token_path_or_exception_columns(
     )
 
 
+def test_legacy_task2_schema_is_unavailable_until_explicit_writer_migration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "market.duckdb"
+    store = MarketStore(path)
+    store.initialize_schema()
+    with duckdb.connect(str(path)) as connection:
+        create_task2_continuity_tables(connection)
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+    with RefreshRunLock(tmp_path / "market-refresh.lock"):
+        store.initialize_continuity_schema()
+    assert store.repair_queue_snapshot().status == "ready"
+
+
+def test_schema_with_fake_check_constraints_is_unavailable_even_with_claimed_meta(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "market.duckdb"
+    with duckdb.connect(str(path)) as connection:
+        create_task2_continuity_tables(connection, fake_checks=True)
+        connection.execute(
+            """
+            CREATE TABLE continuity_schema_meta (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                schema_hash VARCHAR NOT NULL,
+                CHECK (singleton = 1),
+                CHECK (schema_version = 1)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO continuity_schema_meta VALUES (1, 1, ?)",
+            [getattr(market_store_module, "_CONTINUITY_SCHEMA_HASH", "pending-schema-hash")],
+        )
+
+    assert MarketStore(path).repair_queue_snapshot().status == "unavailable"
+
+
 def test_enqueue_is_deterministic_and_idempotent_across_restart(tmp_path: Path) -> None:
     path = tmp_path / "market.duckdb"
     lock_path = tmp_path / "market-refresh.lock"
@@ -411,6 +537,125 @@ def test_lease_finalize_requires_matching_owner_id_and_state_version(tmp_path: P
     assert snapshot.attempts[0].outcome == "running"
 
 
+def test_finalize_revalidates_copied_lease_and_matches_database_trade_date(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+    assert lease is not None
+    other_date = date(2026, 8, 11)
+    bypassed_lease = lease.model_copy(update={"target_session": other_date})
+    bypassed_result = ready_refresh(other_date).model_copy(update={"request_key": job.job_id})
+    before = store.repair_queue_snapshot()
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                bypassed_lease,
+                outcome="succeeded",
+                refresh_result=bypassed_result,
+                now=NOW + timedelta(minutes=1),
+                retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+            )
+
+    assert store.repair_queue_snapshot() == before
+
+
+def test_finalize_revalidates_copied_refresh_and_retry_policy(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    first, second = enqueue(store, lock_path, date(2026, 8, 10), date(2026, 8, 11))
+    with RefreshRunLock(lock_path):
+        first_lease = store.claim_repair_job(
+            first.job_id,
+            owner="worker-a",
+            expected_version=first.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        second_lease = store.claim_repair_job(
+            second.job_id,
+            owner="worker-b",
+            expected_version=second.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+    assert first_lease is not None and second_lease is not None
+    invalid_ready = ready_refresh(first.trade_date).model_copy(update={"succeeded_count": 0})
+    invalid_policy = module.RepairRetryPolicy(max_attempts=4, base_seconds=3600).model_copy(
+        update={"max_attempts": 0}
+    )
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                first_lease,
+                outcome="succeeded",
+                refresh_result=invalid_ready,
+                now=NOW + timedelta(minutes=1),
+                retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+            )
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                second_lease,
+                outcome="failed",
+                refresh_result=error_refresh(second.trade_date, attempt=1),
+                now=NOW + timedelta(minutes=1),
+                retry_policy=invalid_policy,
+            )
+
+    snapshot = store.repair_queue_snapshot()
+    assert all(item.state == "leased" for item in snapshot.jobs)
+    assert all(item.outcome == "running" for item in snapshot.attempts)
+
+
+def test_success_finalize_requires_deterministic_job_request_key(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+    assert lease is not None
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                lease,
+                outcome="succeeded",
+                refresh_result=ready_refresh(job.trade_date).model_copy(
+                    update={"request_key": "unrelated-request"}
+                ),
+                now=NOW + timedelta(minutes=1),
+                retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+            )
+
+    assert store.repair_queue_snapshot().jobs[0].state == "leased"
+
+
 def test_naive_datetime_is_rejected_and_persisted_times_are_utc(tmp_path: Path) -> None:
     module = continuity_module()
     path = tmp_path / "market.duckdb"
@@ -442,6 +687,71 @@ def test_naive_datetime_is_rejected_and_persisted_times_are_utc(tmp_path: Path) 
     assert lease is not None
     assert job.created_at.tzinfo == UTC
     assert lease.expires_at.tzinfo == UTC
+
+
+def test_claim_rejects_time_before_job_update_without_mutation(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10), now=NOW)[0]
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.claim_repair_job(
+                job.job_id,
+                owner="worker-a",
+                expected_version=job.state_version,
+                now=NOW - timedelta(seconds=1),
+                lease_seconds=1800,
+            )
+
+    assert store.repair_queue_snapshot().jobs[0] == job
+    assert store.repair_queue_snapshot().attempts == ()
+
+
+def test_finalize_and_reconcile_reject_time_before_attempt_started(tmp_path: Path) -> None:
+    module = continuity_module()
+    policy = module.RepairRetryPolicy(max_attempts=4, base_seconds=3600)
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    first, second = enqueue(store, lock_path, date(2026, 8, 10), date(2026, 8, 11))
+    claimed_at = NOW + timedelta(minutes=10)
+    with RefreshRunLock(lock_path):
+        first_lease = store.claim_repair_job(
+            first.job_id,
+            owner="worker-a",
+            expected_version=first.state_version,
+            now=claimed_at,
+            lease_seconds=1800,
+        )
+        second_lease = store.claim_repair_job(
+            second.job_id,
+            owner="worker-b",
+            expected_version=second.state_version,
+            now=claimed_at,
+            lease_seconds=1800,
+        )
+    assert first_lease is not None and second_lease is not None
+    before = store.repair_queue_snapshot()
+    backdated = NOW + timedelta(minutes=5)
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.finalize_repair_attempt(
+                first_lease,
+                outcome="failed",
+                refresh_result=error_refresh(first.trade_date, attempt=1),
+                now=backdated,
+                retry_policy=policy,
+            )
+        with pytest.raises(module.RepairQueueError):
+            store.reconcile_published_repair_jobs([second.trade_date], now=backdated)
+
+    assert store.repair_queue_snapshot() == before
 
 
 def test_expired_lease_becomes_one_abandoned_attempt_and_retry_wait(tmp_path: Path) -> None:
@@ -526,6 +836,37 @@ def test_expired_worker_cannot_finalize_before_lease_recovery(tmp_path: Path) ->
     snapshot = store.repair_queue_snapshot()
     assert snapshot.jobs[0].state == "leased"
     assert snapshot.attempts[0].outcome == "running"
+
+
+def test_reap_revalidates_copied_retry_policy_without_mutation(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=60,
+        )
+    assert lease is not None
+    before = store.repair_queue_snapshot()
+    invalid_policy = module.RepairRetryPolicy(max_attempts=4, base_seconds=3600).model_copy(
+        update={"base_seconds": 1}
+    )
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            store.reap_expired_repair_leases(
+                now=NOW + timedelta(seconds=60),
+                retry_policy=invalid_policy,
+            )
+
+    assert store.repair_queue_snapshot() == before
 
 
 def test_retry_is_exponential_capped_and_budgeted(tmp_path: Path) -> None:
@@ -622,6 +963,147 @@ def test_non_retryable_dead_letter_and_terminal_jobs_never_reopen(tmp_path: Path
     unchanged = store.repair_queue_snapshot().jobs[0]
     assert unchanged.state == "dead_letter"
     assert unchanged.state_version == dead.state_version
+
+
+def test_snapshot_rejects_pending_with_terminal_attempt(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    first = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        first_lease = store.claim_repair_job(
+            first.job_id,
+            owner="worker-a",
+            expected_version=first.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        assert first_lease is not None
+        store.finalize_repair_attempt(
+            first_lease,
+            outcome="failed",
+            refresh_result=error_refresh(first.trade_date, attempt=1),
+            now=NOW + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            """
+            UPDATE repair_jobs
+            SET state = 'pending', next_attempt_at = NULL
+            WHERE job_id = ?
+            """,
+            [first.job_id],
+        )
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_snapshot_rejects_retry_wait_with_successful_latest_attempt(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        assert lease is not None
+        store.finalize_repair_attempt(
+            lease,
+            outcome="failed",
+            refresh_result=error_refresh(job.trade_date, attempt=1),
+            now=NOW + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            """
+            UPDATE repair_attempts
+            SET outcome = 'succeeded', failure_stage = NULL, failure_class = NULL,
+                retryable = FALSE
+            WHERE job_id = ?
+            """,
+            [job.job_id],
+        )
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_snapshot_requires_abandoned_count_to_equal_abandoned_attempts(tmp_path: Path) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=60,
+        )
+        assert lease is not None
+        store.reap_expired_repair_leases(
+            now=NOW + timedelta(seconds=60),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            "UPDATE repair_jobs SET abandoned_attempt_count = 0 WHERE job_id = ?",
+            [job.job_id],
+        )
+
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_snapshot_checks_attempt_sequence_without_allocating_attempt_count_range(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 10))[0]
+    with RefreshRunLock(lock_path):
+        lease = store.claim_repair_job(
+            job.job_id,
+            owner="worker-a",
+            expected_version=job.state_version,
+            now=NOW,
+            lease_seconds=1800,
+        )
+        assert lease is not None
+        store.finalize_repair_attempt(
+            lease,
+            outcome="failed",
+            refresh_result=error_refresh(job.trade_date, attempt=1, retryable=False),
+            now=NOW + timedelta(minutes=1),
+            retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=3600),
+        )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            "UPDATE repair_jobs SET attempt_count = 2000000000 WHERE job_id = ?",
+            [job.job_id],
+        )
+
+    def forbidden_range(*_args):
+        raise AssertionError("snapshot must not allocate a range from corrupt attempt_count")
+
+    monkeypatch.setattr(module, "range", forbidden_range, raising=False)
+    assert store.repair_queue_snapshot().status == "unavailable"
 
 
 def test_dead_letter_does_not_block_a_newer_pending_job(tmp_path: Path) -> None:

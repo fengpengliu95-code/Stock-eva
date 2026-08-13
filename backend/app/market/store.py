@@ -1,6 +1,10 @@
+import hashlib
 import json
+import os
+import re
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -61,44 +65,134 @@ _REPAIR_ATTEMPT_COLUMNS = (
     "started_at",
     "completed_at",
 )
-_REPAIR_JOB_SCHEMA = (
-    ("job_id", "VARCHAR", True, True),
-    ("trade_date", "DATE", True, False),
-    ("universe_id", "VARCHAR", True, False),
-    ("state", "VARCHAR", True, False),
-    ("state_version", "BIGINT", True, False),
-    ("attempt_count", "INTEGER", True, False),
-    ("abandoned_attempt_count", "INTEGER", True, False),
-    ("next_attempt_at", "TIMESTAMP WITH TIME ZONE", False, False),
-    ("lease_id", "VARCHAR", False, False),
-    ("lease_owner", "VARCHAR", False, False),
-    ("lease_expires_at", "TIMESTAMP WITH TIME ZONE", False, False),
-    ("last_attempt_id", "VARCHAR", False, False),
-    ("last_failure_stage", "VARCHAR", False, False),
-    ("last_failure_class", "VARCHAR", False, False),
-    ("created_at", "TIMESTAMP WITH TIME ZONE", True, False),
-    ("updated_at", "TIMESTAMP WITH TIME ZONE", True, False),
-    ("published_at", "TIMESTAMP WITH TIME ZONE", False, False),
+_REPAIR_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS repair_jobs (
+    job_id VARCHAR PRIMARY KEY,
+    trade_date DATE NOT NULL,
+    universe_id VARCHAR NOT NULL,
+    state VARCHAR NOT NULL,
+    state_version BIGINT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    abandoned_attempt_count INTEGER NOT NULL,
+    next_attempt_at TIMESTAMPTZ,
+    lease_id VARCHAR UNIQUE,
+    lease_owner VARCHAR,
+    lease_expires_at TIMESTAMPTZ,
+    last_attempt_id VARCHAR,
+    last_failure_stage VARCHAR,
+    last_failure_class VARCHAR,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ,
+    UNIQUE (trade_date, universe_id),
+    CHECK (state IN ('pending', 'leased', 'retry_wait', 'published', 'dead_letter')),
+    CHECK (state_version >= 1),
+    CHECK (attempt_count >= 0),
+    CHECK (abandoned_attempt_count >= 0 AND abandoned_attempt_count <= attempt_count),
+    CHECK (
+        (state = 'leased' AND lease_id IS NOT NULL AND lease_owner IS NOT NULL
+         AND lease_expires_at IS NOT NULL)
+        OR
+        (state <> 'leased' AND lease_id IS NULL AND lease_owner IS NULL
+         AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        (state = 'published' AND published_at IS NOT NULL)
+        OR (state <> 'published' AND published_at IS NULL)
+    )
 )
-_REPAIR_ATTEMPT_SCHEMA = (
-    ("attempt_id", "VARCHAR", True, True),
-    ("job_id", "VARCHAR", True, False),
-    ("attempt_number", "INTEGER", True, False),
-    ("lease_id", "VARCHAR", True, False),
-    ("lease_owner", "VARCHAR", True, False),
-    ("outcome", "VARCHAR", True, False),
-    ("refresh_run_id", "VARCHAR", False, False),
-    ("failure_stage", "VARCHAR", False, False),
-    ("failure_class", "VARCHAR", False, False),
-    ("retryable", "BOOLEAN", False, False),
-    ("started_at", "TIMESTAMP WITH TIME ZONE", True, False),
-    ("completed_at", "TIMESTAMP WITH TIME ZONE", False, False),
+"""
+_REPAIR_ATTEMPTS_DDL = """
+CREATE TABLE IF NOT EXISTS repair_attempts (
+    attempt_id VARCHAR PRIMARY KEY,
+    job_id VARCHAR NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    lease_id VARCHAR NOT NULL UNIQUE,
+    lease_owner VARCHAR NOT NULL,
+    outcome VARCHAR NOT NULL,
+    refresh_run_id VARCHAR,
+    failure_stage VARCHAR,
+    failure_class VARCHAR,
+    retryable BOOLEAN,
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    UNIQUE (job_id, attempt_number),
+    CHECK (attempt_number > 0),
+    CHECK (outcome IN ('running', 'succeeded', 'failed', 'abandoned')),
+    CHECK (
+        (outcome = 'running' AND completed_at IS NULL AND retryable IS NULL)
+        OR
+        (outcome <> 'running' AND completed_at IS NOT NULL AND retryable IS NOT NULL)
+    )
 )
-_REPAIR_UNIQUE_CONSTRAINTS = {
-    "repair_jobs": {("job_id",), ("lease_id",), ("trade_date", "universe_id")},
-    "repair_attempts": {("attempt_id",), ("lease_id",), ("job_id", "attempt_number")},
-}
-_REPAIR_CHECK_COUNTS = {"repair_jobs": 6, "repair_attempts": 3}
+"""
+_CONTINUITY_SCHEMA_META_DDL = """
+CREATE TABLE IF NOT EXISTS continuity_schema_meta (
+    singleton INTEGER PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    schema_hash VARCHAR NOT NULL,
+    CHECK (singleton = 1),
+    CHECK (schema_version = 1)
+)
+"""
+_CONTINUITY_DDL = (
+    _REPAIR_JOBS_DDL,
+    _REPAIR_ATTEMPTS_DDL,
+    _CONTINUITY_SCHEMA_META_DDL,
+)
+_CONTINUITY_SCHEMA_HASH = hashlib.sha256(
+    "\n".join(" ".join(statement.split()) for statement in _CONTINUITY_DDL).encode()
+).hexdigest()
+_CONTINUITY_TABLES = ("continuity_schema_meta", "repair_attempts", "repair_jobs")
+
+
+def _normalize_schema_expression(value: str | None) -> str | None:
+    return None if value is None else re.sub(r"\s+", " ", value).strip()
+
+
+def _continuity_schema_signature(connection: duckdb.DuckDBPyConnection) -> tuple:
+    tables = tuple(
+        (
+            table,
+            tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+            ),
+        )
+        for table in _CONTINUITY_TABLES
+    )
+    constraints = tuple(
+        sorted(
+            (
+                row[0],
+                row[1],
+                _normalize_schema_expression(row[2]),
+                _normalize_schema_expression(row[3]),
+                tuple(row[4] or ()),
+            )
+            for row in connection.execute(
+                """
+                SELECT table_name, constraint_type, constraint_text, expression,
+                       constraint_column_names
+                FROM duckdb_constraints()
+                WHERE table_name IN ('continuity_schema_meta', 'repair_attempts', 'repair_jobs')
+                  AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'CHECK')
+                """
+            ).fetchall()
+        )
+    )
+    return tables, constraints
+
+
+@lru_cache(maxsize=1)
+def _expected_continuity_schema_signature() -> tuple:
+    connection = duckdb.connect(":memory:")
+    try:
+        for statement in _CONTINUITY_DDL:
+            connection.execute(statement)
+        return _continuity_schema_signature(connection)
+    finally:
+        connection.close()
 
 
 class MarketStoreReadError(RuntimeError):
@@ -117,13 +211,33 @@ class MarketStore:
         self.temp_directory = temp_directory or path.parent / ".duckdb-tmp"
         self.read_only = read_only
 
-    def _connect(self) -> duckdb.DuckDBPyConnection:
+    def _open_writer_connection(
+        self,
+        *,
+        path: Path | None = None,
+        temp_directory: Path | None = None,
+        create_directories: bool = True,
+    ) -> duckdb.DuckDBPyConnection:
         if self.read_only:
             raise RuntimeError("read-only market store cannot open a writer connection")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.temp_directory.mkdir(parents=True, exist_ok=True)
-        connection = duckdb.connect(str(self.path))
-        connection.execute("SET temp_directory = ?", [str(self.temp_directory)])
+        database_path = path or self.path
+        temporary = temp_directory or self.temp_directory
+        if create_directories:
+            database_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.mkdir(parents=True, exist_ok=True)
+        connection = duckdb.connect(str(database_path))
+        connection.execute("SET temp_directory = ?", [str(temporary)])
+        return connection
+
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        connection = self._open_writer_connection()
+        self._initialize_base_schema_on_connection(connection)
+        return connection
+
+    @staticmethod
+    def _initialize_base_schema_on_connection(
+        connection: duckdb.DuckDBPyConnection,
+    ) -> None:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_bars (
@@ -254,12 +368,90 @@ class MarketStore:
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS failure_class VARCHAR"
         )
         connection.execute("ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS retryable BOOLEAN")
-        return connection
 
     def initialize_schema(self) -> None:
         """Explicitly initialize or migrate schema for a writer-owned store."""
         connection = self._connect()
         connection.close()
+
+    def initialize_all_writer_schema(self, *, staging_directory: Path) -> None:
+        """Atomically migrate base and continuity schema under the caller-owned lock."""
+        if self.read_only:
+            raise RepairQueueError("read-only market store cannot migrate writer schema")
+        if not staging_directory.is_dir():
+            raise RepairQueueError("market schema migration staging is unavailable")
+        if self.path.exists():
+            self._initialize_all_existing_writer_schema(staging_directory)
+            return
+        self._initialize_all_new_writer_schema(staging_directory)
+
+    def _initialize_all_existing_writer_schema(self, staging_directory: Path) -> None:
+        connection = None
+        try:
+            connection = self._open_writer_connection(
+                temp_directory=staging_directory,
+                create_directories=False,
+            )
+            connection.begin()
+            self._initialize_base_schema_on_connection(connection)
+            self._initialize_continuity_schema_on_connection(connection)
+            connection.commit()
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except duckdb.Error:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _initialize_all_new_writer_schema(self, staging_directory: Path) -> None:
+        staging_path = staging_directory / f".{self.path.name}.{uuid4().hex}.migration"
+        connection = None
+        created_directories: list[Path] = []
+        try:
+            connection = self._open_writer_connection(
+                path=staging_path,
+                temp_directory=staging_directory,
+                create_directories=False,
+            )
+            connection.begin()
+            self._initialize_base_schema_on_connection(connection)
+            self._initialize_continuity_schema_on_connection(connection)
+            connection.commit()
+            connection.close()
+            connection = None
+            current = self.path.parent
+            while not current.exists():
+                created_directories.append(current)
+                current = current.parent
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists():
+                raise RepairQueueConflictError("market schema target appeared during migration")
+            os.replace(staging_path, self.path)
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except duckdb.Error:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            for candidate in (staging_path, Path(f"{staging_path}.wal")):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+            if not self.path.exists():
+                for directory in created_directories:
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        break
 
     def _connect_continuity_writer(self) -> duckdb.DuckDBPyConnection:
         if self.read_only:
@@ -276,37 +468,19 @@ class MarketStore:
     @staticmethod
     def _continuity_schema_is_valid(connection: duckdb.DuckDBPyConnection) -> bool:
         try:
-            jobs = tuple(
-                (row[1], row[2], row[3], row[5])
-                for row in connection.execute("PRAGMA table_info('repair_jobs')").fetchall()
-            )
-            attempts = tuple(
-                (row[1], row[2], row[3], row[5])
-                for row in connection.execute("PRAGMA table_info('repair_attempts')").fetchall()
-            )
-            constraints = connection.execute(
+            if _continuity_schema_signature(connection) != (
+                _expected_continuity_schema_signature()
+            ):
+                return False
+            rows = connection.execute(
                 """
-                SELECT table_name, constraint_type, constraint_column_names
-                FROM duckdb_constraints()
-                WHERE table_name IN ('repair_jobs', 'repair_attempts')
-                  AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'CHECK')
+                SELECT singleton, schema_version, schema_hash
+                FROM continuity_schema_meta
                 """
             ).fetchall()
         except duckdb.Error:
             return False
-        if jobs != _REPAIR_JOB_SCHEMA or attempts != _REPAIR_ATTEMPT_SCHEMA:
-            return False
-        unique_constraints = {"repair_jobs": set(), "repair_attempts": set()}
-        check_counts = {"repair_jobs": 0, "repair_attempts": 0}
-        for table, constraint_type, columns in constraints:
-            if constraint_type in {"PRIMARY KEY", "UNIQUE"}:
-                unique_constraints[table].add(tuple(columns))
-            elif constraint_type == "CHECK":
-                check_counts[table] += 1
-        return (
-            unique_constraints == _REPAIR_UNIQUE_CONSTRAINTS
-            and check_counts == _REPAIR_CHECK_COUNTS
-        )
+        return rows == [(1, 1, _CONTINUITY_SCHEMA_HASH)]
 
     @classmethod
     def _require_continuity_schema(cls, connection: duckdb.DuckDBPyConnection) -> None:
@@ -318,85 +492,7 @@ class MarketStore:
         connection = self._connect_continuity_writer()
         try:
             connection.begin()
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS repair_jobs (
-                    job_id VARCHAR PRIMARY KEY,
-                    trade_date DATE NOT NULL,
-                    universe_id VARCHAR NOT NULL,
-                    state VARCHAR NOT NULL,
-                    state_version BIGINT NOT NULL,
-                    attempt_count INTEGER NOT NULL,
-                    abandoned_attempt_count INTEGER NOT NULL,
-                    next_attempt_at TIMESTAMPTZ,
-                    lease_id VARCHAR UNIQUE,
-                    lease_owner VARCHAR,
-                    lease_expires_at TIMESTAMPTZ,
-                    last_attempt_id VARCHAR,
-                    last_failure_stage VARCHAR,
-                    last_failure_class VARCHAR,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    published_at TIMESTAMPTZ,
-                    UNIQUE (trade_date, universe_id),
-                    CHECK (state IN (
-                        'pending', 'leased', 'retry_wait', 'published', 'dead_letter'
-                    )),
-                    CHECK (state_version >= 1),
-                    CHECK (attempt_count >= 0),
-                    CHECK (
-                        abandoned_attempt_count >= 0
-                        AND abandoned_attempt_count <= attempt_count
-                    ),
-                    CHECK (
-                        (state = 'leased'
-                         AND lease_id IS NOT NULL
-                         AND lease_owner IS NOT NULL
-                         AND lease_expires_at IS NOT NULL)
-                        OR
-                        (state <> 'leased'
-                         AND lease_id IS NULL
-                         AND lease_owner IS NULL
-                         AND lease_expires_at IS NULL)
-                    ),
-                    CHECK (
-                        (state = 'published' AND published_at IS NOT NULL)
-                        OR (state <> 'published' AND published_at IS NULL)
-                    )
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS repair_attempts (
-                    attempt_id VARCHAR PRIMARY KEY,
-                    job_id VARCHAR NOT NULL,
-                    attempt_number INTEGER NOT NULL,
-                    lease_id VARCHAR NOT NULL UNIQUE,
-                    lease_owner VARCHAR NOT NULL,
-                    outcome VARCHAR NOT NULL,
-                    refresh_run_id VARCHAR,
-                    failure_stage VARCHAR,
-                    failure_class VARCHAR,
-                    retryable BOOLEAN,
-                    started_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ,
-                    UNIQUE (job_id, attempt_number),
-                    CHECK (attempt_number > 0),
-                    CHECK (outcome IN ('running', 'succeeded', 'failed', 'abandoned')),
-                    CHECK (
-                        (outcome = 'running'
-                         AND completed_at IS NULL
-                         AND retryable IS NULL)
-                        OR
-                        (outcome <> 'running'
-                         AND completed_at IS NOT NULL
-                         AND retryable IS NOT NULL)
-                    )
-                )
-                """
-            )
-            self._require_continuity_schema(connection)
+            self._initialize_continuity_schema_on_connection(connection)
             connection.commit()
         except RepairQueueError:
             connection.rollback()
@@ -406,6 +502,23 @@ class MarketStore:
             raise RepairQueueError("repair queue schema migration failed") from None
         finally:
             connection.close()
+
+    @classmethod
+    def _initialize_continuity_schema_on_connection(
+        cls,
+        connection: duckdb.DuckDBPyConnection,
+    ) -> None:
+        for statement in _CONTINUITY_DDL:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO continuity_schema_meta (
+                singleton, schema_version, schema_hash
+            ) VALUES (1, 1, ?)
+            """,
+            [_CONTINUITY_SCHEMA_HASH],
+        )
+        cls._require_continuity_schema(connection)
 
     @staticmethod
     def _repair_job_from_row(row) -> RepairJob:
@@ -445,6 +558,56 @@ class MarketStore:
             started_at=row[10],
             completed_at=row[11],
         )
+
+    @staticmethod
+    def _validated_lease(value: RepairLease) -> RepairLease:
+        if not isinstance(value, RepairLease):
+            raise RepairQueueError("repair lease contract is invalid")
+        try:
+            return RepairLease.model_validate(value.model_dump(mode="python", round_trip=True))
+        except ValidationError as exc:
+            raise RepairQueueError("repair lease contract is invalid") from exc
+
+    @staticmethod
+    def _validated_retry_policy(value: RepairRetryPolicy) -> RepairRetryPolicy:
+        if not isinstance(value, RepairRetryPolicy):
+            raise RepairQueueError("repair retry policy is invalid")
+        try:
+            return RepairRetryPolicy.model_validate(
+                value.model_dump(mode="python", round_trip=True)
+            )
+        except ValidationError as exc:
+            raise RepairQueueError("repair retry policy is invalid") from exc
+
+    @staticmethod
+    def _validated_refresh_result(value: RefreshResult) -> RefreshResult:
+        if not isinstance(value, RefreshResult):
+            raise RepairQueueError("repair refresh result contract is invalid")
+        try:
+            result = RefreshResult.model_validate(value.model_dump(mode="python", round_trip=True))
+        except ValidationError as exc:
+            raise RepairQueueError("repair refresh result contract is invalid") from exc
+        started_at = require_utc(result.started_at)
+        completed_at = require_utc(result.completed_at)
+        if completed_at < started_at:
+            raise RepairQueueError("repair refresh result timestamps are invalid")
+        return result
+
+    @classmethod
+    def _validate_job_attempts_on_connection(
+        cls,
+        connection: duckdb.DuckDBPyConnection,
+        job: RepairJob,
+    ) -> None:
+        attempts = tuple(
+            cls._repair_attempt_from_row(row)
+            for row in connection.execute(
+                f"SELECT {', '.join(_REPAIR_ATTEMPT_COLUMNS)} FROM repair_attempts "
+                "WHERE job_id = ? ORDER BY attempt_number",
+                [job.job_id],
+            ).fetchall()
+        )
+        RepairQueueSnapshot(status="ready", jobs=(job,), attempts=attempts)
 
     def repair_queue_snapshot(self) -> RepairQueueSnapshot:
         """Read queue evidence without creating or migrating any file or table."""
@@ -579,6 +742,8 @@ class MarketStore:
                 connection.rollback()
                 return None
             job = self._repair_job_from_row(row)
+            if timestamp < job.created_at or timestamp < job.updated_at:
+                raise RepairQueueError("repair queue claim time is invalid")
             eligible = (
                 job.state in {"pending", "retry_wait"}
                 and job.state_version == expected_version
@@ -589,7 +754,7 @@ class MarketStore:
                 return None
             attempt_number = job.attempt_count + 1
             updated = connection.execute(
-                """
+                f"""
                 UPDATE repair_jobs
                 SET state = 'leased', state_version = state_version + 1,
                     attempt_count = ?, next_attempt_at = NULL,
@@ -599,7 +764,7 @@ class MarketStore:
                   AND state_version = ?
                   AND state IN ('pending', 'retry_wait')
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                RETURNING state_version
+                RETURNING {", ".join(_REPAIR_JOB_COLUMNS)}
                 """,
                 [
                     attempt_number,
@@ -625,15 +790,17 @@ class MarketStore:
                 """,
                 [attempt_id, job_id, attempt_number, lease_id, owner, timestamp],
             )
+            claimed_job = self._repair_job_from_row(updated)
             result = RepairLease(
                 job_id=job_id,
                 attempt_id=attempt_id,
                 lease_id=lease_id,
                 owner=owner,
                 target_session=job.trade_date,
-                state_version=updated[0],
+                state_version=claimed_job.state_version,
                 expires_at=expires_at,
             )
+            self._validate_job_attempts_on_connection(connection, claimed_job)
             connection.commit()
             return result
         except RepairQueueError:
@@ -655,12 +822,9 @@ class MarketStore:
         retry_policy: RepairRetryPolicy,
     ) -> RepairJob:
         """CAS one terminal attempt while the caller owns market-refresh.lock."""
-        if (
-            not isinstance(lease, RepairLease)
-            or not isinstance(refresh_result, RefreshResult)
-            or not isinstance(retry_policy, RepairRetryPolicy)
-        ):
-            raise RepairQueueError("repair queue finalization contract is invalid")
+        lease = self._validated_lease(lease)
+        refresh_result = self._validated_refresh_result(refresh_result)
+        retry_policy = self._validated_retry_policy(retry_policy)
         if outcome not in {"succeeded", "failed"}:
             raise RepairQueueError("repair queue finalization outcome is invalid")
         timestamp = require_utc(now)
@@ -717,19 +881,41 @@ class MarketStore:
             if row is None:
                 raise RepairQueueConflictError("repair queue lease no longer matches")
             job = self._repair_job_from_row(row)
+            attempt_row = connection.execute(
+                f"SELECT {', '.join(_REPAIR_ATTEMPT_COLUMNS)} FROM repair_attempts "
+                "WHERE attempt_id = ? AND job_id = ? AND lease_id = ? "
+                "AND lease_owner = ? AND outcome = 'running'",
+                [lease.attempt_id, lease.job_id, lease.lease_id, lease.owner],
+            ).fetchone()
+            if attempt_row is None:
+                raise RepairQueueConflictError("repair queue attempt no longer matches")
+            attempt = self._repair_attempt_from_row(attempt_row)
+            if (
+                job.trade_date != lease.target_session
+                or refresh_result.requested_date != job.trade_date
+            ):
+                raise RepairQueueError("repair target does not match database job")
+            if (
+                timestamp < job.created_at
+                or timestamp < job.updated_at
+                or timestamp < attempt.started_at
+            ):
+                raise RepairQueueError("repair queue finalization time is invalid")
+            if outcome == "succeeded" and refresh_result.request_key != job.job_id:
+                raise RepairQueueError("repair publication request key does not match job")
             if outcome == "failed":
                 if retryable and job.attempt_count < retry_policy.max_attempts:
                     next_attempt_at = timestamp + retry_policy.delay_after(job.attempt_count)
                 else:
                     next_state = "dead_letter"
             attempt_updated = connection.execute(
-                """
+                f"""
                 UPDATE repair_attempts
                 SET outcome = ?, refresh_run_id = ?, failure_stage = ?,
                     failure_class = ?, retryable = ?, completed_at = ?
                 WHERE attempt_id = ? AND job_id = ? AND lease_id = ?
                   AND lease_owner = ? AND outcome = 'running'
-                RETURNING attempt_id
+                RETURNING {", ".join(_REPAIR_ATTEMPT_COLUMNS)}
                 """,
                 [
                     attempt_outcome,
@@ -746,6 +932,7 @@ class MarketStore:
             ).fetchone()
             if attempt_updated is None:
                 raise RepairQueueConflictError("repair queue attempt no longer matches")
+            terminal_attempt = self._repair_attempt_from_row(attempt_updated)
             updated_row = connection.execute(
                 f"""
                 UPDATE repair_jobs
@@ -777,6 +964,9 @@ class MarketStore:
             if updated_row is None:
                 raise RepairQueueConflictError("repair queue lease no longer matches")
             result = self._repair_job_from_row(updated_row)
+            self._validate_job_attempts_on_connection(connection, result)
+            if terminal_attempt.attempt_id != result.last_attempt_id:
+                raise RepairQueueError("repair queue terminal attempt is inconsistent")
             connection.commit()
             return result
         except (RepairQueueConflictError, RepairQueueError):
@@ -796,8 +986,7 @@ class MarketStore:
     ) -> list[RepairJob]:
         """Audit expired leases while the caller owns market-refresh.lock."""
         timestamp = require_utc(now)
-        if not isinstance(retry_policy, RepairRetryPolicy):
-            raise RepairQueueError("repair retry policy is invalid")
+        retry_policy = self._validated_retry_policy(retry_policy)
         connection = self._connect_continuity_writer()
         recovered: list[RepairJob] = []
         try:
@@ -812,6 +1001,21 @@ class MarketStore:
                 job = self._repair_job_from_row(row)
                 if job.lease_id is None or job.lease_owner is None or job.last_attempt_id is None:
                     raise RepairQueueError("expired repair lease is invalid")
+                attempt_row = connection.execute(
+                    f"SELECT {', '.join(_REPAIR_ATTEMPT_COLUMNS)} FROM repair_attempts "
+                    "WHERE attempt_id = ? AND job_id = ? AND lease_id = ? "
+                    "AND lease_owner = ? AND outcome = 'running'",
+                    [job.last_attempt_id, job.job_id, job.lease_id, job.lease_owner],
+                ).fetchone()
+                if attempt_row is None:
+                    raise RepairQueueConflictError("expired repair attempt no longer matches")
+                attempt = self._repair_attempt_from_row(attempt_row)
+                if (
+                    timestamp < job.created_at
+                    or timestamp < job.updated_at
+                    or timestamp < attempt.started_at
+                ):
+                    raise RepairQueueError("expired repair lease time is invalid")
                 next_state = (
                     "retry_wait" if job.attempt_count < retry_policy.max_attempts else "dead_letter"
                 )
@@ -821,12 +1025,12 @@ class MarketStore:
                     else None
                 )
                 attempt_updated = connection.execute(
-                    """
+                    f"""
                     UPDATE repair_attempts
                     SET outcome = 'abandoned', retryable = TRUE, completed_at = ?
                     WHERE attempt_id = ? AND job_id = ? AND lease_id = ?
                       AND lease_owner = ? AND outcome = 'running'
-                    RETURNING attempt_id
+                    RETURNING {", ".join(_REPAIR_ATTEMPT_COLUMNS)}
                     """,
                     [
                         timestamp,
@@ -838,6 +1042,7 @@ class MarketStore:
                 ).fetchone()
                 if attempt_updated is None:
                     raise RepairQueueConflictError("expired repair attempt no longer matches")
+                terminal_attempt = self._repair_attempt_from_row(attempt_updated)
                 updated_row = connection.execute(
                     f"""
                     UPDATE repair_jobs
@@ -864,7 +1069,11 @@ class MarketStore:
                 ).fetchone()
                 if updated_row is None:
                     raise RepairQueueConflictError("expired repair lease no longer matches")
-                recovered.append(self._repair_job_from_row(updated_row))
+                recovered_job = self._repair_job_from_row(updated_row)
+                self._validate_job_attempts_on_connection(connection, recovered_job)
+                if terminal_attempt.attempt_id != recovered_job.last_attempt_id:
+                    raise RepairQueueError("expired repair attempt is inconsistent")
+                recovered.append(recovered_job)
             connection.commit()
             return recovered
         except (RepairQueueConflictError, RepairQueueError):
@@ -905,6 +1114,9 @@ class MarketStore:
             ).fetchall()
             for row in rows:
                 job = self._repair_job_from_row(row)
+                if timestamp < job.created_at or timestamp < job.updated_at:
+                    raise RepairQueueError("repair reconciliation time is invalid")
+                terminal_attempt: RepairAttempt | None = None
                 if job.state == "leased":
                     if (
                         job.lease_id is None
@@ -912,14 +1124,25 @@ class MarketStore:
                         or job.last_attempt_id is None
                     ):
                         raise RepairQueueError("leased repair job is invalid")
+                    attempt_row = connection.execute(
+                        f"SELECT {', '.join(_REPAIR_ATTEMPT_COLUMNS)} FROM repair_attempts "
+                        "WHERE attempt_id = ? AND job_id = ? AND lease_id = ? "
+                        "AND lease_owner = ? AND outcome = 'running'",
+                        [job.last_attempt_id, job.job_id, job.lease_id, job.lease_owner],
+                    ).fetchone()
+                    if attempt_row is None:
+                        raise RepairQueueConflictError("repair queue attempt no longer matches")
+                    attempt = self._repair_attempt_from_row(attempt_row)
+                    if timestamp < attempt.started_at:
+                        raise RepairQueueError("repair reconciliation time is invalid")
                     attempt_updated = connection.execute(
-                        """
+                        f"""
                         UPDATE repair_attempts
                         SET outcome = 'succeeded', failure_stage = NULL,
                             failure_class = NULL, retryable = FALSE, completed_at = ?
                         WHERE attempt_id = ? AND job_id = ? AND lease_id = ?
                           AND lease_owner = ? AND outcome = 'running'
-                        RETURNING attempt_id
+                        RETURNING {", ".join(_REPAIR_ATTEMPT_COLUMNS)}
                         """,
                         [
                             timestamp,
@@ -931,6 +1154,7 @@ class MarketStore:
                     ).fetchone()
                     if attempt_updated is None:
                         raise RepairQueueConflictError("repair queue attempt no longer matches")
+                    terminal_attempt = self._repair_attempt_from_row(attempt_updated)
                 updated_row = connection.execute(
                     f"""
                     UPDATE repair_jobs
@@ -957,7 +1181,14 @@ class MarketStore:
                 ).fetchone()
                 if updated_row is None:
                     raise RepairQueueConflictError("repair queue state no longer matches")
-                reconciled.append(self._repair_job_from_row(updated_row))
+                reconciled_job = self._repair_job_from_row(updated_row)
+                self._validate_job_attempts_on_connection(connection, reconciled_job)
+                if (
+                    terminal_attempt is not None
+                    and terminal_attempt.attempt_id != reconciled_job.last_attempt_id
+                ):
+                    raise RepairQueueError("repair reconciliation attempt is inconsistent")
+                reconciled.append(reconciled_job)
             connection.commit()
             return reconciled
         except (RepairQueueConflictError, RepairQueueError):

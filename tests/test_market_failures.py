@@ -372,7 +372,7 @@ def test_market_schema_migration_cli_sanitizes_failure_output(
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(
         MarketStore,
-        "initialize_schema",
+        "_initialize_continuity_schema_on_connection",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
     )
     monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
