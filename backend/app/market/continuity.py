@@ -31,6 +31,22 @@ ContinuityUnavailableReason = Literal[
     "IMMUTABLE_OBJECT_INVALID",
 ]
 ContinuityInventoryMode = Literal["immutable_dataset", "local_mutable"]
+ContinuityLane = Literal["freshness", "repair"]
+ContinuityAction = Literal["run", "wait", "none"]
+ContinuityDecisionReason = Literal[
+    "FRESHNESS_DUE",
+    "FRESHNESS_WAIT",
+    "REPAIR_READY",
+    "REPAIR_DISABLED",
+    "CONTROL_STATE_UNAVAILABLE",
+    "NO_ELIGIBLE_REPAIR",
+    "CALENDAR_UNAVAILABLE",
+    "PROVIDER_HEALTH_UNAVAILABLE",
+    "PROVIDER_NOT_CLOSED",
+    "REPAIR_CLAIMED",
+    "ALREADY_RUNNING",
+    "REPAIR_CONSUMER_FAILED",
+]
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _R2F1_UNIVERSE_ID = "all-main-board"
@@ -104,6 +120,50 @@ class ContinuityUnavailable(BaseModel):
     reason_code: ContinuityUnavailableReason
     writes_control_state: Literal[False] = False
     provider_requests: Literal[0] = 0
+
+
+class ContinuityDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: ContinuityAction
+    lane: ContinuityLane | None
+    target_session: date | None
+    repair_job_id: str | None = None
+    next_run_at: datetime | None = None
+    reason_code: ContinuityDecisionReason
+    provider_requests: Literal[0] = 0
+
+    @field_validator("repair_job_id")
+    @classmethod
+    def safe_repair_job_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return require_safe_identifier(value)
+        except RepairQueueError as exc:
+            raise ValueError("repair decision identifier is invalid") from exc
+
+    @field_validator("next_run_at")
+    @classmethod
+    def aware_next_run_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("continuity decision timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def valid_decision_shape(self) -> "ContinuityDecision":
+        if self.lane == "repair":
+            if self.target_session is None or self.repair_job_id is None:
+                raise ValueError("repair decision requires a target job")
+            if self.repair_job_id != repair_job_id(self.target_session, _R2F1_UNIVERSE_ID):
+                raise ValueError("repair decision target does not match job identity")
+        elif self.repair_job_id is not None:
+            raise ValueError("only a repair decision may carry a repair job")
+        if self.action == "run" and (self.lane is None or self.target_session is None):
+            raise ValueError("run decision requires a lane and target")
+        return self
 
 
 ContinuityEnqueueStatus = Literal[
@@ -797,3 +857,288 @@ class RepairQueueSnapshot(BaseModel):
                     ):
                         raise ValueError("running repair attempt is orphaned")
         return self
+
+
+class FreshnessDecision(Protocol):
+    action: str
+    target_session: date | None
+    refresh_state: str
+    next_run_at: datetime | None
+
+
+class RepairClaimStore(Protocol):
+    def repair_queue_snapshot(self) -> RepairQueueSnapshot: ...
+
+    def claim_repair_job(
+        self,
+        job_id: str,
+        *,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+        lease_seconds: int,
+    ) -> RepairLease | None: ...
+
+
+class ProviderHealthReader(Protocol):
+    def provider_health(self) -> object: ...
+
+
+class ContinuityPolicy:
+    """Wrap the existing freshness decision without reproducing its slot policy."""
+
+    def decide(
+        self,
+        *,
+        freshness: FreshnessDecision,
+        jobs: tuple[RepairJob, ...] | None,
+        repair_enabled: bool,
+        now: datetime,
+    ) -> ContinuityDecision:
+        timestamp = require_utc(now)
+        target = freshness.target_session
+        if target is None:
+            return ContinuityDecision(
+                action="none",
+                lane="freshness",
+                target_session=None,
+                reason_code="CALENDAR_UNAVAILABLE",
+            )
+        if freshness.action == "run":
+            return ContinuityDecision(
+                action="run",
+                lane="freshness",
+                target_session=target,
+                next_run_at=freshness.next_run_at,
+                reason_code="FRESHNESS_DUE",
+            )
+        if not repair_enabled:
+            return ContinuityDecision(
+                action=freshness.action,
+                lane="freshness",
+                target_session=target,
+                next_run_at=freshness.next_run_at,
+                reason_code="REPAIR_DISABLED",
+            )
+        can_repair = freshness.action == "none" and freshness.refresh_state == "success"
+        can_repair = can_repair or (
+            freshness.action == "wait"
+            and freshness.refresh_state == "retry_wait"
+            and freshness.next_run_at is not None
+            and require_utc(freshness.next_run_at) > timestamp
+        )
+        if not can_repair:
+            return ContinuityDecision(
+                action=freshness.action,
+                lane="freshness",
+                target_session=target,
+                next_run_at=freshness.next_run_at,
+                reason_code="FRESHNESS_WAIT",
+            )
+        if jobs is None:
+            return ContinuityDecision(
+                action=freshness.action,
+                lane="freshness",
+                target_session=target,
+                next_run_at=freshness.next_run_at,
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        validated = tuple(RepairJob.model_validate(item.model_dump(mode="python")) for item in jobs)
+        eligible = tuple(
+            sorted(
+                (
+                    job
+                    for job in validated
+                    if job.trade_date < target
+                    and (
+                        job.state == "pending"
+                        or (
+                            job.state == "retry_wait"
+                            and job.next_attempt_at is not None
+                            and job.next_attempt_at <= timestamp
+                        )
+                    )
+                ),
+                key=lambda job: (job.trade_date, job.job_id),
+            )
+        )
+        if not eligible:
+            return ContinuityDecision(
+                action=freshness.action,
+                lane="freshness",
+                target_session=target,
+                next_run_at=freshness.next_run_at,
+                reason_code="NO_ELIGIBLE_REPAIR",
+            )
+        selected = eligible[0]
+        return ContinuityDecision(
+            action="run",
+            lane="repair",
+            target_session=selected.trade_date,
+            repair_job_id=selected.job_id,
+            next_run_at=freshness.next_run_at,
+            reason_code="REPAIR_READY",
+        )
+
+
+class RepairClaimCoordinator:
+    """Revalidate and synchronously hand one claimed repair lease to its owner."""
+
+    def __init__(
+        self,
+        *,
+        store: RepairClaimStore,
+        health_store: ProviderHealthReader,
+        lock_path: Path,
+        owner: str,
+        lease_seconds: int,
+        provider_factory=None,
+        policy: ContinuityPolicy | None = None,
+    ) -> None:
+        self._store = store
+        self._health_store = health_store
+        self._lock_path = lock_path
+        self._owner = require_safe_identifier(owner)
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 60 <= lease_seconds <= 86400
+        ):
+            raise RepairQueueError("repair claim lease policy is invalid")
+        self._lease_seconds = lease_seconds
+        self._provider_factory = provider_factory
+        self._policy = policy or ContinuityPolicy()
+
+    def claim_ready_once(
+        self,
+        *,
+        freshness: FreshnessDecision,
+        latest_expected_session: date,
+        repair_enabled: bool,
+        now: datetime,
+        revalidator: Callable[[], FreshnessDecision],
+        lease_consumer: Callable[[RepairLease], object] | None,
+    ) -> ContinuityDecision:
+        timestamp = require_utc(now)
+        initial = self._decision(freshness, repair_enabled, timestamp)
+        if initial.action != "run" or initial.lane != "repair":
+            return initial
+        if (
+            freshness.target_session != latest_expected_session
+            or initial.target_session is None
+            or initial.target_session >= latest_expected_session
+        ):
+            return self._freshness_wait(freshness, "NO_ELIGIBLE_REPAIR")
+        if not self._health_is_closed():
+            return self._repair_wait(initial, "PROVIDER_HEALTH_UNAVAILABLE")
+        if lease_consumer is None:
+            return initial
+
+        try:
+            from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
+        except Exception:
+            return self._repair_wait(initial, "CONTROL_STATE_UNAVAILABLE")
+
+        try:
+            with RefreshRunLock(self._lock_path):
+                refreshed_freshness = revalidator()
+                refreshed = self._decision(refreshed_freshness, repair_enabled, timestamp)
+                if refreshed.action != "run" or refreshed.lane != "repair":
+                    return refreshed
+                if (
+                    refreshed.target_session is None
+                    or refreshed.target_session >= refreshed_freshness.target_session
+                ):
+                    return self._freshness_wait(
+                        refreshed_freshness,
+                        "NO_ELIGIBLE_REPAIR",
+                    )
+                if not self._health_is_closed():
+                    return self._repair_wait(refreshed, "PROVIDER_NOT_CLOSED")
+                snapshot = self._store.repair_queue_snapshot()
+                refreshed = self._policy.decide(
+                    freshness=refreshed_freshness,
+                    jobs=snapshot.jobs if snapshot.status == "ready" else None,
+                    repair_enabled=repair_enabled,
+                    now=timestamp,
+                )
+                if refreshed.action != "run" or refreshed.lane != "repair":
+                    return refreshed
+                job = next(
+                    (item for item in snapshot.jobs if item.job_id == refreshed.repair_job_id),
+                    None,
+                )
+                if snapshot.status != "ready" or job is None:
+                    return self._repair_wait(refreshed, "CONTROL_STATE_UNAVAILABLE")
+                lease = self._store.claim_repair_job(
+                    job.job_id,
+                    owner=self._owner,
+                    expected_version=job.state_version,
+                    now=timestamp,
+                    lease_seconds=self._lease_seconds,
+                )
+                if lease is None:
+                    return self._repair_wait(refreshed, "NO_ELIGIBLE_REPAIR")
+                try:
+                    lease_consumer(lease)
+                except Exception:
+                    return self._repair_wait(refreshed, "REPAIR_CONSUMER_FAILED")
+                return self._replace_decision(refreshed, reason_code="REPAIR_CLAIMED")
+        except RefreshAlreadyRunning:
+            return self._repair_wait(initial, "ALREADY_RUNNING")
+        except Exception:
+            return self._repair_wait(initial, "CONTROL_STATE_UNAVAILABLE")
+
+    def _decision(
+        self,
+        freshness: FreshnessDecision,
+        repair_enabled: bool,
+        now: datetime,
+    ) -> ContinuityDecision:
+        snapshot = self._store.repair_queue_snapshot()
+        return self._policy.decide(
+            freshness=freshness,
+            jobs=snapshot.jobs if snapshot.status == "ready" else None,
+            repair_enabled=repair_enabled,
+            now=now,
+        )
+
+    def _health_is_closed(self) -> bool:
+        try:
+            health = self._health_store.provider_health()
+        except Exception:
+            return False
+        return getattr(health, "state", None) == "CLOSED"
+
+    @staticmethod
+    def _repair_wait(
+        decision: ContinuityDecision,
+        reason: ContinuityDecisionReason,
+    ) -> ContinuityDecision:
+        return RepairClaimCoordinator._replace_decision(
+            decision,
+            action="wait",
+            reason_code=reason,
+        )
+
+    @staticmethod
+    def _replace_decision(
+        decision: ContinuityDecision,
+        **updates: object,
+    ) -> ContinuityDecision:
+        payload = decision.model_dump(mode="python")
+        payload.update(updates)
+        return ContinuityDecision.model_validate(payload)
+
+    @staticmethod
+    def _freshness_wait(
+        freshness: FreshnessDecision,
+        reason: ContinuityDecisionReason,
+    ) -> ContinuityDecision:
+        return ContinuityDecision(
+            action=freshness.action,
+            lane="freshness",
+            target_session=freshness.target_session,
+            next_run_at=freshness.next_run_at,
+            reason_code=reason,
+        )

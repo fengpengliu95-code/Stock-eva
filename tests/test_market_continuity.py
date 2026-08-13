@@ -14,6 +14,7 @@ from backend.app.config import Settings
 from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
 from backend.app.market.calendar import CalendarConfig, TradingCalendar
 from backend.app.market.models import DailyBar, RefreshResult
+from backend.app.market.provider_health import ProviderHealthError
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import NasMarketStore
 from backend.app.storage.models import VerifiedReadySessionInventory
@@ -3015,3 +3016,590 @@ def test_enqueue_lock_boundary_does_not_swallow_base_exceptions(
             configured_start=session,
             latest_completed_session=session,
         )
+
+
+def continuity_policy_job(
+    trade_date: date,
+    *,
+    state: str = "pending",
+    next_attempt_at: datetime | None = None,
+) -> object:
+    module = continuity_module()
+    attempted = state != "pending"
+    return module.RepairJob(
+        job_id=f"repair:{trade_date}:{UNIVERSE_ID}",
+        trade_date=trade_date,
+        universe_id=UNIVERSE_ID,
+        state=state,
+        state_version=2 if attempted else 1,
+        attempt_count=1 if attempted else 0,
+        abandoned_attempt_count=0,
+        next_attempt_at=next_attempt_at,
+        last_attempt_id="attempt-1" if attempted else None,
+        last_failure_stage="fetch" if attempted else None,
+        last_failure_class="transport_timeout" if attempted else None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("freshness", "jobs", "enabled", "expected"),
+    [
+        (
+            {
+                "action": "run",
+                "target_session": date(2026, 8, 13),
+                "refresh_state": "running",
+            },
+            (date(2026, 8, 3),),
+            True,
+            ("run", "freshness", date(2026, 8, 13), None, "FRESHNESS_DUE"),
+        ),
+        (
+            {
+                "action": "none",
+                "target_session": date(2026, 8, 13),
+                "refresh_state": "success",
+            },
+            (date(2026, 8, 3), date(2026, 8, 4), date(2026, 8, 5)),
+            True,
+            (
+                "run",
+                "repair",
+                date(2026, 8, 3),
+                f"repair:2026-08-03:{UNIVERSE_ID}",
+                "REPAIR_READY",
+            ),
+        ),
+        (
+            {
+                "action": "wait",
+                "target_session": date(2026, 8, 13),
+                "refresh_state": "retry_wait",
+                "next_run_at": NOW + timedelta(hours=1),
+            },
+            (date(2026, 8, 3),),
+            True,
+            (
+                "run",
+                "repair",
+                date(2026, 8, 3),
+                f"repair:2026-08-03:{UNIVERSE_ID}",
+                "REPAIR_READY",
+            ),
+        ),
+        (
+            {
+                "action": "run",
+                "target_session": date(2026, 8, 13),
+                "refresh_state": "running",
+            },
+            (date(2026, 8, 3),),
+            False,
+            ("run", "freshness", date(2026, 8, 13), None, "FRESHNESS_DUE"),
+        ),
+        (
+            {
+                "action": "none",
+                "target_session": date(2026, 8, 13),
+                "refresh_state": "success",
+            },
+            (date(2026, 8, 3),),
+            False,
+            ("none", "freshness", date(2026, 8, 13), None, "REPAIR_DISABLED"),
+        ),
+    ],
+)
+def test_continuity_policy_preserves_freshness_priority_and_selects_oldest_repair(
+    freshness: dict[str, object],
+    jobs: tuple[date, ...],
+    enabled: bool,
+    expected: tuple[object, ...],
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    decision = module.ContinuityPolicy().decide(
+        freshness=automation.ScheduleDecision(**freshness),
+        jobs=tuple(continuity_policy_job(item) for item in reversed(jobs)),
+        repair_enabled=enabled,
+        now=NOW,
+    )
+
+    assert (
+        decision.action,
+        decision.lane,
+        decision.target_session,
+        decision.repair_job_id,
+        decision.reason_code,
+    ) == expected
+    assert decision.provider_requests == 0
+
+
+def test_continuity_policy_retry_due_uses_existing_freshness_decision_without_retry_copy() -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    retry_slot = NOW
+    decision = module.ContinuityPolicy().decide(
+        freshness=automation.ScheduleDecision(
+            action="run",
+            target_session=date(2026, 8, 13),
+            refresh_state="running",
+        ),
+        jobs=(continuity_policy_job(date(2026, 8, 3)),),
+        repair_enabled=True,
+        now=retry_slot,
+    )
+
+    assert decision.action == "run"
+    assert decision.lane == "freshness"
+    assert decision.reason_code == "FRESHNESS_DUE"
+    assert "RETRY_TIMES" not in vars(module.ContinuityPolicy)
+
+
+def test_continuity_policy_excludes_latest_until_calendar_advances_and_skips_dead_letter() -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    policy = module.ContinuityPolicy()
+    same_day = continuity_policy_job(date(2026, 8, 13))
+    dead = continuity_policy_job(date(2026, 8, 3), state="dead_letter")
+    pending = continuity_policy_job(date(2026, 8, 4))
+
+    current = policy.decide(
+        freshness=automation.ScheduleDecision(
+            action="none",
+            target_session=date(2026, 8, 13),
+            refresh_state="success",
+        ),
+        jobs=(dead, same_day, pending),
+        repair_enabled=True,
+        now=NOW,
+    )
+    advanced = policy.decide(
+        freshness=automation.ScheduleDecision(
+            action="none",
+            target_session=date(2026, 8, 14),
+            refresh_state="success",
+        ),
+        jobs=(same_day,),
+        repair_enabled=True,
+        now=NOW,
+    )
+
+    assert current.target_session == date(2026, 8, 4)
+    assert current.repair_job_id == pending.job_id
+    assert advanced.target_session == date(2026, 8, 13)
+    assert advanced.repair_job_id == same_day.job_id
+
+
+def test_continuity_policy_retry_eligibility_queue_unavailable_and_no_job_are_typed() -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    policy = module.ContinuityPolicy()
+    freshness = automation.ScheduleDecision(
+        action="wait",
+        target_session=date(2026, 8, 13),
+        refresh_state="retry_wait",
+        next_run_at=NOW + timedelta(hours=1),
+    )
+    future_job = continuity_policy_job(
+        date(2026, 8, 3),
+        state="retry_wait",
+        next_attempt_at=NOW + timedelta(hours=2),
+    )
+
+    unavailable = policy.decide(
+        freshness=freshness,
+        jobs=None,
+        repair_enabled=True,
+        now=NOW,
+    )
+    no_eligible = policy.decide(
+        freshness=freshness,
+        jobs=(future_job,),
+        repair_enabled=True,
+        now=NOW,
+    )
+
+    assert unavailable.action == no_eligible.action == "wait"
+    assert unavailable.lane == no_eligible.lane == "freshness"
+    assert unavailable.next_run_at == no_eligible.next_run_at == freshness.next_run_at
+    assert unavailable.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert no_eligible.reason_code == "NO_ELIGIBLE_REPAIR"
+
+
+def test_continuity_decision_contract_is_frozen_allowlisted_and_consistent() -> None:
+    module = continuity_module()
+    valid = module.ContinuityDecision(
+        action="run",
+        lane="repair",
+        target_session=date(2026, 8, 3),
+        repair_job_id=f"repair:2026-08-03:{UNIVERSE_ID}",
+        reason_code="REPAIR_READY",
+    )
+
+    assert set(valid.model_dump()) == {
+        "action",
+        "lane",
+        "target_session",
+        "repair_job_id",
+        "next_run_at",
+        "reason_code",
+        "provider_requests",
+    }
+    with pytest.raises(ValidationError, match="frozen"):
+        valid.action = "none"
+    with pytest.raises(ValidationError):
+        module.ContinuityDecision(**valid.model_dump(), payload="secret")
+    with pytest.raises(ValidationError):
+        module.ContinuityDecision(
+            action="run",
+            lane="repair",
+            target_session=date(2026, 8, 3),
+            repair_job_id="/private/job",
+            reason_code="REPAIR_READY",
+        )
+    with pytest.raises(ValidationError):
+        module.ContinuityDecision(
+            action="run",
+            lane="freshness",
+            target_session=date(2026, 8, 13),
+            repair_job_id=f"repair:2026-08-03:{UNIVERSE_ID}",
+            reason_code="FRESHNESS_DUE",
+        )
+
+
+class RecordingHealthGate:
+    def __init__(self, *states: object) -> None:
+        self.states = list(states)
+        self.calls = 0
+        self.acquire_probe_calls = 0
+        self.resolve_probe_calls = 0
+
+    def provider_health(self):
+        self.calls += 1
+        state = self.states[min(self.calls - 1, len(self.states) - 1)]
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    def acquire_probe(self, *args, **kwargs):
+        self.acquire_probe_calls += 1
+        raise AssertionError("repair claim must not acquire a provider probe")
+
+    def resolve_probe(self, *args, **kwargs):
+        self.resolve_probe_calls += 1
+        raise AssertionError("repair claim must not resolve a provider probe")
+
+
+def circuit_health(state: str):
+    module = importlib.import_module("backend.app.market.provider_health")
+    return module.ProviderHealth(
+        state=module.CircuitState(state),
+        endpoints=(),
+        blocking_endpoints=(),
+        probe_endpoints=(),
+    )
+
+
+@pytest.mark.parametrize("blocked", ["OPEN", "HALF_OPEN", "unavailable"])
+def test_repair_claim_health_gate_blocks_without_claim_attempt_or_probe(
+    tmp_path: Path,
+    blocked: str,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    path = tmp_path / "market.duckdb"
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 3))[0]
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+    health = RecordingHealthGate(
+        ProviderHealthError("token=secret /private/provider-health.db")
+        if blocked == "unavailable"
+        else circuit_health(blocked)
+    )
+    provider_calls = 0
+
+    def reject_provider() -> None:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("Task4 must not construct or call a provider")
+
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+        provider_factory=reject_provider,
+    )
+    before = store.repair_queue_snapshot()
+
+    result = coordinator.claim_ready_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: freshness,
+        lease_consumer=lambda lease: pytest.fail("blocked repair cannot produce a lease"),
+    )
+
+    assert result.action == "wait"
+    assert result.lane == "repair"
+    assert result.target_session == job.trade_date
+    assert result.reason_code == "PROVIDER_HEALTH_UNAVAILABLE"
+    assert store.repair_queue_snapshot() == before
+    assert health.calls == 1
+    assert health.acquire_probe_calls == health.resolve_probe_calls == 0
+    assert provider_calls == 0
+
+
+def test_repair_claim_rechecks_health_under_lock_and_only_consumer_owns_lease(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(store, lock_path)
+    job = enqueue(store, lock_path, date(2026, 8, 3))[0]
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("OPEN"))
+    consumed = []
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+
+    decision = coordinator.claim_ready_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: freshness,
+        lease_consumer=consumed.append,
+    )
+
+    assert decision.action == "wait"
+    assert decision.reason_code == "PROVIDER_NOT_CLOSED"
+    assert consumed == []
+    snapshot = store.repair_queue_snapshot()
+    assert snapshot.jobs[0] == job
+    assert snapshot.attempts == ()
+    assert health.calls == 2
+
+
+def test_repair_claim_closed_claims_exactly_oldest_one_and_hands_it_to_consumer(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(store, lock_path)
+    jobs = enqueue(
+        store,
+        lock_path,
+        date(2026, 8, 5),
+        date(2026, 8, 3),
+        date(2026, 8, 4),
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    consumed = []
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+
+    decision = coordinator.claim_ready_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: freshness,
+        lease_consumer=consumed.append,
+    )
+
+    assert decision.action == "run"
+    assert decision.lane == "repair"
+    assert decision.target_session == date(2026, 8, 3)
+    assert decision.reason_code == "REPAIR_CLAIMED"
+    assert len(consumed) == 1
+    assert consumed[0].job_id == f"repair:2026-08-03:{UNIVERSE_ID}"
+    snapshot = store.repair_queue_snapshot()
+    assert sum(job.state == "leased" for job in snapshot.jobs) == 1
+    assert len(snapshot.attempts) == 1
+    assert snapshot.attempts[0].outcome == "running"
+    assert {job.trade_date for job in jobs if job.state == "pending"} == {
+        date(2026, 8, 3),
+        date(2026, 8, 4),
+        date(2026, 8, 5),
+    }
+
+
+def test_repair_claim_without_consumer_never_leases_or_mutates(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(store, lock_path)
+    enqueue(store, lock_path, date(2026, 8, 3))
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"))
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    before = store.repair_queue_snapshot()
+
+    decision = coordinator.claim_ready_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: freshness,
+        lease_consumer=None,
+    )
+
+    assert decision.action == "run"
+    assert decision.reason_code == "REPAIR_READY"
+    assert store.repair_queue_snapshot() == before
+    assert health.calls == 1
+
+
+def test_repair_claim_consumer_failure_is_sanitized_and_left_for_stale_recovery(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(store, lock_path)
+    enqueue(store, lock_path, date(2026, 8, 3))
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    provider_calls = 0
+
+    def reject_provider() -> None:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("Task4 cannot construct a repair provider")
+
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+        provider_factory=reject_provider,
+    )
+
+    decision = coordinator.claim_ready_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: freshness,
+        lease_consumer=lambda lease: (_ for _ in ()).throw(
+            RuntimeError("token=secret /private/provider")
+        ),
+    )
+
+    snapshot = store.repair_queue_snapshot()
+    assert decision.action == "wait"
+    assert decision.reason_code == "REPAIR_CONSUMER_FAILED"
+    assert snapshot.jobs[0].state == "leased"
+    assert snapshot.attempts[0].outcome == "running"
+    assert provider_calls == 0
+    assert health.acquire_probe_calls == health.resolve_probe_calls == 0
+    assert not {"payload", "token", "url", "path", "exception", "error"} & set(
+        decision.model_dump(mode="json")
+    )
+
+
+def test_repair_claim_busy_lock_and_freshness_change_leave_queue_unchanged(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(store, lock_path)
+    enqueue(store, lock_path, date(2026, 8, 3))
+    waiting = automation.ScheduleDecision(
+        action="wait",
+        target_session=date(2026, 8, 13),
+        refresh_state="retry_wait",
+        next_run_at=NOW + timedelta(hours=1),
+    )
+    due = automation.ScheduleDecision(
+        action="run",
+        target_session=date(2026, 8, 13),
+        refresh_state="running",
+    )
+    coordinator = module.RepairClaimCoordinator(
+        store=store,
+        health_store=RecordingHealthGate(circuit_health("CLOSED")),
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    before = store.repair_queue_snapshot()
+
+    changed = coordinator.claim_ready_once(
+        freshness=waiting,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        now=NOW,
+        revalidator=lambda: due,
+        lease_consumer=lambda lease: pytest.fail("freshness due must not claim"),
+    )
+    with RefreshRunLock(lock_path):
+        busy = coordinator.claim_ready_once(
+            freshness=waiting,
+            latest_expected_session=date(2026, 8, 13),
+            repair_enabled=True,
+            now=NOW,
+            revalidator=lambda: waiting,
+            lease_consumer=lambda lease: pytest.fail("busy lock must not claim"),
+        )
+
+    assert changed.lane == "freshness"
+    assert changed.reason_code == "FRESHNESS_DUE"
+    assert busy.action == "wait"
+    assert busy.reason_code == "ALREADY_RUNNING"
+    assert store.repair_queue_snapshot() == before

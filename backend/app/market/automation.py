@@ -141,6 +141,19 @@ class ProviderProbeRunner(Protocol):
     def run(self, endpoint: ProviderEndpoint, *, trade_date: date, refresh_id: str) -> None: ...
 
 
+class ContinuityCoordinator(Protocol):
+    def claim_ready_once(
+        self,
+        *,
+        freshness: ScheduleDecision,
+        latest_expected_session: date,
+        repair_enabled: bool,
+        now: datetime,
+        revalidator: Callable[[], ScheduleDecision],
+        lease_consumer: None,
+    ) -> object: ...
+
+
 class BaoStockProbeRunner:
     """Construct one write-free, one-attempt provider for a leased endpoint probe."""
 
@@ -541,6 +554,8 @@ class MarketAutomationService:
         post_publish=None,
         health_store=None,
         probe_runner: ProviderProbeRunner | None = None,
+        continuity: ContinuityCoordinator | None = None,
+        repair_enabled: bool = False,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -550,6 +565,9 @@ class MarketAutomationService:
         self.post_publish = post_publish
         self.health_store = health_store or InMemoryProviderHealthStore()
         self.probe_runner = probe_runner
+        self.continuity = continuity
+        self.repair_enabled = repair_enabled
+        self.last_continuity_decision: object | None = None
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -569,6 +587,7 @@ class MarketAutomationService:
             target_session=decision.target_session,
             next_run_at=decision.next_run_at,
         )
+        self._plan_continuity(decision, local)
         if decision.action != "run":
             state = current or SchedulerState(
                 target_session=decision.target_session,
@@ -610,6 +629,35 @@ class MarketAutomationService:
                 next_retry_at=next_retry,
             )
             return AutomationOutcome(decision=decision, state=state)
+
+    def _plan_continuity(self, decision: ScheduleDecision, local: datetime) -> None:
+        if not self.repair_enabled or self.continuity is None:
+            return
+        target = decision.target_session
+        if target is None:
+            return
+
+        def revalidate() -> ScheduleDecision:
+            published = self.store.published_refresh()
+            current = self.store.scheduler_state()
+            return self.policy.decide(
+                local,
+                published_as_of=published.requested_date if published else None,
+                state=current,
+            )
+
+        try:
+            self.last_continuity_decision = self.continuity.claim_ready_once(
+                freshness=decision,
+                latest_expected_session=target,
+                repair_enabled=True,
+                now=local.astimezone(UTC),
+                revalidator=revalidate,
+                lease_consumer=None,
+            )
+        except Exception:
+            self.last_continuity_decision = None
+            _log_event(logging.WARNING, "market_continuity_decision_unavailable")
 
     def _execute_due(
         self,

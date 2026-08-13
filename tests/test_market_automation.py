@@ -225,6 +225,77 @@ class CompleteProvider:
         )
 
 
+def test_automation_optional_continuity_dependency_preserves_legacy_behavior_exactly(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    now = datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI)
+    baseline_store = MarketStore(tmp_path / "baseline.duckdb")
+    explicit_store = MarketStore(tmp_path / "explicit-none.duckdb")
+    save_published(baseline_store, date(2026, 7, 24))
+    save_published(explicit_store, date(2026, 7, 24))
+    baseline_provider = CompleteProvider(fixture_bars())
+    explicit_provider = CompleteProvider(fixture_bars())
+    baseline = module.MarketAutomationService(
+        baseline_store,
+        baseline_provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+    )
+    explicit = module.MarketAutomationService(
+        explicit_store,
+        explicit_provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        continuity=None,
+        repair_enabled=False,
+    )
+
+    baseline_outcome = baseline.run_due_once(now)
+    explicit_outcome = explicit.run_due_once(now)
+
+    assert explicit_outcome == baseline_outcome
+    assert explicit_provider.fetch_calls == baseline_provider.fetch_calls == 0
+    assert explicit_provider.calendar_calls == baseline_provider.calendar_calls == 0
+    assert explicit_store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_automation_optional_continuity_hook_is_planning_only_and_never_consumes_lease(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 24))
+    provider = CompleteProvider(fixture_bars())
+
+    class PlanningOnlyContinuity:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def claim_ready_once(self, **kwargs):
+            self.calls.append(kwargs)
+            assert kwargs["lease_consumer"] is None
+            return {"reason_code": "REPAIR_READY"}
+
+    continuity = PlanningOnlyContinuity()
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        continuity=continuity,
+        repair_enabled=True,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.decision.action == "none"
+    assert len(continuity.calls) == 1
+    assert service.last_continuity_decision == {"reason_code": "REPAIR_READY"}
+    assert provider.fetch_calls == provider.calendar_calls == 0
+    assert store.repair_queue_snapshot().status == "unavailable"
+
+
 class HealthClock:
     def __init__(self, now: datetime) -> None:
         self.now = now
