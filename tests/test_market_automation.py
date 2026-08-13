@@ -12,6 +12,7 @@ from pathlib import Path
 from time import monotonic
 from zoneinfo import ZoneInfo
 
+import duckdb
 import httpx
 import pytest
 
@@ -1460,6 +1461,79 @@ def test_refresh_lock_rejects_a_second_process(tmp_path: Path) -> None:
         with pytest.raises(module.RefreshAlreadyRunning):
             with module.RefreshRunLock(lock_path):
                 pass
+
+
+def test_market_schema_migration_busy_lock_is_sanitized_and_zero_write(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "local_temp_dir": tmp_path / "tmp",
+            "local_lock_dir": tmp_path / "locks",
+        }
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+    lock_path = settings.local_lock_dir / "market-refresh.lock"
+
+    with cli.RefreshRunLock(lock_path):
+        before = {
+            item.relative_to(tmp_path): (
+                item.stat().st_size,
+                item.stat().st_mtime_ns,
+                hashlib.sha256(item.read_bytes()).hexdigest(),
+            )
+            for item in tmp_path.rglob("*")
+            if item.is_file()
+        }
+        assert cli.main() == 1
+        after = {
+            item.relative_to(tmp_path): (
+                item.stat().st_size,
+                item.stat().st_mtime_ns,
+                hashlib.sha256(item.read_bytes()).hexdigest(),
+            )
+            for item in tmp_path.rglob("*")
+            if item.is_file()
+        }
+
+    assert before == after
+    assert json.loads(capsys.readouterr().out) == {
+        "error_code": "market_control_schema_migration_busy",
+        "status": "error",
+        "writes_market_control_schema": False,
+    }
+
+
+def test_market_schema_migration_adds_continuity_tables_under_shared_lock(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "local_temp_dir": tmp_path / "tmp",
+            "local_lock_dir": tmp_path / "locks",
+        }
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
+
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "migration": "market_control_schema",
+        "status": "ready",
+        "writes_market_control_schema": True,
+    }
+    path = settings.market_data_dir / settings.market_database_name
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert {"repair_jobs", "repair_attempts"} <= {
+            row[0] for row in connection.execute("SHOW TABLES").fetchall()
+        }
 
 
 def test_automation_defers_without_fetching_when_refresh_lock_is_busy(

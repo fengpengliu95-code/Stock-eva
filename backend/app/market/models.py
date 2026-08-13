@@ -38,7 +38,7 @@ class DailyBar(BaseModel):
 class RefreshResult(BaseModel):
     run_id: str
     request_key: str | None = None
-    run_kind: Literal["daily", "backfill"] = "daily"
+    run_kind: Literal["daily", "backfill", "repair"] = "daily"
     requested_date: date
     source: Literal["baostock"]
     status: Literal["ready", "partial", "error"]

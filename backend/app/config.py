@@ -1,3 +1,4 @@
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -54,6 +55,11 @@ class Settings(BaseSettings):
     provider_circuit_failure_threshold: int = Field(default=3, gt=0)
     provider_circuit_cooldown_seconds: float = Field(default=900.0, gt=0)
     provider_circuit_probe_lease_seconds: float = Field(default=120.0, gt=0)
+    market_continuity_start_date: date | None = None
+    market_repair_enabled: bool = False
+    market_repair_max_attempts: int = Field(default=4, ge=1, le=20)
+    market_repair_lease_seconds: int = Field(default=1800, ge=60, le=86400)
+    market_repair_retry_base_seconds: int = Field(default=3600, ge=900, le=86400)
 
     @field_validator("user_database_name", "portfolio_database_name")
     @classmethod

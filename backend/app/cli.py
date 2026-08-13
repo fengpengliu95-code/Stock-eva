@@ -508,10 +508,26 @@ def main() -> int:
         try:
             settings = get_settings()
             layout = StorageLayout(settings)
-            MarketStore(
+            store = MarketStore(
                 layout.local_paths.market_database,
                 temp_directory=layout.duckdb_temporary,
-            ).initialize_schema()
+            )
+            with RefreshRunLock(layout.market_refresh_lock):
+                store.initialize_schema()
+                store.initialize_continuity_schema()
+        except RefreshAlreadyRunning:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "market_control_schema_migration_busy",
+                        "writes_market_control_schema": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
         except Exception:
             print(
                 json.dumps(
