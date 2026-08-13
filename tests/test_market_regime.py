@@ -527,14 +527,18 @@ def test_published_cache_revalidates_same_generation_object_mutation(
         staging_root=tmp_path / "staging",
     )
     calls = 0
-    original_hash = dataset_module._sha256
+    original_validation = dataset_module.NasMarketStore._validate_published_object
 
-    def counted_hash(path: Path) -> str:
+    def counted_validation(self, descriptor, item, expected_fingerprint) -> None:
         nonlocal calls
         calls += 1
-        return original_hash(path)
+        original_validation(self, descriptor, item, expected_fingerprint)
 
-    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    monkeypatch.setattr(
+        dataset_module.NasMarketStore,
+        "_validate_published_object",
+        counted_validation,
+    )
     reader.store.ensure_readiness()
     assert calls >= 1
     calls = 0
@@ -552,18 +556,22 @@ def test_published_cache_revalidates_same_generation_object_mutation(
         staging_root=tmp_path / "staging-second",
     )
     barrier = threading.Barrier(2)
-    barrier_paths: set[Path] = set()
+    barrier_roots: set[Path] = set()
     barrier_lock = threading.Lock()
 
-    def barrier_hash(path: Path) -> str:
+    def barrier_validation(self, descriptor, item, expected_fingerprint) -> None:
         with barrier_lock:
-            first_for_path = path not in barrier_paths
-            barrier_paths.add(path)
-        if first_for_path:
+            first_for_root = self.root not in barrier_roots
+            barrier_roots.add(self.root)
+        if first_for_root:
             barrier.wait(timeout=2)
-        return original_hash(path)
+        original_validation(self, descriptor, item, expected_fingerprint)
 
-    monkeypatch.setattr(dataset_module, "_sha256", barrier_hash)
+    monkeypatch.setattr(
+        dataset_module.NasMarketStore,
+        "_validate_published_object",
+        barrier_validation,
+    )
     errors: list[BaseException] = []
 
     def strict_snapshot(target) -> None:
@@ -581,7 +589,11 @@ def test_published_cache_revalidates_same_generation_object_mutation(
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
     assert errors == []
-    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    monkeypatch.setattr(
+        dataset_module.NasMarketStore,
+        "_validate_published_object",
+        counted_validation,
+    )
     store = store_module.MarketRegimeStore(reader)
 
     store.read(AS_OF)
@@ -742,15 +754,19 @@ def test_snapshot_backfill_selects_twenty_manifest_dates_with_one_checksum_pass(
         dataset_root=dataset_root,
         staging_root=tmp_path / "staging",
     )
-    original_hash = dataset_module._sha256
+    original_validation = dataset_module.NasMarketStore._validate_published_object
     calls = 0
 
-    def counted_hash(path: Path) -> str:
+    def counted_validation(self, descriptor, item, expected_fingerprint) -> None:
         nonlocal calls
         calls += 1
-        return original_hash(path)
+        original_validation(self, descriptor, item, expected_fingerprint)
 
-    monkeypatch.setattr(dataset_module, "_sha256", counted_hash)
+    monkeypatch.setattr(
+        dataset_module.NasMarketStore,
+        "_validate_published_object",
+        counted_validation,
+    )
     service = snapshots.RegimeSnapshotCaptureService(
         regime_store=store_module.MarketRegimeStore(reader),
         snapshot_store=snapshots.RegimeSnapshotStore(tmp_path / "derived" / "snapshots.sqlite3"),
