@@ -213,11 +213,12 @@ class RepairAttempt(BaseModel):
         elif self.completed_at is None or self.retryable is None:
             raise ValueError("terminal repair attempt requires completion evidence")
         if self.outcome == "succeeded" and (
-            self.failure_stage is not None
+            self.refresh_run_id is None
+            or self.failure_stage is not None
             or self.failure_class is not None
             or self.retryable is not False
         ):
-            raise ValueError("successful repair attempt cannot carry a failure")
+            raise ValueError("successful repair attempt requires internal refresh evidence")
         if self.outcome == "failed" and (self.failure_stage is None or self.failure_class is None):
             raise ValueError("failed repair attempt requires sanitized failure evidence")
         if self.outcome == "failed" and self.refresh_run_id is None:
@@ -301,6 +302,11 @@ class RepairQueueSnapshot(BaseModel):
                     for item in job_attempts
                 ):
                     raise ValueError("repair attempt time falls outside its job lineage")
+                if any(
+                    item.completed_at is not None and item.completed_at > job.updated_at
+                    for item in job_attempts
+                ):
+                    raise ValueError("repair attempt completion exceeds its job transition")
                 for previous, current in zip(job_attempts, job_attempts[1:], strict=False):
                     if previous.completed_at is None or previous.completed_at > current.started_at:
                         raise ValueError("repair attempt time lineage overlaps")
@@ -323,6 +329,7 @@ class RepairQueueSnapshot(BaseModel):
                     or attempt.lease_owner != job.lease_owner
                     or job.lease_expires_at is None
                     or job.lease_expires_at <= attempt.started_at
+                    or attempt.started_at != job.updated_at
                 ):
                     raise ValueError("repair lease attempt reference is invalid")
                 if job.state in {"retry_wait", "dead_letter"} and attempt.outcome not in {
@@ -330,6 +337,11 @@ class RepairQueueSnapshot(BaseModel):
                     "abandoned",
                 }:
                     raise ValueError("failed repair job lacks a terminal failure attempt")
+                if (
+                    job.state in {"retry_wait", "dead_letter"}
+                    and attempt.completed_at != job.updated_at
+                ):
+                    raise ValueError("failed repair transition time is inconsistent")
                 if job.state == "published" and attempt.outcome == "running":
                     raise ValueError("published repair job cannot have a running attempt")
                 succeeded = [item for item in job_attempts if item.outcome == "succeeded"]
@@ -339,6 +351,8 @@ class RepairQueueSnapshot(BaseModel):
                     or job.state != "published"
                 ):
                     raise ValueError("successful repair attempt lineage is invalid")
+                if succeeded and succeeded[0].completed_at != job.updated_at:
+                    raise ValueError("successful repair transition time is inconsistent")
                 nonretryable_failures = [
                     item
                     for item in job_attempts

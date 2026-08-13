@@ -1436,9 +1436,37 @@ def test_strict_published_reconciliation_finalizes_leased_attempt_consistently(
     assert snapshot.jobs[0].state_version == pending.state_version + 1
     assert snapshot.jobs[1].state_version == lease.state_version + 1
     assert snapshot.jobs[1].lease_id is None
-    assert snapshot.attempts[0].outcome == "succeeded"
-    assert snapshot.attempts[0].retryable is False
+    assert snapshot.jobs[1].abandoned_attempt_count == 1
+    assert snapshot.attempts[0].outcome == "abandoned"
+    assert snapshot.attempts[0].retryable is True
+    assert snapshot.attempts[0].refresh_run_id is None
     assert snapshot.attempts[0].completed_at == NOW + timedelta(minutes=2)
+    assert snapshot.jobs[1].updated_at == snapshot.attempts[0].completed_at
+    with RefreshRunLock(lock_path):
+        assert (
+            store.reconcile_published_repair_jobs(
+                [leased_job.trade_date], now=NOW + timedelta(minutes=3)
+            )
+            == []
+        )
+    assert store.repair_queue_snapshot() == snapshot
+
+
+def test_succeeded_attempt_requires_internal_refresh_audit_reference() -> None:
+    module = continuity_module()
+
+    with pytest.raises(ValidationError):
+        module.RepairAttempt(
+            attempt_id="attempt-a",
+            job_id=module.repair_job_id(date(2026, 8, 10), UNIVERSE_ID),
+            attempt_number=1,
+            lease_id="lease-a",
+            lease_owner="worker-a",
+            outcome="succeeded",
+            retryable=False,
+            started_at=NOW,
+            completed_at=NOW + timedelta(minutes=1),
+        )
 
 
 @pytest.mark.parametrize("failed_state", ["retry_wait", "dead_letter"])
@@ -1491,6 +1519,128 @@ def test_manifest_reconciliation_publishes_failed_job_without_rewriting_attempt(
     assert snapshot.jobs[0].last_failure_stage is None
     assert snapshot.jobs[0].last_failure_class is None
     assert snapshot.attempts == (before_attempt,)
+    assert snapshot.attempts[0].completed_at is not None
+    assert snapshot.attempts[0].completed_at <= snapshot.jobs[0].updated_at
+
+
+@pytest.mark.parametrize(
+    ("corruption", "mutation"),
+    [
+        (corruption, mutation)
+        for corruption in ("leased_transition_mismatch", "terminal_after_job_update")
+        for mutation in ("enqueue", "claim", "reconcile", "finalize", "reap")
+    ],
+)
+def test_time_corrupt_snapshot_blocks_every_mutation_without_writes(
+    tmp_path: Path,
+    corruption: str,
+    mutation: str,
+) -> None:
+    module = continuity_module()
+    path = tmp_path / f"{corruption}-{mutation}.duckdb"
+    lock_path = tmp_path / f"{corruption}-{mutation}.lock"
+    store = MarketStore(path)
+    initialize_continuity(store, lock_path)
+    terminal_job, active_job, pending_job = enqueue(
+        store,
+        lock_path,
+        date(2026, 8, 10),
+        date(2026, 8, 11),
+        date(2026, 8, 12),
+    )
+    policy = module.RepairRetryPolicy(max_attempts=4, base_seconds=3600)
+    first_claimed_at = NOW + timedelta(minutes=1)
+    with RefreshRunLock(lock_path):
+        first_lease = store.claim_repair_job(
+            terminal_job.job_id,
+            owner="worker-a",
+            expected_version=terminal_job.state_version,
+            now=first_claimed_at,
+            lease_seconds=1800,
+        )
+        assert first_lease is not None
+        terminal_job = store.finalize_repair_attempt(
+            first_lease,
+            outcome="failed",
+            refresh_result=error_refresh(
+                terminal_job.trade_date,
+                attempt=1,
+                started_at=first_claimed_at,
+            ),
+            now=first_claimed_at + timedelta(minutes=1),
+            retry_policy=policy,
+        )
+        active_lease = store.claim_repair_job(
+            active_job.job_id,
+            owner="worker-b",
+            expected_version=active_job.state_version,
+            now=first_claimed_at + timedelta(minutes=2),
+            lease_seconds=1800,
+        )
+    assert active_lease is not None
+    with duckdb.connect(str(path)) as connection:
+        if corruption == "leased_transition_mismatch":
+            connection.execute(
+                "UPDATE repair_jobs SET updated_at = updated_at + INTERVAL 1 SECOND "
+                "WHERE job_id = ?",
+                [active_job.job_id],
+            )
+        else:
+            connection.execute(
+                "UPDATE repair_attempts SET completed_at = completed_at + INTERVAL 1 SECOND "
+                "WHERE job_id = ?",
+                [terminal_job.job_id],
+            )
+        before_jobs = connection.execute("SELECT * FROM repair_jobs ORDER BY job_id").fetchall()
+        before_attempts = connection.execute(
+            "SELECT * FROM repair_attempts ORDER BY attempt_id"
+        ).fetchall()
+    before_bytes = path.read_bytes()
+    mutation_at = first_claimed_at + timedelta(minutes=4)
+
+    with RefreshRunLock(lock_path):
+        with pytest.raises(module.RepairQueueError):
+            if mutation == "enqueue":
+                store.enqueue_repair_jobs(
+                    [date(2026, 8, 13)], universe_id=UNIVERSE_ID, now=mutation_at
+                )
+            elif mutation == "claim":
+                store.claim_repair_job(
+                    pending_job.job_id,
+                    owner="worker-c",
+                    expected_version=pending_job.state_version,
+                    now=mutation_at,
+                    lease_seconds=1800,
+                )
+            elif mutation == "reconcile":
+                store.reconcile_published_repair_jobs([pending_job.trade_date], now=mutation_at)
+            elif mutation == "finalize":
+                store.finalize_repair_attempt(
+                    active_lease,
+                    outcome="failed",
+                    refresh_result=error_refresh(
+                        active_job.trade_date,
+                        attempt=1,
+                        started_at=first_claimed_at + timedelta(minutes=2, seconds=2),
+                    ),
+                    now=mutation_at,
+                    retry_policy=policy,
+                )
+            else:
+                store.reap_expired_repair_leases(
+                    now=active_lease.expires_at + timedelta(seconds=1),
+                    retry_policy=policy,
+                )
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM repair_jobs ORDER BY job_id").fetchall() == (
+            before_jobs
+        )
+        assert (
+            connection.execute("SELECT * FROM repair_attempts ORDER BY attempt_id").fetchall()
+            == before_attempts
+        )
+    assert path.read_bytes() == before_bytes
 
 
 @pytest.mark.parametrize("corruption", ["attempt_before_job", "invalid_lease_expiry"])

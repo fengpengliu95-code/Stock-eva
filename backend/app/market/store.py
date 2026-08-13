@@ -3,6 +3,8 @@ import json
 import os
 import re
 import stat
+import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -145,6 +147,19 @@ _CONTINUITY_SCHEMA_HASH = hashlib.sha256(
     "\n".join(" ".join(statement.split()) for statement in _CONTINUITY_DDL).encode()
 ).hexdigest()
 _CONTINUITY_TABLES = ("continuity_schema_meta", "repair_attempts", "repair_jobs")
+_SCHEMA_MIGRATION_DATABASE = "market.duckdb"
+_SCHEMA_MIGRATION_WAL = f"{_SCHEMA_MIGRATION_DATABASE}.wal"
+_SCHEMA_MIGRATION_ARTIFACTS = {
+    _SCHEMA_MIGRATION_DATABASE,
+    _SCHEMA_MIGRATION_WAL,
+}
+_SCHEMA_MIGRATION_CHILD = """
+import os
+import sys
+os.fchdir(int(sys.argv[1]))
+from backend.app.market.store import _bound_schema_migration_child
+raise SystemExit(_bound_schema_migration_child(sys.argv[2]))
+"""
 
 
 def _normalize_schema_expression(value: str | None) -> str | None:
@@ -193,6 +208,63 @@ def _expected_continuity_schema_signature() -> tuple:
         return _continuity_schema_signature(connection)
     finally:
         connection.close()
+
+
+def _bound_schema_artifacts() -> list[dict[str, int | str]]:
+    artifacts: list[dict[str, int | str]] = []
+    for name in sorted(_SCHEMA_MIGRATION_ARTIFACTS):
+        try:
+            artifact = os.stat(name, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(artifact.st_mode):
+            artifacts.append(
+                {
+                    "name": name,
+                    "device": artifact.st_dev,
+                    "inode": artifact.st_ino,
+                }
+            )
+    return artifacts
+
+
+def _bound_schema_migration_child(action: str) -> int:
+    """Run only after the child has fchdir'd to the inherited private directory fd."""
+    connection = None
+    status = "error"
+    try:
+        if action not in {"initialize", "migrate"}:
+            raise ValueError("invalid schema migration action")
+        connection = duckdb.connect(_SCHEMA_MIGRATION_DATABASE)
+        connection.execute("SET temp_directory = '.'")
+        if action == "migrate":
+            connection.begin()
+            MarketStore._initialize_base_schema_on_connection(connection)
+            MarketStore._initialize_continuity_schema_on_connection(connection)
+            connection.commit()
+        connection.close()
+        connection = None
+        status = "ready"
+    except Exception:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except duckdb.Error:
+                pass
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except duckdb.Error:
+                pass
+    print(
+        json.dumps(
+            {"artifacts": _bound_schema_artifacts(), "status": status},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0 if status == "ready" else 1
 
 
 class MarketStoreReadError(RuntimeError):
@@ -408,7 +480,6 @@ class MarketStore:
                     target_parent_fd=target_parent_fd,
                     target_parent_identity=target_parent_identity,
                     expected_inode=(target_stat.st_dev, target_stat.st_ino),
-                    original_mode=stat.S_IMODE(target_stat.st_mode),
                 )
             else:
                 self._initialize_all_new_writer_schema(
@@ -543,6 +614,147 @@ class MarketStore:
             os.close(descriptor)
         cls._require_bound_regular_file(parent_fd, name, expected_inode)
 
+    @staticmethod
+    def _run_bound_schema_migration_child(
+        directory_fd: int,
+        action: str,
+    ) -> tuple[bool, dict[str, tuple[int, int]]]:
+        if action not in {"initialize", "migrate"}:
+            raise RepairQueueError("market schema migration action is invalid")
+        environment = os.environ.copy()
+        project_root = str(Path(__file__).resolve().parents[3])
+        existing_python_path = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            f"{project_root}{os.pathsep}{existing_python_path}"
+            if existing_python_path
+            else project_root
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", _SCHEMA_MIGRATION_CHILD, str(directory_fd), action],
+                pass_fds=(directory_fd,),
+                close_fds=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=environment,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RepairQueueError("market schema migration child failed") from None
+        try:
+            payload = json.loads(result.stdout)
+            if set(payload) != {"artifacts", "status"}:
+                raise ValueError
+            status = payload["status"]
+            if status not in {"ready", "error"} or not isinstance(payload["artifacts"], list):
+                raise ValueError
+            artifacts: dict[str, tuple[int, int]] = {}
+            for artifact in payload["artifacts"]:
+                if not isinstance(artifact, dict) or set(artifact) != {
+                    "device",
+                    "inode",
+                    "name",
+                }:
+                    raise ValueError
+                name = artifact["name"]
+                device = artifact["device"]
+                inode = artifact["inode"]
+                if (
+                    name not in _SCHEMA_MIGRATION_ARTIFACTS
+                    or name in artifacts
+                    or not isinstance(device, int)
+                    or isinstance(device, bool)
+                    or device < 0
+                    or not isinstance(inode, int)
+                    or isinstance(inode, bool)
+                    or inode <= 0
+                ):
+                    raise ValueError
+                artifacts[name] = (device, inode)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise RepairQueueError("market schema migration child failed") from None
+        ready = result.returncode == 0 and status == "ready"
+        if result.returncode == 0 and status != "ready":
+            raise RepairQueueError("market schema migration child failed")
+        return ready, artifacts
+
+    @staticmethod
+    def _merge_registered_artifacts(
+        registered: dict[str, tuple[int, int]],
+        observed: dict[str, tuple[int, int]],
+    ) -> None:
+        for name, identity in observed.items():
+            prior = registered.get(name)
+            if prior is not None and prior != identity:
+                raise RepairQueueConflictError("market schema artifact identity changed")
+            registered[name] = identity
+
+    @classmethod
+    def _require_registered_artifacts(
+        cls,
+        directory_fd: int,
+        registered: dict[str, tuple[int, int]],
+    ) -> None:
+        names = set(os.listdir(directory_fd))
+        if names != set(registered) or _SCHEMA_MIGRATION_DATABASE not in names:
+            raise RepairQueueConflictError("market schema staging artifacts changed")
+        if _SCHEMA_MIGRATION_WAL in names:
+            raise RepairQueueError("market schema migration left an uncommitted artifact")
+        for name, identity in registered.items():
+            cls._require_bound_regular_file(directory_fd, name, identity)
+
+    @classmethod
+    def _remove_registered_artifacts(
+        cls,
+        directory_fd: int,
+        registered: dict[str, tuple[int, int]],
+    ) -> None:
+        for name, identity in sorted(registered.items(), reverse=True):
+            try:
+                cls._require_bound_regular_file(directory_fd, name, identity)
+            except RepairQueueError:
+                continue
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+    def _create_bound_staging_root(
+        self,
+        staging_parent_fd: int,
+    ) -> tuple[str, int, tuple[int, int]]:
+        staging_name = f".{self.path.name}.{uuid4().hex}.migration"
+        os.mkdir(staging_name, mode=0o700, dir_fd=staging_parent_fd)
+        root_stat = os.stat(staging_name, dir_fd=staging_parent_fd, follow_symlinks=False)
+        staging_identity = (root_stat.st_dev, root_stat.st_ino)
+        staging_root_fd = os.open(
+            staging_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=staging_parent_fd,
+        )
+        return staging_name, staging_root_fd, staging_identity
+
+    @staticmethod
+    def _remove_bound_staging_root(
+        staging_parent_fd: int,
+        staging_name: str,
+        staging_identity: tuple[int, int],
+    ) -> None:
+        try:
+            current = os.stat(
+                staging_name,
+                dir_fd=staging_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == staging_identity:
+            try:
+                os.rmdir(staging_name, dir_fd=staging_parent_fd)
+            except OSError:
+                pass
+
     def _initialize_all_existing_writer_schema(
         self,
         staging_directory: Path,
@@ -551,47 +763,57 @@ class MarketStore:
         target_parent_fd: int,
         target_parent_identity: tuple[int, int],
         expected_inode: tuple[int, int],
-        original_mode: int,
     ) -> None:
-        connection = None
-        mode_changed = False
-        committed = False
+        staging_parent_fd = -1
+        staging_root_fd = -1
+        staging_name: str | None = None
+        staging_root_identity: tuple[int, int] | None = None
+        registered: dict[str, tuple[int, int]] = {}
         try:
-            connection = self._open_writer_connection(
-                temp_directory=staging_directory,
-                create_directories=False,
+            staging_parent_fd, current_staging_identity, _ = self._open_directory_chain(
+                staging_directory, create=False
+            )
+            if current_staging_identity != staging_identity:
+                raise RepairQueueConflictError("market schema directory changed during migration")
+            staging_name, staging_root_fd, staging_root_identity = self._create_bound_staging_root(
+                staging_parent_fd
             )
             self._require_directory_path_identity(staging_directory, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
-            connection.begin()
-            self._initialize_base_schema_on_connection(connection)
-            self._initialize_continuity_schema_on_connection(connection)
+            os.link(
+                self.path.name,
+                _SCHEMA_MIGRATION_DATABASE,
+                src_dir_fd=target_parent_fd,
+                dst_dir_fd=staging_root_fd,
+                follow_symlinks=False,
+            )
+            registered[_SCHEMA_MIGRATION_DATABASE] = expected_inode
+            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "migrate")
+            self._merge_registered_artifacts(registered, observed)
+            if not ready:
+                raise RepairQueueError("market schema migration child failed")
+            self._require_registered_artifacts(staging_root_fd, registered)
+            self._require_directory_path_identity(staging_directory, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
             self._chmod_bound_file(target_parent_fd, self.path.name, expected_inode, 0o600)
-            mode_changed = True
-            connection.commit()
-            committed = True
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, expected_inode)
-        except Exception:
-            if connection is not None:
-                try:
-                    connection.rollback()
-                except duckdb.Error:
-                    pass
-            if mode_changed and not committed:
-                self._chmod_bound_file(
-                    target_parent_fd,
-                    self.path.name,
-                    expected_inode,
-                    original_mode,
-                )
-            raise
         finally:
-            if connection is not None:
-                connection.close()
+            if staging_root_fd >= 0:
+                self._remove_registered_artifacts(staging_root_fd, registered)
+                os.close(staging_root_fd)
+            if (
+                staging_parent_fd >= 0
+                and staging_name is not None
+                and staging_root_identity is not None
+            ):
+                self._remove_bound_staging_root(
+                    staging_parent_fd, staging_name, staging_root_identity
+                )
+            if staging_parent_fd >= 0:
+                os.close(staging_parent_fd)
 
     def _initialize_all_new_writer_schema(
         self,
@@ -602,62 +824,57 @@ class MarketStore:
         target_parent_fd: int,
         target_parent_identity: tuple[int, int],
     ) -> None:
-        staging_name = f".{self.path.name}.{uuid4().hex}.migration"
-        staging_root = staging_directory / staging_name
+        staging_name: str | None = None
+        staging_root: Path | None = None
         staging_root_fd = -1
         staging_identity: tuple[int, int] | None = None
-        staging_inode: tuple[int, int] | None = None
         published_inode: tuple[int, int] | None = None
         staging_owned = False
         target_published = False
         publication_complete = False
-        connection = None
+        registered: dict[str, tuple[int, int]] = {}
         try:
-            os.mkdir(staging_name, mode=0o700, dir_fd=staging_parent_fd)
-            root_stat = os.stat(staging_name, dir_fd=staging_parent_fd, follow_symlinks=False)
-            staging_identity = (root_stat.st_dev, root_stat.st_ino)
+            staging_name, staging_root_fd, staging_identity = self._create_bound_staging_root(
+                staging_parent_fd
+            )
+            staging_root = staging_directory / staging_name
             staging_owned = True
-            staging_root_fd = os.open(
-                staging_name,
-                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=staging_parent_fd,
-            )
+            self._require_directory_path_identity(staging_directory, staging_parent_identity)
+            assert staging_root is not None
+            self._require_directory_path_identity(staging_root, staging_identity)
+            self._require_directory_path_identity(self.path.parent, target_parent_identity)
+            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "initialize")
+            self._merge_registered_artifacts(registered, observed)
+            if not ready:
+                raise RepairQueueError("market schema migration child failed")
+            self._require_registered_artifacts(staging_root_fd, registered)
+            ready, observed = self._run_bound_schema_migration_child(staging_root_fd, "migrate")
+            self._merge_registered_artifacts(registered, observed)
+            if not ready:
+                raise RepairQueueError("market schema migration child failed")
+            self._require_registered_artifacts(staging_root_fd, registered)
+            published_inode = registered[_SCHEMA_MIGRATION_DATABASE]
             self._require_directory_path_identity(staging_directory, staging_parent_identity)
             self._require_directory_path_identity(staging_root, staging_identity)
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
-            connection = self._open_writer_connection(
-                path=staging_root / "market.duckdb",
-                temp_directory=staging_directory,
-                create_directories=False,
+            self._chmod_bound_file(
+                staging_root_fd,
+                _SCHEMA_MIGRATION_DATABASE,
+                published_inode,
+                0o600,
             )
-            stage_stat = os.stat("market.duckdb", dir_fd=staging_root_fd, follow_symlinks=False)
-            if not stat.S_ISREG(stage_stat.st_mode):
-                raise RepairQueueError("market schema staging artifact is invalid")
-            staging_inode = (stage_stat.st_dev, stage_stat.st_ino)
-            connection.begin()
-            self._initialize_base_schema_on_connection(connection)
-            self._initialize_continuity_schema_on_connection(connection)
-            connection.commit()
-            connection.close()
-            connection = None
-            self._require_directory_path_identity(staging_directory, staging_parent_identity)
-            self._require_directory_path_identity(staging_root, staging_identity)
-            self._require_directory_path_identity(self.path.parent, target_parent_identity)
-            self._require_bound_regular_file(staging_root_fd, "market.duckdb", staging_inode)
-            self._chmod_bound_file(staging_root_fd, "market.duckdb", staging_inode, 0o600)
             os.link(
-                "market.duckdb",
+                _SCHEMA_MIGRATION_DATABASE,
                 self.path.name,
                 src_dir_fd=staging_root_fd,
                 dst_dir_fd=target_parent_fd,
                 follow_symlinks=False,
             )
             target_published = True
-            published_inode = staging_inode
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
-            self._require_bound_regular_file(target_parent_fd, self.path.name, staging_inode)
-            os.unlink("market.duckdb", dir_fd=staging_root_fd)
-            staging_inode = None
+            self._require_bound_regular_file(target_parent_fd, self.path.name, published_inode)
+            self._remove_registered_artifacts(staging_root_fd, registered)
+            registered.clear()
             os.close(staging_root_fd)
             staging_root_fd = -1
             os.rmdir(staging_name, dir_fd=staging_parent_fd)
@@ -666,16 +883,7 @@ class MarketStore:
             self._require_directory_path_identity(self.path.parent, target_parent_identity)
             self._require_bound_regular_file(target_parent_fd, self.path.name, published_inode)
             publication_complete = True
-        except Exception:
-            if connection is not None:
-                try:
-                    connection.rollback()
-                except duckdb.Error:
-                    pass
-            raise
         finally:
-            if connection is not None:
-                connection.close()
             if target_published and not publication_complete and published_inode is not None:
                 try:
                     self._require_bound_regular_file(
@@ -689,51 +897,10 @@ class MarketStore:
                     except FileNotFoundError:
                         pass
             if staging_root_fd >= 0:
-                if staging_inode is not None:
-                    try:
-                        self._require_bound_regular_file(
-                            staging_root_fd, "market.duckdb", staging_inode
-                        )
-                    except RepairQueueError:
-                        pass
-                    else:
-                        try:
-                            os.unlink("market.duckdb", dir_fd=staging_root_fd)
-                        except FileNotFoundError:
-                            pass
-                try:
-                    wal_stat = os.stat(
-                        "market.duckdb.wal",
-                        dir_fd=staging_root_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                else:
-                    if stat.S_ISREG(wal_stat.st_mode):
-                        try:
-                            os.unlink("market.duckdb.wal", dir_fd=staging_root_fd)
-                        except FileNotFoundError:
-                            pass
+                self._remove_registered_artifacts(staging_root_fd, registered)
                 os.close(staging_root_fd)
-            if staging_owned and staging_identity is not None:
-                try:
-                    current = os.stat(
-                        staging_name,
-                        dir_fd=staging_parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (
-                        stat.S_ISDIR(current.st_mode)
-                        and (current.st_dev, current.st_ino) == staging_identity
-                    ):
-                        try:
-                            os.rmdir(staging_name, dir_fd=staging_parent_fd)
-                        except OSError:
-                            pass
+            if staging_owned and staging_identity is not None and staging_name is not None:
+                self._remove_bound_staging_root(staging_parent_fd, staging_name, staging_identity)
 
     def _connect_continuity_writer(self) -> duckdb.DuckDBPyConnection:
         if self.read_only:
@@ -1454,8 +1621,8 @@ class MarketStore:
                     attempt_updated = connection.execute(
                         f"""
                         UPDATE repair_attempts
-                        SET outcome = 'succeeded', failure_stage = NULL,
-                            failure_class = NULL, retryable = FALSE, completed_at = ?
+                        SET outcome = 'abandoned', failure_stage = NULL,
+                            failure_class = NULL, retryable = TRUE, completed_at = ?
                         WHERE attempt_id = ? AND job_id = ? AND lease_id = ?
                           AND lease_owner = ? AND outcome = 'running'
                         RETURNING {", ".join(_REPAIR_ATTEMPT_COLUMNS)}
@@ -1475,6 +1642,7 @@ class MarketStore:
                     f"""
                     UPDATE repair_jobs
                     SET state = 'published', state_version = state_version + 1,
+                        abandoned_attempt_count = abandoned_attempt_count + ?,
                         next_attempt_at = NULL, lease_id = NULL, lease_owner = NULL,
                         lease_expires_at = NULL, last_failure_stage = NULL,
                         last_failure_class = NULL, updated_at = ?, published_at = ?
@@ -1485,6 +1653,7 @@ class MarketStore:
                     RETURNING {", ".join(_REPAIR_JOB_COLUMNS)}
                     """,
                     [
+                        1 if job.state == "leased" else 0,
                         timestamp,
                         timestamp,
                         job.job_id,

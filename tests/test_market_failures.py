@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -373,7 +374,7 @@ def test_market_schema_migration_cli_sanitizes_failure_output(
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(
         MarketStore,
-        "_initialize_continuity_schema_on_connection",
+        "_run_bound_schema_migration_child",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
     )
     monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
@@ -498,6 +499,173 @@ def test_writer_schema_migration_parent_replacement_race_is_fail_closed(
     assert list(external.iterdir()) == [marker]
     assert not (displaced / target.name).exists()
     assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("database_kind", ["new", "existing"])
+def test_writer_schema_duckdb_open_is_bound_to_inherited_directory_fd(
+    tmp_path: Path,
+    monkeypatch,
+    database_kind: str,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target_parent = tmp_path / "market"
+    target_parent.mkdir()
+    target = target_parent / "stock_eva.duckdb"
+    if database_kind == "existing":
+        with duckdb.connect(str(target)) as connection:
+            connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+            connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    displaced = tmp_path / f"displaced-{database_kind}"
+    external = tmp_path / f"external-{database_kind}"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_bytes(b"external evidence")
+    real_run = subprocess.run
+    race_count = 0
+
+    def replace_named_parent_before_child_open(*args, **kwargs):
+        nonlocal race_count
+        assert len(kwargs["pass_fds"]) == 1
+        assert kwargs["close_fds"] is True
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert args[0][-1] in {"initialize", "migrate"}
+        assert str(target) not in args[0]
+        if race_count == 0:
+            race_count += 1
+            if database_kind == "new":
+                private_roots = [
+                    item
+                    for item in staging.iterdir()
+                    if item.is_dir() and item.name.endswith(".migration")
+                ]
+                assert len(private_roots) == 1
+                private_roots[0].rename(displaced)
+                private_roots[0].symlink_to(external, target_is_directory=True)
+            else:
+                target_parent.rename(displaced)
+                target_parent.symlink_to(external, target_is_directory=True)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", replace_named_parent_before_child_open)
+    external_before = {
+        item.relative_to(external): item.read_bytes()
+        for item in external.rglob("*")
+        if item.is_file()
+    }
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert race_count == 1
+    assert {
+        item.relative_to(external): item.read_bytes()
+        for item in external.rglob("*")
+        if item.is_file()
+    } == external_before
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_writer_schema_cleanup_only_removes_registered_wal_inode(
+    tmp_path: Path,
+    monkeypatch,
+    registered: bool,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    sentinel = b"wal ownership evidence"
+    wal_inode: list[int] = []
+    real_run = subprocess.run
+
+    def inject_wal_after_child(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        private_roots = [
+            item for item in staging.iterdir() if item.is_dir() and item.name.endswith(".migration")
+        ]
+        assert len(private_roots) == 1
+        wal = private_roots[0] / "market.duckdb.wal"
+        wal.write_bytes(sentinel)
+        wal_stat = wal.stat()
+        wal_inode.append(wal_stat.st_ino)
+        payload = json.loads(result.stdout)
+        if registered:
+            payload["artifacts"].append(
+                {
+                    "device": wal_stat.st_dev,
+                    "inode": wal_stat.st_ino,
+                    "name": wal.name,
+                }
+            )
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            json.dumps(payload, sort_keys=True),
+            "suppressed raw child failure",
+        )
+
+    monkeypatch.setattr(subprocess, "run", inject_wal_after_child)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    remaining_wals = list(staging.glob(".*.migration/market.duckdb.wal"))
+    if registered:
+        assert remaining_wals == []
+        assert list(staging.iterdir()) == []
+    else:
+        assert len(remaining_wals) == 1
+        assert remaining_wals[0].read_bytes() == sentinel
+        assert remaining_wals[0].stat().st_ino == wal_inode[0]
+    assert not target.parent.exists()
+
+
+@pytest.mark.parametrize("failure_mode", ["exception", "timeout", "nonzero", "residual"])
+def test_writer_schema_child_failure_modes_are_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+    failure_mode: str,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+
+    def fail_child(*args, **kwargs):
+        if failure_mode == "exception":
+            raise OSError("raw child launch failure /private/path token=secret")
+        if failure_mode == "timeout":
+            raise subprocess.TimeoutExpired(args[0], timeout=1)
+        if failure_mode == "residual":
+            private_roots = [
+                item
+                for item in staging.iterdir()
+                if item.is_dir() and item.name.endswith(".migration")
+            ]
+            assert len(private_roots) == 1
+            (private_roots[0] / "unknown-residual").write_bytes(b"foreign residual")
+        return subprocess.CompletedProcess(
+            args[0],
+            9,
+            '{"artifacts": [], "status": "error"}',
+            "raw child stderr /private/path token=secret",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_child)
+
+    with pytest.raises(module.RepairQueueError):
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert not target.parent.exists()
+    if failure_mode == "residual":
+        residuals = list(staging.glob(".*.migration/unknown-residual"))
+        assert len(residuals) == 1
+        assert residuals[0].read_bytes() == b"foreign residual"
+    else:
+        assert list(staging.iterdir()) == []
 
 
 def test_legacy_fourteen_column_refresh_projection_defaults_failure_fields() -> None:

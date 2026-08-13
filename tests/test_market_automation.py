@@ -1558,6 +1558,7 @@ def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
             )
             """
         )
+        connection.execute("CREATE TABLE continuity_schema_meta(blocker VARCHAR)")
     path.chmod(0o640)
     settings = cli.get_settings().model_copy(
         update={
@@ -1576,15 +1577,6 @@ def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
         hashlib.sha256(path.read_bytes()).hexdigest(),
     )
 
-    def fail_continuity(*_args, **_kwargs):
-        raise RuntimeError("token=secret /private/path raw failure")
-
-    monkeypatch.setattr(
-        cli.MarketStore,
-        "_initialize_continuity_schema_on_connection",
-        fail_continuity,
-        raising=False,
-    )
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
 
@@ -1640,14 +1632,17 @@ def test_market_schema_migration_new_database_failure_leaves_tree_unchanged(
 
     before = tree_fingerprint()
 
-    def fail_continuity(*_args, **_kwargs):
-        raise RuntimeError("token=secret /private/path raw failure")
+    real_child = cli.MarketStore._run_bound_schema_migration_child
+
+    def fail_migration_stage(directory_fd: int, action: str):
+        if action == "migrate":
+            return False, {}
+        return real_child(directory_fd, action)
 
     monkeypatch.setattr(
         cli.MarketStore,
-        "_initialize_continuity_schema_on_connection",
-        fail_continuity,
-        raising=False,
+        "_run_bound_schema_migration_child",
+        staticmethod(fail_migration_stage),
     )
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(sys, "argv", ["stock-eva", "market-schema-migrate"])
