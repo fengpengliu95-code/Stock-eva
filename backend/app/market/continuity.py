@@ -1,5 +1,9 @@
+import hashlib
+import json
 import re
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Literal, Protocol
 
 from pydantic import (
@@ -102,6 +106,71 @@ class ContinuityUnavailable(BaseModel):
     provider_requests: Literal[0] = 0
 
 
+ContinuityEnqueueStatus = Literal[
+    "current",
+    "enqueued",
+    "unavailable",
+    "already_running",
+]
+ContinuityEnqueueReason = Literal[
+    "CONTINUITY_START_UNCONFIGURED",
+    "CONTINUITY_RANGE_INVALID",
+    "CALENDAR_UNAVAILABLE",
+    "CALENDAR_CONFLICT",
+    "MANIFEST_INVENTORY_UNAVAILABLE",
+    "IMMUTABLE_OBJECT_INVALID",
+    "REFRESH_ALREADY_RUNNING",
+    "CONTROL_STATE_UNAVAILABLE",
+]
+
+
+class ContinuityEnqueueResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: ContinuityEnqueueStatus
+    reason_code: ContinuityEnqueueReason | None = None
+    fresh_scan: ContinuityScanResult | None = None
+    manifest_generation: str | None = None
+    scan_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    created_jobs: tuple["RepairJob", ...] = ()
+    created_count: int = Field(default=0, ge=0)
+    existing_count: int = Field(default=0, ge=0)
+    writes_control_state: bool = False
+    provider_requests: Literal[0] = 0
+
+    @model_validator(mode="after")
+    def valid_enqueue_shape(self) -> "ContinuityEnqueueResult":
+        available = self.status in {"current", "enqueued"}
+        if available != (self.fresh_scan is not None):
+            raise ValueError("continuity enqueue scan evidence is incomplete")
+        if available != (self.reason_code is None):
+            raise ValueError("continuity enqueue reason does not match status")
+        if available != (self.manifest_generation is not None):
+            raise ValueError("continuity enqueue generation does not match status")
+        if available != (self.scan_identity is not None):
+            raise ValueError("continuity enqueue identity does not match status")
+        if self.created_count != len(self.created_jobs):
+            raise ValueError("continuity enqueue created count does not match jobs")
+        if self.status != "enqueued" and (self.created_jobs or self.existing_count):
+            raise ValueError("non-enqueue result cannot carry queue counts")
+        if self.status == "current" and self.fresh_scan.status != "current":
+            raise ValueError("current enqueue result requires current scan evidence")
+        if self.status == "enqueued" and self.fresh_scan.status != "gaps":
+            raise ValueError("enqueue result requires gap scan evidence")
+        if self.status == "already_running" and self.reason_code != "REFRESH_ALREADY_RUNNING":
+            raise ValueError("busy enqueue result requires the busy reason")
+        if self.status == "unavailable" and self.reason_code in {
+            None,
+            "REFRESH_ALREADY_RUNNING",
+        }:
+            raise ValueError("unavailable enqueue result requires an unavailable reason")
+        if self.writes_control_state is not available:
+            raise ValueError(
+                "continuity enqueue write flag does not match successful orchestration"
+            )
+        return self
+
+
 class ConfirmedCalendarReader(Protocol):
     @property
     def status(self) -> Literal["confirmed", "unavailable"]: ...
@@ -116,6 +185,24 @@ class VerifiedInventoryReader(Protocol):
     ) -> VerifiedReadySessionInventory: ...
 
 
+class ContinuityQueueWriter(Protocol):
+    def initialize_continuity_schema(self) -> None: ...
+
+    def enqueue_repair_jobs(
+        self,
+        missing_dates: tuple[date, ...],
+        *,
+        universe_id: str,
+        now: datetime,
+    ) -> list["RepairJob"]: ...
+
+
+class RefreshLock(Protocol):
+    def __enter__(self) -> "RefreshLock": ...
+
+    def __exit__(self, *args: object) -> None: ...
+
+
 class ContinuityInventory:
     """Pure confirmed-calendar minus verified immutable-manifest scanner."""
 
@@ -125,7 +212,7 @@ class ContinuityInventory:
         calendar: ConfirmedCalendarReader,
         inventory_reader: VerifiedInventoryReader,
         inventory_mode: ContinuityInventoryMode,
-        calendar_conflict: bool = False,
+        calendar_conflict: bool | Callable[[], bool] = False,
     ) -> None:
         self._calendar = calendar
         self._inventory_reader = inventory_reader
@@ -161,7 +248,14 @@ class ContinuityInventory:
         if self._inventory_mode != "immutable_dataset":
             return ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
         try:
-            if self._calendar_conflict:
+            conflict = (
+                self._calendar_conflict()
+                if callable(self._calendar_conflict)
+                else self._calendar_conflict
+            )
+            if type(conflict) is not bool:
+                return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+            if conflict:
                 return ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
             if self._calendar.status != "confirmed":
                 return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
@@ -209,6 +303,109 @@ class ContinuityInventory:
     @staticmethod
     def _valid_date(value: object) -> bool:
         return isinstance(value, date) and not isinstance(value, datetime)
+
+
+class ContinuityEnqueueService:
+    """Writer-only lock/revalidate/enqueue orchestration for continuity gaps."""
+
+    def __init__(
+        self,
+        *,
+        scanner: ContinuityInventory,
+        store: ContinuityQueueWriter,
+        lock_path: Path,
+        universe_id: str,
+        clock: Callable[[], datetime],
+        lock_factory: Callable[[Path], RefreshLock] | None = None,
+    ) -> None:
+        self._scanner = scanner
+        self._store = store
+        self._lock_path = lock_path
+        self._universe_id = require_universe_id(universe_id)
+        self._clock = clock
+        self._lock_factory = lock_factory
+
+    def execute(
+        self,
+        *,
+        configured_start: date | None,
+        latest_completed_session: date | None,
+        requested_start: date | None = None,
+        requested_end: date | None = None,
+        completed_scan: ContinuityScanResult | None = None,
+    ) -> ContinuityEnqueueResult:
+        if completed_scan is not None:
+            try:
+                ContinuityScanResult.model_validate(completed_scan.model_dump(mode="python"))
+            except (AttributeError, TypeError, ValueError):
+                return ContinuityEnqueueResult(
+                    status="unavailable",
+                    reason_code="CONTINUITY_RANGE_INVALID",
+                )
+        from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
+
+        lock_factory = self._lock_factory or RefreshRunLock
+        try:
+            with lock_factory(self._lock_path):
+                fresh = self._scanner.scan(
+                    configured_start=configured_start,
+                    latest_completed_session=latest_completed_session,
+                    requested_start=requested_start,
+                    requested_end=requested_end,
+                )
+                if isinstance(fresh, ContinuityUnavailable):
+                    return ContinuityEnqueueResult(
+                        status="unavailable",
+                        reason_code=fresh.reason_code,
+                    )
+                scan_identity = self._scan_identity(fresh)
+                timestamp = require_utc(self._clock())
+                self._store.initialize_continuity_schema()
+                if fresh.status == "current":
+                    return ContinuityEnqueueResult(
+                        status="current",
+                        fresh_scan=fresh,
+                        manifest_generation=fresh.manifest_generation,
+                        scan_identity=scan_identity,
+                        writes_control_state=True,
+                    )
+                created = tuple(
+                    self._store.enqueue_repair_jobs(
+                        fresh.missing_sessions,
+                        universe_id=self._universe_id,
+                        now=timestamp,
+                    )
+                )
+                return ContinuityEnqueueResult(
+                    status="enqueued",
+                    fresh_scan=fresh,
+                    manifest_generation=fresh.manifest_generation,
+                    scan_identity=scan_identity,
+                    created_jobs=created,
+                    created_count=len(created),
+                    existing_count=len(fresh.missing_sessions) - len(created),
+                    writes_control_state=True,
+                )
+        except RefreshAlreadyRunning:
+            return ContinuityEnqueueResult(
+                status="already_running",
+                reason_code="REFRESH_ALREADY_RUNNING",
+            )
+        except RepairQueueError:
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        except Exception:
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+
+    @staticmethod
+    def _scan_identity(scan: ContinuityScanResult) -> str:
+        content = json.dumps(scan.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(content.encode()).hexdigest()
 
 
 def require_utc(value: datetime) -> datetime:
