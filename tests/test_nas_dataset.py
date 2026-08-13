@@ -1,11 +1,14 @@
 import asyncio
+import hashlib
 import json
 import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import duckdb
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from backend.app import cli
 from backend.app.api.market import get_market_store
@@ -148,6 +151,260 @@ def _ready_result_on(trade_date: date) -> RefreshResult:
             "requested_date": trade_date,
         }
     )
+
+
+def _dataset_fingerprint(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    entries: list[tuple[str, str, int, int]] = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_dir():
+            entries.append((relative, "directory", 0, path.stat().st_mtime_ns))
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        stat = path.stat()
+        entries.append((relative, digest, stat.st_size, stat.st_mtime_ns))
+    return tuple(entries)
+
+
+def test_verified_ready_inventory_enumerates_all_current_manifest_partitions(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    control = MarketStore(tmp_path / "control" / "market.duckdb")
+    store = NasMarketStore(control, root, tmp_path / "staging")
+    sessions = (date(2026, 7, 21), date(2026, 7, 23))
+    for session in sessions:
+        store.save_refresh(
+            _bars_on(session),
+            _ready_result_on(session),
+            publish=True,
+        )
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    verified_at = datetime(2026, 8, 13, 9, 30, tzinfo=UTC)
+
+    inventory = store.verified_ready_session_inventory(now=verified_at)
+
+    assert inventory.status == "ready"
+    assert inventory.source == "baostock"
+    assert inventory.manifest_generation == manifest["generation"]
+    assert inventory.sessions == sessions
+    assert inventory.verified_at == verified_at
+    assert len(inventory.manifest_identity) == 64
+    assert "/" not in inventory.manifest_identity
+    assert "path" not in inventory.model_dump(mode="json")
+    assert control.published_refresh().requested_date == sessions[-1]
+    with pytest.raises(ValidationError, match="frozen"):
+        inventory.sessions = ()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "wrong_hash"])
+def test_verified_ready_inventory_rejects_missing_or_wrong_hash_object(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.verified_ready_session_inventory()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    parquet = root / manifest["files"][0]["path"]
+    if corruption == "missing":
+        parquet.unlink()
+        expected = "missing parquet"
+    else:
+        parquet.write_bytes(b"corrupt-after-success")
+        expected = "checksum mismatch"
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match=expected):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
+@pytest.mark.parametrize("corruption", ["wrong_schema", "wrong_row_count"])
+def test_verified_ready_inventory_rejects_wrong_schema_and_row_count(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.verified_ready_session_inventory()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "wrong_row_count":
+        manifest["files"][0]["row_count"] += 1
+        expected = "row count mismatch"
+    else:
+        bad_file = root / "bars" / "wrong-schema.parquet"
+        connection = duckdb.connect(":memory:")
+        try:
+            connection.execute(
+                "COPY (SELECT 1 AS wrong_column) TO ? (FORMAT PARQUET)",
+                [str(bad_file)],
+            )
+        finally:
+            connection.close()
+        manifest["files"][0].update(
+            {
+                "path": "bars/wrong-schema.parquet",
+                "sha256": _sha256(bad_file),
+                "row_count": 1,
+            }
+        )
+        expected = "incompatible schema"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match=expected):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
+def test_verified_ready_inventory_is_bound_to_one_manifest_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    sessions = (date(2026, 7, 21), date(2026, 7, 23))
+    for session in sessions:
+        store.save_refresh(
+            _bars_on(session),
+            _ready_result_on(session),
+            publish=True,
+        )
+    manifest_path = root / "manifest.json"
+    captured = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_identity = hashlib.sha256(
+        json.dumps(captured, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    original_manifest = store._manifest
+    calls = 0
+
+    def switch_generation_after_capture() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        snapshot = original_manifest()
+        replacement = {
+            "dataset": "stock-eva-market",
+            "schema_version": 2,
+            "generation": "generation-after-capture",
+            "files": [],
+        }
+        manifest_path.write_text(json.dumps(replacement), encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setattr(store, "_manifest", switch_generation_after_capture)
+
+    inventory = store.verified_ready_session_inventory()
+
+    assert calls == 1
+    assert inventory.manifest_generation == captured["generation"]
+    assert inventory.manifest_identity == expected_identity
+    assert inventory.sessions == sessions
+    assert json.loads(manifest_path.read_text())["generation"] == "generation-after-capture"
+
+
+def test_lightweight_manifest_dates_is_not_the_continuity_inventory_contract(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.verified_ready_session_inventory()
+    parquet = next((root / "bars").rglob("*.parquet"))
+    parquet.write_bytes(b"corrupt-after-inventory")
+
+    assert store.manifest_dates() == [date(2026, 7, 23)]
+    with pytest.raises(DatasetError, match="checksum mismatch"):
+        store.verified_ready_session_inventory()
+
+
+def test_verified_ready_inventory_accepts_valid_empty_manifest(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+
+    inventory = store.verified_ready_session_inventory()
+
+    assert inventory.status == "ready"
+    assert inventory.sessions == ()
+
+
+def test_verified_ready_inventory_rejects_symlink_escape_without_writes(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    published = root / manifest["files"][0]["path"]
+    outside = tmp_path / "outside.parquet"
+    outside.write_bytes(published.read_bytes())
+    escaped = root / "bars" / "escaped.parquet"
+    escaped.symlink_to(outside)
+    manifest["files"][0].update(
+        {
+            "path": "bars/escaped.parquet",
+            "sha256": _sha256(outside),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match="unsafe file path"):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
+
+
+def test_verified_ready_inventory_rejects_path_like_generation_without_writes(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["generation"] = "/private/dataset-generation"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _dataset_fingerprint(root)
+
+    with pytest.raises(DatasetError, match="inventory metadata"):
+        store.verified_ready_session_inventory()
+
+    assert _dataset_fingerprint(root) == before
 
 
 def test_verified_local_mirror_is_idempotent_and_manifest_readable(tmp_path: Path) -> None:

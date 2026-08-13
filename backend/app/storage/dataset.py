@@ -16,6 +16,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import duckdb
@@ -23,7 +24,11 @@ from pydantic import ValidationError
 
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
-from backend.app.storage.models import DatasetManifest, DatasetSentinel
+from backend.app.storage.models import (
+    DatasetManifest,
+    DatasetSentinel,
+    VerifiedReadySessionInventory,
+)
 
 SENTINEL_NAME = ".stock-eva-dataset.json"
 MANIFEST_NAME = "manifest.json"
@@ -80,6 +85,8 @@ class PublishedReadSnapshot:
     fingerprints: tuple[tuple[int, int, int, int, int], ...]
     generation: str = ""
     trade_dates: tuple[date, ...] = ()
+    manifest_identity: str = ""
+    partitions: tuple[tuple[str, date], ...] = ()
 
 
 class _ManifestLock:
@@ -312,6 +319,8 @@ class NasMarketStore:
                 path = self.root / relative
                 if not path.is_file():
                     raise DatasetError("published manifest references a missing parquet file")
+                if path.resolve(strict=True) != self.root.resolve() / relative:
+                    raise DatasetError("manifest contains unsafe file path")
                 paths.append(path)
             fingerprints = [self._fingerprint(path) for path in paths]
             validation_needed = []
@@ -321,49 +330,43 @@ class NasMarketStore:
                     cached = _VALIDATED_OBJECTS.get(key)
                     if cached == fingerprint and not force_validation:
                         _VALIDATED_OBJECTS.move_to_end(key)
-                if force_validation or cached != fingerprint:
+                if force_validation or verify_checksums or cached != fingerprint:
                     validation_needed.append((item, path, fingerprint, key))
 
             # Hashing and DuckDB validation are deliberately outside the process-global
-            # LRU lock. Strict R1-B cache snapshots hash every object; ordinary readers
-            # hash only unseen or metadata-changed objects.
-            validated_paths: set[Path] = set()
+            # LRU lock. Strict snapshots revalidate every object; ordinary readers
+            # validate only unseen or metadata-changed objects.
             for item, path, fingerprint, key in validation_needed:
                 before = self._fingerprint(path)
                 checksum = _sha256(path)
-                after = self._fingerprint(path)
-                if before != fingerprint or after != fingerprint:
-                    raise DatasetError("published object changed during validation")
                 if checksum != item["sha256"]:
                     raise DatasetError("published parquet checksum mismatch")
                 self._validate_parquet(path, item["row_count"])
-                validated_paths.add(path)
+                after = self._fingerprint(path)
+                if before != fingerprint or after != fingerprint:
+                    raise DatasetError("published object changed during validation")
                 with _VALIDATION_LOCK:
                     _VALIDATED_OBJECTS[key] = fingerprint
                     _VALIDATED_OBJECTS.move_to_end(key)
                     while len(_VALIDATED_OBJECTS) > _VALIDATED_OBJECTS_LIMIT:
                         _VALIDATED_OBJECTS.popitem(last=False)
 
-            if verify_checksums:
-                for item, path, fingerprint in zip(items, paths, fingerprints, strict=True):
-                    if path in validated_paths:
-                        continue
-                    before = self._fingerprint(path)
-                    checksum = _sha256(path)
-                    after = self._fingerprint(path)
-                    if before != fingerprint or after != fingerprint:
-                        raise DatasetError("published object changed during validation")
-                    if checksum != item["sha256"]:
-                        raise DatasetError("published parquet checksum mismatch")
             content = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
+            manifest_identity = hashlib.sha256(content.encode()).hexdigest()
+            partitions = tuple(
+                sorted(
+                    (str(item["source"]), date.fromisoformat(str(item["trade_date"])))
+                    for item in items
+                )
+            )
             return PublishedReadSnapshot(
-                identity=f"{self.root.resolve()}:{hashlib.sha256(content.encode()).hexdigest()}",
+                identity=f"{self.root.resolve()}:{manifest_identity}",
                 paths=tuple(paths),
                 fingerprints=tuple(fingerprints),
                 generation=str(manifest["generation"]),
-                trade_dates=tuple(
-                    sorted({date.fromisoformat(item["trade_date"]) for item in items})
-                ),
+                trade_dates=tuple(sorted({trade_date for _, trade_date in partitions})),
+                manifest_identity=manifest_identity,
+                partitions=partitions,
             )
         except OSError as exc:
             raise DatasetError("published NAS dataset is unavailable") from exc
@@ -428,6 +431,33 @@ class NasMarketStore:
     def read_snapshot(self, *, verify_checksums: bool = False) -> PublishedReadSnapshot:
         """Capture one checked manifest/object view for a bound reader query."""
         return self._read_snapshot(verify_checksums=verify_checksums)
+
+    def verified_ready_session_inventory(
+        self,
+        source: Literal["baostock"] = "baostock",
+        *,
+        now: datetime | None = None,
+    ) -> VerifiedReadySessionInventory:
+        """Return sessions proven by one strict immutable manifest snapshot."""
+        if source != "baostock":
+            raise DatasetError("published inventory source is unsupported")
+        verified_at = now or datetime.now(UTC)
+        if verified_at.utcoffset() is None:
+            raise DatasetError("inventory verification time must be timezone-aware")
+        snapshot = self._read_snapshot(verify_checksums=True)
+        try:
+            return VerifiedReadySessionInventory(
+                manifest_generation=snapshot.generation,
+                manifest_identity=snapshot.manifest_identity,
+                sessions=tuple(
+                    trade_date
+                    for partition_source, trade_date in snapshot.partitions
+                    if partition_source == source
+                ),
+                verified_at=verified_at,
+            )
+        except ValidationError as exc:
+            raise DatasetError("published inventory metadata is invalid") from exc
 
     def exists(self) -> bool:
         return bool(self._paths())

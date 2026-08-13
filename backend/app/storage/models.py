@@ -1,7 +1,37 @@
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class VerifiedReadySessionInventory(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["ready"] = "ready"
+    source: Literal["baostock"] = "baostock"
+    manifest_generation: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    manifest_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sessions: tuple[date, ...]
+    verified_at: datetime
+
+    @field_validator("sessions")
+    @classmethod
+    def require_sorted_unique_sessions(cls, value: tuple[date, ...]) -> tuple[date, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("sessions must be sorted and unique")
+        return value
+
+    @field_validator("verified_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("verified_at must be timezone-aware")
+        return value.astimezone(UTC)
 
 
 class StorageReadiness(BaseModel):
