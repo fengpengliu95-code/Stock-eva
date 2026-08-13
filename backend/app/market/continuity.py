@@ -117,6 +117,7 @@ ContinuityEnqueueReason = Literal[
     "CONTINUITY_RANGE_INVALID",
     "CALENDAR_UNAVAILABLE",
     "CALENDAR_CONFLICT",
+    "CALENDAR_CONFLICT_SOURCE_UNAVAILABLE",
     "MANIFEST_INVENTORY_UNAVAILABLE",
     "IMMUTABLE_OBJECT_INVALID",
     "REFRESH_ALREADY_RUNNING",
@@ -218,6 +219,10 @@ class ContinuityInventory:
         self._inventory_reader = inventory_reader
         self._inventory_mode = inventory_mode
         self._calendar_conflict = calendar_conflict
+
+    @property
+    def calendar_conflict_is_dynamic(self) -> bool:
+        return callable(self._calendar_conflict)
 
     def scan(
         self,
@@ -337,60 +342,89 @@ class ContinuityEnqueueService:
         if completed_scan is not None:
             try:
                 ContinuityScanResult.model_validate(completed_scan.model_dump(mode="python"))
-            except (AttributeError, TypeError, ValueError):
+            except Exception:
                 return ContinuityEnqueueResult(
                     status="unavailable",
                     reason_code="CONTINUITY_RANGE_INVALID",
                 )
-        from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
-
-        lock_factory = self._lock_factory or RefreshRunLock
         try:
-            with lock_factory(self._lock_path):
-                fresh = self._scanner.scan(
-                    configured_start=configured_start,
-                    latest_completed_session=latest_completed_session,
-                    requested_start=requested_start,
-                    requested_end=requested_end,
+            timestamp = require_utc(self._clock())
+        except Exception:
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        try:
+            if not self._scanner.calendar_conflict_is_dynamic:
+                return ContinuityEnqueueResult(
+                    status="unavailable",
+                    reason_code="CALENDAR_CONFLICT_SOURCE_UNAVAILABLE",
                 )
-                if isinstance(fresh, ContinuityUnavailable):
-                    return ContinuityEnqueueResult(
-                        status="unavailable",
-                        reason_code=fresh.reason_code,
+            preflight = self._scanner.scan(
+                configured_start=configured_start,
+                latest_completed_session=latest_completed_session,
+                requested_start=requested_start,
+                requested_end=requested_end,
+            )
+        except Exception:
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        if isinstance(preflight, ContinuityUnavailable):
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code=preflight.reason_code,
+            )
+        try:
+            default_lock, already_running = self._resolve_default_lock()
+            lock_factory = self._lock_factory or default_lock
+            try:
+                lock = lock_factory(self._lock_path)
+                with lock:
+                    fresh = self._scanner.scan(
+                        configured_start=configured_start,
+                        latest_completed_session=latest_completed_session,
+                        requested_start=requested_start,
+                        requested_end=requested_end,
                     )
-                scan_identity = self._scan_identity(fresh)
-                timestamp = require_utc(self._clock())
-                self._store.initialize_continuity_schema()
-                if fresh.status == "current":
+                    if isinstance(fresh, ContinuityUnavailable):
+                        return ContinuityEnqueueResult(
+                            status="unavailable",
+                            reason_code=fresh.reason_code,
+                        )
+                    scan_identity = self._scan_identity(fresh)
+                    self._store.initialize_continuity_schema()
+                    if fresh.status == "current":
+                        return ContinuityEnqueueResult(
+                            status="current",
+                            fresh_scan=fresh,
+                            manifest_generation=fresh.manifest_generation,
+                            scan_identity=scan_identity,
+                            writes_control_state=True,
+                        )
+                    created = tuple(
+                        self._store.enqueue_repair_jobs(
+                            fresh.missing_sessions,
+                            universe_id=self._universe_id,
+                            now=timestamp,
+                        )
+                    )
                     return ContinuityEnqueueResult(
-                        status="current",
+                        status="enqueued",
                         fresh_scan=fresh,
                         manifest_generation=fresh.manifest_generation,
                         scan_identity=scan_identity,
+                        created_jobs=created,
+                        created_count=len(created),
+                        existing_count=len(fresh.missing_sessions) - len(created),
                         writes_control_state=True,
                     )
-                created = tuple(
-                    self._store.enqueue_repair_jobs(
-                        fresh.missing_sessions,
-                        universe_id=self._universe_id,
-                        now=timestamp,
-                    )
-                )
+            except already_running:
                 return ContinuityEnqueueResult(
-                    status="enqueued",
-                    fresh_scan=fresh,
-                    manifest_generation=fresh.manifest_generation,
-                    scan_identity=scan_identity,
-                    created_jobs=created,
-                    created_count=len(created),
-                    existing_count=len(fresh.missing_sessions) - len(created),
-                    writes_control_state=True,
+                    status="already_running",
+                    reason_code="REFRESH_ALREADY_RUNNING",
                 )
-        except RefreshAlreadyRunning:
-            return ContinuityEnqueueResult(
-                status="already_running",
-                reason_code="REFRESH_ALREADY_RUNNING",
-            )
         except RepairQueueError:
             return ContinuityEnqueueResult(
                 status="unavailable",
@@ -401,6 +435,15 @@ class ContinuityEnqueueService:
                 status="unavailable",
                 reason_code="CONTROL_STATE_UNAVAILABLE",
             )
+
+    @staticmethod
+    def _resolve_default_lock() -> tuple[
+        Callable[[Path], RefreshLock],
+        type[Exception],
+    ]:
+        from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
+
+        return RefreshRunLock, RefreshAlreadyRunning
 
     @staticmethod
     def _scan_identity(scan: ContinuityScanResult) -> str:

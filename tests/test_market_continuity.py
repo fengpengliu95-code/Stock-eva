@@ -2213,6 +2213,7 @@ def test_enqueue_service_repeats_scan_inside_lock_and_ignores_stale_gap_result(
         calendar=calendar,
         inventory_reader=reader,
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     stale = scanner.scan(
         configured_start=sessions[0],
@@ -2260,7 +2261,7 @@ def test_enqueue_service_repeats_scan_inside_lock_and_ignores_stale_gap_result(
     assert result.writes_control_state is True
     assert result.provider_requests == 0
     assert lock_factory.calls == [lock_path]
-    assert reader.calls == ["baostock", "baostock"]
+    assert reader.calls == ["baostock", "baostock", "baostock"]
     assert store.repair_queue_snapshot().jobs == ()
 
 
@@ -2359,6 +2360,7 @@ def test_enqueue_service_rechecks_changed_latest_boundary_before_any_write(
         calendar=calendar,
         inventory_reader=reader,
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     stale = scanner.scan(
         configured_start=sessions[0],
@@ -2433,6 +2435,7 @@ def test_enqueue_service_corrupt_object_while_waiting_fails_before_control_write
         calendar=RecordingConfirmedCalendar({session: "open"}),
         inventory_reader=dataset,
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     stale = scanner.scan(
         configured_start=session,
@@ -2492,6 +2495,7 @@ def test_enqueue_service_busy_lock_is_typed_sanitized_and_full_tree_unchanged(
         calendar=calendar,
         inventory_reader=reader,
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     lock_path = tmp_path / "locks" / "market-refresh.lock"
     precreate_lock(lock_path)
@@ -2526,7 +2530,7 @@ def test_enqueue_service_busy_lock_is_typed_sanitized_and_full_tree_unchanged(
     assert result.existing_count == 0
     assert result.writes_control_state is False
     assert result.provider_requests == 0
-    assert reader.calls == []
+    assert reader.calls == ["baostock"]
     assert schema_calls == 0
     assert store.path.exists() is False
     with pytest.raises(ValidationError):
@@ -2547,6 +2551,7 @@ def test_enqueue_service_fresh_gaps_initialize_and_enqueue_oldest_first_idempote
         calendar=calendar,
         inventory_reader=reader,
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     provider_constructions = 0
 
@@ -2594,7 +2599,7 @@ def test_enqueue_service_fresh_gaps_initialize_and_enqueue_oldest_first_idempote
     snapshot = store.repair_queue_snapshot()
     assert tuple(job.trade_date for job in snapshot.jobs) == expected_missing
     assert snapshot.attempts == ()
-    assert reader.calls == ["baostock", "baostock"]
+    assert reader.calls == ["baostock", "baostock", "baostock", "baostock"]
     assert provider_constructions == 0
     assert first.provider_requests == second.provider_requests == 0
 
@@ -2609,6 +2614,7 @@ def test_enqueue_service_invalid_clock_fails_closed_before_schema_write(
         calendar=RecordingConfirmedCalendar({session: "open"}),
         inventory_reader=RecordingInventoryReader(ready_inventory_generation("generation-g1")),
         inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
     )
     lock_path = tmp_path / "locks" / "market-refresh.lock"
     precreate_lock(lock_path)
@@ -2683,3 +2689,329 @@ def test_enqueue_service_rejects_bypassed_completed_scan_without_lock_or_write(
     assert lock_factory.calls == []
     assert store.path.exists() is False
     assert tree_fingerprint(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "preflight_failure",
+    [
+        "invalid_bounds",
+        "unknown_calendar",
+        "calendar_conflict",
+        "corrupt_inventory",
+        "local_mutable",
+    ],
+)
+def test_enqueue_preflight_failure_never_resolves_or_touches_lock_path(
+    tmp_path: Path,
+    preflight_failure: str,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    calendar = RecordingConfirmedCalendar({session: "open"})
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
+    conflict = {"detected": preflight_failure == "calendar_conflict"}
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode=(
+            "local_mutable" if preflight_failure == "local_mutable" else "immutable_dataset"
+        ),
+        calendar_conflict=lambda: conflict["detected"],
+    )
+    if preflight_failure == "unknown_calendar":
+        calendar.statuses[session] = "unknown"
+    elif preflight_failure == "corrupt_inventory":
+        reader.failure = RuntimeError(
+            "token=secret url=https://provider.invalid /private/object.parquet"
+        )
+    lock_path = tmp_path / "runtime" / "locks" / "market-refresh.lock"
+    store = MarketStore(tmp_path / "runtime" / "control" / "market.duckdb")
+    lock_calls = 0
+
+    def reject_lock_resolution(path: Path):
+        nonlocal lock_calls
+        lock_calls += 1
+        raise AssertionError("failed pure preflight must not resolve a lock")
+
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=store,
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=reject_lock_resolution,
+    )
+    before = tree_fingerprint(tmp_path)
+
+    result = service.execute(
+        configured_start=session,
+        requested_start=(
+            session + timedelta(days=1) if preflight_failure == "invalid_bounds" else None
+        ),
+        latest_completed_session=session,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code in {
+        "CONTINUITY_RANGE_INVALID",
+        "CALENDAR_UNAVAILABLE",
+        "CALENDAR_CONFLICT",
+        "MANIFEST_INVENTORY_UNAVAILABLE",
+    }
+    assert lock_calls == 0
+    assert lock_path.exists() is False
+    assert lock_path.parent.exists() is False
+    assert store.path.exists() is False
+    assert tree_fingerprint(tmp_path) == before
+
+
+def test_enqueue_invalid_clock_precedes_preflight_and_leaves_empty_root_untouched(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
+    )
+    lock_path = tmp_path / "runtime" / "locks" / "market-refresh.lock"
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=MarketStore(tmp_path / "runtime" / "control" / "market.duckdb"),
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW.replace(tzinfo=None),
+        lock_factory=lambda path: pytest.fail("invalid clock must precede lock resolution"),
+    )
+    before = tree_fingerprint(tmp_path)
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert reader.calls == []
+    assert lock_path.parent.exists() is False
+    assert tree_fingerprint(tmp_path) == before
+
+
+def test_enqueue_rejects_static_conflict_source_before_lock_or_inventory_read(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+        calendar_conflict=False,
+    )
+    lock_path = tmp_path / "runtime" / "locks" / "market-refresh.lock"
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=MarketStore(tmp_path / "runtime" / "control" / "market.duckdb"),
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=lambda path: pytest.fail("static conflict source must not reach lock"),
+    )
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert scanner.calendar_conflict_is_dynamic is False
+    assert result.status == "unavailable"
+    assert result.reason_code == "CALENDAR_CONFLICT_SOURCE_UNAVAILABLE"
+    assert reader.calls == []
+    assert lock_path.parent.exists() is False
+    assert tree_fingerprint(tmp_path) == ()
+
+
+def test_enqueue_dynamic_conflict_is_read_once_per_scan_and_changes_while_waiting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    conflict = {"detected": False, "calls": 0}
+
+    def conflict_reader() -> bool:
+        conflict["calls"] += 1
+        return bool(conflict["detected"])
+
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+        calendar_conflict=conflict_reader,
+    )
+    lock_path = tmp_path / "locks" / "market-refresh.lock"
+    store = MarketStore(tmp_path / "control" / "market.duckdb")
+    schema_calls = 0
+
+    def reject_schema() -> None:
+        nonlocal schema_calls
+        schema_calls += 1
+
+    monkeypatch.setattr(store, "initialize_continuity_schema", reject_schema)
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=store,
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=HookedRefreshLockFactory(lambda: conflict.__setitem__("detected", True)),
+    )
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert scanner.calendar_conflict_is_dynamic is True
+    assert result.status == "unavailable"
+    assert result.reason_code == "CALENDAR_CONFLICT"
+    assert conflict["calls"] == 2
+    assert reader.calls == ["baostock"]
+    assert schema_calls == 0
+    assert store.path.exists() is False
+    assert lock_path.exists() is True
+
+
+def test_enqueue_dynamic_conflict_reader_exception_is_sanitized_before_lock(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+
+    def broken_conflict_reader() -> bool:
+        raise RuntimeError("token=secret url=https://provider.invalid /private/calendar")
+
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory_generation("generation-g1")),
+        inventory_mode="immutable_dataset",
+        calendar_conflict=broken_conflict_reader,
+    )
+    lock_path = tmp_path / "runtime" / "locks" / "market-refresh.lock"
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=MarketStore(tmp_path / "runtime" / "control" / "market.duckdb"),
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=lambda path: pytest.fail("broken conflict reader must not reach lock"),
+    )
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CALENDAR_UNAVAILABLE"
+    assert "token" not in result.model_dump_json()
+    assert lock_path.parent.exists() is False
+
+
+@pytest.mark.parametrize("failure_stage", ["resolution", "construction", "acquire"])
+def test_enqueue_lock_boundary_exceptions_are_typed_and_sanitized(
+    tmp_path: Path,
+    monkeypatch,
+    failure_stage: str,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory_generation("generation-g1")),
+        inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
+    )
+    raw = "token=secret url=https://provider.invalid /private/lock"
+
+    class BrokenAcquire:
+        def __enter__(self):
+            raise RuntimeError(raw)
+
+        def __exit__(self, *args):
+            return None
+
+    if failure_stage == "resolution":
+        monkeypatch.setattr(
+            module.ContinuityEnqueueService,
+            "_resolve_default_lock",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError(raw))),
+        )
+        lock_factory = None
+    elif failure_stage == "construction":
+
+        def lock_factory(path: Path):
+            raise RuntimeError(raw)
+    else:
+
+        def lock_factory(path: Path):
+            return BrokenAcquire()
+
+    lock_path = tmp_path / "runtime" / "locks" / "market-refresh.lock"
+    store = MarketStore(tmp_path / "runtime" / "control" / "market.duckdb")
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=store,
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=lock_factory,
+    )
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert raw not in result.model_dump_json()
+    assert store.path.exists() is False
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_enqueue_lock_boundary_does_not_swallow_base_exceptions(
+    tmp_path: Path,
+    interrupt: type[BaseException],
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory_generation("generation-g1")),
+        inventory_mode="immutable_dataset",
+        calendar_conflict=lambda: False,
+    )
+
+    def interrupted_lock_factory(path: Path):
+        raise interrupt()
+
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store=MarketStore(tmp_path / "control" / "market.duckdb"),
+        lock_path=tmp_path / "locks" / "market-refresh.lock",
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=interrupted_lock_factory,
+    )
+
+    with pytest.raises(interrupt):
+        service.execute(
+            configured_start=session,
+            latest_completed_session=session,
+        )
