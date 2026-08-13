@@ -809,6 +809,110 @@ def test_existing_writer_schema_first_post_swap_fsync_failure_rolls_back_origina
     assert list(staging.iterdir()) == []
 
 
+def test_existing_writer_schema_rolls_back_same_inode_append_during_exchange_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    target.parent.mkdir()
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+        connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    original_inode = target.stat().st_ino
+    marker = b"final-window-same-inode-marker"
+    real_exchange = MarketStore._atomic_exchange_bound_files
+    exchange_count = 0
+
+    def append_immediately_before_first_exchange(*args, **kwargs):
+        nonlocal exchange_count
+        if exchange_count == 0:
+            descriptor = os.open(target, os.O_WRONLY | os.O_APPEND)
+            try:
+                os.write(descriptor, marker)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            assert target.stat().st_ino == original_inode
+        result = real_exchange(*args, **kwargs)
+        exchange_count += 1
+        return result
+
+    monkeypatch.setattr(
+        MarketStore,
+        "_atomic_exchange_bound_files",
+        staticmethod(append_immediately_before_first_exchange),
+    )
+
+    with pytest.raises(
+        module.RepairQueueConflictError,
+        match="market schema target changed during exchange",
+    ) as exc_info:
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert "uncertain" not in str(exc_info.value)
+    assert exchange_count == 2
+    assert target.stat().st_ino == original_inode
+    assert target.read_bytes().endswith(marker)
+    assert sum(item.stat().st_ino == original_inode for item in tmp_path.rglob("*")) == 1
+    assert list(staging.iterdir()) == []
+
+
+def test_existing_writer_schema_rolls_back_foreign_entry_during_exchange_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = __import__("backend.app.market.continuity", fromlist=["RepairQueueError"])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = tmp_path / "market" / "stock_eva.duckdb"
+    target.parent.mkdir()
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value INTEGER)")
+        connection.execute("INSERT INTO existing_evidence VALUES (7)")
+    original_inode = target.stat().st_ino
+    original_bytes = target.read_bytes()
+    preserved_original = target.with_name("preserved-original.duckdb")
+    foreign = b"final-window-foreign-entry"
+    real_exchange = MarketStore._atomic_exchange_bound_files
+    exchange_count = 0
+    foreign_inode = 0
+
+    def replace_entry_immediately_before_first_exchange(*args, **kwargs):
+        nonlocal exchange_count, foreign_inode
+        if exchange_count == 0:
+            target.rename(preserved_original)
+            target.write_bytes(foreign)
+            foreign_inode = target.stat().st_ino
+        result = real_exchange(*args, **kwargs)
+        exchange_count += 1
+        return result
+
+    monkeypatch.setattr(
+        MarketStore,
+        "_atomic_exchange_bound_files",
+        staticmethod(replace_entry_immediately_before_first_exchange),
+    )
+
+    with pytest.raises(
+        module.RepairQueueConflictError,
+        match="market schema target changed during exchange",
+    ) as exc_info:
+        MarketStore(target).initialize_all_writer_schema(staging_directory=staging)
+
+    assert "uncertain" not in str(exc_info.value)
+    assert exchange_count == 2
+    assert (target.stat().st_ino, target.read_bytes()) == (foreign_inode, foreign)
+    assert (preserved_original.stat().st_ino, preserved_original.read_bytes()) == (
+        original_inode,
+        original_bytes,
+    )
+    assert sum(item.stat().st_ino == original_inode for item in tmp_path.rglob("*")) == 1
+    assert list(staging.iterdir()) == []
+
+
 def test_existing_writer_schema_child_failure_preserves_original_bytes_and_schema(
     tmp_path: Path,
     monkeypatch,

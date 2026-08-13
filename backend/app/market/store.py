@@ -1061,22 +1061,16 @@ class MarketStore:
         database_name: str,
         target_parent_fd: int,
         target_name: str,
-        source_fd: int,
-        source_fingerprint: tuple[int, int, int, int, str],
         migrated_fingerprint: tuple[int, int, int, str],
-    ) -> None:
-        source_portable = _portable_fingerprint(source_fingerprint)
+    ) -> tuple[int, int, int, str]:
         try:
-            if cls._bound_file_fingerprint(source_fd) != source_fingerprint:
-                raise RepairQueueConflictError("market schema original evidence changed")
-            if (
-                _portable_fingerprint(cls._bound_path_fingerprint(target_parent_fd, target_name))
-                != migrated_fingerprint
-                or _portable_fingerprint(
-                    cls._bound_path_fingerprint(staging_root_fd, database_name)
-                )
-                != source_portable
-            ):
+            target_fingerprint = _portable_fingerprint(
+                cls._bound_path_fingerprint(target_parent_fd, target_name)
+            )
+            displaced_fingerprint = _portable_fingerprint(
+                cls._bound_path_fingerprint(staging_root_fd, database_name)
+            )
+            if target_fingerprint != migrated_fingerprint:
                 raise RepairQueueConflictError("market schema exchange cannot be rolled back")
             cls._atomic_exchange_bound_files(
                 staging_root_fd,
@@ -1084,11 +1078,9 @@ class MarketStore:
                 target_parent_fd,
                 target_name,
             )
-            if cls._bound_file_fingerprint(source_fd) != source_fingerprint:
-                raise RepairQueueConflictError("market schema original evidence changed")
             if (
                 _portable_fingerprint(cls._bound_path_fingerprint(target_parent_fd, target_name))
-                != source_portable
+                != displaced_fingerprint
                 or _portable_fingerprint(
                     cls._bound_path_fingerprint(staging_root_fd, database_name)
                 )
@@ -1096,6 +1088,7 @@ class MarketStore:
             ):
                 raise RepairQueueConflictError("market schema exchange rollback changed")
             os.fsync(target_parent_fd)
+            return displaced_fingerprint
         except (OSError, RepairQueueError):
             raise RepairQueueConflictError("market schema exchange recovery is uncertain") from None
 
@@ -1256,14 +1249,15 @@ class MarketStore:
                             database_name=_SCHEMA_MIGRATION_DATABASE,
                             target_parent_fd=target_parent_fd,
                             target_name=self.path.name,
-                            source_fd=source_fd,
-                            source_fingerprint=source_fingerprint,
                             migrated_fingerprint=migrated_fingerprint,
                         )
                     except RepairQueueError:
                         registered.clear()
                         raise
                     registered[_SCHEMA_MIGRATION_DATABASE] = migrated_fingerprint
+                    raise RepairQueueConflictError(
+                        "market schema target changed during exchange"
+                    ) from None
                 raise
             registered[_SCHEMA_MIGRATION_DATABASE] = _portable_fingerprint(source_fingerprint)
         finally:
