@@ -14,6 +14,7 @@ from backend.app import cli
 from backend.app.api.market import get_market_store
 from backend.app.config import Settings
 from backend.app.main import app
+from backend.app.market.calendar import CalendarConfig, TradingCalendar
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.service import MarketSummaryService
@@ -164,6 +165,20 @@ def _dataset_fingerprint(root: Path) -> tuple[tuple[str, str, int, int], ...]:
         stat = path.stat()
         entries.append((relative, digest, stat.st_size, stat.st_mtime_ns))
     return tuple(entries)
+
+
+def _confirmed_calendar_2026() -> TradingCalendar:
+    return TradingCalendar(
+        [
+            CalendarConfig(
+                year=2026,
+                status="confirmed",
+                published_on=date(2025, 12, 31),
+                sources=[],
+                closed_dates=[],
+            )
+        ]
+    )
 
 
 def _replace_manifest_partition_from_query(
@@ -380,6 +395,106 @@ def test_verified_ready_inventory_accepts_valid_empty_manifest(tmp_path: Path) -
 
     assert inventory.status == "ready"
     assert inventory.sessions == ()
+
+
+def test_continuity_scan_treats_valid_empty_manifest_as_all_open_sessions_missing(
+    tmp_path: Path,
+) -> None:
+    from backend.app.market import continuity
+
+    root = _root(tmp_path)
+    control_path = tmp_path / "control" / "market.duckdb"
+    store = NasMarketStore(MarketStore(control_path), root, tmp_path / "staging")
+    scanner = continuity.ContinuityInventory(
+        calendar=_confirmed_calendar_2026(),
+        inventory_reader=store,
+        inventory_mode="immutable_dataset",
+    )
+    before = _dataset_fingerprint(tmp_path)
+
+    result = scanner.scan(
+        configured_start=date(2026, 7, 20),
+        latest_completed_session=date(2026, 7, 24),
+    )
+
+    assert result.status == "gaps"
+    assert result.manifest_generation == "generation-empty"
+    assert result.confirmed_open_sessions == tuple(date(2026, 7, day) for day in range(20, 25))
+    assert result.published_ready_sessions == ()
+    assert result.missing_sessions == result.confirmed_open_sessions
+    assert result.writes_control_state is False
+    assert result.provider_requests == 0
+    assert control_path.exists() is False
+    assert _dataset_fingerprint(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_object",
+        "wrong_hash",
+        "wrong_row_count",
+        "wrong_schema",
+        "unsafe_path",
+        "malformed_manifest",
+    ],
+)
+def test_continuity_scan_rejects_corrupt_strict_inventory_before_writer_construction(
+    tmp_path: Path,
+    monkeypatch,
+    corruption: str,
+) -> None:
+    from backend.app.market import continuity
+
+    root = _root(tmp_path)
+    control = MarketStore(tmp_path / "control" / "market.duckdb")
+    store = NasMarketStore(control, root, tmp_path / "staging")
+    store.save_refresh(_bars(), _ready_result(), publish=True)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    published = root / manifest["files"][0]["path"]
+    if corruption == "missing_object":
+        published.unlink()
+    elif corruption == "wrong_hash":
+        published.write_bytes(b"corrupt-object")
+    elif corruption == "wrong_row_count":
+        manifest["files"][0]["row_count"] += 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif corruption == "wrong_schema":
+        _replace_manifest_partition_from_query(
+            root,
+            name="continuity-wrong-schema",
+            query="SELECT 1 AS wrong_column FROM read_parquet(?, hive_partitioning=false)",
+        )
+    elif corruption == "unsafe_path":
+        manifest["files"][0]["path"] = "../outside.parquet"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        manifest_path.write_text("{malformed", encoding="utf-8")
+
+    writer_calls = 0
+
+    def reject_writer_construction(*args, **kwargs):
+        nonlocal writer_calls
+        writer_calls += 1
+        raise AssertionError("continuity scanner must not construct a writer")
+
+    monkeypatch.setattr(MarketStore, "__init__", reject_writer_construction)
+    scanner = continuity.ContinuityInventory(
+        calendar=_confirmed_calendar_2026(),
+        inventory_reader=store,
+        inventory_mode="immutable_dataset",
+    )
+    before = _dataset_fingerprint(tmp_path)
+
+    result = scanner.scan(
+        configured_start=date(2026, 7, 23),
+        latest_completed_session=date(2026, 7, 23),
+    )
+
+    assert result == continuity.ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+    assert writer_calls == 0
+    assert _dataset_fingerprint(tmp_path) == before
 
 
 def test_verified_ready_inventory_rejects_symlink_escape_without_writes(

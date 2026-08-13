@@ -1,6 +1,6 @@
 import re
 from datetime import UTC, date, datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol
 
 from pydantic import (
     AfterValidator,
@@ -12,11 +12,21 @@ from pydantic import (
 )
 
 from backend.app.market.failures import MarketFailureClass, MarketFailureStage
+from backend.app.storage.models import VerifiedReadySessionInventory
 
 RepairJobState = Literal["pending", "leased", "retry_wait", "published", "dead_letter"]
 RepairAttemptOutcome = Literal["running", "succeeded", "failed", "abandoned"]
 RepairFinalizationOutcome = Literal["succeeded", "failed"]
 ContinuityControlReason = Literal["CONTROL_STATE_UNAVAILABLE"]
+ContinuityUnavailableReason = Literal[
+    "CONTINUITY_START_UNCONFIGURED",
+    "CONTINUITY_RANGE_INVALID",
+    "CALENDAR_UNAVAILABLE",
+    "CALENDAR_CONFLICT",
+    "MANIFEST_INVENTORY_UNAVAILABLE",
+    "IMMUTABLE_OBJECT_INVALID",
+]
+ContinuityInventoryMode = Literal["immutable_dataset", "local_mutable"]
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _R2F1_UNIVERSE_ID = "all-main-board"
@@ -28,6 +38,177 @@ class RepairQueueError(RuntimeError):
 
 class RepairQueueConflictError(RepairQueueError):
     """A stale lease or state version failed its compare-and-swap."""
+
+
+class ContinuityScanResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["current", "gaps"]
+    effective_start: date
+    effective_end: date
+    manifest_generation: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    confirmed_open_sessions: tuple[date, ...]
+    published_ready_sessions: tuple[date, ...]
+    missing_sessions: tuple[date, ...]
+    writes_control_state: Literal[False] = False
+    provider_requests: Literal[0] = 0
+
+    @field_validator(
+        "confirmed_open_sessions",
+        "published_ready_sessions",
+        "missing_sessions",
+    )
+    @classmethod
+    def require_sorted_unique_dates(cls, value: tuple[date, ...]) -> tuple[date, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("continuity sessions must be sorted and unique")
+        return value
+
+    @model_validator(mode="after")
+    def valid_scan_shape(self) -> "ContinuityScanResult":
+        if self.effective_start > self.effective_end:
+            raise ValueError("continuity range is invalid")
+        for sessions in (
+            self.confirmed_open_sessions,
+            self.published_ready_sessions,
+            self.missing_sessions,
+        ):
+            if any(
+                session < self.effective_start or session > self.effective_end
+                for session in sessions
+            ):
+                raise ValueError("continuity session falls outside the effective range")
+        published = set(self.published_ready_sessions)
+        expected_missing = tuple(
+            session for session in self.confirmed_open_sessions if session not in published
+        )
+        if self.missing_sessions != expected_missing:
+            raise ValueError("continuity missing sessions do not match verified evidence")
+        if (self.status == "gaps") != bool(self.missing_sessions):
+            raise ValueError("continuity status does not match the gap set")
+        return self
+
+
+class ContinuityUnavailable(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["unavailable"] = "unavailable"
+    reason_code: ContinuityUnavailableReason
+    writes_control_state: Literal[False] = False
+    provider_requests: Literal[0] = 0
+
+
+class ConfirmedCalendarReader(Protocol):
+    @property
+    def status(self) -> Literal["confirmed", "unavailable"]: ...
+
+    def confirmed_open_sessions(self, start: date, end: date) -> tuple[date, ...] | None: ...
+
+
+class VerifiedInventoryReader(Protocol):
+    def verified_ready_session_inventory(
+        self,
+        source: Literal["baostock"] = "baostock",
+    ) -> VerifiedReadySessionInventory: ...
+
+
+class ContinuityInventory:
+    """Pure confirmed-calendar minus verified immutable-manifest scanner."""
+
+    def __init__(
+        self,
+        *,
+        calendar: ConfirmedCalendarReader,
+        inventory_reader: VerifiedInventoryReader,
+        inventory_mode: ContinuityInventoryMode,
+        calendar_conflict: bool = False,
+    ) -> None:
+        self._calendar = calendar
+        self._inventory_reader = inventory_reader
+        self._inventory_mode = inventory_mode
+        self._calendar_conflict = calendar_conflict
+
+    def scan(
+        self,
+        *,
+        configured_start: date | None,
+        latest_completed_session: date | None,
+        requested_start: date | None = None,
+        requested_end: date | None = None,
+    ) -> ContinuityScanResult | ContinuityUnavailable:
+        if configured_start is None:
+            return ContinuityUnavailable(reason_code="CONTINUITY_START_UNCONFIGURED")
+        if not self._valid_date(configured_start) or not self._valid_date(latest_completed_session):
+            return ContinuityUnavailable(reason_code="CONTINUITY_RANGE_INVALID")
+        if requested_start is not None and not self._valid_date(requested_start):
+            return ContinuityUnavailable(reason_code="CONTINUITY_RANGE_INVALID")
+        if requested_end is not None and not self._valid_date(requested_end):
+            return ContinuityUnavailable(reason_code="CONTINUITY_RANGE_INVALID")
+
+        effective_start = requested_start or configured_start
+        effective_end = requested_end or latest_completed_session
+        if (
+            configured_start > latest_completed_session
+            or effective_start < configured_start
+            or effective_end > latest_completed_session
+            or effective_start > effective_end
+        ):
+            return ContinuityUnavailable(reason_code="CONTINUITY_RANGE_INVALID")
+        if self._inventory_mode != "immutable_dataset":
+            return ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+        try:
+            if self._calendar_conflict:
+                return ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
+            if self._calendar.status != "confirmed":
+                return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+            confirmed_open = self._calendar.confirmed_open_sessions(
+                effective_start,
+                effective_end,
+            )
+        except Exception:
+            return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        day_count = (effective_end - effective_start).days + 1
+        if (
+            confirmed_open is None
+            or not isinstance(confirmed_open, tuple)
+            or len(confirmed_open) > day_count
+            or any(not self._valid_date(session) for session in confirmed_open)
+            or tuple(sorted(set(confirmed_open))) != confirmed_open
+            or any(
+                session < effective_start or session > effective_end for session in confirmed_open
+            )
+        ):
+            return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        try:
+            inventory = self._inventory_reader.verified_ready_session_inventory("baostock")
+            inventory = VerifiedReadySessionInventory.model_validate(
+                inventory.model_dump(mode="python")
+            )
+        except Exception:
+            return ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+
+        ready_in_range = tuple(
+            session for session in inventory.sessions if effective_start <= session <= effective_end
+        )
+        ready_set = set(ready_in_range)
+        missing = tuple(session for session in confirmed_open if session not in ready_set)
+        return ContinuityScanResult(
+            status="gaps" if missing else "current",
+            effective_start=effective_start,
+            effective_end=effective_end,
+            manifest_generation=inventory.manifest_generation,
+            confirmed_open_sessions=confirmed_open,
+            published_ready_sessions=ready_in_range,
+            missing_sessions=missing,
+        )
+
+    @staticmethod
+    def _valid_date(value: object) -> bool:
+        return isinstance(value, date) and not isinstance(value, datetime)
 
 
 def require_utc(value: datetime) -> datetime:

@@ -11,8 +11,10 @@ from pydantic import ValidationError
 import backend.app.market.store as market_store_module
 from backend.app.config import Settings
 from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
+from backend.app.market.calendar import CalendarConfig, TradingCalendar
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.storage.models import VerifiedReadySessionInventory
 
 NOW = datetime(2026, 8, 13, 4, 0, tzinfo=UTC)
 UNIVERSE_ID = "all-main-board"
@@ -126,6 +128,77 @@ def ready_refresh(trade_date: date, *, started_at: datetime = NOW) -> RefreshRes
 def file_fingerprint(path: Path) -> tuple[int, int, str]:
     stat = path.stat()
     return stat.st_size, stat.st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tree_fingerprint(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    entries: list[tuple[str, str, int, int]] = []
+    for path in sorted(root.rglob("*")):
+        stat = path.stat()
+        relative = str(path.relative_to(root))
+        if path.is_dir():
+            entries.append((relative, "directory", 0, stat.st_mtime_ns))
+        else:
+            entries.append(
+                (
+                    relative,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                )
+            )
+    return tuple(entries)
+
+
+class RecordingInventoryReader:
+    def __init__(
+        self,
+        inventory: VerifiedReadySessionInventory | None = None,
+        *,
+        failure: Exception | None = None,
+    ) -> None:
+        self.inventory = inventory
+        self.failure = failure
+        self.calls: list[str] = []
+
+    def verified_ready_session_inventory(
+        self,
+        source: str = "baostock",
+    ) -> VerifiedReadySessionInventory:
+        self.calls.append(source)
+        if self.failure is not None:
+            raise self.failure
+        assert self.inventory is not None
+        return self.inventory
+
+
+class RecordingConfirmedCalendar:
+    status = "confirmed"
+
+    def __init__(self, statuses: dict[date, str]) -> None:
+        self.statuses = statuses
+        self.calls: list[tuple[date, date]] = []
+
+    def confirmed_open_sessions(self, start: date, end: date) -> tuple[date, ...] | None:
+        self.calls.append((start, end))
+        current = start
+        opened: list[date] = []
+        while current <= end:
+            status = self.statuses.get(current, "unknown")
+            if status == "unknown":
+                return None
+            if status == "open":
+                opened.append(current)
+            current += timedelta(days=1)
+        return tuple(opened)
+
+
+def ready_inventory(*sessions: date) -> VerifiedReadySessionInventory:
+    return VerifiedReadySessionInventory(
+        manifest_generation="generation-task3",
+        manifest_identity="a" * 64,
+        sessions=tuple(sorted(sessions)),
+        verified_at=NOW,
+    )
 
 
 def create_task2_continuity_tables(
@@ -1755,3 +1828,311 @@ def test_typed_contracts_reject_unknown_fields_unsafe_ids_and_naive_times() -> N
         )
     with pytest.raises(ValidationError):
         module.RepairJob(**{**valid, "created_at": NOW.replace(tzinfo=None)})
+
+
+def test_scan_is_confirmed_open_minus_strict_noncontiguous_inventory() -> None:
+    module = continuity_module()
+    sessions = tuple(date(2026, 8, day) for day in range(3, 8))
+    calendar = RecordingConfirmedCalendar({session: "open" for session in sessions})
+    reader = RecordingInventoryReader(ready_inventory(sessions[0], sessions[2], sessions[4]))
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+    )
+
+    assert result == module.ContinuityScanResult(
+        status="gaps",
+        effective_start=sessions[0],
+        effective_end=sessions[-1],
+        manifest_generation="generation-task3",
+        confirmed_open_sessions=sessions,
+        published_ready_sessions=(sessions[0], sessions[2], sessions[4]),
+        missing_sessions=(sessions[1], sessions[3]),
+    )
+    assert calendar.calls == [(sessions[0], sessions[-1])]
+    assert reader.calls == ["baostock"]
+    assert result.writes_control_state is False
+    assert result.provider_requests == 0
+    assert set(result.model_dump()) == {
+        "status",
+        "effective_start",
+        "effective_end",
+        "manifest_generation",
+        "confirmed_open_sessions",
+        "published_ready_sessions",
+        "missing_sessions",
+        "writes_control_state",
+        "provider_requests",
+    }
+    with pytest.raises(ValidationError, match="frozen"):
+        result.missing_sessions = ()
+    with pytest.raises(ValidationError):
+        module.ContinuityScanResult(**result.model_dump(), payload="forbidden")
+
+
+def test_scan_uses_one_narrow_calendar_query_and_filters_out_of_range_ready_dates() -> None:
+    module = continuity_module()
+    configured = date(2026, 8, 3)
+    requested_start = date(2026, 8, 4)
+    requested_end = date(2026, 8, 6)
+    latest = date(2026, 8, 7)
+    calendar = RecordingConfirmedCalendar(
+        {
+            date(2026, 8, 4): "open",
+            date(2026, 8, 5): "closed",
+            date(2026, 8, 6): "open",
+        }
+    )
+    reader = RecordingInventoryReader(
+        ready_inventory(
+            date(2026, 8, 3),
+            date(2026, 8, 4),
+            date(2026, 8, 5),
+            date(2026, 8, 7),
+        )
+    )
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=configured,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        latest_completed_session=latest,
+    )
+
+    assert result.status == "gaps"
+    assert result.effective_start == requested_start
+    assert result.effective_end == requested_end
+    assert result.confirmed_open_sessions == (date(2026, 8, 4), date(2026, 8, 6))
+    assert result.published_ready_sessions == (date(2026, 8, 4), date(2026, 8, 5))
+    assert result.missing_sessions == (date(2026, 8, 6),)
+    assert calendar.calls == [(requested_start, requested_end)]
+    assert reader.calls == ["baostock"]
+
+
+def test_scan_is_current_when_every_confirmed_open_session_is_verified_ready() -> None:
+    module = continuity_module()
+    sessions = (date(2026, 8, 3), date(2026, 8, 4))
+    calendar = RecordingConfirmedCalendar({session: "open" for session in sessions})
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=RecordingInventoryReader(ready_inventory(*sessions)),
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+    )
+
+    assert result.status == "current"
+    assert result.missing_sessions == ()
+
+
+def test_unknown_calendar_day_rejects_the_entire_scan_before_inventory() -> None:
+    module = continuity_module()
+    sessions = tuple(date(2026, 8, day) for day in range(3, 6))
+    calendar = RecordingConfirmedCalendar(
+        {sessions[0]: "open", sessions[1]: "unknown", sessions[2]: "open"}
+    )
+    reader = RecordingInventoryReader(ready_inventory(sessions[0], sessions[2]))
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+    assert calendar.calls == [(sessions[0], sessions[-1])]
+    assert reader.calls == []
+
+
+@pytest.mark.parametrize(
+    ("configured_start", "requested_start", "requested_end", "latest", "reason"),
+    [
+        (None, None, None, date(2026, 8, 7), "CONTINUITY_START_UNCONFIGURED"),
+        (
+            date(2026, 8, 8),
+            None,
+            None,
+            date(2026, 8, 7),
+            "CONTINUITY_RANGE_INVALID",
+        ),
+        (
+            date(2026, 8, 3),
+            date(2026, 8, 2),
+            None,
+            date(2026, 8, 7),
+            "CONTINUITY_RANGE_INVALID",
+        ),
+        (
+            date(2026, 8, 3),
+            None,
+            date(2026, 8, 8),
+            date(2026, 8, 7),
+            "CONTINUITY_RANGE_INVALID",
+        ),
+        (
+            date(2026, 8, 3),
+            date(2026, 8, 6),
+            date(2026, 8, 5),
+            date(2026, 8, 7),
+            "CONTINUITY_RANGE_INVALID",
+        ),
+        (
+            date(2026, 8, 3),
+            None,
+            None,
+            None,
+            "CONTINUITY_RANGE_INVALID",
+        ),
+    ],
+)
+def test_scan_rejects_unconfigured_or_expanded_ranges_before_any_reader(
+    configured_start: date | None,
+    requested_start: date | None,
+    requested_end: date | None,
+    latest: date | None,
+    reason: str,
+) -> None:
+    module = continuity_module()
+    calendar = RecordingConfirmedCalendar({})
+    reader = RecordingInventoryReader(ready_inventory())
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=configured_start,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        latest_completed_session=latest,
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code=reason)
+    assert calendar.calls == []
+    assert reader.calls == []
+
+
+def test_unknown_calendar_day_rejects_complete_scan_without_writes(tmp_path: Path) -> None:
+    module = continuity_module()
+    calendar = TradingCalendar(
+        [
+            CalendarConfig(
+                year=2026,
+                status="confirmed",
+                published_on=date(2025, 12, 31),
+                sources=[],
+                closed_dates=[],
+            )
+        ]
+    )
+    reader = RecordingInventoryReader(ready_inventory(date(2026, 12, 31)))
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+    (tmp_path / "control.duckdb").write_bytes(b"unchanged-control")
+    (tmp_path / "pointer.json").write_bytes(b"unchanged-pointer")
+    before = tree_fingerprint(tmp_path)
+
+    result = scanner.scan(
+        configured_start=date(2026, 12, 31),
+        latest_completed_session=date(2027, 1, 4),
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+    assert reader.calls == []
+    assert tree_fingerprint(tmp_path) == before
+
+
+def test_calendar_conflict_rejects_complete_scan_before_calendar_or_inventory() -> None:
+    module = continuity_module()
+    calendar = RecordingConfirmedCalendar({date(2026, 8, 3): "open"})
+    reader = RecordingInventoryReader(ready_inventory())
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+        calendar_conflict=True,
+    )
+
+    result = scanner.scan(
+        configured_start=date(2026, 8, 3),
+        latest_completed_session=date(2026, 8, 3),
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
+    assert calendar.calls == []
+    assert reader.calls == []
+
+
+def test_local_mutable_inventory_is_unavailable_and_never_read() -> None:
+    module = continuity_module()
+    calendar = RecordingConfirmedCalendar({date(2026, 8, 3): "open"})
+    reader = RecordingInventoryReader(
+        failure=AssertionError("local mutable history must not be read")
+    )
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="local_mutable",
+    )
+
+    result = scanner.scan(
+        configured_start=date(2026, 8, 3),
+        latest_completed_session=date(2026, 8, 3),
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+    assert calendar.calls == []
+    assert reader.calls == []
+
+
+def test_inventory_failure_is_sanitized_and_preserves_full_tree(tmp_path: Path) -> None:
+    module = continuity_module()
+    raw_error = "token=secret url=https://provider.invalid /private/raw-manifest.json"
+    calendar = RecordingConfirmedCalendar({date(2026, 8, 3): "open"})
+    reader = RecordingInventoryReader(failure=RuntimeError(raw_error))
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+    (tmp_path / "market.duckdb").write_bytes(b"unchanged")
+    before = tree_fingerprint(tmp_path)
+
+    result = scanner.scan(
+        configured_start=date(2026, 8, 3),
+        latest_completed_session=date(2026, 8, 3),
+    )
+
+    assert result == module.ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+    payload = result.model_dump(mode="json")
+    assert set(payload) == {"status", "reason_code", "writes_control_state", "provider_requests"}
+    assert raw_error not in str(payload)
+    assert "token" not in payload
+    assert "url" not in payload
+    assert "path" not in payload
+    assert "exception" not in payload
+    assert calendar.calls == [(date(2026, 8, 3), date(2026, 8, 3))]
+    assert reader.calls == ["baostock"]
+    assert tree_fingerprint(tmp_path) == before

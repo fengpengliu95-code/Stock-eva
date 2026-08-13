@@ -61,6 +61,19 @@ class TradingCalendar:
             return "closed"
         return "open"
 
+    def confirmed_open_sessions(self, start: date, end: date) -> tuple[date, ...] | None:
+        """Return inclusive confirmed opens, or no result if any day is unknown."""
+        current = start
+        opened: list[date] = []
+        while current <= end:
+            status = self.session_status(current)
+            if status == "unknown":
+                return None
+            if status == "open":
+                opened.append(current)
+            current += timedelta(days=1)
+        return tuple(opened)
+
     def previous_session(self, value: date) -> date | None:
         current = value - timedelta(days=1)
         for _ in range(370):
