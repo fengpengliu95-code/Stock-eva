@@ -13,11 +13,12 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market.baostock import INDEX_SYMBOLS
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
+from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
 from backend.app.market.failures import (
     MarketFailure,
     legacy_failure_quality_issues,
@@ -132,13 +133,30 @@ class ScheduleDecision(BaseModel):
 
 
 class AutomationOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     decision: ScheduleDecision
     state: SchedulerState
     result: RefreshResult | None = None
-    # Repair execution is continuity evidence, not a freshness scheduler result.  Keep it
-    # additive so legacy callers can continue reading ``result`` while the scheduler state
-    # remains owned exclusively by the freshness lane.
-    continuity_result: object | None = None
+    # Repair execution is continuity evidence, not a freshness scheduler result.  The field is
+    # omitted when absent so the pre-R2-F1 JSON contract remains byte-for-byte compatible.
+    continuity_result: RepairExecutionResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def valid_lane_shape(self) -> "AutomationOutcome":
+        if self.continuity_result is not None:
+            if self.result is not None:
+                raise ValueError("repair evidence cannot populate freshness result")
+            if self.continuity_result.decision.lane != "repair":
+                raise ValueError("continuity result must use repair decision lane")
+            if self.continuity_result.status == "skipped":
+                raise ValueError("skipped continuity evidence is not a public repair result")
+        if self.result is not None and self.result.run_kind == "repair":
+            raise ValueError("repair refresh result must use continuity_result")
+        return self
 
 
 class ProviderProbeRunner(Protocol):
@@ -155,7 +173,7 @@ class ContinuityCoordinator(Protocol):
         now: datetime,
         revalidator: Callable[[], ScheduleDecision],
         lease_consumer: None,
-    ) -> object: ...
+    ) -> ContinuityDecision: ...
 
 
 class BaoStockProbeRunner:
@@ -573,8 +591,8 @@ class MarketAutomationService:
         self.continuity = continuity
         self.repair_enabled = repair_enabled
         self.repair_executor = repair_executor
-        self.last_continuity_decision: object | None = None
-        self.last_repair_result: object | None = None
+        self.last_continuity_decision: ContinuityDecision | None = None
+        self.last_repair_result: RepairExecutionResult | None = None
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -596,11 +614,10 @@ class MarketAutomationService:
         )
         repair_result = self._plan_continuity(decision, local)
         if repair_result is not None and repair_result.status != "skipped":
-            result = repair_result.refresh_result
             # A repair must never rewrite the daily freshness state.  Return the prior
             # state (or an unsaved projection when no state exists) and expose repair evidence
-            # on its dedicated continuity field.  The legacy ``result`` field is retained for
-            # compatibility with callers that already display the refresh audit.
+            # only on its dedicated continuity field.  ``result`` remains exclusively owned by
+            # the freshness lane, preserving the pre-R2-F1 consumer contract.
             state = current or SchedulerState(
                 target_session=decision.target_session,
                 refresh_state=decision.refresh_state,
@@ -609,7 +626,6 @@ class MarketAutomationService:
             return AutomationOutcome(
                 decision=decision,
                 state=state,
-                result=result,
                 continuity_result=repair_result,
             )
         if decision.action != "run":

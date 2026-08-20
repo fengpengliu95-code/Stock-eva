@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import httpx
 import pytest
+from pydantic import ValidationError
 
 import backend.app.cli as cli
 import backend.app.market.store as market_store_module
@@ -350,7 +351,9 @@ def test_automation_executes_one_repair_result_without_entering_freshness_lane(
 
     outcome = service.run_due_once(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI))
 
-    assert outcome.result == refresh
+    assert outcome.result is None
+    assert outcome.continuity_result is not None
+    assert outcome.continuity_result.refresh_result == refresh
     assert outcome.state.refresh_state == "success"
     assert provider.fetch_calls == provider.calendar_calls == 0
 
@@ -459,6 +462,225 @@ def test_repair_outcome_is_continuity_only_and_preserves_freshness_retry_state(
     assert second.decision.action == "run"
     assert second.state.refresh_state == "success"
     assert provider.fetch_calls == 1
+
+
+def _typed_repair_decision(
+    *,
+    target: date,
+    action: str = "run",
+    lane: str = "repair",
+    reason_code: str = "REPAIR_CLAIMED",
+    next_run_at: datetime | None = None,
+) -> ContinuityDecision:
+    return ContinuityDecision(
+        action=action,
+        lane=lane,
+        target_session=target,
+        repair_job_id=(f"repair:{target.isoformat()}:all-main-board" if lane == "repair" else None),
+        next_run_at=next_run_at,
+        reason_code=reason_code,
+    )
+
+
+def _typed_repair_refresh(
+    *,
+    target: date,
+    status: str = "ready",
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> RefreshResult:
+    started_at = started_at or datetime(2026, 8, 20, 10, tzinfo=UTC)
+    completed_at = completed_at or datetime(2026, 8, 20, 10, 1, tzinfo=UTC)
+    ready = status == "ready"
+    return RefreshResult(
+        run_id=f"repair-{target.isoformat()}-attempt-1",
+        request_key=f"repair:baostock:{target.isoformat()}:all-main-board",
+        run_kind="repair",
+        requested_date=target,
+        source="baostock",
+        status=status,
+        requested_count=1,
+        succeeded_count=1 if ready else 0,
+        coverage_ratio=1 if ready else 0,
+        failed_symbols=[] if ready else ["sh.600000"],
+        quality_issues=[] if ready else ["provider_error"],
+        error_message=None if ready else "market refresh failed",
+        failure_stage=None if ready else "fetch",
+        failure_class=None if ready else "transport_timeout",
+        retryable=None if ready else True,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+
+
+def test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field() -> None:
+    module = load_module("backend.app.market.automation")
+    decision = module.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = module.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    legacy = module.AutomationOutcome(decision=decision, state=state)
+
+    assert legacy.model_dump(mode="json") == {
+        "decision": decision.model_dump(mode="json"),
+        "state": state.model_dump(mode="json"),
+        "result": None,
+    }
+    assert "continuity_result" not in legacy.model_dump_json()
+    with pytest.raises(ValidationError):
+        module.AutomationOutcome(
+            decision=decision,
+            state=state,
+            continuity_result={"status": "published"},
+        )
+
+
+def test_automation_outcome_repair_is_not_a_freshness_result() -> None:
+    automation = load_module("backend.app.market.automation")
+    target = date(2026, 8, 19)
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    repair = RepairExecutionResult(
+        status="published",
+        decision=_typed_repair_decision(target=target),
+        refresh_result=_typed_repair_refresh(target=target),
+        reason_code="REPAIR_PUBLISHED",
+        provider_requests=1,
+    )
+    outcome = automation.AutomationOutcome(
+        decision=decision,
+        state=state,
+        continuity_result=repair,
+    )
+
+    assert outcome.result is None
+    assert outcome.continuity_result == repair
+    assert outcome.model_dump(mode="json")["continuity_result"]["status"] == "published"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"provider_requests": True},
+        {
+            "status": "published",
+            "refresh_result": _typed_repair_refresh(target=date(2026, 8, 19), status="partial"),
+        },
+        {"status": "failed", "refresh_result": _typed_repair_refresh(target=date(2026, 8, 19))},
+        {"status": "skipped", "provider_requests": 1},
+        {
+            "status": "skipped",
+            "refresh_result": _typed_repair_refresh(target=date(2026, 8, 19), status="partial"),
+        },
+        {
+            "status": "failed",
+            "decision": _typed_repair_decision(
+                target=date(2026, 8, 19),
+                lane="freshness",
+                reason_code="FRESHNESS_WAIT",
+                action="wait",
+                next_run_at=datetime(2026, 8, 20, 11, tzinfo=UTC),
+            ),
+        },
+        {
+            "status": "published",
+            "refresh_result": _typed_repair_refresh(target=date(2026, 8, 19)).model_copy(
+                update={"request_key": "repair:baostock:2026-08-20:all-main-board"}
+            ),
+        },
+        {
+            "status": "published",
+            "refresh_result": _typed_repair_refresh(
+                target=date(2026, 8, 19), completed_at=datetime(2026, 8, 20, 9, tzinfo=UTC)
+            ),
+        },
+    ],
+    ids=[
+        "bool-provider-request",
+        "published-partial",
+        "failed-ready",
+        "skipped-provider-request",
+        "skipped-refresh-result",
+        "failed-freshness-decision",
+        "request-key-mismatch",
+        "refresh-time-order",
+    ],
+)
+def test_repair_execution_result_rejects_illegal_status_matrix(updates: dict[str, object]) -> None:
+    target = date(2026, 8, 19)
+    payload: dict[str, object] = {
+        "status": "published",
+        "decision": _typed_repair_decision(target=target),
+        "refresh_result": _typed_repair_refresh(target=target),
+        "reason_code": "REPAIR_PUBLISHED",
+        "provider_requests": 1,
+    }
+    payload.update(updates)
+    with pytest.raises(ValidationError):
+        RepairExecutionResult.model_validate(payload)
+
+
+def test_repair_execution_result_roundtrip_revalidates_model_copy_contradiction() -> None:
+    target = date(2026, 8, 19)
+    valid = RepairExecutionResult(
+        status="published",
+        decision=_typed_repair_decision(target=target),
+        refresh_result=_typed_repair_refresh(target=target),
+        reason_code="REPAIR_PUBLISHED",
+        provider_requests=1,
+    )
+    bypassed = valid.model_copy(update={"status": "skipped", "provider_requests": 0})
+    with pytest.raises(ValidationError):
+        RepairExecutionResult.model_validate(bypassed.model_dump(mode="python"))
+
+
+def test_cli_automation_payload_is_typed_and_preserves_legacy_shape() -> None:
+    automation = load_module("backend.app.market.automation")
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    legacy = automation.AutomationOutcome(decision=decision, state=state)
+    payload = cli._automation_outcome_payload(legacy)
+    assert set(payload) == {"decision", "state", "result"}
+    assert payload["result"] is None
+    repair = RepairExecutionResult(
+        status="published",
+        decision=_typed_repair_decision(target=date(2026, 8, 19)),
+        refresh_result=_typed_repair_refresh(target=date(2026, 8, 19)),
+        reason_code="REPAIR_PUBLISHED",
+        provider_requests=1,
+    )
+    repaired = automation.AutomationOutcome(
+        decision=decision,
+        state=state,
+        continuity_result=repair,
+    )
+    repair_payload = cli._automation_outcome_payload(repaired)
+    assert set(repair_payload) == {"decision", "state", "result", "continuity_result"}
+    assert repair_payload["result"] is None
+    assert repair_payload["continuity_result"]["status"] == "published"
+    serialized = json.dumps(repair_payload)
+    assert "path" not in serialized
+    assert "token" not in serialized
+    assert "url" not in serialized
 
 
 class HealthClock:

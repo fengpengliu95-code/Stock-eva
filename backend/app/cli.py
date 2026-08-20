@@ -17,6 +17,7 @@ from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.config import get_settings
 from backend.app.market.automation import (
+    AutomationOutcome,
     BaoStockProbeRunner,
     MarketAutomationService,
     RefreshAlreadyRunning,
@@ -104,6 +105,30 @@ def _provider_health_payload(health: ProviderHealth) -> dict[str, object]:
             if item.cooldown_until is not None
         },
     }
+
+
+def _automation_outcome_payload(outcome: AutomationOutcome) -> dict[str, object]:
+    """Serialize only the stable, typed automation contract for CLI consumers."""
+    payload: dict[str, object] = {
+        "decision": outcome.decision.model_dump(mode="json"),
+        "state": outcome.state.model_dump(mode="json"),
+        # ``result`` is a legacy freshness field and intentionally remains present as null.
+        "result": outcome.result.model_dump(mode="json") if outcome.result is not None else None,
+    }
+    repair = outcome.continuity_result
+    if repair is not None:
+        payload["continuity_result"] = {
+            "status": repair.status,
+            "decision": repair.decision.model_dump(mode="json"),
+            "refresh_result": (
+                repair.refresh_result.model_dump(mode="json")
+                if repair.refresh_result is not None
+                else None
+            ),
+            "reason_code": repair.reason_code,
+            "provider_requests": repair.provider_requests,
+        }
+    return payload
 
 
 def _probe_timeout_value(value: str) -> int:
@@ -1282,7 +1307,7 @@ def main() -> int:
         print(
             json.dumps(
                 {
-                    **outcome.model_dump(mode="json"),
+                    **_automation_outcome_payload(outcome),
                     "provider_health": _provider_health_payload(provider_health),
                 },
                 ensure_ascii=False,

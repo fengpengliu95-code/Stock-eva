@@ -1238,7 +1238,123 @@ class RepairExecutionResult(BaseModel):
     decision: ContinuityDecision
     refresh_result: RefreshResult | None = None
     reason_code: RepairExecutionReason
-    provider_requests: int = Field(ge=0, le=1)
+    provider_requests: Literal[0, 1] = 0
+
+    @field_validator("provider_requests", mode="before")
+    @classmethod
+    def strict_provider_request_count(cls, value: object) -> int:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("provider request count must be 0 or 1")
+        return value
+
+    @model_validator(mode="after")
+    def valid_execution_matrix(self) -> "RepairExecutionResult":
+        decision = self.decision
+        refresh = self.refresh_result
+        target = decision.target_session
+
+        if self.status == "published":
+            if (
+                decision.action != "run"
+                or decision.lane != "repair"
+                or decision.reason_code != "REPAIR_CLAIMED"
+                or target is None
+                or self.reason_code != "REPAIR_PUBLISHED"
+                or self.provider_requests != 1
+                or refresh is None
+            ):
+                raise ValueError("published repair execution evidence is inconsistent")
+            self._validate_refresh_evidence(refresh, target, require_ready=True)
+            return self
+
+        if self.status == "failed":
+            if decision.lane != "repair" or target is None:
+                raise ValueError("failed repair execution requires a repair decision")
+            if self.reason_code in {"REPAIR_RESULT_FAILED", "POST_PUBLISH_INVENTORY_MISSING"}:
+                if (
+                    decision.action != "run"
+                    or decision.reason_code != "REPAIR_CLAIMED"
+                    or self.provider_requests != 1
+                    or refresh is None
+                ):
+                    raise ValueError("failed repair publication evidence is inconsistent")
+                self._validate_refresh_evidence(refresh, target, require_ready=False)
+                if refresh.status not in {"partial", "error"}:
+                    raise ValueError("failed repair publication requires partial or error result")
+                return self
+            if self.reason_code == "REPAIR_CONSUMER_FAILED":
+                if decision.lane != "repair" or (
+                    (decision.action, decision.reason_code)
+                    not in {
+                        ("wait", "REPAIR_CONSUMER_FAILED"),
+                        # A consumer may fail before the coordinator rewrites the claimed
+                        # decision.  This is an explicit, sanitized no-refresh-result contract;
+                        # it is never accepted for any other failure reason.
+                        ("run", "REPAIR_CLAIMED"),
+                    }
+                ):
+                    raise ValueError("consumer failure requires a repair wait decision")
+                if refresh is not None:
+                    self._validate_refresh_evidence(refresh, target, require_ready=False)
+                    if refresh.status not in {"partial", "error"}:
+                        raise ValueError("consumer failure result must be partial or error")
+                return self
+            raise ValueError("failed repair execution reason is not allowlisted")
+
+        # A skipped invocation has no provider or publication evidence.  A freshness run is
+        # allowed to be represented as skipped when the repair lane yielded to it; a claimed
+        # repair run is never allowed to masquerade as skipped.
+        if refresh is not None or self.provider_requests != 0:
+            raise ValueError("skipped repair execution cannot carry provider evidence")
+        if (
+            decision.action == "run"
+            and decision.lane == "repair"
+            and decision.reason_code == "REPAIR_CLAIMED"
+        ):
+            raise ValueError("claimed repair execution cannot be skipped")
+        allowed_skip_reasons = {
+            "REPAIR_DISABLED",
+            "FRESHNESS_DUE",
+            "FRESHNESS_WAIT",
+            "CONTROL_STATE_UNAVAILABLE",
+            "PROVIDER_HEALTH_UNAVAILABLE",
+            "PROVIDER_NOT_CLOSED",
+            "NO_ELIGIBLE_REPAIR",
+            "ALREADY_RUNNING",
+            "REPAIR_CONSUMER_FAILED",
+        }
+        if self.reason_code not in allowed_skip_reasons:
+            raise ValueError("skipped repair execution reason is not allowlisted")
+        if decision.lane == "repair" and decision.action == "wait":
+            if self.reason_code != decision.reason_code:
+                raise ValueError("skipped repair reason does not match decision")
+        elif decision.lane == "freshness":
+            if self.reason_code != decision.reason_code:
+                raise ValueError("skipped freshness reason does not match decision")
+        return self
+
+    @staticmethod
+    def _validate_refresh_evidence(
+        refresh: RefreshResult,
+        target: date,
+        *,
+        require_ready: bool,
+    ) -> None:
+        if refresh.run_kind != "repair":
+            raise ValueError("repair evidence must use repair run kind")
+        if refresh.requested_date != target:
+            raise ValueError("repair evidence date does not match decision target")
+        if refresh.request_key != repair_request_key(target):
+            raise ValueError("repair evidence request key does not match repair job")
+        try:
+            started_at = require_utc(refresh.started_at)
+            completed_at = require_utc(refresh.completed_at)
+        except RepairQueueError as exc:
+            raise ValueError("repair evidence timestamps must be UTC-aware") from exc
+        if completed_at < started_at:
+            raise ValueError("repair evidence completed time precedes start")
+        if require_ready and refresh.status != "ready":
+            raise ValueError("published repair requires ready refresh evidence")
 
 
 class ContinuityRepairExecutor:
