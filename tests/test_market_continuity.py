@@ -3228,7 +3228,300 @@ def test_continuity_policy_retry_eligibility_queue_unavailable_and_no_job_are_ty
     assert no_eligible.reason_code == "NO_ELIGIBLE_REPAIR"
 
 
-def test_continuity_decision_contract_is_frozen_allowlisted_and_consistent() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "FRESHNESS_DUE",
+            },
+            id="run-freshness-due",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                "reason_code": "REPAIR_READY",
+            },
+            id="run-repair-ready-current",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                "next_run_at": NOW + timedelta(hours=1),
+                "reason_code": "REPAIR_READY",
+            },
+            id="run-repair-ready-freshness-retry-slot",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                "reason_code": "REPAIR_CLAIMED",
+            },
+            id="run-repair-claimed",
+        ),
+        *(
+            pytest.param(
+                {
+                    "action": "wait",
+                    "lane": "freshness",
+                    "target_session": date(2026, 8, 13),
+                    "next_run_at": (
+                        datetime(2026, 8, 13, 13, 0, tzinfo=timezone(timedelta(hours=8)))
+                        if reason == "FRESHNESS_WAIT"
+                        else NOW + timedelta(hours=1)
+                    ),
+                    "reason_code": reason,
+                },
+                id=f"wait-freshness-{reason.lower()}",
+            )
+            for reason in (
+                "FRESHNESS_WAIT",
+                "REPAIR_DISABLED",
+                "CONTROL_STATE_UNAVAILABLE",
+                "NO_ELIGIBLE_REPAIR",
+            )
+        ),
+        *(
+            pytest.param(
+                {
+                    "action": "wait",
+                    "lane": "repair",
+                    "target_session": date(2026, 8, 3),
+                    "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                    "next_run_at": (
+                        NOW + timedelta(hours=1) if reason == "ALREADY_RUNNING" else None
+                    ),
+                    "reason_code": reason,
+                },
+                id=f"wait-repair-{reason.lower()}",
+            )
+            for reason in (
+                "PROVIDER_HEALTH_UNAVAILABLE",
+                "PROVIDER_NOT_CLOSED",
+                "CONTROL_STATE_UNAVAILABLE",
+                "NO_ELIGIBLE_REPAIR",
+                "ALREADY_RUNNING",
+                "REPAIR_CONSUMER_FAILED",
+            )
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": None,
+                "reason_code": "CALENDAR_UNAVAILABLE",
+            },
+            id="none-calendar-unavailable",
+        ),
+        *(
+            pytest.param(
+                {
+                    "action": "none",
+                    "lane": "freshness",
+                    "target_session": date(2026, 8, 13),
+                    "reason_code": reason,
+                },
+                id=f"none-freshness-{reason.lower()}",
+            )
+            for reason in (
+                "FRESHNESS_WAIT",
+                "REPAIR_DISABLED",
+                "CONTROL_STATE_UNAVAILABLE",
+                "NO_ELIGIBLE_REPAIR",
+            )
+        ),
+    ],
+)
+def test_continuity_decision_accepts_only_actual_production_matrix_rows(
+    payload: dict[str, object],
+) -> None:
+    module = continuity_module()
+    decision = module.ContinuityDecision.model_validate(payload)
+
+    assert module.ContinuityDecision.model_validate(decision.model_dump(mode="python")) == decision
+    if decision.next_run_at is not None:
+        assert decision.next_run_at.tzinfo == UTC
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {
+                "action": "none",
+                "lane": None,
+                "target_session": None,
+                "reason_code": "CALENDAR_UNAVAILABLE",
+            },
+            id="lane-none",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "repair_job_id": f"repair:2026-08-13:{UNIVERSE_ID}",
+                "reason_code": "FRESHNESS_DUE",
+            },
+            id="freshness-with-repair-job",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-04:{UNIVERSE_ID}",
+                "reason_code": "REPAIR_READY",
+            },
+            id="repair-job-target-mismatch",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "reason_code": "REPAIR_READY",
+            },
+            id="repair-without-job",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "REPAIR_READY",
+            },
+            id="run-freshness-wrong-reason",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "next_run_at": NOW + timedelta(hours=1),
+                "reason_code": "FRESHNESS_DUE",
+            },
+            id="run-freshness-with-next-slot",
+        ),
+        pytest.param(
+            {
+                "action": "run",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                "reason_code": "PROVIDER_NOT_CLOSED",
+            },
+            id="run-repair-wrong-reason",
+        ),
+        pytest.param(
+            {
+                "action": "wait",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "next_run_at": NOW + timedelta(hours=1),
+                "reason_code": "FRESHNESS_DUE",
+            },
+            id="wait-freshness-wrong-reason",
+        ),
+        pytest.param(
+            {
+                "action": "wait",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "FRESHNESS_WAIT",
+            },
+            id="wait-freshness-without-next-slot",
+        ),
+        pytest.param(
+            {
+                "action": "wait",
+                "lane": "repair",
+                "target_session": date(2026, 8, 3),
+                "repair_job_id": f"repair:2026-08-03:{UNIVERSE_ID}",
+                "reason_code": "REPAIR_READY",
+            },
+            id="wait-repair-ready",
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "CALENDAR_UNAVAILABLE",
+            },
+            id="calendar-unavailable-with-target",
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": None,
+                "reason_code": "REPAIR_DISABLED",
+            },
+            id="none-freshness-without-target",
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "REPAIR_READY",
+            },
+            id="none-repair-ready",
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "next_run_at": NOW + timedelta(hours=1),
+                "reason_code": "NO_ELIGIBLE_REPAIR",
+            },
+            id="none-with-next-slot",
+        ),
+        pytest.param(
+            {
+                "action": "wait",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "next_run_at": datetime(2026, 8, 13, 5, 0),
+                "reason_code": "FRESHNESS_WAIT",
+            },
+            id="naive-next-slot",
+        ),
+        pytest.param(
+            {
+                "action": "none",
+                "lane": "freshness",
+                "target_session": date(2026, 8, 13),
+                "reason_code": "token=secret /private/provider",
+            },
+            id="raw-reason",
+        ),
+    ],
+)
+def test_continuity_decision_rejects_cross_state_combinations(
+    payload: dict[str, object],
+) -> None:
+    module = continuity_module()
+
+    with pytest.raises(ValidationError):
+        module.ContinuityDecision.model_validate(payload)
+
+
+def test_continuity_decision_roundtrip_rejects_model_copy_bypass_and_raw_fields() -> None:
     module = continuity_module()
     valid = module.ContinuityDecision(
         action="run",
@@ -3267,6 +3560,9 @@ def test_continuity_decision_contract_is_frozen_allowlisted_and_consistent() -> 
             repair_job_id=f"repair:2026-08-03:{UNIVERSE_ID}",
             reason_code="FRESHNESS_DUE",
         )
+    bypassed = valid.model_copy(update={"action": "none"})
+    with pytest.raises(ValidationError):
+        module.ContinuityDecision.model_validate(bypassed.model_dump(mode="python"))
 
 
 class RecordingHealthGate:
@@ -3324,20 +3620,12 @@ def test_repair_claim_health_gate_blocks_without_claim_attempt_or_probe(
         if blocked == "unavailable"
         else circuit_health(blocked)
     )
-    provider_calls = 0
-
-    def reject_provider() -> None:
-        nonlocal provider_calls
-        provider_calls += 1
-        raise AssertionError("Task4 must not construct or call a provider")
-
     coordinator = module.RepairClaimCoordinator(
         store=store,
         health_store=health,
         lock_path=lock_path,
         owner="repair-worker",
         lease_seconds=1800,
-        provider_factory=reject_provider,
     )
     before = store.repair_queue_snapshot()
 
@@ -3357,7 +3645,6 @@ def test_repair_claim_health_gate_blocks_without_claim_attempt_or_probe(
     assert store.repair_queue_snapshot() == before
     assert health.calls == 1
     assert health.acquire_probe_calls == health.resolve_probe_calls == 0
-    assert provider_calls == 0
 
 
 def test_repair_claim_rechecks_health_under_lock_and_only_consumer_owns_lease(
@@ -3512,20 +3799,12 @@ def test_repair_claim_consumer_failure_is_sanitized_and_left_for_stale_recovery(
         refresh_state="success",
     )
     health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
-    provider_calls = 0
-
-    def reject_provider() -> None:
-        nonlocal provider_calls
-        provider_calls += 1
-        raise AssertionError("Task4 cannot construct a repair provider")
-
     coordinator = module.RepairClaimCoordinator(
         store=store,
         health_store=health,
         lock_path=lock_path,
         owner="repair-worker",
         lease_seconds=1800,
-        provider_factory=reject_provider,
     )
 
     decision = coordinator.claim_ready_once(
@@ -3544,7 +3823,6 @@ def test_repair_claim_consumer_failure_is_sanitized_and_left_for_stale_recovery(
     assert decision.reason_code == "REPAIR_CONSUMER_FAILED"
     assert snapshot.jobs[0].state == "leased"
     assert snapshot.attempts[0].outcome == "running"
-    assert provider_calls == 0
     assert health.acquire_probe_calls == health.resolve_probe_calls == 0
     assert not {"payload", "token", "url", "path", "exception", "error"} & set(
         decision.model_dump(mode="json")

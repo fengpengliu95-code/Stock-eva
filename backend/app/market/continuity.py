@@ -47,6 +47,25 @@ ContinuityDecisionReason = Literal[
     "ALREADY_RUNNING",
     "REPAIR_CONSUMER_FAILED",
 ]
+_FRESHNESS_WAIT_REASONS = frozenset(
+    {
+        "FRESHNESS_WAIT",
+        "REPAIR_DISABLED",
+        "CONTROL_STATE_UNAVAILABLE",
+        "NO_ELIGIBLE_REPAIR",
+    }
+)
+_REPAIR_WAIT_REASONS = frozenset(
+    {
+        "PROVIDER_HEALTH_UNAVAILABLE",
+        "PROVIDER_NOT_CLOSED",
+        "CONTROL_STATE_UNAVAILABLE",
+        "NO_ELIGIBLE_REPAIR",
+        "ALREADY_RUNNING",
+        "REPAIR_CONSUMER_FAILED",
+    }
+)
+_FRESHNESS_NONE_REASONS = _FRESHNESS_WAIT_REASONS
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _R2F1_UNIVERSE_ID = "all-main-board"
@@ -126,7 +145,7 @@ class ContinuityDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     action: ContinuityAction
-    lane: ContinuityLane | None
+    lane: ContinuityLane
     target_session: date | None
     repair_job_id: str | None = None
     next_run_at: datetime | None = None
@@ -161,8 +180,31 @@ class ContinuityDecision(BaseModel):
                 raise ValueError("repair decision target does not match job identity")
         elif self.repair_job_id is not None:
             raise ValueError("only a repair decision may carry a repair job")
-        if self.action == "run" and (self.lane is None or self.target_session is None):
-            raise ValueError("run decision requires a lane and target")
+
+        if self.action == "run":
+            if self.target_session is None:
+                raise ValueError("run decision requires a target")
+            if self.lane == "freshness":
+                if self.reason_code != "FRESHNESS_DUE" or self.next_run_at is not None:
+                    raise ValueError("freshness run decision is inconsistent")
+            elif self.reason_code not in {"REPAIR_READY", "REPAIR_CLAIMED"}:
+                raise ValueError("repair run decision is inconsistent")
+        elif self.action == "wait":
+            if self.target_session is None:
+                raise ValueError("wait decision requires a target")
+            if self.lane == "freshness":
+                if self.reason_code not in _FRESHNESS_WAIT_REASONS or self.next_run_at is None:
+                    raise ValueError("freshness wait decision is inconsistent")
+            elif self.reason_code not in _REPAIR_WAIT_REASONS:
+                raise ValueError("repair wait decision is inconsistent")
+        else:
+            if self.lane != "freshness" or self.next_run_at is not None:
+                raise ValueError("none decision is inconsistent")
+            if self.reason_code == "CALENDAR_UNAVAILABLE":
+                if self.target_session is not None:
+                    raise ValueError("calendar-unavailable decision cannot carry a target")
+            elif self.reason_code not in _FRESHNESS_NONE_REASONS or self.target_session is None:
+                raise ValueError("freshness none decision is inconsistent")
         return self
 
 
@@ -992,7 +1034,6 @@ class RepairClaimCoordinator:
         lock_path: Path,
         owner: str,
         lease_seconds: int,
-        provider_factory=None,
         policy: ContinuityPolicy | None = None,
     ) -> None:
         self._store = store
@@ -1006,7 +1047,6 @@ class RepairClaimCoordinator:
         ):
             raise RepairQueueError("repair claim lease policy is invalid")
         self._lease_seconds = lease_seconds
-        self._provider_factory = provider_factory
         self._policy = policy or ContinuityPolicy()
 
     def claim_ready_once(
