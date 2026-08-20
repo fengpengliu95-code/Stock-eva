@@ -15,6 +15,7 @@ from backend.app.market.calendar_sync import (
 )
 from backend.app.market.continuity import (
     ContinuityInventory,
+    ContinuityStatusSummary,
     build_continuity_status_summary,
 )
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
@@ -226,7 +227,23 @@ def market_status(
         freshness_state=scheduler,
         now=now,
     )
-    return MarketDataStatus(
+    try:
+        continuity = ContinuityStatusSummary.model_validate(
+            continuity.model_dump(mode="python", round_trip=True)
+        )
+    except Exception:
+        # A bypassed internal model must degrade only the additive continuity fields.  Keep
+        # the pre-R2-F1 base status path and its existing HTTP failure behavior intact.
+        continuity = ContinuityStatusSummary(
+            continuity_start_date=(
+                settings.market_continuity_start_date
+                if isinstance(settings.market_continuity_start_date, date)
+                else None
+            ),
+            repair_execution_enabled=bool(settings.market_repair_enabled),
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+    status = MarketDataStatus(
         market_phase=phase,
         calendar_status=calendar_status,
         latest_expected_session=expected,
@@ -248,6 +265,7 @@ def market_status(
         calendar_sources=[item.model_dump() for item in calendar.sources_for(now.year)],
         **continuity.model_dump(mode="python"),
     )
+    return MarketDataStatus.model_validate(status.model_dump(mode="python", round_trip=True))
 
 
 @router.get("/history/dates", response_model=list[date])

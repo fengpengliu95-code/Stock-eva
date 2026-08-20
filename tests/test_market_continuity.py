@@ -15,7 +15,7 @@ from backend.app.config import Settings
 from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
 from backend.app.market.calendar import CalendarConfig, TradingCalendar
 from backend.app.market.models import DailyBar, RefreshResult
-from backend.app.market.provider_health import ProviderHealthError
+from backend.app.market.provider_health import CircuitState, ProviderHealthError
 from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.models import VerifiedReadySessionInventory
@@ -2016,6 +2016,99 @@ def test_status_summary_disabled_repair_is_blocked_without_health_read() -> None
 
     assert summary.continuity_status == "blocked"
     assert summary.continuity_reason_code == "REPAIR_EXECUTION_DISABLED"
+
+
+def test_status_summary_revalidates_bypassed_scan_before_reading_internal_fields() -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+
+    class BypassedScanner:
+        def scan(self, **_kwargs):
+            # model_construct intentionally bypasses the frozen scan contract.  The public
+            # summary must not dereference missing fields or expose arbitrary internals.
+            return module.ContinuityScanResult.model_construct(
+                status="gaps",
+                effective_start=session,
+                effective_end=session,
+                manifest_generation="raw token=secret /private/manifest",
+            )
+
+    summary = module.build_continuity_status_summary(
+        scanner=BypassedScanner(),
+        configured_start=session,
+        latest_completed_session=session,
+        queue_snapshot=None,
+        repair_enabled=True,
+        provider_health=None,
+        freshness_state=None,
+        now=NOW,
+    )
+
+    assert summary.continuity_status == "unavailable"
+    assert summary.continuity_reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert summary.missing_session_count == 0
+    serialized = json.dumps(summary.model_dump(mode="json"))
+    assert "token=secret" not in serialized
+    assert "/private/manifest" not in serialized
+
+
+def test_status_summary_revalidates_bypassed_queue_and_provider_snapshots() -> None:
+    module = continuity_module()
+    sessions = (date(2026, 8, 3), date(2026, 8, 4))
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open" for session in sessions}),
+        inventory_reader=RecordingInventoryReader(ready_inventory(sessions[0])),
+        inventory_mode="immutable_dataset",
+    )
+    valid_job = module.RepairJob(
+        job_id="repair:2026-08-04:all-main-board",
+        trade_date=sessions[1],
+        universe_id=UNIVERSE_ID,
+        state="pending",
+        state_version=1,
+        attempt_count=0,
+        abandoned_attempt_count=0,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    bypassed_job = module.RepairJob.model_construct(
+        job_id=valid_job.job_id,
+        universe_id=UNIVERSE_ID,
+        state="pending",
+    )
+    bypassed_queue = module.RepairQueueSnapshot.model_construct(
+        status="ready",
+        jobs=(bypassed_job,),
+        attempts=(),
+    )
+    unavailable_queue = module.build_continuity_status_summary(
+        scanner=scanner,
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+        queue_snapshot=bypassed_queue,
+        repair_enabled=True,
+        provider_health=None,
+        freshness_state=None,
+        now=NOW,
+    )
+    assert unavailable_queue.continuity_status == "unavailable"
+    assert unavailable_queue.continuity_reason_code == "CONTROL_STATE_UNAVAILABLE"
+
+    bypassed_provider = module.ProviderHealth.model_construct(
+        state=CircuitState.OPEN,
+    )
+    unavailable_provider = module.build_continuity_status_summary(
+        scanner=scanner,
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+        queue_snapshot=module.RepairQueueSnapshot(status="ready", jobs=(valid_job,), attempts=()),
+        repair_enabled=True,
+        provider_health=bypassed_provider,
+        freshness_state=None,
+        now=NOW,
+    )
+    assert unavailable_provider.continuity_status == "unavailable"
+    assert unavailable_provider.continuity_reason_code == "CONTROL_STATE_UNAVAILABLE"
 
 
 def test_scan_uses_one_narrow_calendar_query_and_filters_out_of_range_ready_dates() -> None:

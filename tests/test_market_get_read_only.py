@@ -12,13 +12,16 @@ import duckdb
 import httpx
 import pytest
 
+import backend.app.api.market as market_api
 import backend.app.cli as cli_module
 import backend.app.main as main_module
 import backend.app.market.store as market_store_module
 from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
+from backend.app.market.automation import RefreshRunLock
 from backend.app.market.calendar_sync import CalendarSyncStore
+from backend.app.market.continuity import ContinuityStatusSummary, ContinuityUnavailable
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore, MarketStoreReadError
@@ -348,6 +351,36 @@ def test_market_status_local_mutable_mode_reports_manifest_unavailable_without_w
     assert not runtime.exists()
 
 
+def test_market_status_outer_continuity_model_is_revalidated_and_sanitized(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": AS_OF}
+    )
+    _publish_fixture(settings, dataset_root)
+
+    monkeypatch.setattr(
+        market_api,
+        "build_continuity_status_summary",
+        lambda **_: ContinuityStatusSummary.model_construct(
+            continuity_status="raw-state",
+            continuity_reason_code="raw token=secret /private/status",
+        ),
+    )
+
+    response = _api_get("/api/v1/market/status", settings, raise_app_exceptions=False)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["continuity_status"] == "unavailable"
+    assert payload["continuity_reason_code"] == "CONTROL_STATE_UNAVAILABLE"
+    serialized = json.dumps(payload)
+    assert "raw token=secret" not in serialized
+    assert "/private/status" not in serialized
+
+
 def test_market_continuity_execute_enqueues_only_after_strict_rescan(
     tmp_path: Path,
     monkeypatch,
@@ -404,6 +437,107 @@ def test_market_continuity_execute_enqueues_only_after_strict_rescan(
     with duckdb.connect(str(control), read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM repair_jobs").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM repair_attempts").fetchone()[0] == 0
+
+
+def test_market_continuity_execute_does_not_create_broad_runtime_after_locked_rescan_fails(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A stale second scan must fail before staging/temp/user runtime creation."""
+    source_settings = _settings(tmp_path / "source", tmp_path / "dataset")
+    _publish_fixture(source_settings, tmp_path / "dataset")
+    execution_root = tmp_path / "execution"
+    settings = source_settings.model_copy(
+        update={
+            "market_continuity_start_date": AS_OF,
+            "user_data_dir": execution_root / "user",
+            "local_staging_dir": execution_root / "staging",
+            "local_lock_dir": execution_root / "locks",
+            "local_temp_dir": execution_root / "temp",
+        }
+    )
+    original_scan = cli_module.ContinuityInventory.scan
+    calls = 0
+
+    def fail_locked_rescan(self, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        return original_scan(self, **kwargs)
+
+    monkeypatch.setattr(cli_module.ContinuityInventory, "scan", fail_locked_rescan)
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+            "--execute",
+        ],
+    )
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason_code"] == "CALENDAR_UNAVAILABLE"
+    assert calls == 3
+    assert not (execution_root / "staging").exists()
+    assert not (execution_root / "temp").exists()
+    assert not (execution_root / "user").exists()
+
+
+def test_market_continuity_execute_busy_lock_does_not_create_broad_runtime_dirs(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A pre-existing busy canonical lock must be observed before broad initialization."""
+    source_settings = _settings(tmp_path / "source", tmp_path / "dataset")
+    _publish_fixture(source_settings, tmp_path / "dataset")
+    execution_root = tmp_path / "execution"
+    settings = source_settings.model_copy(
+        update={
+            "market_continuity_start_date": AS_OF,
+            "user_data_dir": execution_root / "user",
+            "local_staging_dir": execution_root / "staging",
+            "local_lock_dir": execution_root / "locks",
+            "local_temp_dir": execution_root / "temp",
+        }
+    )
+    lock_path = settings.local_lock_dir / "market-refresh.lock"
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+            "--execute",
+        ],
+    )
+
+    with RefreshRunLock(lock_path):
+        before = _tree(execution_root) if execution_root.exists() else ()
+        assert cli_module.main() == 1
+        payload = json.loads(capsys.readouterr().out)
+        after = _tree(execution_root) if execution_root.exists() else ()
+
+    assert payload["reason_code"] == "REFRESH_ALREADY_RUNNING"
+    assert before == after
+    assert lock_path.is_file()
+    assert not (execution_root / "staging").exists()
+    assert not (execution_root / "temp").exists()
+    assert not (execution_root / "user").exists()
 
 
 def test_missing_market_storage_gets_create_no_runtime_paths(tmp_path: Path) -> None:

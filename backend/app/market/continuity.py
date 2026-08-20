@@ -18,6 +18,7 @@ from pydantic import (
 
 from backend.app.market.failures import MarketFailureClass, MarketFailureStage
 from backend.app.market.models import RefreshResult
+from backend.app.market.provider_health import ProviderHealth
 from backend.app.storage.models import VerifiedReadySessionInventory
 
 RepairJobState = Literal["pending", "leased", "retry_wait", "published", "dead_letter"]
@@ -445,7 +446,8 @@ class ContinuityEnqueueService:
         self,
         *,
         scanner: ContinuityInventory,
-        store: ContinuityQueueWriter,
+        store: ContinuityQueueWriter | None = None,
+        store_factory: Callable[[], ContinuityQueueWriter] | None = None,
         lock_path: Path,
         universe_id: str,
         clock: Callable[[], datetime],
@@ -454,6 +456,11 @@ class ContinuityEnqueueService:
     ) -> None:
         self._scanner = scanner
         self._store = store
+        if store is None and store_factory is None:
+            raise ValueError("continuity enqueue requires a queue store")
+        if store is not None and store_factory is not None:
+            raise ValueError("continuity enqueue accepts one queue store source")
+        self._store_factory = store_factory
         self._lock_path = lock_path
         self._universe_id = require_universe_id(universe_id)
         self._clock = clock
@@ -524,10 +531,14 @@ class ContinuityEnqueueService:
                             reason_code=fresh.reason_code,
                         )
                     scan_identity = self._scan_identity(fresh)
+                    store = self._store
+                    if store is None:
+                        assert self._store_factory is not None
+                        store = self._store_factory()
                     if self._schema_initializer is not None:
                         self._schema_initializer()
                     else:
-                        self._store.initialize_continuity_schema()
+                        store.initialize_continuity_schema()
                     if fresh.status == "current":
                         return ContinuityEnqueueResult(
                             status="current",
@@ -537,7 +548,7 @@ class ContinuityEnqueueService:
                             writes_control_state=True,
                         )
                     created = tuple(
-                        self._store.enqueue_repair_jobs(
+                        store.enqueue_repair_jobs(
                             fresh.missing_sessions,
                             universe_id=self._universe_id,
                             now=timestamp,
@@ -988,20 +999,42 @@ def build_continuity_status_summary(
             continuity_reason_code="MANIFEST_INVENTORY_UNAVAILABLE",
         )
     try:
-        scan = scanner.scan(
+        raw_scan = scanner.scan(
             configured_start=configured_start,
             latest_completed_session=latest_completed_session,
         )
+        if isinstance(raw_scan, ContinuityUnavailable):
+            scan: ContinuityScanResult | ContinuityUnavailable = (
+                ContinuityUnavailable.model_validate(
+                    raw_scan.model_dump(mode="python", round_trip=True)
+                )
+            )
+        else:
+            scan = ContinuityScanResult.model_validate(
+                raw_scan.model_dump(mode="python", round_trip=True)
+            )
     except Exception:
         return ContinuityStatusSummary(
             **base,
-            continuity_reason_code="MANIFEST_INVENTORY_UNAVAILABLE",
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
         )
     if isinstance(scan, ContinuityUnavailable):
         return ContinuityStatusSummary(
             **base,
             continuity_reason_code=scan.reason_code,
         )
+
+    queue: RepairQueueSnapshot | None = None
+    if queue_snapshot is not None:
+        try:
+            queue = RepairQueueSnapshot.model_validate(
+                queue_snapshot.model_dump(mode="python", round_trip=True)
+            )
+        except Exception:
+            return ContinuityStatusSummary(
+                **base,
+                continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
 
     missing = scan.missing_sessions
     if not missing:
@@ -1012,18 +1045,7 @@ def build_continuity_status_summary(
 
     # A queue snapshot is optional only for a current scan.  For gaps, its absence or
     # unavailable status means the controller cannot prove control state and must fail closed.
-    if queue_snapshot is None:
-        return ContinuityStatusSummary(
-            **base,
-            missing_session_count=len(missing),
-            oldest_missing_session=missing[0],
-            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
-        )
-    try:
-        queue = RepairQueueSnapshot.model_validate(
-            queue_snapshot.model_dump(mode="python", round_trip=True)
-        )
-    except Exception:
+    if queue is None:
         return ContinuityStatusSummary(
             **base,
             missing_session_count=len(missing),
@@ -1124,6 +1146,26 @@ def build_continuity_status_summary(
                 "REPAIR_DEAD_LETTER_ONLY" if dead_letter else "REPAIR_QUEUE_NOT_ENQUEUED"
             ),
         )
+
+    if provider_health is not None:
+        try:
+            if isinstance(provider_health, ProviderHealth):
+                provider_health = ProviderHealth.model_validate(
+                    provider_health.model_dump(mode="python", round_trip=True)
+                )
+            else:
+                # Keep the pure summary helper usable with lightweight test doubles, while
+                # still constraining non-model snapshots to the public circuit-state enum.
+                provider_state = getattr(provider_health, "state", None)
+                provider_state = getattr(provider_state, "value", provider_state)
+                if provider_state not in {"CLOSED", "OPEN", "HALF_OPEN"}:
+                    raise ValueError("provider health state is invalid")
+        except Exception:
+            return ContinuityStatusSummary(
+                **base,
+                **counts,
+                continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
 
     provider_state = getattr(provider_health, "state", None)
     provider_state = getattr(provider_state, "value", provider_state)

@@ -40,6 +40,7 @@ from backend.app.market.continuity import (
     ContinuityEnqueueService,
     ContinuityInventory,
     ContinuityRepairExecutor,
+    ContinuityScanResult,
     ContinuityUnavailable,
     RepairClaimCoordinator,
     RepairRetryPolicy,
@@ -587,6 +588,23 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             requested_start=args.start,
             requested_end=args.end,
         )
+        try:
+            if isinstance(scan, ContinuityUnavailable):
+                scan = ContinuityUnavailable.model_validate(
+                    scan.model_dump(mode="python", round_trip=True)
+                )
+            else:
+                scan = ContinuityScanResult.model_validate(
+                    scan.model_dump(mode="python", round_trip=True)
+                )
+        except Exception:
+            payload = _continuity_cli_payload(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                execute=args.execute,
+            )
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
         if isinstance(scan, ContinuityUnavailable):
             payload = _continuity_cli_payload(
                 status=(
@@ -607,22 +625,34 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 0
 
-        # The first strict scan above is the preflight.  Only now may the explicit enqueue
-        # operation create local runtime directories and acquire the existing refresh lock.
-        layout.ensure_local_runtime_dirs()
-        writer = MarketStore(
-            layout.local_paths.market_database,
-            temp_directory=layout.duckdb_temporary,
-        )
+        # The first strict scan above is the preflight.  The store factory is deliberately
+        # lazy: the shared lock is acquired and the evidence is revalidated before it creates
+        # any broad runtime directory or opens a writer-owned control database.
+        writer: MarketStore | None = None
+
+        def create_writer() -> MarketStore:
+            nonlocal writer
+            layout.ensure_local_runtime_dirs()
+            writer = MarketStore(
+                layout.local_paths.market_database,
+                temp_directory=layout.duckdb_temporary,
+            )
+            return writer
+
+        def initialize_writer_schema() -> None:
+            if writer is None:
+                raise RuntimeError("continuity writer was not created")
+            writer.initialize_all_writer_schema(
+                staging_directory=layout.market_refresh_lock.parent,
+            )
+
         result = ContinuityEnqueueService(
             scanner=scanner,
-            store=writer,
+            store_factory=create_writer,
             lock_path=layout.market_refresh_lock,
             universe_id="all-main-board",
             clock=get_market_clock(),
-            schema_initializer=lambda: writer.initialize_all_writer_schema(
-                staging_directory=layout.market_refresh_lock.parent,
-            ),
+            schema_initializer=initialize_writer_schema,
         ).execute(
             configured_start=settings.market_continuity_start_date,
             latest_completed_session=latest,
