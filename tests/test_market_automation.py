@@ -908,6 +908,71 @@ def test_cli_automation_payload_roundtrip_keeps_legal_legacy_result_shape() -> N
     assert payload["result"] == result.model_dump(mode="json")
 
 
+def test_auto_refresh_cli_invalid_outcome_is_a_stable_error_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A bypassed automation result must not escape the CLI as a traceback."""
+    automation = load_module("backend.app.market.automation")
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "user_data_dir": tmp_path / "user",
+            "local_control_dir": tmp_path / "control",
+            "local_staging_dir": tmp_path / "staging",
+            "local_lock_dir": tmp_path / "locks",
+            "local_temp_dir": tmp_path / "tmp",
+            "nas_market_dataset_root": None,
+            "local_market_dataset_root": None,
+        }
+    )
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    invalid_outcome = automation.AutomationOutcome.model_construct(
+        decision=decision,
+        state=state,
+        result={
+            "run_id": "private/run-id",
+            "error_message": "token=private https://provider.invalid/private",
+            "run_kind": "repair",
+        },
+        continuity_result=None,
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        cli.MarketAutomationService,
+        "run_due_once",
+        lambda *_args, **_kwargs: invalid_outcome,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stock-eva", "auto-refresh-once", "--execute"],
+    )
+
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload == {
+        "status": "error",
+        "reason_code": "AUTOMATION_RESULT_UNAVAILABLE",
+        "writes_market_data": False,
+    }
+    serialized = captured.out + captured.err
+    assert "private/run-id" not in serialized
+    assert "token=private" not in serialized
+    assert "provider.invalid" not in serialized
+
+
 class HealthClock:
     def __init__(self, now: datetime) -> None:
         self.now = now

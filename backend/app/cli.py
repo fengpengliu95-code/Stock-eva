@@ -1314,10 +1314,27 @@ def main() -> int:
                 )
             )
             return 1
+        try:
+            automation_payload = _automation_outcome_payload(outcome)
+        except ValidationError:
+            # A contradictory internal outcome is an unavailable automation result.  Keep
+            # this boundary allowlisted: Pydantic's details may contain private paths,
+            # request keys, or provider text from a bypassed model.
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "reason_code": "AUTOMATION_RESULT_UNAVAILABLE",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         print(
             json.dumps(
                 {
-                    **_automation_outcome_payload(outcome),
+                    **automation_payload,
                     "provider_health": _provider_health_payload(provider_health),
                 },
                 ensure_ascii=False,
