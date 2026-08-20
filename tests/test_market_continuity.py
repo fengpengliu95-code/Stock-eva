@@ -93,7 +93,7 @@ def error_refresh(
 ) -> RefreshResult:
     return RefreshResult(
         run_id=f"repair-run-{trade_date}-{attempt}",
-        request_key=f"repair:{trade_date}:{UNIVERSE_ID}",
+        request_key=f"repair:baostock:{trade_date}:all-main-board",
         run_kind="repair",
         requested_date=trade_date,
         source="baostock",
@@ -115,7 +115,7 @@ def error_refresh(
 def ready_refresh(trade_date: date, *, started_at: datetime = NOW) -> RefreshResult:
     return RefreshResult(
         run_id=f"repair-run-{trade_date}-ready",
-        request_key=f"repair:{trade_date}:{UNIVERSE_ID}",
+        request_key=f"repair:baostock:{trade_date}:all-main-board",
         run_kind="repair",
         requested_date=trade_date,
         source="baostock",
@@ -3881,3 +3881,369 @@ def test_repair_claim_busy_lock_and_freshness_change_leave_queue_unchanged(
     assert busy.action == "wait"
     assert busy.reason_code == "ALREADY_RUNNING"
     assert store.repair_queue_snapshot() == before
+
+
+def test_full_session_repair_executor_uses_canonical_chain_and_exact_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(queue_store, lock_path)
+    target = date(2026, 8, 3)
+    enqueue(queue_store, lock_path, target)
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    provider = object()
+    calls: list[dict[str, object]] = []
+
+    def fake_refresh(store, received_provider, **kwargs):
+        calls.append({"store": store, "provider": received_provider, **kwargs})
+        return ready_refresh(target, started_at=NOW)
+
+    monkeypatch.setattr(automation, "run_publication_refresh", fake_refresh)
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+
+    class SequencedReader:
+        def __init__(self) -> None:
+            self.values = [ready_inventory(), ready_inventory(target)]
+
+        def verified_ready_session_inventory(self, source: str = "baostock"):
+            return self.values.pop(0)
+
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=provider,
+        inventory_reader=SequencedReader(),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+
+    result = executor.execute_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        revalidator=lambda: freshness,
+    )
+
+    assert result.status == "published"
+    assert len(calls) == 1
+    assert calls[0]["store"] is executor.canonical_store
+    assert calls[0]["provider"] is provider
+    assert calls[0]["required_symbols"] == {"sh.600000"}
+    assert calls[0]["run_kind"] == "repair"
+    assert calls[0]["request_key"] == "repair:baostock:2026-08-03:all-main-board"
+    assert calls[0]["run_id"].startswith("repair-2026-08-03-")
+    assert queue_store.repair_queue_snapshot().jobs[0].state == "published"
+
+
+def test_full_session_repair_executor_rejects_post_publish_inventory_without_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(queue_store, lock_path)
+    target = date(2026, 8, 3)
+    enqueue(queue_store, lock_path, target)
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    monkeypatch.setattr(
+        automation,
+        "run_publication_refresh",
+        lambda *_args, **_kwargs: ready_refresh(target, started_at=NOW),
+    )
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=object(),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+
+    result = executor.execute_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        revalidator=lambda: freshness,
+    )
+
+    assert result.status == "failed"
+    assert result.reason_code == "POST_PUBLISH_INVENTORY_MISSING"
+    snapshot = queue_store.repair_queue_snapshot()
+    assert snapshot.jobs[0].state == "dead_letter"
+    assert snapshot.attempts[0].outcome == "failed"
+    assert snapshot.attempts[0].failure_stage == "publish"
+    assert snapshot.attempts[0].failure_class == "storage"
+
+
+def test_full_session_repair_executor_propagates_process_kill_after_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(queue_store, lock_path)
+    target = date(2026, 8, 3)
+    enqueue(queue_store, lock_path, target)
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+
+    class SimulatedKill(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        automation,
+        "run_publication_refresh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SimulatedKill()),
+    )
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=object(),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+
+    with pytest.raises(SimulatedKill):
+        executor.execute_once(
+            freshness=freshness,
+            latest_expected_session=date(2026, 8, 13),
+            repair_enabled=True,
+            revalidator=lambda: freshness,
+        )
+
+    snapshot = queue_store.repair_queue_snapshot()
+    assert snapshot.jobs[0].state == "leased"
+    assert snapshot.attempts[0].outcome == "running"
+
+
+@pytest.mark.parametrize(
+    "retryable, expected_state", [(True, "retry_wait"), (False, "dead_letter")]
+)
+def test_full_session_repair_executor_finalizes_failure_once_without_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retryable: bool,
+    expected_state: str,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(queue_store, lock_path)
+    target = date(2026, 8, 3)
+    enqueue(queue_store, lock_path, target)
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    calls = 0
+
+    def fake_refresh(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return error_refresh(target, attempt=1, retryable=retryable, started_at=NOW)
+
+    monkeypatch.setattr(automation, "run_publication_refresh", fake_refresh)
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=object(),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+
+    result = executor.execute_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        revalidator=lambda: freshness,
+    )
+
+    assert result.status == "failed"
+    assert result.reason_code == "REPAIR_RESULT_FAILED"
+    assert calls == 1
+    snapshot = queue_store.repair_queue_snapshot()
+    assert snapshot.jobs[0].state == expected_state
+    assert len(snapshot.attempts) == 1
+    assert snapshot.attempts[0].outcome == "failed"
+
+
+def test_repair_executor_rejects_unknown_calendar_before_queue_schema_write(
+    tmp_path: Path,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    initialize_continuity(queue_store, lock_path)
+    target = date(2026, 8, 3)
+    enqueue(queue_store, lock_path, target)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({target: "unknown"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        inventory_mode="immutable_dataset",
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"))
+    calls = 0
+
+    def initializer() -> None:
+        nonlocal calls
+        calls += 1
+
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=object(),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+        scanner=scanner,
+        configured_start=target,
+        queue_schema_initializer=initializer,
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 13),
+        refresh_state="success",
+    )
+
+    result = executor.execute_once(
+        freshness=freshness,
+        latest_expected_session=date(2026, 8, 13),
+        repair_enabled=True,
+        revalidator=lambda: freshness,
+    )
+
+    assert result.status == "skipped"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert calls == 0
+    assert queue_store.repair_queue_snapshot().jobs[0].state == "pending"
+
+
+def test_repair_executor_initializes_and_claims_missing_queue_only_after_strict_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = continuity_module()
+    automation = importlib.import_module("backend.app.market.automation")
+    lock_path = tmp_path / "market-refresh.lock"
+    queue_store = MarketStore(tmp_path / "market.duckdb")
+    queue_store.initialize_schema()
+    target = date(2026, 8, 3)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({target: "open", target + timedelta(days=1): "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        inventory_mode="immutable_dataset",
+    )
+    monkeypatch.setattr(
+        automation,
+        "run_publication_refresh",
+        lambda *_args, **_kwargs: error_refresh(target, attempt=1),
+    )
+    health = RecordingHealthGate(circuit_health("CLOSED"), circuit_health("CLOSED"))
+    coordinator = module.RepairClaimCoordinator(
+        store=queue_store,
+        health_store=health,
+        lock_path=lock_path,
+        owner="repair-worker",
+        lease_seconds=1800,
+    )
+    executor = module.ContinuityRepairExecutor(
+        coordinator=coordinator,
+        queue_store=queue_store,
+        canonical_store=object(),
+        provider=object(),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        required_symbols=lambda: {"sh.600000"},
+        clock=lambda: NOW,
+        retry_policy=module.RepairRetryPolicy(max_attempts=4, base_seconds=900),
+        scanner=scanner,
+        configured_start=target,
+        queue_schema_initializer=queue_store.initialize_continuity_schema,
+    )
+    freshness = automation.ScheduleDecision(
+        action="none",
+        target_session=target + timedelta(days=1),
+        refresh_state="success",
+    )
+
+    result = executor.execute_once(
+        freshness=freshness,
+        latest_expected_session=target + timedelta(days=1),
+        repair_enabled=True,
+        revalidator=lambda: freshness,
+    )
+
+    assert result.status == "failed"
+    assert queue_store.repair_queue_snapshot().jobs[0].state == "retry_wait"
+    assert queue_store.repair_queue_snapshot().attempts[0].outcome == "failed"

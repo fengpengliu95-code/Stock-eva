@@ -23,6 +23,12 @@ from backend.app.market.calendar_sync import (
     CalendarSyncStore,
     run_calendar_sync_loop,
 )
+from backend.app.market.continuity import (
+    ContinuityInventory,
+    ContinuityRepairExecutor,
+    RepairClaimCoordinator,
+    RepairRetryPolicy,
+)
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.orchestration.adapters import build_after_close_pipeline
@@ -74,14 +80,59 @@ async def lifespan(_: FastAPI):
             yield
             return
     user_store = UserStore(layout.local_paths.user_database)
+    trading_calendar = get_trading_calendar()
+    provider = BaoStockProvider(
+        min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
+        factor_cache_path=str(layout.local_paths.factor_cache_database),
+        socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+    )
+    continuity = None
+    repair_executor = None
+    if (
+        settings.market_repair_enabled
+        and settings.market_continuity_start_date is not None
+        and isinstance(market_store, NasMarketStore)
+    ):
+        queue_store = market_store.control
+        continuity = ContinuityInventory(
+            calendar=trading_calendar,
+            inventory_reader=market_store,
+            inventory_mode="immutable_dataset",
+            calendar_conflict=False,
+        )
+        coordinator = RepairClaimCoordinator(
+            store=queue_store,
+            health_store=health_store,
+            lock_path=layout.market_refresh_lock,
+            owner="auto-refresh-repair",
+            lease_seconds=settings.market_repair_lease_seconds,
+        )
+        repair_executor = ContinuityRepairExecutor(
+            coordinator=coordinator,
+            queue_store=queue_store,
+            canonical_store=market_store,
+            provider=provider,
+            inventory_reader=market_store,
+            required_symbols=lambda: collect_required_symbols(user_store),
+            clock=get_market_clock(),
+            retry_policy=RepairRetryPolicy(
+                max_attempts=settings.market_repair_max_attempts,
+                base_seconds=settings.market_repair_retry_base_seconds,
+            ),
+            scanner=continuity,
+            configured_start=settings.market_continuity_start_date,
+            queue_schema_initializer=queue_store.initialize_continuity_schema,
+            health_store=health_store,
+            post_publish=build_after_close_pipeline(
+                layout.local_paths.user_database,
+                market_store,
+                settings=settings,
+            ),
+        )
     service = MarketAutomationService(
         market_store,
-        BaoStockProvider(
-            min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
-            factor_cache_path=str(layout.local_paths.factor_cache_database),
-            socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
-        ),
-        get_trading_calendar(),
+        provider,
+        trading_calendar,
         required_symbols=lambda: collect_required_symbols(user_store),
         lock_path=layout.market_refresh_lock,
         post_publish=build_after_close_pipeline(
@@ -97,6 +148,9 @@ async def lifespan(_: FastAPI):
                 socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
             )
         ),
+        continuity=coordinator if repair_executor is not None else None,
+        repair_enabled=(repair_executor is not None),
+        repair_executor=repair_executor,
     )
     calendar_service = CalendarSyncService(
         CalendarSyncStore(layout.local_paths.control / settings.calendar_sync_database_name),

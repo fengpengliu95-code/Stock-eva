@@ -26,6 +26,7 @@ from backend.app.market.continuity import (
     RepairQueueSnapshot,
     RepairRetryPolicy,
     repair_job_id,
+    repair_request_key,
     require_safe_identifier,
     require_universe_id,
     require_utc,
@@ -1912,7 +1913,7 @@ class MarketStore:
                 or timestamp < attempt.started_at
             ):
                 raise RepairQueueError("repair queue finalization time is invalid")
-            if refresh_result.request_key != job.job_id:
+            if refresh_result.request_key != repair_request_key(job.trade_date):
                 raise RepairQueueError("repair publication request key does not match job")
             if (
                 refresh_result.started_at < job.created_at

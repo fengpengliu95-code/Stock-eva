@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import re
@@ -16,6 +17,7 @@ from pydantic import (
 )
 
 from backend.app.market.failures import MarketFailureClass, MarketFailureStage
+from backend.app.market.models import RefreshResult
 from backend.app.storage.models import VerifiedReadySessionInventory
 
 RepairJobState = Literal["pending", "leased", "retry_wait", "published", "dead_letter"]
@@ -46,6 +48,8 @@ ContinuityDecisionReason = Literal[
     "REPAIR_CLAIMED",
     "ALREADY_RUNNING",
     "REPAIR_CONSUMER_FAILED",
+    "POST_PUBLISH_INVENTORY_MISSING",
+    "REPAIR_PUBLISHED",
 ]
 _FRESHNESS_WAIT_REASONS = frozenset(
     {
@@ -69,6 +73,13 @@ _FRESHNESS_NONE_REASONS = _FRESHNESS_WAIT_REASONS
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _R2F1_UNIVERSE_ID = "all-main-board"
+
+
+def repair_request_key(trade_date: date) -> str:
+    """Return the stable provider-scoped request identity for one full session."""
+    if not isinstance(trade_date, date) or isinstance(trade_date, datetime):
+        raise RepairQueueError("repair queue trade date is invalid")
+    return f"repair:baostock:{trade_date.isoformat()}:{_R2F1_UNIVERSE_ID}"
 
 
 class RepairQueueError(RuntimeError):
@@ -1058,16 +1069,22 @@ class RepairClaimCoordinator:
         now: datetime,
         revalidator: Callable[[], FreshnessDecision],
         lease_consumer: Callable[[RepairLease], object] | None,
+        pre_claim: Callable[[], object] | None = None,
     ) -> ContinuityDecision:
         timestamp = require_utc(now)
         initial = self._decision(freshness, repair_enabled, timestamp)
-        if initial.action != "run" or initial.lane != "repair":
+        needs_locked_preflight = (
+            pre_claim is not None
+            and initial.reason_code == "CONTROL_STATE_UNAVAILABLE"
+            and freshness.action in {"none", "wait"}
+        )
+        if (initial.action != "run" or initial.lane != "repair") and not needs_locked_preflight:
             return initial
         if (
             freshness.target_session != latest_expected_session
             or initial.target_session is None
             or initial.target_session >= latest_expected_session
-        ):
+        ) and not needs_locked_preflight:
             return self._freshness_wait(freshness, "NO_ELIGIBLE_REPAIR")
         if not self._health_is_closed():
             return self._repair_wait(initial, "PROVIDER_HEALTH_UNAVAILABLE")
@@ -1081,6 +1098,8 @@ class RepairClaimCoordinator:
 
         try:
             with RefreshRunLock(self._lock_path):
+                if pre_claim is not None:
+                    pre_claim()
                 refreshed_freshness = revalidator()
                 refreshed = self._decision(refreshed_freshness, repair_enabled, timestamp)
                 if refreshed.action != "run" or refreshed.lane != "repair":
@@ -1182,3 +1201,314 @@ class RepairClaimCoordinator:
             next_run_at=freshness.next_run_at,
             reason_code=reason,
         )
+
+
+RepairExecutionStatus = Literal["published", "failed", "skipped"]
+RepairExecutionReason = Literal[
+    "REPAIR_PUBLISHED",
+    "POST_PUBLISH_INVENTORY_MISSING",
+    "REPAIR_RESULT_FAILED",
+    "REPAIR_DISABLED",
+    "FRESHNESS_DUE",
+    "FRESHNESS_WAIT",
+    "CONTROL_STATE_UNAVAILABLE",
+    "PROVIDER_HEALTH_UNAVAILABLE",
+    "PROVIDER_NOT_CLOSED",
+    "NO_ELIGIBLE_REPAIR",
+    "ALREADY_RUNNING",
+    "REPAIR_CONSUMER_FAILED",
+]
+
+
+class RepairExecutionResult(BaseModel):
+    """Sanitized result of one bounded continuity repair invocation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: RepairExecutionStatus
+    decision: ContinuityDecision
+    refresh_result: RefreshResult | None = None
+    reason_code: RepairExecutionReason
+    provider_requests: int = Field(ge=0, le=1)
+
+
+class ContinuityRepairExecutor:
+    """Execute at most one leased full-session repair under the coordinator lock.
+
+    ``RepairClaimCoordinator`` owns the cross-process lock for the complete callback lifetime.
+    The callback therefore must not acquire ``RefreshRunLock`` again; it only performs canonical
+    publication, strict post-publication evidence and the queue CAS finalization while that same
+    lock remains held.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: RepairClaimCoordinator,
+        queue_store: RepairClaimStore,
+        canonical_store,
+        provider,
+        inventory_reader: VerifiedInventoryReader,
+        required_symbols: Callable[[], set[str]],
+        clock: Callable[[], datetime],
+        retry_policy: RepairRetryPolicy,
+        before_store: Callable[[], None] | None = None,
+        post_publish: Callable[[RefreshResult], None] | None = None,
+        pre_claim: Callable[[], object] | None = None,
+        scanner: ContinuityInventory | None = None,
+        configured_start: date | None = None,
+        queue_schema_initializer: Callable[[], None] | None = None,
+        health_store=None,
+    ) -> None:
+        self.coordinator = coordinator
+        self.queue_store = queue_store
+        self.canonical_store = canonical_store
+        self.provider = provider
+        self.inventory_reader = inventory_reader
+        self.required_symbols = required_symbols
+        self.clock = clock
+        self.retry_policy = retry_policy
+        self.before_store = before_store
+        self.post_publish = post_publish
+        self.pre_claim = pre_claim
+        self.scanner = scanner
+        self.configured_start = configured_start
+        self.queue_schema_initializer = queue_schema_initializer
+        self.health_store = health_store
+
+    def execute_once(
+        self,
+        *,
+        freshness: FreshnessDecision,
+        latest_expected_session: date,
+        repair_enabled: bool,
+        revalidator: Callable[[], FreshnessDecision],
+    ) -> RepairExecutionResult:
+        timestamp = require_utc(self.clock())
+        holder: dict[str, RefreshResult] = {}
+
+        def prepare() -> None:
+            # A strict inventory read is the only authority for crash reconciliation.  When a
+            # scanner is configured it also proves calendar coverage before any queue mutation.
+            scan: ContinuityScanResult | ContinuityUnavailable | None = None
+            inventory: VerifiedReadySessionInventory | None = None
+            if self.scanner is not None:
+                if self.configured_start is None:
+                    raise RepairQueueError("continuity start is unconfigured")
+                scan = self.scanner.scan(
+                    configured_start=self.configured_start,
+                    latest_completed_session=latest_expected_session,
+                )
+                if isinstance(scan, ContinuityUnavailable):
+                    raise RepairQueueError("continuity evidence is unavailable")
+            else:
+                inventory = self.inventory_reader.verified_ready_session_inventory("baostock")
+            if self.queue_schema_initializer is not None:
+                self.queue_schema_initializer()
+            if scan is not None:
+                self.queue_store.reconcile_published_repair_jobs(
+                    scan.published_ready_sessions,
+                    now=timestamp,
+                )
+                self.queue_store.enqueue_repair_jobs(
+                    scan.missing_sessions,
+                    universe_id=_R2F1_UNIVERSE_ID,
+                    now=timestamp,
+                )
+            else:
+                assert inventory is not None
+                self.queue_store.reconcile_published_repair_jobs(
+                    inventory.sessions,
+                    now=timestamp,
+                )
+            reap_expired = getattr(self.queue_store, "reap_expired_repair_leases", None)
+            if callable(reap_expired):
+                reap_expired(now=timestamp, retry_policy=self.retry_policy)
+            if self.pre_claim is not None:
+                self.pre_claim()
+
+        def consume(lease: RepairLease) -> None:
+            request_key = repair_request_key(lease.target_session)
+            run_id = require_safe_identifier(
+                f"repair-{lease.target_session.isoformat()}-{lease.attempt_id}"
+            )
+            from backend.app.market.automation import run_publication_refresh
+
+            required_symbols_error = False
+            try:
+                required_symbols = self.required_symbols()
+            except Exception:
+                required_symbols = set()
+                required_symbols_error = True
+            before_store = self.before_store
+            refresh_operation = getattr(self.provider, "refresh_operation", None)
+            if self.health_store is not None:
+                from backend.app.market.automation import (
+                    _RefreshObservationCollector,
+                    transport_observation_sink,
+                )
+
+                collector = _RefreshObservationCollector(self.health_store, run_id)
+
+                def before_store_with_audit() -> None:
+                    collector.resolve_touched_endpoints()
+                    if before_store is not None:
+                        before_store()
+
+                before_store = before_store_with_audit
+                provider_scope_factory = (
+                    (lambda: refresh_operation(run_id))
+                    if callable(refresh_operation)
+                    else contextlib.nullcontext
+                )
+                observation_scope = transport_observation_sink(collector.record)
+            else:
+                provider_scope_factory = (
+                    (lambda: refresh_operation(run_id))
+                    if callable(refresh_operation)
+                    else contextlib.nullcontext
+                )
+                observation_scope = contextlib.nullcontext()
+            if required_symbols_error:
+                result = self._unexpected_failure(
+                    lease.target_session,
+                    request_key=request_key,
+                    run_id=run_id,
+                    started_at=timestamp,
+                )
+            else:
+                try:
+                    with observation_scope, provider_scope_factory():
+                        result = run_publication_refresh(
+                            self.canonical_store,
+                            self.provider,
+                            trade_date=lease.target_session,
+                            required_symbols=required_symbols,
+                            request_key=request_key,
+                            run_id=run_id,
+                            run_kind="repair",
+                            before_store=before_store,
+                        )
+                except Exception:
+                    result = self._unexpected_failure(
+                        lease.target_session,
+                        request_key=request_key,
+                        run_id=run_id,
+                        started_at=timestamp,
+                    )
+            if not isinstance(result, RefreshResult):
+                raise RepairQueueError("repair publication result is invalid")
+            if result.status == "ready":
+                inventory = self.inventory_reader.verified_ready_session_inventory("baostock")
+                if lease.target_session not in inventory.sessions:
+                    result = self._storage_failure(result)
+                elif self.post_publish is not None:
+                    try:
+                        self.post_publish(result)
+                    except Exception:
+                        result = self._storage_failure(result)
+            holder["result"] = result
+            finalization_time = max(timestamp, require_utc(result.completed_at))
+            outcome: RepairFinalizationOutcome = (
+                "succeeded" if result.status == "ready" else "failed"
+            )
+            self.queue_store.finalize_repair_attempt(
+                lease,
+                outcome=outcome,
+                refresh_result=result,
+                now=finalization_time,
+                retry_policy=self.retry_policy,
+            )
+
+        decision = self.coordinator.claim_ready_once(
+            freshness=freshness,
+            latest_expected_session=latest_expected_session,
+            repair_enabled=repair_enabled,
+            now=timestamp,
+            revalidator=revalidator,
+            lease_consumer=consume,
+            pre_claim=prepare,
+        )
+        result = holder.get("result")
+        if decision.reason_code == "REPAIR_CLAIMED" and result is not None:
+            if result.status == "ready":
+                return RepairExecutionResult(
+                    status="published",
+                    decision=decision,
+                    refresh_result=result,
+                    reason_code="REPAIR_PUBLISHED",
+                    provider_requests=1,
+                )
+            return RepairExecutionResult(
+                status="failed",
+                decision=decision,
+                refresh_result=result,
+                reason_code=(
+                    "POST_PUBLISH_INVENTORY_MISSING"
+                    if result.failure_class == "storage" and result.failure_stage == "publish"
+                    else "REPAIR_RESULT_FAILED"
+                ),
+                provider_requests=1,
+            )
+        return RepairExecutionResult(
+            status="skipped",
+            decision=decision,
+            reason_code=self._skip_reason(decision.reason_code),
+            provider_requests=0,
+        )
+
+    @staticmethod
+    def _storage_failure(result: RefreshResult) -> RefreshResult:
+        return result.model_copy(
+            update={
+                "status": "error",
+                "error_message": "market publication failed",
+                "quality_issues": ["market_refresh_failed"],
+                "failure_stage": "publish",
+                "failure_class": "storage",
+                "retryable": False,
+            }
+        )
+
+    @staticmethod
+    def _unexpected_failure(
+        trade_date: date,
+        *,
+        request_key: str,
+        run_id: str,
+        started_at: datetime,
+    ) -> RefreshResult:
+        return RefreshResult(
+            run_id=run_id,
+            request_key=request_key,
+            run_kind="repair",
+            requested_date=trade_date,
+            source="baostock",
+            status="error",
+            requested_count=0,
+            succeeded_count=0,
+            coverage_ratio=0,
+            quality_issues=["market_refresh_failed"],
+            error_message="market refresh failed",
+            failure_stage="fetch",
+            failure_class="internal",
+            retryable=False,
+            started_at=started_at,
+            completed_at=started_at,
+        )
+
+    @staticmethod
+    def _skip_reason(reason: ContinuityDecisionReason) -> RepairExecutionReason:
+        if reason in {
+            "REPAIR_DISABLED",
+            "FRESHNESS_DUE",
+            "FRESHNESS_WAIT",
+            "CONTROL_STATE_UNAVAILABLE",
+            "PROVIDER_HEALTH_UNAVAILABLE",
+            "PROVIDER_NOT_CLOSED",
+            "NO_ELIGIBLE_REPAIR",
+            "ALREADY_RUNNING",
+            "REPAIR_CONSUMER_FAILED",
+        }:
+            return reason
+        return "CONTROL_STATE_UNAVAILABLE"

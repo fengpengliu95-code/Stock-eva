@@ -374,7 +374,7 @@ def run_publication_refresh(
     required_symbols: set[str],
     request_key: str | None = None,
     run_id: str | None = None,
-    run_kind: Literal["daily", "backfill"] = "daily",
+    run_kind: Literal["daily", "backfill", "repair"] = "daily",
     before_store: Callable[[], None] | None = None,
 ) -> RefreshResult:
     """Fetch to canonical staging, validate all gates, then move the pointer."""
@@ -556,6 +556,7 @@ class MarketAutomationService:
         probe_runner: ProviderProbeRunner | None = None,
         continuity: ContinuityCoordinator | None = None,
         repair_enabled: bool = False,
+        repair_executor=None,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -567,7 +568,9 @@ class MarketAutomationService:
         self.probe_runner = probe_runner
         self.continuity = continuity
         self.repair_enabled = repair_enabled
+        self.repair_executor = repair_executor
         self.last_continuity_decision: object | None = None
+        self.last_repair_result: object | None = None
         self.policy = SchedulePolicy(calendar)
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
@@ -587,7 +590,37 @@ class MarketAutomationService:
             target_session=decision.target_session,
             next_run_at=decision.next_run_at,
         )
-        self._plan_continuity(decision, local)
+        repair_result = self._plan_continuity(decision, local)
+        if repair_result is not None and repair_result.status != "skipped":
+            result = repair_result.refresh_result
+            if repair_result.status == "published" and result is not None:
+                state = SchedulerState(
+                    target_session=decision.target_session,
+                    refresh_state="success",
+                    attempt_count=(current.attempt_count + 1 if current else 1),
+                    last_attempt_at=result.started_at,
+                    last_success_at=result.completed_at,
+                    calendar_status="confirmed",
+                    next_retry_at=None,
+                    error_code=None,
+                )
+            else:
+                state = SchedulerState(
+                    target_session=decision.target_session,
+                    refresh_state="error",
+                    attempt_count=(current.attempt_count + 1 if current else 1),
+                    last_attempt_at=result.started_at if result is not None else local,
+                    last_success_at=current.last_success_at if current else None,
+                    calendar_status="confirmed",
+                    error_code=(
+                        result.failure_class
+                        if result is not None and result.failure_class is not None
+                        else repair_result.reason_code
+                    ),
+                    next_retry_at=None,
+                )
+            self.store.save_scheduler_state(state)
+            return AutomationOutcome(decision=decision, state=state, result=result)
         if decision.action != "run":
             state = current or SchedulerState(
                 target_session=decision.target_session,
@@ -630,12 +663,12 @@ class MarketAutomationService:
             )
             return AutomationOutcome(decision=decision, state=state)
 
-    def _plan_continuity(self, decision: ScheduleDecision, local: datetime) -> None:
+    def _plan_continuity(self, decision: ScheduleDecision, local: datetime):
         if not self.repair_enabled or self.continuity is None:
-            return
+            return None
         target = decision.target_session
         if target is None:
-            return
+            return None
 
         def revalidate() -> ScheduleDecision:
             published = self.store.published_refresh()
@@ -647,6 +680,16 @@ class MarketAutomationService:
             )
 
         try:
+            if self.repair_executor is not None:
+                result = self.repair_executor.execute_once(
+                    freshness=decision,
+                    latest_expected_session=target,
+                    repair_enabled=True,
+                    revalidator=revalidate,
+                )
+                self.last_repair_result = result
+                self.last_continuity_decision = result.decision
+                return result
             self.last_continuity_decision = self.continuity.claim_ready_once(
                 freshness=decision,
                 latest_expected_session=target,
@@ -655,9 +698,12 @@ class MarketAutomationService:
                 revalidator=revalidate,
                 lease_consumer=None,
             )
+            return None
         except Exception:
             self.last_continuity_decision = None
+            self.last_repair_result = None
             _log_event(logging.WARNING, "market_continuity_decision_unavailable")
+            return None
 
     def _execute_due(
         self,

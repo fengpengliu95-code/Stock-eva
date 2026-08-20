@@ -11,6 +11,7 @@ from backend.app.api.market import get_market_store
 from backend.app.main import app
 from backend.app.market.automation import run_publication_refresh
 from backend.app.market.baostock import BaoStockError, BaoStockProvider, ProviderBatch
+from backend.app.market.continuity import repair_request_key
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.refresh import MarketRefreshService
@@ -599,6 +600,52 @@ def test_failed_incident_candidate_preserves_existing_pointer_and_objects(
     assert store.published_refresh().model_dump(mode="json") == pointer_before
     assert (dataset_root / "manifest.json").read_bytes() == manifest_before
     assert {path: (dataset_root / path).read_bytes() for path in objects_before} == objects_before
+
+
+def test_older_repair_extends_manifest_without_regressing_latest_pointer(
+    tmp_path: Path,
+) -> None:
+    store, dataset_root = immutable_dataset_store(tmp_path)
+    latest = date(2026, 8, 11)
+    older = date(2026, 8, 10)
+    latest_provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=[bar.model_copy(update={"trade_date": latest}) for bar in fixture_bars()],
+            expected_symbols=[bar.symbol for bar in fixture_bars()],
+            failed_symbols=[],
+        )
+    )
+    older_provider = FixedBatchProvider(
+        ProviderBatch(
+            bars=[bar.model_copy(update={"trade_date": older}) for bar in fixture_bars()],
+            expected_symbols=[bar.symbol for bar in fixture_bars()],
+            failed_symbols=[],
+        )
+    )
+    published = run_publication_refresh(
+        store,
+        latest_provider,
+        trade_date=latest,
+        required_symbols={"sh.600000"},
+    )
+    assert published.status == "ready"
+
+    repaired = run_publication_refresh(
+        store,
+        older_provider,
+        trade_date=older,
+        required_symbols={"sh.600000"},
+        request_key=repair_request_key(older),
+        run_id="repair-2026-08-10-attempt-1",
+        run_kind="repair",
+    )
+
+    assert repaired.status == "ready"
+    assert store.published_refresh().requested_date == latest
+    assert set(store.verified_ready_session_inventory().sessions) == {older, latest}
+    persisted = next(item for item in store.list_refreshes() if item.run_id == repaired.run_id)
+    assert persisted.run_kind == "repair"
+    assert persisted.request_key == repair_request_key(older)
 
 
 def test_history_is_queryable_by_date_and_exports_one_parquet_partition(tmp_path: Path) -> None:

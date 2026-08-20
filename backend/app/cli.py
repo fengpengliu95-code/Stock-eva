@@ -33,6 +33,12 @@ from backend.app.market.backfill import (
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.calendar_sync import CalendarSyncService, CalendarSyncStore
+from backend.app.market.continuity import (
+    ContinuityInventory,
+    ContinuityRepairExecutor,
+    RepairClaimCoordinator,
+    RepairRetryPolicy,
+)
 from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.failures import (
     MarketFailure,
@@ -835,6 +841,78 @@ def main() -> int:
     socket_timeout_seconds = (
         getattr(args, "socket_timeout_seconds", None) or settings.baostock_socket_timeout_seconds
     )
+    health_options = {
+        "failure_threshold": settings.provider_circuit_failure_threshold,
+        "cooldown_seconds": settings.provider_circuit_cooldown_seconds,
+        "probe_lease_seconds": settings.provider_circuit_probe_lease_seconds,
+    }
+    now = get_market_clock()()
+    if args.command == "auto-refresh-once" and not args.execute:
+        # Planning is deliberately before writer/NAS/provider construction.  The local control
+        # reader never initializes a missing DuckDB or mutates the NAS pointer.
+        try:
+            if layout.provider_health_database.exists():
+                health_store = SQLiteProviderHealthStore(
+                    layout.provider_health_database,
+                    **health_options,
+                )
+                provider_health = health_store.provider_health_snapshot()
+            else:
+                provider_health = InMemoryProviderHealthStore(
+                    **health_options
+                ).provider_health_snapshot()
+            read_store = MarketStore(
+                layout.local_paths.market_database,
+                temp_directory=layout.duckdb_temporary,
+                read_only=True,
+            )
+            published = read_store.published_refresh()
+            decision = MarketAutomationService(
+                read_store,
+                object(),
+                get_trading_calendar(),
+                required_symbols=set,
+            ).policy.decide(
+                now,
+                published_as_of=(published.requested_date if published is not None else None),
+                state=read_store.scheduler_state(),
+            )
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "PROVIDER_HEALTH_UNAVAILABLE",
+                        "writes_market_data": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": "dry-run",
+                    "action": decision.action,
+                    "target_session": (
+                        decision.target_session.isoformat()
+                        if decision.target_session is not None
+                        else None
+                    ),
+                    "refresh_state": decision.refresh_state,
+                    "next_run_at": (
+                        decision.next_run_at.isoformat()
+                        if decision.next_run_at is not None
+                        else None
+                    ),
+                    "provider_health": _provider_health_payload(provider_health),
+                    "writes_market_data": False,
+                    "execute_requires": "--execute",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     if args.command == "calendar-sync":
         if (args.start is None) != (args.end is None):
             print(
@@ -1109,71 +1187,6 @@ def main() -> int:
         return 0
     if args.command == "auto-refresh-once":
         calendar = get_trading_calendar()
-        now = get_market_clock()()
-        health_options = {
-            "failure_threshold": settings.provider_circuit_failure_threshold,
-            "cooldown_seconds": settings.provider_circuit_cooldown_seconds,
-            "probe_lease_seconds": settings.provider_circuit_probe_lease_seconds,
-        }
-        if not args.execute:
-            try:
-                if layout.provider_health_database.exists():
-                    health_store = SQLiteProviderHealthStore(
-                        layout.provider_health_database,
-                        **health_options,
-                    )
-                    provider_health = health_store.provider_health_snapshot()
-                else:
-                    provider_health = InMemoryProviderHealthStore(
-                        **health_options
-                    ).provider_health_snapshot()
-            except Exception:
-                print(
-                    json.dumps(
-                        {
-                            "status": "error",
-                            "error_code": "PROVIDER_HEALTH_UNAVAILABLE",
-                            "writes_market_data": False,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-                return 1
-            published = store.published_refresh()
-            decision = MarketAutomationService(
-                store,
-                object(),
-                calendar,
-                required_symbols=set,
-            ).policy.decide(
-                now,
-                published_as_of=(published.requested_date if published is not None else None),
-                state=store.scheduler_state(),
-            )
-            print(
-                json.dumps(
-                    {
-                        "status": "dry-run",
-                        "action": decision.action,
-                        "target_session": (
-                            decision.target_session.isoformat()
-                            if decision.target_session is not None
-                            else None
-                        ),
-                        "refresh_state": decision.refresh_state,
-                        "next_run_at": (
-                            decision.next_run_at.isoformat()
-                            if decision.next_run_at is not None
-                            else None
-                        ),
-                        "provider_health": _provider_health_payload(provider_health),
-                        "writes_market_data": False,
-                        "execute_requires": "--execute",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return 0
         try:
             health_store = SQLiteProviderHealthStore(
                 layout.provider_health_database,
@@ -1186,6 +1199,50 @@ def main() -> int:
                 socket_timeout_seconds=socket_timeout_seconds,
             )
             user_store = UserStore(layout.local_paths.user_database)
+            continuity = None
+            coordinator = None
+            repair_executor = None
+            if (
+                settings.market_repair_enabled
+                and settings.market_continuity_start_date is not None
+                and isinstance(store, NasMarketStore)
+            ):
+                queue_store = store.control
+                continuity = ContinuityInventory(
+                    calendar=calendar,
+                    inventory_reader=store,
+                    inventory_mode="immutable_dataset",
+                    calendar_conflict=False,
+                )
+                coordinator = RepairClaimCoordinator(
+                    store=queue_store,
+                    health_store=health_store,
+                    lock_path=layout.market_refresh_lock,
+                    owner="auto-refresh-repair",
+                    lease_seconds=settings.market_repair_lease_seconds,
+                )
+                repair_executor = ContinuityRepairExecutor(
+                    coordinator=coordinator,
+                    queue_store=queue_store,
+                    canonical_store=store,
+                    provider=provider,
+                    inventory_reader=store,
+                    required_symbols=lambda: collect_required_symbols(user_store),
+                    clock=get_market_clock(),
+                    retry_policy=RepairRetryPolicy(
+                        max_attempts=settings.market_repair_max_attempts,
+                        base_seconds=settings.market_repair_retry_base_seconds,
+                    ),
+                    scanner=continuity,
+                    configured_start=settings.market_continuity_start_date,
+                    queue_schema_initializer=queue_store.initialize_continuity_schema,
+                    health_store=health_store,
+                    post_publish=build_after_close_pipeline(
+                        layout.local_paths.user_database,
+                        store,
+                        settings=settings,
+                    ),
+                )
             service = MarketAutomationService(
                 store,
                 provider,
@@ -1207,6 +1264,9 @@ def main() -> int:
                         socket_timeout_seconds=socket_timeout_seconds,
                     )
                 ),
+                continuity=coordinator,
+                repair_enabled=(repair_executor is not None),
+                repair_executor=repair_executor,
             )
             outcome = service.run_due_once(now)
             provider_health = health_store.provider_health()

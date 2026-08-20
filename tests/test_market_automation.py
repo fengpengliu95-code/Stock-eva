@@ -28,6 +28,7 @@ from backend.app.market.baostock_vendor import (
     emit_terminal_observation,
     transport_observation_sink,
 )
+from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
@@ -294,6 +295,64 @@ def test_automation_optional_continuity_hook_is_planning_only_and_never_consumes
     assert service.last_continuity_decision == {"reason_code": "REPAIR_READY"}
     assert provider.fetch_calls == provider.calendar_calls == 0
     assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_automation_executes_one_repair_result_without_entering_freshness_lane(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 24))
+    provider = CompleteProvider(fixture_bars())
+    target = date(2026, 7, 24)
+    refresh = RefreshResult(
+        run_id="repair-2026-07-24-attempt-1",
+        request_key="repair:baostock:2026-07-24:all-main-board",
+        run_kind="repair",
+        requested_date=target,
+        source="baostock",
+        status="ready",
+        requested_count=1,
+        succeeded_count=1,
+        coverage_ratio=1,
+        started_at=datetime(2026, 7, 24, 10, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
+    )
+    continuity = object()
+    executor = type(
+        "Executor",
+        (),
+        {
+            "execute_once": lambda self, **kwargs: RepairExecutionResult(
+                status="published",
+                decision=ContinuityDecision(
+                    action="run",
+                    lane="repair",
+                    target_session=target,
+                    repair_job_id="repair:2026-07-24:all-main-board",
+                    reason_code="REPAIR_CLAIMED",
+                ),
+                refresh_result=refresh,
+                reason_code="REPAIR_PUBLISHED",
+                provider_requests=1,
+            )
+        },
+    )()
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        continuity=continuity,
+        repair_enabled=True,
+        repair_executor=executor,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result == refresh
+    assert outcome.state.refresh_state == "success"
+    assert provider.fetch_calls == provider.calendar_calls == 0
 
 
 class HealthClock:
