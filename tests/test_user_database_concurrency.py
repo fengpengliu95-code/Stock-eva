@@ -30,10 +30,7 @@ def test_shared_user_database_initializes_safely_under_concurrency(
         ]
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [
-                executor.submit(run_after, start, call)
-                for call in calls
-            ]
+            futures = [executor.submit(run_after, start, call) for call in calls]
             results = [future.result() for future in futures]
 
         assert results == [[], [], []]

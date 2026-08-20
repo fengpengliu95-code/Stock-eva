@@ -223,11 +223,7 @@ def test_multi_symbol_range_query_is_bounded_and_uses_one_query(
     assert store.fetched_rows == 156 * 20
     assert list(grouped) == symbols
     assert all(len(grouped[symbol]) == 156 for symbol in symbols)
-    assert all(
-        bar.trade_date <= date(2025, 12, 31)
-        for bars in grouped.values()
-        for bar in bars
-    )
+    assert all(bar.trade_date <= date(2025, 12, 31) for bars in grouped.values() for bar in bars)
     with pytest.raises(ValueError, match="at most 200"):
         store.symbols_bars(
             [f"sh.{index:06d}" for index in range(201)],

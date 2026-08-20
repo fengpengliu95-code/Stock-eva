@@ -59,8 +59,5 @@ def calculate_indicators(closes: list[float]) -> dict[str, list[float | None]]:
     for definition in INDICATOR_REGISTRY.values():
         outputs = definition.calculate(close)
         for field, values in zip(definition.output_fields, outputs, strict=True):
-            result[field] = [
-                None if np.isnan(value) else float(value)
-                for value in values
-            ]
+            result[field] = [None if np.isnan(value) else float(value) for value in values]
     return result

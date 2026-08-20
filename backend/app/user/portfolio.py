@@ -28,10 +28,7 @@ class PortfolioValuationService:
             return self._empty()
         if not self.market_store.exists():
             return self._market_error(positions, "market_data_missing")
-        refresh = (
-            self.market_store.published_refresh()
-            or self.market_store.latest_refresh()
-        )
+        refresh = self.market_store.published_refresh() or self.market_store.latest_refresh()
         if refresh is None or refresh.status == "error":
             return self._market_error(positions, "market_refresh_error")
 
@@ -116,9 +113,7 @@ class PortfolioValuationService:
             items=items,
             covered_market_value=_money(market_value_total) if covered else None,
             covered_cost_basis=_money(cost_total) if covered else None,
-            covered_unrealized_pnl=(
-                _money(market_value_total - cost_total) if covered else None
-            ),
+            covered_unrealized_pnl=(_money(market_value_total - cost_total) if covered else None),
             valuation_basis=VALUATION_BASIS,
             quality_issues=issues,
         )
@@ -169,8 +164,7 @@ class PortfolioValuationService:
                 suspended_symbols=[],
             ),
             items=[
-                PortfolioValuationService._unvalued(position, "missing")
-                for position in positions
+                PortfolioValuationService._unvalued(position, "missing") for position in positions
             ],
             covered_market_value=None,
             covered_cost_basis=None,

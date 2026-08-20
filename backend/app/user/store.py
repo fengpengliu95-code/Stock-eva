@@ -132,9 +132,7 @@ class UserStore:
     def list_positions(self) -> list[Position]:
         connection = self._connect()
         try:
-            rows = connection.execute(
-                "SELECT * FROM positions ORDER BY symbol"
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
         finally:
             connection.close()
         return [self._position(row) for row in rows]
@@ -223,9 +221,7 @@ class UserStore:
     def list_watchlists(self) -> list[Watchlist]:
         connection = self._connect()
         try:
-            rows = connection.execute(
-                "SELECT * FROM watchlists ORDER BY name, id"
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM watchlists ORDER BY name, id").fetchall()
         finally:
             connection.close()
         return [self._watchlist(row) for row in rows]
@@ -250,10 +246,13 @@ class UserStore:
     def add_watchlist_item(self, watchlist_id: str, symbol: str) -> tuple[WatchlistItem, bool]:
         connection = self._connect()
         try:
-            if connection.execute(
-                "SELECT 1 FROM watchlists WHERE id = ?",
-                [watchlist_id],
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM watchlists WHERE id = ?",
+                    [watchlist_id],
+                ).fetchone()
+                is None
+            ):
                 raise NotFoundError("watchlist not found")
             existing = connection.execute(
                 "SELECT * FROM watchlist_items WHERE watchlist_id = ? AND symbol = ?",
@@ -278,10 +277,13 @@ class UserStore:
     def list_watchlist_items(self, watchlist_id: str) -> list[WatchlistItem]:
         connection = self._connect()
         try:
-            if connection.execute(
-                "SELECT 1 FROM watchlists WHERE id = ?",
-                [watchlist_id],
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM watchlists WHERE id = ?",
+                    [watchlist_id],
+                ).fetchone()
+                is None
+            ):
                 raise NotFoundError("watchlist not found")
             rows = connection.execute(
                 """
@@ -298,10 +300,13 @@ class UserStore:
     def remove_watchlist_item(self, watchlist_id: str, symbol: str) -> None:
         connection = self._connect()
         try:
-            if connection.execute(
-                "SELECT 1 FROM watchlists WHERE id = ?",
-                [watchlist_id],
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM watchlists WHERE id = ?",
+                    [watchlist_id],
+                ).fetchone()
+                is None
+            ):
                 raise NotFoundError("watchlist not found")
             connection.execute(
                 "DELETE FROM watchlist_items WHERE watchlist_id = ? AND symbol = ?",

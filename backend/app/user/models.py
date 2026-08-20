@@ -8,8 +8,10 @@ from pydantic import BaseModel, Field, field_validator
 def _normalize_symbol(value: str) -> str:
     normalized = value.strip().lower()
     parts = normalized.split(".")
-    if len(parts) != 2 or parts[0] not in {"sh", "sz"} or not (
-        len(parts[1]) == 6 and parts[1].isdigit()
+    if (
+        len(parts) != 2
+        or parts[0] not in {"sh", "sz"}
+        or not (len(parts[1]) == 6 and parts[1].isdigit())
     ):
         raise ValueError("symbol must look like sh.600000 or sz.000001")
     return normalized

@@ -86,9 +86,7 @@ def run_real_e2e_acceptance(
         raise AcceptanceError("ready_published_snapshot_required")
     as_of_date = published.requested_date
     effective_dates = [
-        item
-        for item in market_store.available_dates("baostock")
-        if item <= as_of_date
+        item for item in market_store.available_dates("baostock") if item <= as_of_date
     ]
     if len(effective_dates) < MINIMUM_EFFECTIVE_DAYS:
         raise AcceptanceError("at_least_21_effective_days_required")
@@ -115,8 +113,7 @@ def run_real_e2e_acceptance(
             validate_rule(acceptance_rule_ast()),
         )
         scan_key = (
-            f"acceptance:{strategy.id}:v{version.version}:"
-            f"{as_of_date.isoformat()}:all-main-board"
+            f"acceptance:{strategy.id}:v{version.version}:{as_of_date.isoformat()}:all-main-board"
         )
         scan_service = StrategyRunService(strategy_store, market_store)
         first_scan = scan_service.run_all_main_board(
@@ -135,9 +132,7 @@ def run_real_e2e_acceptance(
             raise AcceptanceError("strategy_scan_batch_failed")
 
         candidates = sorted(
-            result.symbol
-            for result in first_scan.results
-            if result.status == "matched"
+            result.symbol for result in first_scan.results if result.status == "matched"
         )
         sample_symbol = candidates[0] if candidates else sorted(latest_by_symbol)[0]
         sample_bar = latest_by_symbol[sample_symbol]
@@ -171,12 +166,8 @@ def run_real_e2e_acceptance(
         if (
             not first_event_ids
             or first_event_ids != second_event_ids
-            or [
-                event.idempotency_key for event in first_alert.events
-            ]
-            != [
-                event.idempotency_key for event in second_alert.events
-            ]
+            or [event.idempotency_key for event in first_alert.events]
+            != [event.idempotency_key for event in second_alert.events]
         ):
             raise AcceptanceError("alert_evaluation_idempotency_failed")
 

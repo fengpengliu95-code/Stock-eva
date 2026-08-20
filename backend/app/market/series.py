@@ -46,9 +46,7 @@ def _validate_effective_bar(bar: DailyBar, *, adjustment: Literal["none", "qfq"]
         else:
             invalid = invalid or value < 0
         if invalid:
-            raise DataQualityError(
-                f"{bar.symbol} {bar.trade_date} invalid {field}={value!r}"
-            )
+            raise DataQualityError(f"{bar.symbol} {bar.trade_date} invalid {field}={value!r}")
     if adjustment == "qfq":
         if bar.adjust_factor is None:
             raise DataQualityError(f"{bar.symbol} {bar.trade_date} missing adjust_factor")
@@ -113,10 +111,7 @@ class PriceSeriesService:
                 raise DataQualityError(
                     f"{bar.symbol} {bar.trade_date} invalid qfq multiplier={factor!r}"
                 )
-            adjusted_prices = {
-                field: getattr(bar, field) * factor
-                for field in _PRICE_FIELDS
-            }
+            adjusted_prices = {field: getattr(bar, field) * factor for field in _PRICE_FIELDS}
             for field, value in adjusted_prices.items():
                 if not math.isfinite(value) or value <= 0:
                     raise DataQualityError(

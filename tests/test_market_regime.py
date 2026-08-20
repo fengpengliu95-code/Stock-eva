@@ -56,16 +56,8 @@ def _scope(models, *, all_expected_symbols_observed: bool = True):
         "sh.000852",
         "sz.399006",
     ]
-    observed_boards = (
-        expected_boards
-        if all_expected_symbols_observed
-        else expected_boards[:2]
-    )
-    observed_indexes = (
-        expected_indexes
-        if all_expected_symbols_observed
-        else expected_indexes[:2]
-    )
+    observed_boards = expected_boards if all_expected_symbols_observed else expected_boards[:2]
+    observed_indexes = expected_indexes if all_expected_symbols_observed else expected_indexes[:2]
     return models.ActualMarketScope(
         expected_boards=expected_boards,
         observed_boards=observed_boards,
@@ -1244,8 +1236,10 @@ def test_snapshot_api_reads_exact_persisted_result_without_recomputation(
 ) -> None:
     analysis_api = import_module("backend.app.api.analysis")
     snapshots = import_module("backend.app.regime.snapshots")
-    result = import_module("backend.app.regime.service").MarketRegimeService().evaluate(
-        _inputs(import_module("backend.app.regime.models"), 0)
+    result = (
+        import_module("backend.app.regime.service")
+        .MarketRegimeService()
+        .evaluate(_inputs(import_module("backend.app.regime.models"), 0))
     )
     snapshot_store = snapshots.RegimeSnapshotStore(tmp_path / "control" / "snapshots.sqlite3")
     persisted, _ = snapshot_store.capture(
@@ -1278,8 +1272,10 @@ def test_snapshot_api_failures_are_sanitized_and_read_only(
 ) -> None:
     analysis_api = import_module("backend.app.api.analysis")
     snapshots = import_module("backend.app.regime.snapshots")
-    result = import_module("backend.app.regime.service").MarketRegimeService().evaluate(
-        _inputs(import_module("backend.app.regime.models"), 0)
+    result = (
+        import_module("backend.app.regime.service")
+        .MarketRegimeService()
+        .evaluate(_inputs(import_module("backend.app.regime.models"), 0))
     )
     snapshot_store = snapshots.RegimeSnapshotStore(tmp_path / "control" / "snapshots.sqlite3")
     snapshot_store.capture(
@@ -1358,7 +1354,6 @@ def test_snapshot_api_rejects_invalid_or_future_before_reader(path: str) -> None
     )
 
     assert response.status_code == 422
-
 
 
 def test_api_missing_database_is_empty_and_creates_no_filesystem_state(

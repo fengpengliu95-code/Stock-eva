@@ -25,9 +25,7 @@ class ValidatedRule:
 
 def _exact_keys(value: dict[str, Any], required: set[str]) -> None:
     if set(value) != required:
-        raise RuleValidationError(
-            f"expected keys {sorted(required)}, got {sorted(value)}"
-        )
+        raise RuleValidationError(f"expected keys {sorted(required)}, got {sorted(value)}")
 
 
 def _validate_operand(value: object) -> None:

@@ -69,20 +69,12 @@ class MarketRegimeService:
         strategic_state = self._strategic_state(total_score)
         tactical_state = self._tactical_state(total_score)
         missing_inputs = sorted(
-            {
-                missing
-                for component in components
-                for missing in component.missing_inputs
-            }
+            {missing for component in components for missing in component.missing_inputs}
         )
         issues = sorted(
             {
                 *inputs.quality_issues,
-                *(
-                    issue
-                    for component in components
-                    for issue in component.quality_issues
-                ),
+                *(issue for component in components for issue in component.quality_issues),
             }
         )
         if missing_inputs:
@@ -105,14 +97,10 @@ class MarketRegimeService:
             status = "ready"
         confidence = self._confidence(components)
         supporting = [
-            evidence
-            for component in components
-            for evidence in component.supporting_evidence
+            evidence for component in components for evidence in component.supporting_evidence
         ]
         contrary = [
-            evidence
-            for component in components
-            for evidence in component.contrary_evidence
+            evidence for component in components for evidence in component.contrary_evidence
         ]
         result_id = self._result_id(inputs)
         return MarketRegimeResult(
@@ -156,9 +144,7 @@ class MarketRegimeService:
         return "neutral"
 
     def _confidence(self, components) -> RegimeConfidence:
-        available_weight = sum(
-            item.weight for item in components if item.score is not None
-        )
+        available_weight = sum(item.weight for item in components if item.score is not None)
         quality_factor = sum(
             item.weight
             * (

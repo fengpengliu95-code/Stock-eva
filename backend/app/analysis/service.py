@@ -43,10 +43,7 @@ class SecurityAnalysisService:
                 close=point.close,
                 volume=point.volume,
                 amount=point.amount,
-                **{
-                    field: values[index]
-                    for field, values in indicators.items()
-                },
+                **{field: values[index] for field, values in indicators.items()},
             )
             for index, point in enumerate(prices)
         ]

@@ -51,8 +51,7 @@ class SystemMountInspector:
         candidates = [
             item
             for line in result.stdout.splitlines()
-            if (item := self._parse_mount(line)) is not None
-            and _contains(item.mount_point, path)
+            if (item := self._parse_mount(line)) is not None and _contains(item.mount_point, path)
         ]
         if not candidates:
             return None
@@ -72,18 +71,14 @@ class SystemMountInspector:
             return MountInfo(
                 mount_point=Path(macos.group(1)),
                 filesystem_type=macos.group(2).lower(),
-                options=tuple(
-                    filter(None, (macos.group(3) or "").replace(" ", "").split(","))
-                ),
+                options=tuple(filter(None, (macos.group(3) or "").replace(" ", "").split(","))),
             )
         return None
 
 
 def _contains(parent: Path, child: Path) -> bool:
     try:
-        return os.path.commonpath((parent.resolve(), child.resolve())) == str(
-            parent.resolve()
-        )
+        return os.path.commonpath((parent.resolve(), child.resolve())) == str(parent.resolve())
     except (OSError, ValueError):
         return False
 

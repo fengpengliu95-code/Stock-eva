@@ -98,9 +98,7 @@ class ClassificationService:
         selected = self.store.read_snapshot(as_of, index_id=index_id)
         rows = selected.index_components
         generation_id = (
-            selected.generation.generation_id
-            if selected.generation is not None
-            else None
+            selected.generation.generation_id if selected.generation is not None else None
         )
         snapshot_date = selected.index_snapshot_date
         if not rows:
@@ -145,9 +143,7 @@ class ClassificationService:
         self._ensure_taxonomy(taxonomy_id, selected.generation)
         rows = selected.sector_memberships
         generation_id = (
-            selected.generation.generation_id
-            if selected.generation is not None
-            else None
+            selected.generation.generation_id if selected.generation is not None else None
         )
         snapshot_date = selected.sector_snapshot_date
         if not rows:
@@ -193,9 +189,7 @@ class ClassificationService:
         self._ensure_taxonomy(taxonomy_id, selected.generation)
         rows = selected.sector_memberships
         generation_id = (
-            selected.generation.generation_id
-            if selected.generation is not None
-            else None
+            selected.generation.generation_id if selected.generation is not None else None
         )
         snapshot_date = selected.sector_snapshot_date
         members = [row for row in rows if row.sector_id == sector_id]
@@ -241,9 +235,7 @@ class ClassificationService:
             if eligibility_reason(row, as_of) is None
         }
         reasons = Counter(
-            reason
-            for row in securities
-            if (reason := eligibility_reason(row, as_of)) is not None
+            reason for row in securities if (reason := eligibility_reason(row, as_of)) is not None
         )
         actionability = Counter(
             reason

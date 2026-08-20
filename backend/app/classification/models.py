@@ -145,9 +145,7 @@ class ClassificationSnapshot(BaseModel):
     securities: list[SecurityMasterRecord] = Field(default_factory=list)
     index_components: list[IndexComponentRecord] = Field(default_factory=list)
     sector_memberships: list[SectorMembershipRecord] = Field(default_factory=list)
-    declared_taxonomies: list[str] = Field(
-        default_factory=lambda: [TAXONOMY_BAOSTOCK_INDUSTRY]
-    )
+    declared_taxonomies: list[str] = Field(default_factory=lambda: [TAXONOMY_BAOSTOCK_INDUSTRY])
 
 
 class Eligibility(BaseModel):

@@ -136,8 +136,7 @@ def test_workspace_uses_native_controls_and_has_no_inline_event_handlers() -> No
 
     assert any(tag == "button" for tag, _ in parser.tags)
     assert all(
-        not any(name.startswith("on") for name in attributes)
-        for _, attributes in parser.tags
+        not any(name.startswith("on") for name in attributes) for _, attributes in parser.tags
     )
 
 
@@ -211,10 +210,7 @@ def test_workspace_exposes_accessible_alert_controls_and_history() -> None:
         "alert-signal-date",
         "alert-rule-select",
     } <= parser.labels_for
-    assert any(
-        attributes.get("aria-live") == "polite"
-        for _, attributes in parser.tags
-    )
+    assert any(attributes.get("aria-live") == "polite" for _, attributes in parser.tags)
 
 
 def test_workspace_alert_script_uses_local_api_and_safe_dom_rendering() -> None:
@@ -260,8 +256,6 @@ def test_workspace_build_is_scoped_and_reproducible() -> None:
 
 
 def test_workspace_bundle_has_no_node_runtime_dependency() -> None:
-    bundle = (
-        ROOT / "workspace" / "assets" / "security-cockpit.js"
-    ).read_text()
+    bundle = (ROOT / "workspace" / "assets" / "security-cockpit.js").read_text()
 
     assert "process.env" not in bundle

@@ -50,11 +50,7 @@ def header_values(
     headers: list[tuple[str, str]],
     name: str,
 ) -> list[str]:
-    return [
-        value
-        for header_name, value in headers
-        if header_name.lower() == name.lower()
-    ]
+    return [value for header_name, value in headers if header_name.lower() == name.lower()]
 
 
 def test_workspace_get_responses_are_never_cached(tmp_path: Path) -> None:

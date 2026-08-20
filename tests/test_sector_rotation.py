@@ -1494,11 +1494,7 @@ def test_leader_ranking_representative_scale_has_stable_runtime_budget(
     tmp_path: Path,
 ) -> None:
     sector_service = import_module("backend.app.sector.service")
-    symbols = [
-        f"sh.{prefix}{index:03d}"
-        for prefix in (600, 601, 603, 605)
-        for index in range(750)
-    ]
+    symbols = [f"sh.{prefix}{index:03d}" for prefix in (600, 601, 603, 605) for index in range(750)]
     securities = [_security(symbol) for symbol in symbols]
     memberships = [_membership(symbol, "market") for symbol in symbols]
     generation = import_module("backend.app.classification.models").GenerationSummary(
@@ -2134,8 +2130,7 @@ def test_symbol_exchange_prefix_mismatch_is_excluded_when_sources_agree_on_wrong
         security_overrides={"sh.600002": {"exchange": "sz"}},
     )
     mismatched = [
-        bar.model_copy(update={"exchange": "sz"})
-        for bar in _bars("sh.600002", drift=0.02)
+        bar.model_copy(update={"exchange": "sz"}) for bar in _bars("sh.600002", drift=0.02)
     ]
     sector_service = import_module("backend.app.sector.service")
     service = sector_service.SectorRotationService(
@@ -2170,9 +2165,7 @@ def test_supported_main_board_prefixes_and_index_history_remain_compatible(
         "sz.003001",
     ]
     index_rows = [
-        bar.model_copy(
-            update={"security_type": "index", "board": "index", "adjust_factor": None}
-        )
+        bar.model_copy(update={"security_type": "index", "board": "index", "adjust_factor": None})
         for bar in _bars("sh.000001", drift=0.001)
     ]
     service, _, _ = _service(
