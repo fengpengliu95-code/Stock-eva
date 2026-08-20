@@ -21,6 +21,8 @@ from backend.app.market.calendar_sync import (
     CalendarSyncPolicy,
     CalendarSyncService,
     CalendarSyncStore,
+    CalendarSyncStoreReadError,
+    read_calendar_conflict,
     run_calendar_sync_loop,
 )
 from backend.app.market.provider_health import (
@@ -167,6 +169,35 @@ def test_bundled_calendar_supports_cross_year_strategy_history() -> None:
         confirmed_open += calendar.session_status(current) == "open"
         current += timedelta(days=1)
     assert confirmed_open >= 260
+
+
+def test_read_calendar_conflict_is_dynamic_select_only_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "control" / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+            ('{"conflict_detected": false}',),
+        )
+
+    assert read_calendar_conflict(path) is False
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+            ('{"conflict_detected": true}',),
+        )
+    assert read_calendar_conflict(path) is True
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        read_calendar_conflict(tmp_path / "missing.sqlite3")
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE calendar_sync_state")
+    with pytest.raises(CalendarSyncStoreReadError):
+        read_calendar_conflict(path)
 
 
 def test_calendar_sync_schedule_does_not_repeat_completed_slots(tmp_path: Path) -> None:

@@ -1130,6 +1130,95 @@ def test_lifespan_writer_owner_repairs_legacy_control_schema(
     assert pointer.requested_date == AS_OF
 
 
+def test_lifespan_repair_scanner_reads_calendar_conflict_dynamically(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={
+            "auto_refresh_enabled": True,
+            "market_repair_enabled": True,
+            "market_continuity_start_date": date(2026, 7, 20),
+        }
+    )
+    _publish_fixture(settings, dataset_root)
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    with sqlite3.connect(calendar_path) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+            ('{"conflict_detected": true}',),
+        )
+
+    class ReadyPreflight:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def inspect(self) -> StorageReadiness:
+            return StorageReadiness(
+                mode="local_dataset",
+                status="ready",
+                market_data_available=True,
+                serving_source="local",
+                mount_type="local",
+                sentinel_status="ready",
+                manifest_status="ready",
+                dataset_generation="fixture",
+            )
+
+    captured: dict[str, object] = {}
+    real_inventory = main_module.ContinuityInventory
+
+    def capture_inventory(**kwargs):
+        scanner = real_inventory(**kwargs)
+        captured["scanner"] = scanner
+        return scanner
+
+    class CapturingAutomationService:
+        def __init__(self, *_args, **kwargs) -> None:
+            captured.update(kwargs)
+
+    async def idle_loop(_service, stop, **_kwargs) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "settings", settings)
+    monkeypatch.setattr(main_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(main_module, "ContinuityInventory", capture_inventory)
+    monkeypatch.setattr(main_module, "MarketAutomationService", CapturingAutomationService)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def run_lifespan() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(run_lifespan())
+
+    scanner = captured["scanner"]
+    blocked = scanner.scan(
+        configured_start=date(2026, 7, 20),
+        latest_completed_session=date(2026, 7, 23),
+    )
+    assert isinstance(blocked, ContinuityUnavailable)
+    assert blocked.reason_code == "CALENDAR_CONFLICT"
+
+    with sqlite3.connect(calendar_path) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+            ('{"conflict_detected": false}',),
+        )
+    refreshed = scanner.scan(
+        configured_start=date(2026, 7, 20),
+        latest_completed_session=date(2026, 7, 23),
+    )
+    assert not (
+        isinstance(refreshed, ContinuityUnavailable)
+        and refreshed.reason_code == "CALENDAR_CONFLICT"
+    )
+
+
 def test_market_store_reader_sees_previous_commit_during_writer_transaction(
     tmp_path: Path,
 ) -> None:

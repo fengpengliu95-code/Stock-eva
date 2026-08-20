@@ -35,7 +35,11 @@ from backend.app.market.backfill import (
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
-from backend.app.market.calendar_sync import CalendarSyncService, CalendarSyncStore
+from backend.app.market.calendar_sync import (
+    CalendarSyncService,
+    CalendarSyncStore,
+    read_calendar_conflict,
+)
 from backend.app.market.continuity import (
     ContinuityEnqueueService,
     ContinuityInventory,
@@ -1481,11 +1485,14 @@ def main() -> int:
                 and isinstance(store, NasMarketStore)
             ):
                 queue_store = store.control
+                calendar_sync_path = (
+                    layout.local_paths.control / settings.calendar_sync_database_name
+                )
                 continuity = ContinuityInventory(
                     calendar=calendar,
                     inventory_reader=store,
                     inventory_mode="immutable_dataset",
-                    calendar_conflict=False,
+                    calendar_conflict=lambda: read_calendar_conflict(calendar_sync_path),
                 )
                 coordinator = RepairClaimCoordinator(
                     store=queue_store,

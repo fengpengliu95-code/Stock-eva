@@ -21,6 +21,7 @@ from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.calendar_sync import (
     CalendarSyncService,
     CalendarSyncStore,
+    read_calendar_conflict,
     run_calendar_sync_loop,
 )
 from backend.app.market.continuity import (
@@ -94,11 +95,12 @@ async def lifespan(_: FastAPI):
         and isinstance(market_store, NasMarketStore)
     ):
         queue_store = market_store.control
+        calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
         continuity = ContinuityInventory(
             calendar=trading_calendar,
             inventory_reader=market_store,
             inventory_mode="immutable_dataset",
-            calendar_conflict=False,
+            calendar_conflict=lambda: read_calendar_conflict(calendar_sync_path),
         )
         coordinator = RepairClaimCoordinator(
             store=queue_store,

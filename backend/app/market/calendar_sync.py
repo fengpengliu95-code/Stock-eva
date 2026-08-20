@@ -457,6 +457,30 @@ class CalendarSyncStore:
         ]
 
 
+def read_calendar_conflict(path: Path) -> bool:
+    """Read the current calendar conflict flag without initializing control state.
+
+    Repair gates must distinguish a missing control database from a valid state with no
+    conflict. The caller receives only the typed boolean or sanitized read-boundary exception.
+    """
+    if not path.is_file():
+        raise CalendarSyncStoreReadError("calendar sync control database cannot be read")
+    store = CalendarSyncStore(path, initialize=False)
+    try:
+        with store._connect_reader() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM calendar_sync_state WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            raise ValueError("calendar sync state is unavailable")
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict) or type(payload.get("conflict_detected")) is not bool:
+            raise ValueError("calendar sync state is invalid")
+        return CalendarSyncState.model_validate(payload).conflict_detected
+    except (sqlite3.Error, OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise CalendarSyncStoreReadError("calendar sync control database cannot be read") from exc
+
+
 class CalendarSyncService:
     def __init__(
         self,
