@@ -156,6 +156,42 @@ partial/error 运行不会覆盖上一完整快照。`GET /api/v1/market/status`
 `published_as_of`、`refresh_state`、最近成功和下次重试时间，并声明能力为日终、
 非实时。
 
+## R2-F1 连续性扫描与修复队列边界
+
+连续性只在配置 `STOCK_EVA_MARKET_CONTINUITY_START_DATE` 后生效。扫描的权威输入是
+已确认的交易所日历与当前 manifest 引用的、经过路径/存在性/SHA-256/Parquet schema/
+行数复核的不可变分区；本地可变 DuckDB 的 `daily_bars`、历史 manifest 目录和
+`published_snapshots` 不能替代该证据。未配置起始日、日历未知或冲突、manifest/对象
+校验失败时，整个扫描为 `unavailable`，不产生队列、provider、Parquet、manifest 或
+pointer 写入。
+
+新增 `GET /api/v1/market/status` 字段是兼容性 additive contract：
+`continuity_status`（`current/gaps/blocked/unavailable`）、边界与缺口日期、待处理/
+重试等待/租约中/dead-letter 计数、`active_lane`、`repair_execution_enabled` 和
+allowlist `continuity_reason_code`。缺少或损坏连续性表只使这些字段降级，不会隐式
+初始化或迁移数据库；基础行情控制 schema 损坏仍按既有 503 合同返回。状态读取只用
+provider health 的 snapshot API，不会回收过期 HALF_OPEN 探测租约。
+
+操作员可先做完全离线的计划读取：
+
+```bash
+uv run python -m backend.app.cli market-continuity \
+  [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+```
+
+该命令在 runtime 目录、写入型 store、pointer reconciliation 和 provider 构造之前
+完成范围与严格 manifest 预检；输出缺口、`provider_requests=0` 以及所有写入标志为
+false。`--execute` 只在同一锁内再次完整扫描并显式迁移本机连续性控制 schema、幂等写入
+`repair_jobs`，仍是 enqueue-only：不 claim、不 lease、不创建 attempt、不请求 provider，
+也不直接改 Parquet、manifest 或 pointer。计划或校验失败（包括日期倒置、越过配置边界、
+未来日期和未知日历）即使带 `--execute` 也不创建 runtime 路径。
+
+自动修复开关 `STOCK_EVA_MARKET_REPAIR_ENABLED` 默认关闭。关闭时连续性证据和状态仍可
+读取，已记录的 job/attempt 不删除、不回退，正常 freshness lane 不受影响。队列的
+`dead_letter` 不自动重开；只有严格 manifest reconciliation 能将已经发布的日期收敛为
+`published`。真正的 provider repair、生产/NAS/LaunchAgent 操作不属于 R2-F1 离线交付，
+必须另行授权和验收。
+
 ## 历史查询与导出
 
 - `GET /api/v1/market/history/dates` 返回本地已有交易日。

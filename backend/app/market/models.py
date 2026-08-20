@@ -179,6 +179,36 @@ class MarketDataStatus(BaseModel):
             "adjust_factors_for_eligible_stocks",
         ]
     )
+    # R2-F1 continuity is deliberately additive.  These fields are defaulted so older
+    # consumers and fixtures can continue constructing the legacy status payload.
+    continuity_status: Literal["current", "gaps", "blocked", "unavailable"] = "unavailable"
+    continuity_start_date: date | None = None
+    missing_session_count: int = Field(default=0, ge=0)
+    oldest_missing_session: date | None = None
+    repair_execution_enabled: bool = False
+    repair_pending_count: int = Field(default=0, ge=0)
+    repair_retry_wait_count: int = Field(default=0, ge=0)
+    repair_active_count: int = Field(default=0, ge=0)
+    repair_dead_letter_count: int = Field(default=0, ge=0)
+    active_lane: Literal["freshness", "repair"] | None = None
+    continuity_reason_code: (
+        Literal[
+            "CONTINUITY_START_UNCONFIGURED",
+            "CONTINUITY_RANGE_INVALID",
+            "CALENDAR_UNAVAILABLE",
+            "CALENDAR_CONFLICT",
+            "MANIFEST_INVENTORY_UNAVAILABLE",
+            "IMMUTABLE_OBJECT_INVALID",
+            "CONTROL_STATE_UNAVAILABLE",
+            "REPAIR_EXECUTION_DISABLED",
+            "PROVIDER_CIRCUIT_OPEN",
+            "PROVIDER_CIRCUIT_HALF_OPEN",
+            "PROVIDER_HEALTH_UNAVAILABLE",
+            "REPAIR_QUEUE_NOT_ENQUEUED",
+            "REPAIR_DEAD_LETTER_ONLY",
+        ]
+        | None
+    ) = None
 
 
 class PriceSeriesPoint(BaseModel):

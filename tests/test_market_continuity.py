@@ -4,6 +4,7 @@ import json
 import multiprocessing
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -1939,6 +1940,82 @@ def test_scan_is_confirmed_open_minus_strict_noncontiguous_inventory() -> None:
         result.missing_sessions = ()
     with pytest.raises(ValidationError):
         module.ContinuityScanResult(**result.model_dump(), payload="forbidden")
+
+
+def test_status_summary_is_sanitized_and_health_snapshot_only() -> None:
+    module = continuity_module()
+    sessions = (date(2026, 8, 3), date(2026, 8, 4))
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open" for session in sessions}),
+        inventory_reader=RecordingInventoryReader(ready_inventory(sessions[0])),
+        inventory_mode="immutable_dataset",
+    )
+    pending = module.RepairJob(
+        job_id="repair:2026-08-04:all-main-board",
+        trade_date=sessions[1],
+        universe_id=UNIVERSE_ID,
+        state="pending",
+        state_version=1,
+        attempt_count=0,
+        abandoned_attempt_count=0,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    queue = module.RepairQueueSnapshot(status="ready", jobs=(pending,), attempts=())
+    summary = module.build_continuity_status_summary(
+        scanner=scanner,
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+        queue_snapshot=queue,
+        repair_enabled=True,
+        provider_health=SimpleNamespace(state="CLOSED"),
+        freshness_state=SimpleNamespace(refresh_state="success"),
+        now=NOW,
+    )
+
+    assert summary.continuity_status == "gaps"
+    assert summary.missing_session_count == 1
+    assert summary.oldest_missing_session == sessions[1]
+    assert summary.repair_pending_count == 1
+    assert summary.continuity_reason_code is None
+    assert set(summary.model_dump()) == {
+        "continuity_status",
+        "continuity_start_date",
+        "missing_session_count",
+        "oldest_missing_session",
+        "repair_execution_enabled",
+        "repair_pending_count",
+        "repair_retry_wait_count",
+        "repair_active_count",
+        "repair_dead_letter_count",
+        "active_lane",
+        "continuity_reason_code",
+    }
+
+
+def test_status_summary_disabled_repair_is_blocked_without_health_read() -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory()),
+        inventory_mode="immutable_dataset",
+    )
+    queue = module.RepairQueueSnapshot(status="ready", jobs=(), attempts=())
+
+    summary = module.build_continuity_status_summary(
+        scanner=scanner,
+        configured_start=session,
+        latest_completed_session=session,
+        queue_snapshot=queue,
+        repair_enabled=False,
+        provider_health=SimpleNamespace(state="OPEN"),
+        freshness_state=None,
+        now=NOW,
+    )
+
+    assert summary.continuity_status == "blocked"
+    assert summary.continuity_reason_code == "REPAIR_EXECUTION_DISABLED"
 
 
 def test_scan_uses_one_narrow_calendar_query_and_filters_out_of_range_ready_dates() -> None:

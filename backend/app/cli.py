@@ -37,8 +37,10 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
 from backend.app.market.calendar_sync import CalendarSyncService, CalendarSyncStore
 from backend.app.market.continuity import (
+    ContinuityEnqueueService,
     ContinuityInventory,
     ContinuityRepairExecutor,
+    ContinuityUnavailable,
     RepairClaimCoordinator,
     RepairRetryPolicy,
 )
@@ -475,7 +477,190 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=MINIMUM_RELEASE_ONE_SESSIONS,
     )
+    continuity = subparsers.add_parser(
+        "market-continuity",
+        help="plan or enqueue verified immutable continuity gaps",
+    )
+    continuity.add_argument("--start", type=date.fromisoformat)
+    continuity.add_argument("--end", type=date.fromisoformat)
+    continuity.add_argument(
+        "--execute",
+        action="store_true",
+        help="persist only verified continuity repair jobs; never runs a provider repair",
+    )
     return parser
+
+
+def _continuity_cli_payload(
+    *,
+    status: str,
+    effective_start: date | None = None,
+    effective_end: date | None = None,
+    missing_sessions: tuple[date, ...] = (),
+    reason_code: str | None = None,
+    writes_control_state: bool = False,
+    created_count: int = 0,
+    existing_count: int = 0,
+    created_job_ids: tuple[str, ...] = (),
+    execute: bool = False,
+) -> dict[str, object]:
+    """Return the stable, path/provider-free operator payload."""
+    payload: dict[str, object] = {
+        "status": status,
+        "effective_start": effective_start.isoformat() if effective_start else None,
+        "effective_end": effective_end.isoformat() if effective_end else None,
+        "missing_session_count": len(missing_sessions),
+        "oldest_missing_session": (missing_sessions[0].isoformat() if missing_sessions else None),
+        "writes_control_state": writes_control_state,
+        "provider_requests": 0,
+        "writes_parquet": False,
+        "writes_manifest": False,
+        "writes_pointer": False,
+        "reason_code": reason_code,
+    }
+    if execute:
+        payload.update(
+            {
+                "created_count": created_count,
+                "existing_count": existing_count,
+                "created_job_ids": list(created_job_ids),
+            }
+        )
+    else:
+        payload["execute_requires"] = "--execute"
+    return payload
+
+
+def _market_continuity_command(args: argparse.Namespace) -> int:
+    """Plan or enqueue continuity before any general runtime initialization."""
+    try:
+        settings = get_settings()
+        layout = StorageLayout(settings)
+        readiness = StoragePreflight(settings).inspect()
+        dataset_root = configured_market_dataset_root(settings)
+        if (
+            not readiness.market_data_available
+            or readiness.mode not in {"nas", "local_dataset"}
+            or dataset_root is None
+        ):
+            payload = _continuity_cli_payload(
+                status="unavailable",
+                reason_code="MANIFEST_INVENTORY_UNAVAILABLE",
+                execute=args.execute,
+            )
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
+
+        calendar = get_trading_calendar()
+        calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
+        read_control = MarketStore(
+            layout.local_paths.market_database,
+            temp_directory=layout.duckdb_temporary,
+            read_only=True,
+        )
+        immutable_store = NasMarketStore(
+            read_control,
+            dataset_root,
+            layout.local_paths.staging,
+        )
+        scanner = ContinuityInventory(
+            calendar=calendar,
+            inventory_reader=immutable_store,
+            inventory_mode="immutable_dataset",
+            # Re-read the local sync state on every scan.  The enqueue service invokes a
+            # second scan inside the shared lock; a conflict introduced between scans must
+            # fail closed rather than use a stale preflight value.
+            calendar_conflict=lambda: (
+                CalendarSyncStore(
+                    calendar_sync_path,
+                    initialize=False,
+                )
+                .state()
+                .conflict_detected
+            ),
+        )
+        now = get_market_clock()()
+        latest = calendar.latest_expected_session(now)
+        scan = scanner.scan(
+            configured_start=settings.market_continuity_start_date,
+            latest_completed_session=latest,
+            requested_start=args.start,
+            requested_end=args.end,
+        )
+        if isinstance(scan, ContinuityUnavailable):
+            payload = _continuity_cli_payload(
+                status=(
+                    "error" if scan.reason_code == "CONTINUITY_RANGE_INVALID" else "unavailable"
+                ),
+                reason_code=scan.reason_code,
+                execute=args.execute,
+            )
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
+        if not args.execute:
+            payload = _continuity_cli_payload(
+                status=scan.status,
+                effective_start=scan.effective_start,
+                effective_end=scan.effective_end,
+                missing_sessions=scan.missing_sessions,
+            )
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        # The first strict scan above is the preflight.  Only now may the explicit enqueue
+        # operation create local runtime directories and acquire the existing refresh lock.
+        layout.ensure_local_runtime_dirs()
+        writer = MarketStore(
+            layout.local_paths.market_database,
+            temp_directory=layout.duckdb_temporary,
+        )
+        result = ContinuityEnqueueService(
+            scanner=scanner,
+            store=writer,
+            lock_path=layout.market_refresh_lock,
+            universe_id="all-main-board",
+            clock=get_market_clock(),
+            schema_initializer=lambda: writer.initialize_all_writer_schema(
+                staging_directory=layout.market_refresh_lock.parent,
+            ),
+        ).execute(
+            configured_start=settings.market_continuity_start_date,
+            latest_completed_session=latest,
+            requested_start=args.start,
+            requested_end=args.end,
+            completed_scan=scan,
+        )
+        fresh = result.fresh_scan
+        if result.status == "current":
+            output_status = "current"
+        elif result.status == "enqueued":
+            output_status = "gaps"
+        elif result.status == "already_running":
+            output_status = "unavailable"
+        else:
+            output_status = "unavailable"
+        payload = _continuity_cli_payload(
+            status=output_status,
+            effective_start=fresh.effective_start if fresh else scan.effective_start,
+            effective_end=fresh.effective_end if fresh else scan.effective_end,
+            missing_sessions=fresh.missing_sessions if fresh else scan.missing_sessions,
+            reason_code=result.reason_code,
+            writes_control_state=result.writes_control_state,
+            created_count=result.created_count,
+            existing_count=result.existing_count,
+            created_job_ids=tuple(item.job_id for item in result.created_jobs),
+            execute=True,
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if result.status in {"current", "enqueued"} else 1
+    except Exception:
+        payload = _continuity_cli_payload(
+            status="unavailable",
+            reason_code="CONTROL_STATE_UNAVAILABLE",
+            execute=getattr(args, "execute", False),
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 1
 
 
 def main() -> int:
@@ -494,6 +679,8 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "market-continuity":
+        return _market_continuity_command(args)
     if args.command == "provider-canary":
         report_arguments = {
             "trade_date": args.trade_date,

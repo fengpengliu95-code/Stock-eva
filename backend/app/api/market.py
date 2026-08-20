@@ -13,7 +13,12 @@ from backend.app.market.calendar_sync import (
     CalendarSyncStore,
     CalendarSyncStoreReadError,
 )
+from backend.app.market.continuity import (
+    ContinuityInventory,
+    build_continuity_status_summary,
+)
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
+from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
@@ -40,6 +45,22 @@ def get_calendar_sync_store(
         settings.local_control_dir / settings.calendar_sync_database_name,
         initialize=False,
     )
+
+
+def _read_provider_health_snapshot(settings: Settings):
+    """Read circuit evidence without initializing or reaping persisted probe leases."""
+    layout = StorageLayout(settings)
+    if not layout.provider_health_database.is_file():
+        return None
+    try:
+        return SQLiteProviderHealthStore(
+            layout.provider_health_database,
+            failure_threshold=settings.provider_circuit_failure_threshold,
+            cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+            probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+        ).provider_health_snapshot()
+    except Exception:
+        return None
 
 
 def get_market_store(
@@ -180,6 +201,31 @@ def market_status(
             phase = "complete"
         elif refresh_state in {"delayed", "error"}:
             phase = "delayed"
+    if isinstance(store, NasMarketStore):
+        continuity_scanner = ContinuityInventory(
+            calendar=calendar,
+            inventory_reader=store,
+            inventory_mode="immutable_dataset",
+            calendar_conflict=lambda: calendar_maintenance.conflict_detected,
+        )
+        continuity_queue = store.control.repair_queue_snapshot()
+        provider_health = _read_provider_health_snapshot(settings)
+    else:
+        # Mutable local DuckDB history is deliberately not an immutable publication
+        # authority for continuity.
+        continuity_scanner = None
+        continuity_queue = None
+        provider_health = None
+    continuity = build_continuity_status_summary(
+        scanner=continuity_scanner,
+        configured_start=settings.market_continuity_start_date,
+        latest_completed_session=expected,
+        queue_snapshot=continuity_queue,
+        repair_enabled=settings.market_repair_enabled,
+        provider_health=provider_health,
+        freshness_state=scheduler,
+        now=now,
+    )
     return MarketDataStatus(
         market_phase=phase,
         calendar_status=calendar_status,
@@ -200,6 +246,7 @@ def market_status(
         calendar_conflict_at=calendar_maintenance.conflict_at,
         calendar_next_sync_at=(calendar_decision.next_sync_at or calendar_maintenance.next_sync_at),
         calendar_sources=[item.model_dump() for item in calendar.sources_for(now.year)],
+        **continuity.model_dump(mode="python"),
     )
 
 

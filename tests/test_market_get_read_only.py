@@ -3,6 +3,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import duckdb
 import httpx
 import pytest
 
+import backend.app.cli as cli_module
 import backend.app.main as main_module
 import backend.app.market.store as market_store_module
 from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
@@ -303,6 +305,105 @@ def test_market_get_dependency_never_reconciles_control_pointer(
     response = _api_get("/api/v1/market/summary", settings, raise_app_exceptions=False)
 
     assert response.status_code == 200
+
+
+def test_market_status_exposes_unavailable_continuity_additives_without_migration(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": date(2026, 7, 20)}
+    )
+    control = _publish_fixture(settings, dataset_root)
+    before = _fingerprint(control, dataset_root)
+
+    response = _api_get("/api/v1/market/status", settings, raise_app_exceptions=False)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["continuity_status"] == "unavailable"
+    assert payload["continuity_start_date"] == "2026-07-20"
+    assert payload["missing_session_count"] > 0
+    assert payload["repair_execution_enabled"] is False
+    assert payload["continuity_reason_code"] == "CONTROL_STATE_UNAVAILABLE"
+    assert _fingerprint(control, dataset_root) == before
+
+
+def test_market_status_local_mutable_mode_reports_manifest_unavailable_without_writes(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, tmp_path / "unused").model_copy(
+        update={
+            "local_market_dataset_root": None,
+            "market_continuity_start_date": date(2026, 7, 20),
+        }
+    )
+    runtime = tmp_path / "runtime"
+
+    response = _api_get("/api/v1/market/status", settings, raise_app_exceptions=False)
+
+    assert response.status_code == 200
+    assert response.json()["continuity_status"] == "unavailable"
+    assert response.json()["continuity_reason_code"] == "MANIFEST_INVENTORY_UNAVAILABLE"
+    assert not runtime.exists()
+
+
+def test_market_continuity_execute_enqueues_only_after_strict_rescan(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    target = date(2026, 7, 22)
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={
+            "market_continuity_start_date": target,
+        }
+    )
+    control = _publish_fixture(settings, dataset_root)
+    before_dataset = _fingerprint(control, dataset_root)
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            target.isoformat(),
+            "--end",
+            target.isoformat(),
+            "--execute",
+        ],
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "BaoStockProvider",
+        lambda **_: pytest.fail("continuity enqueue must not construct a provider"),
+    )
+    monkeypatch.setattr(
+        NasMarketStore,
+        "reconcile_control_pointer",
+        lambda *_args, **_kwargs: pytest.fail("continuity enqueue must not reconcile pointer"),
+    )
+
+    assert cli_module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "gaps"
+    assert payload["writes_control_state"] is True
+    assert payload["provider_requests"] == 0
+    assert payload["writes_parquet"] is False
+    assert payload["writes_manifest"] is False
+    assert payload["writes_pointer"] is False
+    assert payload["created_count"] == 1
+    after_dataset = _fingerprint(control, dataset_root)
+    assert after_dataset.dataset_tree == before_dataset.dataset_tree
+    assert after_dataset.calendar_hash == before_dataset.calendar_hash
+    assert after_dataset.calendar_mtime_ns == before_dataset.calendar_mtime_ns
+    assert after_dataset.calendar_schema == before_dataset.calendar_schema
+    with duckdb.connect(str(control), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM repair_jobs").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM repair_attempts").fetchone()[0] == 0
 
 
 def test_missing_market_storage_gets_create_no_runtime_paths(tmp_path: Path) -> None:

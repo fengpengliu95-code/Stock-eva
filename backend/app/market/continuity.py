@@ -32,6 +32,21 @@ ContinuityUnavailableReason = Literal[
     "MANIFEST_INVENTORY_UNAVAILABLE",
     "IMMUTABLE_OBJECT_INVALID",
 ]
+ContinuityStatusReason = Literal[
+    "CONTINUITY_START_UNCONFIGURED",
+    "CONTINUITY_RANGE_INVALID",
+    "CALENDAR_UNAVAILABLE",
+    "CALENDAR_CONFLICT",
+    "MANIFEST_INVENTORY_UNAVAILABLE",
+    "IMMUTABLE_OBJECT_INVALID",
+    "CONTROL_STATE_UNAVAILABLE",
+    "REPAIR_EXECUTION_DISABLED",
+    "PROVIDER_CIRCUIT_OPEN",
+    "PROVIDER_CIRCUIT_HALF_OPEN",
+    "PROVIDER_HEALTH_UNAVAILABLE",
+    "REPAIR_QUEUE_NOT_ENQUEUED",
+    "REPAIR_DEAD_LETTER_ONLY",
+]
 ContinuityInventoryMode = Literal["immutable_dataset", "local_mutable"]
 ContinuityLane = Literal["freshness", "repair"]
 ContinuityAction = Literal["run", "wait", "none"]
@@ -435,6 +450,7 @@ class ContinuityEnqueueService:
         universe_id: str,
         clock: Callable[[], datetime],
         lock_factory: Callable[[Path], RefreshLock] | None = None,
+        schema_initializer: Callable[[], None] | None = None,
     ) -> None:
         self._scanner = scanner
         self._store = store
@@ -442,6 +458,7 @@ class ContinuityEnqueueService:
         self._universe_id = require_universe_id(universe_id)
         self._clock = clock
         self._lock_factory = lock_factory
+        self._schema_initializer = schema_initializer
 
     def execute(
         self,
@@ -507,7 +524,10 @@ class ContinuityEnqueueService:
                             reason_code=fresh.reason_code,
                         )
                     scan_identity = self._scan_identity(fresh)
-                    self._store.initialize_continuity_schema()
+                    if self._schema_initializer is not None:
+                        self._schema_initializer()
+                    else:
+                        self._store.initialize_continuity_schema()
                     if fresh.status == "current":
                         return ContinuityEnqueueResult(
                             status="current",
@@ -910,6 +930,223 @@ class RepairQueueSnapshot(BaseModel):
                     ):
                         raise ValueError("running repair attempt is orphaned")
         return self
+
+
+class ContinuityStatusSummary(BaseModel):
+    """Sanitized, read-only continuity evidence for API and operator consumers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    continuity_status: Literal["current", "gaps", "blocked", "unavailable"] = "unavailable"
+    continuity_start_date: date | None = None
+    missing_session_count: int = Field(default=0, ge=0)
+    oldest_missing_session: date | None = None
+    repair_execution_enabled: bool = False
+    repair_pending_count: int = Field(default=0, ge=0)
+    repair_retry_wait_count: int = Field(default=0, ge=0)
+    repair_active_count: int = Field(default=0, ge=0)
+    repair_dead_letter_count: int = Field(default=0, ge=0)
+    active_lane: ContinuityLane | None = None
+    continuity_reason_code: ContinuityStatusReason | None = None
+
+
+def build_continuity_status_summary(
+    *,
+    scanner: "ContinuityInventory | None",
+    configured_start: date | None,
+    latest_completed_session: date | None,
+    queue_snapshot: RepairQueueSnapshot | None,
+    repair_enabled: bool,
+    provider_health: object | None,
+    freshness_state: object | None,
+    now: datetime | None = None,
+) -> ContinuityStatusSummary:
+    """Build continuity status using only strict evidence and SELECT-only snapshots.
+
+    This function has no writer, lock, provider, or circuit-reclamation dependency.  Invalid
+    internal objects intentionally degrade to an allowlisted unavailable result instead of
+    serializing arbitrary implementation details.
+    """
+
+    base = dict(
+        continuity_start_date=(
+            configured_start
+            if isinstance(configured_start, date) and not isinstance(configured_start, datetime)
+            else None
+        ),
+        repair_execution_enabled=bool(repair_enabled),
+    )
+
+    if configured_start is None:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_reason_code="CONTINUITY_START_UNCONFIGURED",
+        )
+    if scanner is None:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_reason_code="MANIFEST_INVENTORY_UNAVAILABLE",
+        )
+    try:
+        scan = scanner.scan(
+            configured_start=configured_start,
+            latest_completed_session=latest_completed_session,
+        )
+    except Exception:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_reason_code="MANIFEST_INVENTORY_UNAVAILABLE",
+        )
+    if isinstance(scan, ContinuityUnavailable):
+        return ContinuityStatusSummary(
+            **base,
+            continuity_reason_code=scan.reason_code,
+        )
+
+    missing = scan.missing_sessions
+    if not missing:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_status="current",
+        )
+
+    # A queue snapshot is optional only for a current scan.  For gaps, its absence or
+    # unavailable status means the controller cannot prove control state and must fail closed.
+    if queue_snapshot is None:
+        return ContinuityStatusSummary(
+            **base,
+            missing_session_count=len(missing),
+            oldest_missing_session=missing[0],
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+    try:
+        queue = RepairQueueSnapshot.model_validate(
+            queue_snapshot.model_dump(mode="python", round_trip=True)
+        )
+    except Exception:
+        return ContinuityStatusSummary(
+            **base,
+            missing_session_count=len(missing),
+            oldest_missing_session=missing[0],
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+    if queue.status != "ready":
+        return ContinuityStatusSummary(
+            **base,
+            missing_session_count=len(missing),
+            oldest_missing_session=missing[0],
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+
+    missing_set = set(missing)
+    jobs = tuple(
+        job
+        for job in queue.jobs
+        if job.universe_id == _R2F1_UNIVERSE_ID and job.trade_date in missing_set
+    )
+    pending = sum(job.state == "pending" for job in jobs)
+    retry_wait = sum(job.state == "retry_wait" for job in jobs)
+    active = sum(job.state == "leased" for job in jobs)
+    dead_letter = sum(job.state == "dead_letter" for job in jobs)
+
+    active_lane: ContinuityLane | None = None
+    timestamp = now or datetime.now(UTC)
+    try:
+        timestamp = require_utc(timestamp)
+    except RepairQueueError:
+        return ContinuityStatusSummary(
+            **base,
+            missing_session_count=len(missing),
+            oldest_missing_session=missing[0],
+            repair_pending_count=pending,
+            repair_retry_wait_count=retry_wait,
+            repair_active_count=active,
+            repair_dead_letter_count=dead_letter,
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+    for job in jobs:
+        if (
+            job.state == "leased"
+            and job.lease_expires_at is not None
+            and job.lease_expires_at > timestamp
+        ):
+            active_lane = "repair"
+            break
+    if active_lane is None and freshness_state is not None:
+        refresh_state = getattr(freshness_state, "refresh_state", None)
+        if refresh_state not in {
+            None,
+            "disabled",
+            "idle",
+            "scheduled",
+            "retry_wait",
+            "success",
+            "delayed",
+            "error",
+            "running",
+        }:
+            return ContinuityStatusSummary(
+                **base,
+                missing_session_count=len(missing),
+                oldest_missing_session=missing[0],
+                repair_pending_count=pending,
+                repair_retry_wait_count=retry_wait,
+                repair_active_count=active,
+                repair_dead_letter_count=dead_letter,
+                continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        if refresh_state == "running":
+            active_lane = "freshness"
+
+    counts = dict(
+        missing_session_count=len(missing),
+        oldest_missing_session=missing[0],
+        repair_pending_count=pending,
+        repair_retry_wait_count=retry_wait,
+        repair_active_count=active,
+        repair_dead_letter_count=dead_letter,
+        active_lane=active_lane,
+    )
+    if not repair_enabled:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_status="blocked",
+            **counts,
+            continuity_reason_code="REPAIR_EXECUTION_DISABLED",
+        )
+
+    if pending == 0 and retry_wait == 0 and active == 0:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_status="blocked",
+            **counts,
+            continuity_reason_code=(
+                "REPAIR_DEAD_LETTER_ONLY" if dead_letter else "REPAIR_QUEUE_NOT_ENQUEUED"
+            ),
+        )
+
+    provider_state = getattr(provider_health, "state", None)
+    provider_state = getattr(provider_state, "value", provider_state)
+    if provider_state == "OPEN":
+        reason: ContinuityStatusReason = "PROVIDER_CIRCUIT_OPEN"
+    elif provider_state == "HALF_OPEN":
+        reason = "PROVIDER_CIRCUIT_HALF_OPEN"
+    elif provider_state != "CLOSED":
+        reason = "PROVIDER_HEALTH_UNAVAILABLE"
+    else:
+        reason = None
+    if reason is not None:
+        return ContinuityStatusSummary(
+            **base,
+            continuity_status="blocked",
+            **counts,
+            continuity_reason_code=reason,
+        )
+    return ContinuityStatusSummary(
+        **base,
+        continuity_status="gaps",
+        **counts,
+    )
 
 
 class FreshnessDecision(Protocol):
