@@ -439,6 +439,137 @@ def test_market_continuity_execute_enqueues_only_after_strict_rescan(
         assert connection.execute("SELECT count(*) FROM repair_attempts").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("publish_current", [True, False])
+def test_market_continuity_plan_requires_readable_queue_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    publish_current: bool,
+) -> None:
+    """Planning must not claim current/gaps when writer-owned control is unavailable."""
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": AS_OF}
+    )
+    if publish_current:
+        _publish_fixture(settings, dataset_root)
+    else:
+        _empty_dataset(dataset_root)
+    before = _tree(tmp_path) if tmp_path.exists() else ()
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+        ],
+    )
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["reason_code"] == "CONTROL_STATE_UNAVAILABLE"
+    assert payload["writes_control_state"] is False
+    assert payload["provider_requests"] == 0
+    assert payload["writes_parquet"] is False
+    assert payload["writes_manifest"] is False
+    assert payload["writes_pointer"] is False
+    assert _tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("publish_current", [True, False])
+def test_market_continuity_plan_maps_scan_with_ready_queue(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    publish_current: bool,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": AS_OF}
+    )
+    if publish_current:
+        control = _publish_fixture(settings, dataset_root)
+        expected_status = "current"
+    else:
+        _empty_dataset(dataset_root)
+        control = settings.market_data_dir / settings.market_database_name
+        MarketStore(control).initialize_schema()
+        expected_status = "gaps"
+    with RefreshRunLock(settings.local_lock_dir / "market-refresh.lock"):
+        MarketStore(control).initialize_continuity_schema()
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+        ],
+    )
+
+    assert cli_module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == expected_status
+    assert payload["reason_code"] is None
+    assert payload["writes_control_state"] is False
+    assert payload["provider_requests"] == 0
+
+
+@pytest.mark.parametrize("corruption", ["zero_bytes", "wrong_schema"])
+def test_market_continuity_plan_rejects_malformed_queue_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    corruption: str,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": AS_OF}
+    )
+    control = _publish_fixture(settings, dataset_root)
+    if corruption == "zero_bytes":
+        control.write_bytes(b"")
+    else:
+        connection = duckdb.connect(str(control))
+        try:
+            connection.execute("DROP TABLE IF EXISTS daily_bars")
+            connection.execute("CREATE TABLE unrelated(value INTEGER)")
+        finally:
+            connection.close()
+    before = _tree(tmp_path)
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+        ],
+    )
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["reason_code"] == "CONTROL_STATE_UNAVAILABLE"
+    assert payload["writes_control_state"] is False
+    assert payload["provider_requests"] == 0
+    assert _tree(tmp_path) == before
+
+
 def test_market_continuity_execute_does_not_create_broad_runtime_after_locked_rescan_fails(
     tmp_path: Path,
     monkeypatch,

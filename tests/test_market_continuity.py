@@ -2018,6 +2018,46 @@ def test_status_summary_disabled_repair_is_blocked_without_health_read() -> None
     assert summary.continuity_reason_code == "REPAIR_EXECUTION_DISABLED"
 
 
+@pytest.mark.parametrize(
+    ("inventory_sessions", "expected_missing"),
+    [
+        ((date(2026, 8, 3),), ()),
+        ((), (date(2026, 8, 3),)),
+    ],
+)
+def test_status_summary_requires_readable_queue_for_current_and_gaps(
+    inventory_sessions: tuple[date, ...],
+    expected_missing: tuple[date, ...],
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    scanner = module.ContinuityInventory(
+        calendar=RecordingConfirmedCalendar({session: "open"}),
+        inventory_reader=RecordingInventoryReader(ready_inventory(*inventory_sessions)),
+        inventory_mode="immutable_dataset",
+    )
+    unavailable = module.RepairQueueSnapshot(
+        status="unavailable",
+        reason_code="CONTROL_STATE_UNAVAILABLE",
+    )
+
+    summary = module.build_continuity_status_summary(
+        scanner=scanner,
+        configured_start=session,
+        latest_completed_session=session,
+        queue_snapshot=unavailable,
+        repair_enabled=True,
+        provider_health=None,
+        freshness_state=None,
+        now=NOW,
+    )
+
+    assert summary.continuity_status == "unavailable"
+    assert summary.continuity_reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert summary.missing_session_count == len(expected_missing)
+    assert summary.oldest_missing_session == (expected_missing[0] if expected_missing else None)
+
+
 def test_status_summary_revalidates_bypassed_scan_before_reading_internal_fields() -> None:
     module = continuity_module()
     session = date(2026, 8, 3)

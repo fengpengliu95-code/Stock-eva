@@ -43,6 +43,7 @@ from backend.app.market.continuity import (
     ContinuityScanResult,
     ContinuityUnavailable,
     RepairClaimCoordinator,
+    RepairQueueSnapshot,
     RepairRetryPolicy,
 )
 from backend.app.market.factor_cache import AdjustmentFactorCache
@@ -616,6 +617,26 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
         if not args.execute:
+            # Planning is strictly read-only.  The immutable scan alone is not
+            # sufficient to claim the controller is usable: SELECT-only queue
+            # evidence must also be present and valid.  Do not initialize the
+            # database or any runtime path on this branch.
+            try:
+                queue = RepairQueueSnapshot.model_validate(
+                    read_control.repair_queue_snapshot().model_dump(mode="python", round_trip=True)
+                )
+            except Exception:
+                queue = None
+            if queue is None or queue.status != "ready":
+                payload = _continuity_cli_payload(
+                    status="unavailable",
+                    effective_start=scan.effective_start,
+                    effective_end=scan.effective_end,
+                    missing_sessions=scan.missing_sessions,
+                    reason_code="CONTROL_STATE_UNAVAILABLE",
+                )
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                return 1
             payload = _continuity_cli_payload(
                 status=scan.status,
                 effective_start=scan.effective_start,

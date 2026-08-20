@@ -1071,27 +1071,21 @@ def build_continuity_status_summary(
             )
 
     missing = scan.missing_sessions
+    # The queue is writer-owned control evidence for every published continuity
+    # conclusion, including the empty/current case.  A current immutable manifest
+    # cannot prove that the controller is usable when its control tables are absent
+    # or unavailable, so fail closed before mapping either scan status.
+    if queue is None or queue.status != "ready":
+        return ContinuityStatusSummary(
+            **base,
+            missing_session_count=len(missing),
+            oldest_missing_session=missing[0] if missing else None,
+            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
     if not missing:
         return ContinuityStatusSummary(
             **base,
             continuity_status="current",
-        )
-
-    # A queue snapshot is optional only for a current scan.  For gaps, its absence or
-    # unavailable status means the controller cannot prove control state and must fail closed.
-    if queue is None:
-        return ContinuityStatusSummary(
-            **base,
-            missing_session_count=len(missing),
-            oldest_missing_session=missing[0],
-            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
-        )
-    if queue.status != "ready":
-        return ContinuityStatusSummary(
-            **base,
-            missing_session_count=len(missing),
-            oldest_missing_session=missing[0],
-            continuity_reason_code="CONTROL_STATE_UNAVAILABLE",
         )
 
     missing_set = set(missing)
