@@ -2901,9 +2901,11 @@ def test_enqueue_service_rejects_bypassed_completed_scan_without_lock_or_write(
 ) -> None:
     module = continuity_module()
     session = date(2026, 8, 3)
+    calendar = RecordingConfirmedCalendar({session: "open"})
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
     scanner = module.ContinuityInventory(
-        calendar=RecordingConfirmedCalendar({session: "open"}),
-        inventory_reader=RecordingInventoryReader(ready_inventory_generation("generation-g1")),
+        calendar=calendar,
+        inventory_reader=reader,
         inventory_mode="immutable_dataset",
     )
     completed = scanner.scan(
@@ -2934,9 +2936,88 @@ def test_enqueue_service_rejects_bypassed_completed_scan_without_lock_or_write(
     )
 
     assert result.status == "unavailable"
-    assert result.reason_code == "CONTINUITY_RANGE_INVALID"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert lock_factory.calls == []
     assert store.path.exists() is False
+    assert tree_fingerprint(tmp_path) == before
+
+
+@pytest.mark.parametrize("malformed_kind", ["generation", "status", "date", "reason", "copy"])
+def test_enqueue_service_rejects_invalid_completed_scan_as_control_unavailable(
+    tmp_path: Path,
+    malformed_kind: str,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    valid_scan = module.ContinuityScanResult(
+        status="current",
+        effective_start=session,
+        effective_end=session,
+        manifest_generation="generation-g1",
+        confirmed_open_sessions=(session,),
+        published_ready_sessions=(session,),
+        missing_sessions=(),
+    )
+    if malformed_kind == "generation":
+        completed = module.ContinuityScanResult.model_construct(
+            **{**valid_scan.model_dump(), "manifest_generation": "bad token /private"},
+        )
+    elif malformed_kind == "status":
+        completed = module.ContinuityScanResult.model_construct(
+            **{**valid_scan.model_dump(), "status": "unknown"},
+        )
+    elif malformed_kind == "date":
+        completed = module.ContinuityScanResult.model_construct(
+            **{**valid_scan.model_dump(), "effective_start": "not-a-date"},
+        )
+    elif malformed_kind == "reason":
+        completed = module.ContinuityUnavailable.model_construct(reason_code="UNKNOWN_REASON")
+    else:
+        completed = valid_scan.model_copy(update={"missing_sessions": (), "status": "gaps"})
+
+    calendar = RecordingConfirmedCalendar({session: "open"})
+    reader = RecordingInventoryReader(ready_inventory_generation("generation-g1"))
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+    lock_path = tmp_path / "locks" / "market-refresh.lock"
+    precreate_lock(lock_path)
+    lock_factory = HookedRefreshLockFactory(
+        lambda: pytest.fail("invalid completed scan must be rejected before locking")
+    )
+    store_factory_calls = 0
+
+    def store_factory():
+        nonlocal store_factory_calls
+        store_factory_calls += 1
+        raise AssertionError("invalid completed scan must not construct the queue store")
+
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store_factory=store_factory,
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+        lock_factory=lock_factory,
+    )
+    before = tree_fingerprint(tmp_path)
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+        completed_scan=completed,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.writes_control_state is False
+    assert result.provider_requests == 0
+    assert lock_factory.calls == []
+    assert store_factory_calls == 0
+    assert calendar.calls == []
+    assert reader.calls == []
     assert tree_fingerprint(tmp_path) == before
 
 

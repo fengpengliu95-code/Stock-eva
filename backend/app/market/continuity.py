@@ -482,7 +482,7 @@ class ContinuityEnqueueService:
             if not isinstance(validated_completed, ContinuityScanResult):
                 return ContinuityEnqueueResult(
                     status="unavailable",
-                    reason_code="CONTINUITY_RANGE_INVALID",
+                    reason_code="CONTROL_STATE_UNAVAILABLE",
                 )
         try:
             timestamp = require_utc(self._clock())
