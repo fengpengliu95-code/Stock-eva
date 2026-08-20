@@ -355,6 +355,112 @@ def test_automation_executes_one_repair_result_without_entering_freshness_lane(
     assert provider.fetch_calls == provider.calendar_calls == 0
 
 
+@pytest.mark.parametrize("repair_kind", ["success", "partial", "error", "consumer"])
+def test_repair_outcome_is_continuity_only_and_preserves_freshness_retry_state(
+    tmp_path: Path,
+    repair_kind: str,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    target = date(2026, 7, 24)
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 23))
+    before_state = module.SchedulerState(
+        target_session=target,
+        refresh_state="retry_wait",
+        attempt_count=2,
+        last_attempt_at=datetime(2026, 7, 24, 18, tzinfo=SHANGHAI),
+        last_success_at=datetime(2026, 7, 23, 18, 20, tzinfo=SHANGHAI),
+        next_retry_at=datetime(2026, 7, 24, 18, 40, tzinfo=SHANGHAI),
+        calendar_status="confirmed",
+        error_code="transport_timeout",
+    )
+    store.save_scheduler_state(before_state)
+    provider = CompleteProvider(fixture_bars(target))
+    decision = ContinuityDecision(
+        action="run",
+        lane="repair",
+        target_session=date(2026, 7, 23),
+        repair_job_id="repair:2026-07-23:all-main-board",
+        reason_code="REPAIR_CLAIMED",
+    )
+    repair_refresh = RefreshResult(
+        run_id="repair-2026-07-23-attempt-1",
+        request_key="repair:baostock:2026-07-23:all-main-board",
+        run_kind="repair",
+        requested_date=date(2026, 7, 23),
+        source="baostock",
+        status="ready"
+        if repair_kind == "success"
+        else ("partial" if repair_kind == "partial" else "error"),
+        requested_count=1,
+        succeeded_count=1 if repair_kind == "success" else 0,
+        coverage_ratio=1 if repair_kind == "success" else 0,
+        failed_symbols=[] if repair_kind == "success" else ["sh.600000"],
+        quality_issues=[] if repair_kind == "success" else ["provider_error"],
+        error_message=None if repair_kind == "success" else "provider request failed",
+        failure_stage=None if repair_kind == "success" else "fetch",
+        failure_class=None if repair_kind == "success" else "transport_timeout",
+        retryable=None if repair_kind == "success" else True,
+        started_at=datetime(2026, 7, 24, 10, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
+    )
+
+    class FakeRepairExecutor:
+        def execute_once(self, **kwargs):
+            if kwargs["freshness"].action == "run":
+                return RepairExecutionResult(
+                    status="skipped",
+                    decision=ContinuityDecision(
+                        action="run",
+                        lane="freshness",
+                        target_session=target,
+                        reason_code="FRESHNESS_DUE",
+                    ),
+                    reason_code="FRESHNESS_DUE",
+                    provider_requests=0,
+                )
+            if repair_kind == "consumer":
+                return RepairExecutionResult(
+                    status="failed",
+                    decision=decision,
+                    reason_code="REPAIR_CONSUMER_FAILED",
+                    provider_requests=1,
+                )
+            return RepairExecutionResult(
+                status="published" if repair_kind == "success" else "failed",
+                decision=decision,
+                refresh_result=repair_refresh,
+                reason_code=(
+                    "REPAIR_PUBLISHED" if repair_kind == "success" else "REPAIR_RESULT_FAILED"
+                ),
+                provider_requests=1,
+            )
+
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        continuity=object(),
+        repair_enabled=True,
+        repair_executor=FakeRepairExecutor(),
+    )
+
+    first = service.run_due_once(datetime(2026, 7, 24, 18, 20, tzinfo=SHANGHAI))
+
+    assert store.scheduler_state() == before_state
+    assert first.state == before_state
+    assert first.continuity_result is not None
+    assert first.continuity_result.provider_requests == 1
+    assert provider.fetch_calls == provider.calendar_calls == 0
+
+    # The old retry slot remains due and is allowed to run freshness on the next invocation.
+    second = service.run_due_once(datetime(2026, 7, 24, 18, 40, tzinfo=SHANGHAI))
+    assert second.decision.action == "run"
+    assert second.state.refresh_state == "success"
+    assert provider.fetch_calls == 1
+
+
 class HealthClock:
     def __init__(self, now: datetime) -> None:
         self.now = now

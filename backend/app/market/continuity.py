@@ -1074,9 +1074,7 @@ class RepairClaimCoordinator:
         timestamp = require_utc(now)
         initial = self._decision(freshness, repair_enabled, timestamp)
         needs_locked_preflight = (
-            pre_claim is not None
-            and initial.reason_code == "CONTROL_STATE_UNAVAILABLE"
-            and freshness.action in {"none", "wait"}
+            pre_claim is not None and repair_enabled and lease_consumer is not None
         )
         if (initial.action != "run" or initial.lane != "repair") and not needs_locked_preflight:
             return initial
@@ -1086,8 +1084,13 @@ class RepairClaimCoordinator:
             or initial.target_session >= latest_expected_session
         ) and not needs_locked_preflight:
             return self._freshness_wait(freshness, "NO_ELIGIBLE_REPAIR")
-        if not self._health_is_closed():
-            return self._repair_wait(initial, "PROVIDER_HEALTH_UNAVAILABLE")
+        if not needs_locked_preflight:
+            health_closed, _health_unavailable = self._health_status()
+            if not health_closed:
+                # Before entering the shared lock, every non-CLOSED state is an unavailable
+                # claim gate.  The more specific PROVIDER_NOT_CLOSED reason is reserved for a
+                # state that changed while the lock was held.
+                return self._repair_wait(initial, "PROVIDER_HEALTH_UNAVAILABLE")
         if lease_consumer is None:
             return initial
 
@@ -1112,8 +1115,14 @@ class RepairClaimCoordinator:
                         refreshed_freshness,
                         "NO_ELIGIBLE_REPAIR",
                     )
-                if not self._health_is_closed():
-                    return self._repair_wait(refreshed, "PROVIDER_NOT_CLOSED")
+                health_closed, health_unavailable = self._health_status()
+                if not health_closed:
+                    return self._repair_wait(
+                        refreshed,
+                        "PROVIDER_HEALTH_UNAVAILABLE"
+                        if health_unavailable
+                        else "PROVIDER_NOT_CLOSED",
+                    )
                 snapshot = self._store.repair_queue_snapshot()
                 refreshed = self._policy.decide(
                     freshness=refreshed_freshness,
@@ -1162,12 +1171,12 @@ class RepairClaimCoordinator:
             now=now,
         )
 
-    def _health_is_closed(self) -> bool:
+    def _health_status(self) -> tuple[bool, bool]:
         try:
             health = self._health_store.provider_health()
         except Exception:
-            return False
-        return getattr(health, "state", None) == "CLOSED"
+            return False, True
+        return getattr(health, "state", None) == "CLOSED", False
 
     @staticmethod
     def _repair_wait(
@@ -1335,6 +1344,7 @@ class ContinuityRepairExecutor:
             from backend.app.market.automation import run_publication_refresh
 
             required_symbols_error = False
+            provider_called = False
             try:
                 required_symbols = self.required_symbols()
             except Exception:
@@ -1377,6 +1387,12 @@ class ContinuityRepairExecutor:
                     started_at=timestamp,
                 )
             else:
+                # Record the provider boundary before entering it.  A later queue/control
+                # failure must not erase the fact that this repair attempted one provider
+                # refresh.  BaseException is intentionally not caught below so process-kill
+                # remains recoverable through manifest reconciliation.
+                provider_called = True
+                holder["provider_requests"] = 1
                 try:
                     with observation_scope, provider_scope_factory():
                         result = run_publication_refresh(
@@ -1399,15 +1415,23 @@ class ContinuityRepairExecutor:
             if not isinstance(result, RefreshResult):
                 raise RepairQueueError("repair publication result is invalid")
             if result.status == "ready":
-                inventory = self.inventory_reader.verified_ready_session_inventory("baostock")
-                if lease.target_session not in inventory.sessions:
-                    result = self._storage_failure(result)
-                elif self.post_publish is not None:
-                    try:
-                        self.post_publish(result)
-                    except Exception:
+                try:
+                    inventory = self.inventory_reader.verified_ready_session_inventory("baostock")
+                except Exception as error:
+                    # A ready result is not a complete repair until the strict post-publish
+                    # inventory can be read back.  Convert storage/control failures to the
+                    # sanitized publication failure and finalize the lease exactly once.
+                    result = self._storage_failure(result, error=error)
+                else:
+                    if lease.target_session not in inventory.sessions:
                         result = self._storage_failure(result)
+                    elif self.post_publish is not None:
+                        try:
+                            self.post_publish(result)
+                        except Exception:
+                            result = self._storage_failure(result)
             holder["result"] = result
+            holder["provider_requests"] = 1 if provider_called else 0
             finalization_time = max(timestamp, require_utc(result.completed_at))
             outcome: RepairFinalizationOutcome = (
                 "succeeded" if result.status == "ready" else "failed"
@@ -1430,6 +1454,7 @@ class ContinuityRepairExecutor:
             pre_claim=prepare,
         )
         result = holder.get("result")
+        provider_requests = holder.get("provider_requests", 0)
         if decision.reason_code == "REPAIR_CLAIMED" and result is not None:
             if result.status == "ready":
                 return RepairExecutionResult(
@@ -1437,7 +1462,7 @@ class ContinuityRepairExecutor:
                     decision=decision,
                     refresh_result=result,
                     reason_code="REPAIR_PUBLISHED",
-                    provider_requests=1,
+                    provider_requests=provider_requests,
                 )
             return RepairExecutionResult(
                 status="failed",
@@ -1448,17 +1473,40 @@ class ContinuityRepairExecutor:
                     if result.failure_class == "storage" and result.failure_stage == "publish"
                     else "REPAIR_RESULT_FAILED"
                 ),
-                provider_requests=1,
+                provider_requests=provider_requests,
+            )
+        # Preserve a sanitized result if finalization/control handling itself failed after
+        # the provider callback.  The coordinator's generic wait reason must not report zero
+        # provider requests for a callback that already ran.
+        if result is not None and provider_requests:
+            return RepairExecutionResult(
+                status="failed",
+                decision=decision,
+                refresh_result=result,
+                reason_code="REPAIR_CONSUMER_FAILED",
+                provider_requests=provider_requests,
             )
         return RepairExecutionResult(
             status="skipped",
             decision=decision,
             reason_code=self._skip_reason(decision.reason_code),
-            provider_requests=0,
+            provider_requests=provider_requests,
         )
 
     @staticmethod
-    def _storage_failure(result: RefreshResult) -> RefreshResult:
+    def _storage_failure(
+        result: RefreshResult,
+        *,
+        error: Exception | None = None,
+    ) -> RefreshResult:
+        retryable = False
+        if error is not None:
+            # Dataset integrity failures are terminal for this candidate.  A local control
+            # database read outage is a transient storage failure and follows the existing
+            # retry policy.  Arbitrary exceptions remain non-retryable and sanitized.
+            from backend.app.market.store import MarketStoreReadError
+
+            retryable = isinstance(error, MarketStoreReadError)
         return result.model_copy(
             update={
                 "status": "error",
@@ -1466,7 +1514,7 @@ class ContinuityRepairExecutor:
                 "quality_issues": ["market_refresh_failed"],
                 "failure_stage": "publish",
                 "failure_class": "storage",
-                "retryable": False,
+                "retryable": retryable,
             }
         )
 

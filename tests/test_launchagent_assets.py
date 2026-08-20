@@ -92,6 +92,19 @@ def test_after_close_agent_uses_idempotent_backend_schedule() -> None:
     assert refresh["ProcessType"] == "Background"
 
 
+def test_continuity_reuses_the_single_after_close_slot_without_new_launchagent_asset() -> None:
+    rendered = {path.name: rendered_plist(path.name) for path in sorted(LAUNCHD.glob("*.plist.in"))}
+    refresh_commands = [
+        payload["ProgramArguments"]
+        for payload in rendered.values()
+        if "auto-refresh-once" in payload["ProgramArguments"]
+    ]
+
+    assert len(refresh_commands) == 1
+    assert refresh_commands[0][-1] == "--execute"
+    assert not any("continuity" in name.lower() for name in rendered)
+
+
 def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_enabled(
     tmp_path: Path,
     monkeypatch,

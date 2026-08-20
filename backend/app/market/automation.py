@@ -135,6 +135,10 @@ class AutomationOutcome(BaseModel):
     decision: ScheduleDecision
     state: SchedulerState
     result: RefreshResult | None = None
+    # Repair execution is continuity evidence, not a freshness scheduler result.  Keep it
+    # additive so legacy callers can continue reading ``result`` while the scheduler state
+    # remains owned exclusively by the freshness lane.
+    continuity_result: object | None = None
 
 
 class ProviderProbeRunner(Protocol):
@@ -593,34 +597,21 @@ class MarketAutomationService:
         repair_result = self._plan_continuity(decision, local)
         if repair_result is not None and repair_result.status != "skipped":
             result = repair_result.refresh_result
-            if repair_result.status == "published" and result is not None:
-                state = SchedulerState(
-                    target_session=decision.target_session,
-                    refresh_state="success",
-                    attempt_count=(current.attempt_count + 1 if current else 1),
-                    last_attempt_at=result.started_at,
-                    last_success_at=result.completed_at,
-                    calendar_status="confirmed",
-                    next_retry_at=None,
-                    error_code=None,
-                )
-            else:
-                state = SchedulerState(
-                    target_session=decision.target_session,
-                    refresh_state="error",
-                    attempt_count=(current.attempt_count + 1 if current else 1),
-                    last_attempt_at=result.started_at if result is not None else local,
-                    last_success_at=current.last_success_at if current else None,
-                    calendar_status="confirmed",
-                    error_code=(
-                        result.failure_class
-                        if result is not None and result.failure_class is not None
-                        else repair_result.reason_code
-                    ),
-                    next_retry_at=None,
-                )
-            self.store.save_scheduler_state(state)
-            return AutomationOutcome(decision=decision, state=state, result=result)
+            # A repair must never rewrite the daily freshness state.  Return the prior
+            # state (or an unsaved projection when no state exists) and expose repair evidence
+            # on its dedicated continuity field.  The legacy ``result`` field is retained for
+            # compatibility with callers that already display the refresh audit.
+            state = current or SchedulerState(
+                target_session=decision.target_session,
+                refresh_state=decision.refresh_state,
+                next_retry_at=decision.next_run_at,
+            )
+            return AutomationOutcome(
+                decision=decision,
+                state=state,
+                result=result,
+                continuity_result=repair_result,
+            )
         if decision.action != "run":
             state = current or SchedulerState(
                 target_session=decision.target_session,
