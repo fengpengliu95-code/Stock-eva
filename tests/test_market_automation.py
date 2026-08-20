@@ -646,6 +646,46 @@ def test_repair_execution_result_roundtrip_revalidates_model_copy_contradiction(
         RepairExecutionResult.model_validate(bypassed.model_dump(mode="python"))
 
 
+def test_consumer_failure_with_refresh_evidence_requires_one_provider_request() -> None:
+    target = date(2026, 8, 19)
+    decision = _typed_repair_decision(
+        target=target,
+        action="run",
+        reason_code="REPAIR_CLAIMED",
+    )
+    failed_refresh = _typed_repair_refresh(target=target, status="error")
+    with pytest.raises(ValidationError):
+        RepairExecutionResult(
+            status="failed",
+            decision=decision,
+            refresh_result=failed_refresh,
+            reason_code="REPAIR_CONSUMER_FAILED",
+            provider_requests=0,
+        )
+    valid_without_result = RepairExecutionResult(
+        status="failed",
+        decision=decision,
+        reason_code="REPAIR_CONSUMER_FAILED",
+        provider_requests=0,
+    )
+    assert valid_without_result.refresh_result is None
+    assert valid_without_result.provider_requests == 0
+
+
+def test_consumer_failure_model_copy_roundtrip_cannot_zero_evidence_count() -> None:
+    target = date(2026, 8, 19)
+    valid = RepairExecutionResult(
+        status="failed",
+        decision=_typed_repair_decision(target=target),
+        refresh_result=_typed_repair_refresh(target=target, status="error"),
+        reason_code="REPAIR_CONSUMER_FAILED",
+        provider_requests=1,
+    )
+    bypassed = valid.model_copy(update={"provider_requests": 0})
+    with pytest.raises(ValidationError):
+        RepairExecutionResult.model_validate(bypassed.model_dump(mode="python"))
+
+
 def test_cli_automation_payload_is_typed_and_preserves_legacy_shape() -> None:
     automation = load_module("backend.app.market.automation")
     decision = automation.ScheduleDecision(
@@ -681,6 +721,57 @@ def test_cli_automation_payload_is_typed_and_preserves_legacy_shape() -> None:
     assert "path" not in serialized
     assert "token" not in serialized
     assert "url" not in serialized
+
+
+def test_cli_repair_payload_is_an_explicit_allowlist_and_excludes_raw_failure_text() -> None:
+    automation = load_module("backend.app.market.automation")
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    target = date(2026, 8, 19)
+    refresh = _typed_repair_refresh(target=target, status="error").model_copy(
+        update={
+            "error_message": "raw token=secret /private/path https://provider.invalid/private",
+            "run_id": "internal/path/token",
+        }
+    )
+    repair = RepairExecutionResult(
+        status="failed",
+        decision=_typed_repair_decision(target=target),
+        refresh_result=refresh,
+        reason_code="REPAIR_RESULT_FAILED",
+        provider_requests=1,
+    )
+    payload = cli._automation_outcome_payload(
+        automation.AutomationOutcome(
+            decision=decision,
+            state=state,
+            continuity_result=repair,
+        )
+    )
+    serialized = json.dumps(payload)
+    repair_refresh = payload["continuity_result"]["refresh_result"]
+    assert set(repair_refresh) == {
+        "status",
+        "requested_date",
+        "run_kind",
+        "requested_count",
+        "succeeded_count",
+        "coverage_ratio",
+        "failure_stage",
+        "failure_class",
+        "retryable",
+    }
+    assert "error_message" not in serialized
+    assert "raw token=secret" not in serialized
+    assert "/private/path" not in serialized
+    assert "provider.invalid" not in serialized
 
 
 class HealthClock:

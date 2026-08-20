@@ -1295,6 +1295,10 @@ class RepairExecutionResult(BaseModel):
                 ):
                     raise ValueError("consumer failure requires a repair wait decision")
                 if refresh is not None:
+                    if self.provider_requests != 1:
+                        raise ValueError(
+                            "consumer failure with refresh evidence requires one provider request"
+                        )
                     self._validate_refresh_evidence(refresh, target, require_ready=False)
                     if refresh.status not in {"partial", "error"}:
                         raise ValueError("consumer failure result must be partial or error")
@@ -1332,6 +1336,40 @@ class RepairExecutionResult(BaseModel):
             if self.reason_code != decision.reason_code:
                 raise ValueError("skipped freshness reason does not match decision")
         return self
+
+    def public_payload(self) -> dict[str, object]:
+        """Return the bounded repair evidence contract for public consumers.
+
+        ``RefreshResult`` remains the internal persistence/finalization model and its
+        ``model_dump`` intentionally retains the sanitized diagnostic message needed by
+        storage.  Public repair consumers must use this explicit projection instead; no
+        arbitrary string fields (message, run id, request key, symbols, or paths) cross the
+        boundary.
+        """
+        # ``model_copy``/``model_construct`` can bypass Pydantic validators.  Revalidate the
+        # complete internal object before projecting any field across this boundary.
+        validated = type(self).model_validate(self.model_dump(mode="python"))
+        refresh_payload: dict[str, object] | None = None
+        if validated.refresh_result is not None:
+            refresh = validated.refresh_result
+            refresh_payload = {
+                "status": refresh.status,
+                "requested_date": refresh.requested_date.isoformat(),
+                "run_kind": refresh.run_kind,
+                "requested_count": refresh.requested_count,
+                "succeeded_count": refresh.succeeded_count,
+                "coverage_ratio": refresh.coverage_ratio,
+                "failure_stage": refresh.failure_stage,
+                "failure_class": refresh.failure_class,
+                "retryable": refresh.retryable,
+            }
+        return {
+            "status": validated.status,
+            "decision": validated.decision.model_dump(mode="json"),
+            "refresh_result": refresh_payload,
+            "reason_code": validated.reason_code,
+            "provider_requests": validated.provider_requests,
+        }
 
     @staticmethod
     def _validate_refresh_evidence(
@@ -1546,7 +1584,12 @@ class ContinuityRepairExecutor:
                             self.post_publish(result)
                         except Exception:
                             result = self._storage_failure(result)
-            holder["result"] = result
+            # A pre-provider failure still needs the internal RefreshResult for queue
+            # finalization, but it is not public provider evidence.  Expose a refresh result
+            # only after the provider boundary was entered so a zero-count result can never
+            # be returned to RepairExecutionResult consumers.
+            if provider_called:
+                holder["result"] = result
             holder["provider_requests"] = 1 if provider_called else 0
             finalization_time = max(timestamp, require_utc(result.completed_at))
             outcome: RepairFinalizationOutcome = (
@@ -1571,30 +1614,40 @@ class ContinuityRepairExecutor:
         )
         result = holder.get("result")
         provider_requests = holder.get("provider_requests", 0)
-        if decision.reason_code == "REPAIR_CLAIMED" and result is not None:
-            if result.status == "ready":
+        if decision.reason_code == "REPAIR_CLAIMED":
+            if result is not None:
+                if result.status == "ready":
+                    return RepairExecutionResult(
+                        status="published",
+                        decision=decision,
+                        refresh_result=result,
+                        reason_code="REPAIR_PUBLISHED",
+                        provider_requests=provider_requests,
+                    )
                 return RepairExecutionResult(
-                    status="published",
+                    status="failed",
                     decision=decision,
                     refresh_result=result,
-                    reason_code="REPAIR_PUBLISHED",
+                    reason_code=(
+                        "POST_PUBLISH_INVENTORY_MISSING"
+                        if result.failure_class == "storage" and result.failure_stage == "publish"
+                        else "REPAIR_RESULT_FAILED"
+                    ),
                     provider_requests=provider_requests,
                 )
+            # The lease was claimed, but the consumer failed before entering the provider
+            # boundary.  There is deliberately no refresh evidence and therefore no provider
+            # request count to report.
             return RepairExecutionResult(
                 status="failed",
                 decision=decision,
-                refresh_result=result,
-                reason_code=(
-                    "POST_PUBLISH_INVENTORY_MISSING"
-                    if result.failure_class == "storage" and result.failure_stage == "publish"
-                    else "REPAIR_RESULT_FAILED"
-                ),
+                reason_code="REPAIR_CONSUMER_FAILED",
                 provider_requests=provider_requests,
             )
         # Preserve a sanitized result if finalization/control handling itself failed after
         # the provider callback.  The coordinator's generic wait reason must not report zero
         # provider requests for a callback that already ran.
-        if result is not None and provider_requests:
+        if decision.reason_code == "REPAIR_CONSUMER_FAILED":
             return RepairExecutionResult(
                 status="failed",
                 decision=decision,

@@ -117,17 +117,7 @@ def _automation_outcome_payload(outcome: AutomationOutcome) -> dict[str, object]
     }
     repair = outcome.continuity_result
     if repair is not None:
-        payload["continuity_result"] = {
-            "status": repair.status,
-            "decision": repair.decision.model_dump(mode="json"),
-            "refresh_result": (
-                repair.refresh_result.model_dump(mode="json")
-                if repair.refresh_result is not None
-                else None
-            ),
-            "reason_code": repair.reason_code,
-            "provider_requests": repair.provider_requests,
-        }
+        payload["continuity_result"] = repair.public_payload()
     return payload
 
 
