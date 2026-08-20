@@ -138,7 +138,13 @@ def _publish_fixture(settings: Settings, dataset_root: Path) -> Path:
         settings.local_staging_dir,
     )
     store.save_refresh(_bars(), _ready_result(), publish=True)
-    CalendarSyncStore(settings.local_control_dir / settings.calendar_sync_database_name)
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    CalendarSyncStore(calendar_path)
+    with sqlite3.connect(calendar_path) as connection:
+        connection.execute(
+            "INSERT INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+            ('{"conflict_detected": false}',),
+        )
     UserStore(settings.user_data_dir / settings.user_database_name).list_positions()
     return control_path
 
@@ -455,6 +461,13 @@ def test_market_continuity_plan_requires_readable_queue_without_writes(
         _publish_fixture(settings, dataset_root)
     else:
         _empty_dataset(dataset_root)
+        calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+        CalendarSyncStore(calendar_path)
+        with sqlite3.connect(calendar_path) as connection:
+            connection.execute(
+                "INSERT INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+                ('{"conflict_detected": false}',),
+            )
     before = _tree(tmp_path) if tmp_path.exists() else ()
     monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
     monkeypatch.setattr(
@@ -482,6 +495,58 @@ def test_market_continuity_plan_requires_readable_queue_without_writes(
     assert _tree(tmp_path) == before
 
 
+@pytest.mark.parametrize(
+    "calendar_corruption", ["missing_db", "missing_row", "missing_table", "bad_payload"]
+)
+def test_market_continuity_plan_requires_readable_calendar_control(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    calendar_corruption: str,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={"market_continuity_start_date": AS_OF}
+    )
+    control = _publish_fixture(settings, dataset_root)
+    with RefreshRunLock(settings.local_lock_dir / "market-refresh.lock"):
+        MarketStore(control).initialize_continuity_schema()
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    if calendar_corruption == "missing_db":
+        calendar_path.unlink()
+    else:
+        with sqlite3.connect(calendar_path) as connection:
+            if calendar_corruption == "missing_row":
+                connection.execute("DELETE FROM calendar_sync_state")
+            elif calendar_corruption == "missing_table":
+                connection.execute("DROP TABLE calendar_sync_state")
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO calendar_sync_state "
+                    "(singleton, payload_json) VALUES (1, '[]')"
+                )
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-continuity",
+            "--start",
+            AS_OF.isoformat(),
+            "--end",
+            AS_OF.isoformat(),
+        ],
+    )
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["reason_code"] == "CALENDAR_UNAVAILABLE"
+    assert payload["writes_control_state"] is False
+    assert payload["provider_requests"] == 0
+
+
 @pytest.mark.parametrize("publish_current", [True, False])
 def test_market_continuity_plan_maps_scan_with_ready_queue(
     tmp_path: Path,
@@ -500,6 +565,13 @@ def test_market_continuity_plan_maps_scan_with_ready_queue(
         _empty_dataset(dataset_root)
         control = settings.market_data_dir / settings.market_database_name
         MarketStore(control).initialize_schema()
+        calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+        CalendarSyncStore(calendar_path)
+        with sqlite3.connect(calendar_path) as connection:
+            connection.execute(
+                "INSERT INTO calendar_sync_state (singleton, payload_json) VALUES (1, ?)",
+                ('{"conflict_detected": false}',),
+            )
         expected_status = "gaps"
     with RefreshRunLock(settings.local_lock_dir / "market-refresh.lock"):
         MarketStore(control).initialize_continuity_schema()
@@ -1217,6 +1289,71 @@ def test_lifespan_repair_scanner_reads_calendar_conflict_dynamically(
         isinstance(refreshed, ContinuityUnavailable)
         and refreshed.reason_code == "CALENDAR_CONFLICT"
     )
+
+
+def test_lifespan_calendar_reader_does_not_initialize_missing_control_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root).model_copy(
+        update={
+            "auto_refresh_enabled": True,
+            "market_repair_enabled": True,
+            "market_continuity_start_date": date(2026, 7, 20),
+        }
+    )
+    _publish_fixture(settings, dataset_root)
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    calendar_path.unlink()
+    calls: list[bool] = []
+    real_store = main_module.CalendarSyncStore
+
+    class CapturingCalendarStore(real_store):
+        def __init__(self, path, *, initialize=True):
+            calls.append(initialize)
+            super().__init__(path, initialize=initialize)
+
+    class ReadyPreflight:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def inspect(self) -> StorageReadiness:
+            return StorageReadiness(
+                mode="local_dataset",
+                status="ready",
+                market_data_available=True,
+                serving_source="local",
+                mount_type="local",
+                sentinel_status="ready",
+                manifest_status="ready",
+                dataset_generation="fixture",
+            )
+
+    class CapturingAutomationService:
+        def __init__(self, *_args, **kwargs) -> None:
+            pass
+
+    async def idle_loop(_service, stop, **_kwargs) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "settings", settings)
+    monkeypatch.setattr(main_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(main_module, "CalendarSyncStore", CapturingCalendarStore)
+    monkeypatch.setattr(main_module, "MarketAutomationService", CapturingAutomationService)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "build_after_close_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "run_automation_loop", idle_loop)
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def run_lifespan() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(run_lifespan())
+
+    assert calls == [False]
+    assert not calendar_path.exists()
 
 
 def test_market_store_reader_sees_previous_commit_during_writer_transaction(

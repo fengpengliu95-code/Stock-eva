@@ -154,8 +154,11 @@ async def lifespan(_: FastAPI):
         repair_enabled=(repair_executor is not None),
         repair_executor=repair_executor,
     )
+    calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
     calendar_service = CalendarSyncService(
-        CalendarSyncStore(layout.local_paths.control / settings.calendar_sync_database_name),
+        # The loop may plan a repair before calendar control state exists.  Its reader must
+        # never create that state; the explicit execution callback below owns initialization.
+        CalendarSyncStore(calendar_sync_path, initialize=False),
         get_trading_calendar(),
         BaoStockProvider(
             min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
@@ -167,7 +170,13 @@ async def lifespan(_: FastAPI):
     def execute_calendar_plan(plan):
         try:
             with RefreshRunLock(layout.market_refresh_lock):
-                return calendar_service.execute(plan)
+                writer_service = CalendarSyncService(
+                    CalendarSyncStore(calendar_sync_path),
+                    calendar_service.calendar,
+                    calendar_service.provider,
+                    health_store=health_store,
+                )
+                return writer_service.execute(plan)
         except RefreshAlreadyRunning:
             return None
 

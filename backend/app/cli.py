@@ -576,14 +576,7 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             # Re-read the local sync state on every scan.  The enqueue service invokes a
             # second scan inside the shared lock; a conflict introduced between scans must
             # fail closed rather than use a stale preflight value.
-            calendar_conflict=lambda: (
-                CalendarSyncStore(
-                    calendar_sync_path,
-                    initialize=False,
-                )
-                .state()
-                .conflict_detected
-            ),
+            calendar_conflict=lambda: read_calendar_conflict(calendar_sync_path),
         )
         now = get_market_clock()()
         latest = calendar.latest_expected_session(now)
