@@ -1363,12 +1363,23 @@ class RepairExecutionResult(BaseModel):
                 "failure_class": refresh.failure_class,
                 "retryable": refresh.retryable,
             }
+        decision = validated.decision
+        decision_payload = {
+            "action": decision.action,
+            "lane": decision.lane,
+            "target_session": (
+                decision.target_session.isoformat() if decision.target_session is not None else None
+            ),
+            "next_run_at": (
+                decision.next_run_at.isoformat() if decision.next_run_at is not None else None
+            ),
+            "reason_code": decision.reason_code,
+        }
         return {
             "status": validated.status,
-            "decision": validated.decision.model_dump(mode="json"),
+            "decision": decision_payload,
             "refresh_result": refresh_payload,
             "reason_code": validated.reason_code,
-            "provider_requests": validated.provider_requests,
         }
 
     @staticmethod

@@ -8,6 +8,8 @@ from pathlib import Path
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
 from backend.app.classification.failures import (
     ClassificationFailure,
     ClassificationFailureError,
@@ -109,13 +111,31 @@ def _provider_health_payload(health: ProviderHealth) -> dict[str, object]:
 
 def _automation_outcome_payload(outcome: AutomationOutcome) -> dict[str, object]:
     """Serialize only the stable, typed automation contract for CLI consumers."""
+    # ``model_copy``/``model_construct`` can bypass Pydantic validators.  Revalidate the
+    # complete outcome before reading any field so contradictory internal state cannot reach
+    # the legacy or repair serializers.
+    try:
+        validated = AutomationOutcome.model_validate(
+            outcome.model_dump(mode="python", warnings="none")
+        )
+    except ValidationError:
+        # Pydantic's normal validation detail includes ``input_value`` snippets.  Those
+        # snippets may contain private paths, request keys, or provider text injected into a
+        # bypassed model, so never expose the original exception to CLI callers.
+        try:
+            AutomationOutcome.model_validate({"decision": None, "state": None, "result": None})
+        except ValidationError as sanitized:
+            raise sanitized from None
+        raise RuntimeError("automation outcome validation unexpectedly succeeded") from None
     payload: dict[str, object] = {
-        "decision": outcome.decision.model_dump(mode="json"),
-        "state": outcome.state.model_dump(mode="json"),
+        "decision": validated.decision.model_dump(mode="json"),
+        "state": validated.state.model_dump(mode="json"),
         # ``result`` is a legacy freshness field and intentionally remains present as null.
-        "result": outcome.result.model_dump(mode="json") if outcome.result is not None else None,
+        "result": (
+            validated.result.model_dump(mode="json") if validated.result is not None else None
+        ),
     }
-    repair = outcome.continuity_result
+    repair = validated.continuity_result
     if repair is not None:
         payload["continuity_result"] = repair.public_payload()
     return payload

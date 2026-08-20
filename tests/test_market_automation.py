@@ -72,6 +72,31 @@ def load_module(name: str):
         pytest.fail(f"{name} is not implemented")
 
 
+def assert_public_repair_payload_is_sanitized(value: object) -> None:
+    forbidden = (
+        "job_id",
+        "request_key",
+        "run_id",
+        "provider_requests",
+        "error_message",
+        "path",
+        "token",
+        "url",
+    )
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert isinstance(key, str)
+            assert not any(term in key for term in forbidden), key
+            assert_public_repair_payload_is_sanitized(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            assert_public_repair_payload_is_sanitized(item)
+        return
+    if isinstance(value, str):
+        assert not any(term in value for term in forbidden), value
+
+
 def synthetic_calendar():
     module = load_module("backend.app.market.calendar")
     return module.TradingCalendar.from_dict(
@@ -717,10 +742,40 @@ def test_cli_automation_payload_is_typed_and_preserves_legacy_shape() -> None:
     assert set(repair_payload) == {"decision", "state", "result", "continuity_result"}
     assert repair_payload["result"] is None
     assert repair_payload["continuity_result"]["status"] == "published"
+    assert set(repair_payload["continuity_result"]) == {
+        "status",
+        "decision",
+        "refresh_result",
+        "reason_code",
+    }
+    assert set(repair_payload["continuity_result"]["decision"]) == {
+        "action",
+        "lane",
+        "target_session",
+        "next_run_at",
+        "reason_code",
+    }
+    assert set(repair_payload["continuity_result"]["refresh_result"]) == {
+        "status",
+        "requested_date",
+        "run_kind",
+        "requested_count",
+        "succeeded_count",
+        "coverage_ratio",
+        "failure_stage",
+        "failure_class",
+        "retryable",
+    }
     serialized = json.dumps(repair_payload)
     assert "path" not in serialized
     assert "token" not in serialized
     assert "url" not in serialized
+    assert "provider_requests" not in serialized
+    assert "repair_job_id" not in serialized
+    assert "run_id" not in serialized
+    assert "request_key" not in serialized
+    assert "error_message" not in serialized
+    assert_public_repair_payload_is_sanitized(repair_payload["continuity_result"])
 
 
 def test_cli_repair_payload_is_an_explicit_allowlist_and_excludes_raw_failure_text() -> None:
@@ -772,6 +827,85 @@ def test_cli_repair_payload_is_an_explicit_allowlist_and_excludes_raw_failure_te
     assert "raw token=secret" not in serialized
     assert "/private/path" not in serialized
     assert "provider.invalid" not in serialized
+    assert_public_repair_payload_is_sanitized(payload["continuity_result"])
+
+
+def test_cli_automation_payload_revalidates_outer_model_copy_before_reading_fields() -> None:
+    automation = load_module("backend.app.market.automation")
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    target = date(2026, 8, 19)
+    refresh = _typed_repair_refresh(target=target, status="error").model_copy(
+        update={
+            "error_message": "raw token=secret /private/path https://provider.invalid/private",
+            "run_id": "run-id-secret",
+        }
+    )
+    base_repair = RepairExecutionResult(
+        status="failed",
+        decision=_typed_repair_decision(target=target),
+        refresh_result=_typed_repair_refresh(target=target, status="error"),
+        reason_code="REPAIR_RESULT_FAILED",
+        provider_requests=1,
+    )
+    bypassed_refresh = refresh.model_copy(update={"request_key": "request-key-secret"})
+    bypassed_repair = base_repair.model_copy(update={"refresh_result": bypassed_refresh})
+    bypassed_repair = bypassed_repair.model_copy(
+        update={"status": "skipped", "provider_requests": 0}
+    )
+    bypassed_outcome = automation.AutomationOutcome(
+        decision=decision,
+        state=state,
+        continuity_result=base_repair,
+    ).model_copy(
+        update={
+            "result": {
+                "run_id": "run-id-secret",
+                "error_message": "raw token=secret /private/path https://provider.invalid/private",
+                "run_kind": "repair",
+            },
+            "continuity_result": bypassed_repair,
+        }
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        cli._automation_outcome_payload(bypassed_outcome)
+
+    error_text = str(caught.value)
+    assert "raw token=secret" not in error_text
+    assert "/private/path" not in error_text
+    assert "provider.invalid" not in error_text
+    assert "run-id-secret" not in error_text
+    assert "request-key-secret" not in error_text
+
+
+def test_cli_automation_payload_roundtrip_keeps_legal_legacy_result_shape() -> None:
+    automation = load_module("backend.app.market.automation")
+    decision = automation.ScheduleDecision(
+        action="none",
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    state = automation.SchedulerState(
+        target_session=date(2026, 8, 20),
+        refresh_state="success",
+    )
+    result = _typed_repair_refresh(target=date(2026, 8, 19), status="error").model_copy(
+        update={"run_kind": "daily", "request_key": None}
+    )
+    outcome = automation.AutomationOutcome(decision=decision, state=state, result=result)
+
+    payload = cli._automation_outcome_payload(outcome)
+
+    assert set(payload) == {"decision", "state", "result"}
+    assert payload["result"] == result.model_dump(mode="json")
 
 
 class HealthClock:
