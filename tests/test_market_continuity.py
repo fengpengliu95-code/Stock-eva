@@ -2519,6 +2519,84 @@ def test_enqueue_service_rechecks_evidence_under_lock_before_schema_or_database_
     assert not {"payload", "token", "url", "path", "exception", "error"} & set(payload)
 
 
+@pytest.mark.parametrize("malformed_kind", ["generation", "status", "dates", "reason"])
+def test_enqueue_service_revalidates_bypassed_fresh_scan_before_control_write(
+    tmp_path: Path,
+    malformed_kind: str,
+) -> None:
+    module = continuity_module()
+    session = date(2026, 8, 3)
+    valid_scan = module.ContinuityScanResult(
+        status="current",
+        effective_start=session,
+        effective_end=session,
+        manifest_generation="generation-g1",
+        confirmed_open_sessions=(session,),
+        published_ready_sessions=(session,),
+        missing_sessions=(),
+    )
+    if malformed_kind == "generation":
+        payload = {**valid_scan.model_dump(), "manifest_generation": "bad token /private"}
+        malformed = module.ContinuityScanResult.model_construct(
+            **payload,
+        )
+    elif malformed_kind == "status":
+        payload = {**valid_scan.model_dump(), "status": "unknown"}
+        malformed = module.ContinuityScanResult.model_construct(
+            **payload,
+        )
+    elif malformed_kind == "dates":
+        payload = {**valid_scan.model_dump(), "effective_start": "not-a-date"}
+        malformed = module.ContinuityScanResult.model_construct(
+            **payload,
+        )
+    else:
+        malformed = module.ContinuityUnavailable.model_construct(reason_code="UNKNOWN_REASON")
+
+    class BypassedScanner:
+        calendar_conflict_is_dynamic = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scan(self, **_kwargs):
+            self.calls += 1
+            return valid_scan if self.calls == 1 else malformed
+
+    scanner = BypassedScanner()
+    lock_path = tmp_path / "locks" / "market-refresh.lock"
+    precreate_lock(lock_path)
+    before = tree_fingerprint(tmp_path)
+    store_factory_calls = 0
+
+    def store_factory():
+        nonlocal store_factory_calls
+        store_factory_calls += 1
+        raise AssertionError("invalid fresh scan must not construct the queue store")
+
+    service = module.ContinuityEnqueueService(
+        scanner=scanner,
+        store_factory=store_factory,
+        lock_path=lock_path,
+        universe_id=UNIVERSE_ID,
+        clock=lambda: NOW,
+    )
+
+    result = service.execute(
+        configured_start=session,
+        latest_completed_session=session,
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.fresh_scan is None
+    assert result.writes_control_state is False
+    assert result.provider_requests == 0
+    assert store_factory_calls == 0
+    assert scanner.calls == 2
+    assert tree_fingerprint(tmp_path) == before
+
+
 def test_enqueue_service_rechecks_changed_latest_boundary_before_any_write(
     tmp_path: Path,
     monkeypatch,

@@ -88,6 +88,7 @@ _REPAIR_WAIT_REASONS = frozenset(
 _FRESHNESS_NONE_REASONS = _FRESHNESS_WAIT_REASONS
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_GENERATION = re.compile(r"^generation-[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
 _R2F1_UNIVERSE_ID = "all-main-board"
 
 
@@ -115,7 +116,7 @@ class ContinuityScanResult(BaseModel):
     manifest_generation: str = Field(
         min_length=1,
         max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        pattern=_SAFE_GENERATION.pattern,
     )
     confirmed_open_sessions: tuple[date, ...]
     published_ready_sessions: tuple[date, ...]
@@ -477,9 +478,8 @@ class ContinuityEnqueueService:
         completed_scan: ContinuityScanResult | None = None,
     ) -> ContinuityEnqueueResult:
         if completed_scan is not None:
-            try:
-                ContinuityScanResult.model_validate(completed_scan.model_dump(mode="python"))
-            except Exception:
+            validated_completed = self._revalidate_scan_evidence(completed_scan)
+            if not isinstance(validated_completed, ContinuityScanResult):
                 return ContinuityEnqueueResult(
                     status="unavailable",
                     reason_code="CONTINUITY_RANGE_INVALID",
@@ -497,13 +497,19 @@ class ContinuityEnqueueService:
                     status="unavailable",
                     reason_code="CALENDAR_CONFLICT_SOURCE_UNAVAILABLE",
                 )
-            preflight = self._scanner.scan(
+            raw_preflight = self._scanner.scan(
                 configured_start=configured_start,
                 latest_completed_session=latest_completed_session,
                 requested_start=requested_start,
                 requested_end=requested_end,
             )
         except Exception:
+            return ContinuityEnqueueResult(
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+            )
+        preflight = self._revalidate_scan_evidence(raw_preflight)
+        if preflight is None:
             return ContinuityEnqueueResult(
                 status="unavailable",
                 reason_code="CONTROL_STATE_UNAVAILABLE",
@@ -519,12 +525,18 @@ class ContinuityEnqueueService:
             try:
                 lock = lock_factory(self._lock_path)
                 with lock:
-                    fresh = self._scanner.scan(
+                    raw_fresh = self._scanner.scan(
                         configured_start=configured_start,
                         latest_completed_session=latest_completed_session,
                         requested_start=requested_start,
                         requested_end=requested_end,
                     )
+                    fresh = self._revalidate_scan_evidence(raw_fresh)
+                    if fresh is None:
+                        return ContinuityEnqueueResult(
+                            status="unavailable",
+                            reason_code="CONTROL_STATE_UNAVAILABLE",
+                        )
                     if isinstance(fresh, ContinuityUnavailable):
                         return ContinuityEnqueueResult(
                             status="unavailable",
@@ -593,6 +605,28 @@ class ContinuityEnqueueService:
     def _scan_identity(scan: ContinuityScanResult) -> str:
         content = json.dumps(scan.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()
+
+    @staticmethod
+    def _revalidate_scan_evidence(
+        value: object,
+    ) -> ContinuityScanResult | ContinuityUnavailable | None:
+        """Round-trip scanner output through the public models before dereference.
+
+        Scanner output is a control-plane boundary: tests, adapters, and legacy callers can
+        construct Pydantic models with ``model_construct`` and bypass their validators.  Do
+        not inspect any fields until a complete strict round-trip succeeds.  ``Exception`` is
+        intentionally the boundary here; process-level ``BaseException`` signals must remain
+        visible to the caller.
+        """
+        if not isinstance(value, (ContinuityScanResult, ContinuityUnavailable)):
+            return None
+        try:
+            payload = value.model_dump(mode="python", warnings=False)
+            if isinstance(value, ContinuityScanResult):
+                return ContinuityScanResult.model_validate(payload)
+            return ContinuityUnavailable.model_validate(payload)
+        except Exception:
+            return None
 
 
 def require_utc(value: datetime) -> datetime:
