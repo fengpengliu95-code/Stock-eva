@@ -2,7 +2,8 @@
 
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
-**Status:** R2-F0.1 offline code gate complete; deployment and R2-F0 production gate remain closed
+**Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; deployment,
+R2-F0 production gate and R2-F2 start gate remain closed
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
@@ -42,6 +43,20 @@ but it does not erase completed work or rewrite old acceptance evidence.
 - Multi-provider failover stays disabled. A second source must first complete at least 20
   consecutive trading sessions of whole-session shadow qualification; symbol-level mixing remains
   prohibited, and failover requires a separately approved manual qualification/failover stage.
+
+### 2026-08-21 R2-F1 status checkpoint
+
+- R2-F1 Continuity Controller is **OFFLINE CODE GO** at exact reviewed code HEAD
+  336107be1149d829c0ea841dd2466982bff7d689; see
+  [its acceptance record](../acceptance/release-2-r2f1.md).
+- Focused evidence is 466 tests, the full repository gate is 1,403 tests, Ruff and diff gates are
+  green, and the independent final review is High 0 / Medium 0.
+- R2-F1 remains offline-only: no real provider, installation, NAS, LaunchAgent or production
+  execution occurred. The refresh LaunchAgent remains unloaded/frozen and R2-F0 remains
+  production NO-GO.
+- R2-F2 Provider Evidence Framework is the next planned stage but may start only after explicit
+  user approval. Automatic failover remains disabled; second-source qualification still requires
+  at least 20 consecutive whole-session shadow trading days.
 
 ## 2. Verified baseline on 2026-08-12
 

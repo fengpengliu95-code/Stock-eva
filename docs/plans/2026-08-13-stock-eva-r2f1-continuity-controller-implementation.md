@@ -924,7 +924,8 @@ acceptance file. No commit may contain R2-F2 raw evidence, multi-provider or fai
 
 ## Definition of R2-F1 offline complete
 
-R2-F1 is complete only when all seven tasks are committed and reviewed, all design requirements
-have direct passing evidence, full-suite/style gates pass, the exact code HEAD has High 0 / Medium
-0, and the acceptance record states the offline-only boundary. Passing R2-F1 does not close the
-R2-F0 production incident, install a runtime, authorize a provider call or begin R2-F2.
+R2-F1 is complete: all seven tasks are committed and reviewed, all design requirements have direct
+passing evidence, full-suite/style gates pass, the exact code HEAD 336107be1149d829c0ea841dd2466982bff7d689
+has High 0 / Medium 0, and the acceptance record states the offline-only boundary. Passing R2-F1
+does not close the R2-F0 production incident, install a runtime, authorize a provider call or
+begin R2-F2. R2-F2 remains a planned next stage pending explicit user approval.

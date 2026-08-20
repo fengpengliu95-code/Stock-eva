@@ -26,6 +26,11 @@ production NO-GO. See
 [R2-F0.1 acceptance](../acceptance/release-2-r2f0-1.md) and
 [R2-F0 incident acceptance](../acceptance/release-2-r2f0.md).
 
+**R2-F1 closure status:** OFFLINE CODE GO at exact reviewed code HEAD
+336107be1149d829c0ea841dd2466982bff7d689; see
+[R2-F1 acceptance](../acceptance/release-2-r2f1.md). The code gate is complete, but this does not
+authorize installation, real provider access, production repair or R2-F2.
+
 **Next confirmation gate:** Gap Scanner + Health-aware Repair Queue is the next code stage and may
 start only after explicit user confirmation. Provider-neutral RAW Evidence Framework follows it;
 then a second source must pass at least 20 consecutive trading sessions of whole-session shadow
@@ -2076,7 +2081,8 @@ installed runtime or observation window.
 ## Final implementation checklist
 
 - [ ] R2-F0 closes the incident without symbol allowlists or relaxed active-stock factor gates.
-- [ ] R2-F1 repairs missing confirmed sessions after restart without starving freshness.
+- [x] R2-F1 repairs missing confirmed sessions after restart without starving freshness; offline
+  code gate is GO at 336107be1149d829c0ea841dd2466982bff7d689.
 - [ ] R2-F2 replays immutable raw evidence and preserves all legacy canonical objects/readers.
 - [ ] R2-F3 qualifies at least one secondary over 20 consecutive trading sessions.
 - [ ] R2-F4 demonstrates default-off, whole-session failover with zero mixed-source rows.

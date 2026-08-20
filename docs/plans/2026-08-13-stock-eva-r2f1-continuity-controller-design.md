@@ -652,5 +652,8 @@ flowchart TD
 | FR-26–FR-30 | API/CLI storage fingerprints, sanitization and rollback-switch tests |
 | NFR-1–NFR-11 | Focused suites, full repository suite, Ruff/format/diff checks and independent review |
 
-Root quality review accepted this specification on 2026-08-13, so offline implementation may
-start. Code completion is still only an offline gate; it cannot claim production R2-F1 GO.
+Root quality review accepted this specification on 2026-08-13. Offline implementation and the
+independent final review are complete at exact code HEAD
+336107be1149d829c0ea841dd2466982bff7d689, with High 0 / Medium 0 and verdict
+R2-F1 OFFLINE CODE GO. This remains only an offline code gate; it cannot claim production R2-F1
+GO, authorize a provider request, or start R2-F2 without explicit user approval.
