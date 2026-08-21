@@ -247,6 +247,7 @@ def _read_result(
     *,
     before_page_request: Callable[[], None] | None = None,
     next_page_scope: Callable[[int], Any] | None = None,
+    page_capture: Callable[[int, list[str], list[list[str]]], None] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
         raise _provider_status_error(
@@ -255,6 +256,17 @@ def _read_result(
         )
     rows: list[list[str]] = []
     page_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
+
+    def capture_page() -> None:
+        if page_capture is None or not hasattr(result, "data"):
+            return
+        page_capture(
+            _page_number(result),
+            list(result.fields),
+            [list(row) for row in result.data],
+        )
+
+    capture_page()
     while True:
         page_request_required = (
             before_page_request is not None
@@ -302,6 +314,7 @@ def _read_result(
                         "BaoStock pagination protocol did not advance",
                         normalized_error=NormalizedTransportError.PAGINATION_STALLED,
                     )
+                capture_page()
         else:
             has_row = result.next()
         if not has_row:
@@ -931,11 +944,16 @@ class BaoStockProvider:
         self,
         endpoint: TransportEndpoint,
         operation: Callable[[], Any],
+        *,
+        page_capture: Callable[[int, int, list[str], list[list[str]]], None] | None = None,
+        session_binding: Callable[[], None] | None = None,
     ) -> tuple[list[str], list[list[str]]]:
         with self._refresh_operation():
             last_error: BaoStockError | None = None
             for attempt in range(1, self.max_attempts + 1):
                 self._ensure_session(endpoint)
+                if session_binding is not None:
+                    session_binding()
                 self._pace_request()
                 try:
                     with self._request_scope(endpoint, attempt=attempt, page=1):
@@ -949,6 +967,13 @@ class BaoStockProvider:
                                     endpoint,
                                     attempt=attempt,
                                     page=page,
+                                ),
+                                page_capture=(
+                                    None
+                                    if page_capture is None
+                                    else lambda page, fields, rows: page_capture(
+                                        attempt, page, fields, rows
+                                    )
                                 ),
                             )
 

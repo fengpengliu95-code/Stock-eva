@@ -6,7 +6,7 @@ accidental real request fail loudly.
 """
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -20,15 +20,18 @@ from backend.app.market.provider_transport import (
     ProtocolStage,
     TransportObservation,
     TransportOutcome,
+    current_request_context,
 )
 from backend.app.market.provider_transport import (
     ProviderEndpoint as TransportEndpoint,
 )
+from backend.app.market.providers import base as provider_base
 from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.providers.base import (
     ENDPOINT_CONTRACTS,
     AttemptCompletion,
     DailyAStockRow,
+    DailyFactorRow,
     EndpointContractSummary,
     ExpectedLogicalRequest,
     ExpectedLogicalRequestPlan,
@@ -92,6 +95,62 @@ def _plan_container(item: ExpectedLogicalRequest | None = None) -> ExpectedLogic
     return ExpectedLogicalRequestPlan(
         requests=(request,),
         request_count=1,
+        request_plan_hash=plan_hash,
+    )
+
+
+def _full_plan() -> ExpectedLogicalRequestPlan:
+    requests = (
+        _plan(
+            endpoint=ProviderEndpoint.TRADE_DATES,
+            role=RequestRole.CALENDAR,
+            instrument=None,
+            variant="trade_dates.v1",
+            symbols=(),
+            ordinal=0,
+        ),
+        _plan(
+            endpoint=ProviderEndpoint.ALL_STOCK,
+            role=RequestRole.UNIVERSE,
+            variant="all_stock.market.v1",
+            symbols=(),
+            ordinal=1,
+        ),
+        _plan(ordinal=2, symbols=("sh.600000",)),
+        _plan(
+            endpoint=ProviderEndpoint.DAILY_FACTOR,
+            role=RequestRole.DAILY_FACTOR,
+            variant="daily_factor.v1",
+            symbols=("sh.600000",),
+            ordinal=3,
+        ),
+        _plan(
+            endpoint=ProviderEndpoint.ADJUST_FACTOR,
+            role=RequestRole.ADJUST_FACTOR,
+            variant="adjust_factor.session.v1",
+            symbols=("sh.600000",),
+            ordinal=4,
+        ),
+        _plan(
+            endpoint=ProviderEndpoint.INDEX_HISTORY,
+            role=RequestRole.INDEX_HISTORY,
+            instrument=InstrumentRole.INDEX,
+            variant="index_history.session.v1",
+            symbols=("sh.000001",),
+            ordinal=5,
+        ),
+    )
+    plan_hash = sha256(
+        json.dumps(
+            [request.model_dump(mode="json") for request in requests],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return ExpectedLogicalRequestPlan(
+        requests=requests,
+        request_count=len(requests),
         request_plan_hash=plan_hash,
     )
 
@@ -233,7 +292,13 @@ def _provider_raw_batch() -> ProviderRawBatch:
         request_plan_hash=plan.request_plan_hash,
         endpoint_batches=(_batch(),),
         request_completions=(completion,),
-        completion_hash=completion.compute_hash(),
+        completion_hash=sha256(
+            json.dumps(
+                [completion.model_dump(mode="json")],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
         transport_lineage=(_lineage(),),
         transport_observations=TransportObservationAggregate.from_observations((projection,)),
         endpoint_summaries=(summary,),
@@ -262,6 +327,117 @@ def _projection(*, provider_code: str | None = None) -> TransportObservationProj
         observed_at=NOW,
     )
     return TransportObservationProjection.from_observation(observation)
+
+
+class _SdkResult:
+    """Complete offline analogue of BaoStock ResultData used by _read_result."""
+
+    error_code = "0"
+    error_msg = ""
+    per_page_count = 2000
+
+    def __init__(self, fields: list[str], rows: list[list[str]]) -> None:
+        self.fields = fields
+        self.data = [list(row) for row in rows]
+        self.cur_page_num = "1"
+        self.cur_row_num = 0
+        self.current = None
+
+    def next(self) -> bool:
+        if self.cur_row_num >= len(self.data):
+            return False
+        self.current = self.data[self.cur_row_num]
+        self.cur_row_num += 1
+        return True
+
+    def get_row_data(self):
+        return self.current
+
+
+class _CompleteSdkClient:
+    """Offline BaoStock-shaped client with every incumbent query method."""
+
+    def __init__(self, *, response_date: str = "2026-08-20") -> None:
+        self.response_date = response_date
+        self.calls: list[tuple[str, object, object]] = []
+        self.login_calls = 0
+        self.logout_calls = 0
+
+    def login(self):
+        self.login_calls += 1
+        return _SdkResult([], [])
+
+    def logout(self):
+        self.logout_calls += 1
+
+    def _record(self, name: str, *args: object) -> None:
+        context = current_request_context()
+        self.calls.append((name, args, context))
+
+    def query_trade_dates(self, **kwargs):
+        self._record("query_trade_dates", kwargs)
+        return _SdkResult(["calendar_date", "is_trading_day"], [[self.response_date, "1"]])
+
+    def query_all_stock(self, **kwargs):
+        self._record("query_all_stock", kwargs)
+        return _SdkResult(["code", "tradeStatus", "code_name"], [["sh.600000", "1", "fixture"]])
+
+    def query_daily_history_k_AStock(self, **kwargs):
+        self._record("query_daily_history_k_AStock", kwargs)
+        return _SdkResult(DAILY_FIELDS.split(","), [self._daily_row("sh.600000")])
+
+    def query_daily_adjust_factor(self, **kwargs):
+        self._record("query_daily_adjust_factor", kwargs)
+        return _SdkResult(
+            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            [["sh.600000", self.response_date, "1", "0.8", "0.8"]],
+        )
+
+    def query_adjust_factor(self, code, **kwargs):
+        self._record("query_adjust_factor", code, kwargs)
+        return _SdkResult(
+            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            [[code, self.response_date, "1", "0.8", "0.8"]],
+        )
+
+    def query_history_k_data_plus(self, code, fields, **kwargs):
+        self._record("query_history_k_data_plus", code, fields, kwargs)
+        return _SdkResult(fields.split(","), [self._daily_row(code)])
+
+    def _daily_row(self, code: str) -> list[str]:
+        values = {
+            "date": self.response_date,
+            "code": code,
+            "open": "10",
+            "high": "11",
+            "low": "9",
+            "close": "10.5",
+            "preclose": "10",
+            "volume": "100",
+            "amount": "1000",
+            "adjustflag": "3",
+            "turn": "1",
+            "tradestatus": "1",
+            "pctChg": "5",
+            "isST": "0",
+        }
+        return [values[name] for name in DAILY_FIELDS.split(",")]
+
+
+class _RetryingSdkClient(_CompleteSdkClient):
+    """Fails after a captured full page, then succeeds on the retry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.daily_calls = 0
+
+    def query_daily_history_k_AStock(self, **kwargs):
+        self.daily_calls += 1
+        self._record("query_daily_history_k_AStock", kwargs)
+        result = _SdkResult(DAILY_FIELDS.split(","), [self._daily_row("sh.600000")])
+        if self.daily_calls == 1:
+            result.per_page_count = 1
+        return result
 
 
 def test_provider_id_is_static_baostock_allowlist() -> None:
@@ -369,6 +545,19 @@ def test_endpoint_schema_variants_reject_date_mismatch_and_mixed_sessions() -> N
         )
 
 
+def test_session_and_range_request_date_rules_are_discriminated() -> None:
+    with pytest.raises(ValueError):
+        _plan().model_copy(update={"start_date": date(2026, 8, 19), "end_date": date(2026, 8, 20)})
+    index_range = _plan(
+        endpoint=ProviderEndpoint.INDEX_HISTORY,
+        role=RequestRole.INDEX_HISTORY,
+        instrument=InstrumentRole.INDEX,
+        variant="index_history.range.v1",
+        symbols=("sh.000001",),
+    ).model_copy(update={"start_date": date(2026, 8, 19), "end_date": date(2026, 8, 20)})
+    assert index_range.start_date < index_range.end_date
+
+
 def test_validate_raw_date_binding_rejects_cross_day_before_normalize() -> None:
     with pytest.raises(ValueError):
         validate_raw_date_binding(
@@ -436,11 +625,18 @@ def test_logical_request_plan_hash_excludes_observed_pages_and_completion_hash_b
     assert first.compute_hash() != second.compute_hash()
 
 
+def test_provider_raw_batch_rejects_arbitrary_completion_hash() -> None:
+    with pytest.raises(ValueError):
+        _provider_raw_batch().model_copy(update={"completion_hash": "f" * 64})
+
+
 def test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker() -> (
     None
 ):
     with pytest.raises(ValueError):
         _attempt(pages=(1, 3))
+    with pytest.raises(ValueError):
+        _attempt(pages=(1, 1))
     with pytest.raises(ValueError):
         _attempt(pages=(), terminal=True, outcome=TransportOutcome.SUCCESS)
 
@@ -493,21 +689,79 @@ def test_baostock_adapter_preserves_endpoint_and_session_contract() -> None:
     assert adapter.max_attempts == 2
 
 
+def test_baostock_adapter_uses_ordinary_incumbent_sdk_boundary_for_all_endpoints() -> None:
+    client = _CompleteSdkClient()
+    request = _provider_request(
+        plan=_full_plan(),
+        session_symbols=("sh.000001", "sh.600000"),
+    )
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    raw = adapter.fetch_raw(request)
+
+    assert [item.endpoint for item in raw.endpoint_batches] == list(ProviderEndpoint)
+    assert {call[0] for call in client.calls} == {
+        "query_trade_dates",
+        "query_all_stock",
+        "query_daily_history_k_AStock",
+        "query_daily_adjust_factor",
+        "query_adjust_factor",
+        "query_history_k_data_plus",
+    }
+    assert client.login_calls == 1
+    assert client.logout_calls == 1
+    assert raw.endpoint_batches[2].rows[0].code == "sh.600000"
+
+
+def test_baostock_adapter_rejects_cross_day_sdk_rows_before_normalization() -> None:
+    client = _CompleteSdkClient(response_date="2026-08-19")
+    request = _provider_request(
+        plan=_full_plan(),
+        session_symbols=("sh.000001", "sh.600000"),
+    )
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(ValueError, match="date"):
+        adapter.fetch_raw(request)
+
+
+def test_baostock_adapter_discards_failed_partial_page_source_rows_on_retry() -> None:
+    client = _RetryingSdkClient()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=2, min_request_interval_seconds=0)
+
+    raw = adapter.fetch_raw(_provider_request())
+
+    completion = raw.request_completions[0]
+    assert [(attempt.attempt, attempt.outcome) for attempt in completion.attempts] == [
+        (1, TransportOutcome.ERROR),
+        (2, TransportOutcome.SUCCESS),
+    ]
+    assert completion.row_count == 1
+    assert len(raw.endpoint_batches) == 1
+    assert raw.endpoint_batches[0].row_count == 1
+    assert {item.attempt for item in raw.transport_observations.observations} == {1, 2}
+    assert any(
+        item.protocol_stage is ProtocolStage.PAGINATION
+        and item.outcome is TransportOutcome.ERROR
+        and item.normalized_error is not None
+        for item in raw.transport_observations.observations
+    )
+    assert all(
+        item.observation_digest == item.compute_digest()
+        for item in raw.transport_observations.observations
+    )
+
+
 def test_baostock_adapter_captures_source_rows_before_normalization() -> None:
-    class RawClient:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def fetch_raw(self, request: ProviderRequest) -> ProviderRawBatch:
-            self.calls += 1
-            assert request.provider_id is ProviderId.BAOSTOCK
-            return _provider_raw_batch()
-
-    client = RawClient()
-    adapter = BaoStockProviderAdapter(client=client)
+    client = _CompleteSdkClient()
+    adapter = BaoStockProviderAdapter(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
     captured = adapter.fetch_raw(_provider_request())
     assert captured.endpoint_batches[0].rows[0].code == "sh.600000"
-    assert client.calls == 1
+    assert client.calls[0][0] == "query_daily_history_k_AStock"
 
 
 def test_baostock_compatibility_produces_existing_daily_bar_semantics() -> None:
@@ -537,3 +791,130 @@ def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor() -> N
     assert row.tradestatus == "0"
     assert row.volume is None
     assert row.amount is None
+
+
+def test_raw_batch_binds_lineage_endpoint_and_request_identity() -> None:
+    with pytest.raises(ValueError):
+        _batch(lineage=_lineage(endpoint=ProviderEndpoint.INDEX_HISTORY))
+
+
+def test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality() -> None:
+    with pytest.raises(ValueError):
+        _provider_raw_batch().model_copy(update={"endpoint_batches": ()})
+
+
+def test_provider_raw_batch_rejects_failed_attempt_source_rows() -> None:
+    failed = RequestCompletion(
+        plan_ordinal=0,
+        attempts=(_attempt(outcome=TransportOutcome.ERROR, pages=(), terminal=False),),
+        final_outcome=TransportOutcome.ERROR,
+        row_count=0,
+    )
+    with pytest.raises(ValueError):
+        _provider_raw_batch().model_copy(
+            update={"request_completions": (failed,), "endpoint_batches": ()}
+        )
+
+
+def test_active_daily_rows_reject_null_activity_and_suspended_rows_reject_activity() -> None:
+    with pytest.raises(ValueError):
+        DailyAStockRow(**_daily_row(volume=None))
+    with pytest.raises(ValueError):
+        DailyAStockRow(**_daily_row(tradestatus="0", volume="1", amount="0"))
+
+
+def test_factor_rows_require_finite_positive_adjustment_factors() -> None:
+    values = {
+        "endpoint": ProviderEndpoint.DAILY_FACTOR,
+        "schema_variant": "daily_factor.v1",
+        "request_role": RequestRole.DAILY_FACTOR,
+        "instrument_role": InstrumentRole.STOCK,
+        "code": "sh.600000",
+        "dividOperateDate": date(2026, 8, 20),
+        "foreAdjustFactor": Decimal("1"),
+        "backAdjustFactor": Decimal("0"),
+        "adjustFactor": Decimal("0"),
+    }
+    with pytest.raises(ValueError):
+        DailyFactorRow(**values)
+
+
+def test_index_history_rows_reject_suspended_index() -> None:
+    with pytest.raises(ValueError):
+        IndexHistorySessionRow(
+            endpoint=ProviderEndpoint.INDEX_HISTORY,
+            schema_variant="index_history.session.v1",
+            request_role=RequestRole.INDEX_HISTORY,
+            instrument_role=InstrumentRole.INDEX,
+            date=date(2026, 8, 20),
+            code="sh.000001",
+            open=1,
+            high=1,
+            low=1,
+            close=1,
+            preclose=1,
+            volume=None,
+            amount=None,
+            adjustflag="3",
+            turn=None,
+            tradestatus="0",
+            pctChg=None,
+            isST="0",
+        )
+
+
+def test_safe_relative_path_rejects_traversal_repeated_and_trailing_components() -> None:
+    for value in ("../x", "/abs", "a//b", "a/", "a/./b", "a/../b"):
+        with pytest.raises(ValueError):
+            provider_base.validate_safe_relative_path(value)
+
+
+def test_registry_versions_are_safe_and_roundtrip_revalidated() -> None:
+    registry = provider_registry()
+    assert registry.adapter_version == "r2f2.v1"
+    with pytest.raises(ValueError):
+        registry.model_copy(update={"adapter_version": "not safe version"})
+    assert type(registry).model_validate(registry.model_dump()) == registry
+
+
+def test_observation_digest_canonicalizes_observed_at_to_utc() -> None:
+    observation = TransportObservation(
+        refresh_id="refresh-1",
+        provider_session_id="session-1",
+        request_id="request-1",
+        provider_id="baostock",
+        endpoint=TransportEndpoint.DAILY_ASTOCK,
+        attempt=1,
+        page=1,
+        protocol_stage=ProtocolStage.COMPLETE,
+        elapsed_ms=20,
+        recv_calls=1,
+        response_bytes=128,
+        end_marker_seen=True,
+        outcome=TransportOutcome.SUCCESS,
+        observed_at=datetime(2026, 8, 20, 16, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    projection = TransportObservationProjection.from_observation(observation)
+    assert projection.observed_at == datetime(2026, 8, 20, 8, 0, tzinfo=UTC)
+    assert projection.observation_digest == projection.compute_digest()
+
+
+def test_provider_public_exports_are_complete() -> None:
+    exports = __import__("backend.app.market.providers", fromlist=["*"])
+    for name in (
+        "BaoStockDailyBarAdapter",
+        "BaoStockProviderAdapter",
+        "ENDPOINT_CONTRACTS",
+        "ProviderId",
+        "ProviderRawBatch",
+    ):
+        assert hasattr(exports, name), name
+
+
+def test_task8_factor_provenance_models_are_not_task7_provider_fields() -> None:
+    forbidden = {
+        "factor_cache_records",
+        "factor_resolution",
+        "factor_resolution_sha256",
+    }
+    assert not forbidden.intersection(ProviderRawBatch.model_fields)

@@ -7,6 +7,7 @@ plugin registry and it does not expose provider payloads or arbitrary mappings.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -15,6 +16,7 @@ from hashlib import sha256
 from typing import Annotated, Literal, Protocol
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -44,13 +46,34 @@ SafeVersion = Annotated[
     str,
     StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,63}$"),
 ]
+
+
+def validate_safe_relative_path(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(
+            char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-"
+            for char in value
+        )
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError("relative path is not lexically safe")
+    return value
+
+
 SafeIdentifier = Annotated[
     str,
     StringConstraints(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"),
 ]
 SafeSha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 SafeRelativePath = Annotated[
-    str, StringConstraints(min_length=1, max_length=512, pattern=r"^[A-Za-z0-9._/-]+$")
+    str,
+    StringConstraints(min_length=1, max_length=512, pattern=r"^[A-Za-z0-9._/-]+$"),
+    AfterValidator(validate_safe_relative_path),
 ]
 BoundedToken = Annotated[str, StringConstraints(max_length=64, pattern=r"^[A-Za-z0-9._:-]*$")]
 BoundedText = Annotated[str, StringConstraints(max_length=256)]
@@ -132,6 +155,16 @@ def _digest(value: object) -> str:
     return sha256(_canonical(value)).hexdigest()
 
 
+def _finite_number(value: float | Decimal | None, *, positive: bool = False) -> bool:
+    if value is None:
+        return False
+    try:
+        finite = math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return finite and (not positive or value > 0)
+
+
 class _ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -165,6 +198,14 @@ class ExpectedLogicalRequest(_ContractModel):
     def validate_call_symbols(self) -> ExpectedLogicalRequest:
         if self.start_date > self.end_date:
             raise ValueError("request date range is invalid")
+        if self.endpoint is ProviderEndpoint.ALL_STOCK and self.start_date != self.end_date:
+            raise ValueError("universe request requires one explicit date")
+        if (
+            self.endpoint is not ProviderEndpoint.TRADE_DATES
+            and self.schema_variant != "index_history.range.v1"
+            and self.start_date != self.end_date
+        ):
+            raise ValueError("session request requires one explicit date")
         if self.endpoint in {ProviderEndpoint.TRADE_DATES, ProviderEndpoint.ALL_STOCK}:
             if self.symbols:
                 raise ValueError("calendar and universe calls require empty per-call symbols")
@@ -354,6 +395,23 @@ class DailyAStockRow(RawEndpointRowBase):
     pctChg: float | Decimal | None
     isST: BoundedToken
 
+    @model_validator(mode="after")
+    def validate_daily_semantics(self) -> DailyAStockRow:
+        if not all(
+            _finite_number(value)
+            for value in (self.open, self.high, self.low, self.close, self.preclose)
+        ):
+            raise ValueError("daily OHLC values must be finite")
+        for value in (self.turn, self.pctChg):
+            if value is not None and not _finite_number(value):
+                raise ValueError("daily optional values must be finite")
+        if self.tradestatus == "1":
+            if not _finite_number(self.volume) or not _finite_number(self.amount):
+                raise ValueError("active daily rows require finite activity")
+        elif any(value is not None and value != 0 for value in (self.volume, self.amount)):
+            raise ValueError("suspended daily rows cannot contain activity")
+        return self
+
 
 class FactorFields(_ContractModel):
     code: SafeSymbol
@@ -361,6 +419,13 @@ class FactorFields(_ContractModel):
     foreAdjustFactor: float | Decimal
     backAdjustFactor: float | Decimal
     adjustFactor: float | Decimal
+
+    @field_validator("foreAdjustFactor", "backAdjustFactor", "adjustFactor")
+    @classmethod
+    def require_positive_factor(cls, value: float | Decimal) -> float | Decimal:
+        if not _finite_number(value, positive=True):
+            raise ValueError("adjustment factors must be finite and positive")
+        return value
 
 
 class DailyFactorRow(RawEndpointRowBase, FactorFields):
@@ -401,6 +466,18 @@ class IndexHistorySessionRow(RawEndpointRowBase, IndexHistoryFields):
             "sz.399001",
         }:
             raise ValueError("index role requires required index symbol")
+        if self.instrument_role is InstrumentRole.INDEX and self.tradestatus != "1":
+            raise ValueError("index rows cannot be suspended")
+        if not all(
+            _finite_number(value)
+            for value in (self.open, self.high, self.low, self.close, self.preclose)
+        ):
+            raise ValueError("index OHLC values must be finite")
+        if self.tradestatus == "1":
+            if not _finite_number(self.volume) or not _finite_number(self.amount):
+                raise ValueError("active index rows require finite activity")
+        elif any(value is not None and value != 0 for value in (self.volume, self.amount)):
+            raise ValueError("suspended index rows cannot contain activity")
         return self
 
 
@@ -580,6 +657,11 @@ class RawEndpointBatch(_ContractModel):
     def validate_contract(self) -> RawEndpointBatch:
         contract = endpoint_contract_for(self.endpoint, self.instrument_role, self.schema_variant)
         if (
+            self.lineage.endpoint is not self.endpoint
+            or self.lineage.plan_ordinal != self.plan_ordinal
+        ):
+            raise ValueError("raw endpoint lineage does not bind endpoint and plan")
+        if (
             self.request_role is not contract.request_role
             or self.fields != contract.fields
             or self.units != contract.units
@@ -592,6 +674,26 @@ class RawEndpointBatch(_ContractModel):
         for row in self.rows:
             if row.endpoint is not self.endpoint or row.schema_variant != self.schema_variant:
                 raise ValueError("mixed endpoint rows")
+        if self.endpoint is ProviderEndpoint.ALL_STOCK:
+            if not self.rows:
+                raise ValueError("universe coverage cannot be empty")
+            codes = tuple(row.code for row in self.rows)
+            if codes != tuple(sorted(set(codes))):
+                raise ValueError("universe rows must be unique and ordered")
+        elif self.endpoint in {ProviderEndpoint.DAILY_ASTOCK, ProviderEndpoint.INDEX_HISTORY}:
+            if self.instrument_role is InstrumentRole.INDEX and len(self.rows) != 1:
+                raise ValueError("index session coverage requires one row")
+            keys = tuple((row.code, row.date) for row in self.rows)
+            if len(set(keys)) != len(keys) or keys != tuple(
+                sorted(keys, key=lambda item: (item[1], item[0]))
+            ):
+                raise ValueError("daily rows must be unique and ordered")
+        elif self.endpoint in {ProviderEndpoint.DAILY_FACTOR, ProviderEndpoint.ADJUST_FACTOR}:
+            keys = tuple((row.code, row.dividOperateDate) for row in self.rows)
+            if len(set(keys)) != len(keys) or keys != tuple(
+                sorted(keys, key=lambda item: (item[1], item[0]))
+            ):
+                raise ValueError("factor rows must be unique and ordered")
         return self
 
 
@@ -664,11 +766,11 @@ class TransportObservationProjection(_ContractModel):
     @classmethod
     def from_observation(cls, observation: TransportObservation) -> TransportObservationProjection:
         values = observation.model_dump()
+        values["observed_at"] = observation.observed_at.astimezone(UTC)
         values["provider_id"] = ProviderId.BAOSTOCK
         values["endpoint"] = ProviderEndpoint(observation.endpoint.value)
-        values["observation_digest"] = _digest(
-            {**observation.model_dump(mode="json"), "provider_id": "baostock"}
-        )
+        candidate = cls.model_construct(**values, observation_digest=_EMPTY_SHA256)
+        values["observation_digest"] = candidate.compute_digest()
         return cls.model_validate(values)
 
 
@@ -694,77 +796,6 @@ class TransportObservationAggregate(_ContractModel):
         )
 
 
-class FactorCacheSnapshotRecord(_ContractModel):
-    """Exact factor-cache row projection consumed by later evidence storage."""
-
-    symbol: SafeSymbol
-    trade_date: date
-    fore_adjust_factor: Decimal
-    back_adjust_factor: Decimal | None
-    evidence_kind: BoundedToken
-    evidence_effective_date: date
-    evidence_observed_on: date | None
-    source_row_hash: SafeSha256
-    observed_at: datetime
-    row_fingerprint: SafeSha256
-
-    @field_validator("observed_at")
-    @classmethod
-    def aware(cls, value: datetime) -> datetime:
-        if value.utcoffset() is None:
-            raise ValueError("observed_at must be timezone-aware")
-        return value.astimezone(UTC)
-
-
-class FactorCacheSnapshotRecords(_ContractModel):
-    cache_schema: tuple[SafeIdentifier, ...]
-    rows: tuple[FactorCacheSnapshotRecord, ...]
-    row_count: int = Field(ge=0, le=10_000_000)
-    records_sha256: SafeSha256
-    before_fingerprint: SafeSha256
-    after_fingerprint: SafeSha256
-
-    @model_validator(mode="after")
-    def count_matches(self) -> FactorCacheSnapshotRecords:
-        if self.row_count != len(self.rows):
-            raise ValueError("factor snapshot row count mismatch")
-        return self
-
-
-class LiveFactorResolution(_ContractModel):
-    descriptor_id: SafeIdentifier
-    object_sha256: SafeSha256
-    endpoint: Literal[ProviderEndpoint.DAILY_FACTOR, ProviderEndpoint.ADJUST_FACTOR]
-    row_key: SafeIdentifier
-    schema_variant: SafeVersion
-
-
-class CacheFactorResolution(_ContractModel):
-    cache_object_id: SafeIdentifier
-    cache_object_sha256: SafeSha256
-    record_key: SafeIdentifier
-
-
-class FactorResolutionBinding(_ContractModel):
-    plan_ordinal: int = Field(ge=0, le=4096)
-    symbol: SafeSymbol
-    trade_date: date
-    selected_kind: Literal["factor_cache_snapshot", "daily_factor", "adjust_factor"]
-    selected_value_semantic_hash: SafeSha256
-    live: LiveFactorResolution | None = None
-    cache: CacheFactorResolution | None = None
-    resolution_sha256: SafeSha256
-
-    @model_validator(mode="after")
-    def require_one_source(self) -> FactorResolutionBinding:
-        if self.selected_kind == "factor_cache_snapshot":
-            if self.cache is None or self.live is not None:
-                raise ValueError("cache factor resolution requires cache only")
-        elif self.live is None or self.cache is not None:
-            raise ValueError("live factor resolution requires live only")
-        return self
-
-
 class ProviderRawBatch(_ContractModel):
     provider_id: ProviderId
     request: ProviderRequest
@@ -781,9 +812,6 @@ class ProviderRawBatch(_ContractModel):
     transport_lineage: tuple[TransportLineageRef, ...]
     transport_observations: TransportObservationAggregate
     endpoint_summaries: tuple[EndpointContractSummary, ...]
-    factor_resolution: tuple[FactorResolutionBinding, ...] = ()
-    factor_resolution_sha256: SafeSha256 = _EMPTY_SHA256
-    factor_cache_records: FactorCacheSnapshotRecords | None = None
     failure_class: SafeFailureClass | None = None
 
     @model_validator(mode="after")
@@ -796,8 +824,88 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw batch completion precedes start")
         if self.normalization_clock_utc < self.completed_at:
             raise ValueError("normalization clock precedes completion")
-        if len(self.request_completions) != self.logical_request_plan.request_count:
+        expected_ordinals = tuple(range(self.logical_request_plan.request_count))
+        if tuple(item.plan_ordinal for item in self.request_completions) != expected_ordinals:
             raise ValueError("raw batch completion cardinality mismatch")
+        successful = {
+            item.plan_ordinal: item
+            for item in self.request_completions
+            if item.final_outcome is TransportOutcome.SUCCESS
+        }
+        if tuple(item.plan_ordinal for item in self.endpoint_batches) != tuple(successful):
+            raise ValueError("raw endpoint batch cardinality mismatch")
+        batches = {item.plan_ordinal: item for item in self.endpoint_batches}
+        if len(self.endpoint_summaries) != len(self.endpoint_batches):
+            raise ValueError("raw endpoint summary cardinality mismatch")
+
+        def summary_key(item: RawEndpointBatch | EndpointContractSummary):
+            return (
+                str(item.endpoint),
+                str(item.request_role),
+                "" if item.instrument_role is None else str(item.instrument_role),
+                str(item.schema_variant),
+                item.row_count,
+            )
+
+        batch_summary_keys = sorted(summary_key(item) for item in self.endpoint_batches)
+        summary_keys = sorted(summary_key(item) for item in self.endpoint_summaries)
+        if batch_summary_keys != summary_keys:
+            raise ValueError("raw endpoint summaries do not bind source batches")
+        if any(
+            item.row_count != batches[item.plan_ordinal].row_count for item in successful.values()
+        ):
+            raise ValueError("successful completion row count mismatch")
+        for completion in self.request_completions:
+            batch = batches.get(completion.plan_ordinal)
+            if completion.final_outcome is TransportOutcome.ERROR:
+                if completion.row_count != 0 or batch is not None:
+                    raise ValueError("failed completion cannot persist source rows")
+                continue
+            if batch is None or completion.successful_request_id is None:
+                raise ValueError("successful completion requires source batch")
+            lineage = batch.lineage
+            if (
+                lineage.plan_ordinal != completion.plan_ordinal
+                or lineage.request_id != completion.successful_request_id
+                or lineage.attempt != completion.successful_attempt
+                or lineage.endpoint != batch.endpoint
+            ):
+                raise ValueError("source batch lineage does not bind completion")
+        lineage_keys = sorted(
+            (
+                (
+                    item.refresh_id,
+                    item.provider_session_id,
+                    item.request_id,
+                    item.endpoint,
+                    item.attempt,
+                    item.page,
+                ),
+                item.observation_digest,
+            )
+            for item in self.transport_lineage
+        )
+        projection_keys = sorted(
+            (
+                (
+                    item.refresh_id,
+                    item.provider_session_id,
+                    item.request_id,
+                    item.endpoint,
+                    item.attempt,
+                    item.page,
+                ),
+                item.observation_digest,
+            )
+            for item in self.transport_observations.observations
+        )
+        if lineage_keys != projection_keys:
+            raise ValueError("transport lineage and observations do not join exactly")
+        expected_completion_hash = _digest(
+            [item.model_dump(mode="json") for item in self.request_completions]
+        )
+        if self.completion_hash != expected_completion_hash:
+            raise ValueError("completion hash mismatch")
         return self
 
     @field_validator("started_at", "completed_at", "normalization_clock_utc")
@@ -828,8 +936,8 @@ def provider_registry(provider_id: str | SafeProviderId | None = None):
 
 class _ProviderRegistry(_ContractModel):
     provider_id: ProviderId = ProviderId.BAOSTOCK
-    adapter_version: str = "r2f2.v1"
-    endpoint_contract_version: str = "r2f2-endpoints.v1"
+    adapter_version: SafeVersion = "r2f2.v1"
+    endpoint_contract_version: SafeVersion = "r2f2-endpoints.v1"
     date_semantics: Literal["explicit_trade_date"] = "explicit_trade_date"
     volume_unit: Literal["shares"] = "shares"
     amount_unit: Literal["CNY"] = "CNY"
@@ -845,17 +953,56 @@ def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch)
         or batch.lineage.provider_session_id != request.provider_session_id
     ):
         raise ValueError("raw lineage does not match request")
+    logical = next(
+        (item for item in request.request_plan.requests if item.plan_ordinal == batch.plan_ordinal),
+        None,
+    )
+    if logical is None or logical.endpoint is not batch.endpoint:
+        raise ValueError("raw batch does not bind to request plan")
+    if (
+        logical.schema_variant != batch.schema_variant
+        or logical.request_role is not batch.request_role
+    ):
+        raise ValueError("raw batch role or schema does not bind to request plan")
+    expected_symbols = set(logical.symbols)
+    seen_symbols: set[str] = set()
     for row in batch.rows:
         row_date = getattr(row, "date", getattr(row, "calendar_date", None))
-        if row_date is not None and not (request.trade_date == row_date):
-            raise ValueError("raw row date does not match requested trade date")
+        if row_date is not None:
+            if batch.endpoint is ProviderEndpoint.TRADE_DATES:
+                if not (logical.start_date <= row_date <= logical.end_date):
+                    raise ValueError("calendar row date is outside requested range")
+            elif batch.schema_variant.endswith(".session.v1") or batch.endpoint in {
+                ProviderEndpoint.ALL_STOCK,
+                ProviderEndpoint.DAILY_ASTOCK,
+                ProviderEndpoint.DAILY_FACTOR,
+            }:
+                if request.trade_date != row_date:
+                    raise ValueError("raw row date does not match requested trade date")
+            elif not (logical.start_date <= row_date <= logical.end_date):
+                raise ValueError("raw row date is outside requested range")
         effective = getattr(row, "dividOperateDate", None)
         if effective is not None and effective > request.trade_date:
             raise ValueError("factor effective date is after requested trade date")
         code = getattr(row, "code", None)
-        if code is not None and batch.endpoint not in {
-            ProviderEndpoint.ALL_STOCK,
-            ProviderEndpoint.TRADE_DATES,
-        }:
-            if code not in request.session_symbols:
-                raise ValueError("raw row symbol is outside requested session symbols")
+        if code is None:
+            continue
+        if batch.endpoint is ProviderEndpoint.ALL_STOCK:
+            if code.startswith(("sh.000", "sz.399")):
+                raise ValueError("universe rows cannot satisfy index coverage")
+            continue
+        if code not in request.session_symbols:
+            raise ValueError("raw row symbol is outside requested session symbols")
+        if logical.instrument_role is InstrumentRole.INDEX:
+            if code not in {"sh.000001", "sz.399001"}:
+                raise ValueError("index request contains a stock symbol")
+        elif code in {"sh.000001", "sz.399001"}:
+            raise ValueError("stock request contains an index symbol")
+        seen_symbols.add(code)
+    if batch.endpoint in {
+        ProviderEndpoint.DAILY_ASTOCK,
+        ProviderEndpoint.DAILY_FACTOR,
+        ProviderEndpoint.INDEX_HISTORY,
+    }:
+        if seen_symbols != expected_symbols:
+            raise ValueError("raw batch does not provide required symbol coverage")
