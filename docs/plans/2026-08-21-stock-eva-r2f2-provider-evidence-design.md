@@ -2,13 +2,13 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** In Review — second-round specification findings reconciled; independent re-review required
+**Status:** In Review — third-round contract reconciliation recorded; independent re-review required
 **Decision authority:** User approved starting R2-F2 on 2026-08-21; implementation still requires
   this specification to be independently reviewed and approved.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`4e561367c6b6a5d0aaa3219ec78d730a929fd3f7`
-**Reviewers:** Independent second-round code/spec review found nine Medium specification gaps;
+`70f7ed3c6739566d20d5ae7ba6895d65676a8033`
+**Reviewers:** Independent third-round code/spec review found eight Medium/Low contract gaps;
 this amendment reconciles them for re-review. Status MUST NOT be changed to Approved by this fix.
 
 **Related documents:**
@@ -27,8 +27,10 @@ provider, automatic failover, production refresh, installation, NAS access or La
 ## Specification review closure (authoritative amendment before RED)
 
 The first independent review was correctly **NO-GO**. The second-round Medium findings were
-specification gaps, not permission to narrow the product boundary. Their confirmed root causes and
-closures are:
+specification gaps, not permission to narrow the product boundary. The third-round review then
+found field-name drift, stale umbrella pseudo-contracts, an inaccurate factor-cache projection,
+incomplete attempt/request cardinality, an unenforced endpoint constant, an over-claimed date gate
+and lexical-only path safety. Their confirmed root causes and closures are:
 
 | Finding | Confirmed root cause | Normative closure in this revision |
 | --- | --- | --- |
@@ -41,6 +43,11 @@ closures are:
 | M7 — factor provenance was not self-contained | The mutable `AdjustmentFactorCache` call chain was treated as if the live cache were replayable evidence and factor data was conflated with a provider endpoint. | Add `EvidenceObjectKind.factor_cache_snapshot`, capture only actually-read keys and safe provenance under `RefreshRunLock`, fingerprint before/after, and make online/replay normalization consume only the published snapshot. |
 | M8 — requirement/file traceability was incomplete | FR-28–33, NFR-15–18, AC-16–20 and EC-21–26 were absent or attached to the wrong task; Task 9 also owned the same model file as Task 7. | Add complete numbered traceability and tests, move selection tests to Task 9, give Task 9 a single `market/candidates.py` model owner, and keep Task 7/8 whitelists disjoint. |
 | M9 — stale contract tokens remained | The documents still contained an eleven-gate claim, extra refresh locks and a public replay start-time field, so structural review could not prove closure. | Remove every stale token and run strict design validation, full token/number audit and `git diff --check` before re-review. |
+| M10 — model/table names drifted | The frozen models and field tables used `report_id`/`gate_report_id`, `aggregate_verdict`/`verdict` and `evidence_manifest_sha256`/`evidence_sha256` for the same values. | Use one authoritative name in every model, table, hash rule, test and implementation reference: `gate_report_id`, `verdict` and `evidence_sha256`. |
+| M11 — umbrella plan retained stale pseudo-contracts | The umbrella Task 7–9 section duplicated old `dict` rows, open provider strings and obsolete selection fields. | Replace the section with a high-level roadmap summary and state that the dedicated design and implementation plan are the only contract authorities. |
+| M12 — factor snapshot invented fields | The proposed snapshot row contained `source`, cache version and factor values not present in the current `factor_snapshots` table. | Define `FactorCacheSnapshotRecord` from the current nine table columns only; add a strict read-only `exact_snapshot_records()` API under Task 8 with before/after fingerprints and no schema migration. |
+| M13 — factor resolution/cardinality incomplete | Resolution did not discriminate live/cache provenance, and completion did not represent retries, request IDs or final outcome. | Add mutually exclusive live/cache bindings and `AttemptCompletion`/`RequestCompletion`; bind every page descriptor and resolution hash into the manifest/candidate. |
+| M14 — endpoint/date/path validators were declarative only | Tables described variants, but no authoritative endpoint constant, pre-normalize date binding or semantic relative-path/storage boundary was frozen. | Add `ENDPOINT_CONTRACTS`, `validate_raw_date_binding(request,batch)`, and lexical plus dirfd/O_NOFOLLOW containment rules with model-copy regressions. |
 
 The amendment is still documentation-only. No RED test, provider request, external operation or
 production mutation may begin until the next independent review changes this document to
@@ -212,18 +219,22 @@ automatic failover may be used to close that gap.
   scheduling, 20-session observation, reconciliation against a second source and failover are
   explicitly deferred to R2-F3/F4.
 - FR-28: **Frozen type closure:** The implementation MUST expose the complete `SafeProviderId`,
-  `SafeSymbol`, `SafeVersion`, `ProviderEndpoint`, `ProviderRequest`, `TransportLineageRef`,
-  discriminated raw-row/batch, evidence, gate, candidate, selection and replay models with
+  `SafeSymbol`, `SafeVersion`, `SafeRelativePath`, `ProviderEndpoint`, `ProviderRequest`,
+  `TransportLineageRef`, `FactorCacheSnapshotRecord`, discriminated raw-row/batch, evidence, gate,
+  candidate, selection and replay models with
   immutable `extra="forbid"` validation. Any missing/extra/duplicate field MUST fail closed.
 - FR-29: **Exact endpoint schema closure:** Each of the six endpoint IDs MUST use one of the
-  explicitly named request/schema variants and exact ordered field tuples in this specification;
+  explicitly named `ENDPOINT_CONTRACTS` request/schema/role variants and exact ordered field tuples
+  in this specification;
   an unobserved field, inferred unit, unknown null rule or unclassified same-endpoint variant MUST
   invalidate the complete batch.
 - FR-30: **Request-plan cardinality:** Every logical request and symbol/index shard MUST have one
   ordered `ExpectedLogicalRequest`; execution MUST produce exactly one `RequestCompletion` with
-  contiguous observed pages and a terminal/end marker, and each observed page MUST have exactly one
-  object descriptor and transport-lineage record. The logical request-plan hash and completion hash
-  MUST be verified before evidence, candidate or selection publication; no page total is guessed.
+  ordered `AttemptCompletion` records, fresh request IDs per attempt, contiguous observed pages and
+  one final outcome. Each observed page MUST have exactly one descriptor carrying
+  `plan_ordinal/attempt/request_id/page/object_kind` and one joinable transport-lineage record.
+  The logical request-plan hash and completion hash MUST be verified before evidence, candidate or
+  selection publication; no page total is guessed.
 - FR-31: **Transport binding:** Every published object MUST bind refresh/session/request/endpoint/
   attempt/page to a SHA-256 digest of the sanitized F0.1 observation projection. Payload, URL,
   token, header, cookie and raw provider exception/message MUST remain impossible to persist.
@@ -308,6 +319,11 @@ class EvidenceStore(Protocol):
     def replay(
         self, evidence_id: SafeIdentifier, *, compare_candidate_sha: SafeSha256 | None = None
     ) -> ReplayResult: ...
+
+class FactorSnapshotReader(Protocol):
+    def exact_snapshot_records(
+        self, symbols: Sequence[SafeSymbol], trade_date: date
+    ) -> tuple[FactorCacheSnapshotRecord, ...]: ...
 ```
 
 `fetch_raw` MUST return all six endpoint variants required by the exact request plan or a complete
@@ -315,6 +331,14 @@ sanitized failure; it MUST NOT return a partial batch marked successful. `normal
 only a descriptor/fingerprint/hash-verified `PublishedEvidence` reader and the already-frozen
 `normalization_clock_utc`; a live SDK result is not a valid argument. `EvidenceStore` is a local
 writer/reader boundary and never a network client.
+
+`exact_snapshot_records` MUST execute one explicit read-only `SELECT` over the existing
+`factor_snapshots` columns, return only requested `(symbol, trade_date)` rows in deterministic
+symbol order, compute `row_fingerprint` from the exact returned values, and never call
+`_initialize`, `CREATE`, `ALTER`, `INSERT`, `UPDATE`, `DELETE` or `exact_snapshots` as a proxy.
+The caller computes a selected-key fingerprint before and after online capture while holding the
+existing refresh lock; any changed row, schema/column mismatch or missing requested key fails
+closed. The method is not a cache writer and is not used by read-only GET/plan/replay paths.
 
 CLI contract:
 
@@ -501,7 +525,7 @@ R2F2_GATE_ORDER: tuple[GateName, ...] = (
 R2F2_GATE_EVIDENCE: tuple[tuple[GateName, str, str], ...] = (
     (GateName.TRANSPORT_COMPLETE, "F0.1 TransportObservationProjection", "BaoStockProvider._read / provider transport observation collector"),
     (GateName.SCHEMA, "RawEndpointBatch", "providers.base exact discriminated endpoint/schema validator"),
-    (GateName.DATE, "normalize_baostock_rows", "normalize_baostock_rows date and adjustflag checks"),
+    (GateName.DATE, "validate_raw_date_binding(request, batch) + publication identity", "R2-F2 adapter/evidence requested-date binding followed by existing publication requested_date/session identity gate; normalize.py is not changed and is not claimed to validate the requested date"),
     (GateName.UNIVERSE, "_publication_issues", "backend.app.market.automation._publication_issues expected/required symbols and indexes"),
     (GateName.COVERAGE, "run_publication_refresh", "backend.app.market.automation.run_publication_refresh coverage == 1"),
     (GateName.SEMANTIC, "normalize_baostock_rows + publication_bar_quality_issue", "existing normalized DailyBar and MarketStore quality contract"),
@@ -515,9 +539,16 @@ R2F2_GATE_EVIDENCE: tuple[tuple[GateName, str, str], ...] = (
 `SafeProviderId` is the lexical safety type; the R2-F2 registry additionally requires the value
 to be exactly `ProviderId.BAOSTOCK`. `SafeSymbol` is lowercase and must be sorted lexicographically
 in every tuple. `SafeVersion` identifies a pinned code/schema contract, not a package URL. A
-`SafeRelativePath` is resolved only beneath its already-opened root descriptor; lexical validation
-alone is never treated as a TOCTOU defense. No persisted model may contain a URL, credential,
-token, header, cookie, payload, absolute path or arbitrary exception/message field.
+`SafeRelativePath` is a semantic type, not a regex-only string. Its model validator MUST reject an
+empty value, `.`, `..`, an absolute POSIX path, a leading separator, a backslash, NUL, a repeated
+or trailing separator, and any component equal to `.` or `..`; it MUST also reject a value whose
+`PurePosixPath` resolution escapes the already-opened evidence-root descriptor. Construction and
+`model_copy(update=...)`/round-trip tests exercise these rules. Storage MUST then open the root and
+every ancestor with `dirfd` + `O_DIRECTORY|O_NOFOLLOW`, verify `(st_dev, st_ino, mode)` before and
+after use, open the final object relative to that descriptor, and enforce descriptor containment.
+A lexical pass is never sufficient TOCTOU protection and a caller-supplied resolved path is never
+accepted. No persisted model may contain a URL, credential, token, header, cookie, payload,
+absolute path or arbitrary exception/message field.
 
 ### Frozen in-memory contracts
 
@@ -543,6 +574,7 @@ class TransportLineageRef(BaseModel):
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
     endpoint: ProviderEndpoint
+    plan_ordinal: int = Field(ge=0, le=4096)
     attempt: int = Field(ge=1, le=20)
     page: int = Field(ge=1, le=16384)
     observation_digest: SafeSha256
@@ -634,6 +666,108 @@ RawEndpointRow = Annotated[
     Field(discriminator="schema_variant"),
 ]
 
+class PaginationPolicy(StrEnum):
+    PROVIDER_TERMINAL = "provider_terminal"
+
+class EndpointContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    endpoint: ProviderEndpoint
+    request_role: RequestRole
+    instrument_role: InstrumentRole | None
+    schema_variant: SafeVersion
+    fields: tuple[SafeIdentifier, ...]
+    units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
+    date_semantics: Literal["explicit_trade_date"]
+    pagination_policy: PaginationPolicy
+
+# This is the one authoritative endpoint/schema/role table. RawEndpointBatch,
+# EndpointContractSummary and every object descriptor MUST equal the selected
+# entry byte-for-byte for fields, units, date semantics and pagination policy.
+ENDPOINT_CONTRACTS: tuple[EndpointContract, ...] = (
+    EndpointContract(
+        endpoint=ProviderEndpoint.TRADE_DATES, request_role=RequestRole.CALENDAR,
+        instrument_role=None, schema_variant="trade_dates.v1",
+        fields=("calendar_date", "is_trading_day"), units=(),
+        date_semantics="explicit_trade_date", pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.ALL_STOCK, request_role=RequestRole.UNIVERSE,
+        instrument_role=InstrumentRole.STOCK, schema_variant="all_stock.market.v1",
+        fields=("code", "tradeStatus", "code_name"), units=(),
+        date_semantics="explicit_trade_date", pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.DAILY_ASTOCK, request_role=RequestRole.DAILY_STOCK,
+        instrument_role=InstrumentRole.STOCK, schema_variant="daily_astock.v1",
+        fields=("date", "code", "open", "high", "low", "close", "preclose", "volume",
+                "amount", "adjustflag", "turn", "tradestatus", "pctChg", "isST"),
+        units=(("volume", "shares"), ("amount", "CNY"), ("turn", "percent"),
+               ("pctChg", "percent")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.DAILY_FACTOR, request_role=RequestRole.DAILY_FACTOR,
+        instrument_role=InstrumentRole.STOCK, schema_variant="daily_factor.v1",
+        fields=("code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"),
+        units=(("foreAdjustFactor", "dimensionless"), ("backAdjustFactor", "dimensionless"),
+               ("adjustFactor", "dimensionless")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.ADJUST_FACTOR, request_role=RequestRole.ADJUST_FACTOR,
+        instrument_role=InstrumentRole.STOCK, schema_variant="adjust_factor.session.v1",
+        fields=("code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"),
+        units=(("foreAdjustFactor", "dimensionless"), ("backAdjustFactor", "dimensionless"),
+               ("adjustFactor", "dimensionless")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    # INDEX_HISTORY has the same ordered source fields for both real call roles
+    # (the incumbent provider fetches required indexes and explicit stock symbols).
+    EndpointContract(
+        endpoint=ProviderEndpoint.INDEX_HISTORY, request_role=RequestRole.INDEX_HISTORY,
+        instrument_role=InstrumentRole.INDEX, schema_variant="index_history.session.v1",
+        fields=("date", "code", "open", "high", "low", "close", "preclose", "volume",
+                "amount", "adjustflag", "turn", "tradestatus", "pctChg", "isST"),
+        units=(("volume", "shares"), ("amount", "CNY"), ("turn", "percent"),
+               ("pctChg", "percent")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.INDEX_HISTORY, request_role=RequestRole.INDEX_HISTORY,
+        instrument_role=InstrumentRole.INDEX, schema_variant="index_history.range.v1",
+        fields=("date", "code", "open", "high", "low", "close", "preclose", "volume",
+                "amount", "adjustflag", "turn", "tradestatus", "pctChg", "isST"),
+        units=(("volume", "shares"), ("amount", "CNY"), ("turn", "percent"),
+               ("pctChg", "percent")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.INDEX_HISTORY, request_role=RequestRole.INDEX_HISTORY,
+        instrument_role=InstrumentRole.STOCK, schema_variant="index_history.session.v1",
+        fields=("date", "code", "open", "high", "low", "close", "preclose", "volume",
+                "amount", "adjustflag", "turn", "tradestatus", "pctChg", "isST"),
+        units=(("volume", "shares"), ("amount", "CNY"), ("turn", "percent"),
+               ("pctChg", "percent")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+    EndpointContract(
+        endpoint=ProviderEndpoint.INDEX_HISTORY, request_role=RequestRole.INDEX_HISTORY,
+        instrument_role=InstrumentRole.STOCK, schema_variant="index_history.range.v1",
+        fields=("date", "code", "open", "high", "low", "close", "preclose", "volume",
+                "amount", "adjustflag", "turn", "tradestatus", "pctChg", "isST"),
+        units=(("volume", "shares"), ("amount", "CNY"), ("turn", "percent"),
+               ("pctChg", "percent")), date_semantics="explicit_trade_date",
+        pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+    ),
+)
+
+`ENDPOINT_CONTRACTS[(endpoint, instrument_role, schema_variant)]` is the sole authority for the
+six endpoint IDs and their stock/index variants. `endpoint_contract_for(...)` MUST reject a missing
+or duplicate key, and `RawEndpointBatch`, `EndpointContractSummary`, `EvidenceObjectDescriptor`
+and their `model_copy()`/round-trip forms MUST be revalidated against the constant. A wrong
+endpoint/role/schema combination, changed ordered field tuple, changed units, date semantics or
+pagination policy is a complete batch failure before any evidence write.
+
 class RawEndpointBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     endpoint: ProviderEndpoint
@@ -646,8 +780,10 @@ class RawEndpointBatch(BaseModel):
     rows: tuple[RawEndpointRow, ...]
     row_count: int = Field(ge=0, le=10_000_000)
     source_schema: SafeVersion
+    fields: tuple[SafeIdentifier, ...]
     units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
     date_semantics: Literal["explicit_trade_date"]
+    pagination_policy: PaginationPolicy
     provider_row_order_digest: SafeSha256
 
 class EndpointContractSummary(BaseModel):
@@ -657,41 +793,71 @@ class EndpointContractSummary(BaseModel):
     instrument_role: InstrumentRole | None
     schema_variant: SafeVersion
     source_schema: SafeVersion
+    fields: tuple[SafeIdentifier, ...]
     units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
     date_semantics: Literal["explicit_trade_date"]
+    pagination_policy: PaginationPolicy
     batch_count: int = Field(ge=1, le=4096)
     row_count: int = Field(ge=0, le=10_000_000)
 
-class FactorCacheSnapshotRow(BaseModel):
+class FactorCacheSnapshotRecord(BaseModel):
+    """The exact current factor_snapshots table row; no inferred fields."""
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     symbol: SafeSymbol
     trade_date: date
     fore_adjust_factor: Decimal
-    back_adjust_factor: Decimal
-    adjust_factor: Decimal | None
-    source: Literal["daily_event", "daily_carry", "bootstrap", "bootstrap_no_events"]
+    back_adjust_factor: Decimal | None
+    evidence_kind: BoundedToken
     evidence_effective_date: date
-    evidence_observed_on: date
-    cache_schema_version: SafeVersion
-    provenance_hash: SafeSha256
+    evidence_observed_on: date | None
+    source_row_hash: SafeSha256
+    observed_at: datetime
+    row_fingerprint: SafeSha256
+
+class LiveFactorResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    descriptor_id: SafeIdentifier
+    object_sha256: SafeSha256
+    endpoint: Literal[ProviderEndpoint.DAILY_FACTOR, ProviderEndpoint.ADJUST_FACTOR]
+    row_key: SafeIdentifier
+    schema_variant: SafeVersion
+
+class CacheFactorResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    descriptor_id: SafeIdentifier
+    object_sha256: SafeSha256
+    record_key: SafeIdentifier
+    cache_schema: tuple[SafeIdentifier, ...]
 
 class FactorResolutionBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    plan_ordinal: int = Field(ge=0, le=4096)
     symbol: SafeSymbol
     trade_date: date
     selected_kind: Literal["factor_cache_snapshot", "daily_factor", "adjust_factor"]
-    selected_provenance_hash: SafeSha256
-    raw_endpoint_lineage: TransportLineageRef | None
+    selected_value_semantic_hash: SafeSha256
+    live: LiveFactorResolution | None = None
+    cache: CacheFactorResolution | None = None
+    resolution_sha256: SafeSha256
+
+    @model_validator(mode="after")
+    def require_selected_resolution(self) -> "FactorResolutionBinding":
+        if self.selected_kind == "factor_cache_snapshot":
+            if self.cache is None or self.live is not None:
+                raise ValueError("cache factor resolution requires cache only")
+        elif self.live is None or self.cache is not None:
+            raise ValueError("live factor resolution requires live only")
+        return self
 
 class FactorCacheSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     object_kind: Literal["factor_cache_snapshot"]
-    cache_schema_version: SafeVersion
-    rows: tuple[FactorCacheSnapshotRow, ...]
+    cache_schema: tuple[SafeIdentifier, ...]
+    rows: tuple[FactorCacheSnapshotRecord, ...]
     row_count: int = Field(ge=0, le=10_000_000)
     before_fingerprint: SafeSha256
     after_fingerprint: SafeSha256
-    provenance_hash: SafeSha256
+    snapshot_sha256: SafeSha256
 
 class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -712,6 +878,7 @@ class ProviderRawBatch(BaseModel):
     endpoint_summaries: tuple[EndpointContractSummary, ...]
     factor_cache_snapshot: FactorCacheSnapshot | None
     factor_resolution: tuple[FactorResolutionBinding, ...]
+    factor_resolution_sha256: SafeSha256
     failure_class: SafeFailureClass | None = None
 
 class EvidenceObjectDescriptor(BaseModel):
@@ -723,7 +890,6 @@ class EvidenceObjectDescriptor(BaseModel):
     schema_hash: SafeSha256
     row_count: int = Field(ge=0, le=10_000_000)
     byte_count: int = Field(ge=0, le=67_108_864)
-    units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
     provider_id: Literal["baostock"]
     universe_id: SafeIdentifier
     refresh_id: SafeIdentifier
@@ -733,14 +899,17 @@ class EvidenceObjectDescriptor(BaseModel):
     request_role: RequestRole | None
     instrument_role: InstrumentRole | None
     shard_id: SafeIdentifier | None
+    plan_ordinal: int | None = Field(default=None, ge=0, le=4096)
     attempt: int | None = Field(default=None, ge=1, le=20)
     page: int | None = Field(default=None, ge=1, le=16_384)
+    fields: tuple[SafeIdentifier, ...]
     adapter_version: SafeVersion
     endpoint_contract_version: SafeVersion
     schema_variant: SafeVersion
     source_schema: SafeVersion
     units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
     date_semantics: Literal["explicit_trade_date"]
+    pagination_policy: PaginationPolicy
     normalization_clock_utc: datetime
     transport_observation_digest: SafeSha256 | None
     factor_snapshot_provenance_hash: SafeSha256 | None
@@ -766,6 +935,7 @@ class EvidenceManifest(BaseModel):
     endpoint_summaries: tuple[EndpointContractSummary, ...]
     factor_cache_snapshot: FactorCacheSnapshot | None
     factor_resolution: tuple[FactorResolutionBinding, ...]
+    factor_resolution_sha256: SafeSha256
     request_count: int = Field(ge=1, le=4096)
     attempt_count: int = Field(ge=1, le=20_000)
     failure_class: SafeFailureClass | None = None
@@ -790,11 +960,11 @@ class GateOutcome(BaseModel):
 
 class CandidateGateReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    report_id: SafeIdentifier
+    gate_report_id: SafeIdentifier
     candidate_id: SafeIdentifier
     gate_version: SafeVersion
     outcomes: tuple[GateOutcome, ...]  # exactly R2F2_GATE_ORDER, no missing/extra/duplicate
-    aggregate_verdict: Literal["pass", "fail"]
+    verdict: Literal["pass", "fail"]
     aggregate_sha256: SafeSha256
     created_at: datetime
 
@@ -805,11 +975,12 @@ class CandidateManifest(BaseModel):
     universe_id: SafeIdentifier
     provider_id: Literal["baostock"]
     evidence_id: SafeIdentifier
-    evidence_manifest_sha256: SafeSha256
+    evidence_sha256: SafeSha256
     normalized_object_relative_path: SafeRelativePath
     normalized_object_sha256: SafeSha256
     gate_report_relative_path: SafeRelativePath
     gate_report_sha256: SafeSha256
+    factor_resolution_sha256: SafeSha256
     adapter_version: SafeVersion
     source_schema_version: SafeVersion
     row_count: int = Field(ge=0, le=10_000_000)
@@ -826,7 +997,7 @@ class SessionSelection(BaseModel):
     selected_provider_id: Literal["baostock"]
     reason: SelectionReason
     fallback_from: Literal["baostock"] | None
-    evidence_manifest_sha256: SafeSha256
+    evidence_sha256: SafeSha256
     candidate_manifest_sha256: SafeSha256
     gate_report_sha256: SafeSha256
     selected_at: datetime
@@ -846,11 +1017,13 @@ class ReplayResult(BaseModel):
     failure_class: SafeFailureClass | None
 ```
 
-`EvidenceObjectDescriptor` has a closed kind validator: `raw_endpoint_page` requires a non-null
-endpoint/request role/shard, attempt/page and `transport_observation_digest`, while
-`factor_cache_snapshot` requires a null endpoint/request role/shard/attempt/page and transport
-digest plus a non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an evidence
-object kind, never a seventh provider endpoint, and cannot masquerade as a transport page.
+`EvidenceObjectDescriptor` has a closed kind validator. A `raw_endpoint_page` requires non-null
+endpoint/request role/instrument role/shard/plan ordinal, attempt, page, ordered `fields`/`units`,
+`pagination_policy` and `transport_observation_digest`; its request ID and all cardinality fields
+must join one `AttemptCompletion`. A `factor_cache_snapshot` requires a null endpoint/request
+role/instrument role/shard/plan ordinal/attempt/page and transport digest, but retains the capture
+request ID and requires a non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an
+evidence object kind, never a seventh provider endpoint, and cannot masquerade as a transport page.
 
 `SafeFailureClass` is an existing allowlist (`MarketFailureClass`, `NormalizedTransportError` and
 the explicit `EVIDENCE_*`/`REPLAY_*` public categories); it is not a free-form string. All datetime
@@ -877,15 +1050,32 @@ The implementation keeps model ownership disjoint between tasks:
 The frozen contract listing is normative regardless of module placement; a task may not duplicate
 or redefine a model in another module.
 
+### Model ↔ persisted-field audit (third-round closure)
+
+The following manual diff is the review authority for persisted field names. The implementation
+review MUST repeat this comparison from the actual models and SQL/JSON serializers; a validator
+score cannot substitute for it.
+
+| Model | Persisted projection / source | Field-diff result |
+| --- | --- | --- |
+| `RawEndpointBatch` / `EndpointContractSummary` | `ENDPOINT_CONTRACTS` | `endpoint`, role, variant, ordered `fields`, `source_schema`, exact `units`, `date_semantics` and `pagination_policy` all present; no hidden summary field. |
+| `FactorCacheSnapshotRecord` | Existing `factor_snapshots` SQL table | Exact nine current columns only, plus derived `row_fingerprint`; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. |
+| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. |
+| `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash; no `evidence_manifest_sha256` alias. |
+| `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict`, `aggregate_sha256` are the only report identity/verdict/hash names; no `report_id` or `aggregate_verdict` alias. |
+| `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | `evidence_sha256` is the single evidence hash name; candidate also carries `factor_resolution_sha256`. |
+| `ReplayResult` | CLI/public projection | Frozen normalization clock only; no invocation/start-time field. |
+
+The global token audit MUST return zero stale aliases (`report_id` as a field,
+`aggregate_verdict`, `evidence_manifest_sha256`, `expected_total_pages`, `reconciliation_id`) in
+the dedicated design/implementation documents and the R2-F2 section of the umbrella plan.
+
 The logical request plan and post-fetch completion are separate frozen contracts:
 
 ```python
-class PaginationPolicy(StrEnum):
-    PROVIDER_TERMINAL = "provider_terminal"
-
 class ExpectedLogicalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    ordinal: int = Field(ge=0, le=4096)
+    plan_ordinal: int = Field(ge=0, le=4096)
     endpoint: ProviderEndpoint
     request_role: RequestRole
     instrument_role: InstrumentRole | None
@@ -902,24 +1092,39 @@ class ExpectedLogicalRequestPlan(BaseModel):
     request_count: int = Field(ge=1, le=4096)
     request_plan_hash: SafeSha256
 
+class AttemptCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    plan_ordinal: int = Field(ge=0, le=4096)
+    attempt: int = Field(ge=1, le=20)
+    request_id: SafeIdentifier
+    observed_pages: tuple[int, ...]  # empty only when no page was received; otherwise contiguous
+    terminal: bool
+    outcome: TransportOutcome
+
 class RequestCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    logical_ordinal: int = Field(ge=0, le=4096)
-    observed_pages: tuple[int, ...]  # non-empty, sorted, contiguous, unique
-    terminal_page: int = Field(ge=1, le=16_384)
-    end_marker_seen: bool
+    plan_ordinal: int = Field(ge=0, le=4096)
+    attempts: tuple[AttemptCompletion, ...]  # ordered by attempt, unique request IDs
+    successful_attempt: int | None = Field(default=None, ge=1, le=20)
+    successful_request_id: SafeIdentifier | None = None
+    final_outcome: TransportOutcome
     row_count: int = Field(ge=0, le=10_000_000)
 ```
 
 The plan includes all symbol shards and explicit index requests, but never predicts the provider's
 page count. `request_plan_hash` is SHA-256 of the canonical logical-request tuple without its hash
-field. After execution, each logical request emits exactly one `RequestCompletion`; its
-`observed_pages` MUST be non-empty, unique and contiguous starting at page 1, `terminal_page` MUST
-equal the last observed page, and `end_marker_seen` MUST be true. `completion_hash` is SHA-256 of
-the ordered completion/page-descriptor tuple without its hash field and is independent of the
-logical request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages or an
-absent terminal/end marker fail closed. A provider that returns an empty legal response still emits
-one observed terminal page with its end marker; no total-page guess is required.
+field. After execution, each logical request emits exactly one `RequestCompletion`; every attempt
+has a fresh request ID, attempt numbers are strictly ordered, and non-empty observed pages are
+unique, start at page 1 and are contiguous. Exactly one successful attempt/request ID is allowed
+when `final_outcome=success`; it MUST be the final attempt and MUST be terminal. A failed final
+attempt has `final_outcome=error`, null successful fields and cannot publish evidence. A transport
+failure before page 1 is represented by an empty page tuple; no page is invented. Each observed
+page has exactly one `EvidenceObjectDescriptor` and one joinable `TransportLineageRef` carrying the
+same plan ordinal, attempt, request ID and page. `completion_hash` is SHA-256 of the ordered
+completion/attempt/page-descriptor tuple without its hash field and is independent of the logical
+request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages, duplicate
+request IDs or inconsistent final success/failure cardinality fail closed. No total-page guess is
+required.
 
 ### Provider registry
 
@@ -955,6 +1160,7 @@ additional summary fields hidden in prose. Per-endpoint `source_schema`, `units`
 | transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every attempt/page bound to exact allowlisted projection and aggregate digest |
 | endpoint_summaries | `tuple[EndpointContractSummary, ...]` | Exact source schema/units/date semantics, counts equal descriptor sums |
 | factor_cache_snapshot / factor_resolution | optional snapshot + ordered bindings | Actual cache keys only; provenance and raw endpoint resolution bound |
+| factor_resolution_sha256 | SHA-256 | Hash of ordered live/cache resolution bindings; enters candidate lineage |
 | object_count / row_count | bounded integers | Equal to descriptor sums and readback rows |
 | failure_class | allowlisted optional class | No raw provider message/exception |
 | manifest_sha256 | SHA-256 | Canonical manifest bytes excluding its own hash |
@@ -970,13 +1176,12 @@ summary; it MUST NOT be implemented as one file per loose gate or as a free-form
 | candidate_id | safe identifier | One candidate |
 | gate_version | safe version | Pinned policy |
 | outcomes | ordered tuple of `GateOutcome` | Exactly the ten names in `R2F2_GATE_ORDER`; no missing/extra/duplicate/reordered outcome |
-| verdict | `pass` or `fail` | Required |
-| aggregate_verdict / aggregate_sha256 | literal / hash | All ten outcomes agree; hash excludes itself |
+| verdict / aggregate_sha256 | literal / hash | All ten outcomes agree; hash excludes itself |
 | created_at | UTC datetime | Required |
 
 The aggregate MUST contain exactly the ten ordered names in `R2F2_GATE_ORDER`, exactly one outcome
 per name, and `aggregate_sha256` is the canonical JSON hash of the report without that field.
-`aggregate_verdict` is `pass` only when every outcome is `pass`; a missing, extra, duplicate,
+`verdict` is `pass` only when every outcome is `pass`; a missing, extra, duplicate,
 out-of-order or hash-mismatched outcome is a fail-closed report and cannot be selected. The exact
 ten names and their current-code evidence are `R2F2_GATE_EVIDENCE`; this is the only gate list.
 The existing five-string `MarketDataStatus.publication_gates` response field remains a legacy
@@ -990,9 +1195,10 @@ copied into `CandidateGateReport`, and is not extended or reinterpreted by this 
 | candidate_id | safe identifier | Full-session identity |
 | trade_date / universe_id | date / safe identifier | Exact scope |
 | provider_id | ProviderId | One provider only |
-| evidence_id / evidence_sha256 | ID/hash | Exact evidence |
+| evidence_id / evidence_sha256 | ID/hash | Exact evidence manifest |
 | normalized_object_relative_path / sha256 | relative path/hash | Non-serving candidate Parquet |
 | gate_report_relative_path / sha256 | relative path/hash | Complete gate lineage |
+| factor_resolution_sha256 | hash | Exact ordered live/cache factor-resolution object hash |
 | adapter_version / schema_version | safe version | Exact contract |
 | row_count / required_symbol_count | non-negative int | Exact readback |
 | status | `accepted` / `rejected` | Rejected candidates retained |
@@ -1036,10 +1242,15 @@ the original provider payload is not retained.
 | `index_history.session.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")`; exact 14 daily fields | Same typed daily rules as `daily_astock.v1`; the requested symbol role is discriminated: `index_symbol` MUST be one of existing `INDEX_SYMBOLS` and receives no stock factor; `stock_symbol` is not an index. Units are identical to daily bars. | One exact date/symbol; zero rows is missing and fails required coverage. One row is expected. |
 | `index_history.range.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")` in `fetch_range`; exact 14 daily fields | Same fields/types as `index_history.session.v1`, but the request range MAY contain multiple trading dates. Every row's code equals the requested symbol; no date outside range. | Rows unique and sorted by `(date,code)`; a repeated date or non-advancing page is `PAGINATION_STALLED`/schema failure. |
 
-The two `index_history` variants and the two factor variants are explicit request/schema variants,
-not a union of arbitrary rows. The provider's SDK iterator may expose pages in arrival order; the
-adapter records page/attempt lineage and emits the deterministic evidence order shown above. A
-provider row order that cannot be deterministically normalized is a complete candidate failure.
+The two `index_history` schema variants are each admitted for both `InstrumentRole.INDEX` and
+`InstrumentRole.STOCK`, because the current provider calls fetch the two required index symbols and
+explicit stock symbols through the same SDK method. The two factor variants are explicit
+request/schema variants, not a union of arbitrary rows. These nine entries (one calendar, one
+universe, one daily stock, one daily factor, one adjust-factor, and four stock/index history
+variants) are exactly the `ENDPOINT_CONTRACTS` table; no seventh endpoint is introduced. The
+provider's SDK iterator may expose pages in arrival order; the adapter records page/attempt
+lineage and emits the deterministic evidence order shown above. A provider row order that cannot
+be deterministically normalized is a complete candidate failure.
 
 ### Endpoint role cross-validator
 
@@ -1077,6 +1288,16 @@ or index symbol outside the current `INDEX_SYMBOLS` set invalidates the complete
   index, non-zero suspended activity, malformed placeholder, duplicate or coverage mismatch fails.
 - Source symbols retain the `sh.`/`sz.` six-digit form and canonical symbols are lowercase.
 
+The DATE gate is deliberately split at the evidence boundary. The adapter/evidence module MUST
+implement `validate_raw_date_binding(request, batch)` before any call to
+`normalize_baostock_rows`: it compares every raw date-bearing row and request range to the exact
+`ProviderRequest.trade_date`/logical plan and rejects a cross-day batch with zero candidate
+publication. The existing publication identity gate then compares the normalized session identity
+to `run_publication_refresh(..., trade_date=...)`/`RefreshResult.requested_date` before the current
+canonical chain runs. `normalize_baostock_rows` parses each row's own date and enforces
+`adjustflag="3"`, but it is not claimed to validate the requested-date binding; `normalize.py` is
+outside the R2-F2 whitelist and MUST NOT be modified for this gate.
+
 ### Factor-cache evidence boundary
 
 The current factor call chain is authoritative and is frozen as follows:
@@ -1085,11 +1306,15 @@ The current factor call chain is authoritative and is frozen as follows:
 `materialize_from_stream()`, `exact_snapshots()`, optional `record_bootstrap()`, and finally
 `normalized_rows()`; the cache's `FACTOR_FIELDS` remains the exact five-field provider contract.
 R2-F2 adds no seventh provider endpoint. It captures a separate immutable
-`EvidenceObjectKind.factor_cache_snapshot` containing only keys actually returned by
-`exact_snapshots()` for this `(symbol, trade_date)` request: factor values, source
-(`daily_event`, `daily_carry`, `bootstrap` or `bootstrap_no_events`), effective/observed trade dates, cache schema
-version and a provenance hash. It MUST NOT copy unrelated cache rows, database paths, SQL, tokens or
-mutable cache diagnostics.
+`EvidenceObjectKind.factor_cache_snapshot` using a new strict read-only
+`AdjustmentFactorCache.exact_snapshot_records(symbols, trade_date)` method. The method returns
+only rows actually selected from the existing `factor_snapshots` table, with exactly these current
+columns: `symbol`, `trade_date`, `fore_adjust_factor`, `back_adjust_factor`, `evidence_kind`,
+`evidence_effective_date`, `evidence_observed_on`, `source_row_hash` and `observed_at`; it adds only
+a deterministic `row_fingerprint` derived from those returned values. It does not add or infer
+`source`, `effective_date`, `observed_date`, `adjust_factor`, cache-version or provenance columns,
+and it performs no schema migration. It MUST NOT copy unrelated cache rows, database paths, SQL,
+tokens or mutable cache diagnostics.
 
 The capture runs inside the same outer `RefreshRunLock` as online evidence publication. The
 adapter obtains a stable read-only snapshot and a before/after fingerprint of the selected keys;
@@ -1099,9 +1324,10 @@ reads the live mutable cache after capture. If the live `daily_factor` or `adjus
 also supplies a factor row, its raw endpoint object remains in `RawEndpointBatch` and the
 `FactorResolutionBinding` records whether the selected provenance came from the cache snapshot or
 that endpoint row. A binding mismatch, missing selected object or unproven source is a complete
-candidate failure. Task 7 exposes the compatibility snapshot interface in `providers/baostock.py`;
-Task 8 serializes the snapshot object and binding in `market/evidence.py`; no new factor-cache
-writer or live-cache replay path is permitted.
+candidate failure. Task 8 owns the read-only cache method and its schema/immutability tests,
+serializes the snapshot object and binding in `market/evidence.py`, and adds no factor-cache writer
+or live-cache replay path. The ordered binding hash `factor_resolution_sha256` is present in both
+the evidence manifest and candidate manifest.
 
 ## Acceptance criteria
 
@@ -1125,6 +1351,11 @@ Given an unknown field, row-shape mismatch, date mismatch, invalid unit, duplica
 missing factor, invalid suspended placeholder or suspended index
 When an evidence/candidate gate evaluates
 Then the complete candidate fails closed with a sanitized reason and no canonical mutation.
+
+The date mismatch MUST be rejected by `validate_raw_date_binding(request, batch)` before
+`normalize_baostock_rows` is called; the existing publication requested-date/session identity gate
+must reject any normalized identity mismatch. This criterion does not authorize a `normalize.py`
+change or claim that the normalizer performs the request-date check.
 
 ### AC-4: Content-addressed evidence (FR-6–FR-8, NFR-2, NFR-3, NFR-4, NFR-6)
 
@@ -1217,16 +1448,19 @@ Given a request or response using an unknown provider, symbol, field, schema var
 rule or row shape
 When the Task 7 contract/adapter validates it
 Then the immutable discriminated model rejects the complete batch before evidence publication,
-and each of the six endpoint IDs is accepted only through an explicitly frozen variant.
+each of the six endpoint IDs is accepted only through an `ENDPOINT_CONTRACTS` entry, and a
+`model_copy` or round-trip that changes role, fields, units, date semantics or pagination policy
+also fails closed.
 
 ### AC-17: Request/object/transport cardinality (FR-30–FR-31, NFR-2–NFR-6, NFR-16)
 
 Given multiple symbols, indexes, retries or SDK pages for one refresh
 When Task 8 assembles its evidence manifest
 Then every logical plan item has exactly one completion and every observed page has exactly one
-descriptor and bound sanitized observation lineage; observed pages are contiguous and terminal,
-with no missing, extra, duplicate, out-of-order or swallowed page, and a competing writer performs
-zero canonical writes. The plan does not require a pre-fetched total page count.
+descriptor and bound sanitized observation lineage; every attempt has a joinable request ID,
+observed pages are contiguous, and exactly one final successful attempt or final failure is recorded,
+with no missing, extra, duplicate, out-of-order or swallowed page. A competing writer performs zero
+canonical writes. The plan does not require a pre-fetched total page count.
 
 ### AC-18: Canonical gate aggregate (FR-32, NFR-6–NFR-8)
 
@@ -1241,7 +1475,8 @@ Given a published evidence object and an online or replay normalization run
 When the frozen clock, no-follow layout, CAS and replay comparison rules execute
 Then online and replay use the same `normalization_clock_utc`, same-version output is byte-equal,
 documented encoding-only changes require semantic equality, and missing/corrupt/read-only roots
-cause zero writes.
+cause zero writes. `SafeRelativePath` construction and `model_copy` reject semantic traversal,
+while the storage reader additionally enforces dirfd/O_NOFOLLOW descriptor containment.
 
 ### AC-20: Fallback and validator boundaries (NFR-18, FR-27)
 
@@ -1258,6 +1493,7 @@ reported only as a structural result, and manual implementation traceability rem
 - EC-2: Provider endpoint returns an unknown field, duplicate field, wrong row length or
   malformed type; the complete raw batch is rejected.
 - EC-3: Provider returns a date outside the exact requested session or rows from two sessions;
+  `validate_raw_date_binding(request, batch)` rejects the complete batch before normalization and
   evidence is not published.
 - EC-4: Provider status code is unknown; preserve bounded `provider_code` and map only to
   `UNKNOWN_PROVIDER_PROTOCOL_ERROR`.
@@ -1265,8 +1501,9 @@ reported only as a structural result, and manual implementation traceability rem
   pagination stall; no evidence/candidate is published and existing circuit semantics apply.
 - EC-6: Evidence object exceeds 64 MiB, metadata exceeds 1 MiB or decompression expands beyond
   the bound; reject before normalization.
-- EC-7: Evidence object is a symlink, path traversal, absolute path, directory or substituted
-  inode; descriptor-bound validation rejects it.
+- EC-7: Evidence object is a symlink, empty/repeated/trailing component, `.`, `..`, backslash,
+  NUL, absolute/traversing path, directory or substituted inode; semantic path validation and
+  descriptor-bound dirfd/O_NOFOLLOW containment reject it.
 - EC-8: Evidence manifest is atomically swapped during read; snapshot identity/fingerprint
   mismatch makes the read unavailable.
 - EC-9: Evidence object is deleted, renamed, truncated or hash-mutated after manifest commit;
@@ -1295,7 +1532,8 @@ reported only as a structural result, and manual implementation traceability rem
 - EC-20: Missing evidence root/database/table on GET/plan/replay; return unavailable and do not
   initialize directories, databases, tables or pointers.
 - EC-21: Expected request plan contains a missing, extra, duplicate, out-of-order or swallowed
-  request/shard/page; manifest cardinality validation fails before evidence publication.
+  request/shard/page, duplicate attempt request ID, or inconsistent final success/failure;
+  `AttemptCompletion`/`RequestCompletion` validation fails before evidence publication.
 - EC-22: A descriptor has transport IDs/endpoint/attempt/page that do not match its sanitized
   observation digest; the complete evidence chain is unavailable.
 - EC-23: Candidate gate outcomes omit, duplicate, reorder or add a gate; the aggregate report and
