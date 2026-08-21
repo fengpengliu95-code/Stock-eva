@@ -5,6 +5,7 @@ import socket
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic, sleep
@@ -45,6 +46,42 @@ SZ_MAIN_PREFIXES = ("sz.000", "sz.001", "sz.002", "sz.003")
 logger = logging.getLogger("stock_eva.market.baostock")
 _LOGIN_SOCKET_TIMEOUT_LOCK = threading.Lock()
 _SAFE_PROBE_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
+_CAPTURE_REGISTRY: ContextVar[tuple[int, list[dict[str, object]]] | None] = ContextVar(
+    "baostock_capture_registry", default=None
+)
+
+
+@contextmanager
+def capture_registry(plan_ordinal: int):
+    """Capture authoritative request-scope identities at scope entry."""
+    entries: list[dict[str, object]] = []
+    token = _CAPTURE_REGISTRY.set((plan_ordinal, entries))
+    try:
+        yield entries
+    finally:
+        _CAPTURE_REGISTRY.reset(token)
+
+
+def _capture_scope_entry(
+    *, endpoint: TransportEndpoint, attempt: int, page: int, kind: str
+) -> None:
+    active = _CAPTURE_REGISTRY.get()
+    if active is None:
+        return
+    plan_ordinal, entries = active
+    context = current_request_context()
+    entries.append(
+        {
+            "refresh_id": context.refresh_id,
+            "provider_session_id": context.provider_session_id,
+            "request_id": context.request_id,
+            "endpoint": endpoint,
+            "attempt": attempt,
+            "page": page,
+            "plan_ordinal": plan_ordinal,
+            "lineage_kind": kind,
+        }
+    )
 
 
 class _EofAwareSocket:
@@ -525,6 +562,12 @@ class BaoStockProvider:
             raise BaoStockSessionStateError("BaoStock provider session is unavailable")
         with provider_session_scope(self._provider_session_id):
             with request_scope(endpoint, attempt=attempt, page=page) as context:
+                _capture_scope_entry(
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    page=page,
+                    kind="query_root" if page == 1 else "page",
+                )
                 yield context
 
     def _login(self, endpoint: TransportEndpoint) -> None:
@@ -544,6 +587,12 @@ class BaoStockProvider:
             with provider_session_scope() as session:
                 self._provider_session_id = session.provider_session_id
                 with request_scope(endpoint, attempt=attempt, page=1):
+                    _capture_scope_entry(
+                        endpoint=endpoint,
+                        attempt=attempt,
+                        page=1,
+                        kind="login_audit",
+                    )
                     try:
                         result = self._run_with_deadline(
                             self._call_login,

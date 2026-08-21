@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
 
-from backend.app.market.baostock import DAILY_FIELDS
+from backend.app.market.baostock import DAILY_FIELDS, capture_registry
 from backend.app.market.baostock import BaoStockProvider as IncumbentBaoStockProvider
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.models import DailyBar
@@ -76,7 +76,8 @@ class BaoStockProviderAdapter:
         raw_observations: list[TransportObservation] = []
         with transport_observation_sink(raw_observations.append):
             with self._incumbent.refresh_operation(request.refresh_id):
-                self._incumbent._login(TransportEndpoint.TRADE_DATES)
+                with capture_registry(0) as login_entries:
+                    self._incumbent._login(TransportEndpoint.TRADE_DATES)
                 login_count = len(raw_observations)
                 try:
                     for logical in request.logical_request_plan.requests:
@@ -91,9 +92,7 @@ class BaoStockProviderAdapter:
                 finally:
                     self._incumbent._logout()
         login_projections = tuple(
-            TransportObservationProjection.from_observation_with_lineage(
-                item, plan_ordinal=0, lineage_kind="login_audit"
-            )
+            self._projection(item, login_entries, default_kind="login_audit")
             for item in raw_observations[:login_count]
         )
         completed_at = datetime.now(UTC)
@@ -135,17 +134,18 @@ class BaoStockProviderAdapter:
         captured_pages: list[tuple[int, int, str, str, list[str], list[list[str]]]] = []
         terminals: list[int] = []
         observation_start = len(raw_observations)
-        fields, _rows = self._incumbent._read(
-            endpoint,
-            lambda: self._query(endpoint, logical),
-            page_capture=lambda attempt, page, request_id, session_id, page_fields, page_rows: (
-                captured_pages.append(
-                    (attempt, page, request_id, session_id, page_fields, page_rows)
-                )
-            ),
-            pagination_terminal=lambda: terminals.append(1),
-            capture_all_operation_outcomes=True,
-        )
+        with capture_registry(logical.plan_ordinal) as scope_entries:
+            fields, _rows = self._incumbent._read(
+                endpoint,
+                lambda: self._query(endpoint, logical),
+                page_capture=lambda attempt, page, request_id, session_id, page_fields, page_rows: (
+                    captured_pages.append(
+                        (attempt, page, request_id, session_id, page_fields, page_rows)
+                    )
+                ),
+                pagination_terminal=lambda: terminals.append(1),
+                capture_all_operation_outcomes=True,
+            )
         local = tuple(
             item for item in raw_observations[observation_start:] if item.endpoint is endpoint
         )
@@ -156,19 +156,25 @@ class BaoStockProviderAdapter:
         operations = tuple(item for item in local if item.protocol_stage is ProtocolStage.OPERATION)
         if not operations:
             raise RuntimeError("BaoStock logical request has no operation observation")
-        root_ids = {
-            attempt: next(page[2] for page in captured_pages if page[0] == attempt and page[1] == 1)
-            for attempt in {item.attempt for item in operations}
-        }
+        root_ids: dict[int, str] = {}
+        for item in operations:
+            entries = [
+                entry
+                for entry in scope_entries
+                if entry["request_id"] == item.request_id
+                and entry["provider_session_id"] == item.provider_session_id
+                and entry["attempt"] == item.attempt
+                and entry["page"] == item.page
+                and entry["lineage_kind"] == "query_root"
+            ]
+            if len(entries) == 1 and item.outcome is not TransportOutcome.SUCCESS:
+                root_ids[item.attempt] = item.request_id
+            elif len(entries) == 1 and item.outcome is TransportOutcome.SUCCESS:
+                root_ids.setdefault(item.attempt, item.request_id)
+        if set(root_ids) != {item.attempt for item in operations}:
+            raise RuntimeError("BaoStock logical request has no authoritative query root")
         local_projections = tuple(
-            TransportObservationProjection.from_observation_with_lineage(
-                item,
-                plan_ordinal=logical.plan_ordinal,
-                lineage_kind="query_root"
-                if item.request_id == root_ids.get(item.attempt)
-                else "page",
-            )
-            for item in local
+            self._projection(item, scope_entries, default_kind="page") for item in local
         )
         projection_by_identity = {
             (item.request_id, item.attempt, item.page, item.protocol_stage): projection
@@ -230,9 +236,7 @@ class BaoStockProviderAdapter:
                 units=contract.units,
                 date_semantics=contract.date_semantics,
                 pagination_policy=contract.pagination_policy,
-                provider_row_order_digest=sha256(
-                    json.dumps(page[5], ensure_ascii=False, separators=(",", ":")).encode()
-                ).hexdigest(),
+                provider_row_order_digest=self._typed_row_digest(logical, page[4], page[5]),
             )
             for page, lineage in zip(successful_pages, page_lineages, strict=True)
         )
@@ -289,6 +293,40 @@ class BaoStockProviderAdapter:
         )
         return endpoint_batches, completion, page_lineages, local_projections, summary
 
+    @staticmethod
+    def _projection(item, entries, *, default_kind):
+        matches = [
+            entry
+            for entry in entries
+            if entry["request_id"] == item.request_id
+            and entry["provider_session_id"] == item.provider_session_id
+            and entry["attempt"] == item.attempt
+            and entry["page"] == item.page
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("transport observation has no unique capture registry scope")
+        entry = matches[0]
+        kind = entry["lineage_kind"]
+        if item.protocol_stage is ProtocolStage.COMPLETE and kind == "query_root":
+            kind = "page"
+        return TransportObservationProjection.from_observation_with_lineage(
+            item,
+            plan_ordinal=int(entry["plan_ordinal"]),
+            lineage_kind=kind if kind in {"login_audit", "query_root", "page"} else default_kind,
+        )
+
+    @staticmethod
+    def _typed_row_digest(logical, fields, rows):
+        typed = [BaoStockProviderAdapter._typed_row(logical, fields, row) for row in rows]
+        return sha256(
+            json.dumps(
+                [item.model_dump(mode="json") for item in typed],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
     def _query(self, endpoint, logical):
         iso_date = logical.start_date.isoformat()
         if endpoint is TransportEndpoint.TRADE_DATES:
@@ -319,6 +357,10 @@ class BaoStockProviderAdapter:
     @staticmethod
     def _typed_row(logical, fields, row):
         values = dict(zip(fields, row, strict=True))
+        if logical.schema_variant == "daily_astock.v1" and values.get("tradestatus") != "1":
+            for field in ("volume", "amount", "turn", "pctChg"):
+                if values.get(field) == "":
+                    values[field] = None
         values.update(
             endpoint=logical.endpoint,
             schema_variant=logical.schema_variant,

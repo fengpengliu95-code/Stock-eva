@@ -162,6 +162,10 @@ def _digest(value: object) -> str:
     return sha256(_canonical(value)).hexdigest()
 
 
+def _typed_row_order_digest(rows: Sequence[RawEndpointRow]) -> str:
+    return _digest([row.model_dump(mode="json") for row in rows])
+
+
 def _finite_number(value: float | Decimal | None, *, positive: bool = False) -> bool:
     if value is None:
         return False
@@ -252,6 +256,21 @@ class ExpectedLogicalRequestPlan(_ContractModel):
         ordinals = tuple(item.plan_ordinal for item in self.requests)
         if ordinals != tuple(range(len(self.requests))):
             raise ValueError("request plan ordinals must be ordered")
+        identities = tuple(
+            (
+                item.endpoint,
+                item.request_role,
+                item.instrument_role,
+                item.schema_variant,
+                item.symbols,
+                item.start_date,
+                item.end_date,
+                item.shard_id,
+            )
+            for item in self.requests
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("request plan contains duplicate logical identity")
         return self
 
     @model_validator(mode="after")
@@ -696,6 +715,8 @@ class RawEndpointBatch(_ContractModel):
             raise ValueError("raw endpoint batch does not match endpoint contract")
         if self.row_count != len(self.rows):
             raise ValueError("raw row count mismatch")
+        if self.provider_row_order_digest != _typed_row_order_digest(self.rows):
+            raise ValueError("typed provider row-order digest mismatch")
         for row in self.rows:
             if row.endpoint is not self.endpoint or row.schema_variant != self.schema_variant:
                 raise ValueError("mixed endpoint rows")
@@ -719,6 +740,10 @@ class RawEndpointBatch(_ContractModel):
                 sorted(keys, key=lambda item: (item[1], item[0]))
             ):
                 raise ValueError("factor rows must be unique and ordered")
+        elif self.endpoint is ProviderEndpoint.TRADE_DATES:
+            dates = tuple(row.calendar_date for row in self.rows)
+            if len(set(dates)) != len(dates) or dates != tuple(sorted(dates)):
+                raise ValueError("calendar rows must be unique and ordered")
         return self
 
 
@@ -909,6 +934,16 @@ class ProviderRawBatch(_ContractModel):
         batches_by_ordinal: dict[int, list[RawEndpointBatch]] = {}
         batch_keys: set[tuple[int, str, int, str, int]] = set()
         for item in self.endpoint_batches:
+            logical = self.logical_request_plan.requests[item.plan_ordinal]
+            if (
+                item.endpoint is not logical.endpoint
+                or item.request_role is not logical.request_role
+                or item.instrument_role is not logical.instrument_role
+                or item.schema_variant != logical.schema_variant
+                or item.shard_id != logical.shard_id
+            ):
+                raise ValueError("raw endpoint batch does not bind exact logical request")
+            validate_raw_date_binding(self.request, item)
             key = (
                 item.plan_ordinal,
                 item.lineage.page_request_id,
@@ -947,6 +982,28 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw endpoint summaries do not bind source batches")
         for completion in self.request_completions:
             batches = batches_by_ordinal.get(completion.plan_ordinal, [])
+            logical = self.logical_request_plan.requests[completion.plan_ordinal]
+            operation_matches = tuple(
+                projection
+                for projection in self.transport_observations.observations
+                if projection.observation_digest
+                == next(
+                    attempt.operation_observation_digest
+                    for attempt in completion.attempts
+                    if attempt.attempt == completion.attempts[-1].attempt
+                )
+                and projection.protocol_stage is ProtocolStage.OPERATION
+                and projection.request_id == completion.attempts[-1].root_request_id
+                and projection.endpoint is logical.endpoint
+                and projection.plan_ordinal == completion.plan_ordinal
+                and projection.attempt == completion.attempts[-1].attempt
+                and projection.page == 1
+                and projection.refresh_id == self.request.refresh_id
+                and projection.provider_session_id == completion.attempts[-1].provider_session_id
+                and projection.lineage_kind == "query_root"
+            )
+            if len(operation_matches) != 1:
+                raise ValueError("operation digest must resolve one authoritative query root")
             if completion.final_outcome is TransportOutcome.ERROR:
                 if completion.row_count != 0 or batches:
                     raise ValueError("failed completion cannot persist source rows")
@@ -963,6 +1020,16 @@ class ProviderRawBatch(_ContractModel):
                 for item in batches
             ):
                 raise ValueError("source batch lineage does not bind completion")
+            if batches[0].lineage.page != 1 or (
+                batches[0].lineage.page_request_id != completion.successful_root_request_id
+            ):
+                raise ValueError("page one lineage must bind the successful query root")
+            if any(
+                item.lineage.page > 1
+                and item.lineage.page_request_id == completion.successful_root_request_id
+                for item in batches
+            ):
+                raise ValueError("nested page lineage must have its own request identity")
             pages = tuple(item.lineage.page for item in batches)
             if pages != tuple(sorted(pages)) or pages != completion.attempts[-1].observed_pages:
                 raise ValueError("source batch pages do not bind completion")
@@ -1017,6 +1084,9 @@ class ProviderRawBatch(_ContractModel):
         )
         if len(lineage_keys) != len(set(lineage_keys)):
             raise ValueError("duplicate transport lineage projection")
+        lineage_identities = [key for key, _digest in lineage_keys]
+        if len(lineage_identities) != len(set(lineage_identities)):
+            raise ValueError("conflicting transport lineage projection")
         if len(projection_keys) != len(set(projection_keys)):
             raise ValueError("duplicate transport observation projection")
         projection_set = set(projection_keys)
@@ -1032,11 +1102,45 @@ class ProviderRawBatch(_ContractModel):
                 and projection.outcome is TransportOutcome.SUCCESS
                 and projection.end_marker_seen
                 and projection.request_id == lineage.page_request_id
+                and projection.refresh_id == lineage.refresh_id
+                and projection.provider_session_id == lineage.provider_session_id
+                and projection.endpoint is lineage.endpoint
+                and projection.plan_ordinal == lineage.plan_ordinal
                 and projection.attempt == lineage.attempt
                 and projection.page == lineage.page
             )
             if len(matches) != 1:
                 raise ValueError("page lineage must resolve one marked COMPLETE projection")
+        successful_page_identities = {
+            (
+                completion.plan_ordinal,
+                completion.attempts[-1].attempt,
+                page,
+                request_id,
+            )
+            for completion in self.request_completions
+            if completion.final_outcome is TransportOutcome.SUCCESS
+            for page, request_id in completion.attempts[-1].page_request_ids
+        }
+        complete_projection_digests = {
+            item.observation_digest
+            for item in self.transport_observations.observations
+            if (
+                item.plan_ordinal,
+                item.attempt,
+                item.page,
+                item.request_id,
+            )
+            in successful_page_identities
+            and item.protocol_stage is ProtocolStage.COMPLETE
+            and item.outcome is TransportOutcome.SUCCESS
+            and item.end_marker_seen
+            and item.lineage_kind == "page"
+        }
+        if complete_projection_digests != {
+            item.observation_digest for item in self.transport_lineage
+        }:
+            raise ValueError("successful COMPLETE page projections must join exactly to lineage")
         expected_completion_hash = _digest(
             [item.model_dump(mode="json") for item in self.request_completions]
         )
@@ -1081,6 +1185,9 @@ class _ProviderRegistry(_ContractModel):
         "unadjusted_ohlcv_back_adjust_factor"
     )
     admission_state: Literal["qualified"] = "qualified"
+    supported_fields: tuple[SafeVersion, ...] = tuple(
+        sorted({contract.schema_variant for contract in ENDPOINT_CONTRACTS})
+    )
 
     @model_validator(mode="after")
     def validate_authoritative_versions(self) -> _ProviderRegistry:
@@ -1088,6 +1195,9 @@ class _ProviderRegistry(_ContractModel):
             raise ValueError("unsupported provider adapter version")
         if self.endpoint_contract_version != "r2f2-endpoints.v1":
             raise ValueError("unsupported endpoint contract version")
+        expected = tuple(sorted({contract.schema_variant for contract in ENDPOINT_CONTRACTS}))
+        if self.supported_fields != expected:
+            raise ValueError("provider supported fields do not match endpoint contracts")
         return self
 
 
@@ -1107,6 +1217,8 @@ def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch)
     if (
         logical.schema_variant != batch.schema_variant
         or logical.request_role is not batch.request_role
+        or logical.instrument_role is not batch.instrument_role
+        or logical.shard_id != batch.shard_id
     ):
         raise ValueError("raw batch role or schema does not bind to request plan")
     expected_symbols = set(logical.symbols)
@@ -1139,7 +1251,7 @@ def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch)
             if code.startswith(("sh.000", "sz.399")):
                 raise ValueError("universe rows cannot satisfy index coverage")
             continue
-        if code not in request.session_symbols:
+        if code not in logical.symbols:
             raise ValueError("raw row symbol is outside requested session symbols")
         if logical.instrument_role is InstrumentRole.INDEX:
             if code not in {"sh.000001", "sz.399001"}:
