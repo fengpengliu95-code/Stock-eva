@@ -8,7 +8,7 @@ independent re-review required
   this specification to be independently reviewed and approved.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`2f2e05afe4566600bec5913313001aa997130b3a`
+`41a3c4080c41411f6687d3a8854eea6e3bf74cbf`
 **Reviewers:** Independent review found contract gaps around attempt completion, path/storage
 separation, field/type drift, CLI parser ordering and traceability; this amendment records the
 user's Option A decision and reconciles them for re-review. Status MUST NOT be changed to Approved
@@ -55,6 +55,9 @@ This is a normative boundary for every model, validator, writer, reader, hash an
 - A retry sequence that eventually succeeds publishes only the final successful pages. A logical
   request that ultimately fails publishes no `EvidenceManifest`, does not call normalization,
   and cannot produce a candidate, selection or canonical pointer mutation.
+- `RequestCompletion.row_count` is an aggregate only for a successful final attempt and is checked
+  against the final-success descriptor read-back sum. For an ultimate failure it MUST be zero;
+  failed-attempt source row counts are not a persisted field and cannot enter any manifest or hash.
 
 The explicit publication sequence is therefore:
 
@@ -87,8 +90,8 @@ closures are:
 | M9 — contract vocabulary was not structurally reconciled | Review text and field tables were previously able to drift from the frozen models and gate count, so structural review could not prove closure. | Compare actual model/serializer field sets with the authoritative tables, verify the fixed ten-gate order and run strict design validation plus `git diff --check`; do not infer closure from prose searches. |
 | M10 — model/table names drifted | The frozen models and field tables previously represented the same identity, verdict and hash concepts with different spellings. | Use one authoritative name in every model, table, hash rule, test and implementation reference: `gate_report_id`, `verdict`, `aggregate_sha256` and `evidence_sha256`. |
 | M11 — umbrella plan retained stale pseudo-contracts | The umbrella Task 7–9 section duplicated old `dict` rows, open provider strings and obsolete selection fields. | Replace the section with a high-level roadmap summary and state that the dedicated design and implementation plan are the only contract authorities. |
-| M12 — factor snapshot invented fields | The proposed snapshot row contained `source`, cache version and factor values not present in the current `factor_snapshots` table. | Define `FactorCacheSnapshotRecord` from the current nine table columns only; add a strict read-only `exact_snapshot_records()` API under Task 8 with before/after fingerprints and no schema migration. |
-| M13 — factor resolution/cardinality incomplete | Resolution did not discriminate live/cache provenance, and completion did not represent retries, request IDs or final outcome. | Add mutually exclusive live/cache bindings and `AttemptCompletion`/`RequestCompletion`; bind every page descriptor and resolution hash into the manifest/candidate. |
+| M12 — factor snapshot invented fields | The proposed snapshot row contained `source`, cache version and factor values not present in the current `factor_snapshots` table, and did not separate records from a published descriptor. | Define `FactorCacheSnapshotRecord(s)` from the current nine table columns only; add a strict read-only `exact_snapshot_records()` API under Task 8, then publish a separate descriptor-bound `FactorCacheSnapshotManifest` with before/after, object, schema and records hashes; no schema migration. |
+| M13 — factor resolution/cardinality incomplete | Resolution did not discriminate live/cache provenance, cache identity was not descriptor-bound, and completion did not represent retries, request IDs or final outcome. | Add mutually exclusive live/cache bindings with `cache_object_id`/`cache_object_sha256`/`record_key`, descriptor-bound factor replay and `AttemptCompletion`/`RequestCompletion`; bind every page descriptor and resolution hash into the manifest/candidate. |
 | M14 — endpoint/date/path validators were declarative only | Tables described variants, but no authoritative endpoint constant, pre-normalize date binding or semantic relative-path/storage boundary was frozen. | Add `ENDPOINT_CONTRACTS`, `validate_raw_date_binding(request,batch)`, and lexical plus dirfd/O_NOFOLLOW containment rules with model-copy regressions. |
 
 The amendment is still documentation-only. No RED test, provider request, external operation or
@@ -174,7 +177,8 @@ automatic failover may be used to close that gap.
   `ProviderId("baostock")` in R2-F2. Unknown, empty, mixed-case, path-like or plugin-resolved IDs
   MUST fail closed.
 - FR-2: **Provider contract:** `ProviderRequest` MUST carry provider ID, exact trade date,
-  universe ID and a sorted unique exact symbol set. `ProviderRawBatch` MUST carry adapter and
+  universe ID and a sorted unique, non-empty `session_symbols` set representing the complete
+  canonical target. `ProviderRawBatch` MUST carry adapter and
   endpoint-contract versions, timezone-aware timestamps, endpoint rows, source schema, units and
   date semantics.
 - FR-3: **Compatibility adapter:** The BaoStock adapter MUST delegate to the incumbent
@@ -268,8 +272,9 @@ automatic failover may be used to close that gap.
   explicitly deferred to R2-F3/F4.
 - FR-28: **Frozen type closure:** The implementation MUST expose the complete `SafeProviderId`,
   `SafeSymbol`, `SafeVersion`, `SafeRelativePath`, `ProviderEndpoint`, `ProviderRequest`,
-  `TransportLineageRef`, `FactorCacheSnapshotRecord`, discriminated raw-row/batch, evidence, gate,
-  candidate, selection and replay models with
+  `TransportLineageRef`, `FactorCacheSnapshotRecord(s)`, `FactorCacheSnapshotManifest`,
+  `PublishedFactorCacheSnapshot`, discriminated raw-row/batch, evidence, gate, candidate, selection
+  and replay models with
   immutable `extra="forbid"` validation. Any missing/extra/duplicate field MUST fail closed.
 - FR-29: **Exact endpoint schema closure:** Each of the six endpoint IDs MUST use one of the
   explicitly named `ENDPOINT_CONTRACTS` request/schema/role variants and exact ordered field tuples
@@ -630,8 +635,11 @@ class ProviderRequest(BaseModel):
     request_id: SafeIdentifier
     trade_date: date
     universe_id: SafeIdentifier
-    symbols: tuple[SafeSymbol, ...]  # sorted, unique, non-empty
+    session_symbols: tuple[SafeSymbol, ...]  # complete canonical target; sorted, unique, non-empty
     request_plan: "ExpectedLogicalRequestPlan"
+
+# `session_symbols` is the complete canonical target for this refresh (required stock universe
+# plus required index symbols), not one SDK call's shard. It is sorted, unique and non-empty.
 
 class TransportLineageRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -889,10 +897,9 @@ class LiveFactorResolution(BaseModel):
 
 class CacheFactorResolution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    descriptor_id: SafeIdentifier
-    object_sha256: SafeSha256
+    cache_object_id: SafeIdentifier
+    cache_object_sha256: SafeSha256
     record_key: SafeIdentifier
-    cache_schema: tuple[SafeIdentifier, ...]
 
 class FactorResolutionBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -914,15 +921,35 @@ class FactorResolutionBinding(BaseModel):
             raise ValueError("live factor resolution requires live only")
         return self
 
-class FactorCacheSnapshot(BaseModel):
+class FactorCacheSnapshotRecords(BaseModel):
+    """In-memory read-only records; this is never a published object descriptor."""
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    object_kind: Literal["factor_cache_snapshot"]
     cache_schema: tuple[SafeIdentifier, ...]
     rows: tuple[FactorCacheSnapshotRecord, ...]
     row_count: int = Field(ge=0, le=10_000_000)
+    records_sha256: SafeSha256
     before_fingerprint: SafeSha256
     after_fingerprint: SafeSha256
-    snapshot_sha256: SafeSha256
+
+class FactorCacheSnapshotManifest(BaseModel):
+    """Published descriptor projection; it contains no mutable/live cache records."""
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    object_id: SafeIdentifier
+    relative_path: SafeRelativePath
+    object_sha256: SafeSha256
+    byte_count: int = Field(ge=0, le=67_108_864)
+    row_count: int = Field(ge=0, le=10_000_000)
+    schema_version: SafeVersion
+    schema_hash: SafeSha256
+    records_sha256: SafeSha256
+    before_fingerprint: SafeSha256
+    after_fingerprint: SafeSha256
+
+class PublishedFactorCacheSnapshot(BaseModel):
+    """A descriptor-bound published factor snapshot; replay opens its object by dirfd."""
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    manifest: FactorCacheSnapshotManifest
+    reader_identity: SafeSha256
 
 class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -941,7 +968,7 @@ class ProviderRawBatch(BaseModel):
     transport_lineage: tuple[TransportLineageRef, ...]
     transport_observations: TransportObservationAggregate
     endpoint_summaries: tuple[EndpointContractSummary, ...]
-    factor_cache_snapshot: FactorCacheSnapshot | None
+    factor_cache_records: FactorCacheSnapshotRecords | None
     factor_resolution: tuple[FactorResolutionBinding, ...]
     factor_resolution_sha256: SafeSha256
     failure_class: SafeFailureClass | None = None
@@ -998,7 +1025,7 @@ class EvidenceManifest(BaseModel):
     transport_lineage: tuple[TransportLineageRef, ...]
     transport_observations: TransportObservationAggregate
     endpoint_summaries: tuple[EndpointContractSummary, ...]
-    factor_cache_snapshot: FactorCacheSnapshot | None
+    factor_cache_snapshot: PublishedFactorCacheSnapshot | None
     factor_resolution: tuple[FactorResolutionBinding, ...]
     factor_resolution_sha256: SafeSha256
     request_count: int = Field(ge=1, le=4096)
@@ -1089,8 +1116,24 @@ must join one final-success `AttemptCompletion`; a model validator rejects a des
 attempt/outcome/request ID is not the `RequestCompletion.successful_attempt` binding. A
 `factor_cache_snapshot` requires a null endpoint/request role/instrument role/shard/plan
 ordinal/attempt/page and transport digest, but retains the capture request ID and requires a
-non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an evidence object kind,
-never a seventh provider endpoint, and cannot masquerade as a transport page.
+non-null `factor_snapshot_provenance_hash`. Its `object_id`, `relative_path`, `sha256`,
+`byte_count`, `row_count` and `schema_variant` MUST equal the corresponding
+`FactorCacheSnapshotManifest.object_id`, `relative_path`, `object_sha256`, `byte_count`,
+`row_count`, `schema_variant` and `schema_hash` MUST equal the corresponding manifest fields and
+its `factor_snapshot_provenance_hash` MUST equal `records_sha256`. `EvidenceManifest.objects` MUST
+contain this descriptor exactly once, and `EvidenceManifest.factor_cache_snapshot.manifest` MUST
+be the same identity/hash/size/row/schema projection. Any mismatch in either direction fails
+closed. Thus a factor snapshot is an evidence object kind, never a seventh provider endpoint, and
+cannot masquerade as a transport page.
+
+`FactorCacheSnapshotRecords` is the in-memory read-only record set and is never replayed directly.
+The writer serializes it to one immutable object, creates the `FactorCacheSnapshotManifest` and
+the matching `EvidenceObjectDescriptor`, then exposes only `PublishedFactorCacheSnapshot` to the
+reader. `FactorResolutionBinding.cache` MUST contain `cache_object_id`, `cache_object_sha256` and
+`record_key`, with `live=None`; the reader opens the descriptor's relative path through the
+evidence root dirfd with `O_NOFOLLOW`, verifies object hash/schema/byte count/row count and the
+records hash, and only then resolves `record_key`. It MUST NOT query the live cache or accept an
+in-memory record set during replay.
 
 The evidence writer MUST also run this aggregate validator before the first object compare-create:
 
@@ -1148,8 +1191,9 @@ score cannot substitute for it.
 | Model | Persisted projection / source | Field-diff result |
 | --- | --- | --- |
 | `RawEndpointBatch` / `EndpointContractSummary` | `ENDPOINT_CONTRACTS` | `endpoint`, role, variant, ordered `fields`, `source_schema`, exact `units`, `date_semantics` and `pagination_policy` all present; no hidden summary field. |
-| `FactorCacheSnapshotRecord` | Existing `factor_snapshots` SQL table | Exact nine current columns only, plus derived `row_fingerprint`; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. |
-| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. |
+| `FactorCacheSnapshotRecord` / `FactorCacheSnapshotRecords` | Existing `factor_snapshots` SQL table / in-memory projection | Exact nine current columns plus derived `row_fingerprint`, `records_sha256` and before/after fingerprints; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. This record set is not a published descriptor. |
+| `FactorCacheSnapshotManifest` / `PublishedFactorCacheSnapshot` | Published factor object manifest / descriptor-bound reader | Exactly `object_id`, `relative_path`, `object_sha256`, `byte_count`, `row_count`, `schema_version`, `schema_hash`, `records_sha256`, before/after fingerprints plus reader identity; no embedded mutable rows. |
+| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. Cache descriptor identity/hash/bytes/rows/schema MUST equal `FactorCacheSnapshotManifest`. |
 | `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash and is identical in model, serializer and table. |
 | `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict` and `aggregate_sha256` are identical in model, serializer and table. |
 | `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | Candidate fields are exactly `candidate_id`, `trade_date`, `universe_id`, `provider_id`, `evidence_id`, `evidence_sha256`, `normalized_object_relative_path`, `normalized_object_sha256`, `gate_report_relative_path`, `gate_report_sha256`, `factor_resolution_sha256`, `adapter_version`, `source_schema_version`, `row_count`, `required_symbol_count`, `status`, `manifest_sha256`; selection fields are exactly the model fields below. |
@@ -1179,6 +1223,15 @@ class ExpectedLogicalRequest(BaseModel):
     start_date: date
     end_date: date
     pagination_policy: PaginationPolicy
+
+    @model_validator(mode="after")
+    def validate_call_symbols(self) -> "ExpectedLogicalRequest":
+        if self.endpoint in {ProviderEndpoint.TRADE_DATES, ProviderEndpoint.ALL_STOCK}:
+            if self.symbols:
+                raise ValueError("calendar and universe calls require empty per-call symbols")
+        elif not self.symbols:
+            raise ValueError("non-calendar/non-universe calls require per-call symbols")
+        return self
 
 class ExpectedLogicalRequestPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -1229,7 +1282,12 @@ class RequestCompletion(BaseModel):
             raise ValueError("attempt request IDs must be unique")
         if self.final_outcome != self.attempts[-1].outcome:
             raise ValueError("final outcome must match final attempt")
+        success_count = sum(
+            attempt.outcome is TransportOutcome.SUCCESS for attempt in self.attempts
+        )
         if self.final_outcome == TransportOutcome.SUCCESS:
+            if success_count != 1:
+                raise ValueError("a completion has exactly one final successful attempt")
             if self.successful_attempt is None or self.successful_request_id is None:
                 raise ValueError("successful completion requires final request binding")
             final = self.attempts[-1]
@@ -1237,8 +1295,13 @@ class RequestCompletion(BaseModel):
                 raise ValueError("successful attempt must be final")
             if final.request_id != self.successful_request_id or final.outcome != TransportOutcome.SUCCESS:
                 raise ValueError("successful request binding mismatch")
-        elif self.successful_attempt is not None or self.successful_request_id is not None:
-            raise ValueError("failed completion cannot bind a successful attempt")
+        else:
+            if success_count != 0:
+                raise ValueError("a failed completion cannot contain a successful attempt")
+            if self.successful_attempt is not None or self.successful_request_id is not None:
+                raise ValueError("failed completion cannot bind a successful attempt")
+            if self.row_count != 0:
+                raise ValueError("failed completion row count must be zero")
         return self
 ```
 
@@ -1247,18 +1310,24 @@ page count. `request_plan_hash` is SHA-256 of the canonical logical-request tupl
 field. After execution, each logical request emits exactly one `RequestCompletion`; every attempt
 has a fresh request ID, attempt numbers are strictly ordered, and non-empty observed pages are
 unique, start at page 1 and are contiguous. Exactly one successful attempt/request ID is allowed
-when `final_outcome=success`; it MUST be the final attempt and MUST be terminal. A failed final
-attempt has `final_outcome=error`, null successful fields and cannot publish evidence. A transport
-failure before page 1 is represented by an empty page tuple; no page is invented. Failed-attempt
-page counters and sanitized transport outcomes may remain in the completion/audit projection, but
-their row values and page bytes are discarded before the next attempt. Only the final successful
-attempt's pages receive `EvidenceObjectDescriptor` and `TransportLineageRef` records. The
-completion validator MUST bind every descriptor to the successful request ID/attempt, contiguous
-pages and terminal marker before any object compare-create. `completion_hash` is SHA-256 of the
-ordered completion/attempt/page-descriptor tuple without its hash field and is independent of the
-logical request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages,
-duplicate request IDs or inconsistent final success/failure cardinality fail closed. No total-page
-guess is required.
+when `final_outcome=success`; it MUST be the final attempt and MUST be terminal. A successful
+attempt is terminal: no later attempt is legal, and two successful attempts are never legal. All
+earlier attempts in a successful completion are non-success transport outcomes. A failed final
+attempt has `final_outcome` equal to its final non-success outcome, zero `row_count`, null
+successful fields and cannot publish evidence. A transport failure before page 1 is represented by
+an empty page tuple; no page is invented. `AttemptCompletion` deliberately has no source
+`row_count`, row values or page bytes: failed attempts may retain only bounded F0.1 page/recv
+counters, outcome, request ID and sanitized observation digest. Only the final successful attempt's
+pages receive `EvidenceObjectDescriptor` and `TransportLineageRef` records. For a successful
+completion, `RequestCompletion.row_count` MUST equal the sum of the final successful descriptors'
+read-back row counts; failed-attempt counters are excluded from that sum, manifest `row_count` and
+all object/hash inputs. The completion validator MUST bind every descriptor to the successful
+request ID/attempt, contiguous pages and terminal marker before any object compare-create.
+`completion_hash` is SHA-256 of the ordered completion/attempt/page-descriptor tuple without its
+hash field and is independent of the logical request-plan hash. Missing, duplicate,
+non-contiguous, out-of-order, swallowed pages, duplicate request IDs, success-after-success,
+success-before-later-attempt or inconsistent final success/failure cardinality fail closed. No
+total-page guess is required.
 
 ### Provider registry
 
@@ -1293,9 +1362,9 @@ additional summary fields hidden in prose. Per-endpoint `source_schema`, `units`
 | objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per final-success logical request/page/shard; failed attempts have none |
 | transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every published final-success page is bound to an exact allowlisted projection; failed attempts may appear only as sanitized aggregate observations |
 | endpoint_summaries | `tuple[EndpointContractSummary, ...]` | Exact source schema/units/date semantics, counts equal descriptor sums |
-| factor_cache_snapshot / factor_resolution | optional snapshot + ordered bindings | Actual cache keys only; provenance and raw endpoint resolution bound |
+| factor_cache_snapshot / factor_resolution | `PublishedFactorCacheSnapshot` + ordered bindings | Descriptor-bound object identity/size/schema/row/records hashes; actual cache keys only |
 | factor_resolution_sha256 | SHA-256 | Hash of ordered live/cache resolution bindings; enters candidate lineage |
-| object_count / row_count | bounded integers | Equal to descriptor sums and readback rows |
+| object_count / row_count | bounded integers | Equal to descriptor sums and readback rows; failed-attempt counters never contribute |
 | failure_class | allowlisted optional class | No raw provider message/exception |
 | manifest_sha256 | SHA-256 | Canonical manifest bytes excluding its own hash |
 
@@ -1397,12 +1466,12 @@ written. The only permitted combinations are:
 
 | Endpoint | Request role | Instrument role | Required symbol rule |
 | --- | --- | --- | --- |
-| `trade_dates` | `calendar` | `None` | no symbols; exact requested date/range |
-| `all_stock` | `universe` | `stock` | no per-row index role; universe rows are stock symbols |
-| `daily_astock` | `daily_stock` | `stock` | symbols are the declared stock universe |
-| `daily_factor` | `daily_factor` | `stock` | symbols are declared stock factor keys |
-| `adjust_factor` | `adjust_factor` | `stock` | exactly one requested stock symbol per shard |
-| `index_history` | `index_history` | `index` or `stock` | `index` requires `INDEX_SYMBOLS`; `stock` is an explicit compatibility variant only |
+| `trade_dates` | `calendar` | `None` | `ExpectedLogicalRequest.symbols == ()`; exact requested date/range |
+| `all_stock` | `universe` | `stock` | `ExpectedLogicalRequest.symbols == ()`; universe rows are stock symbols |
+| `daily_astock` | `daily_stock` | `stock` | non-empty per-call symbols are a shard of `ProviderRequest.session_symbols` |
+| `daily_factor` | `daily_factor` | `stock` | non-empty per-call symbols are declared stock factor keys |
+| `adjust_factor` | `adjust_factor` | `stock` | non-empty per-call symbols; exactly one requested stock symbol per shard |
+| `index_history` | `index_history` | `index` or `stock` | non-empty per-call symbols; `index` requires `INDEX_SYMBOLS`; `stock` is an explicit compatibility variant only |
 
 `index_history.session.v1` and `index_history.range.v1` therefore carry an explicit role rather
 than inferring index status from a symbol string. A stock-role index-history request is validated
@@ -1455,17 +1524,22 @@ and it performs no schema migration. It MUST NOT copy unrelated cache rows, data
 tokens or mutable cache diagnostics.
 
 The capture runs inside the same outer `RefreshRunLock` as online evidence publication. The
-adapter obtains a stable read-only snapshot and a before/after fingerprint of the selected keys;
-any missing key, cache mutation, schema mismatch or fingerprint change fails closed. The published
-`FactorCacheSnapshot` is the only factor input to online normalization and replay; neither path
-reads the live mutable cache after capture. If the live `daily_factor` or `adjust_factor` endpoint
+adapter obtains a stable read-only `FactorCacheSnapshotRecords` set and a before/after fingerprint
+of the selected keys; any missing key, cache mutation, schema mismatch or fingerprint change fails
+closed. The writer serializes those records to one immutable object and publishes a
+`FactorCacheSnapshotManifest` plus matching `EvidenceObjectDescriptor`; the
+`PublishedFactorCacheSnapshot` is the only factor input to online normalization and replay,
+neither path reads the live mutable cache after capture. If the live `daily_factor` or
+`adjust_factor` endpoint
 also supplies a factor row, its raw endpoint object remains in `RawEndpointBatch` and the
 `FactorResolutionBinding` records whether the selected provenance came from the cache snapshot or
 that endpoint row. A binding mismatch, missing selected object or unproven source is a complete
 candidate failure. Task 8 owns the read-only cache method and its schema/immutability tests,
-serializes the snapshot object and binding in `market/evidence.py`, and adds no factor-cache writer
-or live-cache replay path. The ordered binding hash `factor_resolution_sha256` is present in both
-the evidence manifest and candidate manifest.
+serializes the records, manifest and binding in `market/evidence.py`, and adds no factor-cache
+writer or live-cache replay path. The ordered binding hash `factor_resolution_sha256` is present in
+both the evidence manifest and candidate manifest. Replay must open the published descriptor by
+dirfd, verify its object hash/schema/size/row/records hashes, and reject any manifest/descriptor
+or binding mismatch in either direction.
 
 ## Acceptance criteria
 
@@ -1586,9 +1660,12 @@ Given a request or response using an unknown provider, symbol, field, schema var
 rule or row shape
 When the Task 7 contract/adapter validates it
 Then the immutable discriminated model rejects the complete batch before evidence publication,
-each of the six endpoint IDs is accepted only through an `ENDPOINT_CONTRACTS` entry, and a
-`model_copy` or round-trip that changes role, fields, units, date semantics or pagination policy
-also fails closed.
+each of the six endpoint IDs is accepted only through an `ENDPOINT_CONTRACTS` entry, calendar and
+universe logical requests require empty per-call symbols while other roles require exact non-empty
+shards, and a `model_copy` or round-trip that changes role, fields, units, date semantics,
+pagination policy or symbol vocabulary also fails closed. The Task 8 factor snapshot manifest and
+descriptor must likewise reject any model-copy/round-trip identity, hash, size, row or schema
+mismatch in either direction.
 
 ### AC-17: Request/object/transport cardinality (FR-30–FR-31, NFR-2–NFR-6, NFR-16)
 
@@ -1597,12 +1674,13 @@ When Task 8 assembles its evidence manifest
 Then every logical plan item has exactly one completion and every observed page has exactly one
 descriptor and bound sanitized observation lineage only when it belongs to the final successful
 attempt; failed attempts retain only bounded page counters/outcomes/request IDs and never create
-evidence files. Every attempt has a joinable request ID, observed pages are contiguous, and exactly
-one final successful attempt or final failure is recorded, with no missing, extra, duplicate,
-out-of-order or swallowed page. A retry that succeeds publishes only final-attempt pages. An
-ultimate failure publishes no evidence manifest, does not normalize, and cannot create a candidate,
-selection or pointer mutation. A competing writer performs zero canonical writes. The plan does not
-require a pre-fetched total page count.
+evidence files or source row counts. Every attempt has a joinable request ID, observed pages are
+contiguous, and exactly one final successful attempt or final failure is recorded, with no missing,
+extra, duplicate, out-of-order or swallowed page. A retry that succeeds publishes only final-attempt
+pages and `RequestCompletion.row_count` equals the final descriptor read-back row sum. An ultimate
+failure has `row_count=0`, publishes no evidence manifest, does not normalize, and cannot create a
+candidate, selection or pointer mutation. A competing writer performs zero canonical writes. The
+plan does not require a pre-fetched total page count.
 
 ### AC-18: Canonical gate aggregate (FR-32, NFR-6–NFR-8)
 
@@ -1619,7 +1697,9 @@ Then online and replay use the same `normalization_clock_utc`, same-version outp
 documented encoding-only changes require semantic equality, and missing/corrupt/read-only roots
 cause zero writes. `SafeRelativePath` construction and `model_copy` reject lexical component
 violations, while `open_evidence_relative(root_dirfd, path, flags)` independently enforces
-dirfd/O_NOFOLLOW descriptor containment and TOCTOU identity checks.
+dirfd/O_NOFOLLOW descriptor containment and TOCTOU identity checks. A factor snapshot replay
+accepts only a descriptor-bound object whose ID/path/hash/bytes/rows/schema/records hashes agree
+with both the published factor manifest and the evidence descriptor; live-cache reads are zero.
 
 ### AC-20: Fallback and validator boundaries (NFR-18, FR-27)
 

@@ -11,7 +11,7 @@ normalize only from that evidence, replay it offline, and record complete candid
 lineage while preserving every legacy reader and canonical publication invariant.
 
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`2f2e05afe4566600bec5913313001aa997130b3a`.
+`41a3c4080c41411f6687d3a8854eea6e3bf74cbf`.
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -141,7 +141,9 @@ Add tests for:
 
 ```python
 def test_provider_id_is_static_baostock_allowlist(): ...
-def test_provider_request_requires_exact_sorted_unique_symbols_and_aware_dates(): ...
+def test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates(): ...
+def test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe(): ...
+def test_provider_and_logical_request_model_copy_round_trip_revalidates_symbol_roles(): ...
 def test_raw_batch_rejects_unknown_fields_secrets_headers_urls_and_raw_exception(): ...
 def test_raw_batch_rejects_nonfinite_values_and_row_shape_mismatch(): ...
 def test_each_baostock_endpoint_has_exact_fields_variant_units_and_order(): ...
@@ -152,7 +154,10 @@ def test_endpoint_role_validator_rejects_stock_index_role_mismatch(): ...
 def test_transport_lineage_preserves_unknown_provider_code_and_maps_unknown_protocol(): ...
 def test_transport_projection_preserves_all_allowlisted_fields_and_digest(): ...
 def test_logical_request_plan_hash_excludes_observed_pages_and_completion_hash_binds_them(): ...
-def test_request_completion_rejects_missing_duplicate_noncontiguous_pages_or_terminal_marker(): ...
+def test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker(): ...
+def test_request_completion_rejects_success_then_later_attempt_and_multiple_successes(): ...
+def test_failed_completion_has_zero_row_count_and_no_failed_source_rows(): ...
+def test_request_completion_model_copy_round_trip_revalidates_success_cardinality(): ...
 def test_baostock_adapter_preserves_endpoint_and_session_contract(): ...
 def test_baostock_adapter_captures_source_rows_before_normalization(): ...
 def test_baostock_compatibility_produces_existing_daily_bar_semantics(): ...
@@ -184,7 +189,7 @@ Implement:
 - a frozen `ProviderId`/registry admitting only `ProviderId.BAOSTOCK`, rejecting empty/path-like/mixed-case/plugin
   identities;
 - typed `ProviderRequest`, `RawEndpointBatch` and `ProviderRawBatch` with bounded allowlisted
-  source fields, UTC timestamps, exact date/universe/symbols, separate logical request-plan and
+  source fields, UTC timestamps, exact date/universe/complete non-empty `session_symbols`, separate logical request-plan and
   observed completion hashes, endpoint summaries and sanitized failure metadata;
 - the authoritative `ENDPOINT_CONTRACTS` constant and exact endpoint/schema variants:
   `trade_dates.v1`, `all_stock.market.v1`,
@@ -199,7 +204,9 @@ Implement:
   per-projection/ordered aggregate SHA-256 digests, binding every endpoint/page/attempt to
   `refresh_id/provider_session_id/request_id`;
 - `InstrumentRole`/`RequestRole` cross-validation for stock/index `index_history` variants and
-  `validate_raw_date_binding(request, batch)` before normalization; do not change `normalize.py`;
+  `ExpectedLogicalRequest.symbols == ()` for `trade_dates`/`all_stock`, non-empty exact per-call
+  shards for every other endpoint, and `validate_raw_date_binding(request, batch)` before
+  normalization; do not change `normalize.py`;
 - compatibility delegation so existing `BaoStockProvider.fetch()` callers keep the current
   canonical models and behavior during the transition.
 
@@ -281,8 +288,13 @@ def test_failed_partial_attempt_creates_zero_evidence_files(tmp_path): ...
 def test_retry_success_publishes_only_final_successful_attempt_pages(tmp_path): ...
 def test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer(tmp_path): ...
 def test_failed_partial_payload_is_not_quarantined_or_hashed(tmp_path): ...
-def test_factor_snapshot_fingerprint_change_fails_closed_and_replay_uses_published_snapshot(tmp_path): ...
+def test_retry_success_row_count_equals_final_descriptor_rows(tmp_path): ...
+def test_failed_attempt_row_count_is_excluded_from_manifest_and_hash(tmp_path): ...
+def test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash(tmp_path): ...
+def test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions(tmp_path): ...
+def test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache(tmp_path): ...
 def test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only(tmp_path): ...
+def test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding(tmp_path): ...
 def test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment(tmp_path): ...
 def test_safe_relative_path_model_copy_round_trip_rejects_escape(tmp_path): ...
 def test_open_evidence_relative_uses_dirfd_nofollow_containment(tmp_path): ...
@@ -342,17 +354,25 @@ Required behavior:
   attempt, and MUST require a terminal/end marker without requiring a prefetch page total.
   Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
   object, manifest or hash; only sanitized transport observations may survive for audit.
-- Serialize one `factor_cache_snapshot` object containing only the selected keys returned by
-  `AdjustmentFactorCache.exact_snapshot_records(symbols, trade_date)`. Each record MUST mirror the
-  current `factor_snapshots` columns (`symbol`, `trade_date`, `fore_adjust_factor`,
-  `back_adjust_factor`, `evidence_kind`, `evidence_effective_date`, `evidence_observed_on`,
-  `source_row_hash`, `observed_at`) plus a stable row fingerprint; no invented `source`,
-  `effective`, `observed`, `adjust_factor` or cache-version field and no schema migration is
-  allowed. Capture and verify before/after fingerprints while the same `RefreshRunLock` is held.
-  If the snapshot changes, is incomplete or cannot bind a mutually exclusive live/cache
-  `FactorResolutionBinding`, fail closed. Online normalization and replay consume only this
-  published snapshot; live mutable cache reads after capture are forbidden. The ordered binding
-  hash `factor_resolution_sha256` MUST be copied into the evidence and candidate manifests.
+- Serialize one immutable `factor_cache_snapshot` object from the in-memory
+  `FactorCacheSnapshotRecords` returned by `AdjustmentFactorCache.exact_snapshot_records(symbols,
+  trade_date)`. Each record MUST mirror the current `factor_snapshots` columns (`symbol`,
+  `trade_date`, `fore_adjust_factor`, `back_adjust_factor`, `evidence_kind`,
+  `evidence_effective_date`, `evidence_observed_on`, `source_row_hash`, `observed_at`) plus a
+  stable row fingerprint; no invented `source`, `effective`, `observed`, `adjust_factor` or
+  cache-version field and no schema migration is allowed. Publish a separate frozen
+  `FactorCacheSnapshotManifest` containing `object_id`, `relative_path`, `object_sha256`,
+  `byte_count`, `row_count`, `schema_version`, `schema_hash`, `records_sha256` and before/after fingerprints.
+  The matching `EvidenceObjectDescriptor(kind=factor_cache_snapshot)` MUST equal that manifest
+  bidirectionally for ID/path/hash/bytes/rows/schema and records hash, and MUST be included in
+  `EvidenceManifest.objects`. Capture and verify before/after fingerprints while the same
+  `RefreshRunLock` is held. If the snapshot changes, is incomplete or cannot bind a mutually
+  exclusive live/cache `FactorResolutionBinding`, fail closed. A cache binding MUST contain only
+  `cache_object_id`, `cache_object_sha256` and `record_key`, with `live=None`. Online normalization
+  and replay consume only `PublishedFactorCacheSnapshot`; replay opens the descriptor by dirfd,
+  verifies hash/schema/bytes/rows/records hash and then resolves the record key. Live mutable cache
+  reads after capture are forbidden. The ordered binding hash `factor_resolution_sha256` MUST be
+  copied into the evidence and candidate manifests.
 - Use evidence compare-create/no-clobber CAS. Identical content is idempotent; a collision with
   different bytes fails closed. Preserve unreferenced staging under `orphan-audit` and never adopt
   it automatically.
@@ -634,26 +654,26 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | FR-17–FR-19, FR-24–FR-26 | models/store/dataset/publication/API readers plus evidence reader | legacy fixtures, lineage mismatch, pointer/read-only fingerprints |
 | FR-20–FR-23 | `validate_raw_date_binding(request, batch)`, existing publication requested-date/session identity gate, adapter failure mapping and existing normalizer quality rules | pre-normalize cross-day rejection, unit/factor/suspension and sanitized failure tests; no `normalize.py` date-binding claim |
 | FR-27 | whitelist/diff and absence of second-source code | static review and no-network gate |
-| FR-28–FR-29 | `providers/base.py` frozen models and role cross-validator | immutable extra-forbid model and exact endpoint variant tests |
-| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion and projection digest/cardinality tests |
+| FR-28–FR-29 | `providers/base.py` frozen models and role cross-validator | immutable extra-forbid model, complete `session_symbols`/per-call symbol rules, factor snapshot manifest/descriptor model and exact endpoint variant tests |
+| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion success cardinality, zero failed row-count, final-descriptor row-count and projection digest/cardinality tests |
 | FR-32 | `market/candidates.py` | exact ordered ten-outcome aggregate test |
 | FR-33 | `market/evidence.py` injected clock plus adapter call boundary | deterministic replay and frozen-clock tests; `normalize.py` remains unchanged |
 | NFR-1–NFR-6 | evidence/publish locking, hashes, canonical serializers | crash/concurrency/TOCTOU/determinism tests |
 | NFR-7–NFR-12 | additive migration and read-only paths | full regression, legacy byte fingerprints, GET/plan/replay tests |
 | NFR-13–NFR-14 | plan/review gates and static registry | commit/review records, dynamic-import scan |
-| NFR-15–NFR-17 | evidence layout/CAS, model↔persisted-field audit and manual traceability | descriptor-bound read, strict design validator and numbered matrix; repeat the design's field diff from actual models/SQL |
+| NFR-15–NFR-17 | evidence layout/CAS, model↔persisted-field audit and manual traceability | descriptor-bound factor snapshot ID/path/hash/bytes/rows/schema/records checks, strict design validator and numbered matrix; repeat the design's field diff from actual models/SQL |
 | NFR-18 | `market/candidates.py` selection policy | fallback rejection and static second-source scan |
 | AC-1–AC-3 | Task 7 provider contract | named provider/adapter tests |
 | AC-4–AC-7 | Task 8 evidence/replay | hash, crash, corruption, zero-write tests |
 | AC-8–AC-11 | Task 9 candidate/selection | gate, lineage, canonical-chain and legacy tests |
 | AC-12–AC-14 | Tasks 8–9 read-only/concurrency | fingerprints, CAS and TOCTOU tests |
-| AC-15–AC-17 | Tasks 7–8 boundary/cardinality | role, exact variant and plan/completion tests |
+| AC-15–AC-17 | Tasks 7–8 boundary/cardinality | role, exact variant, complete session/per-call symbol, request completion success-cardinality and final-row-count tests |
 | AC-18 | Task 9 gate aggregate | exact ten-outcome aggregate test |
 | AC-19 | Task 8 clock/layout/CAS | frozen-clock, storage and replay tests |
 | AC-20 | Task 9 validator/fallback boundary | static validator/manual traceability and fallback test |
 | EC-1–EC-5 | Task 7 provider/transport contract | sanitized endpoint/failure tests |
-| EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser-before-reader with root fingerprints and zero provider/network calls, cardinality, digest, clock and storage tests |
-| EC-10–EC-18, EC-23, EC-26 | Task 9 candidate/selection | lineage, semantic, aggregate, pointer and fallback tests |
+| EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser-before-reader with root fingerprints and zero provider/network calls, successful-attempt/row-count, factor descriptor bidirectional binding, cardinality, digest, clock and storage tests |
+| EC-10–EC-18, EC-23 | Task 9 candidate/selection | lineage, semantic, aggregate, pointer and fallback tests |
 
 If `spec_validator.py --strict` cannot parse the Markdown because of Chinese/Markdown formatting,
 record its actual exit code/output and complete this matrix manually. Do not weaken the spec to make
@@ -673,13 +693,14 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | EC-17 suspended placeholder | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_daily_schema_preserves_legal_suspended_empty_activity_and_factor`; existing exact placeholder gate passes only for legal suspended rows. |
 | EC-18 active/suspended/index semantics | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_and_suspended_index`. |
 | Six endpoint IDs / nine stock-index schema-role variants | Task 7.1 / 7.2 | `test_each_baostock_endpoint_has_exact_fields_variant_units_and_order`, `test_endpoint_contract_constant_rejects_wrong_combination_and_model_copy`; no unknown fields/union-any. |
-| Plan/attempt/object cardinality | Tasks 7.1–8.2 | `test_request_completion_rejects_missing_duplicate_noncontiguous_pages_or_terminal_marker`, `test_manifest_requires_one_descriptor_per_request_shard_and_page`; every attempt/request ID and page joins exactly one descriptor. |
-| Successful-attempt-only evidence | Task 8.1 / 8.2 | `test_failed_partial_attempt_creates_zero_evidence_files`, `test_retry_success_publishes_only_final_successful_attempt_pages`, `test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer`, `test_failed_partial_payload_is_not_quarantined_or_hashed`; failed rows/page bytes never reach staging/object/manifest/hash. |
+| Plan/attempt/object cardinality | Tasks 7.1–8.2 | `test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker`, `test_request_completion_rejects_success_then_later_attempt_and_multiple_successes`, `test_request_completion_model_copy_round_trip_revalidates_success_cardinality`, `test_manifest_requires_one_descriptor_per_request_shard_and_page`; every attempt/request ID and page joins exactly one descriptor. |
+| Successful-attempt-only evidence and row count | Task 8.1 / 8.2 | `test_failed_partial_attempt_creates_zero_evidence_files`, `test_retry_success_publishes_only_final_successful_attempt_pages`, `test_retry_success_row_count_equals_final_descriptor_rows`, `test_failed_attempt_row_count_is_excluded_from_manifest_and_hash`, `test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer`, `test_failed_partial_payload_is_not_quarantined_or_hashed`; failed rows/page bytes/counts never reach staging/object/manifest/hash. |
 | Transport observation digest | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_every_evidence_descriptor_binds_sanitized_transport_observation_digest`; payload/message/URL/token assertions remain negative. |
 | Gate cardinality | Task 9.1 / 9.2 | `test_gate_report_requires_exact_ordered_complete_gate_aggregate`; one canonical report/hash only. |
 | Replay clock/hash | Task 8.1 / 8.2 | `test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time`; same-version byte equality and explicit cross-version semantic exception. |
 | Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
-| Factor snapshot provenance | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint and live-cache exclusion. |
+| Factor snapshot provenance and published descriptor | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash`, `test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions`, `test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding`, `test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint, descriptor bidirectional equality and live-cache exclusion. |
+| Complete session/per-call symbol vocabulary | Task 7.1 / 7.2 | `test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates`, `test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe`; no ambiguous top-level `symbols`. |
 | SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`, `test_open_evidence_relative_uses_dirfd_nofollow_containment`; model is lexical-only and storage owns descriptor-bound containment. |
 | Replay CLI parser ordering | Task 8.1 / 8.2 | `test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader`; parser exits before layout/evidence reader construction, with zero provider/network calls and unchanged root tree/bytes/mtimes. |
 | Selection/pointer order | Task 9.1 / 9.2 | `test_selection_publish_order_never_moves_pointer_early`; selection readback precedes existing pointer chain. |
@@ -688,6 +709,12 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-20 and EC-1–EC-26 to a
 Task step and one of these concrete tests or an explicit static/diff proof. The design-only
 `spec_validator.py` is not allowed to claim implementation or traceability coverage.
+
+Coverage audit for this revision: FR-1..FR-33, NFR-1..NFR-18, AC-1..AC-20 and EC-1..EC-26 are
+all present exactly once in the range matrix after expanding each range; no numbered item is
+unmapped. The new successful-attempt row-count, factor snapshot descriptor and complete-session
+symbol boundaries are separately named above because they are blocking contract proofs, not
+implicit coverage from a broader range.
 
 ### Acceptance document and independent final review
 
