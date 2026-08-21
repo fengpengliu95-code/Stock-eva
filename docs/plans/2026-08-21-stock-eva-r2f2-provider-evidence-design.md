@@ -2,18 +2,18 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** Approved — independent final specification review completed at exact clean reviewed
-HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`; user Option A (successful-attempt-only
-evidence) is normative
-**Decision authority:** User approved starting R2-F2 on 2026-08-21; independent final review
-  approved this specification for the offline Task 7–9 plan only.
+**Status:** In Review — architecture amendment required; implementation is blocked and this
+document is not approved
+**Decision authority:** User approved the R2-F2 direction and Option A on 2026-08-21; the prior
+planning review is historical evidence only and does not approve this amended architecture.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
-**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean reviewed HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0`
-**Reviewers:** The preceding independent review found contract gaps around attempt completion,
-path/storage separation, field/type drift, CLI parser ordering and traceability; the amendment
-recorded the user's Option A decision and reconciled them for re-review. The independent final
-review recorded below is separate from that amendment and is the approval authority.
+**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean code HEAD
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9`; this code HEAD is review evidence only and is not a
+delivery or GO commit
+**Reviewers:** The preceding independent reviews found contract gaps around attempt completion,
+path/storage separation, field/type drift, CLI parser ordering and traceability. Three Task 7
+implementation rounds were reviewed as NO-GO; the exact commits and reconstructed H5/M6 findings
+are recorded in the architecture amendment below. None is delivery.
 
 **Related documents:**
 
@@ -28,7 +28,81 @@ review recorded below is separate from that amendment and is the approval author
 This document specifies Tasks 7–9 of the umbrella plan. It does not approve R2-F3, a second
 provider, automatic failover, production refresh, installation, NAS access or LaunchAgent work.
 
-## Specification review closure (authoritative amendment before RED)
+## Architecture amendment (authoritative revision before any RED)
+
+This revision is documentation-only. It changes status to **In Review — architecture amendment
+required** and deliberately does not self-approve. The exact code HEAD `fea5678` is a non-delivery
+review baseline. The normative Option A successful-attempt-only rule remains unchanged.
+
+### Task 7 review history and reconstructed H5/M6 findings
+
+| Review round | Exact commit | Verdict | Reconstructed blocking evidence |
+| --- | --- | --- | --- |
+| Task 7 initial | `63903663c48149fa3529852eb889c482c9558447` | NO-GO | Provider-neutral contracts and adapter were introduced without a closed actual-session/page identity model; the implementation was not delivery-ready. |
+| Task 7 repair 1 | `c977a40845fec69e99db3655cb0da1ec24700cee` | NO-GO | Retry/completion and transport projection closure improved, but caller-provided identity and completion/page join semantics remained unsafe for evidence publication. |
+| Task 7 repair 2 | `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` | NO-GO | H5: `ProviderRequest` still carries caller-overridable `provider_session_id` and `request_id`; the adapter passes the session override into `provider_session_scope()`. M6: login/relogin observations and query/page request IDs are not modeled as disjoint actual lineages, so a terminal non-OPERATION observation can be mistaken for query completion and page identity is not closed by the required root/page tuple. |
+
+The H5/M6 reconstruction is grounded in the exact code diff: `ProviderRequest` has
+`provider_session_id`/`request_id`; `BaoStockProviderAdapter.fetch_raw()` passes the former into
+incumbent login; `provider_session_scope()` accepts an optional override; and completion/page
+selection is derived from the mixed observation stream. These are architecture blockers, not
+permission to patch production code in this task.
+
+### Identity contract amendment (normative)
+
+1. `ProviderRequest` MUST contain only `provider_id`, `refresh_id`, `trade_date`, `universe_id`,
+   complete sorted unique non-empty `session_symbols`, and one `ExpectedLogicalRequestPlan`.
+   It MUST NOT contain a provider-session ID, root request ID, page request ID or any transport
+   request identity. An envelope ID is not added; if a future envelope is needed it MUST use a
+   distinct name and MUST be explicitly non-transport/non-lineage.
+2. Every actual login/relogin MUST enter incumbent `provider_session_scope()` without a caller
+   override; that scope generates one unique actual `provider_session_id`. Every logical query
+   attempt MUST enter a real query-root `request_scope()` that generates one fresh root
+   `request_id`; every pagination page MUST enter a fresh page `request_scope()` and capture its
+   actual page `request_id`. Callers may not supply or override any of these IDs.
+3. `AttemptCompletion` MUST carry the actual `provider_session_id` and query-root
+   `root_request_id`. Login/relogin observations are sanitized transport audit/lineage only,
+   never a query completion; they are associated with the current logical call by `plan_ordinal`.
+   The terminal state of an attempt is determined only by the matching query-root observation
+   whose `protocol_stage` is `OPERATION`. Page/complete/login observations cannot determine the
+   attempt outcome.
+4. Every captured final-success page MUST close over actual
+   `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`
+   (or an equivalent typed structure). One final-success page/shard produces exactly one
+   `RawEndpointBatch` whose lineage is the actual page request. Failed-attempt pages retain only
+   bounded counts/IDs/audit; all failed source rows and bytes are discarded.
+5. `ProviderRawBatch`/`EvidenceManifest` joins MUST use the exact logical request plan, one
+   completion per logical query, and contiguous final-success page batches/descriptors. Duplicate,
+   missing, extra or out-of-order plans, completions, attempts, page IDs, batches or projections
+   MUST fail closed. `RequestCompletion.row_count` MUST equal the sum of final page read-back rows;
+   every final attempt's pages MUST use the same actual provider session. Actual session IDs are
+   derived from observations/pages; no forged singular top-level session is accepted.
+6. Every `raw_endpoint_page` `EvidenceObjectDescriptor` MUST retain actual
+   `provider_session_id`, query-root `root_request_id` and actual `page_request_id`; the separate
+   factor-snapshot descriptor retains its actual capture session/root identity and deliberately
+   has no page transport identity. `EvidenceManifest` has no singular session field and aggregates
+   sanitized observations across all actual sessions. `attempt_count` counts query attempts only;
+   login audit observations are not query attempts.
+7. The six endpoint IDs and all nine stock/index variants remain exact. Source schema is validated
+   before any zip/object publication, then the read-back source/object digest and schema digest are
+   recomputed before the descriptor or manifest is accepted; adapter and endpoint-contract versions
+   MUST equal the exact current constants, not merely match a safe-token grammar. The public export
+   matrix MUST export every frozen provider contract required by the implementation and tests.
+8. At the typed adapter boundary, blank numeric source values become `None` only for a legally
+   suspended stock row. Active blank numerics, suspended index rows and non-zero suspended
+   activity are rejected. Factor rows MUST use exact logical symbols and `daily_factor` evidence
+   is sorted by `(date, code)`; an empty daily-factor event is raw evidence only, while Task 8's
+   factor-cache snapshot and later factor gate must prove resolution.
+9. Task 8 owns `PublishedEvidence` and `EvidenceReader`. A Task 7 compatibility test MAY use a
+   narrow test seam, but the canonical path MUST be replaced by Task 8's typed
+   hash/schema/row/descriptor-bound reader before any evidence is normalized. Task 7 MUST NOT
+   duplicate `PublishedEvidence` or claim canonical evidence normalization.
+
+No production or test code is changed by this amendment. Existing outer `RefreshRunLock`, Option A,
+no failed source bytes, no dynamic plugin/second provider, no transport/vendor/normalizer changes,
+no network and the production-unchanged boundary remain normative.
+
+## Specification review closure (superseded; retained for Option A rationale)
 
 ### User architecture decision: Option A — successful attempt only
 
@@ -36,7 +110,8 @@ The user selected **A: only persist the complete evidence from the final success
 This is a normative boundary for every model, validator, writer, reader, hash and test below:
 
 - `AttemptCompletion` MAY retain only bounded, sanitized failure-attempt counters, outcome and
-  request identity (`request_id`, observed page numbers/counts and transport observation digest).
+  actual identity (`provider_session_id`, `root_request_id`, observed page numbers/page IDs and
+  transport observation digest).
   It MUST NOT retain failed-attempt row values, payload bytes, page bytes, decompressed content or
   arbitrary provider text.
 - A failed attempt's row count, payload and page bytes are discarded in memory before the next
@@ -45,9 +120,10 @@ This is a normative boundary for every model, validator, writer, reader, hash an
   is explicitly out of scope.
 - `EvidenceObjectDescriptor` and source-shaped Parquet objects MUST reference only the one final
   successful attempt for each logical request. The descriptor is logically unique by
-  `(plan_ordinal, request_id, page)` and its `attempt` MUST equal `RequestCompletion.successful_attempt`.
+  `(plan_ordinal, root_request_id, page_request_id, page)` and its `attempt` MUST equal
+  `RequestCompletion.successful_attempt`.
 - `RequestCompletion` MUST be final-success bound before publication: `final_outcome=success`,
-  exactly one `successful_attempt`/`successful_request_id`, that request ID is the final attempt,
+  exactly one `successful_attempt`/`successful_root_request_id`, that root request ID is the final attempt,
   all published descriptors belong to it, observed pages are contiguous from page 1, and a
   terminal/end marker is present. A final failure has null successful fields and cannot publish.
 - Sanitized `TransportObservationProjection` records for failed attempts MAY be retained as
@@ -96,8 +172,8 @@ closures are:
 | M14 — endpoint/date/path validators were declarative only | Tables described variants, but no authoritative endpoint constant, pre-normalize date binding or semantic relative-path/storage boundary was frozen. | Add `ENDPOINT_CONTRACTS`, `validate_raw_date_binding(request,batch)`, and lexical plus dirfd/O_NOFOLLOW containment rules with model-copy regressions. |
 
 The amendment is still documentation-only. No RED test, provider request, external operation or
-production mutation may begin until the next independent review changes this document to
-**Approved**.
+production mutation may begin until an independent specification reviewer records a separate
+approval decision for this amended contract.
 
 ## Context
 
@@ -177,9 +253,10 @@ automatic failover may be used to close that gap.
 - FR-1: **Registry admission:** The provider registry MUST be static and allow only
   `ProviderId("baostock")` in R2-F2. Unknown, empty, mixed-case, path-like or plugin-resolved IDs
   MUST fail closed.
-- FR-2: **Provider contract:** `ProviderRequest` MUST carry provider ID, exact trade date,
-  universe ID and a sorted unique, non-empty `session_symbols` set representing the complete
-  canonical target. `ProviderRawBatch` MUST carry adapter and
+- FR-2: **Provider contract:** `ProviderRequest` MUST carry only provider ID, refresh ID, exact
+  trade date, universe ID, a sorted unique non-empty complete `session_symbols` set and one
+  `ExpectedLogicalRequestPlan`; it MUST NOT carry provider-session or transport request IDs.
+  `ProviderRawBatch` MUST carry adapter and
   endpoint-contract versions, timezone-aware timestamps, endpoint rows, source schema, units and
   date semantics.
 - FR-3: **Compatibility adapter:** The BaoStock adapter MUST delegate to the incumbent
@@ -284,17 +361,22 @@ automatic failover may be used to close that gap.
   invalidate the complete batch.
 - FR-30: **Request-plan cardinality:** Every logical request and symbol/index shard MUST have one
   ordered `ExpectedLogicalRequest`; execution MUST produce exactly one `RequestCompletion` with
-  ordered `AttemptCompletion` records, fresh request IDs per attempt, contiguous observed pages and
-  one final outcome. Failed attempts may retain only sanitized counters/outcome/request IDs in
+  actual provider session IDs, fresh query-root IDs per attempt, fresh page request IDs per page,
+  ordered `AttemptCompletion` records, contiguous observed pages and
+  one final outcome. Failed attempts may retain only sanitized counters/outcome/actual IDs in
   memory and transport audit. Each published source page MUST have exactly one descriptor carrying
-  `plan_ordinal/attempt/request_id/page/object_kind`, and the descriptor MUST belong to the final
-  successful attempt. The final completion MUST be successful, terminal and bound to all published
+  `plan_ordinal/attempt/root_request_id/page_request_id/page/object_kind`, and the descriptor MUST belong to the final
+  successful attempt. `ProviderRawBatch` and `EvidenceManifest` MUST reject missing, extra,
+  duplicate or out-of-order logical requests/completions/attempts/pages/batches/descriptors; every
+  final batch lineage key plus digest MUST join exactly one sanitized observation projection, every
+  final attempt's pages MUST share its actual provider session, and `row_count` MUST equal final
+  page read-back rows. The final completion MUST be successful, terminal and bound to all published
   descriptors; an ultimate failure publishes no evidence manifest. The logical request-plan hash
   and completion hash MUST be verified before evidence, candidate or selection publication; no page
   total is guessed.
 - FR-31: **Transport binding:** Every published final-success object MUST bind
-  refresh/session/request/endpoint/attempt/page to a SHA-256 digest of the sanitized F0.1
-  observation projection. Failed-attempt projections may be included only in the sanitized ordered
+  refresh/provider-session/query-root/page-request/endpoint/attempt/page to a SHA-256 digest of the
+  sanitized F0.1 observation projection. Failed-attempt projections may be included only in the sanitized ordered
   transport aggregate and never yield source objects. Payload, URL, token, header, cookie and raw
   provider exception/message MUST remain impossible to persist.
 - FR-32: **Gate aggregate:** Candidate publication MUST create exactly one ordered
@@ -324,11 +406,14 @@ automatic failover may be used to close that gap.
   losers do zero canonical writes. Evidence does not add a second blocking lock.
 - **NFR-6 (Determinism):** Canonical JSON serialization, object hashes, candidate IDs, request keys,
   row ordering and replay output MUST be deterministic for identical inputs and contract versions.
+  Transport identities are actual scope outputs; caller input cannot select a provider session,
+  query-root request ID or page request ID.
 - **NFR-7 (Compatibility):** No existing immutable object, legacy manifest, public response contract
   or API reader requires a rewrite. New fields are additive and old source values remain valid.
 - **NFR-8 (Security):** Persisted schemas MUST have no payload/token/header/cookie/URL/path/raw
   exception field or failed-attempt page bytes; all identifiers and provider codes are bounded
-  allowlisted strings. Failure-attempt transport audit is sanitized and non-payload only.
+  allowlisted strings. Failure-attempt transport audit is sanitized and non-payload only; login
+  audit observations cannot become query completions or query attempt counts.
 - **NFR-9 (Semantic correctness):** Date, units, adjustment-factor and suspension gates MUST be
   explicit and tested; no amount/OHLCV value may be labeled fund flow.
 - **NFR-10 (Bounded work):** One online refresh request captures and publishes one complete session
@@ -345,6 +430,10 @@ automatic failover may be used to close that gap.
   `local_lock_dir/market-refresh.lock` MUST be acquired before evidence compare-create, then gate,
   candidate, selection and existing canonical manifest/pointer operations follow the frozen order
   and no-clobber rules; a competing or stale writer MUST fail closed without canonical writes.
+- **NFR-19 (Identity closure):** Each login/relogin MUST generate a unique incumbent provider
+  session; each query attempt MUST generate one root request scope and each page one page request
+  scope. All completion/page/descriptor joins MUST use actual IDs and matching `plan_ordinal`;
+  caller overrides and singular forged session summaries are forbidden.
 - **NFR-17 (Traceability):** Every EC-3/4/12/16/17/18 and every FR/NFR/AC MUST map to a named
   pytest or an explicit static/diff proof in the implementation plan. No validator score may be
   substituted for this manual traceability.
@@ -436,6 +525,8 @@ class TransportObservationProjection(BaseModel):
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
+    plan_ordinal: int = Field(ge=0, le=4096)
+    lineage_kind: Literal["login_audit", "query_root", "page"]
     provider_id: ProviderId
     endpoint: ProviderEndpoint
     attempt: int = Field(ge=1, le=20)
@@ -457,6 +548,10 @@ class TransportObservationAggregate(BaseModel):
     aggregate_digest: SafeSha256
 ```
 
+`request_id` in this projection is an observed transport ID, never a caller-supplied field on
+`ProviderRequest`. `lineage_kind="login_audit"` observations are retained only as sanitized audit
+lineage and are assigned the active logical `plan_ordinal`; `query_root` is the one operation-root
+observation that can determine an attempt terminal state; `page` identifies a pagination request.
 `observation_digest` is SHA-256 of canonical JSON over the exact projection without that digest;
 `aggregate_digest` is SHA-256 of the ordered tuple of projection canonical forms without the
 aggregate field. No `message`, `payload`, `url`, `token`, header, cookie or raw exception is
@@ -512,6 +607,8 @@ SafeIdentifier = Annotated[
                            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ]
 SafeSha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+R2F2_ADAPTER_VERSION: Literal["r2f2.v1"] = "r2f2.v1"
+R2F2_ENDPOINT_CONTRACT_VERSION: Literal["r2f2-endpoints.v1"] = "r2f2-endpoints.v1"
 # Lexical-only path value. It has no root/descriptor knowledge.
 SafeRelativePath = Annotated[
     str, StringConstraints(min_length=1, max_length=512,
@@ -632,12 +729,10 @@ class ProviderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     provider_id: ProviderId
     refresh_id: SafeIdentifier
-    provider_session_id: SafeIdentifier
-    request_id: SafeIdentifier
     trade_date: date
     universe_id: SafeIdentifier
     session_symbols: tuple[SafeSymbol, ...]  # complete canonical target; sorted, unique, non-empty
-    request_plan: "ExpectedLogicalRequestPlan"
+    logical_request_plan: "ExpectedLogicalRequestPlan"
 
 # `session_symbols` is the complete canonical target for this refresh (required stock universe
 # plus required index symbols), not one SDK call's shard. It is sorted, unique and non-empty.
@@ -646,7 +741,8 @@ class TransportLineageRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
-    request_id: SafeIdentifier
+    root_request_id: SafeIdentifier
+    page_request_id: SafeIdentifier
     endpoint: ProviderEndpoint
     plan_ordinal: int = Field(ge=0, le=4096)
     attempt: int = Field(ge=1, le=20)
@@ -956,8 +1052,8 @@ class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     provider_id: ProviderId
     request: ProviderRequest
-    adapter_version: SafeVersion
-    endpoint_contract_version: SafeVersion
+    adapter_version: Literal["r2f2.v1"]
+    endpoint_contract_version: Literal["r2f2-endpoints.v1"]
     started_at: datetime
     completed_at: datetime
     normalization_clock_utc: datetime
@@ -987,7 +1083,8 @@ class EvidenceObjectDescriptor(BaseModel):
     universe_id: SafeIdentifier
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
-    request_id: SafeIdentifier
+    root_request_id: SafeIdentifier | None
+    page_request_id: SafeIdentifier | None
     endpoint: ProviderEndpoint | None
     request_role: RequestRole | None
     instrument_role: InstrumentRole | None
@@ -996,8 +1093,8 @@ class EvidenceObjectDescriptor(BaseModel):
     attempt: int | None = Field(default=None, ge=1, le=20)
     page: int | None = Field(default=None, ge=1, le=16_384)
     fields: tuple[SafeIdentifier, ...]
-    adapter_version: SafeVersion
-    endpoint_contract_version: SafeVersion
+    adapter_version: Literal["r2f2.v1"]
+    endpoint_contract_version: Literal["r2f2-endpoints.v1"]
     schema_variant: SafeVersion
     source_schema: SafeVersion
     units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
@@ -1011,8 +1108,8 @@ class EvidenceManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     evidence_id: SafeIdentifier
     provider_id: ProviderId
-    adapter_version: SafeVersion
-    endpoint_contract_version: SafeVersion
+    adapter_version: Literal["r2f2.v1"]
+    endpoint_contract_version: Literal["r2f2-endpoints.v1"]
     trade_date: date
     universe_id: SafeIdentifier
     requested_at: datetime
@@ -1110,6 +1207,11 @@ class ReplayResult(BaseModel):
     failure_class: SafeFailureClass | None
 ```
 
+`ProviderRawBatch.logical_request_plan` MUST equal `ProviderRequest.logical_request_plan`; its
+`request_plan_hash` is recomputed from that plan. The batch has no caller-provided session or root
+request field; the actual session set is derived from `AttemptCompletion`, page lineages and
+sanitized observations during validation.
+
 ### Factor snapshot descriptor mapping (authoritative and bidirectional)
 
 `FactorCacheSnapshotManifest` and the matching
@@ -1138,10 +1240,11 @@ binding with a different descriptor, a live binding, an alias field or a live mu
 fails closed.
 
 `EvidenceObjectDescriptor` has a closed kind validator. A `raw_endpoint_page` requires non-null
-endpoint/request role/instrument role/shard/plan ordinal, attempt, page, ordered `fields`/`units`,
+endpoint/request role/instrument role/shard/plan ordinal, attempt, page, root/page request IDs,
+ordered `fields`/`units`,
 `pagination_policy` and `transport_observation_digest`; its request ID and all cardinality fields
 must join one final-success `AttemptCompletion`; a model validator rejects a descriptor whose
-attempt/outcome/request ID is not the `RequestCompletion.successful_attempt` binding. A
+attempt/outcome/root/page request IDs are not the `RequestCompletion.successful_attempt` binding. A
 `factor_cache_snapshot` requires a null endpoint/request role/instrument role/shard/plan
 ordinal/attempt/page and transport digest, but retains the capture request ID and requires a
 non-null `factor_snapshot_provenance_hash`. Its descriptor fields MUST satisfy the exact
@@ -1176,7 +1279,10 @@ def validate_publishable_descriptors(
         raise ValueError("ultimate failure cannot publish evidence")
     if any(
         descriptor.attempt != completion.successful_attempt
-        or descriptor.request_id != completion.successful_request_id
+        or descriptor.root_request_id != completion.successful_root_request_id
+        or descriptor.provider_session_id != completion.attempts[-1].provider_session_id
+        or descriptor.page_request_id
+        not in {request_id for _, request_id in completion.attempts[-1].page_request_ids}
         for descriptor in descriptors
         if descriptor.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE
     ):
@@ -1212,6 +1318,20 @@ The implementation keeps model ownership disjoint between tasks:
 The frozen contract listing is normative regardless of module placement; a task may not duplicate
 or redefine a model in another module.
 
+### Public export matrix (authoritative)
+
+`backend.app.market.providers.base` and `backend.app.market.providers` MUST export the complete
+Task 7 surface below; an import that is available only by module internals is incomplete. The
+matrix is a review/test contract, not a license to export Task 8/9 models from Task 7.
+
+| Export module | Required exports |
+| --- | --- |
+| `providers.base` | `SafeProviderId`, `SafeSymbol`, `SafeVersion`, `SafeIdentifier`, `SafeSha256`, `SafeRelativePath`, `ProviderId`, `ProviderEndpoint`, `InstrumentRole`, `RequestRole`, `EvidenceObjectKind`, `PaginationPolicy`, `ENDPOINT_CONTRACTS`, `EndpointContract`, `ExpectedLogicalRequest`, `ExpectedLogicalRequestPlan`, `AttemptCompletion`, `RequestCompletion`, `ProviderRequest`, `TransportLineageRef`, `TransportObservationProjection`, `TransportObservationAggregate`, `RawEndpointRow`, all nine concrete endpoint-row variants, `RawEndpointBatch`, `EndpointContractSummary`, `ProviderRawBatch`, `validate_raw_date_binding`, `provider_registry`, and the exact version constants. |
+| `providers` package | Every provider-neutral type in the preceding row plus `BaoStockProviderAdapter`/`BaoStockDailyBarAdapter`; no `PublishedEvidence`, `EvidenceManifest`, `CandidateManifest` or `SessionSelection`. |
+
+`__all__` and direct imports MUST agree with this matrix. The exact version constants are compared
+by value in tests; a generic `SafeVersion` acceptance is insufficient.
+
 ### Model ↔ persisted-field audit (current closure)
 
 The following manual diff is the review authority for persisted field names. The implementation
@@ -1221,10 +1341,11 @@ score cannot substitute for it.
 | Model | Persisted projection / source | Field-diff result |
 | --- | --- | --- |
 | `RawEndpointBatch` / `EndpointContractSummary` | `ENDPOINT_CONTRACTS` | `endpoint`, role, variant, ordered `fields`, `source_schema`, exact `units`, `date_semantics` and `pagination_policy` all present; no hidden summary field. |
+| `ProviderRequest` / `ProviderRawBatch` | Logical request envelope / actual transport lineage | Request contains no provider-session/request identity; actual session IDs are derived from page/observation joins, and each completion/page uses root/page IDs. Adapter and endpoint-contract versions equal exact current constants. |
 | `FactorCacheSnapshotRecord` / `FactorCacheSnapshotRecords` | Existing `factor_snapshots` SQL table / in-memory projection | Exact nine current columns plus derived `row_fingerprint`, `records_sha256` and before/after fingerprints; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. This record set is not a published descriptor. |
 | `FactorCacheSnapshotManifest` / `PublishedFactorCacheSnapshot` | Published factor object manifest / descriptor-bound reader | Exactly `object_id`, `relative_path`, `object_sha256`, `byte_count`, `row_count`, `schema_variant`, `schema_hash`, `records_sha256`, before/after fingerprints plus reader identity; no embedded mutable rows. |
-| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. The exact bidirectional mapping is `object_id↔object_id`, `relative_path↔relative_path`, `sha256↔object_sha256`, `byte_count↔byte_count`, `row_count↔row_count`, `schema_variant↔schema_variant`, `schema_hash↔schema_hash`, `factor_snapshot_provenance_hash↔records_sha256`; cache binding identity/hash MUST match this same descriptor. |
-| `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash and is identical in model, serializer and table. |
+| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/root_request_id/page_request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. The exact bidirectional mapping is `object_id↔object_id`, `relative_path↔relative_path`, `sha256↔object_sha256`, `byte_count↔byte_count`, `row_count↔row_count`, `schema_variant↔schema_variant`, `schema_hash↔schema_hash`, `factor_snapshot_provenance_hash↔records_sha256`; cache binding identity/hash MUST match this same descriptor. |
+| `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash and is identical in model, serializer and table; there is no singular provider-session field, and observations aggregate across actual sessions. `attempt_count` excludes login audit. |
 | `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict` and `aggregate_sha256` are identical in model, serializer and table. |
 | `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | Candidate fields are exactly `candidate_id`, `trade_date`, `universe_id`, `provider_id`, `evidence_id`, `evidence_sha256`, `normalized_object_relative_path`, `normalized_object_sha256`, `gate_report_relative_path`, `gate_report_sha256`, `factor_resolution_sha256`, `adapter_version`, `source_schema_version`, `row_count`, `required_symbol_count`, `status`, `manifest_sha256`; selection fields are exactly the model fields below. |
 | `ReplayResult` | CLI/public projection | Frozen normalization clock only; no invocation/start-time field. |
@@ -1272,9 +1393,11 @@ class ExpectedLogicalRequestPlan(BaseModel):
 class AttemptCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     plan_ordinal: int = Field(ge=0, le=4096)
+    provider_session_id: SafeIdentifier  # actual incumbent scope; never caller supplied
     attempt: int = Field(ge=1, le=20)
-    request_id: SafeIdentifier
+    root_request_id: SafeIdentifier  # actual query-root request_scope ID
     observed_pages: tuple[int, ...]  # empty only when no page was received; otherwise contiguous
+    page_request_ids: tuple[tuple[int, SafeIdentifier], ...]  # actual page request_scope IDs
     observed_page_count: int = Field(ge=0, le=16_384)
     terminal: bool
     outcome: TransportOutcome
@@ -1287,6 +1410,10 @@ class AttemptCompletion(BaseModel):
             range(1, self.observed_page_count + 1)
         ):
             raise ValueError("observed pages must be contiguous")
+        if tuple(page for page, _ in self.page_request_ids) != self.observed_pages:
+            raise ValueError("page request IDs must close over observed pages")
+        if len({request_id for _, request_id in self.page_request_ids}) != len(self.page_request_ids):
+            raise ValueError("page request IDs must be unique")
         if self.outcome == TransportOutcome.SUCCESS and not self.terminal:
             raise ValueError("successful attempt must be terminal")
         return self
@@ -1294,9 +1421,9 @@ class AttemptCompletion(BaseModel):
 class RequestCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     plan_ordinal: int = Field(ge=0, le=4096)
-    attempts: tuple[AttemptCompletion, ...]  # ordered by attempt, unique request IDs
+    attempts: tuple[AttemptCompletion, ...]  # ordered by attempt; IDs are actual, unique and joined
     successful_attempt: int | None = Field(default=None, ge=1, le=20)
-    successful_request_id: SafeIdentifier | None = None
+    successful_root_request_id: SafeIdentifier | None = None
     final_outcome: TransportOutcome
     row_count: int = Field(default=0, ge=0, le=10_000_000)
 
@@ -1308,7 +1435,7 @@ class RequestCompletion(BaseModel):
             range(1, len(self.attempts) + 1)
         ):
             raise ValueError("attempts must be strictly ordered")
-        if len({attempt.request_id for attempt in self.attempts}) != len(self.attempts):
+        if len({attempt.root_request_id for attempt in self.attempts}) != len(self.attempts):
             raise ValueError("attempt request IDs must be unique")
         if self.final_outcome != self.attempts[-1].outcome:
             raise ValueError("final outcome must match final attempt")
@@ -1318,17 +1445,17 @@ class RequestCompletion(BaseModel):
         if self.final_outcome == TransportOutcome.SUCCESS:
             if success_count != 1:
                 raise ValueError("a completion has exactly one final successful attempt")
-            if self.successful_attempt is None or self.successful_request_id is None:
+            if self.successful_attempt is None or self.successful_root_request_id is None:
                 raise ValueError("successful completion requires final request binding")
             final = self.attempts[-1]
             if final.attempt != self.successful_attempt:
                 raise ValueError("successful attempt must be final")
-            if final.request_id != self.successful_request_id or final.outcome != TransportOutcome.SUCCESS:
+            if final.root_request_id != self.successful_root_request_id or final.outcome != TransportOutcome.SUCCESS:
                 raise ValueError("successful request binding mismatch")
         else:
             if success_count != 0:
                 raise ValueError("a failed completion cannot contain a successful attempt")
-            if self.successful_attempt is not None or self.successful_request_id is not None:
+            if self.successful_attempt is not None or self.successful_root_request_id is not None:
                 raise ValueError("failed completion cannot bind a successful attempt")
             if self.row_count != 0:
                 raise ValueError("failed completion row count must be zero")
@@ -1337,9 +1464,12 @@ class RequestCompletion(BaseModel):
 
 The plan includes all symbol shards and explicit index requests, but never predicts the provider's
 page count. `request_plan_hash` is SHA-256 of the canonical logical-request tuple without its hash
-field. After execution, each logical request emits exactly one `RequestCompletion`; every attempt
-has a fresh request ID, attempt numbers are strictly ordered, and non-empty observed pages are
-unique, start at page 1 and are contiguous. Exactly one successful attempt/request ID is allowed
+field. After execution, each logical query emits exactly one `RequestCompletion`; every attempt has
+the actual provider session ID and a fresh query-root `root_request_id`, and every observed page has
+a fresh actual `page_request_id`. Attempt numbers are strictly ordered, and non-empty observed pages
+are unique, start at page 1 and are contiguous. Login/relogin observations are assigned the active
+`plan_ordinal` as sanitized audit lineage and are excluded from completions and `attempt_count`.
+Exactly one successful attempt/root request ID is allowed
 when `final_outcome=success`; it MUST be the final attempt and MUST be terminal. A successful
 attempt is terminal: no later attempt is legal, and two successful attempts are never legal. All
 earlier attempts in a successful completion are non-success transport outcomes. A failed final
@@ -1347,17 +1477,24 @@ attempt has `final_outcome` equal to its final non-success outcome, zero `row_co
 successful fields and cannot publish evidence. A transport failure before page 1 is represented by
 an empty page tuple; no page is invented. `AttemptCompletion` deliberately has no source
 `row_count`, row values or page bytes: failed attempts may retain only bounded F0.1 page/recv
-counters, outcome, request ID and sanitized observation digest. Only the final successful attempt's
-pages receive `EvidenceObjectDescriptor` and `TransportLineageRef` records. For a successful
+ counters, outcome, actual root/page IDs and sanitized observation digest. Only the final
+successful attempt's pages receive `EvidenceObjectDescriptor` and `TransportLineageRef` records. For a successful
 completion, `RequestCompletion.row_count` MUST equal the sum of the final successful descriptors'
 read-back row counts; failed-attempt counters are excluded from that sum, manifest `row_count` and
 all object/hash inputs. The completion validator MUST bind every descriptor to the successful
-request ID/attempt, contiguous pages and terminal marker before any object compare-create.
+root/page request IDs, actual provider session, contiguous pages and terminal marker before any
+object compare-create.
 `completion_hash` is SHA-256 of the ordered completion/attempt/page-descriptor tuple without its
 hash field and is independent of the logical request-plan hash. Missing, duplicate,
-non-contiguous, out-of-order, swallowed pages, duplicate request IDs, success-after-success,
+non-contiguous, out-of-order, swallowed pages, duplicate root/page IDs, success-after-success,
 success-before-later-attempt or inconsistent final success/failure cardinality fail closed. No
 total-page guess is required.
+
+| Identity model | Frozen fields | Cardinality and lineage rule |
+| --- | --- | --- |
+| `AttemptCompletion` | `plan_ordinal`, actual `provider_session_id`, `attempt`, actual `root_request_id`, contiguous `observed_pages`, `(page, page_request_id)` pairs, `observed_page_count`, `terminal`, `outcome` | One row per logical query attempt. The root ID is generated by query-root scope; page IDs are generated by page scopes; login/relogin audit is excluded. |
+| `RequestCompletion` | `plan_ordinal`, ordered attempts, `successful_attempt`, `successful_root_request_id`, `final_outcome`, `row_count` | Exactly one row per `ExpectedLogicalRequest`. Terminal outcome is decided only by the matching root `ProtocolStage.OPERATION`; success binds the final attempt/session/page set, while failure has zero rows and no successful root. |
+| `RawEndpointBatch` | endpoint/role/schema, plan/shard, actual page lineage, typed rows, exact source schema/fields/units/date/pagination, row/order digest | Exactly one final-success page/shard. Its page lineage digest joins exactly one sanitized projection; failed-attempt source rows are absent. |
 
 ### Provider registry
 
@@ -1388,7 +1525,7 @@ additional summary fields hidden in prose. Per-endpoint `source_schema`, `units`
 | requested_at / completed_at / normalization_clock_utc | UTC datetime | ordered; frozen clock used by normalizer/replay |
 | logical_request_plan / request_plan_hash | `ExpectedLogicalRequestPlan` / SHA-256 | Logical requests only; hash recomputed before publish |
 | request_completions / completion_hash | ordered `RequestCompletion` / SHA-256 | Observed contiguous pages and terminal markers; no expected total |
-| request_count / attempt_count | bounded non-negative integers | Request count equals plan count; attempt count includes sanitized attempt completions, while object count includes final-success pages only |
+| request_count / attempt_count | bounded non-negative integers | Request count equals plan count; attempt count counts query `AttemptCompletion` rows only (login/relogin audit observations are excluded), while object count includes final-success pages only. Actual provider-session IDs are derived from descriptors/observations across the aggregate; no singular session field is admitted. |
 | objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per final-success logical request/page/shard; failed attempts have none |
 | transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every published final-success page is bound to an exact allowlisted projection; failed attempts may appear only as sanitized aggregate observations |
 | endpoint_summaries | `tuple[EndpointContractSummary, ...]` | Exact source schema/units/date semantics, counts equal descriptor sums |
@@ -1473,8 +1610,8 @@ the original provider payload is not retained.
 | --- | --- | --- | --- |
 | `trade_dates.v1` | `query_trade_dates(start_date=ISO, end_date=ISO)`; `calendar_date`, `is_trading_day` | `calendar_date: date`; `is_trading_day: BoundedToken`. Only token `"1"` is a trading session; other tokens are not reinterpreted. No units. A range MAY be empty; the exact-date fetch requires exactly one row. | Provider pages are consumed in page number order; rows are unique and sorted by `calendar_date` ascending in evidence. A duplicate/date outside the requested range fails. |
 | `all_stock.market.v1` | `query_all_stock(day=ISO)`; `code`, `tradeStatus`, `code_name` (the market fixtures expose this exact tuple) | `code: SafeSymbol`; `tradeStatus: BoundedToken` and `code_name: bounded UTF-8 string` (empty string is retained; JSON null is rejected). The market path uses `code` for main-board universe membership; it does not guess additional status semantics. No units. An empty snapshot or duplicate code fails. | One explicit date request; pages must advance under F0.1. Evidence rows sorted by `code` ascending; duplicate codes fail. |
-| `daily_astock.v1` | `query_daily_history_k_AStock(date=ISO)`; exact `DAILY_FIELDS`: `date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST` | `date: date`; `code: SafeSymbol`; OHLC/preclose: finite numeric, non-empty; `volume`, `amount`: finite numeric when active, empty allowed only for a row classified as non-trading by the existing normalizer; `adjustflag: BoundedToken` and MUST be `"3"`; `turn`, `pctChg`: finite numeric or empty string→`None`; `tradestatus`, `isST`: bounded provider tokens, with active exactly `"1"` and no guessed meaning for other values. Units: volume `shares`, amount `CNY`, turnover `percent`, pctChg `percent`. | One exact trade date; pages must advance. Rows are unique by `(code,date)` and sorted by `(date,code)` in evidence. Date mismatch, duplicate symbol or non-finite value fails the full batch. |
-| `daily_factor.v1` | `query_daily_adjust_factor(date=ISO)`; exact `AdjustmentFactorCache.FACTOR_FIELDS`: `code,dividOperateDate,foreAdjustFactor,backAdjustFactor,adjustFactor` | `code: SafeSymbol`; `dividOperateDate: date` and MUST be `<=` the requested session; three factors: finite positive numeric. Units: factors are dimensionless ratios. No null/empty factor values; an empty event response is valid only when the existing factor-cache contract can prove the snapshot another way. | A date event request may have pages; pages and rows are ordered by `(dividOperateDate,code)` in evidence. Duplicate `(code,dividOperateDate)` or future event fails. |
+| `daily_astock.v1` | `query_daily_history_k_AStock(date=ISO)`; exact `DAILY_FIELDS`: `date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST` | `date: date`; `code: SafeSymbol`; blank numeric source values become `None` at the typed adapter boundary only after the row is proven legally suspended; active blank OHLC/activity is rejected. `volume`, `amount`: finite numeric when active, blank→`None` only for a legal suspended stock; `adjustflag: BoundedToken` and MUST be `"3"`; `turn`, `pctChg`: finite numeric or empty string→`None`; `tradestatus`, `isST`: bounded provider tokens, with active exactly `"1"` and no guessed meaning for other values. Units: volume `shares`, amount `CNY`, turnover `percent`, pctChg `percent`. | One exact trade date; pages must advance. Rows are unique by `(code,date)` and sorted by `(date,code)` in evidence. Date mismatch, duplicate symbol, non-finite value, suspended index or non-zero suspended activity fails the full batch. |
+| `daily_factor.v1` | `query_daily_adjust_factor(date=ISO)`; exact `AdjustmentFactorCache.FACTOR_FIELDS`: `code,dividOperateDate,foreAdjustFactor,backAdjustFactor,adjustFactor` | `code: SafeSymbol` and MUST equal the logical request symbol vocabulary; `dividOperateDate: date` and MUST be `<=` the requested session; three factors: finite positive numeric. Units: factors are dimensionless ratios. No null/empty factor values. An empty event response is raw evidence only; Task 8's factor-cache snapshot and later factor gate must prove resolution. | A date event request may have pages; pages and rows are ordered by `(date,code)` in evidence. Duplicate `(code,dividOperateDate)` or future event fails. |
 | `adjust_factor.session.v1` | `query_adjust_factor(stock_symbol,start_date="1990-01-01",end_date=ISO)`; same exact five factor fields | Same typed rules as `daily_factor.v1`; this is a distinct request variant because it is a per-stock history and may be empty for a legal suspended placeholder. It MUST NOT be used to invent an active stock factor. | Rows unique by `(code,dividOperateDate)` and sorted by `(code,dividOperateDate)` in evidence; every row's code equals the requested stock symbol. |
 | `index_history.session.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")`; exact 14 daily fields | Same typed daily rules as `daily_astock.v1`; the requested symbol role is discriminated: `index_symbol` MUST be one of existing `INDEX_SYMBOLS` and receives no stock factor; `stock_symbol` is not an index. Units are identical to daily bars. | One exact date/symbol; zero rows is missing and fails required coverage. One row is expected. |
 | `index_history.range.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")` in `fetch_range`; exact 14 daily fields | Same fields/types as `index_history.session.v1`, but the request range MAY contain multiple trading dates. Every row's code equals the requested symbol; no date outside range. | Rows unique and sorted by `(date,code)`; a repeated date or non-advancing page is `PAGINATION_STALLED`/schema failure. |
@@ -1516,13 +1653,15 @@ or index symbol outside the current `INDEX_SYMBOLS` set invalidates the complete
 - `all_stock` is the source universe snapshot. Main-board membership and required indexes are
   checked against the declared `universe_id`; unknown/duplicate symbols fail closed.
 - `daily_astock` and `index_history` use `adjustflag="3"`; canonical OHLCV remains unadjusted.
-- `daily_factor` and `adjust_factor` provide `backAdjustFactor` by symbol/effective date. The
-  selected factor is the latest eligible effective date `<= trade_date`, and active stock rows
-  without a finite positive factor fail.
+- `daily_factor` and `adjust_factor` provide `backAdjustFactor` by exact logical symbol/effective
+  date. The selected factor is the latest eligible effective date `<= trade_date`, and active stock
+  rows without a finite positive factor fail. An empty `daily_factor` event is only raw evidence;
+  Task 8's typed factor-cache snapshot and later factor gate must prove the selected value.
 - `tradestatus == "1"` is the current active classifier. A non-`"1"` row is not a license to
   infer a new suspension meaning: the existing placeholder and activity gates remain authoritative.
-  A suspended stock may have empty activity/factor only under those existing gates. A suspended
-  index, non-zero suspended activity, malformed placeholder, duplicate or coverage mismatch fails.
+  A suspended stock may have blank numeric activity/factor translated to `None` only under those
+  existing gates. A suspended index, active blank numeric, non-zero suspended activity, malformed
+  placeholder, duplicate or coverage mismatch fails.
 - Source symbols retain the `sh.`/`sz.` six-digit form and canonical symbols are lowercase.
 
 The DATE gate is deliberately split at the evidence boundary. The adapter/evidence module MUST
@@ -1703,9 +1842,11 @@ Given multiple symbols, indexes, retries or SDK pages for one refresh
 When Task 8 assembles its evidence manifest
 Then every logical plan item has exactly one completion and every observed page has exactly one
 descriptor and bound sanitized observation lineage only when it belongs to the final successful
-attempt; failed attempts retain only bounded page counters/outcomes/request IDs and never create
-evidence files or source row counts. Every attempt has a joinable request ID, observed pages are
-contiguous, and exactly one final successful attempt or final failure is recorded, with no missing,
+attempt; login/relogin observations are audit-only and excluded from completions and attempt_count;
+failed attempts retain only bounded page counters/outcomes/actual IDs and never create evidence
+files or source row counts. Every attempt has an actual provider-session ID and query-root request
+ID, every page has an actual page request ID, observed pages are contiguous, and exactly one final
+successful attempt or final failure is recorded, with no missing,
 extra, duplicate, out-of-order or swallowed page. A retry that succeeds publishes only final-attempt
 pages and `RequestCompletion.row_count` equals the final descriptor read-back row sum. An ultimate
 failure has `row_count=0`, publishes no evidence manifest, does not normalize, and cannot create a
@@ -1738,6 +1879,18 @@ implementation-plan validator invocation
 When the R2-F2 writer/orchestrator/review gate runs
 Then the fallback/second-source path is rejected or out of scope, the design-only validator is
 reported only as a structural result, and manual implementation traceability remains required.
+
+### AC-21: Actual provider/query/page identity (FR-2, FR-30–FR-31, NFR-19)
+
+Given a request plan containing login, relogin, retry and pagination observations
+When the incumbent scopes and Task 7/8 validators assemble the lineage
+Then `ProviderRequest` has no provider-session or transport request identity, each login/relogin
+gets a unique actual provider session without caller override, each query attempt has one actual
+query-root ID, each page has one actual page-request ID, login audit does not create a completion,
+and only the matching `ProtocolStage.OPERATION` query-root observation determines the attempt
+terminal outcome. Every final page descriptor joins its exact
+`(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`;
+duplicate/missing/extra/out-of-order IDs fail closed.
 
 ## Edge cases
 
@@ -1804,6 +1957,18 @@ reported only as a structural result, and manual implementation traceability rem
   reader attempts implicit initialization; reject and preserve all pre-read fingerprints.
 - EC-26: A compare-create/no-clobber collision finds different bytes at an existing content path;
   retain both audit contexts if possible, never overwrite and do not move the canonical pointer.
+- EC-27: A caller supplies `provider_session_id`, root request ID or page request ID on
+  `ProviderRequest`, or an incumbent scope receives an override; reject the request/adapter call
+  before transport and generate IDs only inside the real scopes.
+- EC-28: Login/relogin `COMPLETE`/error observations are mistaken for query completion, or a page
+  lacks a matching root/page/session tuple; exclude the audit observation and fail the logical
+  completion/manifest closed.
+- EC-29: A final-success page uses a different provider session, duplicate page request ID,
+  non-contiguous page set or mismatched endpoint/role/schema/version; reject the complete batch
+  before object compare-create.
+- EC-30: A blank active numeric, suspended index, non-zero suspended activity, factor row whose
+  code is outside the logical symbols, unsorted `(date,code)` factor rows, unordered calendar or
+  duplicate/out-of-range calendar row is presented; the typed adapter rejects the batch.
 
 ## Out of scope
 
@@ -1953,7 +2118,7 @@ hash detection, a compromised Python runtime, or a compromised host. Such condit
 when detected and require manual audit. Credentials are supplied only to the incumbent provider
 transport at runtime and are never part of evidence or public state.
 
-## Independent approval evidence
+## Prior independent review evidence (non-authoritative after this amendment)
 
 The final independent review at exact clean HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`
 checked every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-20 and EC-1–EC-26; the eight-group
@@ -1964,11 +2129,13 @@ discard/ultimate-failure behavior; transport lineage; single-lock/CAS ordering; 
 replay; path, CLI, legacy, GET, fallback and offline boundaries. The strict design validator
 returned 100/100 with zero errors, warnings or info; `git diff --check` passed; the worktree was
 clean. Findings: High 0, Medium 0, Low 0. No RED test, provider request, external operation or
-production mutation occurred. This approval authorizes only the offline Task 7–9 RED/GREEN plan;
-it does not authorize real Provider/NAS/install/LaunchAgent/production execution.
+production mutation occurred. This historical review does not approve the identity amendment or
+authorize real Provider/NAS/install/LaunchAgent/production execution.
 
 ## Review gate
 
-Status is **Approved** after the independent review above. Any future contract amendment, High or
-Medium finding, or scope change requires a new review before RED. The linear implementation plan
-below is authoritative for Tasks 7–9.
+Status is **In Review — architecture amendment required**. The three Task 7 rounds are NO-GO and
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is non-delivery. An independent specification review
+MUST approve this identity amendment before RED; then a new fix/replace commit must pass the named
+tests and review gate. No self-approval, provider request, external operation or production change
+is authorized. The amended linear implementation plan below remains blocked until that review.

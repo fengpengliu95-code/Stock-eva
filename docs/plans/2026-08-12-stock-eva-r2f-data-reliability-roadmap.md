@@ -3,10 +3,10 @@
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
 **Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
-specification is Approved at exact reviewed planning HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` after independent H0/M0 review and the user-approved
-Option A successful-attempt-only evidence reconciliation. The dedicated R2-F2 design/implementation
-documents are the only contract authority; deployment and the R2-F0 production gate remain closed
+architecture amendment is **In Review — architecture amendment required** at exact clean code HEAD
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` (non-delivery). The three Task 7 rounds
+`6390366`, `c977a40`, `fea5678` were NO-GO. The dedicated R2-F2 design/implementation documents
+are the only contract authority; deployment and the R2-F0 production gate remain closed.
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
@@ -57,11 +57,13 @@ but it does not erase completed work or rewrite old acceptance evidence.
 - R2-F1 remains offline-only: no real provider, installation, NAS, LaunchAgent or production
   execution occurred. The refresh LaunchAgent remains unloaded/frozen and R2-F0 remains
   production NO-GO.
-- R2-F2 Provider Evidence Framework specification is **Approved** after independent final review at
-  exact planning HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0.
-  The user approved starting it on 2026-08-21 and selected Option A: only the final successful
-  attempt's complete evidence is persisted; failed partial payloads are discarded and never
-  quarantined. Task 7–9 RED/GREEN may now begin under the dedicated
+- R2-F2 Provider Evidence Framework is **In Review — architecture amendment required**. The prior
+  planning review at `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for implementation;
+  the exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is review evidence only.
+  Three Task 7 rounds were NO-GO. Option A remains normative: only the final successful attempt's
+  complete evidence is persisted; failed partial payloads are discarded and never quarantined.
+  Task 7–9 RED/GREEN is blocked pending independent architecture review and a new fix/replace
+  commit under the dedicated
   [R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) and
   [R2-F2 implementation plan](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md),
   while deployment and all real-provider/production operations remain closed.
@@ -352,6 +354,14 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
 - Generalize source fields and manifests from a BaoStock literal to validated provider IDs while
   preserving old rows and response compatibility.
 - Record candidate gate results and one explicit selection record for every canonical publication.
+- Identity amendment: `ProviderRequest` contains no provider-session or transport request identity;
+  incumbent scopes generate actual provider sessions, query-root IDs and page request IDs. Login
+  audit is not query completion, page descriptors close the actual root/page/session tuple, and
+  actual session sets are derived rather than represented by a forged singular session.
+- Exact current adapter/endpoint-contract version constants, all six/nine endpoint variants, typed
+  suspended-blank semantics, factor symbol/date-code ordering, calendar ordering and public export
+  matrix are normative. Task 8 owns typed `PublishedEvidence`/`EvidenceReader`; Task 7 may use only
+  a narrow compatibility seam before Task 8 replaces it with descriptor-bound readback.
 
 **GO**
 
@@ -361,6 +371,11 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
 - Corrupt evidence, schema/version mismatch or hash mismatch fails before normalization/promotion.
 - Existing historical manifests/rows remain readable without rewriting immutable objects.
 - GET requests remain write-free.
+- Only after independent review confirms the amended identity/cardinality model and a new fix/replace
+  commit; `fea5678` and all earlier Task 7 commits remain non-delivery.
+
+**Current gate:** In Review — architecture amendment required; three Task 7 rounds are NO-GO and
+independent spec review is still required.
 
 ### R2-F3 — Shadow Bake-off
 

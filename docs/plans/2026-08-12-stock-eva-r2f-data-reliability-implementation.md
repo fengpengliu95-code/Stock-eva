@@ -31,12 +31,14 @@ production NO-GO. See
 [R2-F1 acceptance](../acceptance/release-2-r2f1.md). The code gate is complete, but this does not
 authorize installation, real provider access, production repair or R2-F2.
 
-**Current gate:** R2-F1 is complete and the user has authorized R2-F2. R2-F2 specification is
-**Approved** after independent final review at exact planning HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0. The user-selected
-Option A boundary persists only final successful attempt evidence and discards failed partial
-payloads without quarantine. The dedicated R2-F2 design and implementation plan are the only
-contract authority; Task 7–9 RED/code may begin only within their offline boundary. A second source
+**Current gate:** R2-F1 is complete. R2-F2 is **In Review — architecture amendment required** at
+exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` (non-delivery). The prior planning
+review at `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for implementation; three Task 7
+rounds (`6390366`, `c977a40`, `fea5678`) were NO-GO. The user-selected Option A boundary persists
+only final successful attempt evidence and discards failed partial payloads without quarantine. The
+dedicated R2-F2 design and implementation plan are the only contract authority; Task 7–9 RED/code
+may begin only after independent architecture review and a new fix/replace commit within their
+offline boundary. A second source
 must still pass at least 20 consecutive trading sessions of
 whole-session shadow qualification; do not mix providers by symbol, and keep automatic failover
 disabled until shadow, qualification and a separately approved manual failover stage are complete.
@@ -626,9 +628,11 @@ scheduling remains usable; do not delete repair tables or audit history.
 
 **Dedicated specification:** [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)<br>
 **Dedicated implementation plan:** [R2-F2 Provider Evidence Framework Implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)<br>
-**Specification status:** **Approved** after independent H0/M0 review at exact planning HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` following the user-approved Option A reconciliation;
-Tasks 7–9 may now begin linearly under the dedicated documents. The dedicated
+**Specification status:** **In Review — architecture amendment required**. The prior independent
+H0/M0 review at planning HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for
+implementation; exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` and the three
+Task 7 rounds are review evidence only, all NO-GO. Tasks 7–9 remain blocked pending independent
+architecture review and a new fix/replace commit under the dedicated documents. The dedicated
 documents are the only authority for
 models, endpoint contracts, factor-cache fields, file whitelists, tests, gates and rollback; this
 umbrella section is intentionally non-normative and contains no duplicate pseudo-code or legacy
@@ -647,6 +651,15 @@ Ruff/diff → independent High/Medium review gate. The dedicated design must fir
 then Tasks 7 → 8 → 9 execute linearly, with a new fix/review cycle for every High or Medium. The
 umbrella roadmap does not repeat task files or commands; reviewers must inspect the dedicated
 whitelists at the exact task commit.
+
+The architecture amendment is explicit: `ProviderRequest` carries no provider-session or transport
+request identity; incumbent scopes generate actual provider sessions, query-root IDs and page IDs;
+login/relogin observations are audit-only and excluded from query completion/attempt counts; each
+final page binds the actual refresh/session/root/page/endpoint/attempt/page tuple. Exact current
+version constants, typed suspended blank handling, factor `(date, code)`/symbol rules, calendar
+order, complete exports and Task 7/Task 8 normalization ownership are blocking tests. Option A,
+outer `RefreshRunLock`, no failed source bytes, no second provider/plugin, no transport/vendor/
+normalizer changes, no network and production unchanged remain in force.
 
 **R2-F2 rollback:** stop consuming new candidate/selection records, use the last
 legacy-compatible canonical pointer and retain evidence/candidates as non-serving audit data. Do

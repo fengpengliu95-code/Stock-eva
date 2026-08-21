@@ -1,17 +1,17 @@
 # Stock EVA R2-F2 Provider Evidence Framework Implementation Plan
 
-> **Spec-first gate:** This plan is executable after
-> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) was independently
-> reviewed and changed to **Approved** at exact clean reviewed HEAD
-> `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`. The approval is offline-only; no production code,
-> provider request or external operation is authorized by this gate.
+> **Spec-first gate:** **In Review — architecture amendment required.** This plan is blocked until
+> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
+> reviewed and approved after the identity amendment. The exact code HEAD
+> `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is a non-delivery review baseline; no production
+> code, provider request or external operation is authorized by this plan.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
 normalize only from that evidence, replay it offline, and record complete candidate/selection
 lineage while preserving every legacy reader and canonical publication invariant.
 
-**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean reviewed HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0`.
+**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean code HEAD
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` (non-delivery).
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -22,25 +22,54 @@ network request, installation, production database mutation, pointer mutation, L
 or external communication is authorized by this plan. The existing production refresh remains
 unloaded/frozen.
 
-**Specification approval evidence:** The independent final review checked FR-1–FR-33,
+**Specification review state:** **In Review — architecture amendment required.** The prior approval
+metadata is superseded. Three Task 7 rounds (`6390366`, `c977a40`, `fea5678`) were NO-GO; H5/M6
+are reconstructed in the dedicated design. A new independent review and a new fix/replace commit
+are required before RED. Option A final-success-only evidence remains normative.
+
+**Prior review evidence (non-authoritative):** The independent final review checked FR-1–FR-33,
 NFR-1–NFR-18, AC-1–AC-20, EC-1–EC-26, the eight-group factor snapshot descriptor mapping in
 both directions, descriptor-bound factor resolution identity/SHA, endpoint/gate/cardinality
 contracts, Task 7–9 whitelists and test ownership, and all offline/security/read-only boundaries.
 The design validator returned 100/100 with zero errors/warnings/info; `git diff --check` passed;
-High 0 / Medium 0 / Low 0; the worktree was clean. This metadata approval does not authorize
-real Provider/NAS/install/LaunchAgent/production execution.
+High 0 / Medium 0 / Low 0; the worktree was clean. This historical metadata does not authorize
+real Provider/NAS/install/LaunchAgent/production execution and is not approval of this amendment.
 
 ## Review closure preflight (must remain before RED)
 
-The prior independent review was **NO-GO**. Its findings were closed by the user Option A
+The prior independent review was **NO-GO**. Its findings were narrowed by the user Option A
 successful-attempt-only evidence boundary, field/type closure, stale umbrella metadata,
 factor-cache schema closure, complete factor resolution/cardinality, endpoint-constant validation,
 parser ordering, the precise date gate and lexical-path versus descriptor-bound storage split. An
-independent final review then approved the dedicated design at exact clean HEAD
-`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0. This plan MUST
-implement the dedicated design definitions verbatim and MUST NOT narrow them to pass current
+independent final review then provided non-authoritative evidence at planning HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0; it did not review
+the current identity amendment. This plan MUST implement the amended design definitions verbatim
+and MUST NOT narrow them to pass current
 tests. No ambiguity exceeds the 30% escalation threshold; any newly discovered unresolved schema
 or security meaning stops the task and returns to specification review.
+
+### Mandatory identity implementation boundary
+
+The amended design is the only authority for this boundary. Task 7 MUST remove
+`provider_session_id` and transport `request_id` from `ProviderRequest`; it carries only provider,
+refresh, date, universe, complete `session_symbols` and `ExpectedLogicalRequestPlan`. The
+incumbent `provider_session_scope()` MUST generate every actual provider session without a caller
+override. Each logical query attempt MUST generate an actual query-root request ID, each page a
+fresh actual page request ID, and `AttemptCompletion` MUST carry `provider_session_id` plus
+`root_request_id`. Login/relogin observations are sanitized audit lineage associated by
+`plan_ordinal`, never query completions; only matching `ProtocolStage.OPERATION` query-root
+observations determine attempt terminal state.
+
+Each final-success page/shard MUST produce one `RawEndpointBatch` with the closed actual lineage
+tuple `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`.
+Failed-attempt rows/bytes are discarded; failed audit retains only bounded IDs/counts. Task 8 MUST
+reject duplicate/missing/extra/out-of-order plans, completions, attempts, pages, batches and
+projections; enforce final-session consistency and `row_count=sum(final page readback rows)`;
+actual session IDs are derived, not forged as a singular request field. Adapter and
+endpoint-contract versions MUST equal exact current constants. Blank numerics become `None` only
+for legal suspended stock rows; factor code/sort/calendar order and public export matrix are
+strictly tested. Task 8 owns `PublishedEvidence`/`EvidenceReader`; Task 7 compatibility may use
+only a narrow seam and MUST NOT duplicate canonical evidence normalization.
 
 ### Feature manifest and dependency map
 
@@ -119,7 +148,8 @@ For each task:
 
 ## Task 7 — Provider-neutral contracts and BaoStock compatibility adapter
 
-**Requirements:** FR-1–FR-5, FR-19–FR-23, FR-27–FR-31; NFR-1, NFR-6, NFR-9, NFR-11, NFR-14;
+**Requirements:** FR-1–FR-5, FR-19–FR-23, FR-27–FR-31; NFR-1, NFR-6, NFR-9, NFR-11, NFR-14,
+NFR-19;
 AC-1–AC-3, AC-15–AC-17; EC-1–EC-5, EC-10, EC-17, EC-18, EC-21, EC-22.
 
 ### Exact file whitelist
@@ -140,8 +170,10 @@ patch, provider health, normalizer, storage layout, canonical publication or API
 `base.py` owns provider-safe types, endpoint/role validators, logical requests/completions, raw
 batches and transport projections. `providers/baostock.py` owns only the compatibility adapter.
 The strict factor-cache snapshot API is owned by Task 8 in `backend/app/market/factor_cache.py`;
-Task 7 may consume existing `FACTOR_FIELDS`/`exact_snapshots()` behavior but MUST NOT invent cache
-provenance fields. `market/models.py` is limited to necessary additive provider-source compatibility.
+Task 7 may consume only the existing provider `FACTOR_FIELDS` shape in a narrow fixture seam; it
+MUST NOT call or define a published factor snapshot, `PublishedEvidence` or `EvidenceReader`, and
+MUST NOT invent cache provenance fields. `market/models.py` is limited to necessary additive
+provider-source compatibility.
 No task may duplicate candidate/evidence models here.
 
 ### 7.1 RED — contract and compatibility tests
@@ -151,6 +183,7 @@ Add tests for:
 ```python
 def test_provider_id_is_static_baostock_allowlist(): ...
 def test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates(): ...
+def test_provider_request_has_no_provider_session_or_transport_request_override_fields(): ...
 def test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe(): ...
 def test_provider_and_logical_request_model_copy_round_trip_revalidates_symbol_roles(): ...
 def test_raw_batch_rejects_unknown_fields_secrets_headers_urls_and_raw_exception(): ...
@@ -167,10 +200,21 @@ def test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_termi
 def test_request_completion_rejects_success_then_later_attempt_and_multiple_successes(): ...
 def test_failed_completion_has_zero_row_count_and_no_failed_source_rows(): ...
 def test_request_completion_model_copy_round_trip_revalidates_success_cardinality(): ...
+def test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden(): ...
+def test_query_root_completion_excludes_login_and_complete_observations(): ...
+def test_multipage_page_request_identities_join_one_root_and_page(): ...
+def test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page(): ...
 def test_baostock_adapter_preserves_endpoint_and_session_contract(): ...
 def test_baostock_adapter_captures_source_rows_before_normalization(): ...
 def test_baostock_compatibility_produces_existing_daily_bar_semantics(): ...
 def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor(): ...
+def test_typed_adapter_maps_suspended_blank_numerics_to_none_only(): ...
+def test_factor_rows_require_exact_logical_symbols_and_daily_date_code_sort(): ...
+def test_calendar_rows_are_unique_ordered_and_within_requested_range(): ...
+def test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions(): ...
+def test_provider_public_exports_are_complete(): ...
+def test_valid_fixture_survives_identity_and_schema_mutations_before_any_write(): ...
+def test_task7_compatibility_normalize_uses_narrow_seam_not_published_evidence(): ...
 ```
 
 Run:
@@ -198,8 +242,9 @@ Implement:
 - a frozen `ProviderId`/registry admitting only `ProviderId.BAOSTOCK`, rejecting empty/path-like/mixed-case/plugin
   identities;
 - typed `ProviderRequest`, `RawEndpointBatch` and `ProviderRawBatch` with bounded allowlisted
-  source fields, UTC timestamps, exact date/universe/complete non-empty `session_symbols`, separate logical request-plan and
-  observed completion hashes, endpoint summaries and sanitized failure metadata;
+  source fields, UTC timestamps, exact date/universe/complete non-empty `session_symbols`, no
+  caller-supplied session/request IDs, separate logical request-plan and observed completion hashes,
+  endpoint summaries and sanitized failure metadata;
 - the authoritative `ENDPOINT_CONTRACTS` constant and exact endpoint/schema variants:
   `trade_dates.v1`, `all_stock.market.v1`,
   `daily_astock.v1`, `daily_factor.v1`, `adjust_factor.session.v1`,
@@ -211,17 +256,32 @@ Implement:
   exposes source-shaped rows before `normalize_baostock_rows()`;
 - sanitized `TransportObservationProjection` preserving every F0.1 allowlisted field and separate
   per-projection/ordered aggregate SHA-256 digests, binding every endpoint/page/attempt to
-  `refresh_id/provider_session_id/request_id`;
+  `refresh_id/provider_session_id/root_request_id/page_request_id`;
 - `InstrumentRole`/`RequestRole` cross-validation for stock/index `index_history` variants and
   `ExpectedLogicalRequest.symbols == ()` for `trade_dates`/`all_stock`, non-empty exact per-call
   shards for every other endpoint, and `validate_raw_date_binding(request, batch)` before
   normalization; do not change `normalize.py`;
+- actual scope identity: incumbent login/relogin generates a unique provider session, every query
+  attempt generates one root request ID, every page one page request ID, login audit is assigned by
+  `plan_ordinal` but excluded from completion/attempt counts, and only matching `OPERATION` query
+  root determines terminal state;
+- exact current adapter/endpoint-contract constants, typed suspended-blank `None` boundary,
+  factor logical-symbol/date-code ordering, calendar ordering, complete public exports, source
+  schema validation before zip/object publication, read-back source/schema digest recomputation and
+  valid fixture-before-mutation tests;
+- Task 7 may use only a narrow compatibility normalization seam; Task 8 replaces it with the
+  typed hash/schema/row/descriptor-bound `PublishedEvidence`/`EvidenceReader` before canonical
+  evidence normalization and Task 7 does not define those models;
 - compatibility delegation so existing `BaoStockProvider.fetch()` callers keep the current
   canonical models and behavior during the transition.
 
-The adapter MUST NOT change the six `ProviderEndpoint` values, request scopes, provider-session
-scope, F0.1 failure mapping, max attempts, socket timeout, circuit state or pagination behavior.
-Do not add a generic plugin mechanism or a second source. Do not change the normalizer.
+The adapter MUST NOT change the six `ProviderEndpoint` values, F0.1 failure mapping, max attempts,
+socket timeout, circuit state or pagination behavior. It MUST use incumbent request/session scopes
+as generators: no caller override is accepted for provider sessions, query-root IDs or page IDs.
+Login/relogin observations are audit-only; only matching `OPERATION` query-root observations close
+an attempt. Task 7 MUST NOT define `PublishedEvidence`/`EvidenceReader`; its compatibility test may
+use only the named narrow test seam. Do not add a generic plugin mechanism or a second source.
+Do not change the normalizer.
 
 Run:
 
@@ -244,9 +304,15 @@ git add backend/app/market/providers backend/app/market/baostock.py \
 git commit -m "refactor(market): add provider-neutral daily-bar contract"
 ```
 
-Independent reviewer checks exact HEAD against FR-1–FR-5 and FR-27–FR-31 and the whitelist, searches for dynamic
-imports and provider literals, proves no transport/normalizer diff, and returns High/Medium/Low
-counts. A High/Medium finding requires a new RED/GREEN fix commit before Task 8.
+Historical Task 7 commits `6390366`, `c977a40` and `fea5678` were three separate NO-GO rounds;
+`fea5678` is review evidence only and is not delivery. The H5/M6 blockers are the caller-overridden
+provider/session/request identity and the non-disjoint login/query-root/page lineage. A replacement
+Task 7 RED/GREEN commit MUST first pass the named identity, cardinality, schema, factor, calendar,
+version, export and valid-fixture tests, then be independently reviewed. The reviewer checks exact
+HEAD against FR-1–FR-5, FR-27–FR-31 and NFR-19 plus the whitelist, searches for dynamic imports and
+provider literals, proves no transport/normalizer diff, and returns High/Medium/Low counts. Any
+High/Medium finding requires a new RED/GREEN fix/replace commit before Task 8; no old commit can be
+called GO.
 
 ## Task 8 — Immutable evidence publication and offline replay
 
@@ -293,12 +359,17 @@ def test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time(
 def test_missing_evidence_root_is_write_free(tmp_path): ...
 def test_get_and_plan_paths_do_not_initialize_evidence_storage(tmp_path): ...
 def test_manifest_requires_one_descriptor_per_request_shard_and_page(tmp_path): ...
+def test_manifest_rejects_missing_extra_duplicate_or_out_of_order_plan_completion_page(tmp_path): ...
+def test_manifest_completion_terminal_uses_matching_query_root_operation_only(tmp_path): ...
+def test_manifest_page_lineage_binds_refresh_session_root_page_endpoint_attempt_page(tmp_path): ...
+def test_manifest_final_attempt_pages_share_actual_provider_session(tmp_path): ...
 def test_failed_partial_attempt_creates_zero_evidence_files(tmp_path): ...
 def test_retry_success_publishes_only_final_successful_attempt_pages(tmp_path): ...
 def test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer(tmp_path): ...
 def test_failed_partial_payload_is_not_quarantined_or_hashed(tmp_path): ...
 def test_retry_success_row_count_equals_final_descriptor_rows(tmp_path): ...
 def test_failed_attempt_row_count_is_excluded_from_manifest_and_hash(tmp_path): ...
+def test_login_audit_observations_are_not_query_attempts(tmp_path): ...
 def test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash(tmp_path): ...
 def test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions(tmp_path): ...
 def test_factor_snapshot_descriptor_manifest_mapping_is_exact_and_bidirectional(tmp_path): ...
@@ -357,7 +428,7 @@ Required behavior:
   exception. Preserve only bounded provider code and allowlisted failure classes.
 - Store one `EvidenceObjectDescriptor` per final-success logical request/endpoint shard/page, in
   the exact ordered `ExpectedLogicalRequestPlan` and its observed `RequestCompletion`; each raw-page
-  descriptor MUST carry object kind, plan ordinal, attempt, request ID, page, relative path,
+  descriptor MUST carry object kind, plan ordinal, attempt, root request ID, page request ID, relative path,
   object/hash/schema hashes, row/byte counts, ordered fields/units, provider/universe,
   refresh/session, endpoint, schema/contract versions, pagination policy and transport observation
   digest. The manifest MUST reject missing, extra, duplicate, out-of-order, non-contiguous or
@@ -365,6 +436,12 @@ Required behavior:
   attempt, and MUST require a terminal/end marker without requiring a prefetch page total.
   Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
   object, manifest or hash; only sanitized transport observations may survive for audit.
+- Every raw-page descriptor MUST retain actual `provider_session_id`, query-root `root_request_id`
+  and page `page_request_id`; the closed join key is
+  `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`.
+  Login/relogin audit projections are aggregated across actual sessions, never counted as query
+  attempts, and cannot satisfy a completion. The final attempt's pages MUST share one actual
+  provider session. `RequestCompletion.row_count` MUST equal final page readback rows exactly.
 - Serialize one immutable `factor_cache_snapshot` object from the in-memory
   `FactorCacheSnapshotRecords` returned by `AdjustmentFactorCache.exact_snapshot_records(symbols,
   trade_date)`. Each record MUST mirror the current `factor_snapshots` columns (`symbol`,
@@ -403,7 +480,9 @@ Required behavior:
   evidence-manifest publish; inject it into online and replay normalization through
   `normalize_baostock_rows(..., ingested_at=normalization_clock_utc)`. Invocation time is never a
   `ReplayResult` field and never enters candidate/semantic/selection hashes.
-- Make `EvidenceReader` the only input accepted by adapter normalization in the canonical path.
+- Make `EvidenceReader` the only input accepted by adapter normalization in the canonical path;
+  Task 8 MUST replace the Task 7 compatibility seam before any evidence normalize call with typed
+  hash/schema/row/descriptor-bound readback. No live SDK/raw object or mutable cache is accepted.
 - Add `market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]`. Its parser rejects
   credentials, token, header, cookie, URL, provider, local path and unknown arguments before it
   constructs the evidence layout or reader. The parser test fingerprints the root tree, bytes and
@@ -672,7 +751,7 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | FR-20–FR-23 | `validate_raw_date_binding(request, batch)`, existing publication requested-date/session identity gate, adapter failure mapping and existing normalizer quality rules | pre-normalize cross-day rejection, unit/factor/suspension and sanitized failure tests; no `normalize.py` date-binding claim |
 | FR-27 | whitelist/diff and absence of second-source code | static review and no-network gate |
 | FR-28–FR-29 | `providers/base.py` frozen models and role cross-validator | immutable extra-forbid model, complete `session_symbols`/per-call symbol rules, factor snapshot manifest/descriptor model and exact endpoint variant tests |
-| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion success cardinality, zero failed row-count, final-descriptor row-count and projection digest/cardinality tests |
+| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion success cardinality, actual session/root/page identity, login-audit exclusion, zero failed row-count, final-descriptor row-count and projection digest/cardinality tests |
 | FR-32 | `market/candidates.py` | exact ordered ten-outcome aggregate test |
 | FR-33 | `market/evidence.py` injected clock plus adapter call boundary | deterministic replay and frozen-clock tests; `normalize.py` remains unchanged |
 | NFR-1–NFR-6 | evidence/publish locking, hashes, canonical serializers | crash/concurrency/TOCTOU/determinism tests |
@@ -680,15 +759,17 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | NFR-13–NFR-14 | plan/review gates and static registry | commit/review records, dynamic-import scan |
 | NFR-15–NFR-17 | evidence layout/CAS, model↔persisted-field audit and manual traceability | descriptor-bound factor snapshot ID/path/hash/bytes/rows/schema/records checks, strict design validator and numbered matrix; repeat the design's field diff from actual models/SQL |
 | NFR-18 | `market/candidates.py` selection policy | fallback rejection and static second-source scan |
+| NFR-19 | incumbent scopes, Task 7 provider contract and Task 8 evidence joins | unique relogin sessions, query-root-only completion, multipage page identities, exact closed lineage tuple and no caller override |
 | AC-1–AC-3 | Task 7 provider contract | named provider/adapter tests |
 | AC-4–AC-7 | Task 8 evidence/replay | hash, crash, corruption, zero-write tests |
 | AC-8–AC-11 | Task 9 candidate/selection | gate, lineage, canonical-chain and legacy tests |
 | AC-12–AC-14 | Tasks 8–9 read-only/concurrency | fingerprints, CAS and TOCTOU tests |
-| AC-15–AC-17 | Tasks 7–8 boundary/cardinality | role, exact variant, complete session/per-call symbol, request completion success-cardinality and final-row-count tests |
+| AC-15–AC-17 | Tasks 7–8 boundary/cardinality | role, exact variant, complete session/per-call symbol, actual session/root/page identity, login exclusion, request completion success-cardinality and final-row-count tests |
 | AC-18 | Task 9 gate aggregate | exact ten-outcome aggregate test |
 | AC-19 | Task 8 clock/layout/CAS | frozen-clock, storage and replay tests |
 | AC-20 | Task 9 validator/fallback boundary | static validator/manual traceability and fallback test |
 | EC-1–EC-5 | Task 7 provider/transport contract | sanitized endpoint/failure tests |
+| EC-27–EC-30 | Tasks 7–8 identity/schema boundary | no ProviderRequest identity fields, unique relogin scopes, query-root-only completion, page tuple, suspended blank/factor/calendar/version/export/valid-fixture tests |
 | EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser-before-reader with root fingerprints and zero provider/network calls, successful-attempt/row-count, factor descriptor bidirectional binding, cardinality, digest, clock and storage tests |
 | EC-10–EC-18, EC-23 | Task 9 candidate/selection | lineage, semantic, aggregate, pointer and fallback tests |
 
@@ -710,7 +791,7 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | EC-17 suspended placeholder | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_daily_schema_preserves_legal_suspended_empty_activity_and_factor`; existing exact placeholder gate passes only for legal suspended rows. |
 | EC-18 active/suspended/index semantics | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_and_suspended_index`. |
 | Six endpoint IDs / nine stock-index schema-role variants | Task 7.1 / 7.2 | `test_each_baostock_endpoint_has_exact_fields_variant_units_and_order`, `test_endpoint_contract_constant_rejects_wrong_combination_and_model_copy`; no unknown fields/union-any. |
-| Plan/attempt/object cardinality | Tasks 7.1–8.2 | `test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker`, `test_request_completion_rejects_success_then_later_attempt_and_multiple_successes`, `test_request_completion_model_copy_round_trip_revalidates_success_cardinality`, `test_manifest_requires_one_descriptor_per_request_shard_and_page`; every attempt/request ID and page joins exactly one descriptor. |
+| Plan/attempt/object cardinality | Tasks 7.1–8.2 | `test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker`, `test_request_completion_rejects_success_then_later_attempt_and_multiple_successes`, `test_request_completion_model_copy_round_trip_revalidates_success_cardinality`, `test_manifest_requires_one_descriptor_per_request_shard_and_page`; every actual session/root/page ID and page joins exactly one descriptor. |
 | Successful-attempt-only evidence and row count | Task 8.1 / 8.2 | `test_failed_partial_attempt_creates_zero_evidence_files`, `test_retry_success_publishes_only_final_successful_attempt_pages`, `test_retry_success_row_count_equals_final_descriptor_rows`, `test_failed_attempt_row_count_is_excluded_from_manifest_and_hash`, `test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer`, `test_failed_partial_payload_is_not_quarantined_or_hashed`; failed rows/page bytes/counts never reach staging/object/manifest/hash. |
 | Transport observation digest | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_every_evidence_descriptor_binds_sanitized_transport_observation_digest`; payload/message/URL/token assertions remain negative. |
 | Gate cardinality | Task 9.1 / 9.2 | `test_gate_report_requires_exact_ordered_complete_gate_aggregate`; one canonical report/hash only. |
@@ -718,22 +799,31 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
 | Factor snapshot provenance and published descriptor | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash`, `test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions`, `test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding`, `test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint, descriptor bidirectional equality and live-cache exclusion. |
 | Complete session/per-call symbol vocabulary | Task 7.1 / 7.2 | `test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates`, `test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe`; no ambiguous top-level `symbols`. |
+| Actual provider/query/page identities | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_provider_request_has_no_provider_session_or_transport_request_override_fields`, `test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden`, `test_query_root_completion_excludes_login_and_complete_observations`, `test_multipage_page_request_identities_join_one_root_and_page`, `test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page`, `test_manifest_final_attempt_pages_share_actual_provider_session`; actual IDs only, no forged singular session. |
+| Typed source null/sort/calendar/version/export closure | Task 7.1 / 7.2 | `test_typed_adapter_maps_suspended_blank_numerics_to_none_only`, `test_factor_rows_require_exact_logical_symbols_and_daily_date_code_sort`, `test_calendar_rows_are_unique_ordered_and_within_requested_range`, `test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions`, `test_provider_public_exports_are_complete`, `test_valid_fixture_survives_identity_and_schema_mutations_before_any_write`. |
+| Task 7/Task 8 normalization ownership | Task 7.1 / Task 8.2 | `test_task7_compatibility_normalize_uses_narrow_seam_not_published_evidence`; Task 8 replaces the seam with typed hash/schema/row/descriptor-bound `EvidenceReader` before canonical normalize. |
 | SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`, `test_open_evidence_relative_uses_dirfd_nofollow_containment`; model is lexical-only and storage owns descriptor-bound containment. |
 | Replay CLI parser ordering | Task 8.1 / 8.2 | `test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader`; parser exits before layout/evidence reader construction, with zero provider/network calls and unchanged root tree/bytes/mtimes. |
 | Selection/pointer order | Task 9.1 / 9.2 | `test_selection_publish_order_never_moves_pointer_early`; selection readback precedes existing pointer chain. |
 | Fallback boundary | Task 9.1 / 9.2 | `test_qualified_fallback_is_reserved_and_rejected_by_r2f2_writers`; static scan proves no second source/plugin/failover. |
 
-The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-20 and EC-1–EC-26 to a
+The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-19, AC-1–AC-21 and EC-1–EC-30 to a
 Task step and one of these concrete tests or an explicit static/diff proof. The design-only
 `spec_validator.py` is not allowed to claim implementation or traceability coverage.
 
-Coverage audit for this revision: FR-1..FR-33, NFR-1..NFR-18, AC-1..AC-20 and EC-1..EC-26 are
+Coverage audit for this revision: FR-1..FR-33, NFR-1..NFR-19, AC-1..AC-21 and EC-1..EC-30 are
 all present exactly once in the range matrix after expanding each range; no numbered item is
 unmapped. The new successful-attempt row-count, factor snapshot descriptor and complete-session
 symbol boundaries are separately named above because they are blocking contract proofs, not
 implicit coverage from a broader range.
 
 ### Acceptance document and independent final review
+
+This amendment's current gate is **In Review — architecture amendment required**. Do not create an
+acceptance GO record, do not call `fea5678` delivery, and do not advance to Task 8 or Task 9 until
+the identity contract receives an independent specification review and a new reviewed
+fix/replace commit. The final handoff MUST report this deliberate In Review state and the need for
+independent spec review.
 
 Create `docs/acceptance/release-2-r2f2.md` only after the universal gate. It MUST state:
 
