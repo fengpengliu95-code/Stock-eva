@@ -657,10 +657,16 @@ The architecture amendment is explicit: `ProviderRequest` carries no provider-se
 request identity; no-argument incumbent login scopes generate actual sessions, and request scopes may
 rebind only the saved actual login ID; the authoritative capture registry maps login audit, root
 page 1 and nested page N. Root `OPERATION` alone closes an attempt, page `COMPLETE` binds final page
-objects, and login/failed observations produce no page lineage/object. Factor snapshot descriptors
+objects, and login/failed observations produce no page lineage/object. `end_marker_seen` is the
+complete per-frame protocol-tail flag and every successful page `COMPLETE` (including page 1 before
+page 2) requires it true; missing/false fails closed. Only `_read_result()`'s `result.next()` control
+flow emits one internal registry `pagination_terminal` on `has_row=False`; it is not a F0.1
+field/stage/outcome/provider code and creates no object. Factor snapshot descriptors
 use a local `capture_id` with provider/session/page identity fields null; object/raw-page-row/
 completion-attempt cardinalities are exact. Exact current version constants, typed suspended blank
-handling, factor `(dividOperateDate, code)`/symbol rules, calendar order, complete exports and Task 7/Task 8 normalization ownership are blocking tests. Option A,
+handling, factor `(dividOperateDate, code)`/symbol rules with daily-factor exact-session versus
+adjust-factor through-date semantics, calendar order, complete exports and Task 7/Task 8
+normalization ownership are blocking tests. Option A,
 outer `RefreshRunLock`, no failed source bytes, no second provider/plugin, no transport/vendor/
 normalizer changes, no network and production unchanged remain in force.
 

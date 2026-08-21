@@ -69,10 +69,14 @@ Initial login uses `plan_ordinal=0`; read-time relogin inherits the active logic
 registry derives `plan_ordinal`/`lineage_kind` deterministically and includes both in the projection
 digest; the adapter may not invent a second projection. Page 1's page ID equals its root ID. Only
 the matching query-root `ProtocolStage.OPERATION` decides attempt terminal state. `COMPLETE` is
-page transport evidence for page 1 or page N: page 1 is final only with `end_marker_seen`, later
-pages continue with fresh page scopes and only the final page may carry that marker. A successful
-final page binds its matching COMPLETE digest, never the OPERATION digest; the root OPERATION
-remains aggregate evidence and drives the completion without binding an object. Login/relogin and failed-attempt observations (including
+page transport evidence for page 1 or page N, and every successful COMPLETE frame on every legal
+page MUST have `end_marker_seen=True`; false/missing is a frame/protocol failure. This flag does
+not terminate logical pagination. `_read_result()` consumes successful rows then calls `result.next()`:
+`has_row=True` enters the next page, and `has_row=False` emits exactly one internal registry
+`pagination_terminal` event, which is not a F0.1 field/stage/outcome/provider code and creates no
+object. Page 1 may have the frame marker and still enter page 2. Each page of a final-success
+attempt binds its matching COMPLETE digest, never the OPERATION digest; the root OPERATION remains aggregate
+evidence and drives the completion without binding an object. Login/relogin and failed-attempt observations (including
 partial pages) remain aggregate-only and produce no `TransportLineageRef`, descriptor, object or
 completion. `TransportLineageRef` is final-success-page-only and resolves exactly one COMPLETE
 projection.
@@ -228,6 +232,11 @@ def test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_termi
 def test_request_completion_rejects_success_then_later_attempt_and_multiple_successes(): ...
 def test_failed_completion_has_zero_row_count_and_no_failed_source_rows(): ...
 def test_request_completion_model_copy_round_trip_revalidates_success_cardinality(): ...
+def test_success_attempt_requires_all_complete_frame_markers_and_one_pagination_terminal(): ...
+def test_page_one_frame_marker_true_still_enters_page_two(): ...
+def test_missing_complete_frame_marker_fails_closed(): ...
+def test_pagination_terminal_emitted_once_only_on_next_false(): ...
+def test_page_after_pagination_terminal_is_rejected(): ...
 def test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden(): ...
 def test_caller_cannot_supply_session_id_to_login_or_query_scope(): ...
 def test_query_request_scope_rebinds_the_saved_actual_login_session(): ...
@@ -247,6 +256,8 @@ def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor(): ...
 def test_typed_adapter_maps_suspended_blank_numerics_to_none_only(): ...
 def test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder(): ...
 def test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort(): ...
+def test_daily_factor_event_date_equals_requested_session_and_rejects_older_or_future(): ...
+def test_adjust_factor_event_date_allows_history_through_requested_date_and_rejects_future(): ...
 def test_factor_event_date_binds_through_date_without_invented_date_key(): ...
 def test_calendar_rows_are_unique_ordered_and_within_requested_range(): ...
 def test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions(): ...
@@ -305,7 +316,10 @@ Implement:
   determines terminal state, while page `COMPLETE` observations bind final page objects and the
   root/page-1 identity is equal;
 - exact current adapter/endpoint-contract constants, typed suspended-blank `None` boundary,
-  factor logical-symbol/`dividOperateDate`-code ordering, calendar ordering, complete public exports, source
+  factor logical-symbol/`dividOperateDate`-code ordering and distinct date semantics: `daily_factor.v1`
+  requires every event date to equal its requested session (older/future fail), while the per-symbol
+  `adjust_factor.session.v1` history permits event dates through the requested trade/end date (future
+  fails), calendar ordering, complete public exports, source
   schema validation before zip/object publication, read-back source/schema digest recomputation and
   valid fixture-before-mutation tests;
 - Task 7 may use only a narrow compatibility normalization seam; Task 8 replaces it with the
@@ -480,7 +494,10 @@ Required behavior:
   refresh/session, endpoint, schema/contract versions, pagination policy and transport observation
   digest. The manifest MUST reject missing, extra, duplicate, out-of-order, non-contiguous or
   swallowed multi-symbol/multi-index/multi-page objects, descriptors from a failed/non-final
-  attempt, and MUST require a terminal/end marker without requiring a prefetch page total.
+  attempt, and MUST require every successful page COMPLETE frame to have `end_marker_seen=True`
+  plus exactly one registry-level `pagination_terminal` emitted only by `_read_result()`'s final
+  `result.next()`/`has_row=False` transition; this is distinct from the F0.1 frame marker and does
+  not require a prefetch page total.
   Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
   object, manifest or hash; only sanitized transport observations may survive for audit.
 - Every raw-page descriptor MUST have `capture_id=None`, retain actual `provider_session_id`,
@@ -855,9 +872,9 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
 | Factor snapshot provenance and published descriptor | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash`, `test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions`, `test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding`, `test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint, descriptor bidirectional equality and live-cache exclusion. |
 | Complete session/per-call symbol vocabulary | Task 7.1 / 7.2 | `test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates`, `test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe`; no ambiguous top-level `symbols`. |
-| Actual provider/query/page identities | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_provider_request_has_no_provider_session_or_transport_request_override_fields`, `test_caller_cannot_supply_session_id_to_login_or_query_scope`, `test_query_request_scope_rebinds_the_saved_actual_login_session`, `test_relogin_scope_generates_a_distinct_actual_session_id`, `test_capture_registry_derives_plan_ordinal_and_lineage_kind_into_digest`, `test_baostock_capture_hook_is_additive_and_scope_registered`, `test_query_root_completion_excludes_login_and_complete_observations`, `test_multipage_page_request_identities_join_one_root_and_page`, `test_page_one_request_id_equals_query_root_id_and_page_n_has_own_id`, `test_final_page_lineage_binds_complete_digest_not_operation_digest`, `test_failed_partial_page_has_no_lineage_or_descriptor`, `test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page`, `test_manifest_final_attempt_pages_share_actual_provider_session`; actual IDs only, no forged singular session. |
+| Actual provider/query/page identities and pagination authority | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_provider_request_has_no_provider_session_or_transport_request_override_fields`, `test_caller_cannot_supply_session_id_to_login_or_query_scope`, `test_query_request_scope_rebinds_the_saved_actual_login_session`, `test_relogin_scope_generates_a_distinct_actual_session_id`, `test_capture_registry_derives_plan_ordinal_and_lineage_kind_into_digest`, `test_baostock_capture_hook_is_additive_and_scope_registered`, `test_query_root_completion_excludes_login_and_complete_observations`, `test_multipage_page_request_identities_join_one_root_and_page`, `test_page_one_request_id_equals_query_root_id_and_page_n_has_own_id`, `test_final_page_lineage_binds_complete_digest_not_operation_digest`, `test_failed_partial_page_has_no_lineage_or_descriptor`, `test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page`, `test_manifest_final_attempt_pages_share_actual_provider_session`, `test_success_attempt_requires_all_complete_frame_markers_and_one_pagination_terminal`, `test_page_one_frame_marker_true_still_enters_page_two`, `test_missing_complete_frame_marker_fails_closed`, `test_pagination_terminal_emitted_once_only_on_next_false`, `test_page_after_pagination_terminal_is_rejected`; actual IDs only, no forged singular session; `end_marker_seen` is per-frame protocol evidence and `pagination_terminal` is the sole registry pagination-end event. |
 | Factor capture identity and manifest counts | Task 8.1 / 8.2 | `test_factor_snapshot_descriptor_requires_local_capture_id_and_null_provider_identity`, `test_factor_snapshot_manifest_and_descriptor_capture_id_match_both_directions`, `test_manifest_object_count_includes_optional_factor_descriptor`, `test_manifest_row_count_excludes_factor_snapshot_rows`, `test_manifest_attempt_count_sums_completion_attempts_only`; capture ID is local and provider/session/page identities remain null. |
-| Typed source null/sort/calendar/version/export closure | Task 7.1 / 7.2 | `test_typed_adapter_maps_suspended_blank_numerics_to_none_only`, `test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder`, `test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort`, `test_factor_event_date_binds_through_date_without_invented_date_key`, `test_calendar_rows_are_unique_ordered_and_within_requested_range`, `test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions`, `test_provider_public_exports_are_complete`, `test_valid_fixture_survives_identity_and_schema_mutations_before_any_write`. |
+| Typed source null/sort/calendar/version/export closure | Task 7.1 / 7.2 | `test_typed_adapter_maps_suspended_blank_numerics_to_none_only`, `test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder`, `test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort`, `test_daily_factor_event_date_equals_requested_session_and_rejects_older_or_future`, `test_adjust_factor_event_date_allows_history_through_requested_date_and_rejects_future`, `test_factor_event_date_binds_through_date_without_invented_date_key`, `test_calendar_rows_are_unique_ordered_and_within_requested_range`, `test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions`, `test_provider_public_exports_are_complete`, `test_valid_fixture_survives_identity_and_schema_mutations_before_any_write`. |
 | Task 7/Task 8 normalization ownership | Task 7.1 / Task 8.2 | `test_task7_compatibility_normalize_uses_narrow_seam_not_published_evidence`; Task 8 replaces the seam with typed hash/schema/row/descriptor-bound `EvidenceReader` before canonical normalize. |
 | SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`, `test_open_evidence_relative_uses_dirfd_nofollow_containment`; model is lexical-only and storage owns descriptor-bound containment. |
 | Replay CLI parser ordering | Task 8.1 / 8.2 | `test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader`; parser exits before layout/evidence reader construction, with zero provider/network calls and unchanged root tree/bytes/mtimes. |

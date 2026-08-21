@@ -61,7 +61,7 @@ permission to patch production code in this task.
    `request_id`; every pagination page MUST enter a fresh page `request_scope()` and capture its
    actual page `request_id`. Callers may not supply or override any of these IDs.
 3. `AttemptCompletion` MUST carry the actual `provider_session_id` and query-root
-   `root_request_id`. Login/relogin observations are sanitized transport audit/lineage only,
+   `root_request_id`. Login/relogin observations are sanitized aggregate audit only,
    never a query completion; they are associated with the current logical call by `plan_ordinal`.
    The terminal state of an attempt is determined only by the matching query-root observation
    whose `protocol_stage` is `OPERATION`. Page/complete/login observations cannot determine the
@@ -128,25 +128,30 @@ them in the projection canonical form and therefore in `observation_digest`; the
 replace either value. Page 1's `page_request_id` MUST equal its query-root `root_request_id`; later
 pages have their own actual page IDs.
 
-The only terminal authority is the unique `ProtocolStage.OPERATION` observation from the matching
-query-root request. A vendor `COMPLETE` on page 1 is transport evidence for that page, not the
-completion terminal; page > 1 `COMPLETE` is likewise page transport evidence. `end_marker_seen` is
-recorded on the relevant COMPLETE projection: page 1 may be the final page only when its marker is
-seen, otherwise page N continues with fresh page scopes and only the final page may carry the marker.
-No page may follow a marked page, and page 1/page N map one-to-one to the contiguous observed page
-set without guessing a total. A successful final raw page/descriptor/`RawEndpointBatch` binds one
+The only attempt terminal authority is the unique `ProtocolStage.OPERATION` observation from the
+matching query-root request. A vendor `COMPLETE` on page 1 is transport evidence for that page,
+not the completion terminal; page > 1 `COMPLETE` is likewise page transport evidence. F0.1's
+`end_marker_seen` is a complete protocol-tail flag on every transport frame: every successful
+`COMPLETE` for every legal page MUST have it true. A missing/false marker is a frame/protocol
+failure, even when the page has rows; it does not decide logical pagination. The authoritative
+pagination control flow is `_read_result()` consuming rows then calling `result.next()`: a
+`has_row=True` transition enters the next page, while `has_row=False` emits exactly one internal
+capture-registry `pagination_terminal` event. That event is not a F0.1 field, stage, outcome or
+provider code, and creates no object. Page 1 may have a true frame marker and still enter page 2;
+page 1/page N map one-to-one to the contiguous observed page set. A successful raw page/descriptor/
+`RawEndpointBatch` binds one
 matching successful COMPLETE projection and its actual tuple/digest; it MUST NOT bind the OPERATION
 digest. The root OPERATION projection remains in `TransportObservationAggregate` and drives
 `AttemptCompletion`, but never binds a page object. Login/relogin observations enter only the
-sanitized aggregate: they create no `TransportLineageRef`, object descriptor or `AttemptCompletion`.
+sanitized aggregate audit: they create no `TransportLineageRef`, object descriptor or `AttemptCompletion`.
 Failed-attempt observations likewise remain aggregate-only, even after a partial page was received;
 they create no page lineage/object and all failed source rows/bytes are discarded.
 
 `TransportLineageRef` is therefore restricted to final-success page COMPLETE projections. Its
 `observation_digest` MUST resolve to exactly one `protocol_stage=COMPLETE` projection with matching
 `page`, while the completion's operation digest resolves separately to the matching root
-`protocol_stage=OPERATION`. “Audit lineage” in this specification means sanitized aggregate
-observations only and MUST NOT be read as an object/completion lineage.
+`protocol_stage=OPERATION`. Login/relogin “audit” means sanitized aggregate audit only and MUST
+NOT be read as an object/completion lineage.
 
 ### Factor snapshot capture identity and manifest counts (normative)
 
@@ -190,8 +195,10 @@ This is a normative boundary for every model, validator, writer, reader, hash an
   `RequestCompletion.successful_attempt`.
 - `RequestCompletion` MUST be final-success bound before publication: `final_outcome=success`,
   exactly one `successful_attempt`/`successful_root_request_id`, that root request ID is the final attempt,
-  all published descriptors belong to it, observed pages are contiguous from page 1, and a
-  terminal/end marker is present. A final failure has null successful fields and cannot publish.
+  all published descriptors belong to it, observed pages are contiguous from page 1, every
+  successful page COMPLETE has `end_marker_seen=True`, and exactly one registry-level
+  `pagination_terminal` follows the final `result.next()`/`has_row=False`. A final failure has null
+  successful fields and cannot publish.
 - Sanitized `TransportObservationProjection` records for failed attempts MAY be retained in the
   non-payload aggregate observations and included in the ordered aggregate digest; no
   `TransportLineageRef`, failed-attempt object descriptor or source row may be inferred from those
@@ -224,7 +231,7 @@ closures are:
 | Finding | Confirmed root cause | Normative closure in this revision |
 | --- | --- | --- |
 | M1 — frozen batch summaries and roles incomplete | `source_schema`, `units` and `date_semantics` were only prose/table fields, while index-history stock/index variants had no role discriminator. | Carry these fields on every `RawEndpointBatch` and aggregate them through a frozen `EndpointContractSummary`; add `InstrumentRole`/`RequestRole` and an explicit endpoint-role validator. |
-| M2 — logical request cardinality predicted pages | The former expected-total-pages field made a caller guess the provider's total page count before fetching. | Replace it with `ExpectedLogicalRequest` plus post-fetch `RequestCompletion`; hash logical requests separately from observed contiguous pages and require terminal/end-marker evidence without guessing totals. |
+| M2 — logical request cardinality predicted pages | The former expected-total-pages field made a caller guess the provider's total page count before fetching. | Replace it with `ExpectedLogicalRequest` plus post-fetch `RequestCompletion`; hash logical requests separately from observed contiguous pages and require exactly one registry `pagination_terminal` plus per-page COMPLETE frame markers without guessing totals. |
 | M3 — transport projection incomplete | Only a digest was named; the complete allowlisted F0.1 observation fields and aggregate verification were not frozen. | Freeze `TransportObservationProjection` with the exact F0.1 field names, preserve bounded `provider_code`, and verify per-projection and ordered aggregate digests. |
 | M4 — gate set contradicted itself | The model had ten names while the table said eleven and the implementation traceability described a different set. | Use one exact ten-gate `R2F2_GATE_ORDER`, map every gate to current Normalize/Quality/publication functions and require exactly ten ordered outcomes. |
 | M5 — lock ownership was ambiguous | Evidence/selection layouts proposed additional blocking locks that could deadlock or reverse the R2-F1 lock order. | Use only the existing `RefreshRunLock` at `local_lock_dir/market-refresh.lock`; content-addressed O_EXCL/no-clobber writes are lock-free compare-create under that outer lock, and replay is read-only. |
@@ -443,7 +450,9 @@ automatic failover may be used to close that gap.
   sum only raw-page descriptor rows, and factor snapshot rows MUST remain confined to their own
   descriptor/manifest row count. `attempt_count` MUST equal the sum of attempts in completions only.
   The final completion MUST be successful, terminal and bound to all published
-  descriptors; an ultimate failure publishes no evidence manifest. The logical request-plan hash
+  descriptors; a successful completion additionally requires one registry-level `pagination_terminal`
+  after the final `result.next()` returns `has_row=False`, while every successful page COMPLETE
+  has its own F0.1 `end_marker_seen=True`; an ultimate failure publishes no evidence manifest. The logical request-plan hash
   and completion hash MUST be verified before evidence, candidate or selection publication; no page
   total is guessed.
 - FR-31: **Transport binding:** Every published final-success object MUST bind
@@ -643,8 +652,8 @@ cannot produce a page lineage or published source object.
 | --- | --- | --- | --- |
 | Initial login | `_login_scoped` → `provider_session_scope()` with no argument; `plan_ordinal=0` | `lineage_kind=login_audit` | Sanitized aggregate observation only; no completion, page lineage or object |
 | Relogin | `_login_scoped` → a fresh no-argument session scope; active logical `plan_ordinal` | `lineage_kind=login_audit` | Sanitized aggregate observation only; new actual session must differ from the prior one |
-| Query root/page 1 | Outer `_read` → `request_scope()`; `page_request_id == root_request_id` | `lineage_kind=query_root`; unique `OPERATION` is attempt terminal authority; same-request `COMPLETE` is page-1 transport evidence | Root OPERATION digest drives `AttemptCompletion`; page-1 COMPLETE digest may bind a final page object |
-| Pagination page N>1 | Nested `_read` page scope → fresh `request_scope()` | `lineage_kind=page`; `COMPLETE` is page transport evidence and `end_marker_seen` closes the observed page set | Only a final-success page COMPLETE digest may bind one `TransportLineageRef`/raw page object |
+| Query root/page 1 | Outer `_read` → `request_scope()`; `page_request_id == root_request_id` | `lineage_kind=query_root`; unique `OPERATION` is attempt terminal authority; same-request `COMPLETE` is page-1 transport evidence and must have `end_marker_seen=True` | Root OPERATION digest drives `AttemptCompletion`; page-1 COMPLETE digest may bind its raw page; a true frame marker does not prevent `result.next()` entering page 2 |
+| Pagination page N>1 | Nested `_read` page scope → fresh `request_scope()` | `lineage_kind=page`; every successful `COMPLETE` must have `end_marker_seen=True`; only `_read_result()` `next()/has_row=False` emits `pagination_terminal` | Each final-success page COMPLETE digest may bind one `TransportLineageRef`/raw page object; pagination terminal is registry-only |
 | Failed attempt or partial page | The same scopes as above, but non-success outcome | Aggregate observation only; partial rows/bytes are discarded | No page lineage, descriptor, object or manifest row |
 
 The registry, not an adapter-local event shape, derives every row's `plan_ordinal` and
@@ -1388,7 +1397,8 @@ def validate_publishable_descriptors(
 ```
 
 The implementation MUST additionally compare the descriptor page set with the final attempt's
-contiguous observed pages and require its terminal marker. This validator runs before staging,
+contiguous observed pages and require exactly one registry `pagination_terminal` plus a true
+`end_marker_seen` on every successful page COMPLETE. This validator runs before staging,
 manifest hashing or normalization; a failed attempt cannot be redirected into `orphan-audit`.
 
 `SafeFailureClass` is an existing allowlist (`MarketFailureClass`, `NormalizedTransportError` and
@@ -1499,6 +1509,7 @@ class AttemptCompletion(BaseModel):
     observed_pages: tuple[int, ...]  # empty only when no page was received; otherwise contiguous
     page_request_ids: tuple[tuple[int, SafeIdentifier], ...]  # actual page request_scope IDs
     observed_page_count: int = Field(ge=0, le=16_384)
+    pagination_terminal_count: int = Field(ge=0, le=1)  # registry next()/has_row=False event
     terminal: bool
     outcome: TransportOutcome
 
@@ -1516,6 +1527,10 @@ class AttemptCompletion(BaseModel):
             raise ValueError("page request IDs must be unique")
         if self.outcome == TransportOutcome.SUCCESS and not self.terminal:
             raise ValueError("successful attempt must be terminal")
+        if self.outcome == TransportOutcome.SUCCESS and self.pagination_terminal_count != 1:
+            raise ValueError("successful attempt requires exactly one pagination terminal")
+        if self.outcome is not TransportOutcome.SUCCESS and self.pagination_terminal_count != 0:
+            raise ValueError("failed attempt cannot claim pagination terminal")
         return self
 
 class RequestCompletion(BaseModel):
@@ -1582,17 +1597,18 @@ successful attempt's pages receive `EvidenceObjectDescriptor` and `TransportLine
 completion, `RequestCompletion.row_count` MUST equal the sum of the final successful descriptors'
 read-back row counts; failed-attempt counters are excluded from that sum, manifest `row_count` and
 all object/hash inputs. The completion validator MUST bind every descriptor to the successful
-root/page request IDs, actual provider session, contiguous pages and terminal marker before any
-object compare-create.
+root/page request IDs, actual provider session, contiguous pages, exactly one registry
+`pagination_terminal` and a true per-page COMPLETE frame marker before any object compare-create.
 `completion_hash` is SHA-256 of the ordered completion/attempt/page-descriptor tuple without its
 hash field and is independent of the logical request-plan hash. Missing, duplicate,
-non-contiguous, out-of-order, swallowed pages, duplicate root/page IDs, success-after-success,
-success-before-later-attempt or inconsistent final success/failure cardinality fail closed. No
-total-page guess is required.
+non-contiguous, out-of-order, swallowed pages, duplicate root/page IDs, any successful COMPLETE
+without its frame marker, missing/duplicate `pagination_terminal`, a page after the registry
+terminal, success-after-success, success-before-later-attempt or inconsistent final success/failure
+cardinality fail closed. No total-page guess is required.
 
 | Identity model | Frozen fields | Cardinality and lineage rule |
 | --- | --- | --- |
-| `AttemptCompletion` | `plan_ordinal`, actual `provider_session_id`, `attempt`, actual `root_request_id`, matching `operation_observation_digest`, contiguous `observed_pages`, `(page, page_request_id)` pairs, `observed_page_count`, `terminal`, `outcome` | One row per logical query attempt. The root ID and operation digest come from query-root scope; page IDs are generated by page scopes; login/relogin audit is excluded. |
+| `AttemptCompletion` | `plan_ordinal`, actual `provider_session_id`, `attempt`, actual `root_request_id`, matching `operation_observation_digest`, contiguous `observed_pages`, `(page, page_request_id)` pairs, `observed_page_count`, `pagination_terminal_count`, `terminal`, `outcome` | One row per logical query attempt. The root ID and operation digest come from query-root scope; page IDs are generated by page scopes; success requires exactly one registry `pagination_terminal` and every successful page COMPLETE frame marker; login/relogin audit is excluded. |
 | `RequestCompletion` | `plan_ordinal`, ordered attempts, `successful_attempt`, `successful_root_request_id`, `final_outcome`, `row_count` | Exactly one row per `ExpectedLogicalRequest`. Terminal outcome is decided only by the matching root `ProtocolStage.OPERATION`; success binds the final attempt/session/page set, while failure has zero rows and no successful root. |
 | `RawEndpointBatch` | endpoint/role/schema, plan/shard, actual page lineage, typed rows, exact source schema/fields/units/date/pagination, row/order digest | Exactly one final-success page/shard. Its page lineage digest joins exactly one sanitized projection; failed-attempt source rows are absent. |
 
@@ -1624,7 +1640,7 @@ additional summary fields hidden in prose. Per-endpoint `source_schema`, `units`
 | trade_date / universe_id | date / safe identifier | Exact session scope |
 | requested_at / completed_at / normalization_clock_utc | UTC datetime | ordered; frozen clock used by normalizer/replay |
 | logical_request_plan / request_plan_hash | `ExpectedLogicalRequestPlan` / SHA-256 | Logical requests only; hash recomputed before publish |
-| request_completions / completion_hash | ordered `RequestCompletion` / SHA-256 | Observed contiguous pages and terminal markers; no expected total |
+| request_completions / completion_hash | ordered `RequestCompletion` / SHA-256 | Observed contiguous pages, one registry pagination terminal and per-page COMPLETE frame markers; no expected total |
 | request_count / attempt_count | bounded non-negative integers | Request count equals plan count; `attempt_count == sum(len(completion.attempts) for completion in request_completions)` and excludes login audit, observation and page counts. `object_count == len(objects)` including an optional factor descriptor; manifest source `row_count` sums raw-page descriptors only. Actual provider-session IDs are derived from descriptors/observations across the aggregate; no singular session field is admitted. |
 | objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per final-success logical request/page/shard; failed attempts have none |
 | transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every published final-success page is bound to an exact allowlisted projection; failed attempts may appear only as sanitized aggregate observations |
@@ -1711,8 +1727,8 @@ the original provider payload is not retained.
 | `trade_dates.v1` | `query_trade_dates(start_date=ISO, end_date=ISO)`; `calendar_date`, `is_trading_day` | `calendar_date: date`; `is_trading_day: BoundedToken`. Only token `"1"` is a trading session; other tokens are not reinterpreted. No units. A range MAY be empty; the exact-date fetch requires exactly one row. | Provider pages are consumed in page number order; rows are unique and sorted by `calendar_date` ascending in evidence. A duplicate/date outside the requested range fails. |
 | `all_stock.market.v1` | `query_all_stock(day=ISO)`; `code`, `tradeStatus`, `code_name` (the market fixtures expose this exact tuple) | `code: SafeSymbol`; `tradeStatus: BoundedToken` and `code_name: bounded UTF-8 string` (empty string is retained; JSON null is rejected). The market path uses `code` for main-board universe membership; it does not guess additional status semantics. No units. An empty snapshot or duplicate code fails. | One explicit date request; pages must advance under F0.1. Evidence rows sorted by `code` ascending; duplicate codes fail. |
 | `daily_astock.v1` | `query_daily_history_k_AStock(date=ISO)`; exact `DAILY_FIELDS`: `date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST` | `date`, `code`, `open`, `high`, `low`, `close`, `preclose`, `adjustflag` and `isST` are required and empty values reject. Only `volume`, `amount`, `turn` and `pctChg` may map source `""` to `None`, and only when this is a stock row with `tradestatus != "1"`; active blank activity rejects. A suspended row may retain finite zero activity at this typed boundary, but the existing quality gate rejects non-zero suspended activity. `adjustflag: BoundedToken` MUST be `"3"`; active tokens remain exact and no index nullable placeholder is legal. Units: volume `shares`, amount `CNY`, turnover `percent`, pctChg `percent`. | One exact trade date; pages must advance. Rows are unique by `(code,date)` and sorted by `(date,code)` in evidence. Date mismatch, duplicate symbol, non-finite value, suspended index or non-zero suspended activity fails the full batch. |
-| `daily_factor.v1` | `query_daily_adjust_factor(date=ISO)`; exact `AdjustmentFactorCache.FACTOR_FIELDS`: `code,dividOperateDate,foreAdjustFactor,backAdjustFactor,adjustFactor` | `code: SafeSymbol` and MUST equal the logical request symbol vocabulary; `dividOperateDate` is the provider event/effective date, not an invented `date` key, and MUST be `<=` the requested session. The request date selects the provider event feed through that date; it does not require every event's effective date to equal the request date. Three factors are finite positive numeric; no null/empty factor values. An empty event response is raw evidence only; Task 8's factor-cache snapshot and later factor gate must prove resolution. | A date event request may have pages; rows are ordered by `(dividOperateDate,code)` in evidence. Duplicate `(dividOperateDate,code)` or future event fails. |
-| `adjust_factor.session.v1` | `query_adjust_factor(stock_symbol,start_date="1990-01-01",end_date=ISO)`; same exact five factor fields | Same typed rules as `daily_factor.v1`; this is a distinct request variant because it is a per-stock history through the requested end date and may be empty for a legal suspended placeholder. It MUST NOT be used to invent an active stock factor; `dividOperateDate` remains the provider event/effective date and need not equal the request end date. | Rows unique by `(dividOperateDate,code)` and sorted by `(dividOperateDate,code)` in evidence; every row's code equals the requested stock symbol. |
+| `daily_factor.v1` | `query_daily_adjust_factor(date=ISO)`; exact `AdjustmentFactorCache.FACTOR_FIELDS`: `code,dividOperateDate,foreAdjustFactor,backAdjustFactor,adjustFactor` | `code: SafeSymbol` and MUST equal the logical request symbol vocabulary; `dividOperateDate` is the provider event/effective date, not an invented `date` key, and MUST equal the requested session. Older or future event dates fail closed. Three factors are finite positive numeric; no null/empty factor values. An empty event response is raw evidence only; Task 8's factor-cache snapshot and later factor gate must prove resolution. | A date event request may have pages; rows are ordered by `(dividOperateDate,code)` in evidence. Duplicate `(dividOperateDate,code)` or any older/future event fails. Daily factor may contain multiple symbols for the same requested session. |
+| `adjust_factor.session.v1` | `query_adjust_factor(stock_symbol,start_date="1990-01-01",end_date=ISO)`; same exact five factor fields | Same typed factor fields, but this is a per-symbol historical query through the requested `end_date`/trade date. `code` MUST equal the one requested stock symbol and `dividOperateDate` MUST be `<=` that requested through date; a future event fails. Older events are legal. It may be empty for a legal suspended placeholder and MUST NOT invent an active stock factor. | Rows unique and sorted by `(dividOperateDate,code)` in evidence; this is a single-symbol shard. |
 | `index_history.session.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")`; exact 14 daily fields | Same typed daily rules as `daily_astock.v1`; the requested symbol role is discriminated: `index_symbol` MUST be one of existing `INDEX_SYMBOLS` and receives no stock factor; `stock_symbol` is not an index. Units are identical to daily bars. | One exact date/symbol; zero rows is missing and fails required coverage. One row is expected. |
 | `index_history.range.v1` | `query_history_k_data_plus(symbol, DAILY_FIELDS, start_date=ISO,end_date=ISO,frequency="d",adjustflag="3")` in `fetch_range`; exact 14 daily fields | Same fields/types as `index_history.session.v1`, but the request range MAY contain multiple trading dates. Every row's code equals the requested symbol; no date outside range. | Rows unique and sorted by `(date,code)`; a repeated date or non-advancing page is `PAGINATION_STALLED`/schema failure. |
 
@@ -1754,11 +1770,15 @@ or index symbol outside the current `INDEX_SYMBOLS` set invalidates the complete
   checked against the declared `universe_id`; unknown/duplicate symbols fail closed.
 - `daily_astock` and `index_history` use `adjustflag="3"`; canonical OHLCV remains unadjusted.
 - `daily_factor` and `adjust_factor` provide `backAdjustFactor` by exact logical symbol and provider
-  event/effective `dividOperateDate`; the selected factor is the latest eligible event date `<=
-  trade_date`. The provider query date/end date controls the event feed through that date; it does
-  not fabricate a `date` key or require `dividOperateDate == trade_date`. Active stock rows without
-  a finite positive factor fail. An empty `daily_factor` event is only raw evidence; Task 8's typed
-  factor-cache snapshot and later factor gate must prove the selected value.
+  event/effective `dividOperateDate`, but their date contracts are distinct. For
+  `daily_factor.v1`, `query_daily_adjust_factor(date=session)` requires every row's
+  `dividOperateDate == session`; both older and future dates fail closed. It may contain multiple
+  symbols on that one requested session. For `adjust_factor.session.v1`, the per-symbol historical
+  query permits every row with `dividOperateDate <= requested through/trade_date`; only future
+  events fail, and older events remain legal. Both variants sort `(dividOperateDate, code)` and
+  never invent a `date` key. These evidence rules do not change the incumbent factor-cache writer,
+  `Normalize` behavior or Quality Gate. An empty `daily_factor` event is only raw evidence; Task
+  8's typed factor-cache snapshot and later factor gate must prove the selected value.
 - `tradestatus == "1"` is the current active classifier. A non-`"1"` row is not a license to
   infer a new suspension meaning: the existing placeholder and activity gates remain authoritative.
   Only source `volume`, `amount`, `turn` and `pctChg` may translate `""` to `None`, and only for a

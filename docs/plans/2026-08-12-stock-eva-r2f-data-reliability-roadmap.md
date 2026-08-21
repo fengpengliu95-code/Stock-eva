@@ -359,12 +359,22 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
   rebind only the saved actual login ID. The authoritative capture registry maps login audit, root
   page 1 and nested page N events; only root `OPERATION` closes an attempt, while page `COMPLETE`
   binds final page objects. Login/failed observations have no page lineage or object.
+- Pagination authority is distinct from the frame marker: every successful page `COMPLETE`, including
+  page 1 before a page 2, requires `end_marker_seen=True`; missing/false is fail-closed. Only
+  `_read_result()`'s `result.next()` control flow emits one internal registry
+  `pagination_terminal` on `has_row=False`; it is not a F0.1 field/stage/outcome/provider code and
+  creates no object. The dedicated RED names are
+  `test_page_one_frame_marker_true_still_enters_page_two`,
+  `test_missing_complete_frame_marker_fails_closed`,
+  `test_pagination_terminal_emitted_once_only_on_next_false` and
+  `test_page_after_pagination_terminal_is_rejected`.
 - Factor snapshot descriptors use a locally generated `capture_id` with all provider/session/page
   transport identity fields null; manifest `object_count`, raw-page-only `row_count` and completion-
   attempt `attempt_count` are exact cardinalities.
 - Exact current adapter/endpoint-contract version constants, all six/nine endpoint variants, typed
-  suspended-blank semantics, factor symbol/`dividOperateDate`-code ordering, calendar ordering and public export
-  matrix are normative. Task 8 owns typed `PublishedEvidence`/`EvidenceReader`; Task 7 may use only
+  suspended-blank semantics, factor symbol/`dividOperateDate`-code ordering with daily-factor exact
+  session versus adjust-factor through-date semantics, calendar ordering and public export matrix
+  are normative. Task 8 owns typed `PublishedEvidence`/`EvidenceReader`; Task 7 may use only
   a narrow compatibility seam before Task 8 replaces it with descriptor-bound readback.
 
 **GO**
