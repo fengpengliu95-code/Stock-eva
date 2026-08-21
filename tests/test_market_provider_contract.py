@@ -683,6 +683,36 @@ class _ReloginAuditClient(_CompleteSdkClient):
         return super().query_daily_history_k_AStock(**kwargs)
 
 
+class _DuplicateOperationClient(_CompleteSdkClient):
+    def query_daily_history_k_AStock(self, **kwargs):
+        self._record("query_daily_history_k_AStock", kwargs)
+        emit_terminal_observation(
+            started_at=monotonic() - 0.001,
+            protocol_stage=ProtocolStage.OPERATION,
+            recv_calls=0,
+            response_bytes=0,
+            end_marker_seen=False,
+            provider_code=None,
+            normalized_error=None,
+        )
+        return _SdkResult(DAILY_FIELDS.split(","), [self._daily_row("sh.600000")])
+
+
+class _ReloginTwoPageClient(_TwoPageRetrySdkClient):
+    def login(self):
+        self.login_calls += 1
+        emit_terminal_observation(
+            started_at=monotonic() - 0.001,
+            protocol_stage=ProtocolStage.OPERATION,
+            recv_calls=0,
+            response_bytes=0,
+            end_marker_seen=False,
+            provider_code=None,
+            normalized_error=None,
+        )
+        return _SdkResult([], [])
+
+
 class _SuspendedStockClient(_CompleteSdkClient):
     def query_daily_history_k_AStock(self, **kwargs):
         self._record("query_daily_history_k_AStock", kwargs)
@@ -1920,3 +1950,126 @@ def test_provider_registry_exposes_authoritative_supported_fields_without_plugin
     assert set(registry.supported_fields) == {
         contract.schema_variant for contract in ENDPOINT_CONTRACTS
     }
+
+
+def test_lineage_join_rejects_forged_root_tuple_against_successful_page_projection() -> None:
+    raw = _provider_raw_batch()
+    forged = raw.transport_lineage[0].model_copy(update={"root_request_id": "forged-root"})
+    with pytest.raises(ValueError):
+        raw.model_copy(update={"transport_lineage": (forged,)})
+
+
+def test_each_attempt_operation_digest_must_join_its_query_root_projection() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_TwoPageRetrySdkClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    completion = raw.request_completions[0]
+    failed = completion.attempts[0].model_copy(update={"operation_observation_digest": "f" * 64})
+    changed = completion.model_copy(update={"attempts": (failed, completion.attempts[1])})
+    completion_hash = sha256(
+        json.dumps(
+            [changed.model_dump(mode="json")], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    with pytest.raises(ValueError):
+        raw.model_copy(
+            update={"request_completions": (changed,), "completion_hash": completion_hash}
+        )
+
+
+def test_capture_registry_preserves_query_root_kind_on_page_one_complete() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    page_one = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE and item.page == 1
+    )
+    assert page_one.lineage_kind == "query_root"
+
+
+def test_capture_registry_active_relogin_and_multipage_kinds_are_scope_authoritative() -> None:
+    calendar = _plan(
+        endpoint=ProviderEndpoint.TRADE_DATES,
+        role=RequestRole.CALENDAR,
+        instrument=None,
+        variant="trade_dates.v1",
+        symbols=(),
+        ordinal=0,
+    )
+    daily = _plan(ordinal=1)
+    requests = (calendar, daily)
+    plan_hash = sha256(
+        json.dumps(
+            [item.model_dump(mode="json") for item in requests],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    plan = ExpectedLogicalRequestPlan(
+        requests=requests, request_count=2, request_plan_hash=plan_hash
+    )
+    raw = BaoStockProviderAdapter(
+        client=_ReloginTwoPageClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request(plan=plan))
+    observations = raw.transport_observations.observations
+    assert any(
+        item.lineage_kind == "login_audit" and item.plan_ordinal == 1 for item in observations
+    )
+    pages = [
+        item
+        for item in observations
+        if item.plan_ordinal == 1
+        and item.protocol_stage is ProtocolStage.COMPLETE
+        and item.attempt == raw.request_completions[1].successful_attempt
+    ]
+    assert [(item.page, item.lineage_kind) for item in pages] == [(1, "query_root"), (2, "page")]
+    assert pages[0].request_id != pages[1].request_id
+
+
+def test_stock_role_index_history_maps_only_suspended_activity_blanks() -> None:
+    logical = _plan(
+        endpoint=ProviderEndpoint.INDEX_HISTORY,
+        role=RequestRole.INDEX_HISTORY,
+        instrument=InstrumentRole.STOCK,
+        variant="index_history.session.v1",
+        symbols=("sh.600000",),
+    )
+    raw = BaoStockProviderAdapter(
+        client=_SuspendedIndexClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request(plan=_plan_container(logical), session_symbols=("sh.600000",)))
+    row = raw.endpoint_batches[0].rows[0]
+    assert row.volume is None and row.amount is None
+    assert row.turn == 1 and row.pctChg == 5
+
+
+def test_adjust_factor_future_date_rejected_through_real_adapter_source() -> None:
+    logical = _plan(
+        endpoint=ProviderEndpoint.ADJUST_FACTOR,
+        role=RequestRole.ADJUST_FACTOR,
+        instrument=InstrumentRole.STOCK,
+        variant="adjust_factor.session.v1",
+        symbols=("sh.600000",),
+    )
+    client = _CompleteSdkClient()
+    client.query_adjust_factor = lambda *args, **kwargs: (
+        client._record("query_adjust_factor", args, kwargs),
+        _SdkResult(
+            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            [["sh.600000", "2026-08-21", "1", "0.8", "0.8"]],
+        ),
+    )[1]
+    with pytest.raises(ValueError, match="after requested"):
+        BaoStockProviderAdapter(
+            client=client, max_attempts=1, min_request_interval_seconds=0
+        ).fetch_raw(
+            _provider_request(plan=_plan_container(logical), session_symbols=("sh.600000",))
+        )
+
+
+def test_login_operation_cannot_be_reused_as_query_root_completion() -> None:
+    with pytest.raises(ValueError):
+        BaoStockProviderAdapter(
+            client=_DuplicateOperationClient(), max_attempts=1, min_request_interval_seconds=0
+        ).fetch_raw(_provider_request())

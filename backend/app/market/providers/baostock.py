@@ -29,6 +29,7 @@ from .base import (
     ExpectedLogicalRequest,
     IndexHistoryRangeRow,
     IndexHistorySessionRow,
+    InstrumentRole,
     ProviderId,
     ProviderRawBatch,
     ProviderRequest,
@@ -153,9 +154,20 @@ class BaoStockProviderAdapter:
             tuple(page[4]) != contract.fields for page in captured_pages
         ):
             raise ValueError("source schema does not match endpoint contract")
-        operations = tuple(item for item in local if item.protocol_stage is ProtocolStage.OPERATION)
+        local_projections = tuple(
+            self._projection(item, scope_entries, default_kind="page") for item in local
+        )
+        operations = tuple(
+            item
+            for item, projection in zip(local, local_projections, strict=True)
+            if item.protocol_stage is ProtocolStage.OPERATION
+            and projection.lineage_kind == "query_root"
+        )
         if not operations:
             raise RuntimeError("BaoStock logical request has no operation observation")
+        for attempt in {item.attempt for item in operations}:
+            if sum(item.attempt == attempt for item in operations) != 1:
+                raise ValueError("BaoStock logical request has duplicate query-root operation")
         root_ids: dict[int, str] = {}
         for item in operations:
             entries = [
@@ -173,9 +185,6 @@ class BaoStockProviderAdapter:
                 root_ids.setdefault(item.attempt, item.request_id)
         if set(root_ids) != {item.attempt for item in operations}:
             raise RuntimeError("BaoStock logical request has no authoritative query root")
-        local_projections = tuple(
-            self._projection(item, scope_entries, default_kind="page") for item in local
-        )
         projection_by_identity = {
             (item.request_id, item.attempt, item.page, item.protocol_stage): projection
             for item, projection in zip(local, local_projections, strict=True)
@@ -307,8 +316,6 @@ class BaoStockProviderAdapter:
             raise RuntimeError("transport observation has no unique capture registry scope")
         entry = matches[0]
         kind = entry["lineage_kind"]
-        if item.protocol_stage is ProtocolStage.COMPLETE and kind == "query_root":
-            kind = "page"
         return TransportObservationProjection.from_observation_with_lineage(
             item,
             plan_ordinal=int(entry["plan_ordinal"]),
@@ -357,7 +364,11 @@ class BaoStockProviderAdapter:
     @staticmethod
     def _typed_row(logical, fields, row):
         values = dict(zip(fields, row, strict=True))
-        if logical.schema_variant == "daily_astock.v1" and values.get("tradestatus") != "1":
+        stock_daily_shaped = logical.schema_variant == "daily_astock.v1" or (
+            logical.schema_variant in {"index_history.session.v1", "index_history.range.v1"}
+            and logical.instrument_role is InstrumentRole.STOCK
+        )
+        if stock_daily_shaped and values.get("tradestatus") != "1":
             for field in ("volume", "amount", "turn", "pctChg"):
                 if values.get(field) == "":
                     values[field] = None

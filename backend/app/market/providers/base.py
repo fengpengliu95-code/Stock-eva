@@ -955,6 +955,8 @@ class ProviderRawBatch(_ContractModel):
                 raise ValueError("duplicate raw endpoint page")
             batch_keys.add(key)
             batches_by_ordinal.setdefault(item.plan_ordinal, []).append(item)
+            if sum(item.lineage == lineage for lineage in self.transport_lineage) != 1:
+                raise ValueError("raw endpoint lineage must join exactly one top-level lineage")
         if len(self.endpoint_summaries) != len(successful):
             raise ValueError("raw endpoint summary cardinality mismatch")
 
@@ -983,27 +985,24 @@ class ProviderRawBatch(_ContractModel):
         for completion in self.request_completions:
             batches = batches_by_ordinal.get(completion.plan_ordinal, [])
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
-            operation_matches = tuple(
-                projection
-                for projection in self.transport_observations.observations
-                if projection.observation_digest
-                == next(
-                    attempt.operation_observation_digest
-                    for attempt in completion.attempts
-                    if attempt.attempt == completion.attempts[-1].attempt
+            for attempt in completion.attempts:
+                operation_matches = tuple(
+                    projection
+                    for projection in self.transport_observations.observations
+                    if projection.observation_digest == attempt.operation_observation_digest
+                    and projection.protocol_stage is ProtocolStage.OPERATION
+                    and projection.request_id == attempt.root_request_id
+                    and projection.endpoint is logical.endpoint
+                    and projection.plan_ordinal == completion.plan_ordinal
+                    and projection.attempt == attempt.attempt
+                    and projection.page == 1
+                    and projection.refresh_id == self.request.refresh_id
+                    and projection.provider_session_id == attempt.provider_session_id
+                    and projection.lineage_kind == "query_root"
+                    and projection.outcome is attempt.outcome
                 )
-                and projection.protocol_stage is ProtocolStage.OPERATION
-                and projection.request_id == completion.attempts[-1].root_request_id
-                and projection.endpoint is logical.endpoint
-                and projection.plan_ordinal == completion.plan_ordinal
-                and projection.attempt == completion.attempts[-1].attempt
-                and projection.page == 1
-                and projection.refresh_id == self.request.refresh_id
-                and projection.provider_session_id == completion.attempts[-1].provider_session_id
-                and projection.lineage_kind == "query_root"
-            )
-            if len(operation_matches) != 1:
-                raise ValueError("operation digest must resolve one authoritative query root")
+                if len(operation_matches) != 1:
+                    raise ValueError("operation digest must resolve one authoritative query root")
             if completion.final_outcome is TransportOutcome.ERROR:
                 if completion.row_count != 0 or batches:
                     raise ValueError("failed completion cannot persist source rows")
@@ -1135,7 +1134,7 @@ class ProviderRawBatch(_ContractModel):
             and item.protocol_stage is ProtocolStage.COMPLETE
             and item.outcome is TransportOutcome.SUCCESS
             and item.end_marker_seen
-            and item.lineage_kind == "page"
+            and item.lineage_kind in {"query_root", "page"}
         }
         if complete_projection_digests != {
             item.observation_digest for item in self.transport_lineage
