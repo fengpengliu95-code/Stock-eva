@@ -2,7 +2,8 @@
 
 > **Spec-first gate:** This plan is executable only after
 > [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
-> reviewed and changed from **In Review** to **Approved**. No production code, test stubs or
+> reviewed and changed from **In Review** to **Approved**. The design is currently **In Review**
+> after six Medium specification findings were amended; no production code, test stubs or
 > RED command may begin before that gate.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
@@ -10,7 +11,7 @@ normalize only from that evidence, replay it offline, and record complete candid
 lineage while preserving every legacy reader and canonical publication invariant.
 
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`f6c18d64a8ac04bd24d3f49fb38a28523e6eb8de`.
+`90680832a3b2d9c876b7917a88ad0213236250ab`.
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -20,6 +21,34 @@ task until a new regression, minimal fix commit, focused/full re-run and fresh r
 network request, installation, production database mutation, pointer mutation, LaunchAgent action
 or external communication is authorized by this plan. The existing production refresh remains
 unloaded/frozen.
+
+## Review closure preflight (must remain before RED)
+
+The prior independent review was **NO-GO** with six Medium specification findings. The design
+amendment closes them by freezing: (M1) all immutable bounded models and safe types; (M2) exact
+six-endpoint fields/units/null rules/variants/order from current code and fixtures; (M3) one
+descriptor per request/shard/page plus expected-plan hash; (M4) transport IDs bound to sanitized
+F0.1 observation digests; (M5) one ordered complete gate aggregate with exact cardinality; and
+(M6) settings/layout/CAS order, replay clock/equivalence, qualified-fallback rejection and manual
+traceability. This plan MUST implement those definitions verbatim and MUST NOT narrow them to pass
+current tests. No ambiguity exceeds the 30% escalation threshold; any newly discovered unresolved
+schema or security meaning stops the task and returns to specification review.
+
+### Feature manifest and dependency map
+
+| Boundary | Authoritative files / artifacts | Dependency and allowed direction |
+| --- | --- | --- |
+| Provider transport/parser (read-only dependency) | `backend/app/market/baostock.py`, `provider_transport.py`, `baostock_vendor.py`, `factor_cache.py` | R2-F2 adapter consumes the six fixed endpoint calls, `ProviderEndpoint`, typed F0.1 `TransportObservation`; it MUST NOT change transport, retry, timeout, circuit or normalizer semantics. |
+| Provider contracts | Task 7 `backend/app/market/providers/{base,baostock}.py`, `backend/app/market/models.py` | Safe types → endpoint variants → `ProviderRequest`/raw discriminated rows → incumbent adapter; no dynamic provider/plugin import. |
+| Evidence publication | Task 8 `backend/app/market/evidence.py`, `config.py`, `storage/layout.py` | Raw batch + transport digests → bounded descriptor-bound object → ordered `EvidenceManifest`; uses existing local safe-path/hash/atomic conventions. |
+| Replay/read-only boundary | Task 8 `cli.py`, `automation.py`, `tests/test_market_get_read_only.py` | Evidence reader → injected-clock normalizer/replay; zero network/provider/canonical pointer/database initialization on reads. |
+| Candidate/selection lineage | Task 9 models/store/dataset/publication/service/series/API compatibility files | Published evidence → exact gate aggregate → candidate manifest → session selection → existing canonical publication chain; no symbol-level mixing. |
+| Existing serving chain | Normalize → Quality Gate → Immutable Parquet → SHA-256 → Manifest → Atomic Publish | R2-F2 adds only validated additive lineage hooks; legacy object bytes/readers remain authoritative. |
+
+Task dependencies are one-way: provider contract depends on incumbent transport/parser; evidence
+depends on provider contract; candidate/selection depends on evidence and R2-F1 lock/CAS/publication
+boundaries. R2-F2 does not depend on or introduce any second provider, shadow schedule, failover,
+NAS, LaunchAgent or production state.
 
 **Authoritative specification:**
 [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)
@@ -108,9 +137,13 @@ def test_provider_id_is_static_baostock_allowlist(): ...
 def test_provider_request_requires_exact_sorted_unique_symbols_and_aware_dates(): ...
 def test_raw_batch_rejects_unknown_fields_secrets_headers_urls_and_raw_exception(): ...
 def test_raw_batch_rejects_nonfinite_values_and_row_shape_mismatch(): ...
+def test_each_baostock_endpoint_has_exact_fields_variant_units_and_order(): ...
+def test_endpoint_schema_variants_reject_date_mismatch_and_mixed_sessions(): ...
+def test_transport_lineage_preserves_unknown_provider_code_and_maps_unknown_protocol(): ...
 def test_baostock_adapter_preserves_endpoint_and_session_contract(): ...
 def test_baostock_adapter_captures_source_rows_before_normalization(): ...
 def test_baostock_compatibility_produces_existing_daily_bar_semantics(): ...
+def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor(): ...
 ```
 
 Run:
@@ -128,12 +161,27 @@ stop and fix the fixture before implementation.
 
 Implement:
 
-- a frozen `ProviderId`/registry with only `baostock`;
+- the complete frozen `SafeProviderId`, `SafeSymbol`, `SafeVersion`, `ProviderEndpoint`,
+  `ProviderRequest`, `TransportLineageRef`, discriminated `RawEndpointRow`/`RawEndpointBatch`,
+  `ProviderRawBatch`, `EvidenceObjectDescriptor`, `EvidenceManifest`, `PublishedEvidence`,
+  `GateOutcome`, `CandidateGateReport`, `CandidateManifest`, `SessionSelection` and
+  `ReplayResult` contracts from the design. Every model is `extra="forbid"`, immutable,
+  finite-number checked, UTC-aware and bounded;
+- a frozen `ProviderId`/registry with only `baostock`, rejecting empty/path-like/mixed-case/plugin
+  identities;
 - typed `ProviderRequest`, `RawEndpointBatch` and `ProviderRawBatch` with bounded allowlisted
-  source fields, UTC timestamps, exact date/universe/symbols and sanitized failure metadata;
+  source fields, UTC timestamps, exact date/universe/symbols, explicit expected request plan and
+  sanitized failure metadata;
+- exact endpoint/schema variants: `trade_dates.v1`, `all_stock.market.v1`,
+  `daily_astock.v1`, `daily_factor.v1`, `adjust_factor.session.v1`,
+  `index_history.session.v1` and `index_history.range.v1`. Freeze the exact field tuples,
+  units, empty/null rules, request parameters, page/attempt lineage and deterministic row order
+  from the design; no `dict[str, object]` or union-any escape hatch;
 - `DailyBarProvider` protocol with `fetch_raw()` and `normalize()` contracts;
 - a BaoStock compatibility adapter that reuses the incumbent call/transport/parser boundary and
   exposes source-shaped rows before `normalize_baostock_rows()`;
+- sanitized `TransportObservation` projection and SHA-256 digest binding every endpoint/page/
+  attempt to `refresh_id/provider_session_id/request_id`;
 - compatibility delegation so existing `BaoStockProvider.fetch()` callers keep the current
   canonical models and behavior during the transition.
 
@@ -201,8 +249,13 @@ def test_evidence_reader_rejects_symlink_toc_tou_oversize_and_object_substitutio
 def test_evidence_reader_rejects_bad_parquet_decompression_and_manifest_swap(tmp_path): ...
 def test_offline_replay_has_zero_network_and_zero_canonical_pointer_writes(tmp_path): ...
 def test_replay_is_deterministic_and_matches_online_candidate(tmp_path): ...
+def test_replay_injects_frozen_normalization_clock_and_excludes_replay_start(tmp_path): ...
 def test_missing_evidence_root_is_write_free(tmp_path): ...
 def test_get_and_plan_paths_do_not_initialize_evidence_storage(tmp_path): ...
+def test_manifest_requires_one_descriptor_per_request_shard_and_page(tmp_path): ...
+def test_every_evidence_descriptor_binds_sanitized_transport_observation_digest(tmp_path): ...
+def test_evidence_compare_create_allows_one_lineage_and_zero_canonical_writes_for_loser(tmp_path): ...
+def test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed(tmp_path): ...
 ```
 
 Run:
@@ -234,17 +287,38 @@ Required behavior:
 
 - Add `evidence_root` and evidence staging layout with safe settings validation. Missing roots are
   unavailable on read paths and are not created implicitly.
+- Add the exact relative settings/layout from the design: `objects/`, `manifests/`, `gates/`,
+  `candidates/`, `selections/`, `staging/`, `locks/` and `orphan-audit/`, with fixed bounded size
+  and row limits. Validate root/ancestor descriptors using no-follow identity checks; no caller
+  supplied path component may escape the opened root.
 - Use relative paths only and reject symlinks, traversal, absolute paths, object substitution,
   manifest swaps, oversize metadata/object and malformed/decompression-invalid Parquet.
 - Never expose or persist transport payload, token, header, cookie, URL, local path or raw
   exception. Preserve only bounded provider code and allowlisted failure classes.
+- Store one `EvidenceObjectDescriptor` per expected logical request/endpoint shard/page, in the
+  exact ordered `ExpectedRequestPlan`; each descriptor MUST carry relative path, object/hash/schema
+  hashes, row/byte counts, units, provider/universe, refresh/session/request, endpoint, attempt,
+  page, schema/contract versions and transport observation digest. The manifest MUST reject missing,
+  extra, duplicate, out-of-order or swallowed multi-symbol/multi-index/multi-page objects.
+- Use evidence compare-create/no-clobber CAS. Identical content is idempotent; a collision with
+  different bytes fails closed. Preserve unreferenced staging under `orphan-audit` and never adopt
+  it automatically.
 - Use deterministic JSON (`ensure_ascii=False`, sorted keys, compact separators), deterministic
   row ordering and content-addressed IDs. Identical bytes are idempotent; changed bytes never
   overwrite an existing object.
+- Generate `normalization_clock_utc` exactly once after fetch/transport completion and before
+  evidence-manifest publish; inject it into online and replay normalization. `replay_started_at`
+  is diagnostic-only and excluded from candidate/semantic/selection hashes.
 - Make `EvidenceReader` the only input accepted by adapter normalization in the canonical path.
 - Add `market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]`. It accepts no
   provider credentials or path and performs zero network, provider, canonical Parquet, canonical
   manifest or pointer writes.
+- Replay MUST report byte hash and semantic hash/match using the design's same-version byte GO and
+  cross-version non-semantic-encoding exception; any unclassified difference is fail-closed.
+- Readers and plan/replay paths MUST use SELECT/read-only descriptors and never initialize roots,
+  schemas, locks or pointers. The full writer order is `RefreshRunLock` → evidence compare-create
+  → evidence manifest → gate aggregate → candidate manifest → selection publish/readback → existing
+  canonical manifest/pointer; a CAS loser performs zero canonical writes.
 - Keep GET and plan paths read-only and independent of evidence schema initialization.
 
 The evidence Parquet is source-shaped, not a socket dump. Daily semantic validation remains the
@@ -320,11 +394,15 @@ def test_legacy_baostock_rows_and_manifests_decode_without_rewrite(tmp_path): ..
 def test_missing_legacy_source_decodes_as_baostock_in_memory(tmp_path): ...
 def test_new_candidate_references_exact_evidence_universe_and_gate_hashes(tmp_path): ...
 def test_every_candidate_gate_has_immutable_pass_or_fail_record(tmp_path): ...
+def test_gate_report_requires_exact_ordered_complete_gate_aggregate(tmp_path): ...
 def test_selection_references_one_complete_candidate_only(tmp_path): ...
 def test_selection_rejects_mixed_provider_or_symbol_level_partition(tmp_path): ...
-def test_qualified_fallback_is_reserved_and_unreachable_in_r2f2(tmp_path): ...
+def test_qualified_fallback_is_reserved_and_rejected_by_r2f2_writers(tmp_path): ...
 def test_new_canonical_manifest_requires_lineage_for_new_entries(tmp_path): ...
 def test_lineage_mismatch_preserves_old_pointer_and_candidate_history(tmp_path): ...
+def test_candidate_rejects_any_lineage_provider_schema_universe_or_hash_mismatch(tmp_path): ...
+def test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_and_suspended_index(tmp_path): ...
+def test_selection_publish_order_never_moves_pointer_early(tmp_path): ...
 def test_existing_market_analysis_alert_user_and_api_json_remain_compatible(tmp_path): ...
 def test_get_reads_and_legacy_manifest_reads_are_write_free(tmp_path): ...
 ```
@@ -347,15 +425,22 @@ Implement:
 - widen only genuine provider identity fields to the static `ProviderId` registry; keep public
   existing `source="baostock"` values and unrelated literals unchanged;
 - decode missing legacy source as BaoStock in memory without touching bytes;
-- add immutable gate reports and candidate manifests referencing exact published evidence,
-  normalized candidate, universe, provider/adapter/schema versions and hashes;
-- add a `SessionSelection` record with `primary_ready` active in R2-F2 and
-  `qualified_fallback` reserved but rejected by current policy;
+- add exactly one immutable `CandidateGateReport` aggregate per candidate, with the ordered
+  `R2F2_GATE_ORDER` and exactly one `GateOutcome` for each gate. Missing, extra, duplicate,
+  out-of-order or aggregate-hash-mismatched outcomes fail closed; rejected candidates retain the
+  sanitized complete report;
+- add immutable candidate manifests referencing exact published evidence, normalized candidate,
+  universe, provider/adapter/schema versions, one gate aggregate path/hash and exact row counts;
+- add a `SessionSelection` record with `primary_ready` active in R2-F2. The schema may contain
+  `qualified_fallback` for future compatibility, but every R2-F2 writer, orchestrator and validator
+  MUST reject it, reject non-null `fallback_from`, and never load a second source/plugin;
 - require exactly one complete candidate/provider for each new canonical partition and reject
   mixed symbols, duplicate providers, incomplete coverage, wrong date/universe or missing lineage;
 - preserve rejected candidate/gate/selection audit artifacts outside the serving pointer;
 - add additive lineage fields to new manifest entries while accepting old schema/entries;
-- invoke only the existing canonical publication chain after selection is complete;
+- invoke only the existing canonical publication chain after selection is atomically published and
+  readback/hash verified under the same `RefreshRunLock`; the canonical manifest/pointer MUST NOT
+  reference a missing selection;
 - keep analysis, alert, user, market summary/history and GET response field compatibility. No new
   public failover endpoint or source-selection control is added.
 
@@ -410,6 +495,19 @@ uv run --extra dev ruff format --check backend tests
 git diff --check
 ```
 
+Run the specification validator against the **design only** (never against this implementation
+plan and never as a substitute for tests or manual traceability):
+
+```bash
+python /Users/finlay/.codex/skills/claude-skills--engineering/spec-driven-workflow/scripts/spec_validator.py \
+  --strict docs/plans/2026-08-21-stock-eva-r2f2-provider-evidence-design.md
+```
+
+Record the actual exit code, score, warnings and errors. The validator checks Markdown structure;
+it does not certify code, implementation steps, endpoint semantics, security, tests, or GO status.
+The manual FR/NFR/AC/EC traceability table above remains mandatory even when the design validator
+is green.
+
 Run the focused R2-F2 matrix:
 
 ```bash
@@ -449,6 +547,31 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 If `spec_validator.py --strict` cannot parse the Markdown because of Chinese/Markdown formatting,
 record its actual exit code/output and complete this matrix manually. Do not weaken the spec to make
 the validator green.
+
+### Mandatory edge-case and new-boundary traceability
+
+The following rows are mandatory named tests/static proofs, not illustrative examples. Task numbers
+refer to the exact RED/GREEN steps above; an absent test is a review blocker.
+
+| Boundary | Task / RED-GREEN step | Required concrete evidence |
+| --- | --- | --- |
+| EC-3 exact date/session | Task 7.1 / 7.2 | `test_endpoint_schema_variants_reject_date_mismatch_and_mixed_sessions`; `daily_astock`/`index_history` rows outside requested date fail full batch. |
+| EC-4 unknown provider code | Task 7.1 / 7.2 | `test_transport_lineage_preserves_unknown_provider_code_and_maps_unknown_protocol`; raw code is bounded, sanitized and mapped only to `UNKNOWN_PROVIDER_PROTOCOL_ERROR`. |
+| EC-12 duplicate writer/request | Task 8.1 / 8.2 | `test_evidence_compare_create_allows_one_lineage_and_zero_canonical_writes_for_loser`; concurrent same request key has one complete winner. |
+| EC-16 lineage mismatch | Task 9.1 / 9.2 | `test_candidate_rejects_any_lineage_provider_schema_universe_or_hash_mismatch`; old pointer and candidate history fingerprints remain unchanged. |
+| EC-17 suspended placeholder | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_daily_schema_preserves_legal_suspended_empty_activity_and_factor`; existing exact placeholder gate passes only for legal suspended rows. |
+| EC-18 active/suspended/index semantics | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_and_suspended_index`. |
+| Six exact endpoint variants | Task 7.1 / 7.2 | `test_each_baostock_endpoint_has_exact_fields_variant_units_and_order`; no unknown fields/union-any. |
+| Plan/object cardinality | Task 8.1 / 8.2 | `test_manifest_requires_one_descriptor_per_request_shard_and_page`; missing/extra/duplicate/swallowed page fails. |
+| Transport observation digest | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_every_evidence_descriptor_binds_sanitized_transport_observation_digest`; payload/message/URL/token assertions remain negative. |
+| Gate cardinality | Task 9.1 / 9.2 | `test_gate_report_requires_exact_ordered_complete_gate_aggregate`; one canonical report/hash only. |
+| Replay clock/hash | Task 8.1 / 8.2 | `test_replay_injects_frozen_normalization_clock_and_excludes_replay_start`; same-version byte equality and explicit cross-version semantic exception. |
+| Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`, `test_selection_publish_order_never_moves_pointer_early`. |
+| Fallback boundary | Task 9.1 / 9.2 | `test_qualified_fallback_is_reserved_and_rejected_by_r2f2_writers`; static scan proves no second source/plugin/failover. |
+
+The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-15 and EC-1–EC-20 to a
+Task step and one of these concrete tests or an explicit static/diff proof. The design-only
+`spec_validator.py` is not allowed to claim implementation or traceability coverage.
 
 ### Acceptance document and independent final review
 
