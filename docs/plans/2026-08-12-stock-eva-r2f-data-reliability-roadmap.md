@@ -355,11 +355,15 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
   preserving old rows and response compatibility.
 - Record candidate gate results and one explicit selection record for every canonical publication.
 - Identity amendment: `ProviderRequest` contains no provider-session or transport request identity;
-  incumbent scopes generate actual provider sessions, query-root IDs and page request IDs. Login
-  audit is not query completion, page descriptors close the actual root/page/session tuple, and
-  actual session sets are derived rather than represented by a forged singular session.
+  `_login_scoped` generates sessions with no-argument incumbent scopes; later request scopes may
+  rebind only the saved actual login ID. The authoritative capture registry maps login audit, root
+  page 1 and nested page N events; only root `OPERATION` closes an attempt, while page `COMPLETE`
+  binds final page objects. Login/failed observations have no page lineage or object.
+- Factor snapshot descriptors use a locally generated `capture_id` with all provider/session/page
+  transport identity fields null; manifest `object_count`, raw-page-only `row_count` and completion-
+  attempt `attempt_count` are exact cardinalities.
 - Exact current adapter/endpoint-contract version constants, all six/nine endpoint variants, typed
-  suspended-blank semantics, factor symbol/date-code ordering, calendar ordering and public export
+  suspended-blank semantics, factor symbol/`dividOperateDate`-code ordering, calendar ordering and public export
   matrix are normative. Task 8 owns typed `PublishedEvidence`/`EvidenceReader`; Task 7 may use only
   a narrow compatibility seam before Task 8 replaces it with descriptor-bound readback.
 
@@ -371,8 +375,8 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
 - Corrupt evidence, schema/version mismatch or hash mismatch fails before normalization/promotion.
 - Existing historical manifests/rows remain readable without rewriting immutable objects.
 - GET requests remain write-free.
-- Only after independent review confirms the amended identity/cardinality model and a new fix/replace
-  commit; `fea5678` and all earlier Task 7 commits remain non-delivery.
+- Only after an independent specification GO, explicit user approval of this breaking amendment and
+  a new reviewed fix/replace commit; `fea5678` and all earlier Task 7 commits remain non-delivery.
 
 **Current gate:** In Review — architecture amendment required; three Task 7 rounds are NO-GO and
 independent spec review is still required.

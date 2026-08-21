@@ -1,8 +1,8 @@
 # Stock EVA R2-F2 Provider Evidence Framework Implementation Plan
 
 > **Spec-first gate:** **In Review — architecture amendment required.** This plan is blocked until
-> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
-> reviewed and approved after the identity amendment. The exact code HEAD
+> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) receives independent
+> specification GO and explicit user approval of this breaking amendment. The exact code HEAD
 > `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is a non-delivery review baseline; no production
 > code, provider request or external operation is authorized by this plan.
 
@@ -53,22 +53,45 @@ or security meaning stops the task and returns to specification review.
 The amended design is the only authority for this boundary. Task 7 MUST remove
 `provider_session_id` and transport `request_id` from `ProviderRequest`; it carries only provider,
 refresh, date, universe, complete `session_symbols` and `ExpectedLogicalRequestPlan`. The
-incumbent `provider_session_scope()` MUST generate every actual provider session without a caller
-override. Each logical query attempt MUST generate an actual query-root request ID, each page a
-fresh actual page request ID, and `AttemptCompletion` MUST carry `provider_session_id` plus
-`root_request_id`. Login/relogin observations are sanitized audit lineage associated by
-`plan_ordinal`, never query completions; only matching `ProtocolStage.OPERATION` query-root
-observations determine attempt terminal state.
+“Caller cannot override” means that the adapter, `ProviderRequest` and external callers cannot
+provide a session ID. `_login_scoped` MUST call `provider_session_scope()` with no arguments for
+each login/relogin, store its fresh actual `provider_session_id` on the live connection, and allow
+the scope to exit while that connection remains alive. A later `_request_scope(saved_actual_id)` may
+rebind that exact incumbent-generated ID; this internal rebind is not a caller override and does not
+change F0.1 semantics. `_discard_session` clears the saved identity, and every relogin generates a
+different actual ID. No long-lived session scope is required. Each logical query attempt MUST
+generate an actual query-root request ID, each page a fresh actual page request ID, and
+`AttemptCompletion` MUST carry `provider_session_id` plus `root_request_id`.
+
+The authoritative additive capture hook is registered at scope entry in the adapter: `_login_scoped`
+records `login_audit`, the outer `_read` page 1 records `query_root`, and page > 1 records `page`.
+Initial login uses `plan_ordinal=0`; read-time relogin inherits the active logical ordinal. The
+registry derives `plan_ordinal`/`lineage_kind` deterministically and includes both in the projection
+digest; the adapter may not invent a second projection. Page 1's page ID equals its root ID. Only
+the matching query-root `ProtocolStage.OPERATION` decides attempt terminal state. `COMPLETE` is
+page transport evidence for page 1 or page N: page 1 is final only with `end_marker_seen`, later
+pages continue with fresh page scopes and only the final page may carry that marker. A successful
+final page binds its matching COMPLETE digest, never the OPERATION digest; the root OPERATION
+remains aggregate evidence and drives the completion without binding an object. Login/relogin and failed-attempt observations (including
+partial pages) remain aggregate-only and produce no `TransportLineageRef`, descriptor, object or
+completion. `TransportLineageRef` is final-success-page-only and resolves exactly one COMPLETE
+projection.
 
 Each final-success page/shard MUST produce one `RawEndpointBatch` with the closed actual lineage
 tuple `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`.
-Failed-attempt rows/bytes are discarded; failed audit retains only bounded IDs/counts. Task 8 MUST
-reject duplicate/missing/extra/out-of-order plans, completions, attempts, pages, batches and
-projections; enforce final-session consistency and `row_count=sum(final page readback rows)`;
+Failed-attempt rows/bytes are discarded; failed observations retain only sanitized aggregate
+projections and bounded IDs/counts. Task 8 MUST reject duplicate/missing/extra/out-of-order plans,
+completions, attempts, pages, batches and projections; enforce final-session consistency and
+`row_count=sum(final raw-page descriptor readback rows)`; `object_count=len(objects)` including an
+optional factor descriptor, while factor snapshot rows never enter manifest source `row_count`.
+`attempt_count=sum(len(completion.attempts) for completion in request_completions)` and excludes
+login audit, observation and page counts.
 actual session IDs are derived, not forged as a singular request field. Adapter and
-endpoint-contract versions MUST equal exact current constants. Blank numerics become `None` only
-for legal suspended stock rows; factor code/sort/calendar order and public export matrix are
-strictly tested. Task 8 owns `PublishedEvidence`/`EvidenceReader`; Task 7 compatibility may use
+endpoint-contract versions MUST equal exact current constants. Only source `volume`, `amount`,
+`turn` and `pctChg` may become `None` for a suspended stock row; required fields and active blank
+activity reject, finite zero suspended activity may remain typed and non-zero activity is rejected
+by the existing gate. Factor rows use exact symbols and `(dividOperateDate, code)` ordering; public
+exports and source-shaped fixture boundaries are strictly tested. Task 8 owns `PublishedEvidence`/`EvidenceReader`; Task 7 compatibility may use
 only a narrow seam and MUST NOT duplicate canonical evidence normalization.
 
 ### Feature manifest and dependency map
@@ -150,7 +173,7 @@ For each task:
 
 **Requirements:** FR-1–FR-5, FR-19–FR-23, FR-27–FR-31; NFR-1, NFR-6, NFR-9, NFR-11, NFR-14,
 NFR-19;
-AC-1–AC-3, AC-15–AC-17; EC-1–EC-5, EC-10, EC-17, EC-18, EC-21, EC-22.
+AC-1–AC-3, AC-15–AC-17, AC-21; EC-1–EC-5, EC-10, EC-17, EC-18, EC-21, EC-22.
 
 ### Exact file whitelist
 
@@ -166,6 +189,11 @@ Create/modify only:
 
 No other file is permitted in the Task 7 commit. In particular, do not touch transport, vendor
 patch, provider health, normalizer, storage layout, canonical publication or API routes.
+
+The permitted `backend/app/market/baostock.py` modification is additive capture-hook wiring only:
+scope entry registers the authoritative context for `_login_scoped`, outer `_read` page 1 and
+nested page N; it MUST not alter `provider_transport`, the vendor client, retries, timeouts,
+circuit state, pagination semantics or F0.1 observation meaning.
 
 `base.py` owns provider-safe types, endpoint/role validators, logical requests/completions, raw
 batches and transport projections. `providers/baostock.py` owns only the compatibility adapter.
@@ -201,15 +229,25 @@ def test_request_completion_rejects_success_then_later_attempt_and_multiple_succ
 def test_failed_completion_has_zero_row_count_and_no_failed_source_rows(): ...
 def test_request_completion_model_copy_round_trip_revalidates_success_cardinality(): ...
 def test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden(): ...
+def test_caller_cannot_supply_session_id_to_login_or_query_scope(): ...
+def test_query_request_scope_rebinds_the_saved_actual_login_session(): ...
+def test_relogin_scope_generates_a_distinct_actual_session_id(): ...
+def test_capture_registry_derives_plan_ordinal_and_lineage_kind_into_digest(): ...
+def test_baostock_capture_hook_is_additive_and_scope_registered(): ...
 def test_query_root_completion_excludes_login_and_complete_observations(): ...
 def test_multipage_page_request_identities_join_one_root_and_page(): ...
+def test_page_one_request_id_equals_query_root_id_and_page_n_has_own_id(): ...
+def test_final_page_lineage_binds_complete_digest_not_operation_digest(): ...
+def test_failed_partial_page_has_no_lineage_or_descriptor(): ...
 def test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page(): ...
 def test_baostock_adapter_preserves_endpoint_and_session_contract(): ...
 def test_baostock_adapter_captures_source_rows_before_normalization(): ...
 def test_baostock_compatibility_produces_existing_daily_bar_semantics(): ...
 def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor(): ...
 def test_typed_adapter_maps_suspended_blank_numerics_to_none_only(): ...
-def test_factor_rows_require_exact_logical_symbols_and_daily_date_code_sort(): ...
+def test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder(): ...
+def test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort(): ...
+def test_factor_event_date_binds_through_date_without_invented_date_key(): ...
 def test_calendar_rows_are_unique_ordered_and_within_requested_range(): ...
 def test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions(): ...
 def test_provider_public_exports_are_complete(): ...
@@ -234,7 +272,7 @@ Implement:
 
 - the complete frozen `SafeProviderId`, `SafeSymbol`, `SafeVersion`, `ProviderEndpoint`,
   `InstrumentRole`, `RequestRole`, `ExpectedLogicalRequest`, `ExpectedLogicalRequestPlan`,
-  `AttemptCompletion`, `RequestCompletion`, `ProviderRequest`, `TransportLineageRef`,
+  `AttemptCompletion` (including the matching root `operation_observation_digest`), `RequestCompletion`, `ProviderRequest`, `TransportLineageRef`,
   `TransportObservationProjection`, discriminated `RawEndpointRow`/`RawEndpointBatch` and
   `ProviderRawBatch` contracts from the design. Evidence models belong to Task 8 and candidate/
   gate/selection models belong only to Task 9 `market/candidates.py`. Every model is `extra="forbid"`, immutable,
@@ -263,10 +301,11 @@ Implement:
   normalization; do not change `normalize.py`;
 - actual scope identity: incumbent login/relogin generates a unique provider session, every query
   attempt generates one root request ID, every page one page request ID, login audit is assigned by
-  `plan_ordinal` but excluded from completion/attempt counts, and only matching `OPERATION` query
-  root determines terminal state;
+  `plan_ordinal` but excluded from completion/attempt counts; only matching `OPERATION` query root
+  determines terminal state, while page `COMPLETE` observations bind final page objects and the
+  root/page-1 identity is equal;
 - exact current adapter/endpoint-contract constants, typed suspended-blank `None` boundary,
-  factor logical-symbol/date-code ordering, calendar ordering, complete public exports, source
+  factor logical-symbol/`dividOperateDate`-code ordering, calendar ordering, complete public exports, source
   schema validation before zip/object publication, read-back source/schema digest recomputation and
   valid fixture-before-mutation tests;
 - Task 7 may use only a narrow compatibility normalization seam; Task 8 replaces it with the
@@ -277,9 +316,10 @@ Implement:
 
 The adapter MUST NOT change the six `ProviderEndpoint` values, F0.1 failure mapping, max attempts,
 socket timeout, circuit state or pagination behavior. It MUST use incumbent request/session scopes
-as generators: no caller override is accepted for provider sessions, query-root IDs or page IDs.
-Login/relogin observations are audit-only; only matching `OPERATION` query-root observations close
-an attempt. Task 7 MUST NOT define `PublishedEvidence`/`EvidenceReader`; its compatibility test may
+as generators: no adapter/ProviderRequest/external caller override is accepted for provider sessions,
+query-root IDs or page IDs; only an internal rebind to an already-generated saved login ID is
+allowed. Login/relogin observations are audit-only; only matching `OPERATION` query-root
+observations close an attempt, and page objects bind matching `COMPLETE` observations. Task 7 MUST NOT define `PublishedEvidence`/`EvidenceReader`; its compatibility test may
 use only the named narrow test seam. Do not add a generic plugin mechanism or a second source.
 Do not change the normalizer.
 
@@ -317,7 +357,7 @@ called GO.
 ## Task 8 — Immutable evidence publication and offline replay
 
 **Requirements:** FR-4–FR-11, FR-19, FR-23–FR-25, FR-30–FR-33; NFR-1–NFR-6, NFR-8–NFR-12,
-NFR-15–NFR-17; AC-2, AC-4–AC-8, AC-12–AC-14, AC-17, AC-19; EC-2, EC-4–EC-9, EC-11, EC-13,
+NFR-15–NFR-17; AC-2, AC-4–AC-8, AC-12–AC-14, AC-17, AC-19, AC-21; EC-2, EC-4–EC-9, EC-11, EC-13,
 EC-14, EC-19–EC-22, EC-24–EC-26.
 
 ### Exact file whitelist
@@ -363,6 +403,8 @@ def test_manifest_rejects_missing_extra_duplicate_or_out_of_order_plan_completio
 def test_manifest_completion_terminal_uses_matching_query_root_operation_only(tmp_path): ...
 def test_manifest_page_lineage_binds_refresh_session_root_page_endpoint_attempt_page(tmp_path): ...
 def test_manifest_final_attempt_pages_share_actual_provider_session(tmp_path): ...
+def test_manifest_page_one_reuses_root_id_and_page_n_uses_page_scope_id(tmp_path): ...
+def test_manifest_rejects_operation_digest_as_page_lineage(tmp_path): ...
 def test_failed_partial_attempt_creates_zero_evidence_files(tmp_path): ...
 def test_retry_success_publishes_only_final_successful_attempt_pages(tmp_path): ...
 def test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer(tmp_path): ...
@@ -370,6 +412,11 @@ def test_failed_partial_payload_is_not_quarantined_or_hashed(tmp_path): ...
 def test_retry_success_row_count_equals_final_descriptor_rows(tmp_path): ...
 def test_failed_attempt_row_count_is_excluded_from_manifest_and_hash(tmp_path): ...
 def test_login_audit_observations_are_not_query_attempts(tmp_path): ...
+def test_manifest_attempt_count_sums_completion_attempts_only(tmp_path): ...
+def test_manifest_object_count_includes_optional_factor_descriptor(tmp_path): ...
+def test_manifest_row_count_excludes_factor_snapshot_rows(tmp_path): ...
+def test_factor_snapshot_descriptor_requires_local_capture_id_and_null_provider_identity(tmp_path): ...
+def test_factor_snapshot_manifest_and_descriptor_capture_id_match_both_directions(tmp_path): ...
 def test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash(tmp_path): ...
 def test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions(tmp_path): ...
 def test_factor_snapshot_descriptor_manifest_mapping_is_exact_and_bidirectional(tmp_path): ...
@@ -436,23 +483,31 @@ Required behavior:
   attempt, and MUST require a terminal/end marker without requiring a prefetch page total.
   Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
   object, manifest or hash; only sanitized transport observations may survive for audit.
-- Every raw-page descriptor MUST retain actual `provider_session_id`, query-root `root_request_id`
-  and page `page_request_id`; the closed join key is
-  `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`.
+- Every raw-page descriptor MUST have `capture_id=None`, retain actual `provider_session_id`,
+  query-root `root_request_id` and page `page_request_id`, and bind the closed join key
+  `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`
+  to exactly one successful `COMPLETE` projection digest (never the root `OPERATION` digest).
   Login/relogin audit projections are aggregated across actual sessions, never counted as query
   attempts, and cannot satisfy a completion. The final attempt's pages MUST share one actual
-  provider session. `RequestCompletion.row_count` MUST equal final page readback rows exactly.
-- Serialize one immutable `factor_cache_snapshot` object from the in-memory
+  provider session. `RequestCompletion.row_count` MUST equal final raw-page readback rows exactly.
+  The optional factor descriptor MUST instead carry a locally generated `capture_id`, with all
+  provider/session/root/page/endpoint/role/shard/plan/attempt/page/transport fields null and a
+  matching factor manifest capture ID. `EvidenceManifest.object_count=len(objects)`; manifest
+  `row_count` sums raw-page descriptors only; `attempt_count=sum(len(completion.attempts) for
+  completion in request_completions)` and excludes audit/observation/page counts.
+- While holding `RefreshRunLock`, generate one locally unique `capture_id` immediately before the
+  exact snapshot read; it is not a provider/session/request ID and must not borrow the last provider
+  identity. Serialize one immutable `factor_cache_snapshot` object from the in-memory
   `FactorCacheSnapshotRecords` returned by `AdjustmentFactorCache.exact_snapshot_records(symbols,
   trade_date)`. Each record MUST mirror the current `factor_snapshots` columns (`symbol`,
   `trade_date`, `fore_adjust_factor`, `back_adjust_factor`, `evidence_kind`,
   `evidence_effective_date`, `evidence_observed_on`, `source_row_hash`, `observed_at`) plus a
   stable row fingerprint; no invented `source`, `effective`, `observed`, `adjust_factor` or
   cache-version field and no schema migration is allowed. Publish a separate frozen
-  `FactorCacheSnapshotManifest` containing `object_id`, `relative_path`, `object_sha256`,
+  `FactorCacheSnapshotManifest` containing locally generated `capture_id`, `object_id`, `relative_path`, `object_sha256`,
   `byte_count`, `row_count`, `schema_variant`, `schema_hash`, `records_sha256` and before/after fingerprints.
   The matching `EvidenceObjectDescriptor(kind=factor_cache_snapshot)` MUST satisfy this exact
-  bidirectional mapping: `object_id↔object_id`, `relative_path↔relative_path`,
+  bidirectional mapping: `capture_id↔capture_id`, `object_id↔object_id`, `relative_path↔relative_path`,
   `sha256↔object_sha256`, `byte_count↔byte_count`, `row_count↔row_count`,
   `schema_variant↔schema_variant`, `schema_hash↔schema_hash`, and
   `factor_snapshot_provenance_hash↔records_sha256`; every equality is enforced in both
@@ -751,7 +806,7 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | FR-20–FR-23 | `validate_raw_date_binding(request, batch)`, existing publication requested-date/session identity gate, adapter failure mapping and existing normalizer quality rules | pre-normalize cross-day rejection, unit/factor/suspension and sanitized failure tests; no `normalize.py` date-binding claim |
 | FR-27 | whitelist/diff and absence of second-source code | static review and no-network gate |
 | FR-28–FR-29 | `providers/base.py` frozen models and role cross-validator | immutable extra-forbid model, complete `session_symbols`/per-call symbol rules, factor snapshot manifest/descriptor model and exact endpoint variant tests |
-| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion success cardinality, actual session/root/page identity, login-audit exclusion, zero failed row-count, final-descriptor row-count and projection digest/cardinality tests |
+| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion success cardinality, actual session/root/page identity, registry-derived capture event, root OPERATION versus page COMPLETE digest binding, login-audit exclusion, zero failed row-count, final-descriptor row-count and projection digest/cardinality tests |
 | FR-32 | `market/candidates.py` | exact ordered ten-outcome aggregate test |
 | FR-33 | `market/evidence.py` injected clock plus adapter call boundary | deterministic replay and frozen-clock tests; `normalize.py` remains unchanged |
 | NFR-1–NFR-6 | evidence/publish locking, hashes, canonical serializers | crash/concurrency/TOCTOU/determinism tests |
@@ -768,6 +823,7 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | AC-18 | Task 9 gate aggregate | exact ten-outcome aggregate test |
 | AC-19 | Task 8 clock/layout/CAS | frozen-clock, storage and replay tests |
 | AC-20 | Task 9 validator/fallback boundary | static validator/manual traceability and fallback test |
+| AC-21 | Tasks 7–8 authoritative capture/identity and descriptor cardinality | session login/query rebind/relogin IDs, scope-derived capture registry, page-one/root identity, COMPLETE-vs-OPERATION digest, factor capture ID, `object_count`/raw-page `row_count`/attempt-count tests |
 | EC-1–EC-5 | Task 7 provider/transport contract | sanitized endpoint/failure tests |
 | EC-27–EC-30 | Tasks 7–8 identity/schema boundary | no ProviderRequest identity fields, unique relogin scopes, query-root-only completion, page tuple, suspended blank/factor/calendar/version/export/valid-fixture tests |
 | EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser-before-reader with root fingerprints and zero provider/network calls, successful-attempt/row-count, factor descriptor bidirectional binding, cardinality, digest, clock and storage tests |
@@ -799,8 +855,9 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
 | Factor snapshot provenance and published descriptor | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash`, `test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions`, `test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding`, `test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint, descriptor bidirectional equality and live-cache exclusion. |
 | Complete session/per-call symbol vocabulary | Task 7.1 / 7.2 | `test_provider_request_requires_complete_nonempty_session_symbols_and_aware_dates`, `test_expected_logical_request_symbols_are_empty_only_for_calendar_and_universe`; no ambiguous top-level `symbols`. |
-| Actual provider/query/page identities | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_provider_request_has_no_provider_session_or_transport_request_override_fields`, `test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden`, `test_query_root_completion_excludes_login_and_complete_observations`, `test_multipage_page_request_identities_join_one_root_and_page`, `test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page`, `test_manifest_final_attempt_pages_share_actual_provider_session`; actual IDs only, no forged singular session. |
-| Typed source null/sort/calendar/version/export closure | Task 7.1 / 7.2 | `test_typed_adapter_maps_suspended_blank_numerics_to_none_only`, `test_factor_rows_require_exact_logical_symbols_and_daily_date_code_sort`, `test_calendar_rows_are_unique_ordered_and_within_requested_range`, `test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions`, `test_provider_public_exports_are_complete`, `test_valid_fixture_survives_identity_and_schema_mutations_before_any_write`. |
+| Actual provider/query/page identities | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_provider_request_has_no_provider_session_or_transport_request_override_fields`, `test_caller_cannot_supply_session_id_to_login_or_query_scope`, `test_query_request_scope_rebinds_the_saved_actual_login_session`, `test_relogin_scope_generates_a_distinct_actual_session_id`, `test_capture_registry_derives_plan_ordinal_and_lineage_kind_into_digest`, `test_baostock_capture_hook_is_additive_and_scope_registered`, `test_query_root_completion_excludes_login_and_complete_observations`, `test_multipage_page_request_identities_join_one_root_and_page`, `test_page_one_request_id_equals_query_root_id_and_page_n_has_own_id`, `test_final_page_lineage_binds_complete_digest_not_operation_digest`, `test_failed_partial_page_has_no_lineage_or_descriptor`, `test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page`, `test_manifest_final_attempt_pages_share_actual_provider_session`; actual IDs only, no forged singular session. |
+| Factor capture identity and manifest counts | Task 8.1 / 8.2 | `test_factor_snapshot_descriptor_requires_local_capture_id_and_null_provider_identity`, `test_factor_snapshot_manifest_and_descriptor_capture_id_match_both_directions`, `test_manifest_object_count_includes_optional_factor_descriptor`, `test_manifest_row_count_excludes_factor_snapshot_rows`, `test_manifest_attempt_count_sums_completion_attempts_only`; capture ID is local and provider/session/page identities remain null. |
+| Typed source null/sort/calendar/version/export closure | Task 7.1 / 7.2 | `test_typed_adapter_maps_suspended_blank_numerics_to_none_only`, `test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder`, `test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort`, `test_factor_event_date_binds_through_date_without_invented_date_key`, `test_calendar_rows_are_unique_ordered_and_within_requested_range`, `test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions`, `test_provider_public_exports_are_complete`, `test_valid_fixture_survives_identity_and_schema_mutations_before_any_write`. |
 | Task 7/Task 8 normalization ownership | Task 7.1 / Task 8.2 | `test_task7_compatibility_normalize_uses_narrow_seam_not_published_evidence`; Task 8 replaces the seam with typed hash/schema/row/descriptor-bound `EvidenceReader` before canonical normalize. |
 | SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`, `test_open_evidence_relative_uses_dirfd_nofollow_containment`; model is lexical-only and storage owns descriptor-bound containment. |
 | Replay CLI parser ordering | Task 8.1 / 8.2 | `test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader`; parser exits before layout/evidence reader construction, with zero provider/network calls and unchanged root tree/bytes/mtimes. |
@@ -821,9 +878,9 @@ implicit coverage from a broader range.
 
 This amendment's current gate is **In Review — architecture amendment required**. Do not create an
 acceptance GO record, do not call `fea5678` delivery, and do not advance to Task 8 or Task 9 until
-the identity contract receives an independent specification review and a new reviewed
-fix/replace commit. The final handoff MUST report this deliberate In Review state and the need for
-independent spec review.
+the identity contract receives an independent specification GO, the user explicitly approves that
+GO because this is a breaking contract amendment, and a new reviewed fix/replace commit passes the
+named tests. The final handoff MUST report this deliberate In Review state and both approval gates.
 
 Create `docs/acceptance/release-2-r2f2.md` only after the universal gate. It MUST state:
 

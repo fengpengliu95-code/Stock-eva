@@ -647,17 +647,20 @@ field contract.
 | Task 9 | Ten-outcome gate aggregate, complete-session candidate/selection lineage and additive legacy-source compatibility. | One BaoStock candidate per session; no symbol-level mixing, fallback or second provider. |
 
 Each task follows the dedicated implementation plan's RED → minimal GREEN → focused/full tests →
-Ruff/diff → independent High/Medium review gate. The dedicated design must first become Approved;
+Ruff/diff → independent High/Medium review gate. The breaking amended dedicated design requires
+independent specification GO followed by explicit user approval before it can become Approved;
 then Tasks 7 → 8 → 9 execute linearly, with a new fix/review cycle for every High or Medium. The
 umbrella roadmap does not repeat task files or commands; reviewers must inspect the dedicated
 whitelists at the exact task commit.
 
 The architecture amendment is explicit: `ProviderRequest` carries no provider-session or transport
-request identity; incumbent scopes generate actual provider sessions, query-root IDs and page IDs;
-login/relogin observations are audit-only and excluded from query completion/attempt counts; each
-final page binds the actual refresh/session/root/page/endpoint/attempt/page tuple. Exact current
-version constants, typed suspended blank handling, factor `(date, code)`/symbol rules, calendar
-order, complete exports and Task 7/Task 8 normalization ownership are blocking tests. Option A,
+request identity; no-argument incumbent login scopes generate actual sessions, and request scopes may
+rebind only the saved actual login ID; the authoritative capture registry maps login audit, root
+page 1 and nested page N. Root `OPERATION` alone closes an attempt, page `COMPLETE` binds final page
+objects, and login/failed observations produce no page lineage/object. Factor snapshot descriptors
+use a local `capture_id` with provider/session/page identity fields null; object/raw-page-row/
+completion-attempt cardinalities are exact. Exact current version constants, typed suspended blank
+handling, factor `(dividOperateDate, code)`/symbol rules, calendar order, complete exports and Task 7/Task 8 normalization ownership are blocking tests. Option A,
 outer `RefreshRunLock`, no failed source bytes, no second provider/plugin, no transport/vendor/
 normalizer changes, no network and production unchanged remain in force.
 
