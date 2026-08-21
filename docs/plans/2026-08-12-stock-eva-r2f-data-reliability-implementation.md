@@ -31,11 +31,13 @@ production NO-GO. See
 [R2-F1 acceptance](../acceptance/release-2-r2f1.md). The code gate is complete, but this does not
 authorize installation, real provider access, production repair or R2-F2.
 
-**Current gate:** R2-F1 is complete and the user has authorized R2-F2 specification work. R2-F2
-remains **In Review** after the user-selected Option A boundary: persist only final successful
-attempt evidence; discard failed partial payloads without quarantine. The dedicated R2-F2 design
-and implementation plan are the only contract authority, and no Task 7–9 RED/code may begin until
-independent approval. A second source must still pass at least 20 consecutive trading sessions of
+**Current gate:** R2-F1 is complete and the user has authorized R2-F2. R2-F2 specification is
+**Approved** after independent final review at exact planning HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0. The user-selected
+Option A boundary persists only final successful attempt evidence and discards failed partial
+payloads without quarantine. The dedicated R2-F2 design and implementation plan are the only
+contract authority; Task 7–9 RED/code may begin only within their offline boundary. A second source
+must still pass at least 20 consecutive trading sessions of
 whole-session shadow qualification; do not mix providers by symbol, and keep automatic failover
 disabled until shadow, qualification and a separately approved manual failover stage are complete.
 
@@ -624,8 +626,9 @@ scheduling remains usable; do not delete repair tables or audit history.
 
 **Dedicated specification:** [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)<br>
 **Dedicated implementation plan:** [R2-F2 Provider Evidence Framework Implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)<br>
-**Specification status:** In Review after the user-approved Option A reconciliation; Tasks 7–9
-remain gated until an independent review changes the dedicated design to Approved. The dedicated
+**Specification status:** **Approved** after independent H0/M0 review at exact planning HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` following the user-approved Option A reconciliation;
+Tasks 7–9 may now begin linearly under the dedicated documents. The dedicated
 documents are the only authority for
 models, endpoint contracts, factor-cache fields, file whitelists, tests, gates and rollback; this
 umbrella section is intentionally non-normative and contains no duplicate pseudo-code or legacy

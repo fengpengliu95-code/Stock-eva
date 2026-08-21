@@ -1,17 +1,17 @@
 # Stock EVA R2-F2 Provider Evidence Framework Implementation Plan
 
-> **Spec-first gate:** This plan is executable only after
-> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
-> reviewed and changed from **In Review** to **Approved**. The design is currently **In Review**
-> after the Option A contract findings were reconciled; no production code, test stubs or
-> RED command may begin before that gate.
+> **Spec-first gate:** This plan is executable after
+> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) was independently
+> reviewed and changed to **Approved** at exact clean reviewed HEAD
+> `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`. The approval is offline-only; no production code,
+> provider request or external operation is authorized by this gate.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
 normalize only from that evidence, replay it offline, and record complete candidate/selection
 lineage while preserving every legacy reader and canonical publication invariant.
 
-**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`41a3c4080c41411f6687d3a8854eea6e3bf74cbf`.
+**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean reviewed HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0`.
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -22,16 +22,25 @@ network request, installation, production database mutation, pointer mutation, L
 or external communication is authorized by this plan. The existing production refresh remains
 unloaded/frozen.
 
+**Specification approval evidence:** The independent final review checked FR-1–FR-33,
+NFR-1–NFR-18, AC-1–AC-20, EC-1–EC-26, the eight-group factor snapshot descriptor mapping in
+both directions, descriptor-bound factor resolution identity/SHA, endpoint/gate/cardinality
+contracts, Task 7–9 whitelists and test ownership, and all offline/security/read-only boundaries.
+The design validator returned 100/100 with zero errors/warnings/info; `git diff --check` passed;
+High 0 / Medium 0 / Low 0; the worktree was clean. This metadata approval does not authorize
+real Provider/NAS/install/LaunchAgent/production execution.
+
 ## Review closure preflight (must remain before RED)
 
-The prior independent review was **NO-GO**. The current amendment additionally closes the user
-Option A successful-attempt-only evidence boundary, field/type drift, stale umbrella metadata,
-factor-cache schema mismatch, incomplete factor resolution/cardinality, missing endpoint-constant
-validation, parser ordering, an over-claimed date gate and the separation of lexical path safety
-from descriptor-bound storage. This plan MUST implement the dedicated design definitions verbatim
-and MUST NOT narrow them to pass current tests. No ambiguity exceeds the 30% escalation threshold;
-any newly discovered unresolved schema or security meaning stops the task and returns to
-specification review.
+The prior independent review was **NO-GO**. Its findings were closed by the user Option A
+successful-attempt-only evidence boundary, field/type closure, stale umbrella metadata,
+factor-cache schema closure, complete factor resolution/cardinality, endpoint-constant validation,
+parser ordering, the precise date gate and lexical-path versus descriptor-bound storage split. An
+independent final review then approved the dedicated design at exact clean HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` with High 0 / Medium 0 / Low 0. This plan MUST
+implement the dedicated design definitions verbatim and MUST NOT narrow them to pass current
+tests. No ambiguity exceeds the 30% escalation threshold; any newly discovered unresolved schema
+or security meaning stops the task and returns to specification review.
 
 ### Feature manifest and dependency map
 

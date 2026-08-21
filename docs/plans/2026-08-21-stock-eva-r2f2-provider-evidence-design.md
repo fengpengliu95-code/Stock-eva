@@ -2,17 +2,18 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** In Review — user Option A (successful-attempt-only evidence) reconciliation recorded;
-independent re-review required
-**Decision authority:** User approved starting R2-F2 on 2026-08-21; implementation still requires
-  this specification to be independently reviewed and approved.
+**Status:** Approved — independent final specification review completed at exact clean reviewed
+HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`; user Option A (successful-attempt-only
+evidence) is normative
+**Decision authority:** User approved starting R2-F2 on 2026-08-21; independent final review
+  approved this specification for the offline Task 7–9 plan only.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
-**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`41a3c4080c41411f6687d3a8854eea6e3bf74cbf`
-**Reviewers:** Independent review found contract gaps around attempt completion, path/storage
-separation, field/type drift, CLI parser ordering and traceability; this amendment records the
-user's Option A decision and reconciles them for re-review. Status MUST NOT be changed to Approved
-by this fix.
+**Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean reviewed HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0`
+**Reviewers:** The preceding independent review found contract gaps around attempt completion,
+path/storage separation, field/type drift, CLI parser ordering and traceability; the amendment
+recorded the user's Option A decision and reconciled them for re-review. The independent final
+review recorded below is separate from that amendment and is the approval authority.
 
 **Related documents:**
 
@@ -1952,9 +1953,22 @@ hash detection, a compromised Python runtime, or a compromised host. Such condit
 when detected and require manual audit. Credentials are supplied only to the incumbent provider
 transport at runtime and are never part of evidence or public state.
 
+## Independent approval evidence
+
+The final independent review at exact clean HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0`
+checked every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-20 and EC-1–EC-26; the eight-group
+`FactorCacheSnapshotManifest`/`EvidenceObjectDescriptor` mapping in both directions; cache
+`FactorResolutionBinding` identity/SHA equality; the exact Task 7–9 whitelist and test ownership;
+the six endpoint IDs and nine endpoint-role variants; the ten-gate order; Option A failed-attempt
+discard/ultimate-failure behavior; transport lineage; single-lock/CAS ordering; deterministic
+replay; path, CLI, legacy, GET, fallback and offline boundaries. The strict design validator
+returned 100/100 with zero errors, warnings or info; `git diff --check` passed; the worktree was
+clean. Findings: High 0, Medium 0, Low 0. No RED test, provider request, external operation or
+production mutation occurred. This approval authorizes only the offline Task 7–9 RED/GREEN plan;
+it does not authorize real Provider/NAS/install/LaunchAgent/production execution.
+
 ## Review gate
 
-Status remains **In Review** until an independent reviewer checks every FR/NFR/AC/EC, verifies the
-exact file whitelist and confirms that no implementation begins before approval. Any High or
-Medium finding requires a spec amendment and a new review before RED. After approval, the linear
-implementation plan below is authoritative for Tasks 7–9.
+Status is **Approved** after the independent review above. Any future contract amendment, High or
+Medium finding, or scope change requires a new review before RED. The linear implementation plan
+below is authoritative for Tasks 7–9.
