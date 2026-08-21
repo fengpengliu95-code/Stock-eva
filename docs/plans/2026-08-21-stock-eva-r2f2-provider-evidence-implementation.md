@@ -3,7 +3,7 @@
 > **Spec-first gate:** This plan is executable only after
 > [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
 > reviewed and changed from **In Review** to **Approved**. The design is currently **In Review**
-> after the third-round contract findings were reconciled; no production code, test stubs or
+> after the Option A contract findings were reconciled; no production code, test stubs or
 > RED command may begin before that gate.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
@@ -11,7 +11,7 @@ normalize only from that evidence, replay it offline, and record complete candid
 lineage while preserving every legacy reader and canonical publication invariant.
 
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`70f7ed3c6739566d20d5ae7ba6895d65676a8033`.
+`2f2e05afe4566600bec5913313001aa997130b3a`.
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -24,13 +24,14 @@ unloaded/frozen.
 
 ## Review closure preflight (must remain before RED)
 
-The prior independent review was **NO-GO**. The third-round amendment additionally closes field
-name drift, stale umbrella pseudo-code, the factor-cache schema mismatch, incomplete factor
-resolution/cardinality, missing endpoint-constant validation, an over-claimed date gate and
-lexical-only path safety. This plan MUST implement the dedicated design definitions verbatim and
-MUST NOT narrow them to pass current tests. No ambiguity exceeds the 30% escalation threshold; any
-newly discovered unresolved schema or security meaning stops the task and returns to specification
-review.
+The prior independent review was **NO-GO**. The current amendment additionally closes the user
+Option A successful-attempt-only evidence boundary, field/type drift, stale umbrella metadata,
+factor-cache schema mismatch, incomplete factor resolution/cardinality, missing endpoint-constant
+validation, parser ordering, an over-claimed date gate and the separation of lexical path safety
+from descriptor-bound storage. This plan MUST implement the dedicated design definitions verbatim
+and MUST NOT narrow them to pass current tests. No ambiguity exceeds the 30% escalation threshold;
+any newly discovered unresolved schema or security meaning stops the task and returns to
+specification review.
 
 ### Feature manifest and dependency map
 
@@ -180,7 +181,7 @@ Implement:
   `ProviderRawBatch` contracts from the design. Evidence models belong to Task 8 and candidate/
   gate/selection models belong only to Task 9 `market/candidates.py`. Every model is `extra="forbid"`, immutable,
   finite-number checked, UTC-aware and bounded;
-- a frozen `ProviderId`/registry with only `baostock`, rejecting empty/path-like/mixed-case/plugin
+- a frozen `ProviderId`/registry admitting only `ProviderId.BAOSTOCK`, rejecting empty/path-like/mixed-case/plugin
   identities;
 - typed `ProviderRequest`, `RawEndpointBatch` and `ProviderRawBatch` with bounded allowlisted
   source fields, UTC timestamps, exact date/universe/symbols, separate logical request-plan and
@@ -276,13 +277,19 @@ def test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time(
 def test_missing_evidence_root_is_write_free(tmp_path): ...
 def test_get_and_plan_paths_do_not_initialize_evidence_storage(tmp_path): ...
 def test_manifest_requires_one_descriptor_per_request_shard_and_page(tmp_path): ...
+def test_failed_partial_attempt_creates_zero_evidence_files(tmp_path): ...
+def test_retry_success_publishes_only_final_successful_attempt_pages(tmp_path): ...
+def test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer(tmp_path): ...
+def test_failed_partial_payload_is_not_quarantined_or_hashed(tmp_path): ...
 def test_factor_snapshot_fingerprint_change_fails_closed_and_replay_uses_published_snapshot(tmp_path): ...
 def test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only(tmp_path): ...
-def test_safe_relative_path_rejects_semantic_traversal_and_storage_uses_dirfd_containment(tmp_path): ...
+def test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment(tmp_path): ...
 def test_safe_relative_path_model_copy_round_trip_rejects_escape(tmp_path): ...
+def test_open_evidence_relative_uses_dirfd_nofollow_containment(tmp_path): ...
 def test_every_evidence_descriptor_binds_sanitized_transport_observation_digest(tmp_path): ...
 def test_evidence_compare_create_allows_one_lineage_and_zero_canonical_writes_for_loser(tmp_path): ...
 def test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed(tmp_path): ...
+def test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader(tmp_path): ...
 ```
 
 Run:
@@ -300,7 +307,7 @@ only a fixture/path problem must be corrected without broadening scope.
 Implement only the following sequence:
 
 ```text
-ProviderRawBatch in memory
+ProviderRawBatch containing only final-success pages in memory
   -> validate allowlisted schema/units/date and sanitize metadata
   -> write bounded source-shaped Parquet partial below evidence staging
   -> descriptor/readback schema, row count, size and SHA-256
@@ -318,18 +325,23 @@ Required behavior:
   `candidates/`, `selections/`, `staging/` and `orphan-audit/`, with fixed bounded size
   and row limits. Validate root/ancestor descriptors using no-follow identity checks; no caller
   supplied path component may escape the opened root.
-- Use relative paths only and reject symlinks, traversal, absolute paths, object substitution,
-  manifest swaps, oversize metadata/object and malformed/decompression-invalid Parquet.
+- Use the pure lexical `SafeRelativePath` validator for component safety and the independent
+  `open_evidence_relative(root_dirfd, path, flags)` storage operation for descriptor-bound
+  `O_NOFOLLOW`/containment/TOCTOU checks. Reject symlinks, traversal, absolute paths, object
+  substitution, manifest swaps, oversize metadata/object and malformed/decompression-invalid
+  Parquet.
 - Never expose or persist transport payload, token, header, cookie, URL, local path or raw
   exception. Preserve only bounded provider code and allowlisted failure classes.
-- Store one `EvidenceObjectDescriptor` per expected logical request/endpoint shard/page, in the
-  exact ordered `ExpectedLogicalRequestPlan` and its observed `RequestCompletion`; each raw-page
+- Store one `EvidenceObjectDescriptor` per final-success logical request/endpoint shard/page, in
+  the exact ordered `ExpectedLogicalRequestPlan` and its observed `RequestCompletion`; each raw-page
   descriptor MUST carry object kind, plan ordinal, attempt, request ID, page, relative path,
   object/hash/schema hashes, row/byte counts, ordered fields/units, provider/universe,
   refresh/session, endpoint, schema/contract versions, pagination policy and transport observation
-  digest. The manifest MUST reject missing,
-  extra, duplicate, out-of-order, non-contiguous or swallowed multi-symbol/multi-index/multi-page
-  objects, and MUST require a terminal/end marker without requiring a prefetch page total.
+  digest. The manifest MUST reject missing, extra, duplicate, out-of-order, non-contiguous or
+  swallowed multi-symbol/multi-index/multi-page objects, descriptors from a failed/non-final
+  attempt, and MUST require a terminal/end marker without requiring a prefetch page total.
+  Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
+  object, manifest or hash; only sanitized transport observations may survive for audit.
 - Serialize one `factor_cache_snapshot` object containing only the selected keys returned by
   `AdjustmentFactorCache.exact_snapshot_records(symbols, trade_date)`. Each record MUST mirror the
   current `factor_snapshots` columns (`symbol`, `trade_date`, `fore_adjust_factor`,
@@ -355,9 +367,11 @@ Required behavior:
   `normalize_baostock_rows(..., ingested_at=normalization_clock_utc)`. Invocation time is never a
   `ReplayResult` field and never enters candidate/semantic/selection hashes.
 - Make `EvidenceReader` the only input accepted by adapter normalization in the canonical path.
-- Add `market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]`. It accepts no
-  provider credentials or path and performs zero network, provider, canonical Parquet, canonical
-  manifest or pointer writes.
+- Add `market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]`. Its parser rejects
+  credentials, token, header, cookie, URL, provider, local path and unknown arguments before it
+  constructs the evidence layout or reader. The parser test fingerprints the root tree, bytes and
+  mtimes and asserts zero provider/network calls; the command then performs zero canonical Parquet,
+  canonical manifest or pointer writes.
 - Replay MUST report byte hash and semantic hash/match using the design's same-version byte GO and
   cross-version non-semantic-encoding exception; any unclassified difference is fail-closed.
 - Readers and plan/replay paths MUST use SELECT/read-only descriptors and never initialize roots,
@@ -378,6 +392,13 @@ staging residue is retained only for orphan audit.
 The evidence Parquet is source-shaped, not a socket dump. Daily semantic validation remains the
 existing normalizer/quality contract: unadjusted prices, `backAdjustFactor`, exact date, units,
 duplicate/coverage and suspension rules.
+
+Option A publication invariants are tested explicitly: a failed partial attempt creates zero
+evidence files and no failed-payload quarantine; a later successful retry publishes only its final
+pages and can retain only sanitized failed-attempt transport projections; an ultimate failure
+publishes no evidence manifest, does not normalize, and cannot create a candidate, selection or
+pointer. The writer performs these checks before object compare-create, and failed row/page bytes
+are discarded in memory rather than written to `orphan-audit`.
 
 Run:
 
@@ -572,7 +593,7 @@ Run the specification validator against the **design only** (never against this 
 plan and never as a substitute for tests or manual traceability):
 
 ```bash
-python /Users/finlay/.codex/skills/claude-skills--engineering/spec-driven-workflow/scripts/spec_validator.py \
+uv run --offline python /Users/finlay/.codex/skills/claude-skills--engineering/spec-driven-workflow/scripts/spec_validator.py \
   --file docs/plans/2026-08-21-stock-eva-r2f2-provider-evidence-design.md --strict
 ```
 
@@ -631,7 +652,7 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | AC-19 | Task 8 clock/layout/CAS | frozen-clock, storage and replay tests |
 | AC-20 | Task 9 validator/fallback boundary | static validator/manual traceability and fallback test |
 | EC-1–EC-5 | Task 7 provider/transport contract | sanitized endpoint/failure tests |
-| EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser, cardinality, digest, clock and storage tests |
+| EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser-before-reader with root fingerprints and zero provider/network calls, cardinality, digest, clock and storage tests |
 | EC-10–EC-18, EC-23, EC-26 | Task 9 candidate/selection | lineage, semantic, aggregate, pointer and fallback tests |
 
 If `spec_validator.py --strict` cannot parse the Markdown because of Chinese/Markdown formatting,
@@ -653,12 +674,14 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | EC-18 active/suspended/index semantics | Task 7.1 / 7.2 and Task 9.1 / 9.2 | `test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_and_suspended_index`. |
 | Six endpoint IDs / nine stock-index schema-role variants | Task 7.1 / 7.2 | `test_each_baostock_endpoint_has_exact_fields_variant_units_and_order`, `test_endpoint_contract_constant_rejects_wrong_combination_and_model_copy`; no unknown fields/union-any. |
 | Plan/attempt/object cardinality | Tasks 7.1–8.2 | `test_request_completion_rejects_missing_duplicate_noncontiguous_pages_or_terminal_marker`, `test_manifest_requires_one_descriptor_per_request_shard_and_page`; every attempt/request ID and page joins exactly one descriptor. |
+| Successful-attempt-only evidence | Task 8.1 / 8.2 | `test_failed_partial_attempt_creates_zero_evidence_files`, `test_retry_success_publishes_only_final_successful_attempt_pages`, `test_ultimate_request_failure_publishes_no_manifest_candidate_or_pointer`, `test_failed_partial_payload_is_not_quarantined_or_hashed`; failed rows/page bytes never reach staging/object/manifest/hash. |
 | Transport observation digest | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_every_evidence_descriptor_binds_sanitized_transport_observation_digest`; payload/message/URL/token assertions remain negative. |
 | Gate cardinality | Task 9.1 / 9.2 | `test_gate_report_requires_exact_ordered_complete_gate_aggregate`; one canonical report/hash only. |
 | Replay clock/hash | Task 8.1 / 8.2 | `test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time`; same-version byte equality and explicit cross-version semantic exception. |
 | Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
 | Factor snapshot provenance | Task 8.1 / 8.2 and Task 9.1 / 9.2 | `test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only`, `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint and live-cache exclusion. |
-| SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_semantic_traversal_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`; construction and `model_copy` fail closed, dirfd/O_NOFOLLOW containment is required. |
+| SafeRelativePath semantics/storage | Task 8.1 / 8.2 | `test_safe_relative_path_rejects_lexical_components_and_storage_uses_dirfd_containment`, `test_safe_relative_path_model_copy_round_trip_rejects_escape`, `test_open_evidence_relative_uses_dirfd_nofollow_containment`; model is lexical-only and storage owns descriptor-bound containment. |
+| Replay CLI parser ordering | Task 8.1 / 8.2 | `test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_path_and_unknown_args_before_reader`; parser exits before layout/evidence reader construction, with zero provider/network calls and unchanged root tree/bytes/mtimes. |
 | Selection/pointer order | Task 9.1 / 9.2 | `test_selection_publish_order_never_moves_pointer_early`; selection readback precedes existing pointer chain. |
 | Fallback boundary | Task 9.1 / 9.2 | `test_qualified_fallback_is_reserved_and_rejected_by_r2f2_writers`; static scan proves no second source/plugin/failover. |
 

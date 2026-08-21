@@ -2,14 +2,17 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** In Review — third-round contract reconciliation recorded; independent re-review required
+**Status:** In Review — user Option A (successful-attempt-only evidence) reconciliation recorded;
+independent re-review required
 **Decision authority:** User approved starting R2-F2 on 2026-08-21; implementation still requires
   this specification to be independently reviewed and approved.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`70f7ed3c6739566d20d5ae7ba6895d65676a8033`
-**Reviewers:** Independent third-round code/spec review found eight Medium/Low contract gaps;
-this amendment reconciles them for re-review. Status MUST NOT be changed to Approved by this fix.
+`2f2e05afe4566600bec5913313001aa997130b3a`
+**Reviewers:** Independent review found contract gaps around attempt completion, path/storage
+separation, field/type drift, CLI parser ordering and traceability; this amendment records the
+user's Option A decision and reconciles them for re-review. Status MUST NOT be changed to Approved
+by this fix.
 
 **Related documents:**
 
@@ -26,11 +29,50 @@ provider, automatic failover, production refresh, installation, NAS access or La
 
 ## Specification review closure (authoritative amendment before RED)
 
-The first independent review was correctly **NO-GO**. The second-round Medium findings were
-specification gaps, not permission to narrow the product boundary. The third-round review then
-found field-name drift, stale umbrella pseudo-contracts, an inaccurate factor-cache projection,
-incomplete attempt/request cardinality, an unenforced endpoint constant, an over-claimed date gate
-and lexical-only path safety. Their confirmed root causes and closures are:
+### User architecture decision: Option A — successful attempt only
+
+The user selected **A: only persist the complete evidence from the final successful attempt**.
+This is a normative boundary for every model, validator, writer, reader, hash and test below:
+
+- `AttemptCompletion` MAY retain only bounded, sanitized failure-attempt counters, outcome and
+  request identity (`request_id`, observed page numbers/counts and transport observation digest).
+  It MUST NOT retain failed-attempt row values, payload bytes, page bytes, decompressed content or
+  arbitrary provider text.
+- A failed attempt's row count, payload and page bytes are discarded in memory before the next
+  attempt and MUST never reach staging, an evidence object, a Parquet file, a manifest, a hash,
+  a candidate or a pointer. R2-F2 has no quarantined failed-payload object; that forensic option
+  is explicitly out of scope.
+- `EvidenceObjectDescriptor` and source-shaped Parquet objects MUST reference only the one final
+  successful attempt for each logical request. The descriptor is logically unique by
+  `(plan_ordinal, request_id, page)` and its `attempt` MUST equal `RequestCompletion.successful_attempt`.
+- `RequestCompletion` MUST be final-success bound before publication: `final_outcome=success`,
+  exactly one `successful_attempt`/`successful_request_id`, that request ID is the final attempt,
+  all published descriptors belong to it, observed pages are contiguous from page 1, and a
+  terminal/end marker is present. A final failure has null successful fields and cannot publish.
+- Sanitized `TransportObservationProjection` records for failed attempts MAY be retained as
+  non-payload transport lineage/audit evidence and included in the ordered aggregate digest; no
+  failed-attempt object descriptor or source row may be inferred from those records.
+- A retry sequence that eventually succeeds publishes only the final successful pages. A logical
+  request that ultimately fails publishes no `EvidenceManifest`, does not call normalization,
+  and cannot produce a candidate, selection or canonical pointer mutation.
+
+The explicit publication sequence is therefore:
+
+```text
+attempt in memory -> validate complete attempt
+  -> on failure: retain sanitized transport projection only, discard rows/page bytes
+  -> on final success: retain only final successful pages
+  -> object compare-create -> EvidenceManifest -> normalize -> gate/candidate/selection
+  -> existing canonical publication chain
+```
+
+No implementation may broaden this sequence by persisting failed partial payloads.
+
+The preceding independent review was correctly **NO-GO**. Its findings were specification gaps,
+not permission to narrow the product boundary. The current review also required the successful-
+attempt-only evidence boundary, field/type closure, accurate umbrella metadata, parser ordering and
+separation of lexical path validation from descriptor-bound storage. Their confirmed root causes and
+closures are:
 
 | Finding | Confirmed root cause | Normative closure in this revision |
 | --- | --- | --- |
@@ -42,8 +84,8 @@ and lexical-only path safety. Their confirmed root causes and closures are:
 | M6 — replay result leaked invocation time | `ReplayResult` included a start-time field even though deterministic public output was required. | Remove the field entirely; only the frozen evidence `normalization_clock_utc` enters hashes/results, while internal observed time is never a result, candidate field or semantic input. |
 | M7 — factor provenance was not self-contained | The mutable `AdjustmentFactorCache` call chain was treated as if the live cache were replayable evidence and factor data was conflated with a provider endpoint. | Add `EvidenceObjectKind.factor_cache_snapshot`, capture only actually-read keys and safe provenance under `RefreshRunLock`, fingerprint before/after, and make online/replay normalization consume only the published snapshot. |
 | M8 — requirement/file traceability was incomplete | FR-28–33, NFR-15–18, AC-16–20 and EC-21–26 were absent or attached to the wrong task; Task 9 also owned the same model file as Task 7. | Add complete numbered traceability and tests, move selection tests to Task 9, give Task 9 a single `market/candidates.py` model owner, and keep Task 7/8 whitelists disjoint. |
-| M9 — stale contract tokens remained | The documents still contained an eleven-gate claim, extra refresh locks and a public replay start-time field, so structural review could not prove closure. | Remove every stale token and run strict design validation, full token/number audit and `git diff --check` before re-review. |
-| M10 — model/table names drifted | The frozen models and field tables used `report_id`/`gate_report_id`, `aggregate_verdict`/`verdict` and `evidence_manifest_sha256`/`evidence_sha256` for the same values. | Use one authoritative name in every model, table, hash rule, test and implementation reference: `gate_report_id`, `verdict` and `evidence_sha256`. |
+| M9 — contract vocabulary was not structurally reconciled | Review text and field tables were previously able to drift from the frozen models and gate count, so structural review could not prove closure. | Compare actual model/serializer field sets with the authoritative tables, verify the fixed ten-gate order and run strict design validation plus `git diff --check`; do not infer closure from prose searches. |
+| M10 — model/table names drifted | The frozen models and field tables previously represented the same identity, verdict and hash concepts with different spellings. | Use one authoritative name in every model, table, hash rule, test and implementation reference: `gate_report_id`, `verdict`, `aggregate_sha256` and `evidence_sha256`. |
 | M11 — umbrella plan retained stale pseudo-contracts | The umbrella Task 7–9 section duplicated old `dict` rows, open provider strings and obsolete selection fields. | Replace the section with a high-level roadmap summary and state that the dedicated design and implementation plan are the only contract authorities. |
 | M12 — factor snapshot invented fields | The proposed snapshot row contained `source`, cache version and factor values not present in the current `factor_snapshots` table. | Define `FactorCacheSnapshotRecord` from the current nine table columns only; add a strict read-only `exact_snapshot_records()` API under Task 8 with before/after fingerprints and no schema migration. |
 | M13 — factor resolution/cardinality incomplete | Resolution did not discriminate live/cache provenance, and completion did not represent retries, request IDs or final outcome. | Add mutually exclusive live/cache bindings and `AttemptCompletion`/`RequestCompletion`; bind every page descriptor and resolution hash into the manifest/candidate. |
@@ -79,8 +121,9 @@ lineage needed by the later shadow and failover stages without enabling them now
 ## Design decisions and ambiguity audit
 
 1. **Only BaoStock is admitted in R2-F2.** The provider registry is a small static allowlist whose
-   only value is `baostock`. It has no plugin loader, entry points, dynamic import, arbitrary
-   provider string admission or second-source adapter.
+   only admitted value is `ProviderId.BAOSTOCK`; a lexical `SafeProviderId` is converted to that
+   enum before admission. It has no plugin loader, entry points, dynamic import, arbitrary provider
+   string admission or second-source adapter.
 2. **The incumbent transport remains authoritative.** The compatibility adapter delegates to the
    current BaoStock transport/parser and preserves its endpoint names, session scopes, retry
    limits, timeout policy, provider-code mapping and circuit integration. F0.1 transport code is
@@ -90,10 +133,12 @@ lineage needed by the later shadow and failover stages without enabling them now
    response body archive, log, exception, credential, URL, cookie or header store. The source-row
    schema is an endpoint allowlist and rejects unknown fields.
 4. **Evidence is published before normalization.** The online sequence is
-   `fetch source rows -> validate/redact -> write bounded Parquet partial -> read back schema,
-   row count and hash -> atomic object rename -> atomic canonical JSON evidence manifest -> read
-   the published evidence -> normalize -> candidate gates`. A live SDK result is never passed
-   directly to normalization by the R2-F2 canonical path.
+   `fetch complete final-success source rows -> validate/redact -> write bounded Parquet partial ->
+   read back schema, row count and hash -> atomic object rename -> atomic canonical JSON evidence
+   manifest -> read the published evidence -> normalize -> candidate gates`. A failed attempt's
+   partial rows/page bytes remain in memory only until sanitized transport audit is recorded, then
+   are discarded; they never enter the partial-file step. A live SDK result is never passed directly
+   to normalization by the R2-F2 canonical path.
 5. **Evidence and candidate artifacts are audit roots, not serving roots.** They use relative paths
    and content hashes. Canonical Parquet and the existing current pointer remain the only serving
    source. Evidence failure or candidate failure cannot move the pointer.
@@ -142,14 +187,17 @@ automatic failover may be used to close that gap.
   `trade_dates`, `all_stock`, `daily_astock`, `daily_factor`, `adjust_factor` and `index_history`.
   Unknown columns, duplicate columns, row-length mismatches, non-finite numeric values or
   unsupported nested values MUST invalidate the complete evidence batch.
-- FR-6: **Evidence object:** Source rows MUST be stored in a bounded Parquet object and its
-  metadata in canonical UTF-8 JSON with sorted keys and compact separators. The evidence object
-  MUST be content-addressed by SHA-256 and idempotent for identical bytes.
-- FR-7: **Evidence manifest binding:** The evidence manifest MUST bind each relative object path to
-  its content hash, schema identifier, row count, provider ID, adapter version, endpoint-contract
-  version, trade date, universe ID, units, date semantics and request identity. Absolute paths,
-  URL, token, cookie, header, raw payload and arbitrary exception fields MUST be impossible in the
-  persisted model.
+- FR-6: **Evidence object:** Source rows from only the final successful attempt MUST be stored in
+  a bounded Parquet object and its metadata in canonical UTF-8 JSON with sorted keys and compact
+  separators. Failed-attempt rows/page bytes are discarded in memory and MUST NOT create a
+  staging file, object, manifest or hash. The evidence object MUST be content-addressed by
+  SHA-256 and idempotent for identical bytes.
+- FR-7: **Evidence manifest binding:** The evidence manifest MUST bind each final-success relative
+  object path to its content hash, schema identifier, row count, provider ID, adapter version,
+  endpoint-contract version, trade date, universe ID, units, date semantics and request identity.
+  It MAY bind sanitized transport observations from failed attempts, but no failed-attempt object
+  descriptor or source bytes may be referenced. Absolute paths, URL, token, cookie, header, raw
+  payload and arbitrary exception fields MUST be impossible in the persisted model.
 - FR-8: **Atomic evidence publish:** Partial objects MUST be written below the evidence staging
   root, read back and verified, then atomically renamed and followed by an atomically published
   canonical JSON manifest. Partial or swapped objects MUST never be treated as published.
@@ -231,13 +279,18 @@ automatic failover may be used to close that gap.
 - FR-30: **Request-plan cardinality:** Every logical request and symbol/index shard MUST have one
   ordered `ExpectedLogicalRequest`; execution MUST produce exactly one `RequestCompletion` with
   ordered `AttemptCompletion` records, fresh request IDs per attempt, contiguous observed pages and
-  one final outcome. Each observed page MUST have exactly one descriptor carrying
-  `plan_ordinal/attempt/request_id/page/object_kind` and one joinable transport-lineage record.
-  The logical request-plan hash and completion hash MUST be verified before evidence, candidate or
-  selection publication; no page total is guessed.
-- FR-31: **Transport binding:** Every published object MUST bind refresh/session/request/endpoint/
-  attempt/page to a SHA-256 digest of the sanitized F0.1 observation projection. Payload, URL,
-  token, header, cookie and raw provider exception/message MUST remain impossible to persist.
+  one final outcome. Failed attempts may retain only sanitized counters/outcome/request IDs in
+  memory and transport audit. Each published source page MUST have exactly one descriptor carrying
+  `plan_ordinal/attempt/request_id/page/object_kind`, and the descriptor MUST belong to the final
+  successful attempt. The final completion MUST be successful, terminal and bound to all published
+  descriptors; an ultimate failure publishes no evidence manifest. The logical request-plan hash
+  and completion hash MUST be verified before evidence, candidate or selection publication; no page
+  total is guessed.
+- FR-31: **Transport binding:** Every published final-success object MUST bind
+  refresh/session/request/endpoint/attempt/page to a SHA-256 digest of the sanitized F0.1
+  observation projection. Failed-attempt projections may be included only in the sanitized ordered
+  transport aggregate and never yield source objects. Payload, URL, token, header, cookie and raw
+  provider exception/message MUST remain impossible to persist.
 - FR-32: **Gate aggregate:** Candidate publication MUST create exactly one ordered
   `CandidateGateReport` containing the complete `R2F2_GATE_ORDER`; missing, extra, duplicate or
   out-of-order outcomes MUST fail closed. A candidate manifest MUST point to one aggregate hash,
@@ -252,7 +305,8 @@ automatic failover may be used to close that gap.
   roots; zero DNS/socket/provider/NAS/LaunchAgent/install/production action is permitted.
 - **NFR-2 (Atomicity):** A process crash at every evidence staging, object rename, evidence-manifest,
   candidate-manifest or selection-manifest boundary MUST expose either the prior complete state or
-  a complete new state, never a partial published object.
+  a complete new state, never a partial published object. Failed-attempt partial pages are discarded
+  before any staging boundary and therefore cannot become orphan, published or quarantined evidence.
 - **NFR-3 (Integrity):** Every object read MUST bind an opened descriptor/stat fingerprint to
   SHA-256/schema/row-count validation; TOCTOU, symlink, path traversal, object substitution and
   manifest swap MUST fail closed.
@@ -267,7 +321,8 @@ automatic failover may be used to close that gap.
 - **NFR-7 (Compatibility):** No existing immutable object, legacy manifest, public response contract
   or API reader requires a rewrite. New fields are additive and old source values remain valid.
 - **NFR-8 (Security):** Persisted schemas MUST have no payload/token/header/cookie/URL/path/raw
-  exception field; all identifiers and provider codes are bounded allowlisted strings.
+  exception field or failed-attempt page bytes; all identifiers and provider codes are bounded
+  allowlisted strings. Failure-attempt transport audit is sanitized and non-payload only.
 - **NFR-9 (Semantic correctness):** Date, units, adjustment-factor and suspension gates MUST be
   explicit and tested; no amount/OHLCV value may be labeled fund flow.
 - **NFR-10 (Bounded work):** One online refresh request captures and publishes one complete session
@@ -304,7 +359,7 @@ replay response.
 
 ```python
 class BaoStockDailyBarAdapter(Protocol):
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     adapter_version: SafeVersion
     endpoint_contract_version: SafeVersion
 
@@ -375,7 +430,7 @@ class TransportObservationProjection(BaseModel):
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     endpoint: ProviderEndpoint
     attempt: int = Field(ge=1, le=20)
     page: int = Field(ge=1, le=16_384)
@@ -451,6 +506,7 @@ SafeIdentifier = Annotated[
                            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ]
 SafeSha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+# Lexical-only path value. It has no root/descriptor knowledge.
 SafeRelativePath = Annotated[
     str, StringConstraints(min_length=1, max_length=512,
                            pattern=r"^[A-Za-z0-9._/-]+$")
@@ -536,19 +592,28 @@ R2F2_GATE_EVIDENCE: tuple[tuple[GateName, str, str], ...] = (
 )
 ```
 
-`SafeProviderId` is the lexical safety type; the R2-F2 registry additionally requires the value
-to be exactly `ProviderId.BAOSTOCK`. `SafeSymbol` is lowercase and must be sorted lexicographically
-in every tuple. `SafeVersion` identifies a pinned code/schema contract, not a package URL. A
-`SafeRelativePath` is a semantic type, not a regex-only string. Its model validator MUST reject an
-empty value, `.`, `..`, an absolute POSIX path, a leading separator, a backslash, NUL, a repeated
-or trailing separator, and any component equal to `.` or `..`; it MUST also reject a value whose
-`PurePosixPath` resolution escapes the already-opened evidence-root descriptor. Construction and
-`model_copy(update=...)`/round-trip tests exercise these rules. Storage MUST then open the root and
-every ancestor with `dirfd` + `O_DIRECTORY|O_NOFOLLOW`, verify `(st_dev, st_ino, mode)` before and
-after use, open the final object relative to that descriptor, and enforce descriptor containment.
-A lexical pass is never sufficient TOCTOU protection and a caller-supplied resolved path is never
-accepted. No persisted model may contain a URL, credential, token, header, cookie, payload,
-absolute path or arbitrary exception/message field.
+`SafeProviderId` is the lexical safety type; the R2-F2 registry accepts it only after an allowlist
+conversion to `ProviderId.BAOSTOCK`. All provider-bearing model and table fields use `ProviderId`;
+there is no parallel provider literal field type. `SafeSymbol` is lowercase and must be sorted lexicographically
+in every tuple. `SafeVersion` identifies a pinned code/schema contract, not a package URL.
+`SafeRelativePath` is a pure lexical component validator. Its model validator MUST reject an empty
+value, `.`, `..`, an absolute POSIX path, a leading separator, a backslash, NUL, a repeated or
+trailing separator, and any component equal to `.` or `..`. It MUST NOT claim knowledge of an
+evidence root, descriptor, inode or containment. Construction and `model_copy(update=...)`/round-trip
+tests exercise these lexical rules.
+
+Storage owns the separate descriptor-bound operation:
+
+```python
+def open_evidence_relative(root_dirfd: int, path: SafeRelativePath, flags: int) -> int: ...
+```
+
+`open_evidence_relative` MUST open the root and every ancestor with `dirfd` plus
+`O_DIRECTORY|O_NOFOLLOW`, verify `(st_dev, st_ino, mode)` before and after use, open the final
+object relative to those descriptors, apply `O_NOFOLLOW` to the final component and enforce
+descriptor containment. A lexical pass is never TOCTOU protection; a caller-supplied resolved path
+is never accepted. No persisted model may contain a URL, credential, token, header, cookie,
+payload, absolute path or arbitrary exception/message field.
 
 ### Frozen in-memory contracts
 
@@ -559,7 +624,7 @@ below and an over-bound value is rejected before any write.
 ```python
 class ProviderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
@@ -861,7 +926,7 @@ class FactorCacheSnapshot(BaseModel):
 
 class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     request: ProviderRequest
     adapter_version: SafeVersion
     endpoint_contract_version: SafeVersion
@@ -890,7 +955,7 @@ class EvidenceObjectDescriptor(BaseModel):
     schema_hash: SafeSha256
     row_count: int = Field(ge=0, le=10_000_000)
     byte_count: int = Field(ge=0, le=67_108_864)
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     universe_id: SafeIdentifier
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
@@ -917,7 +982,7 @@ class EvidenceObjectDescriptor(BaseModel):
 class EvidenceManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     evidence_id: SafeIdentifier
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     adapter_version: SafeVersion
     endpoint_contract_version: SafeVersion
     trade_date: date
@@ -973,7 +1038,7 @@ class CandidateManifest(BaseModel):
     candidate_id: SafeIdentifier
     trade_date: date
     universe_id: SafeIdentifier
-    provider_id: Literal["baostock"]
+    provider_id: ProviderId
     evidence_id: SafeIdentifier
     evidence_sha256: SafeSha256
     normalized_object_relative_path: SafeRelativePath
@@ -994,9 +1059,9 @@ class SessionSelection(BaseModel):
     trade_date: date
     universe_id: SafeIdentifier
     selected_candidate_id: SafeIdentifier
-    selected_provider_id: Literal["baostock"]
+    selected_provider_id: ProviderId
     reason: SelectionReason
-    fallback_from: Literal["baostock"] | None
+    fallback_from: ProviderId | None
     evidence_sha256: SafeSha256
     candidate_manifest_sha256: SafeSha256
     gate_report_sha256: SafeSha256
@@ -1020,10 +1085,34 @@ class ReplayResult(BaseModel):
 `EvidenceObjectDescriptor` has a closed kind validator. A `raw_endpoint_page` requires non-null
 endpoint/request role/instrument role/shard/plan ordinal, attempt, page, ordered `fields`/`units`,
 `pagination_policy` and `transport_observation_digest`; its request ID and all cardinality fields
-must join one `AttemptCompletion`. A `factor_cache_snapshot` requires a null endpoint/request
-role/instrument role/shard/plan ordinal/attempt/page and transport digest, but retains the capture
-request ID and requires a non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an
-evidence object kind, never a seventh provider endpoint, and cannot masquerade as a transport page.
+must join one final-success `AttemptCompletion`; a model validator rejects a descriptor whose
+attempt/outcome/request ID is not the `RequestCompletion.successful_attempt` binding. A
+`factor_cache_snapshot` requires a null endpoint/request role/instrument role/shard/plan
+ordinal/attempt/page and transport digest, but retains the capture request ID and requires a
+non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an evidence object kind,
+never a seventh provider endpoint, and cannot masquerade as a transport page.
+
+The evidence writer MUST also run this aggregate validator before the first object compare-create:
+
+```python
+def validate_publishable_descriptors(
+    completion: RequestCompletion,
+    descriptors: tuple[EvidenceObjectDescriptor, ...],
+) -> None:
+    if completion.final_outcome is not TransportOutcome.SUCCESS:
+        raise ValueError("ultimate failure cannot publish evidence")
+    if any(
+        descriptor.attempt != completion.successful_attempt
+        or descriptor.request_id != completion.successful_request_id
+        for descriptor in descriptors
+        if descriptor.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE
+    ):
+        raise ValueError("only final successful attempt pages may be published")
+```
+
+The implementation MUST additionally compare the descriptor page set with the final attempt's
+contiguous observed pages and require its terminal marker. This validator runs before staging,
+manifest hashing or normalization; a failed attempt cannot be redirected into `orphan-audit`.
 
 `SafeFailureClass` is an existing allowlist (`MarketFailureClass`, `NormalizedTransportError` and
 the explicit `EVIDENCE_*`/`REPLAY_*` public categories); it is not a free-form string. All datetime
@@ -1050,7 +1139,7 @@ The implementation keeps model ownership disjoint between tasks:
 The frozen contract listing is normative regardless of module placement; a task may not duplicate
 or redefine a model in another module.
 
-### Model ↔ persisted-field audit (third-round closure)
+### Model ↔ persisted-field audit (current closure)
 
 The following manual diff is the review authority for persisted field names. The implementation
 review MUST repeat this comparison from the actual models and SQL/JSON serializers; a validator
@@ -1061,14 +1150,19 @@ score cannot substitute for it.
 | `RawEndpointBatch` / `EndpointContractSummary` | `ENDPOINT_CONTRACTS` | `endpoint`, role, variant, ordered `fields`, `source_schema`, exact `units`, `date_semantics` and `pagination_policy` all present; no hidden summary field. |
 | `FactorCacheSnapshotRecord` | Existing `factor_snapshots` SQL table | Exact nine current columns only, plus derived `row_fingerprint`; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. |
 | `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. |
-| `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash; no `evidence_manifest_sha256` alias. |
-| `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict`, `aggregate_sha256` are the only report identity/verdict/hash names; no `report_id` or `aggregate_verdict` alias. |
-| `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | `evidence_sha256` is the single evidence hash name; candidate also carries `factor_resolution_sha256`. |
+| `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash and is identical in model, serializer and table. |
+| `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict` and `aggregate_sha256` are identical in model, serializer and table. |
+| `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | Candidate fields are exactly `candidate_id`, `trade_date`, `universe_id`, `provider_id`, `evidence_id`, `evidence_sha256`, `normalized_object_relative_path`, `normalized_object_sha256`, `gate_report_relative_path`, `gate_report_sha256`, `factor_resolution_sha256`, `adapter_version`, `source_schema_version`, `row_count`, `required_symbol_count`, `status`, `manifest_sha256`; selection fields are exactly the model fields below. |
 | `ReplayResult` | CLI/public projection | Frozen normalization clock only; no invocation/start-time field. |
 
-The global token audit MUST return zero stale aliases (`report_id` as a field,
-`aggregate_verdict`, `evidence_manifest_sha256`, `expected_total_pages`, `reconciliation_id`) in
-the dedicated design/implementation documents and the R2-F2 section of the umbrella plan.
+The field audit is structural, not a self-matching search. Reviewers MUST extract the field names
+from the actual Pydantic models and their SQL/JSON serializers, compare them with the tables above,
+and record any difference as a finding. The current authoritative names are `gate_report_id`,
+`verdict`, `aggregate_sha256`, `evidence_sha256`, `normalized_object_sha256`,
+`gate_report_sha256`, `source_schema_version`, `factor_resolution_sha256` and
+`normalization_clock_utc`; no alias or duplicated spelling may be introduced. The review MUST NOT
+claim closure from a prose token search; it must compare structured model/serializer fields with the
+tables and report concrete differences.
 
 The logical request plan and post-fetch completion are separate frozen contracts:
 
@@ -1098,8 +1192,21 @@ class AttemptCompletion(BaseModel):
     attempt: int = Field(ge=1, le=20)
     request_id: SafeIdentifier
     observed_pages: tuple[int, ...]  # empty only when no page was received; otherwise contiguous
+    observed_page_count: int = Field(ge=0, le=16_384)
     terminal: bool
     outcome: TransportOutcome
+
+    @model_validator(mode="after")
+    def validate_observed_pages(self) -> "AttemptCompletion":
+        if self.observed_page_count != len(self.observed_pages):
+            raise ValueError("observed page count mismatch")
+        if self.observed_pages and self.observed_pages != tuple(
+            range(1, self.observed_page_count + 1)
+        ):
+            raise ValueError("observed pages must be contiguous")
+        if self.outcome == TransportOutcome.SUCCESS and not self.terminal:
+            raise ValueError("successful attempt must be terminal")
+        return self
 
 class RequestCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -1108,7 +1215,31 @@ class RequestCompletion(BaseModel):
     successful_attempt: int | None = Field(default=None, ge=1, le=20)
     successful_request_id: SafeIdentifier | None = None
     final_outcome: TransportOutcome
-    row_count: int = Field(ge=0, le=10_000_000)
+    row_count: int = Field(default=0, ge=0, le=10_000_000)
+
+    @model_validator(mode="after")
+    def validate_final_attempt(self) -> "RequestCompletion":
+        if not self.attempts:
+            raise ValueError("completion requires an attempt")
+        if tuple(attempt.attempt for attempt in self.attempts) != tuple(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise ValueError("attempts must be strictly ordered")
+        if len({attempt.request_id for attempt in self.attempts}) != len(self.attempts):
+            raise ValueError("attempt request IDs must be unique")
+        if self.final_outcome != self.attempts[-1].outcome:
+            raise ValueError("final outcome must match final attempt")
+        if self.final_outcome == TransportOutcome.SUCCESS:
+            if self.successful_attempt is None or self.successful_request_id is None:
+                raise ValueError("successful completion requires final request binding")
+            final = self.attempts[-1]
+            if final.attempt != self.successful_attempt:
+                raise ValueError("successful attempt must be final")
+            if final.request_id != self.successful_request_id or final.outcome != TransportOutcome.SUCCESS:
+                raise ValueError("successful request binding mismatch")
+        elif self.successful_attempt is not None or self.successful_request_id is not None:
+            raise ValueError("failed completion cannot bind a successful attempt")
+        return self
 ```
 
 The plan includes all symbol shards and explicit index requests, but never predicts the provider's
@@ -1118,19 +1249,22 @@ has a fresh request ID, attempt numbers are strictly ordered, and non-empty obse
 unique, start at page 1 and are contiguous. Exactly one successful attempt/request ID is allowed
 when `final_outcome=success`; it MUST be the final attempt and MUST be terminal. A failed final
 attempt has `final_outcome=error`, null successful fields and cannot publish evidence. A transport
-failure before page 1 is represented by an empty page tuple; no page is invented. Each observed
-page has exactly one `EvidenceObjectDescriptor` and one joinable `TransportLineageRef` carrying the
-same plan ordinal, attempt, request ID and page. `completion_hash` is SHA-256 of the ordered
-completion/attempt/page-descriptor tuple without its hash field and is independent of the logical
-request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages, duplicate
-request IDs or inconsistent final success/failure cardinality fail closed. No total-page guess is
-required.
+failure before page 1 is represented by an empty page tuple; no page is invented. Failed-attempt
+page counters and sanitized transport outcomes may remain in the completion/audit projection, but
+their row values and page bytes are discarded before the next attempt. Only the final successful
+attempt's pages receive `EvidenceObjectDescriptor` and `TransportLineageRef` records. The
+completion validator MUST bind every descriptor to the successful request ID/attempt, contiguous
+pages and terminal marker before any object compare-create. `completion_hash` is SHA-256 of the
+ordered completion/attempt/page-descriptor tuple without its hash field and is independent of the
+logical request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages,
+duplicate request IDs or inconsistent final success/failure cardinality fail closed. No total-page
+guess is required.
 
 ### Provider registry
 
 | Field | Type | Constraint |
 | --- | --- | --- |
-| provider_id | `Literal["baostock"]` | Static allowlist only |
+| provider_id | `ProviderId` | Static allowlist; only `ProviderId.BAOSTOCK` is admitted |
 | adapter_version | safe version | Pinned code contract |
 | endpoint_contract_version | safe version | Fixed six-endpoint contract |
 | supported_fields | tuple[str, ...] | Endpoint allowlist |
@@ -1149,15 +1283,15 @@ additional summary fields hidden in prose. Per-endpoint `source_schema`, `units`
 
 | Field | Type | Constraint / verification |
 | --- | --- | --- |
-| evidence_id / provider_id | safe identifier / `Literal["baostock"]` | Deterministic ID and static provider |
+| evidence_id / provider_id | safe identifier / `ProviderId` | Deterministic ID and static provider |
 | adapter_version / endpoint_contract_version | safe version | Exact pinned contracts |
 | trade_date / universe_id | date / safe identifier | Exact session scope |
 | requested_at / completed_at / normalization_clock_utc | UTC datetime | ordered; frozen clock used by normalizer/replay |
 | logical_request_plan / request_plan_hash | `ExpectedLogicalRequestPlan` / SHA-256 | Logical requests only; hash recomputed before publish |
 | request_completions / completion_hash | ordered `RequestCompletion` / SHA-256 | Observed contiguous pages and terminal markers; no expected total |
-| request_count / attempt_count | bounded non-negative integers | Equal to plan count and observed lineage cardinality |
-| objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per observed logical request/page/shard |
-| transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every attempt/page bound to exact allowlisted projection and aggregate digest |
+| request_count / attempt_count | bounded non-negative integers | Request count equals plan count; attempt count includes sanitized attempt completions, while object count includes final-success pages only |
+| objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per final-success logical request/page/shard; failed attempts have none |
+| transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every published final-success page is bound to an exact allowlisted projection; failed attempts may appear only as sanitized aggregate observations |
 | endpoint_summaries | `tuple[EndpointContractSummary, ...]` | Exact source schema/units/date semantics, counts equal descriptor sums |
 | factor_cache_snapshot / factor_resolution | optional snapshot + ordered bindings | Actual cache keys only; provenance and raw endpoint resolution bound |
 | factor_resolution_sha256 | SHA-256 | Hash of ordered live/cache resolution bindings; enters candidate lineage |
@@ -1196,12 +1330,15 @@ copied into `CandidateGateReport`, and is not extended or reinterpreted by this 
 | trade_date / universe_id | date / safe identifier | Exact scope |
 | provider_id | ProviderId | One provider only |
 | evidence_id / evidence_sha256 | ID/hash | Exact evidence manifest |
-| normalized_object_relative_path / sha256 | relative path/hash | Non-serving candidate Parquet |
-| gate_report_relative_path / sha256 | relative path/hash | Complete gate lineage |
+| normalized_object_relative_path | SafeRelativePath | Non-serving candidate Parquet path |
+| normalized_object_sha256 | SafeSha256 | Hash of the normalized candidate object |
+| gate_report_relative_path | SafeRelativePath | Complete gate report path |
+| gate_report_sha256 | SafeSha256 | Hash of the aggregate gate report |
 | factor_resolution_sha256 | hash | Exact ordered live/cache factor-resolution object hash |
-| adapter_version / schema_version | safe version | Exact contract |
+| adapter_version / source_schema_version | safe version | Exact adapter and source schema contracts |
 | row_count / required_symbol_count | non-negative int | Exact readback |
 | status | `accepted` / `rejected` | Rejected candidates retained |
+| manifest_sha256 | SafeSha256 | Canonical candidate manifest bytes excluding its own hash |
 
 ### Session selection
 
@@ -1210,17 +1347,18 @@ copied into `CandidateGateReport`, and is not extended or reinterpreted by this 
 | selection_id | safe identifier | Immutable |
 | trade_date / universe_id | date / safe identifier | Exact canonical partition |
 | selected_candidate_id | safe identifier | Exactly one complete candidate |
-| selected_provider_id | ProviderId | `baostock` in R2-F2 |
+| selected_provider_id | ProviderId | `ProviderId.BAOSTOCK` in R2-F2 |
 | reason | `SelectionReason` | R2-F2 writer/orchestrator/validator accepts only `primary_ready`; `qualified_fallback` is schema-reserved and MUST be rejected |
-| fallback_from | nullable `Literal["baostock"]` | Must be null in R2-F2; any non-null or fallback reason fails |
+| fallback_from | nullable `ProviderId` | Must be null in R2-F2; any non-null or fallback reason fails |
 | evidence_sha256 / candidate_manifest_sha256 / gate_report_sha256 | hashes | Complete lineage |
 | selected_at | UTC datetime | Required |
+| selection_sha256 | SafeSha256 | Canonical selection bytes excluding its own hash |
 
 ### Additive canonical manifest lineage
 
 New file entries MAY carry these fields while retaining the current dataset manifest format and all
 legacy fields: `provider_id`, `universe_id`, `evidence_id`, `evidence_sha256`, `candidate_id`,
-`candidate_manifest_sha256`, `gate_report_sha256`, `adapter_version`, `provider_schema_version`.
+`candidate_manifest_sha256`, `gate_report_sha256`, `adapter_version`, `source_schema_version`.
 Legacy entries without them decode as legacy BaoStock provenance in memory. A new writer MUST NOT
 invent lineage for a legacy entry or rewrite its Parquet bytes.
 
@@ -1457,10 +1595,14 @@ also fails closed.
 Given multiple symbols, indexes, retries or SDK pages for one refresh
 When Task 8 assembles its evidence manifest
 Then every logical plan item has exactly one completion and every observed page has exactly one
-descriptor and bound sanitized observation lineage; every attempt has a joinable request ID,
-observed pages are contiguous, and exactly one final successful attempt or final failure is recorded,
-with no missing, extra, duplicate, out-of-order or swallowed page. A competing writer performs zero
-canonical writes. The plan does not require a pre-fetched total page count.
+descriptor and bound sanitized observation lineage only when it belongs to the final successful
+attempt; failed attempts retain only bounded page counters/outcomes/request IDs and never create
+evidence files. Every attempt has a joinable request ID, observed pages are contiguous, and exactly
+one final successful attempt or final failure is recorded, with no missing, extra, duplicate,
+out-of-order or swallowed page. A retry that succeeds publishes only final-attempt pages. An
+ultimate failure publishes no evidence manifest, does not normalize, and cannot create a candidate,
+selection or pointer mutation. A competing writer performs zero canonical writes. The plan does not
+require a pre-fetched total page count.
 
 ### AC-18: Canonical gate aggregate (FR-32, NFR-6–NFR-8)
 
@@ -1475,8 +1617,9 @@ Given a published evidence object and an online or replay normalization run
 When the frozen clock, no-follow layout, CAS and replay comparison rules execute
 Then online and replay use the same `normalization_clock_utc`, same-version output is byte-equal,
 documented encoding-only changes require semantic equality, and missing/corrupt/read-only roots
-cause zero writes. `SafeRelativePath` construction and `model_copy` reject semantic traversal,
-while the storage reader additionally enforces dirfd/O_NOFOLLOW descriptor containment.
+cause zero writes. `SafeRelativePath` construction and `model_copy` reject lexical component
+violations, while `open_evidence_relative(root_dirfd, path, flags)` independently enforces
+dirfd/O_NOFOLLOW descriptor containment and TOCTOU identity checks.
 
 ### AC-20: Fallback and validator boundaries (NFR-18, FR-27)
 
@@ -1502,8 +1645,9 @@ reported only as a structural result, and manual implementation traceability rem
 - EC-6: Evidence object exceeds 64 MiB, metadata exceeds 1 MiB or decompression expands beyond
   the bound; reject before normalization.
 - EC-7: Evidence object is a symlink, empty/repeated/trailing component, `.`, `..`, backslash,
-  NUL, absolute/traversing path, directory or substituted inode; semantic path validation and
-  descriptor-bound dirfd/O_NOFOLLOW containment reject it.
+  NUL, absolute/traversing path, directory or substituted inode; the pure lexical
+  `SafeRelativePath` validator rejects component violations and descriptor-bound
+  `open_evidence_relative`/dirfd/O_NOFOLLOW containment rejects filesystem violations.
 - EC-8: Evidence manifest is atomically swapped during read; snapshot identity/fingerprint
   mismatch makes the read unavailable.
 - EC-9: Evidence object is deleted, renamed, truncated or hash-mutated after manifest commit;
@@ -1527,15 +1671,21 @@ reported only as a structural result, and manual implementation traceability rem
   with exact existing quality semantics.
 - EC-18: An active stock lacks factor, a suspended row has non-zero activity, or a suspended
   index appears; candidate fails.
-- EC-19: Replay CLI receives credentials, URL, path or provider arguments; parser rejects them
-  and emits no sensitive value.
+- EC-19: Replay CLI receives credentials, token, header, cookie, URL, provider, local path or
+  unknown arguments; the parser rejects them before constructing the evidence layout or reader,
+  emits no sensitive value, performs zero provider/network calls, and leaves root tree/bytes/mtime
+  unchanged.
 - EC-20: Missing evidence root/database/table on GET/plan/replay; return unavailable and do not
   initialize directories, databases, tables or pointers.
 - EC-21: Expected request plan contains a missing, extra, duplicate, out-of-order or swallowed
   request/shard/page, duplicate attempt request ID, or inconsistent final success/failure;
-  `AttemptCompletion`/`RequestCompletion` validation fails before evidence publication.
+  `AttemptCompletion`/`RequestCompletion` validation fails before evidence publication. Failed
+  partial rows/page bytes are discarded in memory, no evidence file is created, a later successful
+  retry publishes only its final pages, and an ultimate failure creates no manifest/candidate/
+  selection/pointer.
 - EC-22: A descriptor has transport IDs/endpoint/attempt/page that do not match its sanitized
-  observation digest; the complete evidence chain is unavailable.
+  observation digest, or a descriptor belongs to a failed/non-final attempt; the complete evidence
+  chain is unavailable and no failed-payload quarantine object is permitted.
 - EC-23: Candidate gate outcomes omit, duplicate, reorder or add a gate; the aggregate report and
   candidate fail closed and no selection is published.
 - EC-24: Online/replay normalization uses different frozen clocks or invocation time enters a
@@ -1563,6 +1713,8 @@ reported only as a structural result, and manual implementation traceability rem
   time financial statement/event ingestion.
 - OS-8: Rewriting old manifests, Parquet, refresh rows, analysis/alert/user JSON or backfilling
   provenance that cannot be proven from existing bytes.
+- OS-9: Persisting failed-attempt partial pages as quarantined forensic objects; R2-F2 retains only
+  sanitized transport observations and counters, and failed payload/row/page bytes are discarded.
 
 ## Rollback and compatibility
 

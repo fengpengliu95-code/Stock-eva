@@ -19,7 +19,7 @@ Ruff, macOS LaunchAgents, optional provider SDK/HTTP adapters selected only afte
 **Authoritative roadmap:**
 `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-roadmap.md`
 
-**Planning status:** R2-F0.1 is OFFLINE CODE GO at exact code HEAD
+**Planning status:** R2-F0.1 is OFFLINE CODE GO at exact reviewed code HEAD
 `b0b643fd78b1b0be27279cbd3380268577408c85`; this document still authorizes no deployment,
 provider purchase, credential creation, network canary or production repair. R2-F0 remains
 production NO-GO. See
@@ -31,11 +31,13 @@ production NO-GO. See
 [R2-F1 acceptance](../acceptance/release-2-r2f1.md). The code gate is complete, but this does not
 authorize installation, real provider access, production repair or R2-F2.
 
-**Next confirmation gate:** Gap Scanner + Health-aware Repair Queue is the next code stage and may
-start only after explicit user confirmation. Provider-neutral RAW Evidence Framework follows it;
-then a second source must pass at least 20 consecutive trading sessions of whole-session shadow
-qualification. Do not mix providers by symbol, and keep automatic failover disabled until shadow,
-qualification and a separately approved manual failover stage are complete.
+**Current gate:** R2-F1 is complete and the user has authorized R2-F2 specification work. R2-F2
+remains **In Review** after the user-selected Option A boundary: persist only final successful
+attempt evidence; discard failed partial payloads without quarantine. The dedicated R2-F2 design
+and implementation plan are the only contract authority, and no Task 7–9 RED/code may begin until
+independent approval. A second source must still pass at least 20 consecutive trading sessions of
+whole-session shadow qualification; do not mix providers by symbol, and keep automatic failover
+disabled until shadow, qualification and a separately approved manual failover stage are complete.
 
 ---
 
@@ -622,9 +624,9 @@ scheduling remains usable; do not delete repair tables or audit history.
 
 **Dedicated specification:** [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)<br>
 **Dedicated implementation plan:** [R2-F2 Provider Evidence Framework Implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)<br>
-**Specification status:** In Review at exact planning HEAD
-`70f7ed3c6739566d20d5ae7ba6895d65676a8033`; Tasks 7–9 remain gated until an independent review
-changes the dedicated design to Approved. The dedicated documents are the only authority for
+**Specification status:** In Review after the user-approved Option A reconciliation; Tasks 7–9
+remain gated until an independent review changes the dedicated design to Approved. The dedicated
+documents are the only authority for
 models, endpoint contracts, factor-cache fields, file whitelists, tests, gates and rollback; this
 umbrella section is intentionally non-normative and contains no duplicate pseudo-code or legacy
 field contract.

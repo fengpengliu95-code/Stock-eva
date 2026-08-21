@@ -3,8 +3,9 @@
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
 **Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
-specification remains In Review after second-round contract reconciliation at planning HEAD
-`4e561367c6b6a5d0aaa3219ec78d730a929fd3f7`; deployment and the R2-F0 production gate remain closed
+specification remains In Review after the user-approved Option A successful-attempt-only evidence
+reconciliation. The dedicated R2-F2 design/implementation documents are the only contract authority;
+deployment and the R2-F0 production gate remain closed
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
@@ -55,9 +56,10 @@ but it does not erase completed work or rewrite old acceptance evidence.
 - R2-F1 remains offline-only: no real provider, installation, NAS, LaunchAgent or production
   execution occurred. The refresh LaunchAgent remains unloaded/frozen and R2-F0 remains
   production NO-GO.
-- R2-F2 Provider Evidence Framework is the next planned stage. The user approved starting its
-  specification on 2026-08-21; its second-round contract reconciliation is documentation-only and
-  implementation remains gated on independent approval of the
+- R2-F2 Provider Evidence Framework is the active specification stage. The user approved starting
+  it on 2026-08-21 and selected Option A: only the final successful attempt's complete evidence is
+  persisted; failed partial payloads are discarded and never quarantined. This reconciliation is
+  documentation-only and implementation remains gated on independent approval of the
   dedicated [R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) and
   [R2-F2 implementation plan](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md).
   Automatic failover remains disabled; second-source qualification still requires at least 20
@@ -351,6 +353,8 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
 **GO**
 
 - Online BaoStock evidence and offline replay produce semantically identical canonical candidates.
+- Only the final successful attempt's complete source pages are persisted; failed partial payloads
+  are discarded and are never quarantined, normalized, hashed or published.
 - Corrupt evidence, schema/version mismatch or hash mismatch fails before normalization/promotion.
 - Existing historical manifests/rows remain readable without rewriting immutable objects.
 - GET requests remain write-free.
