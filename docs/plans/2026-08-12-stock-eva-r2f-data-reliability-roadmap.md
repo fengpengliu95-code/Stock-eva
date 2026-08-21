@@ -2,8 +2,8 @@
 
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
-**Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; deployment,
-R2-F0 production gate and R2-F2 start gate remain closed
+**Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
+specification is In Review; deployment and the R2-F0 production gate remain closed
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
@@ -54,9 +54,12 @@ but it does not erase completed work or rewrite old acceptance evidence.
 - R2-F1 remains offline-only: no real provider, installation, NAS, LaunchAgent or production
   execution occurred. The refresh LaunchAgent remains unloaded/frozen and R2-F0 remains
   production NO-GO.
-- R2-F2 Provider Evidence Framework is the next planned stage but may start only after explicit
-  user approval. Automatic failover remains disabled; second-source qualification still requires
-  at least 20 consecutive whole-session shadow trading days.
+- R2-F2 Provider Evidence Framework is the next planned stage. The user approved starting its
+  specification on 2026-08-21; implementation remains gated on independent approval of the
+  dedicated [R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) and
+  [R2-F2 implementation plan](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md).
+  Automatic failover remains disabled; second-source qualification still requires at least 20
+  consecutive whole-session shadow trading days.
 
 ## 2. Verified baseline on 2026-08-12
 

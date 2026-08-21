@@ -620,6 +620,12 @@ scheduling remains usable; do not delete repair tables or audit history.
 
 ## R2-F2 — Provider Evidence Framework
 
+**Dedicated specification:** [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)<br>
+**Dedicated implementation plan:** [R2-F2 Provider Evidence Framework Implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)<br>
+**Specification status:** In Review — Tasks 7–9 remain gated until an independent review changes
+the dedicated design to Approved. These documents add exact contracts, file whitelists and
+evidence gates without changing R2-F1 or R2-F3 completion status.
+
 ### Task 7: Introduce provider-neutral contracts and a BaoStock compatibility adapter
 
 **Files:**
