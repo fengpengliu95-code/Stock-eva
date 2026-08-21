@@ -2,14 +2,14 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** In Review — six specification findings amended; independent re-review required
+**Status:** In Review — second-round specification findings reconciled; independent re-review required
 **Decision authority:** User approved starting R2-F2 on 2026-08-21; implementation still requires
   this specification to be independently reviewed and approved.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`90680832a3b2d9c876b7917a88ad0213236250ab`
-**Reviewers:** Independent code/spec review found six Medium specification gaps; this amendment
-closes them for re-review. Status MUST NOT be changed to Approved by this fix.
+`4e561367c6b6a5d0aaa3219ec78d730a929fd3f7`
+**Reviewers:** Independent second-round code/spec review found nine Medium specification gaps;
+this amendment reconciles them for re-review. Status MUST NOT be changed to Approved by this fix.
 
 **Related documents:**
 
@@ -26,17 +26,21 @@ provider, automatic failover, production refresh, installation, NAS access or La
 
 ## Specification review closure (authoritative amendment before RED)
 
-The first independent review was correctly **NO-GO**. The six Medium findings were specification
-gaps, not permission to narrow the product boundary. Their confirmed root causes and closures are:
+The first independent review was correctly **NO-GO**. The second-round Medium findings were
+specification gaps, not permission to narrow the product boundary. Their confirmed root causes and
+closures are:
 
 | Finding | Confirmed root cause | Normative closure in this revision |
 | --- | --- | --- |
-| M1 — type contract incomplete | The earlier shorthand used `SafeIdentifier`, an undefined `RawEndpointBatch` and open mappings, so a writer could accept arbitrary provider/symbol/path/row shapes. | Freeze the complete frozen, `extra="forbid"`, UTC-aware model set in **Frozen type vocabulary** and **Frozen in-memory contracts** below. |
-| M2 — endpoint schema under-specified | The earlier prose named six calls but did not freeze their actual call-site field order, variants, empty rules, units or ordering. | Freeze the exact fields observed/required by `baostock.py`, `DAILY_FIELDS`, `AdjustmentFactorCache.FACTOR_FIELDS` and existing fixtures in **Exact BaoStock endpoint contract**; no union/`Any` fallback. |
-| M3 — manifest cardinality/plan ambiguous | One object and a free-form `endpoint_batches` tuple could swallow multiple symbols, pages or attempts and had no expected-plan hash. | Make `EvidenceManifest.objects` an ordered tuple of one descriptor per logical request/page/shard, bind an immutable expected request plan/hash and enforce exact coverage/cardinality. |
-| M4 — transport lineage not cryptographically bound | IDs were named but no persisted object was required to bind them to the sanitized F0.1 observation. | Add `TransportLineageRef.observation_digest`, require one ref per endpoint/attempt/page and hash the canonical allowlisted observation projection only. |
-| M5 — gate cardinality unclear | The previous `Candidate gate report` table described one gate row, while ACs required a complete report; missing/duplicate gates had no explicit fail-closed rule. | Freeze one canonical ordered `CandidateGateReport` aggregate containing the exact gate list, per-gate `GateOutcome` records and aggregate hash; `CandidateManifest` may reference exactly one report. |
-| M6 — storage/replay/traceability boundary incomplete | Defaults, no-clobber/CAS order, replay clock/hash rules, qualified-fallback rejection and validator scope were distributed or implicit. | Freeze settings/layout, macOS-safe primitives, lock/CAS publication order, injected normalization clock, byte/semantic replay rules, explicit fallback rejection and manual traceability gates in this revision. |
+| M1 — frozen batch summaries and roles incomplete | `source_schema`, `units` and `date_semantics` were only prose/table fields, while index-history stock/index variants had no role discriminator. | Carry these fields on every `RawEndpointBatch` and aggregate them through a frozen `EndpointContractSummary`; add `InstrumentRole`/`RequestRole` and an explicit endpoint-role validator. |
+| M2 — logical request cardinality predicted pages | The former expected-total-pages field made a caller guess the provider's total page count before fetching. | Replace it with `ExpectedLogicalRequest` plus post-fetch `RequestCompletion`; hash logical requests separately from observed contiguous pages and require terminal/end-marker evidence without guessing totals. |
+| M3 — transport projection incomplete | Only a digest was named; the complete allowlisted F0.1 observation fields and aggregate verification were not frozen. | Freeze `TransportObservationProjection` with the exact F0.1 field names, preserve bounded `provider_code`, and verify per-projection and ordered aggregate digests. |
+| M4 — gate set contradicted itself | The model had ten names while the table said eleven and the implementation traceability described a different set. | Use one exact ten-gate `R2F2_GATE_ORDER`, map every gate to current Normalize/Quality/publication functions and require exactly ten ordered outcomes. |
+| M5 — lock ownership was ambiguous | Evidence/selection layouts proposed additional blocking locks that could deadlock or reverse the R2-F1 lock order. | Use only the existing `RefreshRunLock` at `local_lock_dir/market-refresh.lock`; content-addressed O_EXCL/no-clobber writes are lock-free compare-create under that outer lock, and replay is read-only. |
+| M6 — replay result leaked invocation time | `ReplayResult` included a start-time field even though deterministic public output was required. | Remove the field entirely; only the frozen evidence `normalization_clock_utc` enters hashes/results, while internal observed time is never a result, candidate field or semantic input. |
+| M7 — factor provenance was not self-contained | The mutable `AdjustmentFactorCache` call chain was treated as if the live cache were replayable evidence and factor data was conflated with a provider endpoint. | Add `EvidenceObjectKind.factor_cache_snapshot`, capture only actually-read keys and safe provenance under `RefreshRunLock`, fingerprint before/after, and make online/replay normalization consume only the published snapshot. |
+| M8 — requirement/file traceability was incomplete | FR-28–33, NFR-15–18, AC-16–20 and EC-21–26 were absent or attached to the wrong task; Task 9 also owned the same model file as Task 7. | Add complete numbered traceability and tests, move selection tests to Task 9, give Task 9 a single `market/candidates.py` model owner, and keep Task 7/8 whitelists disjoint. |
+| M9 — stale contract tokens remained | The documents still contained an eleven-gate claim, extra refresh locks and a public replay start-time field, so structural review could not prove closure. | Remove every stale token and run strict design validation, full token/number audit and `git diff --check` before re-review. |
 
 The amendment is still documentation-only. No RED test, provider request, external operation or
 production mutation may begin until the next independent review changes this document to
@@ -184,8 +188,10 @@ automatic failover may be used to close that gap.
   volume is shares, amount is CNY, and turnover is the provider's percentage field. The adapter
   MUST reject a date mismatch or unsupported unit declaration.
 - FR-21: **Factor semantics:** `adjustflag=3` daily prices remain unadjusted. For eligible stock
-  rows, `backAdjustFactor` is a finite positive factor selected on or before the trade date;
-  missing/invalid factors fail the candidate. Index rows have no stock factor requirement.
+  rows, `backAdjustFactor` is a finite positive factor selected on or before the trade date from
+  the published `factor_cache_snapshot` or an explicitly bound raw factor endpoint; missing,
+  invalid or mutable-cache-only factors fail the candidate. Index rows have no stock factor
+  requirement.
 - FR-22: **Suspension semantics:** `tradestatus != "1"` means suspended/non-trading. A legal
   suspended stock may have missing factor and blank activity represented as zero, with exactly the
   existing suspended-placeholder quality issue. Active stock missing factors, non-zero suspended
@@ -213,9 +219,11 @@ automatic failover may be used to close that gap.
   explicitly named request/schema variants and exact ordered field tuples in this specification;
   an unobserved field, inferred unit, unknown null rule or unclassified same-endpoint variant MUST
   invalidate the complete batch.
-- FR-30: **Request-plan cardinality:** Every logical request, symbol/index shard and SDK page MUST
-  have exactly one ordered plan item, object descriptor and transport-lineage record. The expected
-  plan and its hash MUST be verified before evidence, candidate or selection publication.
+- FR-30: **Request-plan cardinality:** Every logical request and symbol/index shard MUST have one
+  ordered `ExpectedLogicalRequest`; execution MUST produce exactly one `RequestCompletion` with
+  contiguous observed pages and a terminal/end marker, and each observed page MUST have exactly one
+  object descriptor and transport-lineage record. The logical request-plan hash and completion hash
+  MUST be verified before evidence, candidate or selection publication; no page total is guessed.
 - FR-31: **Transport binding:** Every published object MUST bind refresh/session/request/endpoint/
   attempt/page to a SHA-256 digest of the sanitized F0.1 observation projection. Payload, URL,
   token, header, cookie and raw provider exception/message MUST remain impossible to persist.
@@ -240,9 +248,9 @@ automatic failover may be used to close that gap.
 - **NFR-4 (Bounds):** Evidence metadata MUST be <= 1 MiB, each source evidence object MUST be <=
   64 MiB, decompressed Parquet content MUST remain within the same bounded policy, and row counts
   MUST be non-negative and schema-consistent. Oversize or decompression failure is an error.
-- **NFR-5 (Concurrency):** Shared market/evidence publication locks and CAS/version checks MUST
-  allow exactly one logical evidence/candidate/selection publication for a request key; losers do
-  zero canonical writes.
+- **NFR-5 (Concurrency):** The existing `RefreshRunLock` and content-addressed CAS/version checks
+  MUST allow exactly one logical evidence/candidate/selection publication for a request key;
+  losers do zero canonical writes. Evidence does not add a second blocking lock.
 - **NFR-6 (Determinism):** Canonical JSON serialization, object hashes, candidate IDs, request keys,
   row ordering and replay output MUST be deterministic for identical inputs and contract versions.
 - **NFR-7 (Compatibility):** No existing immutable object, legacy manifest, public response contract
@@ -261,9 +269,10 @@ automatic failover may be used to close that gap.
 - **NFR-15 (Path/layout):** Evidence settings, roots, ancestors, directory names and relative
   object paths MUST use the fixed bounded layout and descriptor-bound no-follow checks; missing
   read roots MUST remain zero-write.
-- **NFR-16 (CAS/publication order):** Evidence compare-create, `RefreshRunLock`, selection,
-  canonical manifest and pointer operations MUST follow the frozen order and no-clobber rules;
-  a competing or stale writer MUST fail closed without canonical writes.
+- **NFR-16 (CAS/publication order):** The existing `RefreshRunLock` at
+  `local_lock_dir/market-refresh.lock` MUST be acquired before evidence compare-create, then gate,
+  candidate, selection and existing canonical manifest/pointer operations follow the frozen order
+  and no-clobber rules; a competing or stale writer MUST fail closed without canonical writes.
 - **NFR-17 (Traceability):** Every EC-3/4/12/16/17/18 and every FR/NFR/AC MUST map to a named
   pytest or an explicit static/diff proof in the implementation plan. No validator score may be
   substituted for this manual traceability.
@@ -289,7 +298,9 @@ class BaoStockDailyBarAdapter(Protocol):
     endpoint_contract_version: SafeVersion
 
     def fetch_raw(self, request: ProviderRequest) -> ProviderRawBatch: ...
-    def normalize(self, evidence: PublishedEvidence, *, clock: datetime) -> tuple[DailyBar, ...]: ...
+    def normalize(
+        self, evidence: PublishedEvidence, *, normalization_clock_utc: datetime
+    ) -> tuple[DailyBar, ...]: ...
 
 class EvidenceStore(Protocol):
     def publish(self, batch: ProviderRawBatch) -> EvidenceManifest: ...
@@ -314,8 +325,9 @@ market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]
 The parser accepts only the evidence ID and optional SHA-256 comparison. It rejects credentials,
 URLs, local paths, provider names, arbitrary flags and unknown fields before any root access. It
 returns exactly the sanitized `ReplayResult` projection (`status`, `evidence_id`, candidate/semantic
-hashes and match booleans, normalization clock, bounded row/date fields and allowlisted failure
-class). `replay_started_at` is not returned as candidate evidence and is never hashed. Missing or
+hashes and match booleans, the frozen normalization clock, bounded row/date fields and allowlisted
+failure class). Invocation time is not part of this projection or any candidate evidence and is
+never hashed. Missing or
 corrupt evidence exits non-zero with an allowlisted `EVIDENCE_*`/`REPLAY_*` reason and zero writes.
 
 No new HTTP write endpoint is introduced. Existing `GET /api/v1/market/status`, summary and
@@ -324,17 +336,49 @@ required by legacy clients.
 
 ### Transport observation binding
 
-R2-F0.1 already emits `TransportObservation` with the fixed fields
-`refresh_id/provider_session_id/request_id/provider_id/endpoint/attempt/page/protocol_stage/
-elapsed_ms/recv_calls/response_bytes/end_marker_seen/provider_code/normalized_error/outcome/
-observed_at`. R2-F2 MUST retain those fields only through the sanitized model and compute
-`observation_digest = SHA256(canonical_json(observation_without_digest))`. The canonical projection
-contains no provider message, exception, URL, token, socket payload or credential. A successful
-page descriptor MUST reference one successful terminal observation with matching endpoint,
-attempt/page and IDs; a failed request is retained only as sanitized failure/lineage evidence and
-cannot produce a published object. A digest mismatch, missing observation, duplicate lineage key or
-observation from a different refresh/session/request invalidates the complete candidate and leaves
-the canonical chain untouched.
+R2-F0.1 already emits `TransportObservation`. R2-F2 freezes the exact persisted projection below;
+there is no open mapping and no field may be added by an adapter. `provider_code` remains an
+independently auditable bounded value even when `normalized_error` is
+`UNKNOWN_PROVIDER_PROTOCOL_ERROR`.
+
+`ProtocolStage`, `ProviderCode`, `NormalizedTransportError` and `TransportOutcome` below are the
+existing typed definitions in `backend/app/market/provider_transport.py`; R2-F2 reuses their exact
+names and enum values and does not redefine their transport semantics.
+
+```python
+class TransportObservationProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    refresh_id: SafeIdentifier
+    provider_session_id: SafeIdentifier
+    request_id: SafeIdentifier
+    provider_id: Literal["baostock"]
+    endpoint: ProviderEndpoint
+    attempt: int = Field(ge=1, le=20)
+    page: int = Field(ge=1, le=16_384)
+    protocol_stage: ProtocolStage  # existing provider_transport.ProtocolStage
+    elapsed_ms: int = Field(ge=0, le=86_400_000)
+    recv_calls: int = Field(ge=0, le=10_000_000)
+    response_bytes: int = Field(ge=0, le=67_108_864)
+    end_marker_seen: bool
+    provider_code: ProviderCode | None  # existing provider_transport.ProviderCode
+    normalized_error: NormalizedTransportError | None  # existing F0.1 enum
+    outcome: TransportOutcome  # existing F0.1 enum: success/error
+    observed_at: datetime
+    observation_digest: SafeSha256
+
+class TransportObservationAggregate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    observations: tuple[TransportObservationProjection, ...]
+    aggregate_digest: SafeSha256
+```
+
+`observation_digest` is SHA-256 of canonical JSON over the exact projection without that digest;
+`aggregate_digest` is SHA-256 of the ordered tuple of projection canonical forms without the
+aggregate field. No `message`, `payload`, `url`, `token`, header, cookie or raw exception is
+accepted. Every `TransportLineageRef` and object descriptor binds one projection by matching
+refresh/session/request/endpoint/attempt/page and digest. Missing, duplicate, extra, or
+cross-refresh observations invalidate the complete evidence candidate. A failed observation may
+be retained only as sanitized lineage/audit evidence and cannot produce a published source object.
 
 ```typescript
 interface ProviderReplayResponse {
@@ -345,7 +389,6 @@ interface ProviderReplayResponse {
   byte_match: boolean | null;
   semantic_match: boolean | null;
   normalization_clock_utc: string | null;
-  replay_started_at: string;
   failure_class: string | null;
   row_count: number;
   trade_date: string | null;
@@ -401,6 +444,22 @@ class ProviderEndpoint(StrEnum):
     ADJUST_FACTOR = "adjust_factor"
     INDEX_HISTORY = "index_history"
 
+class InstrumentRole(StrEnum):
+    STOCK = "stock"
+    INDEX = "index"
+
+class RequestRole(StrEnum):
+    CALENDAR = "calendar"
+    UNIVERSE = "universe"
+    DAILY_STOCK = "daily_stock"
+    DAILY_FACTOR = "daily_factor"
+    ADJUST_FACTOR = "adjust_factor"
+    INDEX_HISTORY = "index_history"
+
+class EvidenceObjectKind(StrEnum):
+    RAW_ENDPOINT_PAGE = "raw_endpoint_page"
+    FACTOR_CACHE_SNAPSHOT = "factor_cache_snapshot"
+
 class ProviderId(StrEnum):
     BAOSTOCK = "baostock"
 
@@ -438,6 +497,19 @@ R2F2_GATE_ORDER: tuple[GateName, ...] = (
     GateName.FACTOR, GateName.SUSPENSION, GateName.EVIDENCE_HASH,
     GateName.DETERMINISM,
 )
+
+R2F2_GATE_EVIDENCE: tuple[tuple[GateName, str, str], ...] = (
+    (GateName.TRANSPORT_COMPLETE, "F0.1 TransportObservationProjection", "BaoStockProvider._read / provider transport observation collector"),
+    (GateName.SCHEMA, "RawEndpointBatch", "providers.base exact discriminated endpoint/schema validator"),
+    (GateName.DATE, "normalize_baostock_rows", "normalize_baostock_rows date and adjustflag checks"),
+    (GateName.UNIVERSE, "_publication_issues", "backend.app.market.automation._publication_issues expected/required symbols and indexes"),
+    (GateName.COVERAGE, "run_publication_refresh", "backend.app.market.automation.run_publication_refresh coverage == 1"),
+    (GateName.SEMANTIC, "normalize_baostock_rows + publication_bar_quality_issue", "existing normalized DailyBar and MarketStore quality contract"),
+    (GateName.FACTOR, "_main_board_factor_snapshot + _publication_issues", "AdjustmentFactorCache resolution and missing_adjust_factor gate"),
+    (GateName.SUSPENSION, "publication_bar_quality_issue", "MarketStore.publication_bar_quality_issue suspended placeholder/index rules"),
+    (GateName.EVIDENCE_HASH, "EvidenceReader", "descriptor-bound schema, row-count and SHA-256 readback"),
+    (GateName.DETERMINISM, "EvidenceStore.replay", "frozen normalization clock and byte/semantic replay comparison"),
+)
 ```
 
 `SafeProviderId` is the lexical safety type; the R2-F2 registry additionally requires the value
@@ -463,7 +535,7 @@ class ProviderRequest(BaseModel):
     trade_date: date
     universe_id: SafeIdentifier
     symbols: tuple[SafeSymbol, ...]  # sorted, unique, non-empty
-    request_plan: "ExpectedRequestPlan"
+    request_plan: "ExpectedLogicalRequestPlan"
 
 class TransportLineageRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -480,6 +552,8 @@ class RawEndpointRowBase(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     endpoint: ProviderEndpoint
     schema_variant: SafeVersion
+    request_role: RequestRole
+    instrument_role: InstrumentRole | None
 
 class TradeDatesRow(RawEndpointRowBase):
     endpoint: Literal[ProviderEndpoint.TRADE_DATES]
@@ -564,12 +638,60 @@ class RawEndpointBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     endpoint: ProviderEndpoint
     schema_variant: SafeVersion
+    request_role: RequestRole
+    instrument_role: InstrumentRole | None
     plan_ordinal: int = Field(ge=0, le=4096)
     shard_id: SafeIdentifier
     lineage: TransportLineageRef
     rows: tuple[RawEndpointRow, ...]
     row_count: int = Field(ge=0, le=10_000_000)
+    source_schema: SafeVersion
+    units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
+    date_semantics: Literal["explicit_trade_date"]
     provider_row_order_digest: SafeSha256
+
+class EndpointContractSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    endpoint: ProviderEndpoint
+    request_role: RequestRole
+    instrument_role: InstrumentRole | None
+    schema_variant: SafeVersion
+    source_schema: SafeVersion
+    units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
+    date_semantics: Literal["explicit_trade_date"]
+    batch_count: int = Field(ge=1, le=4096)
+    row_count: int = Field(ge=0, le=10_000_000)
+
+class FactorCacheSnapshotRow(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    symbol: SafeSymbol
+    trade_date: date
+    fore_adjust_factor: Decimal
+    back_adjust_factor: Decimal
+    adjust_factor: Decimal | None
+    source: Literal["daily_event", "daily_carry", "bootstrap", "bootstrap_no_events"]
+    evidence_effective_date: date
+    evidence_observed_on: date
+    cache_schema_version: SafeVersion
+    provenance_hash: SafeSha256
+
+class FactorResolutionBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    symbol: SafeSymbol
+    trade_date: date
+    selected_kind: Literal["factor_cache_snapshot", "daily_factor", "adjust_factor"]
+    selected_provenance_hash: SafeSha256
+    raw_endpoint_lineage: TransportLineageRef | None
+
+class FactorCacheSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    object_kind: Literal["factor_cache_snapshot"]
+    cache_schema_version: SafeVersion
+    rows: tuple[FactorCacheSnapshotRow, ...]
+    row_count: int = Field(ge=0, le=10_000_000)
+    before_fingerprint: SafeSha256
+    after_fingerprint: SafeSha256
+    provenance_hash: SafeSha256
 
 class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -580,15 +702,22 @@ class ProviderRawBatch(BaseModel):
     started_at: datetime
     completed_at: datetime
     normalization_clock_utc: datetime
-    request_plan: "ExpectedRequestPlan"
+    logical_request_plan: "ExpectedLogicalRequestPlan"
+    request_plan_hash: SafeSha256
     endpoint_batches: tuple[RawEndpointBatch, ...]
+    request_completions: tuple["RequestCompletion", ...]
+    completion_hash: SafeSha256
     transport_lineage: tuple[TransportLineageRef, ...]
+    transport_observations: TransportObservationAggregate
+    endpoint_summaries: tuple[EndpointContractSummary, ...]
+    factor_cache_snapshot: FactorCacheSnapshot | None
+    factor_resolution: tuple[FactorResolutionBinding, ...]
     failure_class: SafeFailureClass | None = None
 
 class EvidenceObjectDescriptor(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     object_id: SafeIdentifier
-    object_kind: Literal["raw_endpoint_page"]
+    object_kind: EvidenceObjectKind
     relative_path: SafeRelativePath
     sha256: SafeSha256
     schema_hash: SafeSha256
@@ -600,15 +729,21 @@ class EvidenceObjectDescriptor(BaseModel):
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
-    endpoint: ProviderEndpoint
-    shard_id: SafeIdentifier
-    attempt: int = Field(ge=1, le=20)
-    page: int = Field(ge=1, le=16_384)
+    endpoint: ProviderEndpoint | None
+    request_role: RequestRole | None
+    instrument_role: InstrumentRole | None
+    shard_id: SafeIdentifier | None
+    attempt: int | None = Field(default=None, ge=1, le=20)
+    page: int | None = Field(default=None, ge=1, le=16_384)
     adapter_version: SafeVersion
     endpoint_contract_version: SafeVersion
     schema_variant: SafeVersion
+    source_schema: SafeVersion
+    units: tuple[tuple[SafeIdentifier, BoundedToken], ...]
+    date_semantics: Literal["explicit_trade_date"]
     normalization_clock_utc: datetime
-    transport_observation_digest: SafeSha256
+    transport_observation_digest: SafeSha256 | None
+    factor_snapshot_provenance_hash: SafeSha256 | None
 
 class EvidenceManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -621,10 +756,19 @@ class EvidenceManifest(BaseModel):
     requested_at: datetime
     completed_at: datetime
     normalization_clock_utc: datetime
-    expected_request_plan: "ExpectedRequestPlan"
-    expected_request_plan_sha256: SafeSha256
+    logical_request_plan: "ExpectedLogicalRequestPlan"
+    request_plan_hash: SafeSha256
+    request_completions: tuple["RequestCompletion", ...]
+    completion_hash: SafeSha256
     objects: tuple[EvidenceObjectDescriptor, ...]  # ordered; one request/page/shard per item
     transport_lineage: tuple[TransportLineageRef, ...]
+    transport_observations: TransportObservationAggregate
+    endpoint_summaries: tuple[EndpointContractSummary, ...]
+    factor_cache_snapshot: FactorCacheSnapshot | None
+    factor_resolution: tuple[FactorResolutionBinding, ...]
+    request_count: int = Field(ge=1, le=4096)
+    attempt_count: int = Field(ge=1, le=20_000)
+    failure_class: SafeFailureClass | None = None
     object_count: int = Field(ge=0, le=4096)
     row_count: int = Field(ge=0, le=10_000_000)
     manifest_sha256: SafeSha256
@@ -697,11 +841,16 @@ class ReplayResult(BaseModel):
     byte_match: bool | None
     semantic_match: bool | None
     normalization_clock_utc: datetime | None
-    replay_started_at: datetime  # diagnostic only; excluded from every candidate/selection hash
     row_count: int = Field(ge=0, le=10_000_000)
     trade_date: date | None
     failure_class: SafeFailureClass | None
 ```
+
+`EvidenceObjectDescriptor` has a closed kind validator: `raw_endpoint_page` requires a non-null
+endpoint/request role/shard, attempt/page and `transport_observation_digest`, while
+`factor_cache_snapshot` requires a null endpoint/request role/shard/attempt/page and transport
+digest plus a non-null `factor_snapshot_provenance_hash`. Thus a factor snapshot is an evidence
+object kind, never a seventh provider endpoint, and cannot masquerade as a transport page.
 
 `SafeFailureClass` is an existing allowlist (`MarketFailureClass`, `NormalizedTransportError` and
 the explicit `EVIDENCE_*`/`REPLAY_*` public categories); it is not a free-form string. All datetime
@@ -710,32 +859,67 @@ identifiers, exact counts and cross-object equality. The implementation MUST rej
 that attempts to serialize a payload, exception, URL, path outside the declared relative field,
 or a `qualified_fallback` selection.
 
-`ExpectedRequestPlan` is also frozen and explicit:
+### Frozen model file ownership
+
+The implementation keeps model ownership disjoint between tasks:
+
+- Task 7 `backend/app/market/providers/base.py` owns provider-safe types, endpoint/role contracts,
+  logical requests, completions, raw endpoint batches and transport projections; the existing
+  `backend/app/market/models.py` is touched only for necessary additive provider-source
+  compatibility.
+- Task 8 `backend/app/market/evidence.py` owns `EvidenceObjectDescriptor`, `EvidenceManifest`,
+  `PublishedEvidence`, factor snapshot serialization and `ReplayResult`; settings/layout/CLI and
+  automation only consume these models.
+- Task 9 `backend/app/market/candidates.py` is the single owner of `GateOutcome`,
+  `CandidateGateReport`, `CandidateManifest` and `SessionSelection`. `market/models.py` is not a
+  second candidate-model owner.
+
+The frozen contract listing is normative regardless of module placement; a task may not duplicate
+or redefine a model in another module.
+
+The logical request plan and post-fetch completion are separate frozen contracts:
 
 ```python
-class ExpectedRequest(BaseModel):
+class PaginationPolicy(StrEnum):
+    PROVIDER_TERMINAL = "provider_terminal"
+
+class ExpectedLogicalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     ordinal: int = Field(ge=0, le=4096)
     endpoint: ProviderEndpoint
+    request_role: RequestRole
+    instrument_role: InstrumentRole | None
     schema_variant: SafeVersion
     shard_id: SafeIdentifier
     symbols: tuple[SafeSymbol, ...]
     start_date: date
     end_date: date
-    expected_pages: tuple[int, ...]  # non-empty, sorted, unique; actual pages must equal this
+    pagination_policy: PaginationPolicy
 
-class ExpectedRequestPlan(BaseModel):
+class ExpectedLogicalRequestPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    requests: tuple[ExpectedRequest, ...]  # exact six-endpoint plan for the session
+    requests: tuple[ExpectedLogicalRequest, ...]
     request_count: int = Field(ge=1, le=4096)
-    plan_sha256: SafeSha256
+    request_plan_hash: SafeSha256
+
+class RequestCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    logical_ordinal: int = Field(ge=0, le=4096)
+    observed_pages: tuple[int, ...]  # non-empty, sorted, contiguous, unique
+    terminal_page: int = Field(ge=1, le=16_384)
+    end_marker_seen: bool
+    row_count: int = Field(ge=0, le=10_000_000)
 ```
 
-The plan includes all symbol shards and explicit index requests. It is canonicalized before fetch;
-`plan_sha256` is SHA-256 of the canonical JSON representation without `plan_sha256` itself. The
-manifest's `expected_request_plan_sha256` MUST equal it, and every request ordinal, shard, page,
-endpoint, schema variant and symbol set MUST have exactly one corresponding object/lineage record.
-Multi-symbol, multi-index and multi-page responses therefore cannot be hidden in one object.
+The plan includes all symbol shards and explicit index requests, but never predicts the provider's
+page count. `request_plan_hash` is SHA-256 of the canonical logical-request tuple without its hash
+field. After execution, each logical request emits exactly one `RequestCompletion`; its
+`observed_pages` MUST be non-empty, unique and contiguous starting at page 1, `terminal_page` MUST
+equal the last observed page, and `end_marker_seen` MUST be true. `completion_hash` is SHA-256 of
+the ordered completion/page-descriptor tuple without its hash field and is independent of the
+logical request-plan hash. Missing, duplicate, non-contiguous, out-of-order, swallowed pages or an
+absent terminal/end marker fail closed. A provider that returns an empty legal response still emits
+one observed terminal page with its end marker; no total-page guess is required.
 
 ### Provider registry
 
@@ -753,23 +937,27 @@ Multi-symbol, multi-index and multi-page responses therefore cannot be hidden in
 
 ### Evidence manifest
 
-| Field | Type | Constraint |
+The table below is an exact projection of the frozen `EvidenceManifest` model above; there are no
+additional summary fields hidden in prose. Per-endpoint `source_schema`, `units` and
+`date_semantics` are carried by `RawEndpointBatch` and aggregated into
+`endpoint_summaries`; the manifest is verifiable by summing descriptor and completion counts.
+
+| Field | Type | Constraint / verification |
 | --- | --- | --- |
-| evidence_id | safe identifier | Deterministic content/request ID |
-| provider_id | ProviderId | `baostock` |
-| adapter_version | safe version | Required |
-| endpoint_contract_version | safe version | Required |
+| evidence_id / provider_id | safe identifier / `Literal["baostock"]` | Deterministic ID and static provider |
+| adapter_version / endpoint_contract_version | safe version | Exact pinned contracts |
 | trade_date / universe_id | date / safe identifier | Exact session scope |
-| requested_at / completed_at / observed_at | UTC datetime | Required, ordered |
-| request_count / retry_count | non-negative int | No payload |
-| expected_request_plan / hash | `ExpectedRequestPlan` / SHA-256 | Exact six-endpoint request/shard/page cardinality |
-| objects | `tuple[EvidenceObjectDescriptor, ...]` | Ordered one-object-per-logical-request/page/shard; no object may swallow multiple pages/symbol shards |
-| transport_lineage | `tuple[TransportLineageRef, ...]` | Every attempt/page bound to sanitized F0.1 observation digest |
-| source_schema / units / date_semantics | bounded metadata | Allowlisted fields/values |
-| row_count / object_count | non-negative int | Readback exact and equal to descriptor sums |
-| object_relative_path / object_sha256 | relative path / 64 lowercase hex | Per-object content binding; path is evidence root only |
-| compression | literal | `parquet_internal` only |
-| failure_class / provider_code | allowlisted/validated | No raw message |
+| requested_at / completed_at / normalization_clock_utc | UTC datetime | ordered; frozen clock used by normalizer/replay |
+| logical_request_plan / request_plan_hash | `ExpectedLogicalRequestPlan` / SHA-256 | Logical requests only; hash recomputed before publish |
+| request_completions / completion_hash | ordered `RequestCompletion` / SHA-256 | Observed contiguous pages and terminal markers; no expected total |
+| request_count / attempt_count | bounded non-negative integers | Equal to plan count and observed lineage cardinality |
+| objects | `tuple[EvidenceObjectDescriptor, ...]` | Exactly one descriptor per observed logical request/page/shard |
+| transport_lineage / transport_observations | refs + `TransportObservationAggregate` | Every attempt/page bound to exact allowlisted projection and aggregate digest |
+| endpoint_summaries | `tuple[EndpointContractSummary, ...]` | Exact source schema/units/date semantics, counts equal descriptor sums |
+| factor_cache_snapshot / factor_resolution | optional snapshot + ordered bindings | Actual cache keys only; provenance and raw endpoint resolution bound |
+| object_count / row_count | bounded integers | Equal to descriptor sums and readback rows |
+| failure_class | allowlisted optional class | No raw provider message/exception |
+| manifest_sha256 | SHA-256 | Canonical manifest bytes excluding its own hash |
 
 ### Candidate gate report
 
@@ -781,17 +969,19 @@ summary; it MUST NOT be implemented as one file per loose gate or as a free-form
 | gate_report_id | safe identifier | Immutable |
 | candidate_id | safe identifier | One candidate |
 | gate_version | safe version | Pinned policy |
-| gate_name | allowlisted literal | schema/date/universe/coverage/semantic/factor/suspension/hash |
+| outcomes | ordered tuple of `GateOutcome` | Exactly the ten names in `R2F2_GATE_ORDER`; no missing/extra/duplicate/reordered outcome |
 | verdict | `pass` or `fail` | Required |
-| metrics | bounded scalar map | No payload/path/exception |
-| failure_class | allowlisted optional | Sanitized |
-| evidence_sha256 | hash | Exact input |
+| aggregate_verdict / aggregate_sha256 | literal / hash | All ten outcomes agree; hash excludes itself |
 | created_at | UTC datetime | Required |
 
-The aggregate MUST contain exactly the ordered names in `R2F2_GATE_ORDER` (11 outcomes), exactly
-one outcome per name, and `aggregate_sha256` is the canonical JSON hash of the report without that
-field. `aggregate_verdict` is `pass` only when every outcome is `pass`; a missing, extra, duplicate,
-out-of-order or hash-mismatched outcome is a fail-closed report and cannot be selected.
+The aggregate MUST contain exactly the ten ordered names in `R2F2_GATE_ORDER`, exactly one outcome
+per name, and `aggregate_sha256` is the canonical JSON hash of the report without that field.
+`aggregate_verdict` is `pass` only when every outcome is `pass`; a missing, extra, duplicate,
+out-of-order or hash-mismatched outcome is a fail-closed report and cannot be selected. The exact
+ten names and their current-code evidence are `R2F2_GATE_EVIDENCE`; this is the only gate list.
+The existing five-string `MarketDataStatus.publication_gates` response field remains a legacy
+public description for compatibility; it is not a persisted R2-F2 candidate gate list, must not be
+copied into `CandidateGateReport`, and is not extended or reinterpreted by this version.
 
 ### Candidate manifest
 
@@ -851,6 +1041,26 @@ not a union of arbitrary rows. The provider's SDK iterator may expose pages in a
 adapter records page/attempt lineage and emits the deterministic evidence order shown above. A
 provider row order that cannot be deterministically normalized is a complete candidate failure.
 
+### Endpoint role cross-validator
+
+`RequestRole` and `InstrumentRole` are validated as a closed cross-product before any object is
+written. The only permitted combinations are:
+
+| Endpoint | Request role | Instrument role | Required symbol rule |
+| --- | --- | --- | --- |
+| `trade_dates` | `calendar` | `None` | no symbols; exact requested date/range |
+| `all_stock` | `universe` | `stock` | no per-row index role; universe rows are stock symbols |
+| `daily_astock` | `daily_stock` | `stock` | symbols are the declared stock universe |
+| `daily_factor` | `daily_factor` | `stock` | symbols are declared stock factor keys |
+| `adjust_factor` | `adjust_factor` | `stock` | exactly one requested stock symbol per shard |
+| `index_history` | `index_history` | `index` or `stock` | `index` requires `INDEX_SYMBOLS`; `stock` is an explicit compatibility variant only |
+
+`index_history.session.v1` and `index_history.range.v1` therefore carry an explicit role rather
+than inferring index status from a symbol string. A stock-role index-history request is validated
+against the stock request plan and cannot satisfy required index coverage; an index-role request
+cannot consume stock factors. Any endpoint/role/schema-variant mismatch, mixed role in one batch,
+or index symbol outside the current `INDEX_SYMBOLS` set invalidates the complete batch.
+
 ### Semantic boundary retained from the current normalizer
 
 - `trade_dates` is the only calendar authority for the requested source date; arrival time,
@@ -866,6 +1076,32 @@ provider row order that cannot be deterministically normalized is a complete can
   A suspended stock may have empty activity/factor only under those existing gates. A suspended
   index, non-zero suspended activity, malformed placeholder, duplicate or coverage mismatch fails.
 - Source symbols retain the `sh.`/`sz.` six-digit form and canonical symbols are lowercase.
+
+### Factor-cache evidence boundary
+
+The current factor call chain is authoritative and is frozen as follows:
+`BaoStockProvider._main_board_factor_snapshot()` calls
+`AdjustmentFactorCache.stream_through()`, `record_daily_events()`,
+`materialize_from_stream()`, `exact_snapshots()`, optional `record_bootstrap()`, and finally
+`normalized_rows()`; the cache's `FACTOR_FIELDS` remains the exact five-field provider contract.
+R2-F2 adds no seventh provider endpoint. It captures a separate immutable
+`EvidenceObjectKind.factor_cache_snapshot` containing only keys actually returned by
+`exact_snapshots()` for this `(symbol, trade_date)` request: factor values, source
+(`daily_event`, `daily_carry`, `bootstrap` or `bootstrap_no_events`), effective/observed trade dates, cache schema
+version and a provenance hash. It MUST NOT copy unrelated cache rows, database paths, SQL, tokens or
+mutable cache diagnostics.
+
+The capture runs inside the same outer `RefreshRunLock` as online evidence publication. The
+adapter obtains a stable read-only snapshot and a before/after fingerprint of the selected keys;
+any missing key, cache mutation, schema mismatch or fingerprint change fails closed. The published
+`FactorCacheSnapshot` is the only factor input to online normalization and replay; neither path
+reads the live mutable cache after capture. If the live `daily_factor` or `adjust_factor` endpoint
+also supplies a factor row, its raw endpoint object remains in `RawEndpointBatch` and the
+`FactorResolutionBinding` records whether the selected provenance came from the cache snapshot or
+that endpoint row. A binding mismatch, missing selected object or unproven source is a complete
+candidate failure. Task 7 exposes the compatibility snapshot interface in `providers/baostock.py`;
+Task 8 serializes the snapshot object and binding in `market/evidence.py`; no new factor-cache
+writer or live-cache replay path is permitted.
 
 ## Acceptance criteria
 
@@ -987,9 +1223,10 @@ and each of the six endpoint IDs is accepted only through an explicitly frozen v
 
 Given multiple symbols, indexes, retries or SDK pages for one refresh
 When Task 8 assembles its evidence manifest
-Then every expected plan item has exactly one descriptor and bound sanitized observation lineage,
-with no missing, extra, duplicate or swallowed object, and a competing writer performs zero
-canonical writes.
+Then every logical plan item has exactly one completion and every observed page has exactly one
+descriptor and bound sanitized observation lineage; observed pages are contiguous and terminal,
+with no missing, extra, duplicate, out-of-order or swallowed page, and a competing writer performs
+zero canonical writes. The plan does not require a pre-fetched total page count.
 
 ### AC-18: Canonical gate aggregate (FR-32, NFR-6–NFR-8)
 
@@ -1063,8 +1300,8 @@ reported only as a structural result, and manual implementation traceability rem
   observation digest; the complete evidence chain is unavailable.
 - EC-23: Candidate gate outcomes omit, duplicate, reorder or add a gate; the aggregate report and
   candidate fail closed and no selection is published.
-- EC-24: Online/replay normalization uses different clocks or replay-start time enters a hash;
-  deterministic comparison fails closed.
+- EC-24: Online/replay normalization uses different frozen clocks or invocation time enters a
+  result/hash; deterministic comparison fails closed.
 - EC-25: Evidence root/ancestor is a symlink, wrong inode, non-directory or cross-root path, or a
   reader attempts implicit initialization; reject and preserve all pre-read fingerprints.
 - EC-26: A compare-create/no-clobber collision finds different bytes at an existing content path;
@@ -1127,13 +1364,10 @@ var/evidence/
   candidates/<candidate-id>.json
   selections/<selection-id>.json
   staging/<refresh-id>/<request-id>/<page>.partial
-  locks/evidence-publication.lock
-  locks/refresh-run.lock
-  locks/selection-publication.lock
   orphan-audit/<refresh-id>/...
 ```
 
-`objects`, `manifests`, `gates`, `candidates`, `selections`, `staging`, `locks` and `orphan-audit`
+`objects`, `manifests`, `gates`, `candidates`, `selections`, `staging` and `orphan-audit`
 are fixed path components; no caller may substitute a directory name. Root and each ancestor are
 opened with `O_DIRECTORY|O_NOFOLLOW`, identity-checked (`st_dev`, `st_ino`, mode) before and after
 use, and rejected if a symlink, non-directory, path traversal, absolute path, cross-root path or
@@ -1143,10 +1377,14 @@ reader. The threat boundary is local application-owned storage; this does not cl
 against a same-UID process that continuously mutates a private staging inode, host compromise or
 filesystem corruption beyond detection.
 
-Publication is a compare-and-create protocol, not an overwrite protocol:
+Publication is a compare-and-create protocol, not an overwrite protocol. There is exactly one
+blocking refresh lock: the existing R2-F1 `RefreshRunLock` at
+`local_lock_dir/market-refresh.lock` (`layout.market_refresh_lock`). Evidence publication adds
+no blocking lock and does not acquire any cross-root lock:
 
-1. Under the evidence publication lock, validate the complete `ExpectedRequestPlan` and acquire a
-   `RefreshRunLock` for the full logical refresh. Write each bounded page object below staging,
+1. Acquire `RefreshRunLock` first and keep it for the complete online sequence. Validate the
+   complete `ExpectedLogicalRequestPlan`, capture the factor snapshot and its before/after
+   fingerprint, and write each bounded page object below staging,
    fsync it, read it back through a no-follow descriptor, and compare-create the content-addressed
    object. On macOS, an exclusive create/link or `renameatx_np` no-follow/no-clobber primitive is
    required; a platform without the required primitive fails closed. Existing identical bytes are
@@ -1157,7 +1395,7 @@ Publication is a compare-and-create protocol, not an overwrite protocol:
 3. Gate and candidate reports are then published with the same immutable compare-create rule. A
    `CandidateManifest` may reference only a complete evidence manifest and exactly one canonical
    `CandidateGateReport` aggregate whose ordered gate set is complete.
-4. While the same `RefreshRunLock` remains held, publish the `SessionSelection` first. Only after
+4. While the same existing `RefreshRunLock` remains held, publish the `SessionSelection` first. Only after
    selection readback/hash validation may the existing canonical Parquet/manifest/pointer chain
    run. The canonical manifest/pointer MUST NOT reference a missing selection; a selection may not
    reference missing candidate/evidence/gate objects.
@@ -1166,7 +1404,8 @@ Publication is a compare-and-create protocol, not an overwrite protocol:
    revalidation failure may retain the canonical lock artifact but MUST NOT create broad directories
    or mutate the canonical pointer.
 
-Readers never initialize roots, schemas, locks or directories. A missing root, missing object,
+Readers never initialize roots, schemas, locks or directories. Replay uses no blocking lock (or a
+read-only snapshot descriptor if concurrent mutation is detected). A missing root, missing object,
 invalid ancestor, lock/CAS conflict or incomplete chain returns an allowlisted unavailable/error
    result with zero writes. This is a read-only boundary, not a best-effort repair path.
 
@@ -1175,8 +1414,10 @@ invalid ancestor, lock/CAS conflict or incomplete chain returns an allowlisted u
 `normalization_clock_utc` is generated exactly once after the final fetch/transport observation is
 complete and immediately before evidence manifest publication. Both online normalization and offline
 replay receive this same injected UTC clock; neither calls `datetime.now()` independently while
-constructing candidate bytes. `replay_started_at` is diagnostic-only and MUST NOT enter any
-candidate, semantic or selection hash.
+constructing candidate bytes. The existing `normalize_baostock_rows(..., ingested_at=...)` entry
+point receives this value through the adapter's `normalize(..., normalization_clock_utc=...)`
+compatibility shim. Invocation time may be used only in an internal non-persisted diagnostic log;
+it MUST NOT enter `ReplayResult`, candidate/selection models, semantic hashes or aggregate digests.
 
 Canonical evidence and candidate serialization rules are frozen:
 

@@ -3,7 +3,7 @@
 > **Spec-first gate:** This plan is executable only after
 > [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) is independently
 > reviewed and changed from **In Review** to **Approved**. The design is currently **In Review**
-> after six Medium specification findings were amended; no production code, test stubs or
+> after the second-round specification findings were reconciled; no production code, test stubs or
 > RED command may begin before that gate.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
@@ -11,7 +11,7 @@ normalize only from that evidence, replay it offline, and record complete candid
 lineage while preserving every legacy reader and canonical publication invariant.
 
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean HEAD
-`90680832a3b2d9c876b7917a88ad0213236250ab`.
+`4e561367c6b6a5d0aaa3219ec78d730a929fd3f7`.
 
 **Delivery mode:** One subagent at a time, linear Task 7 → Task 8 → Task 9 commits. RED before
 GREEN. Independent High/Medium review after each task. A High or Medium finding blocks the next
@@ -24,25 +24,25 @@ unloaded/frozen.
 
 ## Review closure preflight (must remain before RED)
 
-The prior independent review was **NO-GO** with six Medium specification findings. The design
-amendment closes them by freezing: (M1) all immutable bounded models and safe types; (M2) exact
-six-endpoint fields/units/null rules/variants/order from current code and fixtures; (M3) one
-descriptor per request/shard/page plus expected-plan hash; (M4) transport IDs bound to sanitized
-F0.1 observation digests; (M5) one ordered complete gate aggregate with exact cardinality; and
-(M6) settings/layout/CAS order, replay clock/equivalence, qualified-fallback rejection and manual
-traceability. This plan MUST implement those definitions verbatim and MUST NOT narrow them to pass
-current tests. No ambiguity exceeds the 30% escalation threshold; any newly discovered unresolved
-schema or security meaning stops the task and returns to specification review.
+The prior independent review was **NO-GO**. This second-round amendment closes nine Medium
+specification findings by freezing: (M1) batch-level schema/units/date summaries and roles; (M2)
+logical-request versus observed completion cardinality; (M3) the complete F0.1 observation
+projection and digests; (M4) one exact ten-gate aggregate; (M5) the existing R2-F1 lock only;
+(M6) a stable replay projection and injected clock; (M7) self-contained factor-cache snapshots;
+(M8) complete requirement/file/test traceability; and (M9) removal of stale contract tokens. This
+plan MUST implement those definitions verbatim and MUST NOT narrow them to pass current tests. No
+ambiguity exceeds the 30% escalation threshold; any newly discovered unresolved schema or
+security meaning stops the task and returns to specification review.
 
 ### Feature manifest and dependency map
 
 | Boundary | Authoritative files / artifacts | Dependency and allowed direction |
 | --- | --- | --- |
 | Provider transport/parser (read-only dependency) | `backend/app/market/baostock.py`, `provider_transport.py`, `baostock_vendor.py`, `factor_cache.py` | R2-F2 adapter consumes the six fixed endpoint calls, `ProviderEndpoint`, typed F0.1 `TransportObservation`; it MUST NOT change transport, retry, timeout, circuit or normalizer semantics. |
-| Provider contracts | Task 7 `backend/app/market/providers/{base,baostock}.py`, `backend/app/market/models.py` | Safe types → endpoint variants → `ProviderRequest`/raw discriminated rows → incumbent adapter; no dynamic provider/plugin import. |
-| Evidence publication | Task 8 `backend/app/market/evidence.py`, `config.py`, `storage/layout.py` | Raw batch + transport digests → bounded descriptor-bound object → ordered `EvidenceManifest`; uses existing local safe-path/hash/atomic conventions. |
+| Provider contracts | Task 7 `backend/app/market/providers/{base,baostock}.py`, necessary `backend/app/market/baostock.py`/`market/models.py` compatibility | Safe types → endpoint/role variants → logical request/completion/raw discriminated rows → incumbent adapter; no dynamic provider/plugin import. |
+| Evidence publication | Task 8 `backend/app/market/evidence.py`, `config.py`, `storage/layout.py` | Raw batch + transport projections + factor snapshot → bounded descriptor-bound object → ordered `EvidenceManifest`; uses existing local safe-path/hash/atomic conventions. |
 | Replay/read-only boundary | Task 8 `cli.py`, `automation.py`, `tests/test_market_get_read_only.py` | Evidence reader → injected-clock normalizer/replay; zero network/provider/canonical pointer/database initialization on reads. |
-| Candidate/selection lineage | Task 9 models/store/dataset/publication/service/series/API compatibility files | Published evidence → exact gate aggregate → candidate manifest → session selection → existing canonical publication chain; no symbol-level mixing. |
+| Candidate/selection lineage | Task 9 `backend/app/market/candidates.py` plus store/dataset/publication/service/series/API compatibility files | Published evidence → exact ten-gate aggregate → candidate manifest → session selection → existing canonical publication chain; no symbol-level mixing. |
 | Existing serving chain | Normalize → Quality Gate → Immutable Parquet → SHA-256 → Manifest → Atomic Publish | R2-F2 adds only validated additive lineage hooks; legacy object bytes/readers remain authoritative. |
 
 Task dependencies are one-way: provider contract depends on incumbent transport/parser; evidence
@@ -110,8 +110,8 @@ For each task:
 
 ## Task 7 — Provider-neutral contracts and BaoStock compatibility adapter
 
-**Requirements:** FR-1–FR-5, FR-19–FR-23, FR-27; NFR-1, NFR-6, NFR-9, NFR-11, NFR-14;
-AC-1, AC-2, AC-3, AC-15; EC-1–EC-5, EC-10, EC-17, EC-18.
+**Requirements:** FR-1–FR-5, FR-19–FR-23, FR-27–FR-31; NFR-1, NFR-6, NFR-9, NFR-11, NFR-14;
+AC-1–AC-3, AC-15–AC-17; EC-1–EC-5, EC-10, EC-17, EC-18, EC-21, EC-22.
 
 ### Exact file whitelist
 
@@ -121,12 +121,18 @@ Create/modify only:
 - Create `backend/app/market/providers/base.py`
 - Create `backend/app/market/providers/baostock.py`
 - Modify `backend/app/market/baostock.py`
-- Modify `backend/app/market/models.py`
+- Modify `backend/app/market/models.py` (provider-source compatibility only)
 - Create `tests/test_market_provider_contract.py`
 - Modify `tests/test_market_data.py`
 
 No other file is permitted in the Task 7 commit. In particular, do not touch transport, vendor
 patch, provider health, normalizer, storage layout, canonical publication or API routes.
+
+`base.py` owns provider-safe types, endpoint/role validators, logical requests/completions, raw
+batches and transport projections. `providers/baostock.py` owns only the compatibility adapter and
+a read-only `AdjustmentFactorCache` snapshot interface delegating to the existing
+`FACTOR_FIELDS`/`exact_snapshots()` provenance. `market/models.py` is limited to necessary additive
+provider-source compatibility. No task may duplicate candidate/evidence models here.
 
 ### 7.1 RED — contract and compatibility tests
 
@@ -139,11 +145,16 @@ def test_raw_batch_rejects_unknown_fields_secrets_headers_urls_and_raw_exception
 def test_raw_batch_rejects_nonfinite_values_and_row_shape_mismatch(): ...
 def test_each_baostock_endpoint_has_exact_fields_variant_units_and_order(): ...
 def test_endpoint_schema_variants_reject_date_mismatch_and_mixed_sessions(): ...
+def test_endpoint_role_validator_rejects_stock_index_role_mismatch(): ...
 def test_transport_lineage_preserves_unknown_provider_code_and_maps_unknown_protocol(): ...
+def test_transport_projection_preserves_all_allowlisted_fields_and_digest(): ...
+def test_logical_request_plan_hash_excludes_observed_pages_and_completion_hash_binds_them(): ...
+def test_request_completion_rejects_missing_duplicate_noncontiguous_pages_or_terminal_marker(): ...
 def test_baostock_adapter_preserves_endpoint_and_session_contract(): ...
 def test_baostock_adapter_captures_source_rows_before_normalization(): ...
 def test_baostock_compatibility_produces_existing_daily_bar_semantics(): ...
 def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor(): ...
+def test_factor_cache_snapshot_is_read_only_and_contains_only_requested_keys(): ...
 ```
 
 Run:
@@ -162,16 +173,17 @@ stop and fix the fixture before implementation.
 Implement:
 
 - the complete frozen `SafeProviderId`, `SafeSymbol`, `SafeVersion`, `ProviderEndpoint`,
-  `ProviderRequest`, `TransportLineageRef`, discriminated `RawEndpointRow`/`RawEndpointBatch`,
-  `ProviderRawBatch`, `EvidenceObjectDescriptor`, `EvidenceManifest`, `PublishedEvidence`,
-  `GateOutcome`, `CandidateGateReport`, `CandidateManifest`, `SessionSelection` and
-  `ReplayResult` contracts from the design. Every model is `extra="forbid"`, immutable,
+  `InstrumentRole`, `RequestRole`, `ExpectedLogicalRequest`, `ExpectedLogicalRequestPlan`,
+  `RequestCompletion`, `ProviderRequest`, `TransportLineageRef`,
+  `TransportObservationProjection`, discriminated `RawEndpointRow`/`RawEndpointBatch` and
+  `ProviderRawBatch` contracts from the design. Evidence models belong to Task 8 and candidate/
+  gate/selection models belong only to Task 9 `market/candidates.py`. Every model is `extra="forbid"`, immutable,
   finite-number checked, UTC-aware and bounded;
 - a frozen `ProviderId`/registry with only `baostock`, rejecting empty/path-like/mixed-case/plugin
   identities;
 - typed `ProviderRequest`, `RawEndpointBatch` and `ProviderRawBatch` with bounded allowlisted
-  source fields, UTC timestamps, exact date/universe/symbols, explicit expected request plan and
-  sanitized failure metadata;
+  source fields, UTC timestamps, exact date/universe/symbols, separate logical request-plan and
+  observed completion hashes, endpoint summaries and sanitized failure metadata;
 - exact endpoint/schema variants: `trade_dates.v1`, `all_stock.market.v1`,
   `daily_astock.v1`, `daily_factor.v1`, `adjust_factor.session.v1`,
   `index_history.session.v1` and `index_history.range.v1`. Freeze the exact field tuples,
@@ -180,8 +192,11 @@ Implement:
 - `DailyBarProvider` protocol with `fetch_raw()` and `normalize()` contracts;
 - a BaoStock compatibility adapter that reuses the incumbent call/transport/parser boundary and
   exposes source-shaped rows before `normalize_baostock_rows()`;
-- sanitized `TransportObservation` projection and SHA-256 digest binding every endpoint/page/
-  attempt to `refresh_id/provider_session_id/request_id`;
+- sanitized `TransportObservationProjection` preserving every F0.1 allowlisted field and separate
+  per-projection/ordered aggregate SHA-256 digests, binding every endpoint/page/attempt to
+  `refresh_id/provider_session_id/request_id`;
+- `InstrumentRole`/`RequestRole` cross-validation for stock/index `index_history` variants and a
+  factor snapshot interface that records only actually-read cache keys and provenance;
 - compatibility delegation so existing `BaoStockProvider.fetch()` callers keep the current
   canonical models and behavior during the transition.
 
@@ -210,14 +225,15 @@ git add backend/app/market/providers backend/app/market/baostock.py \
 git commit -m "refactor(market): add provider-neutral daily-bar contract"
 ```
 
-Independent reviewer checks exact HEAD against FR-1–FR-5 and the whitelist, searches for dynamic
+Independent reviewer checks exact HEAD against FR-1–FR-5 and FR-27–FR-31 and the whitelist, searches for dynamic
 imports and provider literals, proves no transport/normalizer diff, and returns High/Medium/Low
 counts. A High/Medium finding requires a new RED/GREEN fix commit before Task 8.
 
 ## Task 8 — Immutable evidence publication and offline replay
 
-**Requirements:** FR-4–FR-11, FR-19, FR-23–FR-25; NFR-1–NFR-6, NFR-8–NFR-12;
-AC-2, AC-4–AC-8, AC-12–AC-14; EC-2, EC-4–EC-9, EC-11, EC-13, EC-14, EC-19, EC-20.
+**Requirements:** FR-4–FR-11, FR-19, FR-23–FR-25, FR-30–FR-33; NFR-1–NFR-6, NFR-8–NFR-12,
+NFR-15–NFR-17; AC-2, AC-4–AC-8, AC-12–AC-14, AC-17, AC-19; EC-2, EC-4–EC-9, EC-11, EC-13,
+EC-14, EC-19–EC-22, EC-24–EC-26.
 
 ### Exact file whitelist
 
@@ -231,8 +247,9 @@ Create/modify only:
 - Create `tests/test_market_provider_evidence.py`
 - Modify `tests/test_market_get_read_only.py`
 
-Evidence-specific Pydantic models remain in `backend/app/market/evidence.py` unless a design review
-first approves a whitelist amendment. Do not change `storage/dataset.py` in this task; reuse its
+Evidence-specific Pydantic models, factor snapshot serialization and replay projection remain in
+`backend/app/market/evidence.py` unless a design review first approves a whitelist amendment. Do not
+change `storage/dataset.py` in this task; reuse its
 safe relative-path, descriptor/hash and atomic publication conventions through a narrow wrapper.
 
 ### 8.1 RED — evidence/replay and zero-write tests
@@ -249,10 +266,11 @@ def test_evidence_reader_rejects_symlink_toc_tou_oversize_and_object_substitutio
 def test_evidence_reader_rejects_bad_parquet_decompression_and_manifest_swap(tmp_path): ...
 def test_offline_replay_has_zero_network_and_zero_canonical_pointer_writes(tmp_path): ...
 def test_replay_is_deterministic_and_matches_online_candidate(tmp_path): ...
-def test_replay_injects_frozen_normalization_clock_and_excludes_replay_start(tmp_path): ...
+def test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time(tmp_path): ...
 def test_missing_evidence_root_is_write_free(tmp_path): ...
 def test_get_and_plan_paths_do_not_initialize_evidence_storage(tmp_path): ...
 def test_manifest_requires_one_descriptor_per_request_shard_and_page(tmp_path): ...
+def test_factor_snapshot_fingerprint_change_fails_closed_and_replay_uses_published_snapshot(tmp_path): ...
 def test_every_evidence_descriptor_binds_sanitized_transport_observation_digest(tmp_path): ...
 def test_evidence_compare_create_allows_one_lineage_and_zero_canonical_writes_for_loser(tmp_path): ...
 def test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed(tmp_path): ...
@@ -288,7 +306,7 @@ Required behavior:
 - Add `evidence_root` and evidence staging layout with safe settings validation. Missing roots are
   unavailable on read paths and are not created implicitly.
 - Add the exact relative settings/layout from the design: `objects/`, `manifests/`, `gates/`,
-  `candidates/`, `selections/`, `staging/`, `locks/` and `orphan-audit/`, with fixed bounded size
+  `candidates/`, `selections/`, `staging/` and `orphan-audit/`, with fixed bounded size
   and row limits. Validate root/ancestor descriptors using no-follow identity checks; no caller
   supplied path component may escape the opened root.
 - Use relative paths only and reject symlinks, traversal, absolute paths, object substitution,
@@ -296,10 +314,17 @@ Required behavior:
 - Never expose or persist transport payload, token, header, cookie, URL, local path or raw
   exception. Preserve only bounded provider code and allowlisted failure classes.
 - Store one `EvidenceObjectDescriptor` per expected logical request/endpoint shard/page, in the
-  exact ordered `ExpectedRequestPlan`; each descriptor MUST carry relative path, object/hash/schema
+  exact ordered `ExpectedLogicalRequestPlan` and its observed `RequestCompletion`; each descriptor MUST carry relative path, object/hash/schema
   hashes, row/byte counts, units, provider/universe, refresh/session/request, endpoint, attempt,
   page, schema/contract versions and transport observation digest. The manifest MUST reject missing,
-  extra, duplicate, out-of-order or swallowed multi-symbol/multi-index/multi-page objects.
+  extra, duplicate, out-of-order, non-contiguous or swallowed multi-symbol/multi-index/multi-page
+  objects, and MUST require a terminal/end marker without requiring a prefetch page total.
+- Serialize one `factor_cache_snapshot` object containing only the selected keys returned by the
+  existing `AdjustmentFactorCache` call chain, with factor values, source trade/effective dates,
+  cache schema and provenance hash. Capture and verify before/after fingerprints while the same
+  `RefreshRunLock` is held. If the snapshot changes, is incomplete or cannot bind a
+  `FactorResolutionBinding`, fail closed. Online normalization and replay consume only this
+  published snapshot; live mutable cache reads after capture are forbidden.
 - Use evidence compare-create/no-clobber CAS. Identical content is idempotent; a collision with
   different bytes fails closed. Preserve unreferenced staging under `orphan-audit` and never adopt
   it automatically.
@@ -307,8 +332,9 @@ Required behavior:
   row ordering and content-addressed IDs. Identical bytes are idempotent; changed bytes never
   overwrite an existing object.
 - Generate `normalization_clock_utc` exactly once after fetch/transport completion and before
-  evidence-manifest publish; inject it into online and replay normalization. `replay_started_at`
-  is diagnostic-only and excluded from candidate/semantic/selection hashes.
+  evidence-manifest publish; inject it into online and replay normalization through
+  `normalize_baostock_rows(..., ingested_at=normalization_clock_utc)`. Invocation time is never a
+  `ReplayResult` field and never enters candidate/semantic/selection hashes.
 - Make `EvidenceReader` the only input accepted by adapter normalization in the canonical path.
 - Add `market-provider-replay --evidence-id ID [--compare-candidate-sha SHA]`. It accepts no
   provider credentials or path and performs zero network, provider, canonical Parquet, canonical
@@ -320,6 +346,15 @@ Required behavior:
   → evidence manifest → gate aggregate → candidate manifest → selection publish/readback → existing
   canonical manifest/pointer; a CAS loser performs zero canonical writes.
 - Keep GET and plan paths read-only and independent of evidence schema initialization.
+
+The only blocking lock is the existing R2-F1 `RefreshRunLock` at
+`local_lock_dir/market-refresh.lock`. The precise order is: acquire that lock; capture and verify
+the factor snapshot; evidence compare-create with O_EXCL/no-clobber and atomic rename; evidence
+manifest; ten-outcome gate aggregate; candidate manifest; selection publish/readback; then the
+existing canonical pointer chain. Evidence objects and manifests never acquire a second refresh
+lock or a cross-root blocking lock. Replay takes no blocking lock (or a read-only snapshot) and
+performs zero writes. A crash at any boundary leaves prior complete state or a complete new state;
+staging residue is retained only for orphan audit.
 
 The evidence Parquet is source-shaped, not a socket dump. Daily semantic validation remains the
 existing normalizer/quality contract: unadjusted prices, `backAdjustFactor`, exact date, units,
@@ -358,18 +393,18 @@ or credential arguments, and inspects the exact whitelist. High/Medium blocks Ta
 
 ## Task 9 — Candidate/selection manifests and source compatibility migration
 
-**Requirements:** FR-12–FR-19, FR-23–FR-27; NFR-1, NFR-3, NFR-5, NFR-6, NFR-7, NFR-9,
-NFR-10, NFR-12, NFR-14; AC-8–AC-15; EC-10–EC-18.
+**Requirements:** FR-12–FR-19, FR-23–FR-29, FR-32; NFR-1, NFR-3, NFR-5, NFR-6, NFR-7, NFR-9,
+NFR-10, NFR-12, NFR-14, NFR-17–NFR-18; AC-8–AC-16, AC-18, AC-20; EC-10–EC-18, EC-23,
+EC-26.
 
 ### Exact file whitelist
 
 Create/modify only:
 
-- Modify `backend/app/market/models.py`
+- Create `backend/app/market/candidates.py`
 - Modify `backend/app/market/store.py`
 - Modify `backend/app/storage/dataset.py`
 - Modify `backend/app/storage/publication.py`
-- Modify `backend/app/market/automation.py`
 - Modify `backend/app/market/service.py`
 - Modify `backend/app/market/series.py`
 - Modify `backend/app/analysis/models.py`
@@ -384,6 +419,11 @@ No old Parquet/manifest fixture or deployed object may be rewritten. `docs/accep
 is created only in the final acceptance closure commit after all code/review evidence exists; it is
 not part of the Task 9 implementation commit unless the reviewed implementation plan explicitly
 records it as the final bounded evidence commit.
+
+`backend/app/market/candidates.py` is the single owner of `GateOutcome`,
+`CandidateGateReport`, `CandidateManifest` and `SessionSelection`. `market/models.py` may carry
+only additive legacy source compatibility from Task 7 and is not modified by Task 9; it must not
+duplicate candidate, gate or selection definitions.
 
 ### 9.1 RED — legacy/new compatibility and single-session selection tests
 
@@ -405,6 +445,7 @@ def test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_
 def test_selection_publish_order_never_moves_pointer_early(tmp_path): ...
 def test_existing_market_analysis_alert_user_and_api_json_remain_compatible(tmp_path): ...
 def test_get_reads_and_legacy_manifest_reads_are_write_free(tmp_path): ...
+def test_factor_resolution_binds_published_snapshot_or_raw_endpoint(tmp_path): ...
 ```
 
 Run:
@@ -425,10 +466,14 @@ Implement:
 - widen only genuine provider identity fields to the static `ProviderId` registry; keep public
   existing `source="baostock"` values and unrelated literals unchanged;
 - decode missing legacy source as BaoStock in memory without touching bytes;
-- add exactly one immutable `CandidateGateReport` aggregate per candidate, with the ordered
-  `R2F2_GATE_ORDER` and exactly one `GateOutcome` for each gate. Missing, extra, duplicate,
+- add exactly one immutable `CandidateGateReport` aggregate per candidate, with the ordered ten-name
+  `R2F2_GATE_ORDER` and exactly one `GateOutcome` for each gate. The names and current-code
+  evidence are the single `R2F2_GATE_EVIDENCE` table: transport complete, schema, date, universe,
+  coverage, semantic, factor, suspension, evidence hash and determinism. Missing, extra, duplicate,
   out-of-order or aggregate-hash-mismatched outcomes fail closed; rejected candidates retain the
   sanitized complete report;
+- treat the existing five-string `MarketDataStatus.publication_gates` as a legacy public
+  description only; it is not copied into the ten-outcome R2-F2 aggregate and is not modified;
 - add immutable candidate manifests referencing exact published evidence, normalized candidate,
   universe, provider/adapter/schema versions, one gate aggregate path/hash and exact row counts;
 - add a `SessionSelection` record with `primary_ready` active in R2-F2. The schema may contain
@@ -438,6 +483,9 @@ Implement:
   mixed symbols, duplicate providers, incomplete coverage, wrong date/universe or missing lineage;
 - preserve rejected candidate/gate/selection audit artifacts outside the serving pointer;
 - add additive lineage fields to new manifest entries while accepting old schema/entries;
+- bind every factor-bearing normalized row to the published `factor_cache_snapshot` or an explicitly
+  selected raw factor endpoint through `FactorResolutionBinding`; no live mutable cache read is
+  allowed during replay;
 - invoke only the existing canonical publication chain after selection is atomically published and
   readback/hash verified under the same `RefreshRunLock`; the canonical manifest/pointer MUST NOT
   reference a missing selection;
@@ -465,9 +513,10 @@ fingerprints for a legacy manifest/object fixture. The replay must not write a c
 ### 9.3 Task 9 commit and review gate
 
 ```bash
-git add backend/app/market/models.py backend/app/market/store.py \
+git add backend/app/market/store.py \
+  backend/app/market/candidates.py \
   backend/app/storage/dataset.py backend/app/storage/publication.py \
-  backend/app/market/automation.py backend/app/market/service.py \
+  backend/app/market/service.py \
   backend/app/market/series.py backend/app/analysis/models.py \
   backend/app/alert/models.py backend/app/user/models.py backend/app/api/market.py \
   tests/test_market_candidate_selection.py tests/test_market_data.py \
@@ -534,15 +583,30 @@ The validator is a structural aid, not acceptance evidence. The final review mus
 | --- | --- | --- |
 | FR-1–FR-5 | `providers/base.py`, `providers/baostock.py`, incumbent adapter boundary | provider contract RED/GREEN, exact endpoint/session assertions |
 | FR-6–FR-11 | `market/evidence.py`, `config.py`, `storage/layout.py`, `cli.py` | hash/idempotence, crash, bounds, TOCTOU, replay zero-write/determinism |
-| FR-12–FR-16 | candidate/selection models and automation | full-session, gate audit, mixed-source/fallback rejection |
-| FR-17–FR-19, FR-24–FR-26 | models/store/dataset/publication/API readers | legacy fixtures, lineage mismatch, pointer/read-only fingerprints |
+| FR-12–FR-16 | `market/candidates.py` and automation | full-session, gate audit, mixed-source/fallback rejection |
+| FR-17–FR-19, FR-24–FR-26 | models/store/dataset/publication/API readers plus evidence reader | legacy fixtures, lineage mismatch, pointer/read-only fingerprints |
 | FR-20–FR-23 | existing normalizer contract plus adapter failure mapping | date/unit/factor/suspension and sanitized failure tests |
 | FR-27 | whitelist/diff and absence of second-source code | static review and no-network gate |
+| FR-28–FR-29 | `providers/base.py` frozen models and role cross-validator | immutable extra-forbid model and exact endpoint variant tests |
+| FR-30–FR-31 | `providers/base.py` + `market/evidence.py` | logical-plan/completion and projection digest/cardinality tests |
+| FR-32 | `market/candidates.py` | exact ordered ten-outcome aggregate test |
+| FR-33 | `market/evidence.py`, `normalize_baostock_rows` clock shim | deterministic replay and frozen-clock tests |
 | NFR-1–NFR-6 | evidence/publish locking, hashes, canonical serializers | crash/concurrency/TOCTOU/determinism tests |
 | NFR-7–NFR-12 | additive migration and read-only paths | full regression, legacy byte fingerprints, GET/plan/replay tests |
 | NFR-13–NFR-14 | plan/review gates and static registry | commit/review records, dynamic-import scan |
-| AC-1–AC-15 | design-to-code mapping | each AC has named focused regression and review evidence |
-| EC-1–EC-20 | boundary guards and sanitized errors | each EC has a synthetic test or explicit static proof |
+| NFR-15–NFR-17 | evidence layout/CAS and manual traceability | descriptor-bound read, strict validator and numbered matrix |
+| NFR-18 | `market/candidates.py` selection policy | fallback rejection and static second-source scan |
+| AC-1–AC-3 | Task 7 provider contract | named provider/adapter tests |
+| AC-4–AC-7 | Task 8 evidence/replay | hash, crash, corruption, zero-write tests |
+| AC-8–AC-11 | Task 9 candidate/selection | gate, lineage, canonical-chain and legacy tests |
+| AC-12–AC-14 | Tasks 8–9 read-only/concurrency | fingerprints, CAS and TOCTOU tests |
+| AC-15–AC-17 | Tasks 7–8 boundary/cardinality | role, exact variant and plan/completion tests |
+| AC-18 | Task 9 gate aggregate | exact ten-outcome aggregate test |
+| AC-19 | Task 8 clock/layout/CAS | frozen-clock, storage and replay tests |
+| AC-20 | Task 9 validator/fallback boundary | static validator/manual traceability and fallback test |
+| EC-1–EC-5 | Task 7 provider/transport contract | sanitized endpoint/failure tests |
+| EC-6–EC-9, EC-19–EC-22, EC-24–EC-26 | Task 8 evidence/replay | bounds, corruption, parser, cardinality, digest, clock and storage tests |
+| EC-10–EC-18, EC-23, EC-26 | Task 9 candidate/selection | lineage, semantic, aggregate, pointer and fallback tests |
 
 If `spec_validator.py --strict` cannot parse the Markdown because of Chinese/Markdown formatting,
 record its actual exit code/output and complete this matrix manually. Do not weaken the spec to make
@@ -565,11 +629,13 @@ refer to the exact RED/GREEN steps above; an absent test is a review blocker.
 | Plan/object cardinality | Task 8.1 / 8.2 | `test_manifest_requires_one_descriptor_per_request_shard_and_page`; missing/extra/duplicate/swallowed page fails. |
 | Transport observation digest | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_every_evidence_descriptor_binds_sanitized_transport_observation_digest`; payload/message/URL/token assertions remain negative. |
 | Gate cardinality | Task 9.1 / 9.2 | `test_gate_report_requires_exact_ordered_complete_gate_aggregate`; one canonical report/hash only. |
-| Replay clock/hash | Task 8.1 / 8.2 | `test_replay_injects_frozen_normalization_clock_and_excludes_replay_start`; same-version byte equality and explicit cross-version semantic exception. |
-| Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`, `test_selection_publish_order_never_moves_pointer_early`. |
+| Replay clock/hash | Task 8.1 / 8.2 | `test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time`; same-version byte equality and explicit cross-version semantic exception. |
+| Storage layout/CAS/no-write | Task 8.1 / 8.2 | `test_missing_evidence_root_is_write_free`, `test_evidence_root_ancestor_symlink_and_toc_tou_fail_closed`; selection ordering is owned by the Task 9 test below. |
+| Factor snapshot provenance | Task 7.1 / 7.2 and Task 8.1 / 8.2 | `test_factor_resolution_binds_published_snapshot_or_raw_endpoint`; before/after fingerprint and live-cache exclusion. |
+| Selection/pointer order | Task 9.1 / 9.2 | `test_selection_publish_order_never_moves_pointer_early`; selection readback precedes existing pointer chain. |
 | Fallback boundary | Task 9.1 / 9.2 | `test_qualified_fallback_is_reserved_and_rejected_by_r2f2_writers`; static scan proves no second source/plugin/failover. |
 
-The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-15 and EC-1–EC-20 to a
+The reviewer MUST manually trace every FR-1–FR-33, NFR-1–NFR-18, AC-1–AC-20 and EC-1–EC-26 to a
 Task step and one of these concrete tests or an explicit static/diff proof. The design-only
 `spec_validator.py` is not allowed to claim implementation or traceability coverage.
 
