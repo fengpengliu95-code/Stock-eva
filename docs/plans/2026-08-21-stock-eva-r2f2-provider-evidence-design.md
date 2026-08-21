@@ -939,7 +939,7 @@ class FactorCacheSnapshotManifest(BaseModel):
     object_sha256: SafeSha256
     byte_count: int = Field(ge=0, le=67_108_864)
     row_count: int = Field(ge=0, le=10_000_000)
-    schema_version: SafeVersion
+    schema_variant: SafeVersion
     schema_hash: SafeSha256
     records_sha256: SafeSha256
     before_fingerprint: SafeSha256
@@ -1109,6 +1109,33 @@ class ReplayResult(BaseModel):
     failure_class: SafeFailureClass | None
 ```
 
+### Factor snapshot descriptor mapping (authoritative and bidirectional)
+
+`FactorCacheSnapshotManifest` and the matching
+`EvidenceObjectDescriptor(kind=factor_cache_snapshot)` are two projections of the same
+published object. Their field mapping is closed and MUST be checked in both directions; a
+serializer or reader MUST NOT introduce aliases or a second spelling:
+
+| `EvidenceObjectDescriptor` | `FactorCacheSnapshotManifest` |
+| --- | --- |
+| `object_id` | `object_id` |
+| `relative_path` | `relative_path` |
+| `sha256` | `object_sha256` |
+| `byte_count` | `byte_count` |
+| `row_count` | `row_count` |
+| `schema_variant` | `schema_variant` |
+| `schema_hash` | `schema_hash` |
+| `factor_snapshot_provenance_hash` | `records_sha256` |
+
+Every left-hand value MUST equal its right-hand value and every right-hand value MUST equal its
+left-hand value. In particular, `descriptor.sha256` is the manifest's `object_sha256`, while
+`descriptor.schema_hash` is the manifest's `schema_hash`; neither may be omitted or substituted.
+`FactorResolutionBinding.cache.cache_object_id` MUST equal this same descriptor's `object_id`,
+and `cache_object_sha256` MUST equal this same descriptor's `sha256` and the manifest's
+`object_sha256`. `record_key` is resolved only inside that descriptor-bound object. A cache
+binding with a different descriptor, a live binding, an alias field or a live mutable cache read
+fails closed.
+
 `EvidenceObjectDescriptor` has a closed kind validator. A `raw_endpoint_page` requires non-null
 endpoint/request role/instrument role/shard/plan ordinal, attempt, page, ordered `fields`/`units`,
 `pagination_policy` and `transport_observation_digest`; its request ID and all cardinality fields
@@ -1116,24 +1143,26 @@ must join one final-success `AttemptCompletion`; a model validator rejects a des
 attempt/outcome/request ID is not the `RequestCompletion.successful_attempt` binding. A
 `factor_cache_snapshot` requires a null endpoint/request role/instrument role/shard/plan
 ordinal/attempt/page and transport digest, but retains the capture request ID and requires a
-non-null `factor_snapshot_provenance_hash`. Its `object_id`, `relative_path`, `sha256`,
-`byte_count`, `row_count` and `schema_variant` MUST equal the corresponding
-`FactorCacheSnapshotManifest.object_id`, `relative_path`, `object_sha256`, `byte_count`,
-`row_count`, `schema_variant` and `schema_hash` MUST equal the corresponding manifest fields and
-its `factor_snapshot_provenance_hash` MUST equal `records_sha256`. `EvidenceManifest.objects` MUST
+non-null `factor_snapshot_provenance_hash`. Its descriptor fields MUST satisfy the exact
+bidirectional mapping above: `object_id` ↔ `object_id`, `relative_path` ↔ `relative_path`,
+`sha256` ↔ `object_sha256`, `byte_count` ↔ `byte_count`, `row_count` ↔ `row_count`,
+`schema_variant` ↔ `schema_variant`, `schema_hash` ↔ `schema_hash`, and
+`factor_snapshot_provenance_hash` ↔ `records_sha256`. `EvidenceManifest.objects` MUST
 contain this descriptor exactly once, and `EvidenceManifest.factor_cache_snapshot.manifest` MUST
-be the same identity/hash/size/row/schema projection. Any mismatch in either direction fails
-closed. Thus a factor snapshot is an evidence object kind, never a seventh provider endpoint, and
-cannot masquerade as a transport page.
+be the same descriptor-bound identity/hash/size/row/schema/provenance projection. The cache
+binding's `cache_object_id`/`cache_object_sha256` MUST resolve to this same descriptor and
+manifest. Any mismatch in either direction fails closed. Thus a factor snapshot is an evidence
+object kind, never a seventh provider endpoint, and cannot masquerade as a transport page.
 
 `FactorCacheSnapshotRecords` is the in-memory read-only record set and is never replayed directly.
 The writer serializes it to one immutable object, creates the `FactorCacheSnapshotManifest` and
 the matching `EvidenceObjectDescriptor`, then exposes only `PublishedFactorCacheSnapshot` to the
 reader. `FactorResolutionBinding.cache` MUST contain `cache_object_id`, `cache_object_sha256` and
-`record_key`, with `live=None`; the reader opens the descriptor's relative path through the
-evidence root dirfd with `O_NOFOLLOW`, verifies object hash/schema/byte count/row count and the
-records hash, and only then resolves `record_key`. It MUST NOT query the live cache or accept an
-in-memory record set during replay.
+`record_key`, with `live=None`; `cache_object_id` MUST equal the matching descriptor's `object_id`
+and `cache_object_sha256` MUST equal its `sha256` and the manifest's `object_sha256`. The reader
+opens that descriptor's relative path through the evidence root dirfd with `O_NOFOLLOW`, verifies
+object hash/schema/byte count/row count and the records hash, and only then resolves `record_key`.
+It MUST NOT query the live cache or accept an in-memory record set during replay.
 
 The evidence writer MUST also run this aggregate validator before the first object compare-create:
 
@@ -1192,8 +1221,8 @@ score cannot substitute for it.
 | --- | --- | --- |
 | `RawEndpointBatch` / `EndpointContractSummary` | `ENDPOINT_CONTRACTS` | `endpoint`, role, variant, ordered `fields`, `source_schema`, exact `units`, `date_semantics` and `pagination_policy` all present; no hidden summary field. |
 | `FactorCacheSnapshotRecord` / `FactorCacheSnapshotRecords` | Existing `factor_snapshots` SQL table / in-memory projection | Exact nine current columns plus derived `row_fingerprint`, `records_sha256` and before/after fingerprints; no invented `source`, `effective`, `observed`, `adjust_factor` or cache-version column. This record set is not a published descriptor. |
-| `FactorCacheSnapshotManifest` / `PublishedFactorCacheSnapshot` | Published factor object manifest / descriptor-bound reader | Exactly `object_id`, `relative_path`, `object_sha256`, `byte_count`, `row_count`, `schema_version`, `schema_hash`, `records_sha256`, before/after fingerprints plus reader identity; no embedded mutable rows. |
-| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. Cache descriptor identity/hash/bytes/rows/schema MUST equal `FactorCacheSnapshotManifest`. |
+| `FactorCacheSnapshotManifest` / `PublishedFactorCacheSnapshot` | Published factor object manifest / descriptor-bound reader | Exactly `object_id`, `relative_path`, `object_sha256`, `byte_count`, `row_count`, `schema_variant`, `schema_hash`, `records_sha256`, before/after fingerprints plus reader identity; no embedded mutable rows. |
+| `EvidenceObjectDescriptor` | Evidence JSON descriptor | One `units` field only; raw page carries `plan_ordinal/attempt/request_id/page/object_kind`, while cache snapshot keeps capture request ID and null page transport identity. The exact bidirectional mapping is `object_id↔object_id`, `relative_path↔relative_path`, `sha256↔object_sha256`, `byte_count↔byte_count`, `row_count↔row_count`, `schema_variant↔schema_variant`, `schema_hash↔schema_hash`, `factor_snapshot_provenance_hash↔records_sha256`; cache binding identity/hash MUST match this same descriptor. |
 | `EvidenceManifest` | Evidence manifest JSON | `factor_resolution_sha256` is the single ordered binding hash and is identical in model, serializer and table. |
 | `CandidateGateReport` | Gate report JSON | `gate_report_id`, `verdict` and `aggregate_sha256` are identical in model, serializer and table. |
 | `CandidateManifest` / `SessionSelection` | Candidate/selection JSON | Candidate fields are exactly `candidate_id`, `trade_date`, `universe_id`, `provider_id`, `evidence_id`, `evidence_sha256`, `normalized_object_relative_path`, `normalized_object_sha256`, `gate_report_relative_path`, `gate_report_sha256`, `factor_resolution_sha256`, `adapter_version`, `source_schema_version`, `row_count`, `required_symbol_count`, `status`, `manifest_sha256`; selection fields are exactly the model fields below. |

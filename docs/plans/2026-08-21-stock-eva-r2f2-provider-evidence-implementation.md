@@ -292,6 +292,8 @@ def test_retry_success_row_count_equals_final_descriptor_rows(tmp_path): ...
 def test_failed_attempt_row_count_is_excluded_from_manifest_and_hash(tmp_path): ...
 def test_factor_snapshot_manifest_binds_descriptor_identity_size_schema_rows_and_records_hash(tmp_path): ...
 def test_factor_snapshot_descriptor_manifest_mismatch_fails_closed_both_directions(tmp_path): ...
+def test_factor_snapshot_descriptor_manifest_mapping_is_exact_and_bidirectional(tmp_path): ...
+def test_factor_resolution_cache_binding_matches_same_descriptor_identity_and_hash(tmp_path): ...
 def test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache(tmp_path): ...
 def test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only(tmp_path): ...
 def test_factor_snapshot_manifest_model_copy_round_trip_revalidates_descriptor_binding(tmp_path): ...
@@ -362,13 +364,19 @@ Required behavior:
   stable row fingerprint; no invented `source`, `effective`, `observed`, `adjust_factor` or
   cache-version field and no schema migration is allowed. Publish a separate frozen
   `FactorCacheSnapshotManifest` containing `object_id`, `relative_path`, `object_sha256`,
-  `byte_count`, `row_count`, `schema_version`, `schema_hash`, `records_sha256` and before/after fingerprints.
-  The matching `EvidenceObjectDescriptor(kind=factor_cache_snapshot)` MUST equal that manifest
-  bidirectionally for ID/path/hash/bytes/rows/schema and records hash, and MUST be included in
+  `byte_count`, `row_count`, `schema_variant`, `schema_hash`, `records_sha256` and before/after fingerprints.
+  The matching `EvidenceObjectDescriptor(kind=factor_cache_snapshot)` MUST satisfy this exact
+  bidirectional mapping: `object_id↔object_id`, `relative_path↔relative_path`,
+  `sha256↔object_sha256`, `byte_count↔byte_count`, `row_count↔row_count`,
+  `schema_variant↔schema_variant`, `schema_hash↔schema_hash`, and
+  `factor_snapshot_provenance_hash↔records_sha256`; every equality is enforced in both
+  directions. The descriptor MUST be included exactly once in
   `EvidenceManifest.objects`. Capture and verify before/after fingerprints while the same
   `RefreshRunLock` is held. If the snapshot changes, is incomplete or cannot bind a mutually
   exclusive live/cache `FactorResolutionBinding`, fail closed. A cache binding MUST contain only
-  `cache_object_id`, `cache_object_sha256` and `record_key`, with `live=None`. Online normalization
+  `cache_object_id`, `cache_object_sha256` and `record_key`, with `live=None`; its object ID and
+  object SHA-256 MUST equal the same descriptor's `object_id` and `sha256` and therefore the
+  manifest's `object_id` and `object_sha256`. Online normalization
   and replay consume only `PublishedFactorCacheSnapshot`; replay opens the descriptor by dirfd,
   verifies hash/schema/bytes/rows/records hash and then resolves the record key. Live mutable cache
   reads after capture are forbidden. The ordered binding hash `factor_resolution_sha256` MUST be
