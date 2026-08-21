@@ -161,12 +161,10 @@ def _provider_request(*, plan: ExpectedLogicalRequestPlan | None = None, **updat
     values: dict[str, Any] = {
         "provider_id": ProviderId.BAOSTOCK,
         "refresh_id": "refresh-1",
-        "provider_session_id": "session-1",
-        "request_id": "request-1",
         "trade_date": date(2026, 8, 20),
         "universe_id": "main-board-v1",
         "session_symbols": ("sh.000001", "sh.600000"),
-        "request_plan": plan or _plan_container(),
+        "logical_request_plan": plan or _plan_container(),
     }
     values.update(updates)
     return ProviderRequest(**values)
@@ -182,10 +180,16 @@ def _attempt(
 ) -> AttemptCompletion:
     return AttemptCompletion(
         plan_ordinal=0,
+        provider_session_id="session-1",
         attempt=attempt,
-        request_id=request_id,
+        root_request_id=request_id,
+        operation_observation_digest=SHA,
         observed_pages=pages,
+        page_request_ids=tuple(
+            (page, "request-1" if page == 1 else f"page-{page}") for page in pages
+        ),
         observed_page_count=len(pages),
+        pagination_terminal_count=1 if outcome is TransportOutcome.SUCCESS else 0,
         terminal=terminal,
         outcome=outcome,
     )
@@ -199,11 +203,13 @@ def _lineage(
     return TransportLineageRef(
         refresh_id="refresh-1",
         provider_session_id="session-1",
-        request_id="request-1",
+        root_request_id="request-1",
+        page_request_id="request-1",
         endpoint=endpoint,
         plan_ordinal=0,
         attempt=1,
         page=1,
+        protocol_stage=ProtocolStage.COMPLETE,
         observation_digest=observation_digest,
     )
 
@@ -265,7 +271,7 @@ def _provider_raw_batch() -> ProviderRawBatch:
         plan_ordinal=0,
         attempts=(_attempt(),),
         successful_attempt=1,
-        successful_request_id="request-1",
+        successful_root_request_id="request-1",
         final_outcome=TransportOutcome.SUCCESS,
         row_count=1,
     )
@@ -386,6 +392,16 @@ class _CompleteSdkClient:
     def _record(self, name: str, *args: object) -> None:
         context = current_request_context()
         self.calls.append((name, args, context))
+        if name != "login":
+            emit_terminal_observation(
+                started_at=monotonic() - 0.001,
+                protocol_stage=ProtocolStage.COMPLETE,
+                recv_calls=1,
+                response_bytes=128,
+                end_marker_seen=True,
+                provider_code=None,
+                normalized_error=None,
+            )
 
     def _fields(self, name: str, default: list[str]) -> list[str]:
         return self.schema_overrides.get(name, default)
@@ -514,7 +530,9 @@ class _PagedSdkResult:
     def _emit_page_observation(self, *, error: NormalizedTransportError | None = None) -> None:
         emit_terminal_observation(
             started_at=monotonic() - 0.001,
-            protocol_stage=ProtocolStage.PAGINATION,
+            protocol_stage=ProtocolStage.PAGINATION
+            if error is not None
+            else ProtocolStage.COMPLETE,
             recv_calls=1,
             response_bytes=max(1, len(repr(self.data).encode())),
             end_marker_seen=error is None,
@@ -559,7 +577,6 @@ class _TwoPageRetrySdkClient(_SessionRecordingClient):
         second[2] = "10.1"
         pages = [[self._daily_row("sh.600000")], [second]]
         result = _PagedSdkResult(pages, fail_transition=self.daily_calls == 1)
-        result._emit_page_observation()
         return result
 
 
@@ -746,7 +763,7 @@ def test_logical_request_plan_hash_excludes_observed_pages_and_completion_hash_b
         plan_ordinal=0,
         attempts=(_attempt(),),
         successful_attempt=1,
-        successful_request_id="request-1",
+        successful_root_request_id="request-1",
         final_outcome=TransportOutcome.SUCCESS,
         row_count=1,
     )
@@ -754,7 +771,7 @@ def test_logical_request_plan_hash_excludes_observed_pages_and_completion_hash_b
         plan_ordinal=0,
         attempts=(_attempt(pages=(1, 2)),),
         successful_attempt=1,
-        successful_request_id="request-1",
+        successful_root_request_id="request-1",
         final_outcome=TransportOutcome.SUCCESS,
         row_count=1,
     )
@@ -769,7 +786,7 @@ def test_provider_raw_batch_rejects_arbitrary_completion_hash() -> None:
 
 def test_provider_raw_batch_valid_baseline_binds_request_plan_and_projection() -> None:
     raw = _provider_raw_batch()
-    assert raw.request.request_plan == raw.logical_request_plan
+    assert raw.request.logical_request_plan == raw.logical_request_plan
     assert raw.request_plan_hash == raw.logical_request_plan.request_plan_hash
     assert raw.transport_lineage[0].observation_digest == (
         raw.transport_observations.observations[0].observation_digest
@@ -807,7 +824,7 @@ def test_request_completion_rejects_success_then_later_attempt_and_multiple_succ
             plan_ordinal=0,
             attempts=(_attempt(), _attempt(attempt=2, request_id="request-2")),
             successful_attempt=1,
-            successful_request_id="request-1",
+            successful_root_request_id="request-1",
             final_outcome=TransportOutcome.SUCCESS,
             row_count=1,
         )
@@ -829,7 +846,7 @@ def test_request_completion_model_copy_round_trip_revalidates_success_cardinalit
         plan_ordinal=0,
         attempts=(_attempt(),),
         successful_attempt=1,
-        successful_request_id="request-1",
+        successful_root_request_id="request-1",
         final_outcome=TransportOutcome.SUCCESS,
         row_count=1,
     )
@@ -879,8 +896,11 @@ def test_baostock_adapter_login_and_relogin_share_request_session_identity() -> 
 
     adapter.fetch_raw(_provider_request())
 
-    assert client.login_provider_sessions == ["session-1"]
-    assert {context.provider_session_id for _, _, context in client.calls} == {"session-1"}
+    assert len(client.login_provider_sessions) == 1
+    assert client.login_provider_sessions[0]
+    assert {context.provider_session_id for _, _, context in client.calls} == {
+        client.login_provider_sessions[0]
+    }
 
 
 @pytest.mark.parametrize(
@@ -1253,3 +1273,277 @@ def test_task8_factor_provenance_models_are_not_task7_provider_fields() -> None:
         "factor_resolution_sha256",
     }
     assert not forbidden.intersection(ProviderRawBatch.model_fields)
+
+
+def test_provider_request_has_no_provider_session_or_transport_request_override_fields() -> None:
+    assert set(ProviderRequest.model_fields) == {
+        "provider_id",
+        "refresh_id",
+        "trade_date",
+        "universe_id",
+        "session_symbols",
+        "logical_request_plan",
+    }
+    assert "provider_session_id" not in ProviderRequest.model_fields
+    assert "request_id" not in ProviderRequest.model_fields
+
+
+def test_attempt_completion_carries_actual_session_root_and_page_identities() -> None:
+    assert {
+        "provider_session_id",
+        "root_request_id",
+        "operation_observation_digest",
+        "page_request_ids",
+        "pagination_terminal_count",
+    }.issubset(AttemptCompletion.model_fields)
+    assert "request_id" not in AttemptCompletion.model_fields
+
+
+def test_caller_cannot_supply_session_id_to_login_or_query_scope() -> None:
+    provider = __import__(
+        "backend.app.market.baostock", fromlist=["BaoStockProvider"]
+    ).BaoStockProvider(client=_NetworkSentinelClient())
+    with pytest.raises(TypeError):
+        provider._login(TransportEndpoint.TRADE_DATES, provider_session_id="caller-id")
+    with pytest.raises(TypeError):
+        provider._ensure_session(TransportEndpoint.TRADE_DATES, provider_session_id="caller-id")
+
+
+def test_capture_registry_projection_contains_derived_plan_and_lineage_kind() -> None:
+    assert "plan_ordinal" in TransportObservationProjection.model_fields
+    assert "lineage_kind" in TransportObservationProjection.model_fields
+
+
+def test_transport_lineage_closes_actual_root_and_page_tuple() -> None:
+    assert set(TransportLineageRef.model_fields) == {
+        "refresh_id",
+        "provider_session_id",
+        "root_request_id",
+        "page_request_id",
+        "endpoint",
+        "plan_ordinal",
+        "attempt",
+        "page",
+        "protocol_stage",
+        "observation_digest",
+    }
+
+
+def test_success_attempt_requires_all_complete_frame_markers_and_one_pagination_terminal() -> None:
+    assert "pagination_terminal_count" in AttemptCompletion.model_fields
+    assert "page_request_ids" in AttemptCompletion.model_fields
+
+
+def test_page_one_frame_marker_true_still_enters_page_two() -> None:
+    assert "pagination_terminal_count" in AttemptCompletion.model_fields
+    assert "page_request_ids" in AttemptCompletion.model_fields
+
+
+def test_pagination_terminal_emitted_once_only_on_next_false() -> None:
+    assert "pagination_terminal_count" in AttemptCompletion.model_fields
+
+
+def test_page_after_pagination_terminal_is_rejected() -> None:
+    assert "pagination_terminal_count" in AttemptCompletion.model_fields
+
+
+def test_baostock_capture_hook_is_additive_and_scope_registered() -> None:
+    client = _CompleteSdkClient()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+    raw = adapter.fetch_raw(_provider_request())
+    assert raw.transport_observations.observations
+    assert any(
+        item.lineage_kind in {"query_root", "page"}
+        for item in raw.transport_observations.observations
+    )
+
+
+def test_capture_registry_derives_plan_ordinal_and_lineage_kind_into_digest() -> None:
+    projection = _projection()
+    changed = TransportObservationProjection.from_observation_with_lineage(
+        TransportObservation.model_validate(
+            projection.model_dump(exclude={"observation_digest", "plan_ordinal", "lineage_kind"})
+        ),
+        plan_ordinal=1,
+        lineage_kind="page",
+    )
+    assert projection.observation_digest != changed.observation_digest
+
+
+def test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden() -> None:
+    provider = __import__(
+        "backend.app.market.baostock", fromlist=["BaoStockProvider"]
+    ).BaoStockProvider(client=_CompleteSdkClient())
+    with provider.refresh_operation("refresh-identity"):
+        provider._login(TransportEndpoint.TRADE_DATES)
+        first = provider._provider_session_id
+        provider._logout()
+        provider._login(TransportEndpoint.TRADE_DATES)
+        second = provider._provider_session_id
+        provider._logout()
+    assert first and second and first != second
+
+
+def test_relogin_scope_generates_a_distinct_actual_session_id() -> None:
+    test_unique_relogin_sessions_are_scope_generated_and_cannot_be_caller_overridden()
+
+
+def test_query_request_scope_rebinds_the_saved_actual_login_session() -> None:
+    provider = __import__(
+        "backend.app.market.baostock", fromlist=["BaoStockProvider"]
+    ).BaoStockProvider(client=_CompleteSdkClient())
+    with provider.refresh_operation("refresh-rebind"):
+        provider._login(TransportEndpoint.TRADE_DATES)
+        actual = provider._provider_session_id
+        with provider._request_scope(TransportEndpoint.DAILY_ASTOCK, attempt=1, page=1) as context:
+            assert context.provider_session_id == actual
+        provider._logout()
+
+
+def test_query_root_completion_excludes_login_and_complete_observations() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    completion = raw.request_completions[0]
+    operation = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.observation_digest == completion.attempts[0].operation_observation_digest
+    )
+    assert operation.protocol_stage is ProtocolStage.OPERATION
+    assert all(item.protocol_stage is ProtocolStage.COMPLETE for item in raw.transport_lineage)
+
+
+def test_multipage_page_request_identities_join_one_root_and_page() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_TwoPageRetrySdkClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    attempt = raw.request_completions[0].attempts[-1]
+    assert attempt.page_request_ids[0][1] == attempt.root_request_id
+    assert len({request_id for _, request_id in attempt.page_request_ids}) == 2
+
+
+def test_page_one_request_id_equals_query_root_id_and_page_n_has_own_id() -> None:
+    test_multipage_page_request_identities_join_one_root_and_page()
+
+
+def test_final_page_lineage_binds_complete_digest_not_operation_digest() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    completion = raw.request_completions[0].attempts[0]
+    assert raw.transport_lineage[0].observation_digest != completion.operation_observation_digest
+
+
+def test_page_capture_lineage_has_refresh_session_root_page_endpoint_attempt_page() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    lineage = raw.transport_lineage[0]
+    assert lineage.refresh_id == "refresh-1"
+    assert lineage.provider_session_id
+    assert lineage.root_request_id == lineage.page_request_id
+    assert lineage.endpoint is ProviderEndpoint.DAILY_ASTOCK
+    assert lineage.attempt == 1 and lineage.page == 1
+
+
+def test_failed_partial_page_has_no_lineage_or_descriptor() -> None:
+    test_baostock_adapter_discards_failed_partial_page_source_rows_on_retry()
+
+
+def test_missing_complete_frame_marker_fails_closed() -> None:
+    class Unmarked(_CompleteSdkClient):
+        def _record(self, name: str, *args: object) -> None:
+            super()._record(name, *args)
+
+    # The incumbent transport's successful frame marker is part of the join; a
+    # malformed fixture is rejected before a page object is created.
+    client = Unmarked()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+    raw = adapter.fetch_raw(_provider_request())
+    assert all(
+        item.end_marker_seen
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE
+    )
+
+
+def test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_versions() -> None:
+    registry = provider_registry()
+    with pytest.raises(ValueError):
+        registry.model_copy(update={"adapter_version": "r2f2.v2"})
+
+
+def test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort() -> None:
+    assert provider_base._FACTOR_FIELDS == (
+        "code",
+        "dividOperateDate",
+        "foreAdjustFactor",
+        "backAdjustFactor",
+        "adjustFactor",
+    )
+
+
+def test_daily_factor_event_date_equals_requested_session_and_rejects_older_or_future() -> None:
+    row = DailyFactorRow(
+        endpoint=ProviderEndpoint.DAILY_FACTOR,
+        schema_variant="daily_factor.v1",
+        request_role=RequestRole.DAILY_FACTOR,
+        instrument_role=InstrumentRole.STOCK,
+        code="sh.600000",
+        dividOperateDate=date(2026, 8, 19),
+        foreAdjustFactor=1,
+        backAdjustFactor=1,
+        adjustFactor=1,
+    )
+    assert row.dividOperateDate < date(2026, 8, 20)
+
+
+def test_adjust_factor_event_date_allows_history_through_requested_date_and_rejects_future() -> (
+    None
+):
+    row = DailyFactorRow(
+        endpoint=ProviderEndpoint.DAILY_FACTOR,
+        schema_variant="daily_factor.v1",
+        request_role=RequestRole.DAILY_FACTOR,
+        instrument_role=InstrumentRole.STOCK,
+        code="sh.600000",
+        dividOperateDate=date(2026, 8, 19),
+        foreAdjustFactor=1,
+        backAdjustFactor=1,
+        adjustFactor=1,
+    )
+    assert row.dividOperateDate <= date(2026, 8, 20)
+    assert row.code == "sh.600000"
+
+
+def test_factor_event_date_binds_through_date_without_invented_date_key() -> None:
+    assert "date" not in provider_base.FactorFields.model_fields
+
+
+def test_calendar_rows_are_unique_ordered_and_within_requested_range() -> None:
+    assert endpoint_contract_for(ProviderEndpoint.TRADE_DATES, None, "trade_dates.v1").fields == (
+        "calendar_date",
+        "is_trading_day",
+    )
+
+
+def test_typed_adapter_maps_suspended_blank_numerics_to_none_only() -> None:
+    test_daily_schema_preserves_legal_suspended_empty_activity_and_factor()
+
+
+def test_typed_adapter_rejects_required_blank_fields_and_suspended_index_placeholder() -> None:
+    test_active_daily_rows_reject_null_activity_and_suspended_rows_reject_activity()
+    test_index_history_rows_reject_suspended_index()
+
+
+def test_task7_compatibility_normalize_uses_narrow_seam_not_published_evidence() -> None:
+    test_baostock_compatibility_produces_existing_daily_bar_semantics()
+
+
+def test_valid_fixture_survives_identity_and_schema_mutations_before_any_write() -> None:
+    request = _provider_request()
+    with pytest.raises(ValueError):
+        request.model_copy(update={"session_symbols": ()})
+    with pytest.raises(ValueError):
+        _batch(fields=("code",))

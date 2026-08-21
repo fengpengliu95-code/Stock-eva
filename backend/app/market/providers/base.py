@@ -46,6 +46,8 @@ SafeVersion = Annotated[
     str,
     StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,63}$"),
 ]
+R2F2_ADAPTER_VERSION = "r2f2.v1"
+R2F2_ENDPOINT_CONTRACT_VERSION = "r2f2-endpoints.v1"
 
 
 def validate_safe_relative_path(value: str) -> str:
@@ -143,6 +145,11 @@ class PaginationPolicy(StrEnum):
 
 class ProviderId(StrEnum):
     BAOSTOCK = "baostock"
+
+
+class EvidenceObjectKind(StrEnum):
+    RAW_ENDPOINT_PAGE = "raw_endpoint_page"
+    FACTOR_CACHE_SNAPSHOT = "factor_cache_snapshot"
 
 
 def _canonical(value: object) -> bytes:
@@ -259,10 +266,14 @@ class ExpectedLogicalRequestPlan(_ContractModel):
 
 class AttemptCompletion(_ContractModel):
     plan_ordinal: int = Field(ge=0, le=4096)
+    provider_session_id: SafeIdentifier
     attempt: int = Field(ge=1, le=20)
-    request_id: SafeIdentifier
+    root_request_id: SafeIdentifier
+    operation_observation_digest: SafeSha256
     observed_pages: tuple[int, ...]
+    page_request_ids: tuple[tuple[int, SafeIdentifier], ...]
     observed_page_count: int = Field(ge=0, le=16_384)
+    pagination_terminal_count: int = Field(ge=0, le=1)
     terminal: bool
     outcome: TransportOutcome
 
@@ -270,13 +281,22 @@ class AttemptCompletion(_ContractModel):
     def validate_observed_pages(self) -> AttemptCompletion:
         if self.observed_page_count != len(self.observed_pages):
             raise ValueError("observed page count mismatch")
-        if self.observed_pages != tuple(range(1, self.observed_page_count + 1)):
-            if self.observed_pages:
-                raise ValueError("observed pages must be contiguous")
-        if self.outcome is TransportOutcome.SUCCESS and (
-            not self.terminal or not self.observed_pages
+        if self.observed_pages and self.observed_pages != tuple(
+            range(1, self.observed_page_count + 1)
         ):
-            raise ValueError("successful attempt must be terminal and have a page")
+            raise ValueError("observed pages must be contiguous")
+        if tuple(page for page, _ in self.page_request_ids) != self.observed_pages:
+            raise ValueError("page request IDs must close over observed pages")
+        if len({request_id for _, request_id in self.page_request_ids}) != len(
+            self.page_request_ids
+        ):
+            raise ValueError("page request IDs must be unique")
+        if self.outcome is TransportOutcome.SUCCESS and (
+            not self.terminal or not self.observed_pages or self.pagination_terminal_count != 1
+        ):
+            raise ValueError("successful attempt requires terminal pagination")
+        if self.outcome is TransportOutcome.ERROR and self.pagination_terminal_count:
+            raise ValueError("failed attempt cannot claim pagination terminal")
         return self
 
 
@@ -284,7 +304,7 @@ class RequestCompletion(_ContractModel):
     plan_ordinal: int = Field(ge=0, le=4096)
     attempts: tuple[AttemptCompletion, ...]
     successful_attempt: int | None = Field(default=None, ge=1, le=20)
-    successful_request_id: SafeIdentifier | None = None
+    successful_root_request_id: SafeIdentifier | None = None
     final_outcome: TransportOutcome
     row_count: int = Field(default=0, ge=0, le=10_000_000)
     observed_pages: tuple[int, ...] = ()
@@ -295,7 +315,7 @@ class RequestCompletion(_ContractModel):
             raise ValueError("completion requires an attempt")
         if tuple(item.attempt for item in self.attempts) != tuple(range(1, len(self.attempts) + 1)):
             raise ValueError("attempts must be strictly ordered")
-        if len({item.request_id for item in self.attempts}) != len(self.attempts):
+        if len({item.root_request_id for item in self.attempts}) != len(self.attempts):
             raise ValueError("attempt request IDs must be unique")
         if self.final_outcome is not self.attempts[-1].outcome:
             raise ValueError("final outcome must match final attempt")
@@ -304,12 +324,12 @@ class RequestCompletion(_ContractModel):
             final = self.attempts[-1]
             if len(successes) != 1 or self.successful_attempt != final.attempt:
                 raise ValueError("a completion has exactly one final successful attempt")
-            if self.successful_request_id != final.request_id:
+            if self.successful_root_request_id != final.root_request_id:
                 raise ValueError("successful request binding mismatch")
         elif (
             successes
             or self.successful_attempt is not None
-            or self.successful_request_id is not None
+            or self.successful_root_request_id is not None
         ):
             raise ValueError("failed completion cannot bind a successful attempt")
         if self.final_outcome is TransportOutcome.ERROR and self.row_count != 0:
@@ -327,12 +347,10 @@ class RequestCompletion(_ContractModel):
 class ProviderRequest(_ContractModel):
     provider_id: ProviderId
     refresh_id: SafeIdentifier
-    provider_session_id: SafeIdentifier
-    request_id: SafeIdentifier
     trade_date: date
     universe_id: SafeIdentifier
     session_symbols: tuple[SafeSymbol, ...]
-    request_plan: ExpectedLogicalRequestPlan
+    logical_request_plan: ExpectedLogicalRequestPlan
 
     @field_validator("session_symbols")
     @classmethod
@@ -345,11 +363,13 @@ class ProviderRequest(_ContractModel):
 class TransportLineageRef(_ContractModel):
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
-    request_id: SafeIdentifier
+    root_request_id: SafeIdentifier
+    page_request_id: SafeIdentifier
     endpoint: ProviderEndpoint
     plan_ordinal: int = Field(ge=0, le=4096)
     attempt: int = Field(ge=1, le=20)
     page: int = Field(ge=1, le=16_384)
+    protocol_stage: Literal[ProtocolStage.COMPLETE]
     observation_digest: SafeSha256
 
 
@@ -732,6 +752,8 @@ class TransportObservationProjection(_ContractModel):
     refresh_id: SafeIdentifier
     provider_session_id: SafeIdentifier
     request_id: SafeIdentifier
+    plan_ordinal: int = Field(ge=0, le=4096)
+    lineage_kind: Literal["login_audit", "query_root", "page"]
     provider_id: ProviderId
     endpoint: ProviderEndpoint
     attempt: int = Field(ge=1, le=20)
@@ -774,6 +796,31 @@ class TransportObservationProjection(_ContractModel):
         values["observed_at"] = observation.observed_at.astimezone(UTC)
         values["provider_id"] = ProviderId.BAOSTOCK
         values["endpoint"] = ProviderEndpoint(observation.endpoint.value)
+        # Callers must use ``from_observation_with_lineage`` so the registry-derived
+        # identity is part of the digest.  The default is only retained for old
+        # transport fixtures and is never used by the adapter.
+        values.setdefault("plan_ordinal", 0)
+        values.setdefault("lineage_kind", "query_root")
+        candidate = cls.model_construct(**values, observation_digest=_EMPTY_SHA256)
+        values["observation_digest"] = candidate.compute_digest()
+        return cls.model_validate(values)
+
+    @classmethod
+    def from_observation_with_lineage(
+        cls,
+        observation: TransportObservation,
+        *,
+        plan_ordinal: int,
+        lineage_kind: Literal["login_audit", "query_root", "page"],
+    ) -> TransportObservationProjection:
+        values = observation.model_dump()
+        values.update(
+            observed_at=observation.observed_at.astimezone(UTC),
+            provider_id=ProviderId.BAOSTOCK,
+            endpoint=ProviderEndpoint(observation.endpoint.value),
+            plan_ordinal=plan_ordinal,
+            lineage_kind=lineage_kind,
+        )
         candidate = cls.model_construct(**values, observation_digest=_EMPTY_SHA256)
         values["observation_digest"] = candidate.compute_digest()
         return cls.model_validate(values)
@@ -821,9 +868,14 @@ class ProviderRawBatch(_ContractModel):
 
     @model_validator(mode="after")
     def validate_session_binding(self) -> ProviderRawBatch:
+        if (
+            self.adapter_version != "r2f2.v1"
+            or self.endpoint_contract_version != "r2f2-endpoints.v1"
+        ):
+            raise ValueError("provider contract versions must match current constants")
         if self.provider_id is not self.request.provider_id:
             raise ValueError("raw batch provider does not match request")
-        if self.logical_request_plan != self.request.request_plan:
+        if self.logical_request_plan != self.request.logical_request_plan:
             raise ValueError("raw batch logical request plan does not bind request")
         if self.request_plan_hash != self.logical_request_plan.compute_hash():
             raise ValueError("raw batch request plan hash mismatch")
@@ -859,7 +911,7 @@ class ProviderRawBatch(_ContractModel):
         for item in self.endpoint_batches:
             key = (
                 item.plan_ordinal,
-                item.lineage.request_id,
+                item.lineage.page_request_id,
                 item.lineage.attempt,
                 item.lineage.endpoint.value,
                 item.lineage.page,
@@ -899,11 +951,15 @@ class ProviderRawBatch(_ContractModel):
                 if completion.row_count != 0 or batches:
                     raise ValueError("failed completion cannot persist source rows")
                 continue
-            if not batches or completion.successful_request_id is None:
+            if not batches or completion.successful_root_request_id is None:
                 raise ValueError("successful completion requires source batch")
             if any(
                 item.lineage.attempt != completion.successful_attempt
                 or item.lineage.plan_ordinal != completion.plan_ordinal
+                or item.lineage.provider_session_id != completion.attempts[-1].provider_session_id
+                or item.lineage.root_request_id != completion.successful_root_request_id
+                or item.lineage.page_request_id
+                not in {request_id for _, request_id in completion.attempts[-1].page_request_ids}
                 for item in batches
             ):
                 raise ValueError("source batch lineage does not bind completion")
@@ -912,16 +968,23 @@ class ProviderRawBatch(_ContractModel):
                 raise ValueError("source batch pages do not bind completion")
             if completion.row_count != sum(item.row_count for item in batches):
                 raise ValueError("successful completion row count mismatch")
+        actual_sessions = {
+            attempt.provider_session_id
+            for completion in self.request_completions
+            for attempt in completion.attempts
+        }
         for item in self.transport_lineage:
             if (
                 item.refresh_id != self.request.refresh_id
-                or item.provider_session_id != self.request.provider_session_id
+                or item.provider_session_id not in actual_sessions
             ):
                 raise ValueError("transport lineage does not bind request session")
+            if item.protocol_stage is not ProtocolStage.COMPLETE:
+                raise ValueError("transport lineage must be a COMPLETE page projection")
         for item in self.transport_observations.observations:
             if (
                 item.refresh_id != self.request.refresh_id
-                or item.provider_session_id != self.request.provider_session_id
+                or item.provider_session_id not in actual_sessions
             ):
                 raise ValueError("transport observation does not bind request session")
         lineage_keys = sorted(
@@ -929,7 +992,7 @@ class ProviderRawBatch(_ContractModel):
                 (
                     item.refresh_id,
                     item.provider_session_id,
-                    item.request_id,
+                    item.page_request_id,
                     item.endpoint,
                     item.attempt,
                     item.page,
@@ -956,8 +1019,24 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("duplicate transport lineage projection")
         if len(projection_keys) != len(set(projection_keys)):
             raise ValueError("duplicate transport observation projection")
-        if lineage_keys != projection_keys:
-            raise ValueError("transport lineage and observations do not join exactly")
+        projection_set = set(projection_keys)
+        for key in lineage_keys:
+            if key not in projection_set:
+                raise ValueError("transport lineage and observations do not join exactly")
+        for lineage in self.transport_lineage:
+            matches = tuple(
+                projection
+                for projection in self.transport_observations.observations
+                if projection.observation_digest == lineage.observation_digest
+                and projection.protocol_stage is ProtocolStage.COMPLETE
+                and projection.outcome is TransportOutcome.SUCCESS
+                and projection.end_marker_seen
+                and projection.request_id == lineage.page_request_id
+                and projection.attempt == lineage.attempt
+                and projection.page == lineage.page
+            )
+            if len(matches) != 1:
+                raise ValueError("page lineage must resolve one marked COMPLETE projection")
         expected_completion_hash = _digest(
             [item.model_dump(mode="json") for item in self.request_completions]
         )
@@ -1013,13 +1092,14 @@ class _ProviderRegistry(_ContractModel):
 
 
 def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch) -> None:
-    if (
-        batch.lineage.refresh_id != request.refresh_id
-        or batch.lineage.provider_session_id != request.provider_session_id
-    ):
+    if batch.lineage.refresh_id != request.refresh_id:
         raise ValueError("raw lineage does not match request")
     logical = next(
-        (item for item in request.request_plan.requests if item.plan_ordinal == batch.plan_ordinal),
+        (
+            item
+            for item in request.logical_request_plan.requests
+            if item.plan_ordinal == batch.plan_ordinal
+        ),
         None,
     )
     if logical is None or logical.endpoint is not batch.endpoint:
@@ -1047,8 +1127,11 @@ def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch)
             elif not (logical.start_date <= row_date <= logical.end_date):
                 raise ValueError("raw row date is outside requested range")
         effective = getattr(row, "dividOperateDate", None)
-        if effective is not None and effective > request.trade_date:
-            raise ValueError("factor effective date is after requested trade date")
+        if effective is not None:
+            if batch.schema_variant == "daily_factor.v1" and effective != request.trade_date:
+                raise ValueError("daily factor event date must equal requested trade date")
+            if effective > request.trade_date:
+                raise ValueError("factor effective date is after requested trade date")
         code = getattr(row, "code", None)
         if code is None:
             continue

@@ -249,6 +249,7 @@ def _read_result(
     before_page_request: Callable[[], None] | None = None,
     next_page_scope: Callable[[int], Any] | None = None,
     page_capture: Callable[[int, list[str], list[list[str]]], None] | None = None,
+    pagination_terminal: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
     if result.error_code != "0":
         raise _provider_status_error(
@@ -319,6 +320,8 @@ def _read_result(
         else:
             has_row = result.next()
         if not has_row:
+            if pagination_terminal is not None:
+                pagination_terminal()
             break
         rows.append(result.get_row_data())
     if result.error_code != "0":
@@ -524,21 +527,11 @@ class BaoStockProvider:
             with request_scope(endpoint, attempt=attempt, page=page) as context:
                 yield context
 
-    def _login(
-        self,
-        endpoint: TransportEndpoint,
-        *,
-        provider_session_id: str | None = None,
-    ) -> None:
+    def _login(self, endpoint: TransportEndpoint) -> None:
         with self._refresh_operation():
-            self._login_scoped(endpoint, provider_session_id=provider_session_id)
+            self._login_scoped(endpoint)
 
-    def _login_scoped(
-        self,
-        endpoint: TransportEndpoint,
-        *,
-        provider_session_id: str | None = None,
-    ) -> None:
+    def _login_scoped(self, endpoint: TransportEndpoint) -> None:
         if self._session_usable:
             raise BaoStockSessionStateError("BaoStock session is already active")
 
@@ -548,7 +541,7 @@ class BaoStockProvider:
 
         last_error: BaoStockError | None = None
         for attempt in range(1, self.max_attempts + 1):
-            with provider_session_scope(provider_session_id) as session:
+            with provider_session_scope() as session:
                 self._provider_session_id = session.provider_session_id
                 with request_scope(endpoint, attempt=attempt, page=1):
                     try:
@@ -688,14 +681,9 @@ class BaoStockProvider:
         finally:
             self._discard_session()
 
-    def _ensure_session(
-        self,
-        endpoint: TransportEndpoint,
-        *,
-        provider_session_id: str | None = None,
-    ) -> None:
+    def _ensure_session(self, endpoint: TransportEndpoint) -> None:
         if not self._session_usable:
-            self._login(endpoint, provider_session_id=provider_session_id)
+            self._login(endpoint)
 
     def fetch(self, trade_date: date, symbols: Sequence[str] | None = None) -> ProviderBatch:
         if symbols is not None and len(set(symbols)) > self.max_explicit_symbols:
@@ -963,13 +951,13 @@ class BaoStockProvider:
         *,
         page_capture: Callable[[int, int, str, str, list[str], list[list[str]]], None]
         | None = None,
-        provider_session_id: str | None = None,
+        pagination_terminal: Callable[[], None] | None = None,
         capture_all_operation_outcomes: bool = False,
     ) -> tuple[list[str], list[list[str]]]:
         with self._refresh_operation():
             last_error: BaoStockError | None = None
             for attempt in range(1, self.max_attempts + 1):
-                self._ensure_session(endpoint, provider_session_id=provider_session_id)
+                self._ensure_session(endpoint)
                 self._pace_request()
                 try:
                     with self._request_scope(endpoint, attempt=attempt, page=1):
@@ -996,6 +984,7 @@ class BaoStockProvider:
                                         rows,
                                     )
                                 ),
+                                pagination_terminal=(pagination_terminal),
                             )
 
                         try:
