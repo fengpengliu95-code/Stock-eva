@@ -3,10 +3,13 @@
 **Author:** Codex root architecture lead  
 **Date:** 2026-08-12 (Asia/Shanghai)  
 **Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
-architecture amendment is **In Review — architecture amendment required** at exact clean code HEAD
-`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` (non-delivery). The three Task 7 rounds
-`6390366`, `c977a40`, `fea5678` were NO-GO. The dedicated R2-F2 design/implementation documents
-are the only contract authority; deployment and the R2-F0 production gate remain closed.
+architecture amendment is **Approved** at reviewed authority `52039a0` plus this approval metadata
+commit. The third-round independent IDENTITY SPEC REVIEW returned **GO (H0/M0/L1)**, and the user
+explicitly approved the breaking contract in the current conversation and authorized Task 7 to
+start. Exact code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains non-delivery; the three
+Task 7 rounds `6390366`, `c977a40`, `fea5678` remain NO-GO history. The dedicated R2-F2
+design/implementation documents are the only contract authority; deployment and the R2-F0
+production gate remain closed.
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
 **Scope:** R2-F0 through R2-F5  
@@ -57,13 +60,15 @@ but it does not erase completed work or rewrite old acceptance evidence.
 - R2-F1 remains offline-only: no real provider, installation, NAS, LaunchAgent or production
   execution occurred. The refresh LaunchAgent remains unloaded/frozen and R2-F0 remains
   production NO-GO.
-- R2-F2 Provider Evidence Framework is **In Review — architecture amendment required**. The prior
-  planning review at `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for implementation;
-  the exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is review evidence only.
-  Three Task 7 rounds were NO-GO. Option A remains normative: only the final successful attempt's
-  complete evidence is persisted; failed partial payloads are discarded and never quarantined.
-  Task 7–9 RED/GREEN is blocked pending independent architecture review and a new fix/replace
-  commit under the dedicated
+- R2-F2 Provider Evidence Framework is **Approved — architecture amendment** at reviewed authority
+  `52039a0` plus this approval metadata commit. The third-round independent IDENTITY SPEC REVIEW
+  returned **GO (H0/M0/L1)**, and the user explicitly approved the breaking contract and authorized
+  Task 7 to start. The prior planning review at `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is
+  historical; the exact code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains review
+  evidence only and non-delivery. Three Task 7 rounds remain NO-GO history. Option A remains
+  normative: only the final successful attempt's complete evidence is persisted; failed partial
+  payloads are discarded and never quarantined. Task 7–9 RED/GREEN may now proceed under the
+  dedicated
   [R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) and
   [R2-F2 implementation plan](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md),
   while deployment and all real-provider/production operations remain closed.
@@ -385,11 +390,16 @@ rate-limit changes and the mandatory soak can lengthen calendar time.
 - Corrupt evidence, schema/version mismatch or hash mismatch fails before normalization/promotion.
 - Existing historical manifests/rows remain readable without rewriting immutable objects.
 - GET requests remain write-free.
-- Only after an independent specification GO, explicit user approval of this breaking amendment and
-  a new reviewed fix/replace commit; `fea5678` and all earlier Task 7 commits remain non-delivery.
+- The architecture/spec gate is approved at `52039a0` plus this approval metadata commit, so Task 7
+  RED/GREEN may start under the dedicated whitelist. Any resulting implementation still requires
+  its own focused/full tests and independent review; `fea5678` and all earlier Task 7 commits remain
+  historical non-delivery.
 
-**Current gate:** In Review — architecture amendment required; three Task 7 rounds are NO-GO and
-independent spec review is still required.
+**Current gate:** **Approved — architecture amendment** at `52039a0` plus this approval metadata
+commit; independent IDENTITY SPEC REVIEW **GO (H0/M0/L1)** and explicit user approval are recorded.
+Task 7 may start, but no Task 7 implementation or R2-F2 delivery is claimed. The L1 note remains:
+only the legal final `next()` returning `has_row=False` produces `pagination_terminal`; full-page
+exhaustion is a protocol failure. `fea5678` and the earlier Task 7 rounds remain non-delivery history.
 
 ### R2-F3 — Shadow Bake-off
 

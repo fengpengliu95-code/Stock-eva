@@ -1,10 +1,11 @@
 # Stock EVA R2-F2 Provider Evidence Framework Implementation Plan
 
-> **Spec-first gate:** **In Review — architecture amendment required.** This plan is blocked until
-> [the R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md) receives independent
-> specification GO and explicit user approval of this breaking amendment. The exact code HEAD
-> `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is a non-delivery review baseline; no production
-> code, provider request or external operation is authorized by this plan.
+> **Spec-first gate:** **Approved — architecture amendment.** The third-round independent IDENTITY
+> SPEC REVIEW at `52039a0` returned **GO (H0/M0/L1)**, and the user explicitly approved this
+> breaking amendment in the current conversation and authorized Task 7 to start from this reviewed
+> specification. The exact code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains a
+> non-delivery review baseline; no Task 7 implementation or R2-F2 delivery is claimed, and no
+> production code, provider request or external operation is authorized by this plan.
 
 **Goal:** Capture one bounded, sanitized BaoStock source-shaped session, publish immutable evidence,
 normalize only from that evidence, replay it offline, and record complete candidate/selection
@@ -22,10 +23,10 @@ network request, installation, production database mutation, pointer mutation, L
 or external communication is authorized by this plan. The existing production refresh remains
 unloaded/frozen.
 
-**Specification review state:** **In Review — architecture amendment required.** The prior approval
-metadata is superseded. Three Task 7 rounds (`6390366`, `c977a40`, `fea5678`) were NO-GO; H5/M6
-are reconstructed in the dedicated design. A new independent review and a new fix/replace commit
-are required before RED. Option A final-success-only evidence remains normative.
+**Specification review state:** **Approved — architecture amendment.** The third-round independent
+IDENTITY SPEC REVIEW at `52039a0` is **GO (H0/M0/L1)**, and the user approval above authorizes Task
+7 RED/GREEN to start. Three historical Task 7 rounds (`6390366`, `c977a40`, `fea5678`) remain
+NO-GO; `fea5678` remains non-delivery. Option A final-success-only evidence remains normative.
 
 **Prior review evidence (non-authoritative):** The independent final review checked FR-1–FR-33,
 NFR-1–NFR-18, AC-1–AC-20, EC-1–EC-26, the eight-group factor snapshot descriptor mapping in
@@ -73,8 +74,9 @@ page transport evidence for page 1 or page N, and every successful COMPLETE fram
 page MUST have `end_marker_seen=True`; false/missing is a frame/protocol failure. This flag does
 not terminate logical pagination. `_read_result()` consumes successful rows then calls `result.next()`:
 `has_row=True` enters the next page, and `has_row=False` emits exactly one internal registry
-`pagination_terminal` event, which is not a F0.1 field/stage/outcome/provider code and creates no
-object. Page 1 may have the frame marker and still enter page 2. Each page of a final-success
+`pagination_terminal` event only for the legal final transition; full-page exhaustion is a
+protocol failure, not pagination termination. The event is not a F0.1 field/stage/outcome/provider
+code and creates no object. Page 1 may have the frame marker and still enter page 2. Each page of a final-success
 attempt binds its matching COMPLETE digest, never the OPERATION digest; the root OPERATION remains aggregate
 evidence and drives the completion without binding an object. Login/relogin and failed-attempt observations (including
 partial pages) remain aggregate-only and produce no `TransportLineageRef`, descriptor, object or
@@ -893,11 +895,12 @@ implicit coverage from a broader range.
 
 ### Acceptance document and independent final review
 
-This amendment's current gate is **In Review — architecture amendment required**. Do not create an
-acceptance GO record, do not call `fea5678` delivery, and do not advance to Task 8 or Task 9 until
-the identity contract receives an independent specification GO, the user explicitly approves that
-GO because this is a breaking contract amendment, and a new reviewed fix/replace commit passes the
-named tests. The final handoff MUST report this deliberate In Review state and both approval gates.
+This amendment's current gate is **Approved — architecture amendment** at reviewed authority
+`52039a0`, with independent IDENTITY SPEC REVIEW **GO (H0/M0/L1)** and explicit user approval in
+the current conversation authorizing Task 7 to start. Do not create an acceptance GO record or call
+`fea5678` delivery; no Task 7 implementation or R2-F2 delivery is claimed here. The final handoff
+must retain the approval metadata, the three historical NO-GO rounds and the deliberate boundary
+that provider/network/NAS/production operations remain unauthorized.
 
 Create `docs/acceptance/release-2-r2f2.md` only after the universal gate. It MUST state:
 

@@ -31,14 +31,17 @@ production NO-GO. See
 [R2-F1 acceptance](../acceptance/release-2-r2f1.md). The code gate is complete, but this does not
 authorize installation, real provider access, production repair or R2-F2.
 
-**Current gate:** R2-F1 is complete. R2-F2 is **In Review — architecture amendment required** at
-exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` (non-delivery). The prior planning
-review at `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for implementation; three Task 7
-rounds (`6390366`, `c977a40`, `fea5678`) were NO-GO. The user-selected Option A boundary persists
-only final successful attempt evidence and discards failed partial payloads without quarantine. The
+**Current gate:** R2-F1 is complete. R2-F2 is **Approved — architecture amendment** at reviewed
+authority `52039a0` plus this approval metadata commit. The third-round independent IDENTITY SPEC
+REVIEW returned **GO (H0/M0/L1)**, and the user explicitly approved the breaking contract in the
+current conversation and authorized Task 7 to start. Exact clean code HEAD
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains non-delivery; the prior planning review at
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is historical and the three Task 7 rounds
+(`6390366`, `c977a40`, `fea5678`) remain NO-GO. The user-selected Option A boundary persists only
+final successful attempt evidence and discards failed partial payloads without quarantine. The
 dedicated R2-F2 design and implementation plan are the only contract authority; Task 7–9 RED/code
-may begin only after independent architecture review and a new fix/replace commit within their
-offline boundary. A second source
+may now begin within their offline boundary. No Task 7 implementation or R2-F2 delivery is claimed
+by this metadata update. A second source
 must still pass at least 20 consecutive trading sessions of
 whole-session shadow qualification; do not mix providers by symbol, and keep automatic failover
 disabled until shadow, qualification and a separately approved manual failover stage are complete.
@@ -628,12 +631,14 @@ scheduling remains usable; do not delete repair tables or audit history.
 
 **Dedicated specification:** [R2-F2 Provider Evidence Framework Design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md)<br>
 **Dedicated implementation plan:** [R2-F2 Provider Evidence Framework Implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)<br>
-**Specification status:** **In Review — architecture amendment required**. The prior independent
-H0/M0 review at planning HEAD `474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is superseded for
-implementation; exact clean code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` and the three
-Task 7 rounds are review evidence only, all NO-GO. Tasks 7–9 remain blocked pending independent
-architecture review and a new fix/replace commit under the dedicated documents. The dedicated
-documents are the only authority for
+**Specification status:** **Approved — architecture amendment** at reviewed authority `52039a0`
+plus this approval metadata commit. The third-round independent IDENTITY SPEC REVIEW returned
+**GO (H0/M0/L1)**, and the user explicitly approved this breaking contract in the current
+conversation and authorized Task 7 to start. The prior independent H0/M0 review at planning HEAD
+`474b5126b0b8f96dd641d4061e67c1526ea1e0d0` is historical; exact clean code HEAD
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` and the three Task 7 rounds remain review evidence
+only, all NO-GO/non-delivery. Tasks 7–9 may proceed under the dedicated documents; no Task 7
+implementation or R2-F2 delivery is claimed. The dedicated documents are the only authority for
 models, endpoint contracts, factor-cache fields, file whitelists, tests, gates and rollback; this
 umbrella section is intentionally non-normative and contains no duplicate pseudo-code or legacy
 field contract.
@@ -647,9 +652,10 @@ field contract.
 | Task 9 | Ten-outcome gate aggregate, complete-session candidate/selection lineage and additive legacy-source compatibility. | One BaoStock candidate per session; no symbol-level mixing, fallback or second provider. |
 
 Each task follows the dedicated implementation plan's RED → minimal GREEN → focused/full tests →
-Ruff/diff → independent High/Medium review gate. The breaking amended dedicated design requires
-independent specification GO followed by explicit user approval before it can become Approved;
-then Tasks 7 → 8 → 9 execute linearly, with a new fix/review cycle for every High or Medium. The
+Ruff/diff → independent High/Medium review gate. The breaking amended dedicated design has now
+received independent IDENTITY SPEC REVIEW **GO (H0/M0/L1)** and explicit user approval at
+`52039a0` plus this approval metadata commit; Task 7 may start, then Tasks 7 → 8 → 9 execute
+linearly, with a new fix/review cycle for every High or Medium. The
 umbrella roadmap does not repeat task files or commands; reviewers must inspect the dedicated
 whitelists at the exact task commit.
 
@@ -661,7 +667,9 @@ objects, and login/failed observations produce no page lineage/object. `end_mark
 complete per-frame protocol-tail flag and every successful page `COMPLETE` (including page 1 before
 page 2) requires it true; missing/false fails closed. Only `_read_result()`'s `result.next()` control
 flow emits one internal registry `pagination_terminal` on `has_row=False`; it is not a F0.1
-field/stage/outcome/provider code and creates no object. Factor snapshot descriptors
+field/stage/outcome/provider code and creates no object. The L1 implementation note is retained:
+only the legal final `next()` returning `has_row=False` produces `pagination_terminal`; full-page
+exhaustion is a protocol failure. Factor snapshot descriptors
 use a local `capture_id` with provider/session/page identity fields null; object/raw-page-row/
 completion-attempt cardinalities are exact. Exact current version constants, typed suspended blank
 handling, factor `(dividOperateDate, code)`/symbol rules with daily-factor exact-session versus

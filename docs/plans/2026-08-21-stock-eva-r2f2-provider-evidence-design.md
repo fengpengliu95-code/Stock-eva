@@ -2,10 +2,12 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-21 (Asia/Shanghai)
-**Status:** In Review — architecture amendment required; implementation is blocked and this
-document is not approved
-**Decision authority:** User approved the R2-F2 direction and Option A on 2026-08-21; the prior
-planning review is historical evidence only and does not approve this amended architecture.
+**Status:** **Approved — architecture amendment; Task 7 authorized to start, implementation not
+delivered**
+**Decision authority:** The third-round independent IDENTITY SPEC REVIEW at `52039a0` returned
+**GO (H0/M0/L1)**, and the user explicitly approved this breaking contract in the current
+conversation and authorized Task 7 to start from that reviewed specification. The prior planning
+review is historical evidence only.
 **Scope:** R2-F2 offline code and synthetic tests only; one BaoStock compatibility adapter.
 **Baseline:** branch `codex/r2-f2-provider-evidence`, exact clean code HEAD
 `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9`; this code HEAD is review evidence only and is not a
@@ -30,9 +32,11 @@ provider, automatic failover, production refresh, installation, NAS access or La
 
 ## Architecture amendment (authoritative revision before any RED)
 
-This revision is documentation-only. It changes status to **In Review — architecture amendment
-required** and deliberately does not self-approve. The exact code HEAD `fea5678` is a non-delivery
-review baseline. The normative Option A successful-attempt-only rule remains unchanged.
+This revision is documentation-only. It records the independent IDENTITY SPEC REVIEW GO at
+`52039a0` (H0/M0/L1) and the user's explicit approval of the breaking contract, authorizing Task 7
+to start from this specification. The exact code HEAD `fea5678` remains a historical non-delivery
+review baseline; no Task 7 implementation or R2-F2 delivery is claimed. The normative Option A
+successful-attempt-only rule remains unchanged.
 
 ### Task 7 review history and reconstructed H5/M6 findings
 
@@ -2274,10 +2278,13 @@ authorize real Provider/NAS/install/LaunchAgent/production execution.
 
 ## Review gate
 
-Status is **In Review — architecture amendment required**. The three Task 7 rounds are NO-GO and
-`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` is non-delivery. An independent specification review
-MUST issue a specification GO for this identity amendment before RED; because this is a breaking
-contract amendment, the user MUST then explicitly approve that reviewed GO before any new
-fix/replace commit or RED test. The new fix/replace commit must pass the named tests and review gate.
-No self-approval, provider request, external operation or production change is authorized. The
-amended linear implementation plan below remains blocked until both gates.
+Status is **Approved — architecture amendment**. The third-round independent IDENTITY SPEC REVIEW
+at exact reviewed doc/code state `52039a0` returned **GO (H0/M0/L1)**, and the user explicitly
+approved this breaking contract in the current conversation and authorized Task 7 to start from
+this authority. The three historical Task 7 rounds remain NO-GO and
+`fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains non-delivery. The L1 implementation note is
+retained: only the legal final `_read_result()` `next()` returning `has_row=False` produces
+`pagination_terminal`; an apparent full-page exhaustion is a protocol failure, not pagination
+termination. This approval authorizes the next Task 7 RED/GREEN work under the frozen whitelist;
+it does not claim Task 7 implementation or R2-F2 delivery, and it does not authorize provider,
+network, NAS, installation, LaunchAgent or production operations.
