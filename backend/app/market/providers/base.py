@@ -287,6 +287,7 @@ class RequestCompletion(_ContractModel):
     successful_request_id: SafeIdentifier | None = None
     final_outcome: TransportOutcome
     row_count: int = Field(default=0, ge=0, le=10_000_000)
+    observed_pages: tuple[int, ...] = ()
 
     @model_validator(mode="after")
     def validate_final_attempt(self) -> RequestCompletion:
@@ -313,6 +314,10 @@ class RequestCompletion(_ContractModel):
             raise ValueError("failed completion cannot bind a successful attempt")
         if self.final_outcome is TransportOutcome.ERROR and self.row_count != 0:
             raise ValueError("failed completion row count must be zero")
+        final_pages = self.attempts[-1].observed_pages
+        if self.observed_pages and self.observed_pages != final_pages:
+            raise ValueError("completion observed pages do not match final attempt")
+        object.__setattr__(self, "observed_pages", final_pages)
         return self
 
     def compute_hash(self) -> str:
@@ -818,6 +823,8 @@ class ProviderRawBatch(_ContractModel):
     def validate_session_binding(self) -> ProviderRawBatch:
         if self.provider_id is not self.request.provider_id:
             raise ValueError("raw batch provider does not match request")
+        if self.logical_request_plan != self.request.request_plan:
+            raise ValueError("raw batch logical request plan does not bind request")
         if self.request_plan_hash != self.logical_request_plan.compute_hash():
             raise ValueError("raw batch request plan hash mismatch")
         if self.completed_at < self.started_at:
@@ -832,45 +839,91 @@ class ProviderRawBatch(_ContractModel):
             for item in self.request_completions
             if item.final_outcome is TransportOutcome.SUCCESS
         }
-        if tuple(item.plan_ordinal for item in self.endpoint_batches) != tuple(successful):
+        if any(item.plan_ordinal not in successful for item in self.endpoint_batches):
             raise ValueError("raw endpoint batch cardinality mismatch")
-        batches = {item.plan_ordinal: item for item in self.endpoint_batches}
-        if len(self.endpoint_summaries) != len(self.endpoint_batches):
+        expected_batch_order = tuple(
+            (item.plan_ordinal, item.lineage.attempt, item.lineage.page)
+            for item in sorted(
+                self.endpoint_batches,
+                key=lambda item: (item.plan_ordinal, item.lineage.attempt, item.lineage.page),
+            )
+        )
+        actual_batch_order = tuple(
+            (item.plan_ordinal, item.lineage.attempt, item.lineage.page)
+            for item in self.endpoint_batches
+        )
+        if actual_batch_order != expected_batch_order:
+            raise ValueError("raw endpoint batches must be ordered by plan and page")
+        batches_by_ordinal: dict[int, list[RawEndpointBatch]] = {}
+        batch_keys: set[tuple[int, str, int, str, int]] = set()
+        for item in self.endpoint_batches:
+            key = (
+                item.plan_ordinal,
+                item.lineage.request_id,
+                item.lineage.attempt,
+                item.lineage.endpoint.value,
+                item.lineage.page,
+            )
+            if key in batch_keys:
+                raise ValueError("duplicate raw endpoint page")
+            batch_keys.add(key)
+            batches_by_ordinal.setdefault(item.plan_ordinal, []).append(item)
+        if len(self.endpoint_summaries) != len(successful):
             raise ValueError("raw endpoint summary cardinality mismatch")
 
-        def summary_key(item: RawEndpointBatch | EndpointContractSummary):
+        def contract_key(item: RawEndpointBatch | EndpointContractSummary):
             return (
                 str(item.endpoint),
                 str(item.request_role),
                 "" if item.instrument_role is None else str(item.instrument_role),
                 str(item.schema_variant),
-                item.row_count,
             )
 
-        batch_summary_keys = sorted(summary_key(item) for item in self.endpoint_batches)
-        summary_keys = sorted(summary_key(item) for item in self.endpoint_summaries)
-        if batch_summary_keys != summary_keys:
+        expected_summaries = sorted(
+            (
+                contract_key(group[0]),
+                len(group),
+                sum(item.row_count for item in group),
+            )
+            for group in batches_by_ordinal.values()
+        )
+        actual_summaries = sorted(
+            (contract_key(item), item.batch_count, item.row_count)
+            for item in self.endpoint_summaries
+        )
+        if expected_summaries != actual_summaries:
             raise ValueError("raw endpoint summaries do not bind source batches")
-        if any(
-            item.row_count != batches[item.plan_ordinal].row_count for item in successful.values()
-        ):
-            raise ValueError("successful completion row count mismatch")
         for completion in self.request_completions:
-            batch = batches.get(completion.plan_ordinal)
+            batches = batches_by_ordinal.get(completion.plan_ordinal, [])
             if completion.final_outcome is TransportOutcome.ERROR:
-                if completion.row_count != 0 or batch is not None:
+                if completion.row_count != 0 or batches:
                     raise ValueError("failed completion cannot persist source rows")
                 continue
-            if batch is None or completion.successful_request_id is None:
+            if not batches or completion.successful_request_id is None:
                 raise ValueError("successful completion requires source batch")
-            lineage = batch.lineage
-            if (
-                lineage.plan_ordinal != completion.plan_ordinal
-                or lineage.request_id != completion.successful_request_id
-                or lineage.attempt != completion.successful_attempt
-                or lineage.endpoint != batch.endpoint
+            if any(
+                item.lineage.attempt != completion.successful_attempt
+                or item.lineage.plan_ordinal != completion.plan_ordinal
+                for item in batches
             ):
                 raise ValueError("source batch lineage does not bind completion")
+            pages = tuple(item.lineage.page for item in batches)
+            if pages != tuple(sorted(pages)) or pages != completion.attempts[-1].observed_pages:
+                raise ValueError("source batch pages do not bind completion")
+            if completion.row_count != sum(item.row_count for item in batches):
+                raise ValueError("successful completion row count mismatch")
+        for item in self.transport_lineage:
+            if (
+                item.refresh_id != self.request.refresh_id
+                or item.provider_session_id != self.request.provider_session_id
+            ):
+                raise ValueError("transport lineage does not bind request session")
+        for item in self.transport_observations.observations:
+            if (
+                item.refresh_id != self.request.refresh_id
+                or item.provider_session_id != self.request.provider_session_id
+            ):
+                raise ValueError("transport observation does not bind request session")
         lineage_keys = sorted(
             (
                 (
@@ -899,6 +952,10 @@ class ProviderRawBatch(_ContractModel):
             )
             for item in self.transport_observations.observations
         )
+        if len(lineage_keys) != len(set(lineage_keys)):
+            raise ValueError("duplicate transport lineage projection")
+        if len(projection_keys) != len(set(projection_keys)):
+            raise ValueError("duplicate transport observation projection")
         if lineage_keys != projection_keys:
             raise ValueError("transport lineage and observations do not join exactly")
         expected_completion_hash = _digest(
@@ -945,6 +1002,14 @@ class _ProviderRegistry(_ContractModel):
         "unadjusted_ohlcv_back_adjust_factor"
     )
     admission_state: Literal["qualified"] = "qualified"
+
+    @model_validator(mode="after")
+    def validate_authoritative_versions(self) -> _ProviderRegistry:
+        if self.adapter_version != "r2f2.v1":
+            raise ValueError("unsupported provider adapter version")
+        if self.endpoint_contract_version != "r2f2-endpoints.v1":
+            raise ValueError("unsupported endpoint contract version")
+        return self
 
 
 def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch) -> None:
@@ -1001,7 +1066,6 @@ def validate_raw_date_binding(request: ProviderRequest, batch: RawEndpointBatch)
         seen_symbols.add(code)
     if batch.endpoint in {
         ProviderEndpoint.DAILY_ASTOCK,
-        ProviderEndpoint.DAILY_FACTOR,
         ProviderEndpoint.INDEX_HISTORY,
     }:
         if seen_symbols != expected_symbols:

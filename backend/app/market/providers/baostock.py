@@ -18,11 +18,12 @@ from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.models import DailyBar
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.provider_transport import (
-    ProviderEndpoint as TransportEndpoint,
-)
-from backend.app.market.provider_transport import (
+    ProtocolStage,
     TransportObservation,
     TransportOutcome,
+)
+from backend.app.market.provider_transport import (
+    ProviderEndpoint as TransportEndpoint,
 )
 
 from .base import (
@@ -84,11 +85,10 @@ class BaoStockProviderAdapter:
         raw_observations: list[TransportObservation] = []
         with transport_observation_sink(raw_observations.append):
             with self._incumbent.refresh_operation(request.refresh_id):
-                self._incumbent._login(TransportEndpoint.TRADE_DATES)
-                # The incumbent creates its session inside login.  Rebinding the
-                # scoped id here keeps the typed request identity joinable without
-                # changing the incumbent's login/retry behavior.
-                self._incumbent._provider_session_id = request.provider_session_id
+                self._incumbent._login(
+                    TransportEndpoint.TRADE_DATES,
+                    provider_session_id=request.provider_session_id,
+                )
                 try:
                     for logical in request.request_plan.requests:
                         (
@@ -98,7 +98,7 @@ class BaoStockProviderAdapter:
                             logical_observations,
                             summary,
                         ) = self._fetch_logical(request, logical, raw_observations)
-                        endpoint_batches.append(batch)
+                        endpoint_batches.extend(batch)
                         completions.append(completion)
                         lineages.extend(logical_lineages)
                         observations.extend(logical_observations)
@@ -141,14 +141,17 @@ class BaoStockProviderAdapter:
         logical: ExpectedLogicalRequest,
         raw_observations: list[TransportObservation],
     ) -> tuple[
-        RawEndpointBatch,
+        tuple[RawEndpointBatch, ...],
         RequestCompletion,
         tuple[TransportLineageRef, ...],
         tuple[TransportObservationProjection, ...],
         EndpointContractSummary,
     ]:
         endpoint = TransportEndpoint(logical.endpoint.value)
-        captured_pages: list[tuple[int, int, list[str], list[list[str]]]] = []
+        contract = endpoint_contract_for(
+            logical.endpoint, logical.instrument_role, logical.schema_variant
+        )
+        captured_pages: list[tuple[int, int, str, str, list[str], list[list[str]]]] = []
         observation_start = len(raw_observations)
 
         def operation():
@@ -157,20 +160,28 @@ class BaoStockProviderAdapter:
         fields, rows = self._incumbent._read(
             endpoint,
             operation,
-            page_capture=lambda attempt, page, page_fields, page_rows: captured_pages.append(
-                (attempt, page, page_fields, page_rows)
+            page_capture=lambda attempt, page, request_id, session_id, page_fields, page_rows: (
+                captured_pages.append(
+                    (attempt, page, request_id, session_id, page_fields, page_rows)
+                )
             ),
-            session_binding=lambda: setattr(
-                self._incumbent, "_provider_session_id", request.provider_session_id
-            ),
+            provider_session_id=request.provider_session_id,
+            capture_all_operation_outcomes=True,
         )
+        if tuple(fields) != contract.fields or any(
+            tuple(page_fields) != contract.fields for _, _, _, _, page_fields, _ in captured_pages
+        ):
+            raise ValueError("source schema does not match endpoint contract")
         logical_observations = tuple(
             item for item in raw_observations[observation_start:] if item.endpoint is endpoint
         )
         if not logical_observations:
             raise RuntimeError("BaoStock transport observation was not captured")
+        operation_observations = tuple(
+            item for item in logical_observations if item.protocol_stage is ProtocolStage.OPERATION
+        )
         successful = tuple(
-            item for item in logical_observations if item.outcome is TransportOutcome.SUCCESS
+            item for item in operation_observations if item.outcome is TransportOutcome.SUCCESS
         )
         if not successful:
             raise RuntimeError("BaoStock logical request has no successful observation")
@@ -178,22 +189,10 @@ class BaoStockProviderAdapter:
         successful_pages = tuple(item for item in captured_pages if item[0] == successful_attempt)
         if not successful_pages:
             raise RuntimeError("BaoStock successful request has no captured source page")
-        successful_fields = successful_pages[0][2]
-        successful_rows = [row for _, _, _, page_rows in successful_pages for row in page_rows]
+        successful_fields = successful_pages[0][4]
+        successful_rows = [row for *_, page_rows in successful_pages for row in page_rows]
         if successful_fields != fields or successful_rows != rows:
             raise RuntimeError("BaoStock source capture disagrees with normalized read result")
-        final_observation = max(
-            successful,
-            key=lambda item: (item.attempt, item.page, item.observed_at),
-        )
-        contract = endpoint_contract_for(
-            logical.endpoint, logical.instrument_role, logical.schema_variant
-        )
-        typed_rows = tuple(self._typed_row(logical, fields, row) for row in successful_rows)
-        row_digest = sha256(
-            json.dumps(successful_rows, ensure_ascii=False, separators=(",", ":")).encode()
-        ).hexdigest()
-        observation = TransportObservationProjection.from_observation(final_observation)
         projections = tuple(
             TransportObservationProjection.from_observation(item) for item in logical_observations
         )
@@ -210,63 +209,97 @@ class BaoStockProviderAdapter:
             )
             for item, projection in zip(logical_observations, projections, strict=True)
         )
-        lineage = next(
-            item
-            for item in lineages
-            if item.request_id == observation.request_id
-            and item.attempt == observation.attempt
-            and item.page == observation.page
-        )
-        endpoint_batch = RawEndpointBatch(
-            endpoint=logical.endpoint,
-            schema_variant=logical.schema_variant,
-            request_role=logical.request_role,
-            instrument_role=logical.instrument_role,
-            plan_ordinal=logical.plan_ordinal,
-            shard_id=logical.shard_id,
-            lineage=lineage,
-            rows=typed_rows,
-            row_count=len(typed_rows),
-            source_schema=contract.schema_variant,
-            fields=contract.fields,
-            units=contract.units,
-            date_semantics=contract.date_semantics,
-            pagination_policy=contract.pagination_policy,
-            provider_row_order_digest=row_digest,
+
+        def page_lineage(captured: tuple[int, int, str, str, list[str], list[list[str]]]):
+            attempt, page, request_id, session_id, _, _ = captured
+            candidates = [
+                (item, lineage)
+                for item, lineage in zip(logical_observations, lineages, strict=True)
+                if item.request_id == request_id
+                and item.provider_session_id == session_id
+                and item.attempt == attempt
+                and item.page == page
+                and item.protocol_stage
+                in {ProtocolStage.OPERATION, ProtocolStage.COMPLETE, ProtocolStage.PAGINATION}
+            ]
+            if not candidates:
+                raise RuntimeError("BaoStock source page has no transport observation")
+            operation_candidates = [
+                lineage
+                for item, lineage in candidates
+                if item.protocol_stage is ProtocolStage.OPERATION
+            ]
+            if len(operation_candidates) > 1:
+                raise RuntimeError("BaoStock source page has duplicate operation observations")
+            if operation_candidates:
+                return operation_candidates[0]
+            if len(candidates) != 1:
+                raise RuntimeError("BaoStock source page has ambiguous terminal observations")
+            return candidates[0][1]
+
+        endpoint_batches = tuple(
+            RawEndpointBatch(
+                endpoint=logical.endpoint,
+                schema_variant=logical.schema_variant,
+                request_role=logical.request_role,
+                instrument_role=logical.instrument_role,
+                plan_ordinal=logical.plan_ordinal,
+                shard_id=logical.shard_id,
+                lineage=page_lineage(captured),
+                rows=tuple(self._typed_row(logical, fields, row) for row in page_rows),
+                row_count=len(page_rows),
+                source_schema=contract.schema_variant,
+                fields=contract.fields,
+                units=contract.units,
+                date_semantics=contract.date_semantics,
+                pagination_policy=contract.pagination_policy,
+                provider_row_order_digest=sha256(
+                    json.dumps(page_rows, ensure_ascii=False, separators=(",", ":")).encode()
+                ).hexdigest(),
+            )
+            for captured in successful_pages
+            for page_rows in (captured[5],)
         )
         attempts: list[AttemptCompletion] = []
-        for attempt_number in sorted({item.attempt for item in logical_observations}):
+        for attempt_number in sorted({item.attempt for item in operation_observations}):
             attempt_observations = tuple(
-                item for item in logical_observations if item.attempt == attempt_number
+                item for item in operation_observations if item.attempt == attempt_number
             )
             attempt_success = any(
                 item.outcome is TransportOutcome.SUCCESS for item in attempt_observations
             )
             attempt_pages = tuple(
                 sorted(
-                    {page for attempt, page, _, _ in captured_pages if attempt == attempt_number}
+                    {
+                        page
+                        for attempt, page, _, _, _, _ in captured_pages
+                        if attempt == attempt_number
+                    }
                 )
             )
+            attempt_observation = attempt_observations[-1]
             attempts.append(
                 AttemptCompletion(
                     plan_ordinal=logical.plan_ordinal,
                     attempt=attempt_number,
-                    request_id=attempt_observations[-1].request_id,
+                    request_id=attempt_observation.request_id,
                     observed_pages=attempt_pages,
                     observed_page_count=len(attempt_pages),
                     terminal=attempt_success,
-                    outcome=(
-                        TransportOutcome.SUCCESS if attempt_success else TransportOutcome.ERROR
-                    ),
+                    outcome=(attempt_observation.outcome),
                 )
             )
+        final_observation = max(
+            successful,
+            key=lambda item: (item.attempt, item.page, item.observed_at),
+        )
         completion = RequestCompletion(
             plan_ordinal=logical.plan_ordinal,
             attempts=tuple(attempts),
             successful_attempt=final_observation.attempt,
             successful_request_id=final_observation.request_id,
             final_outcome=TransportOutcome.SUCCESS,
-            row_count=len(typed_rows),
+            row_count=sum(item.row_count for item in endpoint_batches),
         )
         summary = EndpointContractSummary(
             endpoint=contract.endpoint,
@@ -278,10 +311,10 @@ class BaoStockProviderAdapter:
             units=contract.units,
             date_semantics=contract.date_semantics,
             pagination_policy=contract.pagination_policy,
-            batch_count=1,
-            row_count=len(typed_rows),
+            batch_count=len(endpoint_batches),
+            row_count=sum(item.row_count for item in endpoint_batches),
         )
-        return endpoint_batch, completion, lineages, projections, summary
+        return endpoint_batches, completion, lineages, projections, summary
 
     def _query(self, endpoint: TransportEndpoint, logical: ExpectedLogicalRequest):
         iso_date = logical.start_date.isoformat()

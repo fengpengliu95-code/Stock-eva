@@ -10,11 +10,13 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import pytest
 
 from backend.app.market.baostock import DAILY_FIELDS
+from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
     ProtocolStage,
@@ -189,7 +191,11 @@ def _attempt(
     )
 
 
-def _lineage(*, endpoint: ProviderEndpoint = ProviderEndpoint.DAILY_ASTOCK) -> TransportLineageRef:
+def _lineage(
+    *,
+    endpoint: ProviderEndpoint = ProviderEndpoint.DAILY_ASTOCK,
+    observation_digest: str = SHA,
+) -> TransportLineageRef:
     return TransportLineageRef(
         refresh_id="refresh-1",
         provider_session_id="session-1",
@@ -198,7 +204,7 @@ def _lineage(*, endpoint: ProviderEndpoint = ProviderEndpoint.DAILY_ASTOCK) -> T
         plan_ordinal=0,
         attempt=1,
         page=1,
-        observation_digest=SHA,
+        observation_digest=observation_digest,
     )
 
 
@@ -280,6 +286,7 @@ def _provider_raw_batch() -> ProviderRawBatch:
         row_count=1,
     )
     projection = _projection()
+    valid_lineage = _lineage(observation_digest=projection.observation_digest)
     return ProviderRawBatch(
         provider_id=ProviderId.BAOSTOCK,
         request=_provider_request(plan=plan),
@@ -290,7 +297,7 @@ def _provider_raw_batch() -> ProviderRawBatch:
         normalization_clock_utc=NOW,
         logical_request_plan=plan,
         request_plan_hash=plan.request_plan_hash,
-        endpoint_batches=(_batch(),),
+        endpoint_batches=(_batch(lineage=valid_lineage),),
         request_completions=(completion,),
         completion_hash=sha256(
             json.dumps(
@@ -299,7 +306,7 @@ def _provider_raw_batch() -> ProviderRawBatch:
                 separators=(",", ":"),
             ).encode()
         ).hexdigest(),
-        transport_lineage=(_lineage(),),
+        transport_lineage=(valid_lineage,),
         transport_observations=TransportObservationAggregate.from_observations((projection,)),
         endpoint_summaries=(summary,),
     )
@@ -357,8 +364,14 @@ class _SdkResult:
 class _CompleteSdkClient:
     """Offline BaoStock-shaped client with every incumbent query method."""
 
-    def __init__(self, *, response_date: str = "2026-08-20") -> None:
+    def __init__(
+        self,
+        *,
+        response_date: str = "2026-08-20",
+        schema_overrides: dict[str, list[str]] | None = None,
+    ) -> None:
         self.response_date = response_date
+        self.schema_overrides = schema_overrides or {}
         self.calls: list[tuple[str, object, object]] = []
         self.login_calls = 0
         self.logout_calls = 0
@@ -374,35 +387,68 @@ class _CompleteSdkClient:
         context = current_request_context()
         self.calls.append((name, args, context))
 
+    def _fields(self, name: str, default: list[str]) -> list[str]:
+        return self.schema_overrides.get(name, default)
+
     def query_trade_dates(self, **kwargs):
         self._record("query_trade_dates", kwargs)
-        return _SdkResult(["calendar_date", "is_trading_day"], [[self.response_date, "1"]])
+        return _SdkResult(
+            self._fields("trade_dates", ["calendar_date", "is_trading_day"]),
+            [[self.response_date, "1"]],
+        )
 
     def query_all_stock(self, **kwargs):
         self._record("query_all_stock", kwargs)
-        return _SdkResult(["code", "tradeStatus", "code_name"], [["sh.600000", "1", "fixture"]])
+        return _SdkResult(
+            self._fields("all_stock", ["code", "tradeStatus", "code_name"]),
+            [["sh.600000", "1", "fixture"]],
+        )
 
     def query_daily_history_k_AStock(self, **kwargs):
         self._record("query_daily_history_k_AStock", kwargs)
-        return _SdkResult(DAILY_FIELDS.split(","), [self._daily_row("sh.600000")])
+        return _SdkResult(
+            self._fields("daily_astock", DAILY_FIELDS.split(",")),
+            [self._daily_row("sh.600000")],
+        )
 
     def query_daily_adjust_factor(self, **kwargs):
         self._record("query_daily_adjust_factor", kwargs)
         return _SdkResult(
-            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            self._fields(
+                "daily_factor",
+                [
+                    "code",
+                    "dividOperateDate",
+                    "foreAdjustFactor",
+                    "backAdjustFactor",
+                    "adjustFactor",
+                ],
+            ),
             [["sh.600000", self.response_date, "1", "0.8", "0.8"]],
         )
 
     def query_adjust_factor(self, code, **kwargs):
         self._record("query_adjust_factor", code, kwargs)
         return _SdkResult(
-            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            self._fields(
+                "adjust_factor",
+                [
+                    "code",
+                    "dividOperateDate",
+                    "foreAdjustFactor",
+                    "backAdjustFactor",
+                    "adjustFactor",
+                ],
+            ),
             [[code, self.response_date, "1", "0.8", "0.8"]],
         )
 
     def query_history_k_data_plus(self, code, fields, **kwargs):
         self._record("query_history_k_data_plus", code, fields, kwargs)
-        return _SdkResult(fields.split(","), [self._daily_row(code)])
+        return _SdkResult(
+            self._fields("index_history", fields.split(",")),
+            [self._daily_row(code)],
+        )
 
     def _daily_row(self, code: str) -> list[str]:
         values = {
@@ -437,6 +483,83 @@ class _RetryingSdkClient(_CompleteSdkClient):
         result = _SdkResult(DAILY_FIELDS.split(","), [self._daily_row("sh.600000")])
         if self.daily_calls == 1:
             result.per_page_count = 1
+        return result
+
+
+class _SessionRecordingClient(_CompleteSdkClient):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.login_provider_sessions: list[str] = []
+
+    def login(self):
+        self.login_provider_sessions.append(current_request_context().provider_session_id)
+        return super().login()
+
+
+class _PagedSdkResult:
+    error_code = "0"
+    error_msg = ""
+
+    def __init__(self, pages: list[list[list[str]]], *, fail_transition: bool = False) -> None:
+        self._pages = pages
+        self._page_index = 0
+        self._fail_transition = fail_transition
+        self.data = [list(row) for row in pages[0]]
+        self.fields = DAILY_FIELDS.split(",")
+        self.cur_page_num = "1"
+        self.cur_row_num = 0
+        self.per_page_count = len(self.data) if len(pages) > 1 else len(self.data) + 1
+        self.current = None
+
+    def _emit_page_observation(self, *, error: NormalizedTransportError | None = None) -> None:
+        emit_terminal_observation(
+            started_at=monotonic() - 0.001,
+            protocol_stage=ProtocolStage.PAGINATION,
+            recv_calls=1,
+            response_bytes=max(1, len(repr(self.data).encode())),
+            end_marker_seen=error is None,
+            provider_code=None,
+            normalized_error=error,
+        )
+
+    def next(self) -> bool:
+        if self.cur_row_num < len(self.data):
+            self.current = self.data[self.cur_row_num]
+            self.cur_row_num += 1
+            return True
+        if self._page_index + 1 >= len(self._pages):
+            return False
+        if self._fail_transition:
+            self._emit_page_observation(
+                error=NormalizedTransportError.RECV_TIMEOUT,
+            )
+            raise TimeoutError("fixture page transition failure")
+        self._page_index += 1
+        self.data = [list(row) for row in self._pages[self._page_index]]
+        self.cur_page_num = str(self._page_index + 1)
+        self.cur_row_num = 1
+        self.current = self.data[0]
+        self._emit_page_observation()
+        self.per_page_count = len(self.data) + 1
+        return True
+
+    def get_row_data(self):
+        return self.current
+
+
+class _TwoPageRetrySdkClient(_SessionRecordingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.daily_calls = 0
+
+    def query_daily_history_k_AStock(self, **kwargs):
+        self.daily_calls += 1
+        self._record("query_daily_history_k_AStock", kwargs)
+        second = self._daily_row("sh.600000")
+        second[2] = "10.1"
+        pages = [[self._daily_row("sh.600000")], [second]]
+        result = _PagedSdkResult(pages, fail_transition=self.daily_calls == 1)
+        result._emit_page_observation()
         return result
 
 
@@ -518,6 +641,20 @@ def test_each_baostock_endpoint_has_exact_fields_variant_units_and_order() -> No
         ("turn", "percent"),
         ("pctChg", "percent"),
     )
+    for contract in ENDPOINT_CONTRACTS:
+        if contract.endpoint in {ProviderEndpoint.DAILY_ASTOCK, ProviderEndpoint.INDEX_HISTORY}:
+            assert contract.fields == tuple(DAILY_FIELDS.split(","))
+        elif contract.endpoint in {
+            ProviderEndpoint.DAILY_FACTOR,
+            ProviderEndpoint.ADJUST_FACTOR,
+        }:
+            assert contract.fields == (
+                "code",
+                "dividOperateDate",
+                "foreAdjustFactor",
+                "backAdjustFactor",
+                "adjustFactor",
+            )
 
 
 def test_endpoint_contract_constant_rejects_wrong_combination_and_model_copy() -> None:
@@ -630,6 +767,29 @@ def test_provider_raw_batch_rejects_arbitrary_completion_hash() -> None:
         _provider_raw_batch().model_copy(update={"completion_hash": "f" * 64})
 
 
+def test_provider_raw_batch_valid_baseline_binds_request_plan_and_projection() -> None:
+    raw = _provider_raw_batch()
+    assert raw.request.request_plan == raw.logical_request_plan
+    assert raw.request_plan_hash == raw.logical_request_plan.request_plan_hash
+    assert raw.transport_lineage[0].observation_digest == (
+        raw.transport_observations.observations[0].observation_digest
+    )
+
+
+def test_provider_raw_batch_rejects_duplicate_projection_and_lineage() -> None:
+    raw = _provider_raw_batch()
+    projections = raw.transport_observations.observations * 2
+    with pytest.raises(ValueError):
+        raw.model_copy(
+            update={
+                "transport_lineage": raw.transport_lineage * 2,
+                "transport_observations": TransportObservationAggregate.from_observations(
+                    projections
+                ),
+            }
+        )
+
+
 def test_request_completion_rejects_empty_duplicate_noncontiguous_pages_or_terminal_marker() -> (
     None
 ):
@@ -711,6 +871,135 @@ def test_baostock_adapter_uses_ordinary_incumbent_sdk_boundary_for_all_endpoints
     assert client.login_calls == 1
     assert client.logout_calls == 1
     assert raw.endpoint_batches[2].rows[0].code == "sh.600000"
+
+
+def test_baostock_adapter_login_and_relogin_share_request_session_identity() -> None:
+    client = _SessionRecordingClient()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    adapter.fetch_raw(_provider_request())
+
+    assert client.login_provider_sessions == ["session-1"]
+    assert {context.provider_session_id for _, _, context in client.calls} == {"session-1"}
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "role", "instrument", "variant", "symbols", "override_name"),
+    (
+        (
+            ProviderEndpoint.TRADE_DATES,
+            RequestRole.CALENDAR,
+            None,
+            "trade_dates.v1",
+            (),
+            "trade_dates",
+        ),
+        (
+            ProviderEndpoint.ALL_STOCK,
+            RequestRole.UNIVERSE,
+            InstrumentRole.STOCK,
+            "all_stock.market.v1",
+            (),
+            "all_stock",
+        ),
+        (
+            ProviderEndpoint.DAILY_ASTOCK,
+            RequestRole.DAILY_STOCK,
+            InstrumentRole.STOCK,
+            "daily_astock.v1",
+            ("sh.600000",),
+            "daily_astock",
+        ),
+        (
+            ProviderEndpoint.DAILY_FACTOR,
+            RequestRole.DAILY_FACTOR,
+            InstrumentRole.STOCK,
+            "daily_factor.v1",
+            ("sh.600000",),
+            "daily_factor",
+        ),
+        (
+            ProviderEndpoint.ADJUST_FACTOR,
+            RequestRole.ADJUST_FACTOR,
+            InstrumentRole.STOCK,
+            "adjust_factor.session.v1",
+            ("sh.600000",),
+            "adjust_factor",
+        ),
+        (
+            ProviderEndpoint.INDEX_HISTORY,
+            RequestRole.INDEX_HISTORY,
+            InstrumentRole.INDEX,
+            "index_history.session.v1",
+            ("sh.000001",),
+            "index_history",
+        ),
+    ),
+)
+def test_baostock_adapter_rejects_every_nonexact_sdk_source_schema(
+    endpoint,
+    role,
+    instrument,
+    variant,
+    symbols,
+    override_name,
+) -> None:
+    logical = _plan(
+        endpoint=endpoint,
+        role=role,
+        instrument=instrument,
+        variant=variant,
+        symbols=symbols,
+    )
+    request = _provider_request(
+        plan=_plan_container(logical),
+        session_symbols=("sh.000001", "sh.600000"),
+    )
+    defaults = {
+        "trade_dates": ["calendar_date", "is_trading_day"],
+        "all_stock": ["code", "tradeStatus", "code_name"],
+        "daily_astock": DAILY_FIELDS.split(","),
+        "daily_factor": [
+            "code",
+            "dividOperateDate",
+            "foreAdjustFactor",
+            "backAdjustFactor",
+            "adjustFactor",
+        ],
+        "adjust_factor": [
+            "code",
+            "dividOperateDate",
+            "foreAdjustFactor",
+            "backAdjustFactor",
+            "adjustFactor",
+        ],
+        "index_history": DAILY_FIELDS.split(","),
+    }
+    client = _CompleteSdkClient(
+        schema_overrides={override_name: list(reversed(defaults[override_name]))}
+    )
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(ValueError, match="source schema"):
+        adapter.fetch_raw(request)
+
+
+def test_baostock_adapter_publishes_one_source_batch_per_final_success_page() -> None:
+    client = _TwoPageRetrySdkClient()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=2, min_request_interval_seconds=0)
+
+    raw = adapter.fetch_raw(_provider_request())
+
+    completion = raw.request_completions[0]
+    assert [(attempt.attempt, attempt.outcome) for attempt in completion.attempts] == [
+        (1, TransportOutcome.ERROR),
+        (2, TransportOutcome.SUCCESS),
+    ]
+    assert completion.observed_pages == (1, 2)
+    assert [batch.lineage.page for batch in raw.endpoint_batches] == [1, 2]
+    assert {batch.lineage.attempt for batch in raw.endpoint_batches} == {2}
+    assert raw.endpoint_summaries[0].batch_count == 2
+    assert raw.endpoint_summaries[0].row_count == completion.row_count == 2
 
 
 def test_baostock_adapter_rejects_cross_day_sdk_rows_before_normalization() -> None:
@@ -874,7 +1163,43 @@ def test_registry_versions_are_safe_and_roundtrip_revalidated() -> None:
     assert registry.adapter_version == "r2f2.v1"
     with pytest.raises(ValueError):
         registry.model_copy(update={"adapter_version": "not safe version"})
+    with pytest.raises(ValueError):
+        registry.model_copy(update={"adapter_version": "r2f2.v2"})
+    with pytest.raises(ValueError):
+        registry.model_copy(update={"endpoint_contract_version": "r2f2-endpoints.v2"})
     assert type(registry).model_validate(registry.model_dump()) == registry
+
+
+def test_empty_daily_factor_event_is_valid_raw_task7_input() -> None:
+    logical = _plan(
+        endpoint=ProviderEndpoint.DAILY_FACTOR,
+        role=RequestRole.DAILY_FACTOR,
+        instrument=InstrumentRole.STOCK,
+        variant="daily_factor.v1",
+        symbols=("sh.600000",),
+    )
+    request = _provider_request(plan=_plan_container(logical))
+    contract = endpoint_contract_for(
+        ProviderEndpoint.DAILY_FACTOR, InstrumentRole.STOCK, "daily_factor.v1"
+    )
+    batch = RawEndpointBatch(
+        endpoint=contract.endpoint,
+        schema_variant=contract.schema_variant,
+        request_role=contract.request_role,
+        instrument_role=contract.instrument_role,
+        plan_ordinal=0,
+        shard_id="shard-0",
+        lineage=_lineage(endpoint=ProviderEndpoint.DAILY_FACTOR),
+        rows=(),
+        row_count=0,
+        source_schema=contract.schema_variant,
+        fields=contract.fields,
+        units=contract.units,
+        date_semantics=contract.date_semantics,
+        pagination_policy=contract.pagination_policy,
+        provider_row_order_digest=SHA,
+    )
+    validate_raw_date_binding(request, batch)
 
 
 def test_observation_digest_canonicalizes_observed_at_to_utc() -> None:
@@ -905,8 +1230,18 @@ def test_provider_public_exports_are_complete() -> None:
         "BaoStockDailyBarAdapter",
         "BaoStockProviderAdapter",
         "ENDPOINT_CONTRACTS",
+        "AttemptCompletion",
+        "EndpointContractSummary",
+        "RawEndpointBatch",
         "ProviderId",
         "ProviderRawBatch",
+        "TransportLineageRef",
+        "TransportObservationProjection",
+        "DailyAStockRow",
+        "DailyFactorRow",
+        "AdjustFactorRow",
+        "IndexHistorySessionRow",
+        "IndexHistoryRangeRow",
     ):
         assert hasattr(exports, name), name
 

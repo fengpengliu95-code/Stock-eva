@@ -29,6 +29,7 @@ from backend.app.market.provider_transport import (
     ProviderEndpoint,
     RefreshTransportContext,
     TransportEndpoint,
+    current_request_context,
     normalize_provider_code,
     provider_session_scope,
     refresh_scope,
@@ -523,11 +524,21 @@ class BaoStockProvider:
             with request_scope(endpoint, attempt=attempt, page=page) as context:
                 yield context
 
-    def _login(self, endpoint: TransportEndpoint) -> None:
+    def _login(
+        self,
+        endpoint: TransportEndpoint,
+        *,
+        provider_session_id: str | None = None,
+    ) -> None:
         with self._refresh_operation():
-            self._login_scoped(endpoint)
+            self._login_scoped(endpoint, provider_session_id=provider_session_id)
 
-    def _login_scoped(self, endpoint: TransportEndpoint) -> None:
+    def _login_scoped(
+        self,
+        endpoint: TransportEndpoint,
+        *,
+        provider_session_id: str | None = None,
+    ) -> None:
         if self._session_usable:
             raise BaoStockSessionStateError("BaoStock session is already active")
 
@@ -537,7 +548,7 @@ class BaoStockProvider:
 
         last_error: BaoStockError | None = None
         for attempt in range(1, self.max_attempts + 1):
-            with provider_session_scope() as session:
+            with provider_session_scope(provider_session_id) as session:
                 self._provider_session_id = session.provider_session_id
                 with request_scope(endpoint, attempt=attempt, page=1):
                     try:
@@ -677,9 +688,14 @@ class BaoStockProvider:
         finally:
             self._discard_session()
 
-    def _ensure_session(self, endpoint: TransportEndpoint) -> None:
+    def _ensure_session(
+        self,
+        endpoint: TransportEndpoint,
+        *,
+        provider_session_id: str | None = None,
+    ) -> None:
         if not self._session_usable:
-            self._login(endpoint)
+            self._login(endpoint, provider_session_id=provider_session_id)
 
     def fetch(self, trade_date: date, symbols: Sequence[str] | None = None) -> ProviderBatch:
         if symbols is not None and len(set(symbols)) > self.max_explicit_symbols:
@@ -945,15 +961,15 @@ class BaoStockProvider:
         endpoint: TransportEndpoint,
         operation: Callable[[], Any],
         *,
-        page_capture: Callable[[int, int, list[str], list[list[str]]], None] | None = None,
-        session_binding: Callable[[], None] | None = None,
+        page_capture: Callable[[int, int, str, str, list[str], list[list[str]]], None]
+        | None = None,
+        provider_session_id: str | None = None,
+        capture_all_operation_outcomes: bool = False,
     ) -> tuple[list[str], list[list[str]]]:
         with self._refresh_operation():
             last_error: BaoStockError | None = None
             for attempt in range(1, self.max_attempts + 1):
-                self._ensure_session(endpoint)
-                if session_binding is not None:
-                    session_binding()
+                self._ensure_session(endpoint, provider_session_id=provider_session_id)
                 self._pace_request()
                 try:
                     with self._request_scope(endpoint, attempt=attempt, page=1):
@@ -972,7 +988,12 @@ class BaoStockProvider:
                                     None
                                     if page_capture is None
                                     else lambda page, fields, rows: page_capture(
-                                        attempt, page, fields, rows
+                                        attempt,
+                                        page,
+                                        current_request_context().request_id,
+                                        current_request_context().provider_session_id,
+                                        fields,
+                                        rows,
                                     )
                                 ),
                             )
@@ -984,7 +1005,8 @@ class BaoStockProvider:
                             )
                         except (BaoStockError, TimeoutError, OSError) as exc:
                             if isinstance(endpoint, ProviderEndpoint) and (
-                                attempt == self.max_attempts
+                                capture_all_operation_outcomes
+                                or attempt == self.max_attempts
                                 or isinstance(exc, _OperationDeadlineUnavailable)
                             ):
                                 _emit_operation_outcome(exc)
