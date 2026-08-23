@@ -363,7 +363,7 @@ def _projection(
         outcome=TransportOutcome.SUCCESS if provider_code is None else TransportOutcome.ERROR,
         observed_at=NOW,
     )
-    lineage_kind = "query_root" if stage is ProtocolStage.OPERATION else "page"
+    lineage_kind = "page" if stage is ProtocolStage.PAGINATION else "query_root"
     return TransportObservationProjection.from_observation_with_lineage(
         observation, plan_ordinal=0, lineage_kind=lineage_kind
     )
@@ -1950,6 +1950,110 @@ def test_provider_registry_exposes_authoritative_supported_fields_without_plugin
     assert set(registry.supported_fields) == {
         contract.schema_variant for contract in ENDPOINT_CONTRACTS
     }
+
+
+def _rebind_page_kind(raw: ProviderRawBatch, *, page: int, lineage_kind: str) -> ProviderRawBatch:
+    target = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE
+        and item.page == page
+        and item.attempt == raw.request_completions[0].successful_attempt
+    )
+    values = target.model_dump(mode="python")
+    values["lineage_kind"] = lineage_kind
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    rebound = TransportObservationProjection.model_validate(values)
+    observations = tuple(
+        rebound if item.observation_digest == target.observation_digest else item
+        for item in raw.transport_observations.observations
+    )
+    aggregate = TransportObservationAggregate.from_observations(observations)
+    lineages = tuple(
+        item.model_copy(update={"observation_digest": rebound.observation_digest})
+        if item.observation_digest == target.observation_digest
+        else item
+        for item in raw.transport_lineage
+    )
+    batches = tuple(
+        item.model_copy(
+            update={
+                "lineage": item.lineage.model_copy(
+                    update={"observation_digest": rebound.observation_digest}
+                )
+            }
+        )
+        if item.lineage.observation_digest == target.observation_digest
+        else item
+        for item in raw.endpoint_batches
+    )
+    completion_hash = sha256(
+        json.dumps(
+            [item.model_dump(mode="json") for item in raw.request_completions],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return raw.model_copy(
+        update={
+            "transport_observations": aggregate,
+            "transport_lineage": lineages,
+            "endpoint_batches": batches,
+            "completion_hash": completion_hash,
+        }
+    )
+
+
+def test_page_one_kind_tamper_is_rejected_after_all_local_digests_are_rebound() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError):
+        _rebind_page_kind(raw, page=1, lineage_kind="page")
+
+
+def test_page_n_reverse_kind_tamper_is_rejected_after_all_local_digests_are_rebound() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_TwoPageRetrySdkClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError):
+        _rebind_page_kind(raw, page=2, lineage_kind="query_root")
+
+
+def test_authoritative_page_kind_index_accepts_correct_page_one_and_page_n() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_TwoPageRetrySdkClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    pages = [
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE
+        and item.attempt == raw.request_completions[0].successful_attempt
+    ]
+    assert [(item.page, item.lineage_kind) for item in pages] == [
+        (1, "query_root"),
+        (2, "page"),
+    ]
+
+
+def test_authoritative_page_index_rejects_missing_page_lineage() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError):
+        raw.model_copy(update={"transport_lineage": ()})
+
+
+def test_authoritative_page_index_rejects_duplicate_page_lineage() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError):
+        raw.model_copy(update={"transport_lineage": raw.transport_lineage * 2})
 
 
 def test_lineage_join_rejects_forged_root_tuple_against_successful_page_projection() -> None:

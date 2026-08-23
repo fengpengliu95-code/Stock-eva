@@ -918,6 +918,48 @@ class ProviderRawBatch(_ContractModel):
         }
         if any(item.plan_ordinal not in successful for item in self.endpoint_batches):
             raise ValueError("raw endpoint batch cardinality mismatch")
+        page_key = tuple[str, str, str, str, int, int, int, int]
+        projection_key = tuple[str, str, str, str, int, int, int]
+        expected_pages: dict[page_key, Literal["query_root", "page"]] = {}
+        expected_projection_keys: dict[
+            projection_key, tuple[page_key, Literal["query_root", "page"]]
+        ] = {}
+        for completion in self.request_completions:
+            if completion.final_outcome is not TransportOutcome.SUCCESS:
+                continue
+            attempt = completion.attempts[-1]
+            logical = self.logical_request_plan.requests[completion.plan_ordinal]
+            for page, page_request_id in attempt.page_request_ids:
+                if page == 1 and page_request_id != attempt.root_request_id:
+                    raise ValueError("successful page one must bind its query root")
+                if page > 1 and page_request_id == attempt.root_request_id:
+                    raise ValueError("nested successful pages require distinct request IDs")
+                key = (
+                    self.request.refresh_id,
+                    attempt.provider_session_id,
+                    attempt.root_request_id,
+                    page_request_id,
+                    logical.endpoint.value,
+                    completion.plan_ordinal,
+                    attempt.attempt,
+                    page,
+                )
+                kind: Literal["query_root", "page"] = "query_root" if page == 1 else "page"
+                if key in expected_pages:
+                    raise ValueError("duplicate authoritative successful page")
+                expected_pages[key] = kind
+                pkey = (
+                    self.request.refresh_id,
+                    attempt.provider_session_id,
+                    page_request_id,
+                    logical.endpoint.value,
+                    completion.plan_ordinal,
+                    attempt.attempt,
+                    page,
+                )
+                if pkey in expected_projection_keys:
+                    raise ValueError("duplicate authoritative successful projection key")
+                expected_projection_keys[pkey] = (key, kind)
         expected_batch_order = tuple(
             (item.plan_ordinal, item.lineage.attempt, item.lineage.page)
             for item in sorted(
@@ -933,6 +975,7 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw endpoint batches must be ordered by plan and page")
         batches_by_ordinal: dict[int, list[RawEndpointBatch]] = {}
         batch_keys: set[tuple[int, str, int, str, int]] = set()
+        batch_lineage_index: dict[page_key, RawEndpointBatch] = {}
         for item in self.endpoint_batches:
             logical = self.logical_request_plan.requests[item.plan_ordinal]
             if (
@@ -955,8 +998,20 @@ class ProviderRawBatch(_ContractModel):
                 raise ValueError("duplicate raw endpoint page")
             batch_keys.add(key)
             batches_by_ordinal.setdefault(item.plan_ordinal, []).append(item)
-            if sum(item.lineage == lineage for lineage in self.transport_lineage) != 1:
-                raise ValueError("raw endpoint lineage must join exactly one top-level lineage")
+            lineage = item.lineage
+            batch_key = (
+                lineage.refresh_id,
+                lineage.provider_session_id,
+                lineage.root_request_id,
+                lineage.page_request_id,
+                lineage.endpoint.value,
+                lineage.plan_ordinal,
+                lineage.attempt,
+                lineage.page,
+            )
+            if batch_key in batch_lineage_index:
+                raise ValueError("duplicate raw endpoint batch lineage")
+            batch_lineage_index[batch_key] = item
         if len(self.endpoint_summaries) != len(successful):
             raise ValueError("raw endpoint summary cardinality mismatch")
 
@@ -1053,93 +1108,73 @@ class ProviderRawBatch(_ContractModel):
                 or item.provider_session_id not in actual_sessions
             ):
                 raise ValueError("transport observation does not bind request session")
-        lineage_keys = sorted(
-            (
-                (
-                    item.refresh_id,
-                    item.provider_session_id,
-                    item.page_request_id,
-                    item.endpoint,
-                    item.attempt,
-                    item.page,
-                ),
-                item.observation_digest,
-            )
-            for item in self.transport_lineage
-        )
-        projection_keys = sorted(
-            (
-                (
-                    item.refresh_id,
-                    item.provider_session_id,
-                    item.request_id,
-                    item.endpoint,
-                    item.attempt,
-                    item.page,
-                ),
-                item.observation_digest,
-            )
-            for item in self.transport_observations.observations
-        )
-        if len(lineage_keys) != len(set(lineage_keys)):
-            raise ValueError("duplicate transport lineage projection")
-        lineage_identities = [key for key, _digest in lineage_keys]
-        if len(lineage_identities) != len(set(lineage_identities)):
-            raise ValueError("conflicting transport lineage projection")
-        if len(projection_keys) != len(set(projection_keys)):
-            raise ValueError("duplicate transport observation projection")
-        projection_set = set(projection_keys)
-        for key in lineage_keys:
-            if key not in projection_set:
-                raise ValueError("transport lineage and observations do not join exactly")
+        lineage_index: dict[page_key, TransportLineageRef] = {}
         for lineage in self.transport_lineage:
-            matches = tuple(
-                projection
-                for projection in self.transport_observations.observations
-                if projection.observation_digest == lineage.observation_digest
-                and projection.protocol_stage is ProtocolStage.COMPLETE
-                and projection.outcome is TransportOutcome.SUCCESS
-                and projection.end_marker_seen
-                and projection.request_id == lineage.page_request_id
-                and projection.refresh_id == lineage.refresh_id
-                and projection.provider_session_id == lineage.provider_session_id
-                and projection.endpoint is lineage.endpoint
-                and projection.plan_ordinal == lineage.plan_ordinal
-                and projection.attempt == lineage.attempt
-                and projection.page == lineage.page
+            key = (
+                lineage.refresh_id,
+                lineage.provider_session_id,
+                lineage.root_request_id,
+                lineage.page_request_id,
+                lineage.endpoint.value,
+                lineage.plan_ordinal,
+                lineage.attempt,
+                lineage.page,
             )
-            if len(matches) != 1:
-                raise ValueError("page lineage must resolve one marked COMPLETE projection")
-        successful_page_identities = {
-            (
-                completion.plan_ordinal,
-                completion.attempts[-1].attempt,
-                page,
-                request_id,
+            if key in lineage_index:
+                raise ValueError("duplicate or conflicting transport lineage projection")
+            lineage_index[key] = lineage
+        projection_index: dict[projection_key, TransportObservationProjection] = {}
+        for projection in self.transport_observations.observations:
+            key = (
+                projection.refresh_id,
+                projection.provider_session_id,
+                projection.request_id,
+                projection.endpoint.value,
+                projection.plan_ordinal,
+                projection.attempt,
+                projection.page,
             )
-            for completion in self.request_completions
-            if completion.final_outcome is TransportOutcome.SUCCESS
-            for page, request_id in completion.attempts[-1].page_request_ids
-        }
-        complete_projection_digests = {
-            item.observation_digest
-            for item in self.transport_observations.observations
+            if key not in expected_projection_keys:
+                continue
             if (
-                item.plan_ordinal,
-                item.attempt,
-                item.page,
-                item.request_id,
+                projection.protocol_stage is not ProtocolStage.COMPLETE
+                or projection.outcome is not TransportOutcome.SUCCESS
+                or not projection.end_marker_seen
+            ):
+                continue
+            if key in projection_index:
+                raise ValueError("duplicate or conflicting successful page projection")
+            projection_index[key] = projection
+        if set(lineage_index) != set(expected_pages):
+            raise ValueError("transport lineage does not exactly match successful pages")
+        if set(batch_lineage_index) != set(expected_pages):
+            raise ValueError("raw endpoint batches do not exactly match successful pages")
+        if set(projection_index) != set(expected_projection_keys):
+            raise ValueError("successful COMPLETE projections do not exactly match pages")
+        for key, expected_kind in expected_pages.items():
+            lineage = lineage_index[key]
+            batch = batch_lineage_index[key]
+            projection_key = (
+                key[0],
+                key[1],
+                key[3],
+                key[4],
+                key[5],
+                key[6],
+                key[7],
             )
-            in successful_page_identities
-            and item.protocol_stage is ProtocolStage.COMPLETE
-            and item.outcome is TransportOutcome.SUCCESS
-            and item.end_marker_seen
-            and item.lineage_kind in {"query_root", "page"}
-        }
-        if complete_projection_digests != {
-            item.observation_digest for item in self.transport_lineage
-        }:
-            raise ValueError("successful COMPLETE page projections must join exactly to lineage")
+            projection = projection_index[projection_key]
+            if (
+                projection.lineage_kind != expected_kind
+                or projection.request_id != key[3]
+                or projection.endpoint.value != key[4]
+                or projection.plan_ordinal != key[5]
+                or projection.attempt != key[6]
+                or projection.page != key[7]
+                or lineage.observation_digest != projection.observation_digest
+                or batch.lineage != lineage
+            ):
+                raise ValueError("successful page lineage joins are not exact")
         expected_completion_hash = _digest(
             [item.model_dump(mode="json") for item in self.request_completions]
         )
