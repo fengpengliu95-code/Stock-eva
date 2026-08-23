@@ -924,11 +924,21 @@ class ProviderRawBatch(_ContractModel):
         expected_projection_keys: dict[
             projection_key, tuple[page_key, Literal["query_root", "page"]]
         ] = {}
+        final_success_scopes: set[tuple[str, str, str, int, int]] = set()
         for completion in self.request_completions:
             if completion.final_outcome is not TransportOutcome.SUCCESS:
                 continue
             attempt = completion.attempts[-1]
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
+            final_success_scopes.add(
+                (
+                    self.request.refresh_id,
+                    attempt.provider_session_id,
+                    logical.endpoint.value,
+                    completion.plan_ordinal,
+                    attempt.attempt,
+                )
+            )
             for page, page_request_id in attempt.page_request_ids:
                 if page == 1 and page_request_id != attempt.root_request_id:
                     raise ValueError("successful page one must bind its query root")
@@ -1134,6 +1144,21 @@ class ProviderRawBatch(_ContractModel):
                 projection.attempt,
                 projection.page,
             )
+            scope = (
+                projection.refresh_id,
+                projection.provider_session_id,
+                projection.endpoint.value,
+                projection.plan_ordinal,
+                projection.attempt,
+            )
+            if (
+                scope in final_success_scopes
+                and projection.protocol_stage is ProtocolStage.COMPLETE
+                and projection.outcome is TransportOutcome.SUCCESS
+                and projection.end_marker_seen
+                and key not in expected_projection_keys
+            ):
+                raise ValueError("successful COMPLETE projection is not an expected page")
             if key not in expected_projection_keys:
                 continue
             if (

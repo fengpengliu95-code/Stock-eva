@@ -2008,6 +2008,47 @@ def _rebind_page_kind(raw: ProviderRawBatch, *, page: int, lineage_kind: str) ->
     )
 
 
+def _append_successful_projection(
+    raw: ProviderRawBatch, *, request_id: str, page: int
+) -> ProviderRawBatch:
+    target = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE
+        and item.outcome is TransportOutcome.SUCCESS
+        and item.end_marker_seen
+        and item.attempt == raw.request_completions[0].successful_attempt
+    )
+    values = target.model_dump(mode="python")
+    values.update(request_id=request_id, page=page, lineage_kind="page")
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    extra = TransportObservationProjection.model_validate(values)
+    observations = (*raw.transport_observations.observations, extra)
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_id", "page"),
+    (("extra-page", 3), ("duplicate-page", 1)),
+)
+def test_final_success_scope_rejects_unbound_successful_complete_projection(
+    request_id: str, page: int
+) -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError):
+        _append_successful_projection(raw, request_id=request_id, page=page)
+
+
 def test_page_one_kind_tamper_is_rejected_after_all_local_digests_are_rebound() -> None:
     raw = BaoStockProviderAdapter(
         client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
