@@ -920,30 +920,54 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw endpoint batch cardinality mismatch")
         page_key = tuple[str, str, str, str, int, int, int, int]
         projection_key = tuple[str, str, str, str, int, int, int]
+        attempt_page_index: dict[page_key, Literal["query_root", "page"]] = {}
+        attempt_projection_keys: dict[
+            projection_key, tuple[page_key, Literal["query_root", "page"]]
+        ] = {}
+        for completion in self.request_completions:
+            logical = self.logical_request_plan.requests[completion.plan_ordinal]
+            for attempt in completion.attempts:
+                for page, page_request_id in attempt.page_request_ids:
+                    if page == 1 and page_request_id != attempt.root_request_id:
+                        raise ValueError("page one must bind its query root")
+                    if page > 1 and page_request_id == attempt.root_request_id:
+                        raise ValueError("nested pages require distinct request IDs")
+                    key = (
+                        self.request.refresh_id,
+                        attempt.provider_session_id,
+                        attempt.root_request_id,
+                        page_request_id,
+                        logical.endpoint.value,
+                        completion.plan_ordinal,
+                        attempt.attempt,
+                        page,
+                    )
+                    kind: Literal["query_root", "page"] = "query_root" if page == 1 else "page"
+                    if key in attempt_page_index:
+                        raise ValueError("duplicate authoritative attempt page")
+                    attempt_page_index[key] = kind
+                    pkey = (
+                        self.request.refresh_id,
+                        attempt.provider_session_id,
+                        page_request_id,
+                        logical.endpoint.value,
+                        completion.plan_ordinal,
+                        attempt.attempt,
+                        page,
+                    )
+                    if pkey in attempt_projection_keys:
+                        raise ValueError("duplicate authoritative attempt projection key")
+                    attempt_projection_keys[pkey] = (key, kind)
         expected_pages: dict[page_key, Literal["query_root", "page"]] = {}
         expected_projection_keys: dict[
             projection_key, tuple[page_key, Literal["query_root", "page"]]
         ] = {}
-        final_success_scopes: set[tuple[str, str, str, int, int]] = set()
         for completion in self.request_completions:
             if completion.final_outcome is not TransportOutcome.SUCCESS:
                 continue
             attempt = completion.attempts[-1]
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
-            final_success_scopes.add(
-                (
-                    self.request.refresh_id,
-                    attempt.provider_session_id,
-                    logical.endpoint.value,
-                    completion.plan_ordinal,
-                    attempt.attempt,
-                )
-            )
             for page, page_request_id in attempt.page_request_ids:
-                if page == 1 and page_request_id != attempt.root_request_id:
-                    raise ValueError("successful page one must bind its query root")
-                if page > 1 and page_request_id == attempt.root_request_id:
-                    raise ValueError("nested successful pages require distinct request IDs")
                 key = (
                     self.request.refresh_id,
                     attempt.provider_session_id,
@@ -954,7 +978,9 @@ class ProviderRawBatch(_ContractModel):
                     attempt.attempt,
                     page,
                 )
-                kind: Literal["query_root", "page"] = "query_root" if page == 1 else "page"
+                kind = attempt_page_index.get(key)
+                if kind is None:
+                    raise ValueError("successful page is not bound to an attempt")
                 if key in expected_pages:
                     raise ValueError("duplicate authoritative successful page")
                 expected_pages[key] = kind
@@ -1135,6 +1161,8 @@ class ProviderRawBatch(_ContractModel):
             lineage_index[key] = lineage
         projection_index: dict[projection_key, TransportObservationProjection] = {}
         for projection in self.transport_observations.observations:
+            if projection.lineage_kind == "login_audit":
+                continue
             key = (
                 projection.refresh_id,
                 projection.provider_session_id,
@@ -1144,37 +1172,24 @@ class ProviderRawBatch(_ContractModel):
                 projection.attempt,
                 projection.page,
             )
-            scope = (
-                projection.refresh_id,
-                projection.provider_session_id,
-                projection.endpoint.value,
-                projection.plan_ordinal,
-                projection.attempt,
-            )
             if (
-                scope in final_success_scopes
-                and projection.protocol_stage is ProtocolStage.COMPLETE
+                projection.protocol_stage is ProtocolStage.COMPLETE
                 and projection.outcome is TransportOutcome.SUCCESS
                 and projection.end_marker_seen
-                and key not in expected_projection_keys
             ):
-                raise ValueError("successful COMPLETE projection is not an expected page")
-            if key not in expected_projection_keys:
-                continue
-            if (
-                projection.protocol_stage is not ProtocolStage.COMPLETE
-                or projection.outcome is not TransportOutcome.SUCCESS
-                or not projection.end_marker_seen
-            ):
-                continue
-            if key in projection_index:
-                raise ValueError("duplicate or conflicting successful page projection")
-            projection_index[key] = projection
+                attempt_binding = attempt_projection_keys.get(key)
+                if attempt_binding is None:
+                    raise ValueError("successful COMPLETE projection is not bound to an attempt")
+                if projection.lineage_kind != attempt_binding[1]:
+                    raise ValueError("successful COMPLETE projection has wrong page kind")
+                if key in projection_index:
+                    raise ValueError("duplicate or conflicting successful page projection")
+                projection_index[key] = projection
         if set(lineage_index) != set(expected_pages):
             raise ValueError("transport lineage does not exactly match successful pages")
         if set(batch_lineage_index) != set(expected_pages):
             raise ValueError("raw endpoint batches do not exactly match successful pages")
-        if set(projection_index) != set(expected_projection_keys):
+        if not set(expected_projection_keys).issubset(projection_index):
             raise ValueError("successful COMPLETE projections do not exactly match pages")
         for key, expected_kind in expected_pages.items():
             lineage = lineage_index[key]

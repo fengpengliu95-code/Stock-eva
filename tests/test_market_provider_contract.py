@@ -658,6 +658,21 @@ class _LoginAuditClient(_CompleteSdkClient):
         return _SdkResult([], [])
 
 
+class _LoginCompleteAuditClient(_CompleteSdkClient):
+    def login(self):
+        self.login_calls += 1
+        emit_terminal_observation(
+            started_at=monotonic() - 0.001,
+            protocol_stage=ProtocolStage.COMPLETE,
+            recv_calls=0,
+            response_bytes=0,
+            end_marker_seen=True,
+            provider_code=None,
+            normalized_error=None,
+        )
+        return _SdkResult([], [])
+
+
 class _ReloginAuditClient(_CompleteSdkClient):
     def __init__(self) -> None:
         super().__init__()
@@ -2032,6 +2047,138 @@ def _append_successful_projection(
         update={
             "transport_observations": TransportObservationAggregate.from_observations(observations)
         }
+    )
+
+
+def _two_logical_plan() -> ExpectedLogicalRequestPlan:
+    requests = (
+        _plan(
+            endpoint=ProviderEndpoint.TRADE_DATES,
+            role=RequestRole.CALENDAR,
+            instrument=None,
+            variant="trade_dates.v1",
+            symbols=(),
+            ordinal=0,
+        ),
+        _plan(ordinal=1),
+    )
+    plan_hash = sha256(
+        json.dumps(
+            [item.model_dump(mode="json") for item in requests],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return ExpectedLogicalRequestPlan(
+        requests=requests,
+        request_count=2,
+        request_plan_hash=plan_hash,
+    )
+
+
+def _append_projection_for_attempt(
+    raw: ProviderRawBatch,
+    *,
+    plan_ordinal: int,
+    attempt: int,
+    endpoint: ProviderEndpoint,
+    projection_plan_ordinal: int,
+    request_id: str,
+    page: int,
+) -> ProviderRawBatch:
+    target = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.COMPLETE
+        and item.outcome is TransportOutcome.SUCCESS
+        and item.end_marker_seen
+        and item.plan_ordinal == plan_ordinal
+        and item.attempt == attempt
+    )
+    values = target.model_dump(mode="python")
+    values.update(
+        endpoint=endpoint,
+        plan_ordinal=projection_plan_ordinal,
+        request_id=request_id,
+        page=page,
+        lineage_kind="query_root" if page == 1 else "page",
+    )
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    extra = TransportObservationProjection.model_validate(values)
+    observations = (*raw.transport_observations.observations, extra)
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "projection_plan_ordinal", "request_id", "page"),
+    (
+        (ProviderEndpoint.TRADE_DATES, 0, "cross-logical-trade-dates", 3),
+        (ProviderEndpoint.INDEX_HISTORY, 1, "cross-logical-index-history", 1),
+    ),
+)
+def test_query_page_projection_must_bind_exact_logical_attempt(
+    endpoint: ProviderEndpoint,
+    projection_plan_ordinal: int,
+    request_id: str,
+    page: int,
+) -> None:
+    plan = _two_logical_plan()
+    raw = BaoStockProviderAdapter(
+        client=_ReloginTwoPageClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request(plan=plan))
+    daily_attempt = raw.request_completions[1].successful_attempt
+    with pytest.raises(ValueError, match="bound to an attempt"):
+        _append_projection_for_attempt(
+            raw,
+            plan_ordinal=1,
+            attempt=daily_attempt,
+            endpoint=endpoint,
+            projection_plan_ordinal=projection_plan_ordinal,
+            request_id=request_id,
+            page=page,
+        )
+
+
+def test_failed_partial_query_page_with_shared_session_attempt_is_aggregate_only() -> None:
+    plan = _two_logical_plan()
+    raw = BaoStockProviderAdapter(
+        client=_ReloginTwoPageClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request(plan=plan))
+    calendar_attempt = raw.request_completions[0].attempts[0]
+    daily_failed_attempt = raw.request_completions[1].attempts[0]
+    assert (calendar_attempt.provider_session_id, calendar_attempt.attempt) == (
+        daily_failed_attempt.provider_session_id,
+        daily_failed_attempt.attempt,
+    )
+    assert daily_failed_attempt.outcome is TransportOutcome.ERROR
+    assert any(
+        item.plan_ordinal == 1
+        and item.attempt == daily_failed_attempt.attempt
+        and item.protocol_stage is ProtocolStage.COMPLETE
+        and item.outcome is TransportOutcome.SUCCESS
+        for item in raw.transport_observations.observations
+    )
+    assert all(
+        item.lineage.attempt == raw.request_completions[item.plan_ordinal].successful_attempt
+        for item in raw.endpoint_batches
+    )
+
+
+def test_complete_login_audit_is_allowed_without_raw_page_lineage() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    assert any(
+        item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
+        for item in raw.transport_observations.observations
     )
 
 
