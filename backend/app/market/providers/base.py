@@ -922,7 +922,8 @@ class ProviderRawBatch(_ContractModel):
         projection_key = tuple[str, str, str, str, int, int, int]
         expected_operation_index: dict[projection_key, tuple[str, TransportOutcome]] = {}
         capture_identity = tuple[str, str, str]
-        query_capture_namespace: set[capture_identity] = set()
+        capture_owner = tuple[str, str, str, int, int, int, str]
+        capture_identity_owner: dict[capture_identity, capture_owner] = {}
         attempt_page_index: dict[page_key, Literal["query_root", "page"]] = {}
         attempt_projection_keys: dict[
             projection_key, tuple[page_key, Literal["query_root", "page"]]
@@ -930,21 +931,44 @@ class ProviderRawBatch(_ContractModel):
         for completion in self.request_completions:
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
             for attempt in completion.attempts:
-                query_capture_namespace.add(
-                    (
+                owner: capture_owner = (
+                    "query",
+                    attempt.root_request_id,
+                    logical.endpoint.value,
+                    completion.plan_ordinal,
+                    attempt.attempt,
+                    1,
+                    "query_root",
+                )
+                root_identity = (
+                    self.request.refresh_id,
+                    attempt.provider_session_id,
+                    attempt.root_request_id,
+                )
+                existing_owner = capture_identity_owner.get(root_identity)
+                if existing_owner is not None and existing_owner != owner:
+                    raise ValueError("capture identity has conflicting query owners")
+                capture_identity_owner[root_identity] = owner
+                for page, page_request_id in attempt.page_request_ids:
+                    page_kind: Literal["query_root", "page"] = "query_root" if page == 1 else "page"
+                    page_owner: capture_owner = (
+                        "query",
+                        attempt.root_request_id,
+                        logical.endpoint.value,
+                        completion.plan_ordinal,
+                        attempt.attempt,
+                        page,
+                        page_kind,
+                    )
+                    page_identity = (
                         self.request.refresh_id,
                         attempt.provider_session_id,
-                        attempt.root_request_id,
+                        page_request_id,
                     )
-                )
-                for page, page_request_id in attempt.page_request_ids:
-                    query_capture_namespace.add(
-                        (
-                            self.request.refresh_id,
-                            attempt.provider_session_id,
-                            page_request_id,
-                        )
-                    )
+                    existing_owner = capture_identity_owner.get(page_identity)
+                    if existing_owner is not None and existing_owner != page_owner:
+                        raise ValueError("capture identity has conflicting query owners")
+                    capture_identity_owner[page_identity] = page_owner
                     if page == 1 and page_request_id != attempt.root_request_id:
                         raise ValueError("page one must bind its query root")
                     if page > 1 and page_request_id == attempt.root_request_id:
@@ -1175,7 +1199,6 @@ class ProviderRawBatch(_ContractModel):
             lineage_index[key] = lineage
         operation_index: dict[projection_key, TransportObservationProjection] = {}
         projection_index: dict[projection_key, TransportObservationProjection] = {}
-        capture_families: dict[capture_identity, Literal["login_audit", "query"]] = {}
         for projection in self.transport_observations.observations:
             identity = (
                 projection.refresh_id,
@@ -1183,19 +1206,51 @@ class ProviderRawBatch(_ContractModel):
                 projection.request_id,
             )
             if projection.lineage_kind == "login_audit":
-                if identity in query_capture_namespace:
+                existing_owner = capture_identity_owner.get(identity)
+                if existing_owner is not None and existing_owner[0] == "query":
                     raise ValueError("login capture identity collides with query namespace")
-                previous_family = capture_families.get(identity)
-                if previous_family == "query":
-                    raise ValueError("capture identity crosses login and query families")
-                capture_families[identity] = "login_audit"
+                login_owner: capture_owner = (
+                    "login",
+                    "",
+                    projection.endpoint.value,
+                    projection.plan_ordinal,
+                    projection.attempt,
+                    projection.page,
+                    "login_audit",
+                )
+                if existing_owner is not None and existing_owner != login_owner:
+                    raise ValueError("capture identity has conflicting login owners")
+                capture_identity_owner[identity] = login_owner
                 continue
-            previous_family = capture_families.get(identity)
-            if previous_family == "login_audit":
-                raise ValueError("capture identity crosses login and query families")
-            capture_families[identity] = "query"
+            is_operation = projection.protocol_stage is ProtocolStage.OPERATION
+            is_successful_complete = (
+                projection.protocol_stage is ProtocolStage.COMPLETE
+                and projection.outcome is TransportOutcome.SUCCESS
+                and projection.end_marker_seen
+            )
+            if not (is_operation or is_successful_complete):
+                continue
+            owner = capture_identity_owner.get(identity)
+            if owner is None or owner[0] != "query":
+                if is_operation:
+                    raise ValueError("operation projection is not owned by an attempt")
+                raise ValueError("query capture identity is not owned by an attempt")
+            projection_kind: Literal["query_root", "page"] = projection.lineage_kind
+            expected_owner: capture_owner = (
+                "query",
+                owner[1],
+                projection.endpoint.value,
+                projection.plan_ordinal,
+                projection.attempt,
+                projection.page,
+                projection_kind,
+            )
+            if owner != expected_owner:
+                if is_operation:
+                    raise ValueError("operation projection has conflicting owner metadata")
+                raise ValueError("query capture identity has conflicting owner metadata")
             if projection.protocol_stage is ProtocolStage.OPERATION:
-                if projection.lineage_kind != "query_root":
+                if projection_kind != "query_root":
                     raise ValueError("operation projection must use query_root lineage")
                 key = (
                     projection.refresh_id,

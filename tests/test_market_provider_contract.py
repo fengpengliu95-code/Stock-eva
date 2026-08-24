@@ -2160,14 +2160,14 @@ def _rebind_login_capture_identity(
     )
 
 
-def _append_login_protocol_stage(raw: ProviderRawBatch) -> ProviderRawBatch:
+def _append_login_protocol_stage(raw: ProviderRawBatch, **updates: Any) -> ProviderRawBatch:
     login = next(
         item
         for item in raw.transport_observations.observations
         if item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
     )
     values = login.model_dump(mode="python")
-    values.update(protocol_stage=ProtocolStage.OPERATION, end_marker_seen=False)
+    values.update(protocol_stage=ProtocolStage.OPERATION, end_marker_seen=False, **updates)
     values.pop("observation_digest")
     candidate = TransportObservationProjection.model_construct(
         **values, observation_digest="0" * 64
@@ -2231,6 +2231,74 @@ def _append_operation_projection(raw: ProviderRawBatch, **updates: Any) -> Provi
     )
 
 
+def _rebind_failed_attempt_to_other_query_root(raw: ProviderRawBatch) -> ProviderRawBatch:
+    source_completion = raw.request_completions[1]
+    source_attempt = source_completion.attempts[0]
+    target_root = raw.request_completions[0].attempts[-1].root_request_id
+    changed_projection_by_digest: dict[str, TransportObservationProjection] = {}
+    for projection in raw.transport_observations.observations:
+        if not (
+            projection.plan_ordinal == source_completion.plan_ordinal
+            and projection.attempt == source_attempt.attempt
+            and projection.request_id == source_attempt.root_request_id
+        ):
+            continue
+        values = projection.model_dump(mode="python")
+        values["request_id"] = target_root
+        values.pop("observation_digest")
+        candidate = TransportObservationProjection.model_construct(
+            **values, observation_digest="0" * 64
+        )
+        values["observation_digest"] = candidate.compute_digest()
+        changed = TransportObservationProjection.model_validate(values)
+        changed_projection_by_digest[projection.observation_digest] = changed
+    operation = next(
+        item
+        for item in changed_projection_by_digest.values()
+        if item.protocol_stage is ProtocolStage.OPERATION
+    )
+    observations = tuple(
+        changed_projection_by_digest.get(item.observation_digest, item)
+        for item in raw.transport_observations.observations
+    )
+    changed_attempt = source_attempt.model_copy(
+        update={
+            "root_request_id": target_root,
+            "page_request_ids": tuple(
+                (page, target_root if page == 1 else request_id)
+                for page, request_id in source_attempt.page_request_ids
+            ),
+            "operation_observation_digest": operation.observation_digest,
+        }
+    )
+    changed_completion = source_completion.model_copy(
+        update={"attempts": (changed_attempt, *source_completion.attempts[1:])}
+    )
+    completions = (*raw.request_completions[:1], changed_completion, *raw.request_completions[2:])
+    completion_hash = sha256(
+        json.dumps(
+            [item.model_dump(mode="json") for item in completions],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations),
+            "request_completions": completions,
+            "completion_hash": completion_hash,
+        }
+    )
+
+
+def test_query_capture_identity_has_one_authoritative_owner_across_logicals() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_ReloginTwoPageClient(), max_attempts=2, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request(plan=_two_logical_plan()))
+    with pytest.raises(ValueError, match="conflicting query owners|capture identity"):
+        _rebind_failed_attempt_to_other_query_root(raw)
+
+
 @pytest.mark.parametrize(
     "updates",
     (
@@ -2286,6 +2354,14 @@ def test_login_capture_identity_and_multiple_login_protocol_stages_are_allowed()
     } == {ProtocolStage.COMPLETE, ProtocolStage.OPERATION}
 
 
+def test_login_capture_identity_rejects_conflicting_owner_metadata() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="conflicting login owners"):
+        _append_login_protocol_stage(raw, plan_ordinal=1)
+
+
 def test_query_complete_cannot_be_reclassified_as_login_audit() -> None:
     raw = BaoStockProviderAdapter(
         client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
@@ -2298,7 +2374,7 @@ def test_login_capture_reclassified_as_query_requires_attempt_binding() -> None:
     raw = BaoStockProviderAdapter(
         client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
     ).fetch_raw(_provider_request())
-    with pytest.raises(ValueError, match="bound to an attempt"):
+    with pytest.raises(ValueError, match="owned by an attempt|bound to an attempt"):
         _rebind_capture_lineage_kind(raw, source_kind="login_audit", target_kind="query_root")
 
 
@@ -2320,7 +2396,7 @@ def test_query_page_projection_must_bind_exact_logical_attempt(
         client=_ReloginTwoPageClient(), max_attempts=2, min_request_interval_seconds=0
     ).fetch_raw(_provider_request(plan=plan))
     daily_attempt = raw.request_completions[1].successful_attempt
-    with pytest.raises(ValueError, match="bound to an attempt"):
+    with pytest.raises(ValueError, match="owned by an attempt|bound to an attempt"):
         _append_projection_for_attempt(
             raw,
             plan_ordinal=1,
