@@ -1,6 +1,10 @@
+import gc
 import hashlib
 import json
+import os
+import shutil
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +14,7 @@ from backend.app.market.candidates import (
     CandidateStore,
     GateName,
     GateOutcome,
+    PublishedCandidateRejection,
     PublishedSelection,
     SelectionReason,
     SessionSelection,
@@ -19,7 +24,8 @@ from backend.app.market.candidates import (
     select_primary_candidate,
     validate_candidate_lineage,
 )
-from backend.app.market.evidence import EvidenceError, EvidenceStore
+from backend.app.market.evidence import EvidenceError, EvidenceStore, PublishedEvidence
+from backend.app.market.models import DailyBar
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import NasMarketStore
 from tests.test_market_provider_contract import _provider_raw_batch
@@ -159,9 +165,11 @@ def test_missing_legacy_source_decodes_as_baostock_in_memory(tmp_path) -> None:
     original = b'{"dataset":"stock-eva-market","schema_version":2,"generation":"legacy","files":[]}'
     manifest = root / "manifest.json"
     manifest.write_bytes(original)
+    before = _tree_fingerprint(root)
     store = NasMarketStore(MarketStore(tmp_path / "control.duckdb"), root, tmp_path / "staging")
     assert store._manifest()["files"] == []
     assert manifest.read_bytes() == original
+    assert _tree_fingerprint(root) == before
 
 
 def test_canonical_manifest_lineage_is_all_or_nothing(tmp_path) -> None:
@@ -321,6 +329,14 @@ def _normalized_payload() -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
+
+
+def _tree_fingerprint(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 def test_legacy_baostock_rows_and_manifests_decode_without_rewrite(tmp_path):
@@ -511,9 +527,11 @@ def test_get_reads_and_legacy_manifest_reads_are_write_free(tmp_path):
     manifest = root / "manifest.json"
     original = b'{"dataset":"stock-eva-market","schema_version":2,"generation":"legacy","files":[]}'
     manifest.write_bytes(original)
+    before = _tree_fingerprint(root)
     store = NasMarketStore(MarketStore(tmp_path / "control.duckdb"), root, tmp_path / "staging")
     assert store._manifest()["files"] == []
     assert manifest.read_bytes() == original
+    assert _tree_fingerprint(root) == before
 
 
 def test_candidate_store_rejects_symlinked_artifact_directory(tmp_path):
@@ -682,4 +700,263 @@ def test_published_selection_model_copy_cannot_forge_capability(tmp_path):
     with pytest.raises(EvidenceError):
         forged.verify()
     published.close()
+    evidence.close()
+
+
+def test_rejected_candidate_publishes_complete_audit_without_selection(tmp_path):
+    evidence, _report, candidate = _real_candidate_bundle(tmp_path)
+    payload_values = json.loads(_normalized_payload())
+    payload_values[0]["is_suspended"] = False
+    payload_values[0]["is_trading"] = True
+    payload_values[0]["quality_status"] = "ready"
+    payload_values[0]["quality_issues"] = []
+    payload = json.dumps(payload_values, sort_keys=True, separators=(",", ":")).encode()
+    rejected_report = evaluate_candidate_gates(
+        candidate_id=candidate.candidate_id,
+        trade_date=candidate.trade_date,
+        required_symbols=("sh.600000",),
+        rows=tuple(DailyBar.model_validate(row) for row in payload_values),
+        evidence=evidence,
+        created_at=NOW,
+    )
+    values = {
+        key: value
+        for key, value in candidate.model_dump(mode="python").items()
+        if key != "manifest_sha256"
+    }
+    values.update(
+        {
+            "normalized_object_sha256": hashlib.sha256(payload).hexdigest(),
+            "gate_report_sha256": rejected_report.aggregate_sha256,
+            "status": "rejected",
+        }
+    )
+    rejected = build_candidate_manifest(**values)
+    result = CandidateStore(tmp_path).publish_chain(
+        report=rejected_report,
+        candidate=rejected,
+        selection=None,
+        evidence=evidence,
+        normalized_payload=payload,
+    )
+    assert isinstance(result, PublishedCandidateRejection)
+    bundle = tmp_path / "bundles" / candidate.candidate_id
+    assert (bundle / "gate.json").is_file()
+    assert (bundle / "candidate.json").is_file()
+    assert (bundle / "normalized.json").is_file()
+    assert not (bundle / "selection.json").exists()
+    assert result.gate_report.verdict == "fail"
+    evidence.close()
+
+
+def test_evaluator_reuses_bound_reader_without_reopening_root(tmp_path, monkeypatch):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    reader = evidence._reader
+    assert reader is not None
+
+    def replay_bomb(*_args, **_kwargs):
+        raise AssertionError("evaluator must not replay through a second reader")
+
+    monkeypatch.setattr(reader, "replay", replay_bomb)
+    evaluate_candidate_gates(
+        candidate_id=candidate.candidate_id,
+        trade_date=candidate.trade_date,
+        required_symbols=("sh.600000",),
+        rows=(json.loads(_normalized_payload())[0],),
+        evidence=evidence,
+        created_at=report.created_at,
+    )
+    evidence.close()
+
+
+def test_evaluator_rejects_root_rename_and_same_content_copy(tmp_path, monkeypatch):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    original_read_rows = PublishedEvidence.read_rows
+    swapped = False
+
+    def swap_after_read(instance):
+        nonlocal swapped
+        result = original_read_rows(instance)
+        if not swapped:
+            swapped = True
+            root = Path(instance._reader.root)
+            moved = root.with_name("evidence-original")
+            root.rename(moved)
+            shutil.copytree(moved, root)
+        return result
+
+    monkeypatch.setattr(PublishedEvidence, "read_rows", swap_after_read)
+    with pytest.raises(ValueError, match="readback"):
+        evaluate_candidate_gates(
+            candidate_id=candidate.candidate_id,
+            trade_date=candidate.trade_date,
+            required_symbols=("sh.600000",),
+            rows=(json.loads(_normalized_payload())[0],),
+            evidence=evidence,
+            created_at=report.created_at,
+        )
+    evidence.close()
+
+
+def test_normalized_subset_or_universe_substitution_is_rejected(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    substituted = json.loads(_normalized_payload())
+    substituted[0]["symbol"] = "sh.600001"
+    substituted[0]["source_record_id"] = "sh.600001-2026-08-20"
+    payload = json.dumps(substituted, sort_keys=True, separators=(",", ":")).encode()
+    values = {
+        key: value
+        for key, value in candidate.model_dump(mode="python").items()
+        if key != "manifest_sha256"
+    }
+    values["normalized_object_sha256"] = hashlib.sha256(payload).hexdigest()
+    substituted_candidate = build_candidate_manifest(**values)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(substituted_candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    with pytest.raises(ValueError, match="universe|gate report"):
+        CandidateStore(tmp_path).publish_chain(
+            report=report,
+            candidate=substituted_candidate,
+            selection=selection,
+            evidence=evidence,
+            normalized_payload=payload,
+        )
+    evidence.close()
+
+
+def test_post_rename_root_failure_rolls_back_owned_bundle(tmp_path, monkeypatch):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    store = CandidateStore(tmp_path)
+    calls = 0
+
+    def fail_after_rename(_fd, _identity):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise EvidenceError("post-rename root replacement", "EVIDENCE_HASH_MISMATCH")
+
+    monkeypatch.setattr(store, "_assert_root", fail_after_rename)
+    with pytest.raises(EvidenceError, match="post-rename"):
+        store.publish_chain(
+            report=report,
+            candidate=candidate,
+            selection=selection,
+            evidence=evidence,
+            normalized_payload=_normalized_payload(),
+        )
+    assert not (tmp_path / "bundles" / candidate.candidate_id).exists()
+    evidence.close()
+
+
+def test_post_rename_root_replacement_quarantines_copy(tmp_path, monkeypatch):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    store = CandidateStore(tmp_path)
+    calls = 0
+
+    def replace_after_rename(_fd, _identity):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            old = tmp_path.with_name("candidate-root-original")
+            tmp_path.rename(old)
+            shutil.copytree(old, tmp_path)
+            raise EvidenceError("post-rename root replacement", "EVIDENCE_HASH_MISMATCH")
+
+    monkeypatch.setattr(store, "_assert_root", replace_after_rename)
+    with pytest.raises(EvidenceError, match="post-rename"):
+        store.publish_chain(
+            report=report,
+            candidate=candidate,
+            selection=selection,
+            evidence=evidence,
+            normalized_payload=_normalized_payload(),
+        )
+    assert not (tmp_path / "bundles" / candidate.candidate_id).exists()
+    assert list((tmp_path / "orphan-audit").iterdir())
+    evidence.close()
+
+
+def test_selection_gc_closes_held_root_fd(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    published = CandidateStore(tmp_path).publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=_normalized_payload(),
+    )
+    assert published is not None and published._root_fd is not None
+    fd = published._root_fd
+    del published
+    gc.collect()
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    evidence.close()
+
+
+def test_cas_existing_winner_is_preserved_when_replayed(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    store = CandidateStore(tmp_path)
+    first = store.publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=_normalized_payload(),
+    )
+    assert first is not None
+    selection_bytes = (
+        tmp_path / "bundles" / candidate.candidate_id / "selection.json"
+    ).read_bytes()
+    second = store.publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=_normalized_payload(),
+    )
+    assert second is not None
+    assert (
+        tmp_path / "bundles" / candidate.candidate_id / "selection.json"
+    ).read_bytes() == selection_bytes
+    first.close()
+    second.close()
     evidence.close()

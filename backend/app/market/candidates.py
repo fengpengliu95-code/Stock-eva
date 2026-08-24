@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from backend.app.market.evidence import (
     EvidenceError,
-    EvidenceReader,
     PublishedEvidence,
     _factor_value_semantic_hash,
 )
@@ -366,6 +365,96 @@ class PublishedSelection(_Immutable):
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
+class PublishedCandidateRejection(_Immutable):
+    """Typed result for a durable rejected candidate audit bundle."""
+
+    status: Literal["rejected"] = "rejected"
+    candidate: CandidateManifest
+    gate_report: CandidateGateReport
+    root_path: str
+    bundle_relative_path: SafeRelativePath
+    _root_fd: int | None = PrivateAttr(default=None)
+    _root_identity: tuple[int, int] | None = PrivateAttr(default=None)
+
+    @classmethod
+    def bind(
+        cls,
+        candidate: CandidateManifest,
+        gate_report: CandidateGateReport,
+        *,
+        root_path: Path,
+        bundle_relative_path: str,
+        root_fd: int,
+        root_identity: tuple[int, int],
+    ) -> PublishedCandidateRejection:
+        value = cls(
+            candidate=candidate,
+            gate_report=gate_report,
+            root_path=str(root_path),
+            bundle_relative_path=bundle_relative_path,
+        )
+        object.__setattr__(value, "_root_fd", os.dup(root_fd))
+        object.__setattr__(value, "_root_identity", root_identity)
+        return value
+
+    def verify(self) -> PublishedCandidateRejection:
+        if self.candidate.status != "rejected" or self.gate_report.verdict != "fail":
+            raise EvidenceError("rejection audit status is invalid", "EVIDENCE_MANIFEST_INVALID")
+        root_fd = self._root_fd
+        identity = self._root_identity
+        if root_fd is None or identity is None:
+            raise EvidenceError("rejection audit is closed", "EVIDENCE_ROOT_UNAVAILABLE")
+        current = os.fstat(root_fd)
+        if (current.st_dev, current.st_ino) != identity:
+            raise EvidenceError("candidate root changed", "EVIDENCE_HASH_MISMATCH")
+        fresh = _open_root_path(Path(self.root_path))
+        try:
+            configured = os.fstat(fresh)
+            if (configured.st_dev, configured.st_ino) != identity:
+                raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH")
+        finally:
+            os.close(fresh)
+        from backend.app.market.evidence import open_evidence_relative
+
+        expected = {
+            "gate.json": _canonical(self.gate_report.model_dump(mode="json")),
+            "candidate.json": _canonical(self.candidate.model_dump(mode="json")),
+        }
+        for name, payload in expected.items():
+            descriptor = open_evidence_relative(root_fd, f"{self.bundle_relative_path}/{name}")
+            try:
+                info = os.fstat(descriptor)
+                data = os.read(descriptor, info.st_size + 1)
+            finally:
+                os.close(descriptor)
+            if data != payload:
+                raise EvidenceError("rejection audit changed", "EVIDENCE_HASH_MISMATCH")
+        normalized = CandidateStore._readback(
+            root_fd, f"{self.bundle_relative_path}/normalized.json"
+        )
+        if hashlib.sha256(normalized).hexdigest() != self.candidate.normalized_object_sha256:
+            raise EvidenceError("rejection normalized object changed", "EVIDENCE_HASH_MISMATCH")
+        return self
+
+    def close(self) -> None:
+        descriptor = self._root_fd
+        if descriptor is not None:
+            object.__setattr__(self, "_root_fd", None)
+            os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
 
 class CandidateStore:
     """Small immutable JSON projection store under the evidence root."""
@@ -603,6 +692,71 @@ class CandidateStore:
             os.close(stage)
 
     @staticmethod
+    def _remove_owned_bundle(
+        parent: int,
+        name: str,
+        expected: tuple[int, int],
+    ) -> None:
+        try:
+            bundle = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+        except OSError:
+            return
+        try:
+            identity = os.fstat(bundle)
+            if (identity.st_dev, identity.st_ino) != expected:
+                return
+            for child in ("normalized.json", "gate.json", "candidate.json", "selection.json"):
+                try:
+                    os.unlink(child, dir_fd=bundle)
+                except FileNotFoundError:
+                    pass
+            os.fsync(bundle)
+            os.rmdir(name, dir_fd=parent)
+            os.fsync(parent)
+        finally:
+            os.close(bundle)
+
+    def _quarantine_replaced_bundle(
+        self,
+        candidate_id: str,
+        expected_root: tuple[int, int],
+    ) -> None:
+        try:
+            root_fd = _open_root_path(self.root)
+        except OSError:
+            return
+        try:
+            current = os.fstat(root_fd)
+            if (current.st_dev, current.st_ino) == expected_root:
+                return
+            bundles = self._mkdir_open(root_fd, "bundles")
+            audit = self._mkdir_open(root_fd, "orphan-audit")
+            try:
+                try:
+                    bundle = os.open(
+                        candidate_id,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=bundles,
+                    )
+                except OSError:
+                    return
+                else:
+                    os.close(bundle)
+                name = f"rejected-bundle-{candidate_id}-{uuid4().hex}"
+                os.rename(candidate_id, name, src_dir_fd=bundles, dst_dir_fd=audit)
+                os.fsync(bundles)
+                os.fsync(audit)
+            finally:
+                os.close(audit)
+                os.close(bundles)
+        finally:
+            os.close(root_fd)
+
+    @staticmethod
     def _readback(root_fd: int, relative: str) -> bytes:
         from backend.app.market.evidence import open_evidence_relative
 
@@ -681,7 +835,7 @@ class CandidateStore:
         selection: SessionSelection | None,
         evidence: PublishedEvidence,
         normalized_payload: bytes,
-    ) -> PublishedSelection | None:
+    ) -> PublishedSelection | PublishedCandidateRejection:
         """Publish one immutable candidate bundle and return its verification capability."""
         validate_candidate_lineage(candidate, evidence, report)
         if not normalized_payload:
@@ -691,13 +845,16 @@ class CandidateStore:
             raise ValueError("normalized candidate object hash mismatch")
         try:
             decoded = json.loads(normalized_payload.decode("utf-8"))
-            if not isinstance(decoded, list) or not decoded:
+            if not isinstance(decoded, list) or (not decoded and candidate.status == "accepted"):
                 raise ValueError("normalized candidate object must contain rows")
             rows = tuple(DailyBar.model_validate(item) for item in decoded)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("normalized candidate object is invalid") from exc
-        symbols = tuple(sorted({row.symbol for row in rows}))
-        if len(rows) != candidate.row_count or len(symbols) != candidate.required_symbol_count:
+        durable_symbols, _durable_roles = _durable_universe(evidence)
+        if (
+            len(rows) != candidate.row_count
+            or len(durable_symbols) != candidate.required_symbol_count
+        ):
             raise ValueError("normalized candidate object cardinality mismatch")
         if any(row.trade_date != candidate.trade_date for row in rows):
             raise ValueError("normalized candidate object date mismatch")
@@ -711,7 +868,7 @@ class CandidateStore:
         recomputed = evaluate_candidate_gates(
             candidate_id=candidate.candidate_id,
             trade_date=candidate.trade_date,
-            required_symbols=symbols,
+            required_symbols=durable_symbols,
             rows=rows,
             evidence=evidence,
             factor_resolution=evidence.manifest.factor_resolution,
@@ -746,7 +903,9 @@ class CandidateStore:
             bundles = self._mkdir_open(fd, "bundles")
             stage_name = f"candidate-bundle-{uuid4().hex}"
             stage = None
-            published = False
+            created_bundle = False
+            completed = False
+            bundle_identity = None
             try:
                 os.mkdir(stage_name, 0o700, dir_fd=staging)
                 stage = os.open(
@@ -760,7 +919,17 @@ class CandidateStore:
                 os.fsync(staging)
                 try:
                     self._rename_exclusive(staging, stage_name, bundles, candidate.candidate_id)
-                    published = True
+                    created_bundle = True
+                    bundle_fd = os.open(
+                        candidate.candidate_id,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=bundles,
+                    )
+                    try:
+                        metadata = os.fstat(bundle_fd)
+                        bundle_identity = (metadata.st_dev, metadata.st_ino)
+                    finally:
+                        os.close(bundle_fd)
                 except FileExistsError:
                     existing = {
                         name: self._readback(fd, f"{bundle}/{name}") for name in bundle_payloads
@@ -769,7 +938,17 @@ class CandidateStore:
                         raise ValueError("immutable candidate bundle collision") from None
                 self._assert_root(fd, identity)
                 if candidate.status != "accepted":
-                    return None
+                    rejection = PublishedCandidateRejection.bind(
+                        candidate,
+                        report,
+                        root_path=self.root,
+                        bundle_relative_path=bundle,
+                        root_fd=fd,
+                        root_identity=identity,
+                    )
+                    rejection.verify()
+                    completed = True
+                    return rejection
                 selection_bytes = bundle_payloads["selection.json"]
                 assert selection is not None
                 capability = PublishedSelection.bind(
@@ -781,11 +960,17 @@ class CandidateStore:
                     selection_bytes=selection_bytes,
                 )
                 capability.verify()
+                completed = True
                 return capability
+            except BaseException:
+                if created_bundle and bundle_identity is not None and not completed:
+                    self._remove_owned_bundle(bundles, candidate.candidate_id, bundle_identity)
+                    self._quarantine_replaced_bundle(candidate.candidate_id, identity)
+                raise
             finally:
                 if stage is not None:
                     os.close(stage)
-                if not published:
+                if not created_bundle:
                     self._remove_owned_stage(staging, stage_name)
                 os.close(bundles)
                 os.close(staging)
@@ -946,6 +1131,24 @@ def _row_value(row: Any, name: str, default: Any = None) -> Any:
     return getattr(row, name, default)
 
 
+def _durable_universe(evidence: PublishedEvidence) -> tuple[tuple[str, ...], dict[str, str]]:
+    symbols: dict[str, str] = {}
+    for request in evidence.manifest.logical_request_plan.requests:
+        if request.endpoint is ProviderEndpoint.DAILY_ASTOCK:
+            role = "stock"
+        elif request.endpoint is ProviderEndpoint.INDEX_HISTORY:
+            role = "index"
+        else:
+            continue
+        for symbol in request.symbols:
+            if symbol in symbols and symbols[symbol] != role:
+                raise ValueError("durable universe assigns conflicting symbol roles")
+            symbols[symbol] = role
+    if not symbols:
+        raise ValueError("durable universe is empty")
+    return tuple(sorted(symbols)), symbols
+
+
 def evaluate_candidate_gates(
     *,
     candidate_id: str,
@@ -963,13 +1166,9 @@ def evaluate_candidate_gates(
     try:
         evidence_pages = evidence.read_rows()
         reader = evidence._reader
-        if reader is None:
+        if reader is None or reader._held_root_fd is None or reader._held_root_identity is None:
             raise EvidenceError("published evidence has no reader", "EVIDENCE_MANIFEST_INVALID")
-        replay_reader = EvidenceReader(reader.root)
-        try:
-            replay = replay_reader.replay(evidence.manifest.evidence_id)
-        finally:
-            replay_reader.close()
+        reader._assert_root_identity(reader._held_root_fd, reader._held_root_identity)
     except EvidenceError as exc:
         raise ValueError("candidate evidence readback failed") from exc
     if (
@@ -980,14 +1179,19 @@ def evaluate_candidate_gates(
     published_resolution = evidence.manifest.factor_resolution
     symbols = tuple(_row_value(row, "symbol", _row_value(row, "code")) for row in rows)
     unique_symbols = set(symbols)
+    durable_symbols, durable_roles = _durable_universe(evidence)
     date_ok = all(
         _row_value(row, "trade_date", _row_value(row, "date")) == trade_date for row in rows
     )
-    coverage_ok = len(rows) == len(required_symbols) and len(unique_symbols) == len(rows)
+    input_universe_ok = tuple(sorted(set(required_symbols))) == durable_symbols
+    coverage_ok = len(rows) == len(durable_symbols) and unique_symbols == set(durable_symbols)
     semantic_ok = bool(rows)
     suspension_ok = bool(rows)
     for row in rows:
         security_type = _row_value(row, "security_type", "stock")
+        expected_role = durable_roles.get(_row_value(row, "symbol"))
+        if expected_role is None or expected_role != security_type:
+            semantic_ok = False
         suspended = bool(_row_value(row, "is_suspended", False))
         if not suspended:
             if _row_value(row, "adjust_factor") is None and security_type == "stock":
@@ -1020,15 +1224,16 @@ def evaluate_candidate_gates(
         tuple(page.get("fields", ())) == tuple(descriptor.fields)
         for page, descriptor in zip(evidence_pages, raw_descriptors, strict=True)
     )
-    replay_ok = (
-        replay.status == "ready"
-        and replay.normalization_clock_utc == evidence_manifest.normalization_clock_utc
+    replay_ok = bool(evidence_pages) and all(
+        evidence_manifest.normalization_clock_utc == descriptor.normalization_clock_utc
+        for descriptor in evidence.manifest.objects
+        if descriptor.object_kind.value == "raw_endpoint_page"
     )
     checks = (
         transport_ok,
         descriptor_fields_ok,
         date_ok,
-        unique_symbols == set(required_symbols),
+        input_universe_ok and unique_symbols == set(durable_symbols),
         coverage_ok,
         semantic_ok,
         factor_ok,
@@ -1041,7 +1246,7 @@ def evaluate_candidate_gates(
             gate_name=name,
             gate_version=gate_version,
             verdict="pass" if passed else "fail",
-            bounded_metrics=(("rows", len(rows)), ("required_symbols", len(required_symbols))),
+            bounded_metrics=(("rows", len(rows)), ("required_symbols", len(durable_symbols))),
             failure_class=None if passed else "semantic",
             referenced_hashes=tuple(
                 item for item in (evidence_manifest.manifest_sha256,) if item is not None
@@ -1109,6 +1314,7 @@ __all__ = [
     "R2F2_GATE_EVIDENCE",
     "R2F2_GATE_ORDER",
     "PublishedSelection",
+    "PublishedCandidateRejection",
     "SelectionReason",
     "SessionSelection",
     "build_candidate_manifest",

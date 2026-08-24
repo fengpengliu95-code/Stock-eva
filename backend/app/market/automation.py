@@ -20,6 +20,7 @@ from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.candidates import (
     CandidateStore,
+    PublishedSelection,
     build_candidate_manifest,
     evaluate_candidate_gates,
     select_primary_candidate,
@@ -465,8 +466,6 @@ def canonical_refresh_callback(
                         factor_resolution=manifest.factor_resolution,
                         created_at=datetime.now(UTC),
                     )
-                    if gate_report.verdict != "pass":
-                        raise ProviderHealthError("canonical candidate gates did not pass")
                     normalized_payload = json.dumps(
                         [item.model_dump(mode="json") for item in normalized.bars],
                         ensure_ascii=False,
@@ -494,15 +493,18 @@ def canonical_refresh_callback(
                         source_schema_version="daily_astock.v1",
                         row_count=len(normalized.bars),
                         required_symbol_count=len(request.session_symbols),
+                        status="accepted" if gate_report.verdict == "pass" else "rejected",
                     )
-                    selection = select_primary_candidate(
-                        trade_date=trade_date,
-                        universe_id=manifest.universe_id,
-                        candidates=(candidate,),
-                        selected_at=datetime.now(UTC),
-                        gate_report=gate_report,
-                        evidence=evidence,
-                    )
+                    selection = None
+                    if candidate.status == "accepted":
+                        selection = select_primary_candidate(
+                            trade_date=trade_date,
+                            universe_id=manifest.universe_id,
+                            candidates=(candidate,),
+                            selected_at=datetime.now(UTC),
+                            gate_report=gate_report,
+                            evidence=evidence,
+                        )
                     published_selection = CandidateStore(evidence_root).publish_chain(
                         report=gate_report,
                         candidate=candidate,
@@ -510,7 +512,9 @@ def canonical_refresh_callback(
                         evidence=evidence,
                         normalized_payload=normalized_payload,
                     )
-                    if published_selection is None:
+                    if gate_report.verdict != "pass":
+                        raise ProviderHealthError("canonical candidate gates did not pass")
+                    if not isinstance(published_selection, PublishedSelection):
                         raise ProviderHealthError("accepted candidate bundle was not published")
                     result = RefreshResult(
                         run_id=run_id,
