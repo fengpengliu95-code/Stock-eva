@@ -74,6 +74,25 @@ def test_market_get_missing_provider_evidence_root_is_write_free(tmp_path: Path)
     assert not root.exists()
 
 
+def test_legacy_manifest_missing_source_is_read_only_and_byte_stable(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root)
+    _publish_fixture(settings, dataset_root)
+    manifest_path = dataset_root / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["files"][0].pop("source")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    before_bytes = manifest_path.read_bytes()
+    before_tree = _tree(dataset_root)
+    NasMarketStore(
+        MarketStore(settings.market_data_dir / settings.market_database_name, read_only=True),
+        dataset_root,
+        settings.local_staging_dir,
+    )._manifest()
+    assert manifest_path.read_bytes() == before_bytes
+    assert _tree(dataset_root) == before_tree
+
+
 def _bars():
     return normalize_baostock_rows(
         fields=[

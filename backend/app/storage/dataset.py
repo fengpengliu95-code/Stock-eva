@@ -23,6 +23,7 @@ from uuid import uuid4
 import duckdb
 from pydantic import ValidationError
 
+from backend.app.market.candidates import SessionSelection
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
 from backend.app.storage.models import (
@@ -36,6 +37,17 @@ MANIFEST_NAME = "manifest.json"
 DATASET = "stock-eva-market"
 SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_R2F2_LINEAGE_FIELDS = (
+    "provider_id",
+    "universe_id",
+    "evidence_id",
+    "evidence_sha256",
+    "candidate_id",
+    "candidate_manifest_sha256",
+    "gate_report_sha256",
+    "adapter_version",
+    "source_schema_version",
+)
 _MAX_METADATA_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 _VALIDATED_OBJECTS_LIMIT = 1024
@@ -254,6 +266,25 @@ class NasMarketStore:
         if self.control.read_only:
             raise RuntimeError("read-only market store cannot run writer lifecycle")
 
+    @staticmethod
+    def _validate_publication_lineage(lineage: dict[str, object] | None) -> dict[str, object]:
+        if lineage is None:
+            return {}
+        if set(lineage) != set(_R2F2_LINEAGE_FIELDS):
+            raise DatasetError("new canonical publication requires complete lineage")
+        if any(lineage.get(field) is None for field in _R2F2_LINEAGE_FIELDS):
+            raise DatasetError("new canonical publication requires complete lineage")
+        if lineage.get("provider_id") != "baostock":
+            raise DatasetError("canonical publication provider lineage is unsupported")
+        for field in (
+            "evidence_sha256",
+            "candidate_manifest_sha256",
+            "gate_report_sha256",
+        ):
+            if not isinstance(lineage.get(field), str) or not _SHA256.fullmatch(lineage[field]):
+                raise DatasetError("canonical publication lineage hash is invalid")
+        return dict(lineage)
+
     @property
     def path(self) -> Path:
         return self.control.path
@@ -282,8 +313,19 @@ class NasMarketStore:
             DatasetManifest.model_validate(manifest_payload)
         except ValidationError as exc:
             raise DatasetError("published dataset metadata is unavailable") from exc
-        payload = manifest_payload
-        files = payload["files"]
+        # Legacy manifests predate R2-F2 provenance and may omit ``source``.
+        # Add the validated incumbent identity only to this read projection;
+        # the immutable manifest bytes are never rewritten.
+        payload = dict(manifest_payload)
+        files = [
+            (
+                {**item, "source": item.get("source", "baostock")}
+                if isinstance(item, dict) and "source" not in item
+                else item
+            )
+            for item in manifest_payload["files"]
+        ]
+        payload["files"] = files
         seen_paths: set[Path] = set()
         seen_partitions: set[tuple[str, date]] = set()
         for item in files:
@@ -296,6 +338,11 @@ class NasMarketStore:
                 raise DatasetError("published manifest has invalid row count metadata")
             if item.get("source") != "baostock" or not isinstance(item.get("trade_date"), str):
                 raise DatasetError("published manifest has invalid market partition metadata")
+            lineage_present = any(field in item for field in _R2F2_LINEAGE_FIELDS)
+            if lineage_present:
+                self._validate_publication_lineage(
+                    {field: item.get(field) for field in _R2F2_LINEAGE_FIELDS}
+                )
             try:
                 trade_date = date.fromisoformat(item["trade_date"])
             except ValueError as exc:
@@ -742,22 +789,30 @@ class NasMarketStore:
         )
         return set(rows)
 
-    def _publish_bars(self, bars: list[DailyBar]) -> None:
+    def _publish_bars(
+        self,
+        bars: list[DailyBar],
+        *,
+        publication_lineage: dict[str, object] | None = None,
+    ) -> None:
         self._ensure_writable()
         if not bars:
             raise DatasetError("cannot publish an empty bar set")
         by_date: dict[tuple[date, str], list[DailyBar]] = defaultdict(list)
         for bar in bars:
             by_date[(bar.trade_date, bar.source)].append(bar)
+        lineage = self._validate_publication_lineage(publication_lineage)
         with _ManifestLock(self.manifest_lock_path):
             baseline = self._manifest()
             baseline_generation = baseline["generation"]
-            self._publish_locked(by_date, baseline_generation)
+            self._publish_locked(by_date, baseline_generation, lineage=lineage)
 
     def _publish_locked(
         self,
         by_date: dict[tuple[date, str], list[DailyBar]],
         baseline_generation: object,
+        *,
+        lineage: dict[str, object] | None = None,
     ) -> None:
         staged_entries: list[tuple[Path, Path, Path, dict[str, object]]] = []
         scratch_paths: list[Path] = []
@@ -802,6 +857,7 @@ class NasMarketStore:
                             "trade_date": trade_date.isoformat(),
                             "source": source,
                             "row_count": row_count,
+                            **(lineage or {}),
                         },
                     )
                 )
@@ -845,13 +901,27 @@ class NasMarketStore:
         result: RefreshResult,
         *,
         publish: bool | None = None,
+        publication_lineage: dict[str, object] | None = None,
+        selection: SessionSelection | None = None,
     ) -> None:
         self._ensure_writable()
         publish = result.status == "ready" if publish is None else publish
         if publish:
             MarketStore._validate_ready_publication(result)
             MarketStore._validate_local_publication_bars(bars, result)
-            self._publish_bars(bars)
+            if publication_lineage is not None:
+                lineage = self._validate_publication_lineage(publication_lineage)
+                if selection is None:
+                    raise DatasetError("canonical pointer requires a verified selection")
+                if (
+                    selection.evidence_sha256 != lineage["evidence_sha256"]
+                    or selection.candidate_manifest_sha256 != lineage["candidate_manifest_sha256"]
+                    or selection.gate_report_sha256 != lineage["gate_report_sha256"]
+                    or selection.selected_provider_id.value != lineage["provider_id"]
+                    or selection.trade_date != result.requested_date
+                ):
+                    raise DatasetError("canonical selection lineage does not match publication")
+            self._publish_bars(bars, publication_lineage=publication_lineage)
             self.control.save_external_publication(result)
         else:
             self.control.save_refresh([], result, publish=False)
