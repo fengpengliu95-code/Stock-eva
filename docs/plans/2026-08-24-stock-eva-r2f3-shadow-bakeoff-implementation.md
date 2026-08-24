@@ -428,6 +428,8 @@ CREATE TABLE session_report (
          (outcome = 'success' AND successful_attempt_id IS NOT NULL AND evidence_id IS NOT NULL AND
           candidate_id IS NOT NULL AND terminal_attestation_id IS NOT NULL AND evidence_sha256 IS NOT NULL AND
           candidate_sha256 IS NOT NULL)),
+  CHECK (outcome <> 'evidence_ready' OR report_version = 1),
+  CHECK (outcome <> 'success' OR report_version >= 2),
   UNIQUE (provider_id, window_id, trade_date, report_version),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
@@ -561,6 +563,31 @@ BEGIN
        AND c.job_id=NEW.job_id AND c.window_id=NEW.window_id AND c.session_id=NEW.session_id
        AND c.candidate_sha256=NEW.candidate_sha256
   ) THEN RAISE(ABORT, 'session_hash_mismatch') END;
+END;
+
+CREATE TRIGGER session_report_success_requires_terminal_attempt
+BEFORE INSERT ON session_report
+WHEN NEW.outcome = 'success'
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_attempt_report a
+     WHERE a.attempt_id=NEW.successful_attempt_id AND a.provider_id=NEW.provider_id
+       AND a.job_id=NEW.job_id AND a.window_id=NEW.window_id AND a.session_id=NEW.session_id
+       AND a.outcome='success' AND a.terminal_marker=1
+       AND a.terminal_session_report_id=NEW.session_report_id
+  ) THEN RAISE(ABORT, 'success_requires_terminal_attempt') END;
+END;
+
+CREATE TRIGGER terminal_attestation_requires_terminal_session
+BEFORE INSERT ON shadow_terminal_attestation
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM session_report s
+     WHERE s.session_report_id=NEW.session_report_id AND s.provider_id=NEW.provider_id
+       AND s.job_id=NEW.job_id AND s.window_id=NEW.window_id AND s.session_id=NEW.session_id
+       AND s.report_version=NEW.session_report_version AND s.outcome='success'
+       AND s.terminal_attestation_id=NEW.attestation_id
+  ) THEN RAISE(ABORT, 'attestation_requires_terminal_success_session') END;
 END;
 
 CREATE TRIGGER terminal_attestation_hash_match
@@ -919,15 +946,25 @@ def terminal_graph_validator(conn, identity, expected_versions, attestation_valu
     assert evidence.sha256 == session.evidence_sha256
     assert candidate.sha256 == session.candidate_sha256
     assert candidate.evidence_sha256 == evidence.sha256
-    assert recompute_request_plan_sha256(plan) == plan.request_plan_sha256
-    assert recompute_completion_sha256(plan, refs, evidence.manifest) == evidence.completion_sha256
-    closure = recompute_attempt_ordinal_closure_sha256(plan, refs, terminal_rows, evidence.manifest)
-    assert closure == attestation_values.attempt_ordinal_closure_sha256
-    assert evidence.completion_sha256 == attestation_values.completion_sha256
+    assert session.outcome == "success"
+    assert session.report_version >= 2
+    assert attestation_values.session_report_version == session.report_version
+    recomputed_request_plan_sha256 = recompute_request_plan_sha256(plan)
+    recomputed_completion_sha256 = recompute_completion_sha256(plan, refs, evidence.manifest)
+    recomputed_ordinal_closure_sha256 = recompute_attempt_ordinal_closure_sha256(
+        plan, refs, terminal_rows, evidence.manifest
+    )
+    recomputed_report_digest = report_digest(refs, terminal_rows, session)
+    assert recomputed_request_plan_sha256 == plan.request_plan_sha256
+    assert recomputed_request_plan_sha256 == attestation_values.request_plan_sha256
+    assert recomputed_completion_sha256 == evidence.completion_sha256
+    assert recomputed_completion_sha256 == attestation_values.completion_sha256
+    assert recomputed_ordinal_closure_sha256 == attestation_values.attempt_ordinal_closure_sha256
+    assert recomputed_report_digest == session.report_sha256
+    assert recomputed_report_digest == attestation_values.report_digest_sha256
     assert candidate.evidence_sha256 == evidence.sha256 == attestation_values.evidence_sha256
     assert candidate.candidate_sha256 == session.candidate_sha256 == attestation_values.candidate_sha256
-    assert report_digest(refs, terminal_rows, session) == session.report_sha256
-    return closure, evidence, candidate
+    return recomputed_ordinal_closure_sha256, evidence, candidate
 
 BEGIN IMMEDIATE
 closure, evidence, candidate = terminal_graph_validator(
@@ -1353,6 +1390,9 @@ def test_session_hash_mismatch_rejects_terminal_attestation(tmp_path): ...
 def test_terminal_validator_runs_before_both_cas_and_zero_writes_on_failure(tmp_path): ...
 def test_terminal_graph_recomputes_request_plan_completion_and_ordinal_closure_sha256(tmp_path): ...
 def test_terminal_graph_rejects_fake_digest_and_endpoint_class_request_page_count_row_or_hash_mismatch(tmp_path): ...
+def test_fake_attestation_from_evidence_ready_session_is_rejected(tmp_path): ...
+def test_each_terminal_attestation_digest_mismatch_rolls_back_job_and_window_versions(tmp_path): ...
+def test_legal_terminal_success_report_version_and_attestation_pass(tmp_path): ...
 ~~~
 
 Run RED:

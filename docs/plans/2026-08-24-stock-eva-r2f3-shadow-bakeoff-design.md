@@ -413,6 +413,8 @@ When the terminal validator recomputes the plan, completion and ordinal-closure 
 Then NFC/UTF-8 canonical bytes and SHA-256 values match the evidence/candidate/session/attestation
 values, every endpoint/endpoint-class/request/page identity is exact and ordered, and any fake
 digest, endpoint/request/page/count/row/content-hash mismatch rolls back without version changes.
+An attestation referencing an `evidence_ready` report (even with matching object hashes) is
+rejected; only a `success` report with `report_version >= 2` and terminal attempt identity passes.
 
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 
@@ -697,7 +699,7 @@ ShadowSessionReport:
   evidence_id, candidate_id, terminal_attestation_id, report_version,
   evidence_sha256, candidate_sha256, report_sha256, window_id
   # evidence_ready requires evidence only and no candidate/attestation; terminal success requires
-  # both IDs/hashes and attestation; failure/skip/unavailable/mismatch has none
+  # both IDs/hashes and attestation plus report_version >= 2; failure/skip/unavailable/mismatch has none
 
 ShadowTerminalAttestation:
   attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
