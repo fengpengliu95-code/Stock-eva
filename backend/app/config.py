@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     provider_evidence_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
     provider_evidence_max_rows: int = Field(default=10_000_000, ge=1)
     provider_evidence_contract_version: str = "r2f2-evidence-v1"
-    provider_shadow_root: Path = Path("var/provider-shadow")
+    provider_shadow_root: Path = Path.cwd() / "var/provider-shadow"
     provider_shadow_enabled: bool = False
     provider_shadow_max_object_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     provider_shadow_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
@@ -138,6 +138,13 @@ class Settings(BaseSettings):
     def validate_shadow_row_bound(cls, value: int) -> int:
         if value != 10_000_000:
             raise ValueError("provider shadow row bound is fixed")
+        return value
+
+    @field_validator("provider_shadow_root")
+    @classmethod
+    def validate_provider_shadow_root_absolute(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("provider shadow root must be absolute")
         return value
 
     @field_validator("provider_tickflow_token_env_name")

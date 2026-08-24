@@ -151,6 +151,7 @@ class ShadowProviderContract(_Immutable):
     endpoint_contract_version: str
     source_schema_version: str
     requires_official_https_proof: bool
+    official_https_proven: bool = False
 
 
 STATIC_PROVIDER_CONTRACTS: dict[ShadowProviderId, ShadowProviderContract] = {
@@ -212,19 +213,34 @@ def terms_evidence_manifest_sha256(evidence: TermsEvidence) -> str:
 
 
 def make_token(
-    provider_id: str,
+    provider_record: ShadowProviderRecord,
+    terms_evidence: TermsEvidence,
     *,
-    requested: str | None = None,
-    terms_approved: bool = False,
-    https_proof: bool = True,
+    provider_contract: ShadowProviderContract | None = None,
     environ: dict[str, str] | None = None,
 ) -> str:
-    """Read the exact environment variable only after all admission gates pass."""
+    """Resolve the exact environment variable only after reviewed admission gates pass."""
     from .registry import TermsEvidenceUnavailable
 
-    env_name = exact_credential_env(provider_id, requested=requested)
-    if not terms_approved or (provider_id == "tushare" and not https_proof):
+    if not isinstance(provider_record, ShadowProviderRecord) or not isinstance(
+        terms_evidence, TermsEvidence
+    ):
+        raise TermsEvidenceUnavailable("reviewed provider projection unavailable")
+    provider_id = provider_record.provider_id.value
+    frozen_contract = STATIC_PROVIDER_CONTRACTS[provider_record.provider_id]
+    contract = provider_contract or frozen_contract
+    if (
+        contract != frozen_contract
+        or contract.provider_id != provider_record.provider_id
+        or provider_record.terms_evidence_hash != terms_evidence.manifest_sha256
+        or provider_record.terms_review_id != terms_evidence.review_id
+        or terms_evidence.approved_credential_mode != "environment-only"
+        or terms_evidence.approved_intended_use != provider_record.intended_use
+        or terms_evidence.approved_retention != provider_record.retention_decision
+        or (contract.requires_official_https_proof and not contract.official_https_proven)
+    ):
         raise TermsEvidenceUnavailable("provider terms or transport proof unavailable")
+    env_name = exact_credential_env(provider_id, requested=provider_record.credential_env_name)
     value = (os.environ if environ is None else environ).get(env_name)
     if not value:
         raise TermsEvidenceUnavailable("provider credential unavailable")

@@ -76,7 +76,25 @@ def market_provider_status(
         return ShadowProviderStatusResponse(
             status="unavailable", unavailable_reason=UnavailableReason.REGISTRY_MISSING
         )
-    path = StorageLayout(settings).provider_registry_database
+    layout = StorageLayout(settings)
+    try:
+        layout.validate_provider_shadow_root(
+            canonical_roots=tuple(
+                root
+                for root in (
+                    settings.local_market_dataset_root,
+                    settings.nas_market_dataset_root,
+                )
+                if root is not None
+            )
+        )
+    except RegistryUnavailable:
+        return ShadowProviderStatusResponse(
+            status="unavailable",
+            provider=provider_id,
+            unavailable_reason=UnavailableReason.SHADOW_ROOT_UNAVAILABLE,
+        )
+    path = layout.provider_registry_database
     if not path.is_file():
         return ShadowProviderStatusResponse(
             status="unavailable",

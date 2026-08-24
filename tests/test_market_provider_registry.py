@@ -1,8 +1,10 @@
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+from backend.app.api.market import UnavailableReason, market_provider_status
 from backend.app.config import Settings
 from backend.app.market.providers.registry import (
     RegistryUnavailable,
@@ -87,12 +89,12 @@ def test_registry_transitions_are_closed_and_quarantine_resets_version(tmp_path)
     terms = _terms()
     registry.put_terms_evidence(terms)
     registry.attach_terms_to_provider("tickflow", terms)
-    assert registry.transition("tickflow", "canary", expected_state_version=0).state_version == 1
+    assert registry.transition("tickflow", "canary", expected_state_version=1).state_version == 2
     with pytest.raises(ValueError):
-        registry.transition("tickflow", "qualified", expected_state_version=1)
-    registry.transition("tickflow", "quarantined", expected_state_version=1)
+        registry.transition("tickflow", "qualified", expected_state_version=2)
+    registry.transition("tickflow", "quarantined", expected_state_version=2)
     with pytest.raises(ValueError):
-        registry.transition("tickflow", "shadow", expected_state_version=2)
+        registry.transition("tickflow", "shadow", expected_state_version=3)
     changed = _record().model_copy(
         update={
             "admission_state": AdmissionState.CANARY,
@@ -101,7 +103,7 @@ def test_registry_transitions_are_closed_and_quarantine_resets_version(tmp_path)
             "terms_review_id": terms.review_id,
         }
     )
-    assert registry.reopen_quarantined(changed).state_version == 3
+    assert registry.reopen_quarantined(changed).state_version == 4
 
 
 def test_missing_or_corrupt_registry_reader_is_unavailable_and_zero_write(tmp_path):
@@ -188,14 +190,14 @@ def test_exact_env_mapping_rejects_arbitrary_env_name_without_reading_client(mon
     with pytest.raises(ValueError):
         exact_credential_env("tickflow", requested="ARBITRARY_TOKEN")
     monkeypatch.setenv("ARBITRARY_TOKEN", "must-not-read")
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         make_token("tickflow", requested="ARBITRARY_TOKEN", terms_approved=False)
 
 
 def test_tushare_execute_rejects_before_http_client_when_https_or_terms_unapproved():
-    with pytest.raises(TermsEvidenceUnavailable):
+    with pytest.raises(TypeError):
         make_token("tushare", terms_approved=False, https_proof=False)
-    with pytest.raises(TermsEvidenceUnavailable):
+    with pytest.raises(TypeError):
         make_token("tushare", terms_approved=True, https_proof=False)
 
 
@@ -217,7 +219,7 @@ def test_registry_ddl_compiles_pragmas_foreign_keys_checks_and_unique_constraint
     initialize_registry(connection)
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
-    assert MIGRATION_ID == "r2f3-registry-0001"
+    assert MIGRATION_ID == "r2f3-registry-0002"
     assert "CREATE TABLE provider_record" in REGISTRY_DDL
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     connection.close()
@@ -247,10 +249,10 @@ def test_registry_cas_uses_begin_immediate_update_where_state_version_and_rowcou
     terms = _terms()
     registry.put_terms_evidence(terms)
     registry.attach_terms_to_provider("tickflow", terms)
-    assert registry.transition("tickflow", "canary", expected_state_version=0).state_version == 1
+    assert registry.transition("tickflow", "canary", expected_state_version=1).state_version == 2
     with pytest.raises(RegistryUnavailable):
-        registry.transition("tickflow", "shadow", expected_state_version=0)
-    assert registry.read_status("tickflow").state_version == 1
+        registry.transition("tickflow", "shadow", expected_state_version=1)
+    assert registry.read_status("tickflow").state_version == 2
 
 
 def test_registry_stale_writer_rolls_back_without_state_or_history_loss(tmp_path):
@@ -262,9 +264,9 @@ def test_registry_stale_writer_rolls_back_without_state_or_history_loss(tmp_path
     first.put_terms_evidence(terms)
     first.attach_terms_to_provider("tickflow", terms)
     stale = ShadowRegistry(path)
-    first.transition("tickflow", "canary", expected_state_version=0)
+    first.transition("tickflow", "canary", expected_state_version=1)
     with pytest.raises(RegistryUnavailable):
-        stale.transition("tickflow", "shadow", expected_state_version=0)
+        stale.transition("tickflow", "shadow", expected_state_version=1)
     assert first.read_status("tickflow").admission_state == AdmissionState.CANARY
 
 
@@ -313,3 +315,151 @@ def test_terms_evidence_descriptor_mutation_symlink_size_or_hash_mismatch_is_una
     (tmp_path / "terms" / "tickflow.txt").write_bytes(b"mutated")
     with pytest.raises(RegistryUnavailable):
         registry.read_terms_evidence(evidence.terms_evidence_id)
+
+
+def test_h1_credential_resolution_uses_reviewed_projection_and_rejects_current_tushare_before_env(
+    monkeypatch,
+):
+    from backend.app.market.providers.registry import resolve_provider_credential
+    from backend.app.market.providers.shadow_contracts import STATIC_PROVIDER_CONTRACTS
+
+    terms = _terms("tushare")
+    record = _record("tushare").model_copy(
+        update={
+            "terms_evidence_hash": terms.manifest_sha256,
+            "terms_review_id": terms.review_id,
+        }
+    )
+    monkeypatch.setenv("STOCK_EVA_TUSHARE_TOKEN", "must-not-read")
+    with pytest.raises(TermsEvidenceUnavailable):
+        resolve_provider_credential(
+            record,
+            terms,
+            provider_contract=STATIC_PROVIDER_CONTRACTS[ShadowProviderId.TUSHARE],
+        )
+    with pytest.raises(TypeError):
+        resolve_provider_credential(record, terms, terms_approved=True)
+
+
+def test_h2_frozen_migrations_have_exact_ids_and_all_registry_triggers(tmp_path):
+    from backend.app.market.shadow_registry_schema import MIGRATION_IDS
+
+    path = tmp_path / "provider_registry.sqlite3"
+    registry = ShadowRegistry(path)
+    registry.initialize()
+    connection = sqlite3.connect(path)
+    assert MIGRATION_IDS == ("r2f3-registry-0001", "r2f3-registry-0002")
+    assert connection.execute(
+        "SELECT migration_id FROM schema_migration ORDER BY schema_version"
+    ).fetchall() == [
+        ("r2f3-registry-0001",),
+        ("r2f3-registry-0002",),
+    ]
+    trigger_count = connection.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='trigger'"
+    ).fetchone()[0]
+    assert trigger_count >= 9
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    connection.close()
+
+
+def test_h3_generic_transition_cannot_qualify_without_verified_terminal_graph():
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    terms = _terms()
+    registry.put_provider(_record())
+    registry.put_terms_evidence(terms)
+    registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    with pytest.raises(ValueError):
+        registry.transition("tickflow", "qualified", expected_state_version=1)
+    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
+    for _index in range(20):
+        window = registry.record_session("tickflow", window.window_id, success=True)
+    assert window.window_state == "observing"
+    with pytest.raises(RegistryUnavailable):
+        registry.promote_qualified(
+            "tickflow",
+            window.window_id,
+            terminal_attestation_id="missing",
+            evidence_sha256=_sha("evidence"),
+            candidate_sha256=_sha("candidate"),
+            session_report_id="missing",
+        )
+
+
+def test_h4_terms_attach_expected_state_cas_resets_window_atomically():
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    window = registry.ensure_window("tickflow", _sha("old"), "cal-1", _sha("calendar"))
+    registry.record_session("tickflow", window.window_id, success=True)
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    assert attached.state_version == 1
+    assert registry.read_status("tickflow").terms_evidence_hash == terms.manifest_sha256
+    reset = registry.read_window("tickflow", window.window_id)
+    assert reset.consecutive_sessions == 0
+    assert reset.state_version == 2
+    with pytest.raises(RegistryUnavailable):
+        registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+
+
+def test_h5_untrusted_shadow_ancestor_symlink_is_zero_write_and_rejected(tmp_path):
+    from backend.app.storage.layout import StorageLayout
+
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    settings = Settings(
+        provider_shadow_root=link / "shadow",
+        provider_evidence_root=tmp_path / "canonical",
+    )
+    with pytest.raises(RegistryUnavailable):
+        StorageLayout(settings).validate_provider_shadow_root()
+    assert not (target / "shadow").exists()
+
+
+def test_h6_golden_partition_is_real_parquet_and_not_serializer_bytes():
+    import duckdb
+
+    path = Path(__file__).parent / "fixtures" / "r2f2_golden" / "partition.parquet"
+    rows = (
+        duckdb.connect(":memory:")
+        .execute(
+            "SELECT trade_date::VARCHAR, symbol, close FROM read_parquet(?) ORDER BY symbol",
+            [str(path)],
+        )
+        .fetchall()
+    )
+    assert rows == [("2026-08-21", "sh.600000", 10.5), ("2026-08-21", "sz.000001", 20.25)]
+
+
+def test_h7_status_missing_or_unusable_shadow_root_is_unavailable_without_initialization(tmp_path):
+    settings = Settings(
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        provider_evidence_root=tmp_path / "canonical",
+    )
+    before = sorted(tmp_path.rglob("*"))
+    response = market_provider_status(settings, provider_id=ShadowProviderId.TICKFLOW)
+    assert response.status == "unavailable"
+    assert response.unavailable_reason in {
+        UnavailableReason.REGISTRY_MISSING,
+        UnavailableReason.SHADOW_ROOT_UNAVAILABLE,
+    }
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_m_canonical_digest_nfc_normalizes_keys_and_rejects_nested_null():
+    from backend.app.market.shadow_registry_schema import canonical_digest
+
+    raw = b'{"job_id":"j","provider_id":"tickflow","requests":{},"window_id":"w"}\n'
+    assert canonical_digest("request-plan", raw)
+    with pytest.raises(ValueError):
+        canonical_digest(
+            "request-plan",
+            b'{"job_id":"j","provider_id":"tickflow","requests":{"nested":null},"window_id":"w"}\n',
+        )

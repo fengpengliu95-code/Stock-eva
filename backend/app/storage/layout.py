@@ -1,3 +1,5 @@
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,6 +83,42 @@ class StorageLayout:
         ):
             raise ValueError("shadow evidence ID must be a basename")
         return self.provider_shadow_bundles / evidence_id
+
+    def validate_provider_shadow_root(self, *, canonical_roots: tuple[Path, ...] = ()) -> Path:
+        """Validate without creating anything, following no symlinks in any ancestor."""
+        from backend.app.market.providers.registry import RegistryUnavailable
+
+        root = self.provider_shadow_root
+        if not root.is_absolute():
+            raise RegistryUnavailable("shadow root unavailable")
+        canonical = tuple(canonical_roots) + (self.provider_evidence_root,)
+        root_resolved = Path(os.path.abspath(root))
+        for candidate in canonical:
+            candidate_resolved = Path(os.path.abspath(candidate))
+            if root_resolved == candidate_resolved:
+                raise RegistryUnavailable("shadow root overlaps canonical root")
+            try:
+                root_resolved.relative_to(candidate_resolved)
+                raise RegistryUnavailable("shadow root overlaps canonical root")
+            except ValueError:
+                pass
+            try:
+                candidate_resolved.relative_to(root_resolved)
+                raise RegistryUnavailable("shadow root overlaps canonical root")
+            except ValueError:
+                pass
+        current = Path(root.anchor)
+        for component in root.parts[1:]:
+            current /= component
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                raise RegistryUnavailable("shadow root unavailable") from None
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise RegistryUnavailable("shadow root unavailable")
+        if root.stat().st_mode & 0o002:
+            raise RegistryUnavailable("shadow root permissions unavailable")
+        return root
 
     @property
     def provider_evidence_root(self) -> Path:
