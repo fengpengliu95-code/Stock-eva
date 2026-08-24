@@ -354,6 +354,7 @@ class EvidenceManifest(_Immutable):
     adapter_version: str = R2F2_ADAPTER_VERSION
     endpoint_contract_version: str = R2F2_ENDPOINT_CONTRACT_VERSION
     trade_date: date
+    refresh_id: SafeIdentifier
     universe_id: SafeIdentifier
     requested_at: datetime
     completed_at: datetime
@@ -750,8 +751,10 @@ class EvidenceReader:
         self.max_object_bytes = max_object_bytes
         self._held_root_fd: int | None = None
         self._held_root_identity: tuple[int, int] | None = None
+        self._closed = False
 
     def close(self) -> None:
+        self._closed = True
         if self._held_root_fd is not None:
             try:
                 os.close(self._held_root_fd)
@@ -775,6 +778,8 @@ class EvidenceReader:
             raise EvidenceError("evidence root was replaced", "EVIDENCE_HASH_MISMATCH")
 
     def _open_read_root(self) -> tuple[int, tuple[int, int]]:
+        if self._closed:
+            raise EvidenceError("evidence reader is closed", "EVIDENCE_ROOT_UNAVAILABLE")
         root_fd = _open_root_dir(self.root, create=False)
         metadata = os.fstat(root_fd)
         identity = (metadata.st_dev, metadata.st_ino)
@@ -782,9 +787,14 @@ class EvidenceReader:
         return root_fd, identity
 
     def read(self, evidence_id: str) -> PublishedEvidence:
+        if self._closed:
+            raise EvidenceError("evidence reader is closed", "EVIDENCE_ROOT_UNAVAILABLE")
         if "/" in evidence_id or ".." in evidence_id:
             raise EvidenceError("unsafe evidence ID", "EVIDENCE_UNSAFE_PATH")
-        self.close()
+        if self._held_root_fd is not None:
+            os.close(self._held_root_fd)
+            self._held_root_fd = None
+            self._held_root_identity = None
         root_fd, root_identity = self._open_read_root()
         try:
             payload = _read_descriptor_fd(
@@ -803,6 +813,14 @@ class EvidenceReader:
                 raise EvidenceError(
                     "evidence manifest invalid", "EVIDENCE_MANIFEST_INVALID"
                 ) from exc
+            identity_probe = manifest.model_dump(mode="json")
+            identity_probe.pop("evidence_id", None)
+            identity_probe.pop("manifest_sha256", None)
+            expected_evidence_id = f"ev-{_digest(identity_probe)[:24]}"
+            if manifest.evidence_id != expected_evidence_id:
+                raise EvidenceError(
+                    "evidence ID content identity mismatch", "EVIDENCE_HASH_MISMATCH"
+                )
             factor_rows: tuple[dict[str, Any], ...] = ()
             for descriptor in manifest.objects:
                 self._assert_root_identity(root_fd, root_identity)
@@ -858,6 +876,7 @@ class EvidenceReader:
                     raise EvidenceError(
                         "factor resolution has duplicate bindings", "EVIDENCE_MANIFEST_INVALID"
                     )
+            self._assert_root_identity(root_fd, root_identity)
             identity = _digest(manifest.model_dump(mode="json"))
             evidence = PublishedEvidence(
                 manifest=manifest, descriptors=manifest.objects, reader_identity=identity
@@ -908,6 +927,7 @@ class EvidenceReader:
             expected = (
                 manifest.provider_id,
                 manifest.universe_id,
+                manifest.refresh_id,
                 manifest.adapter_version,
                 manifest.endpoint_contract_version,
                 logical.endpoint,
@@ -923,6 +943,7 @@ class EvidenceReader:
             actual = (
                 descriptor.provider_id,
                 descriptor.universe_id,
+                descriptor.refresh_id,
                 descriptor.adapter_version,
                 descriptor.endpoint_contract_version,
                 descriptor.endpoint,
@@ -1028,7 +1049,7 @@ class EvidenceReader:
         descriptor: EvidenceObjectDescriptor | None = None,
     ) -> tuple[dict[str, Any], ...]:
         """Read descriptor-bound pages, or one page for the legacy test helper."""
-        if evidence._closed:
+        if self._closed or evidence._closed:
             raise EvidenceError("published evidence reader is closed", "EVIDENCE_ROOT_UNAVAILABLE")
         if descriptor is None:
             owns_fd = self._held_root_fd is None
@@ -1095,21 +1116,27 @@ class EvidenceReader:
                         page["factor_rows"] = tuple(
                             tuple(row.get(field) for field in factor_fields) for row in factor_rows
                         )
+                self._assert_root_identity(root_fd, root_identity)
                 return tuple(pages)
             finally:
                 if owns_fd:
                     os.close(root_fd)
         if descriptor not in evidence.descriptors:
             raise EvidenceError("descriptor is not bound to evidence", "EVIDENCE_MANIFEST_INVALID")
+        if self._held_root_fd is None:
+            bound_reader = evidence._reader
+            if bound_reader is None or bound_reader is self:
+                raise EvidenceError(
+                    "published evidence has no held root", "EVIDENCE_ROOT_UNAVAILABLE"
+                )
+            return bound_reader.read_rows(evidence, descriptor)
         if evidence.reader_identity != _digest(evidence.manifest.model_dump(mode="json")):
             raise EvidenceError("published evidence identity mismatch", "EVIDENCE_HASH_MISMATCH")
-        if self._held_root_fd is not None and self._held_root_identity is not None:
-            self._assert_root_identity(self._held_root_fd, self._held_root_identity)
-            data = _read_descriptor_fd(
-                self._held_root_fd, descriptor.relative_path, self.max_object_bytes
-            )
-        else:
-            data = _read_descriptor(self.root, descriptor.relative_path, self.max_object_bytes)
+        assert self._held_root_identity is not None
+        self._assert_root_identity(self._held_root_fd, self._held_root_identity)
+        data = _read_descriptor_fd(
+            self._held_root_fd, descriptor.relative_path, self.max_object_bytes
+        )
         if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
             raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
         if descriptor.object_kind is EvidenceObjectKind.FACTOR_CACHE_SNAPSHOT:
@@ -1249,6 +1276,7 @@ class EvidenceReader:
             compare_adapter_version is not None
             and compare_adapter_version != manifest.adapter_version
         ):
+            evidence.close()
             return ReplayResult(
                 status="error",
                 evidence_id=evidence_id,
@@ -1278,6 +1306,7 @@ class EvidenceReader:
             if not isinstance(normalized, tuple):
                 raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
         except EvidenceError as exc:
+            evidence.close()
             return ReplayResult(
                 status="error",
                 evidence_id=evidence_id,
@@ -1285,6 +1314,7 @@ class EvidenceReader:
                 failure_class=exc.failure_class,
             )
         except Exception:
+            evidence.close()
             return ReplayResult(
                 status="error",
                 evidence_id=evidence_id,
@@ -1310,6 +1340,7 @@ class EvidenceReader:
         byte_match = None if compare_candidate_sha is None else candidate == compare_candidate_sha
         semantic_match = None if compare_semantic_sha is None else semantic == compare_semantic_sha
         if byte_match is False:
+            evidence.close()
             return ReplayResult(
                 status="error",
                 evidence_id=evidence_id,
@@ -1323,6 +1354,7 @@ class EvidenceReader:
                 failure_class="REPLAY_NONDETERMINISTIC",
             )
         if semantic_match is False:
+            evidence.close()
             return ReplayResult(
                 status="error",
                 evidence_id=evidence_id,
@@ -1335,6 +1367,7 @@ class EvidenceReader:
                 trade_date=manifest.trade_date,
                 failure_class="REPLAY_SEMANTIC_MISMATCH",
             )
+        evidence.close()
         return ReplayResult(
             status="ready",
             evidence_id=evidence_id,
@@ -1612,13 +1645,14 @@ class EvidenceStore:
             writes.append((relative, payload))
         if factor_descriptor is not None:
             descriptors.append(factor_descriptor)
-        manifest_id = evidence_id or f"ev-{_digest([item.sha256 for item in descriptors])[:24]}"
+        manifest_id = evidence_id or "ev-pending"
         manifest_data = dict(
             evidence_id=manifest_id,
             provider_id=batch.provider_id,
             adapter_version=batch.adapter_version,
             endpoint_contract_version=batch.endpoint_contract_version,
             trade_date=batch.request.trade_date,
+            refresh_id=batch.request.refresh_id,
             universe_id=batch.request.universe_id,
             requested_at=batch.started_at,
             completed_at=batch.completed_at,
@@ -1648,6 +1682,17 @@ class EvidenceStore:
                 if item.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE
             ),
         )
+        identity_probe = EvidenceManifest.model_construct(
+            **manifest_data,
+            manifest_sha256="0" * 64,
+        ).model_dump(mode="json")
+        identity_probe.pop("evidence_id", None)
+        identity_probe.pop("manifest_sha256", None)
+        expected_manifest_id = f"ev-{_digest(identity_probe)[:24]}"
+        if evidence_id is not None and evidence_id != expected_manifest_id:
+            raise EvidenceError("evidence ID is not content addressed", "EVIDENCE_HASH_MISMATCH")
+        manifest_id = expected_manifest_id
+        manifest_data["evidence_id"] = manifest_id
         provisional = EvidenceManifest.model_construct(
             **manifest_data,
             manifest_sha256="0" * 64,
@@ -1885,6 +1930,7 @@ class EvidenceStore:
             raise EvidenceError("transport observations are required", "EVIDENCE_MANIFEST_INVALID")
 
     def read(self, evidence_id: str) -> PublishedEvidence:
+        """Return evidence bound to one held root FD; the caller must close it."""
         return EvidenceReader(self.root, max_object_bytes=self.max_object_bytes).read(evidence_id)
 
     def replay(
@@ -1897,14 +1943,18 @@ class EvidenceStore:
         adapter: object | None = None,
         factor_cache: object | None = None,
     ) -> ReplayResult:
-        return EvidenceReader(self.root, max_object_bytes=self.max_object_bytes).replay(
-            evidence_id,
-            compare_candidate_sha=compare_candidate_sha,
-            compare_semantic_sha=compare_semantic_sha,
-            compare_adapter_version=compare_adapter_version,
-            adapter=adapter,
-            factor_cache=factor_cache,
-        )
+        reader = EvidenceReader(self.root, max_object_bytes=self.max_object_bytes)
+        try:
+            return reader.replay(
+                evidence_id,
+                compare_candidate_sha=compare_candidate_sha,
+                compare_semantic_sha=compare_semantic_sha,
+                compare_adapter_version=compare_adapter_version,
+                adapter=adapter,
+                factor_cache=factor_cache,
+            )
+        finally:
+            reader.close()
 
 
 def _dump_json(value: Any) -> Any:

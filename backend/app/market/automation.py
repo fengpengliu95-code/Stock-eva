@@ -128,6 +128,14 @@ def publish_provider_evidence_with_factor_cache(
         ).hexdigest()
         if before_fingerprint != after_fingerprint or before_rows != after_rows:
             raise ProviderHealthError("factor snapshot changed during evidence capture")
+        requested_keys = tuple(f"{symbol}.{trade_date.isoformat()}" for symbol in factor_symbols)
+        actual_keys = tuple(f"{row['symbol']}.{row['trade_date']}" for row in after_rows)
+        if (
+            tuple(sorted(set(factor_symbols))) != tuple(factor_symbols)
+            or len(actual_keys) != len(set(actual_keys))
+            or tuple(sorted(actual_keys)) != tuple(sorted(requested_keys))
+        ):
+            raise ProviderHealthError("factor snapshot does not exactly cover requested symbols")
         records = factor_snapshot_records_from_cache(
             list(after_rows),
             before_fingerprint=before_fingerprint,
@@ -326,18 +334,51 @@ def canonical_refresh_callback(
         run_id: str,
         before_store: Callable[[], None] | None = None,
     ) -> RefreshResult:
-        request = build_canonical_raw_request(
-            adapter,
-            trade_date=trade_date,
-            refresh_id=run_id,
-            required_symbols=required_symbols,
-        )
-        stock_request = next(
-            item
-            for item in request.logical_request_plan.requests
-            if item.endpoint is ContractProviderEndpoint.DAILY_ASTOCK
-        )
-        main_symbols = stock_request.symbols
+        adapter_scope_factory = getattr(adapter, "refresh_operation", None)
+
+        def adapter_scope():
+            return (
+                adapter_scope_factory(run_id) if callable(adapter_scope_factory) else nullcontext()
+            )
+
+        def failure_result(error: Exception) -> RefreshResult:
+            failure = market_failure_from_exception(error, stage="fetch")
+            return RefreshResult(
+                run_id=run_id,
+                request_key=request_key,
+                run_kind="daily",
+                requested_date=trade_date,
+                source="baostock",
+                status="error",
+                requested_count=0,
+                succeeded_count=0,
+                coverage_ratio=0,
+                failed_symbols=[],
+                quality_issues=legacy_failure_quality_issues(failure),
+                error_message=public_failure_message(failure),
+                failure_stage=failure.failure_stage,
+                failure_class=failure.failure_class,
+                retryable=failure.retryable,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+
+        try:
+            with adapter_scope():
+                request = build_canonical_raw_request(
+                    adapter,
+                    trade_date=trade_date,
+                    refresh_id=run_id,
+                    required_symbols=required_symbols,
+                )
+            stock_request = next(
+                item
+                for item in request.logical_request_plan.requests
+                if item.endpoint is ContractProviderEndpoint.DAILY_ASTOCK
+            )
+            main_symbols = stock_request.symbols
+        except Exception as error:
+            return failure_result(error)
 
         def validate_universe(batch: object) -> None:
             universe = tuple(
@@ -389,55 +430,40 @@ def canonical_refresh_callback(
                 raise ProviderHealthError("canonical factor snapshot is empty")
             return tuple(bindings)
 
-        try:
-            manifest, _evidence, bars = run_canonical_raw_refresh(
-                adapter,
-                request,
-                evidence_root=evidence_root,
-                lock_path=lock_path,
-                factor_cache=factor_cache,
-                factor_symbols=main_symbols,
-                trade_date=trade_date,
-                factor_resolution_factory=factor_bindings,
-                validate_batch=validate_universe,
-                _lock_held=True,
-            )
-            normalized = ProviderBatch(
-                bars=list(bars),
-                expected_symbols=list(request.session_symbols),
-                failed_symbols=[],
-            )
-            return run_publication_refresh(
-                store,
-                adapter,
-                trade_date=trade_date,
-                required_symbols=required_symbols,
-                request_key=request_key,
-                run_id=run_id,
-                before_store=before_store,
-                normalized_batch=normalized,
-            )
-        except Exception as error:
-            failure = market_failure_from_exception(error, stage="fetch")
-            return RefreshResult(
-                run_id=run_id,
-                request_key=request_key,
-                run_kind="daily",
-                requested_date=trade_date,
-                source="baostock",
-                status="error",
-                requested_count=0,
-                succeeded_count=0,
-                coverage_ratio=0,
-                failed_symbols=[],
-                quality_issues=legacy_failure_quality_issues(failure),
-                error_message=public_failure_message(failure),
-                failure_stage=failure.failure_stage,
-                failure_class=failure.failure_class,
-                retryable=failure.retryable,
-                started_at=datetime.now(UTC),
-                completed_at=datetime.now(UTC),
-            )
+        with adapter_scope():
+            try:
+                manifest, evidence, bars = run_canonical_raw_refresh(
+                    adapter,
+                    request,
+                    evidence_root=evidence_root,
+                    lock_path=lock_path,
+                    factor_cache=factor_cache,
+                    factor_symbols=main_symbols,
+                    trade_date=trade_date,
+                    factor_resolution_factory=factor_bindings,
+                    validate_batch=validate_universe,
+                    _lock_held=True,
+                )
+                try:
+                    normalized = ProviderBatch(
+                        bars=list(bars),
+                        expected_symbols=list(request.session_symbols),
+                        failed_symbols=[],
+                    )
+                    return run_publication_refresh(
+                        store,
+                        adapter,
+                        trade_date=trade_date,
+                        required_symbols=required_symbols,
+                        request_key=request_key,
+                        run_id=run_id,
+                        before_store=before_store,
+                        normalized_batch=normalized,
+                    )
+                finally:
+                    evidence.close()
+            except Exception as error:
+                return failure_result(error)
 
     return execute
 
@@ -1152,13 +1178,14 @@ class MarketAutomationService:
         refresh_id = f"{request_prefix}-{uuid.uuid4().hex[:12]}"
         collector = _RefreshObservationCollector(self.health_store, refresh_id)
         refresh_operation = getattr(self.provider, "refresh_operation", None)
-        provider_scope = (
-            refresh_operation(refresh_id) if callable(refresh_operation) else nullcontext()
-        )
 
-        with transport_observation_sink(collector.record), provider_scope:
+        def provider_scope():
+            return refresh_operation(refresh_id) if callable(refresh_operation) else nullcontext()
+
+        with transport_observation_sink(collector.record):
             try:
-                provider_sessions = self.provider.trading_dates(target, target)
+                with provider_scope():
+                    provider_sessions = self.provider.trading_dates(target, target)
             except Exception as error:
                 collector.resolve_touched_endpoints()
                 failure = market_failure_from_exception(error, stage="validate")
@@ -1199,15 +1226,17 @@ class MarketAutomationService:
                     before_store=collector.resolve_touched_endpoints,
                 )
             else:
-                result = run_publication_refresh(
-                    self.store,
-                    self.provider,
-                    trade_date=target,
-                    required_symbols=self.required_symbols(),
-                    request_key=request_key,
-                    run_id=refresh_id,
-                    before_store=collector.resolve_touched_endpoints,
-                )
+                with provider_scope():
+                    result = run_publication_refresh(
+                        self.store,
+                        self.provider,
+                        trade_date=target,
+                        required_symbols=self.required_symbols(),
+                        request_key=request_key,
+                        run_id=refresh_id,
+                        before_store=collector.resolve_touched_endpoints,
+                    )
+            collector.resolve_touched_endpoints()
         if result.status == "ready":
             state = running.model_copy(
                 update={

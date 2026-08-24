@@ -64,6 +64,10 @@ class BaoStockProviderAdapter:
     def trading_dates(self, start_date, end_date):
         return self._incumbent.trading_dates(start_date, end_date)
 
+    def refresh_operation(self, refresh_id: str):
+        """Delegate the incumbent transport scope without altering its identity."""
+        return self._incumbent.refresh_operation(refresh_id)
+
     def inspect_main_board(self, trade_date):
         return self._incumbent.inspect_main_board(trade_date)
 

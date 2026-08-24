@@ -199,6 +199,28 @@ def test_evidence_manifest_binds_hash_schema_provider_universe_and_row_count(tmp
     )
 
 
+def test_task8_manifest_binds_refresh_id_and_content_addressed_identity(tmp_path):
+    _, manifest, _, batch = _published(tmp_path)
+    assert manifest.refresh_id == batch.request.refresh_id
+    core = manifest.model_dump(mode="json")
+    core.pop("evidence_id")
+    core.pop("manifest_sha256")
+    assert manifest.evidence_id == f"ev-{_digest(core)[:24]}"
+
+
+def test_task8_reader_rejects_rehashed_manifest_with_changed_refresh_identity(tmp_path):
+    _, manifest, _, _ = _published(tmp_path)
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["refresh_id"] = "forged-refresh"
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
 def test_evidence_rejects_secret_header_cookie_url_path_and_exception_fields(tmp_path):
     with pytest.raises(ValueError):
         _descriptor(tmp_path, relative_path="https://token")
@@ -211,7 +233,7 @@ def test_evidence_publish_is_atomic_at_each_crash_boundary(tmp_path):
 
 
 def test_evidence_reader_rejects_symlink_toc_tou_oversize_and_object_substitution(tmp_path):
-    store, manifest, _, _ = _published(tmp_path)
+    _store, manifest, _, _ = _published(tmp_path)
     object_path = tmp_path / manifest.objects[0].relative_path
     object_path.write_bytes(b"substituted")
     with pytest.raises(EvidenceError):
@@ -734,6 +756,18 @@ def test_task8_published_evidence_close_is_irreversible(tmp_path):
         EvidenceReader(tmp_path).read_rows(evidence, manifest.objects[0])
 
 
+def test_task8_reader_close_is_irreversible(tmp_path):
+    _store, manifest, _, _ = _published(tmp_path)
+    reader = EvidenceReader(tmp_path)
+    evidence = reader.read(manifest.evidence_id)
+    reader.close()
+    reader.close()
+    with pytest.raises(EvidenceError):
+        reader.read(manifest.evidence_id)
+    with pytest.raises(EvidenceError):
+        reader.read_rows(evidence)
+
+
 @pytest.mark.parametrize(
     "field,value",
     (
@@ -796,6 +830,36 @@ def test_task8_factor_binding_capture_does_not_reread_live_cache(tmp_path):
     )
     assert result.status == "ready"
     assert cache.calls == 2
+
+
+def test_task8_factor_requested_symbol_set_is_preflight_zero_write(tmp_path):
+    target = date(2026, 8, 20)
+    base = AdjustmentFactorCache(":memory:")
+    base.record_bootstrap(
+        "sh.600000",
+        target,
+        base.FACTOR_FIELDS,
+        [["sh.600000", target.isoformat(), "1", "1", "1"]],
+    )
+
+    class ShortCache:
+        def exact_snapshot_records(self, symbols, trade_date):
+            return base.exact_snapshot_records(("sh.600000",), trade_date)
+
+    def binding_factory(records, factor_manifest):
+        return (_factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),)
+
+    with pytest.raises(ProviderHealthError):
+        publish_provider_evidence_with_factor_cache(
+            _provider_raw_batch(),
+            evidence_root=tmp_path / "evidence",
+            factor_cache=ShortCache(),
+            factor_symbols=("sh.600000", "sh.600001"),
+            trade_date=target,
+            lock_path=tmp_path / "locks" / "refresh.lock",
+            factor_resolution_factory=binding_factory,
+        )
+    assert not (tmp_path / "evidence").exists()
 
 
 def test_task8_duplicate_factor_binding_is_preflight_zero_write(tmp_path):

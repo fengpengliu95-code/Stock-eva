@@ -24,12 +24,14 @@ import backend.app.market.store as market_store_module
 from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
+from backend.app.market.automation import canonical_refresh_callback
 from backend.app.market.baostock import BaoStockProvider, ProviderBatch
 from backend.app.market.baostock_vendor import (
     emit_terminal_observation,
     transport_observation_sink,
 )
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
+from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
@@ -47,6 +49,7 @@ from backend.app.market.provider_transport import (
     refresh_scope,
     request_scope,
 )
+from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.after_close import (
     AfterClosePipelineService,
@@ -56,6 +59,7 @@ from backend.app.orchestration.after_close import (
 from backend.app.regime.snapshots import RegimeSnapshotUnavailable
 from tests.test_baostock_provider import FIXTURE_PATH, ContinueAfterFailureClient, FakeBaoStock
 from tests.test_market_data import fixture_payload
+from tests.test_market_provider_contract import _CompleteSdkClient
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -286,6 +290,76 @@ def test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch(tm
     assert outcome.result is not None and outcome.result.status == "ready"
     assert len(calls) == 1
     assert provider.fetch_calls == 0
+
+
+def test_real_service_due_route_uses_one_raw_fetch_and_one_normalize(tmp_path: Path):
+    target = date(2026, 7, 23)
+    client = _CompleteSdkClient(response_date=target.isoformat())
+    factor_cache = AdjustmentFactorCache(":memory:")
+    factor_cache.record_bootstrap(
+        "sh.600000",
+        target,
+        factor_cache.FACTOR_FIELDS,
+        [["sh.600000", target.isoformat(), "1", "1", "1"]],
+    )
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        factor_cache=factor_cache,
+    )
+    legacy_fetch_calls = 0
+
+    def legacy_fetch(*args, **kwargs):
+        nonlocal legacy_fetch_calls
+        legacy_fetch_calls += 1
+        raise AssertionError("automatic route must not call legacy fetch")
+
+    provider.fetch = legacy_fetch
+    adapter = BaoStockProviderAdapter(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        factor_cache=factor_cache,
+    )
+    raw_calls = 0
+    normalize_calls = 0
+    original_fetch_raw = adapter.fetch_raw
+    original_normalize = adapter.normalize
+
+    def counted_fetch_raw(*args, **kwargs):
+        nonlocal raw_calls
+        raw_calls += 1
+        return original_fetch_raw(*args, **kwargs)
+
+    def counted_normalize(*args, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return original_normalize(*args, **kwargs)
+
+    adapter.fetch_raw = counted_fetch_raw
+    adapter.normalize = counted_normalize
+    store = MarketStore(tmp_path / "market.duckdb")
+    callback = canonical_refresh_callback(
+        store,
+        adapter,
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        factor_cache=factor_cache,
+    )
+    service = load_module("backend.app.market.automation").MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        health_store=InMemoryProviderHealthStore(),
+        canonical_refresh=callback,
+    )
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    assert outcome.result is not None and outcome.result.status == "ready"
+    assert raw_calls == normalize_calls == 1
+    assert legacy_fetch_calls == 0
 
 
 def test_automation_optional_continuity_dependency_preserves_legacy_behavior_exactly(
