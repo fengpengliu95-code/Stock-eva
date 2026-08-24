@@ -58,6 +58,7 @@ FACTOR_SCHEMA = (
     "source_row_hash",
     "observed_at",
 )
+FACTOR_RESOLUTION_SCHEMA = ("binding",)
 
 
 class EvidenceError(RuntimeError):
@@ -483,6 +484,8 @@ class EvidenceManifest(_Immutable):
                     or item.factor_resolution_provenance_hash != resolution.bindings_sha256
                 ):
                     raise ValueError("factor resolution descriptor and manifest mismatch")
+                if resolution.schema_hash != _digest(FACTOR_RESOLUTION_SCHEMA):
+                    raise ValueError("factor resolution schema hash mismatch")
                 if self.factor_resolution and resolution.binding_count != len(
                     self.factor_resolution
                 ):
@@ -938,6 +941,17 @@ class EvidenceReader:
                     raise EvidenceError(
                         "factor snapshot reader identity mismatch",
                         "EVIDENCE_HASH_MISMATCH",
+                    )
+            if manifest.factor_resolution_snapshot is not None:
+                resolution = manifest.factor_resolution_snapshot
+                expected_reader_identity = _digest(resolution.manifest.model_dump(mode="json"))
+                if resolution.reader_identity != expected_reader_identity:
+                    raise EvidenceError(
+                        "factor resolution reader identity mismatch", "EVIDENCE_HASH_MISMATCH"
+                    )
+                if resolution.manifest.schema_hash != _digest(FACTOR_RESOLUTION_SCHEMA):
+                    raise EvidenceError(
+                        "factor resolution schema hash mismatch", "EVIDENCE_SCHEMA_MISMATCH"
                     )
             if manifest.factor_resolution:
                 keys = [f"{row['symbol']}.{row['trade_date']}" for row in factor_rows]
@@ -1408,6 +1422,10 @@ class EvidenceReader:
                 raise ValueError("factor resolution count")
             if descriptor.factor_resolution_provenance_hash != bindings_sha256:
                 raise ValueError("factor resolution provenance")
+            if descriptor.fields != FACTOR_RESOLUTION_SCHEMA:
+                raise ValueError("factor resolution fields")
+            if descriptor.schema_hash != _digest(FACTOR_RESOLUTION_SCHEMA):
+                raise ValueError("factor resolution schema hash")
             return bindings
         except Exception as exc:
             raise EvidenceError(
@@ -1697,7 +1715,7 @@ class EvidenceStore:
         object_sha = _sha256_bytes(payload)
         object_id = f"factor-resolution-{object_sha[:24]}"
         relative = f"objects/{object_sha[:2]}/{object_id}.json"
-        schema_hash = _digest(("binding",))
+        schema_hash = _digest(FACTOR_RESOLUTION_SCHEMA)
         manifest = FactorResolutionSnapshotManifest(
             capture_id=capture_id,
             object_id=object_id,
@@ -1721,7 +1739,7 @@ class EvidenceStore:
             universe_id="factor-resolution",
             refresh_id=capture_id,
             capture_id=capture_id,
-            fields=("binding",),
+            fields=FACTOR_RESOLUTION_SCHEMA,
             schema_variant="factor-resolution-snapshot.v1",
             source_schema="factor-resolution-snapshot.v1",
             normalization_clock_utc=datetime(1970, 1, 1, tzinfo=UTC),

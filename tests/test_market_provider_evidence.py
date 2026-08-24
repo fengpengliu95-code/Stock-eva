@@ -296,6 +296,73 @@ def test_task8_resolution_sidecar_cas_is_idempotent_and_tamper_evident(tmp_path)
         store.read(first.evidence_id)
 
 
+def _rewrite_manifest_with_content_id(path: Path, raw: dict) -> str:
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    core = dict(raw)
+    core.pop("evidence_id", None)
+    core.pop("manifest_sha256", None)
+    evidence_id = f"ev-{_digest(core)[:24]}"
+    raw["evidence_id"] = evidence_id
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    replacement = path.with_name(f"{evidence_id}.json")
+    path.rename(replacement)
+    replacement.write_text(
+        json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    return evidence_id
+
+
+def test_task8_resolution_schema_hash_is_recomputed_from_authoritative_schema(tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _large_factor_records(8)
+    factor_manifest, _descriptor, _payload = store._build_factor_snapshot(
+        records, capture_id="capture-schema"
+    )
+    manifest = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-schema",
+        factor_resolution=_large_factor_bindings(
+            records, factor_manifest.object_id, factor_manifest.object_sha256
+        ),
+    )
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["factor_resolution_snapshot"]["manifest"]["schema_hash"] = "f" * 64
+    for descriptor in raw["objects"]:
+        if descriptor["object_kind"] == "factor_resolution_snapshot":
+            descriptor["schema_hash"] = "f" * 64
+    evidence_id = _rewrite_manifest_with_content_id(path, raw)
+    with pytest.raises(EvidenceError):
+        store.read(evidence_id)
+
+
+def test_task8_resolution_reader_identity_is_recomputed_from_snapshot_manifest(tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _large_factor_records(8)
+    factor_manifest, _descriptor, _payload = store._build_factor_snapshot(
+        records, capture_id="capture-reader"
+    )
+    manifest = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-reader",
+        factor_resolution=_large_factor_bindings(
+            records, factor_manifest.object_id, factor_manifest.object_sha256
+        ),
+    )
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["factor_resolution_snapshot"]["reader_identity"] = "f" * 64
+    evidence_id = _rewrite_manifest_with_content_id(path, raw)
+    with pytest.raises(EvidenceError):
+        store.read(evidence_id)
+
+
 def test_changed_bytes_create_distinct_evidence_without_overwrite(tmp_path):
     store = EvidenceStore(tmp_path)
     store._prepare_root()
