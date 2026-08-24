@@ -22,3 +22,25 @@ leaves `discovered`; missing terms, intended-use, retention, quota, schema, unit
 or transport proof fail closed before client construction. Task10 performs no
 provider request, credential acquisition, NAS access, production mutation, or
 canonical publication.
+
+## Task11 shadow adapter contract
+
+Task11 adds source-shaped, injected adapters only. The bounded HTTP policy uses
+connect/read/write/pool timeouts, at most five attempts, bounded `Retry-After`,
+bounded response bytes/rows, and a hard request counter. Transport failures are
+typed and sanitized; raw payloads, URLs, headers and credentials are not reports.
+
+TickFlow's offline plan requests `daily`, `universe` and `indexes`. Daily rows
+remain explicitly unadjusted, while factor/corporate-action evidence is an
+explicit `unavailable` gap until the official contract proves it. Tushare's
+offline plan requests `daily`, `adj_factor`, `suspend_d`, `trade_cal` and
+`index_daily` for one exact trade date. Tushare `vol` remains source `lots` and
+`amount` remains source `thousand_cny`; conversion is not performed by the
+adapter. Tushare execute remains blocked without reviewed terms, official HTTPS
+proof and a non-secret external authorization ID.
+
+`market-provider-canary` is network-free by default and reports planned endpoint
+identities and request bounds. Task11 evidence is isolated under the shadow root,
+retains only final successful pages, and ends at `evidence_ready` /
+`pending_normalization`; it never writes canonical data, candidates, selections,
+Parquet or pointers. No real provider canary was run for this offline change.

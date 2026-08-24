@@ -174,6 +174,18 @@ def _provider_canary_symbol(value: str) -> str:
     return value
 
 
+def _shadow_provider_symbol(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", value) is None:
+        raise argparse.ArgumentTypeError("shadow provider symbol is invalid")
+    return value
+
+
+def _external_authorization_id(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+        raise argparse.ArgumentTypeError("external authorization ID is invalid")
+    return value
+
+
 def _evidence_id(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
         raise argparse.ArgumentTypeError("evidence ID is invalid")
@@ -426,6 +438,18 @@ def build_parser() -> argparse.ArgumentParser:
     provider_status.add_argument(
         "--provider",
         choices=tuple(item.value for item in ShadowProviderId),
+    )
+    shadow_canary = subparsers.add_parser(
+        "market-provider-canary",
+        help="plan an isolated TickFlow or Tushare shadow canary",
+    )
+    shadow_canary.add_argument("--provider", required=True, choices=("tickflow", "tushare"))
+    shadow_canary.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
+    shadow_canary.add_argument("--symbols", nargs="*", type=_shadow_provider_symbol, default=())
+    shadow_canary.add_argument("--execute", action="store_true")
+    shadow_canary.add_argument(
+        "--external-authorization-id",
+        type=_external_authorization_id,
     )
     calendar_sync = subparsers.add_parser(
         "calendar-sync",
@@ -822,6 +846,61 @@ def main() -> int:
                 else "registry_schema_invalid",
                 "writes": False,
                 "provider_requests": 0,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
+    if args.command == "market-provider-canary":
+        from backend.app.market.providers.tickflow import TickFlowAdapter
+        from backend.app.market.providers.tushare import TushareAdapter, TushareExecutionBlocked
+
+        symbols = tuple(args.symbols)
+        adapter = (
+            TickFlowAdapter(plan_only=True)
+            if args.provider == "tickflow"
+            else TushareAdapter(plan_only=True)
+        )
+        if not args.execute:
+            plan = adapter.plan(args.trade_date, symbols=symbols)
+            payload = {
+                "status": "planned",
+                "provider": args.provider,
+                "trade_date": args.trade_date.isoformat(),
+                "request_count": plan.request_count,
+                "endpoints": [item.endpoint for item in plan.requests],
+                "provider_requests": 0,
+                "writes": False,
+                "writes_evidence": False,
+                "writes_canonical": False,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+        if not args.external_authorization_id:
+            payload = {
+                "status": "error",
+                "provider": args.provider,
+                "error_code": "external_authorization_required",
+                "provider_requests": 0,
+                "writes": False,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 2
+        try:
+            # Task11's offline command never constructs a real network client.  The registry
+            # check is intentionally read-only and missing state fails closed.
+            settings = get_settings()
+            record = ShadowRegistry(StorageLayout(settings).provider_registry_database).read_status(
+                args.provider
+            )
+            if record.admission_state.value != "canary":
+                raise RegistryUnavailable("provider is not admitted for canary")
+            raise TushareExecutionBlocked("real shadow canary requires separate authorization gate")
+        except Exception:
+            payload = {
+                "status": "unavailable",
+                "provider": args.provider,
+                "error_code": "canary_execution_blocked",
+                "provider_requests": 0,
+                "writes": False,
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1

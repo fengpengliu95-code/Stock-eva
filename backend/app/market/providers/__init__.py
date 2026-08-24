@@ -43,10 +43,48 @@ from .base import (
     validate_raw_date_binding,
     validate_safe_relative_path,
 )
+from .http import (
+    BoundedHTTPClient,
+    BoundedHttpClient,
+    HttpPolicy,
+    HttpRequestPolicy,
+    ProviderHttpError,
+)
+from .tickflow import (
+    TickFlowAdapter,
+    TickFlowPlan,
+    TickFlowProvider,
+    TickFlowSchemaError,
+    TickFlowSourceBatch,
+)
+from .tushare import (
+    TushareAdapter,
+    TushareExecutionBlocked,
+    TusharePlan,
+    TushareProvider,
+    TushareSchemaError,
+    TushareSourceBatch,
+)
 
 __all__ = [
     "BaoStockDailyBarAdapter",
     "BaoStockProviderAdapter",
+    "BoundedHttpClient",
+    "BoundedHTTPClient",
+    "HttpPolicy",
+    "HttpRequestPolicy",
+    "ProviderHttpError",
+    "TickFlowAdapter",
+    "TickFlowPlan",
+    "TickFlowProvider",
+    "TickFlowSourceBatch",
+    "TickFlowSchemaError",
+    "TushareAdapter",
+    "TushareExecutionBlocked",
+    "TusharePlan",
+    "TushareProvider",
+    "TushareSourceBatch",
+    "TushareSchemaError",
     "AdjustFactorRow",
     "AllStockRow",
     "AttemptCompletion",

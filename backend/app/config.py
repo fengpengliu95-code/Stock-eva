@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     provider_shadow_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
     provider_shadow_max_rows: int = Field(default=10_000_000, ge=1)
     provider_shadow_max_requests: int = Field(default=256, ge=1, le=10_000)
+    provider_shadow_max_attempts: int = Field(default=3, ge=1, le=5)
+    provider_shadow_max_response_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    provider_shadow_max_retry_after_seconds: float = Field(default=10.0, ge=0, le=60)
     provider_shadow_request_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
     provider_shadow_execute_enabled: bool = False
     provider_tickflow_token_env_name: str = "STOCK_EVA_TICKFLOW_TOKEN"
