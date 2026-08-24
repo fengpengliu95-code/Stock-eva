@@ -1244,23 +1244,53 @@ def _cleanup_identity(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns)
 
 
-def _cleaned_marker(entry_fd: int, entry_name: str) -> bool:
+def _read_residual_marker(directory_fd: int, name: str) -> dict[str, Any] | None:
     try:
-        raw = _read_verified_at(entry_fd, "CLEANED_RESIDUAL", max_bytes=256)
+        raw = _read_verified_at(directory_fd, name, max_bytes=256)
         marker = json.loads(raw.decode("utf-8"))
     except (ShadowEvidenceUnavailable, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _cleaned_marker(entry_fd: int, entry_name: str) -> bool:
+    marker = _read_residual_marker(entry_fd, "CLEANED_RESIDUAL")
+    if marker is None:
         return False
     try:
-        evidence_id = _safe(marker.get("evidence_id", "")) if isinstance(marker, dict) else ""
+        evidence_id = _safe(marker.get("evidence_id", ""))
     except ValueError:
         return False
-    return isinstance(marker, dict) and (
-        set(marker) == {"nonce", "evidence_id", "status"}
+    return (
+        set(marker)
+        in (
+            {"nonce", "evidence_id", "status"},
+            {"nonce", "evidence_id", "status", "nested"},
+        )
         and marker.get("nonce") == entry_name
-        and isinstance(marker.get("evidence_id"), str)
         and marker.get("evidence_id") == evidence_id
         and marker.get("status") == "CLEANED_RESIDUAL"
+        and marker.get("nested", "pages/.CLEANED_RESIDUAL") == "pages/.CLEANED_RESIDUAL"
     )
+
+
+def _write_residual_marker(directory_fd: int, name: str, payload: bytes) -> None:
+    marker_fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(marker_fd, view)
+            if written <= 0:
+                raise ShadowEvidenceCleanupFailed("shadow orphan cleanup failed")
+            view = view[written:]
+        os.fsync(marker_fd)
+    finally:
+        os.close(marker_fd)
 
 
 def _remove_owned_tree(
@@ -1322,26 +1352,58 @@ def _remove_owned_tree(
             dir_fd=entry_fd,
         )
         try:
-            page_entries = list(os.scandir(pages_fd))
-            if {entry.name for entry in page_entries} != allowed_page_names:
+            pages_info = os.fstat(pages_fd)
+            if not stat.S_ISDIR(pages_info.st_mode) or pages_info.st_nlink < 2:
                 raise fail()
-            for page in page_entries:
-                info = page.stat(follow_symlinks=False)
-                if page.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            expected_pages_identity = _cleanup_identity(pages_info)
+            page_entries = list(os.scandir(pages_fd))
+            nested_marker = _read_residual_marker(pages_fd, ".CLEANED_RESIDUAL")
+            pages_cleaned = False
+            if nested_marker is not None:
+                if (
+                    set(nested_marker) != {"nonce", "evidence_id", "status"}
+                    or nested_marker.get("nonce") != entry_name
+                    or nested_marker.get("evidence_id") != owner["evidence_id"]
+                    or nested_marker.get("status") != "CLEANED_RESIDUAL"
+                ):
                     raise fail()
+                pages_cleaned = True
+                if {entry.name for entry in page_entries} != {".CLEANED_RESIDUAL"}:
+                    raise fail()
+            else:
+                if {entry.name for entry in page_entries} != allowed_page_names:
+                    raise fail()
+                for page in page_entries:
+                    info = page.stat(follow_symlinks=False)
+                    if page.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise fail()
             if _cleanup_identity(os.fstat(entry_fd)) != expected_identity:
                 raise fail()
             parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
             if _cleanup_identity(parent_info) != expected_identity:
                 raise fail()
-            for page in page_entries:
-                os.unlink(page.name, dir_fd=pages_fd)
-            os.fsync(pages_fd)
+            if not pages_cleaned:
+                for page in page_entries:
+                    os.unlink(page.name, dir_fd=pages_fd)
+                nested_marker_payload = _json_bytes(
+                    {
+                        "nonce": entry_name,
+                        "evidence_id": owner["evidence_id"],
+                        "status": "CLEANED_RESIDUAL",
+                    }
+                )
+                _write_residual_marker(pages_fd, ".CLEANED_RESIDUAL", nested_marker_payload)
+                os.fsync(pages_fd)
+            pages_parent_info = os.stat("pages", dir_fd=entry_fd, follow_symlinks=False)
+            pages_conflict = (
+                pages_parent_info.st_dev,
+                pages_parent_info.st_ino,
+                pages_parent_info.st_mode,
+            ) != expected_pages_identity[:3]
         finally:
             os.close(pages_fd)
         for name in root_files:
             os.unlink(name, dir_fd=entry_fd)
-        os.rmdir("pages", dir_fd=entry_fd)
         os.fsync(entry_fd)
         parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
         # Removing children necessarily updates the directory ctime.  The stable
@@ -1352,29 +1414,16 @@ def _remove_owned_tree(
             parent_info.st_ino,
             parent_info.st_mode,
         ) != expected_identity[:3]
+        conflict = conflict or pages_conflict
         marker = _json_bytes(
             {
                 "nonce": entry_name,
                 "evidence_id": owner["evidence_id"],
                 "status": "CLEANED_RESIDUAL",
+                "nested": "pages/.CLEANED_RESIDUAL",
             }
         )
-        marker_fd = os.open(
-            "CLEANED_RESIDUAL",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=entry_fd,
-        )
-        try:
-            view = memoryview(marker)
-            while view:
-                written = os.write(marker_fd, view)
-                if written <= 0:
-                    raise fail()
-                view = view[written:]
-            os.fsync(marker_fd)
-        finally:
-            os.close(marker_fd)
+        _write_residual_marker(entry_fd, "CLEANED_RESIDUAL", marker)
         os.fsync(entry_fd)
         os.fsync(staging_fd)
         return conflict
