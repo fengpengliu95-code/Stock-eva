@@ -863,8 +863,7 @@ class CandidateStore:
             rows = tuple(DailyBar.model_validate(item) for item in decoded)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("normalized candidate object is invalid") from exc
-        if evidence.manifest.universe_id == "all-main-board":
-            _validate_approved_plan(evidence)
+        _validate_approved_plan(evidence)
         durable_symbols, _durable_roles = _durable_universe(evidence)
         if (
             len(rows) != candidate.row_count
@@ -1146,21 +1145,87 @@ def _row_value(row: Any, name: str, default: Any = None) -> Any:
     return getattr(row, name, default)
 
 
-def _durable_universe(evidence: PublishedEvidence) -> tuple[tuple[str, ...], dict[str, str]]:
-    symbols: dict[str, str] = {}
-    for request in evidence.manifest.logical_request_plan.requests:
-        if request.endpoint is ProviderEndpoint.DAILY_ASTOCK:
-            role = "stock"
-        elif request.endpoint is ProviderEndpoint.INDEX_HISTORY:
-            role = "index"
-        else:
-            continue
-        for symbol in request.symbols:
-            if symbol in symbols and symbols[symbol] != role:
-                raise ValueError("durable universe assigns conflicting symbol roles")
-            symbols[symbol] = role
-    if not symbols:
-        raise ValueError("durable universe is empty")
+def _durable_universe(
+    evidence: PublishedEvidence,
+    evidence_pages: tuple[dict[str, Any], ...] | None = None,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Rebuild the session universe from the held raw pages.
+
+    The logical plan is only an expectation.  Publication must also prove that
+    the provider's all-stock and session pages agree with that expectation and
+    with the factor sidecar.  This deliberately consumes ``evidence_pages``
+    supplied by the already-bound reader, so an evaluator cannot reopen a
+    mutable root or substitute a second tree between these checks.
+    """
+    _validate_approved_plan(evidence)
+    pages = evidence_pages if evidence_pages is not None else evidence.read_rows()
+    raw_descriptors = tuple(
+        item for item in evidence.manifest.objects if item.object_kind.value == "raw_endpoint_page"
+    )
+    if len(pages) != len(raw_descriptors):
+        raise ValueError("durable universe raw page cardinality mismatch")
+
+    by_endpoint: dict[ProviderEndpoint, list[dict[str, Any]]] = {}
+    for descriptor, page in zip(raw_descriptors, pages, strict=True):
+        if tuple(page.get("fields", ())) != tuple(descriptor.fields):
+            raise ValueError("durable universe descriptor fields mismatch")
+        fields = tuple(page.get("fields", ()))
+        decoded: list[dict[str, Any]] = []
+        for raw_row in page.get("rows", ()):
+            if len(raw_row) != len(fields):
+                raise ValueError("durable universe raw row shape mismatch")
+            decoded.append(dict(zip(fields, raw_row, strict=True)))
+        if descriptor.endpoint is None:
+            raise ValueError("durable universe raw endpoint is unbound")
+        by_endpoint.setdefault(descriptor.endpoint, []).extend(decoded)
+
+    def symbol(value: Any) -> str:
+        value = str(value or "").strip().lower()
+        if len(value) != 9 or value[:3] not in {"sh.", "sz."} or not value[3:].isdigit():
+            raise ValueError("durable universe contains an invalid symbol")
+        return value
+
+    def unique_codes(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+        values = tuple(symbol(row.get("code")) for row in rows)
+        if len(values) != len(set(values)):
+            raise ValueError("durable universe contains duplicate symbols")
+        return values
+
+    all_stock = unique_codes(by_endpoint.get(ProviderEndpoint.ALL_STOCK, []))
+    requests = evidence.manifest.logical_request_plan.requests
+    plan_stock = tuple(requests[1].symbols)
+    if tuple(all_stock) != plan_stock:
+        raise ValueError("provider all-stock universe does not match logical plan")
+
+    daily_rows = by_endpoint.get(ProviderEndpoint.DAILY_ASTOCK, [])
+    daily_stock = unique_codes(daily_rows)
+    if tuple(daily_stock) != plan_stock:
+        raise ValueError("daily stock universe does not match all-stock universe")
+    if any(str(row.get("date")) != evidence.manifest.trade_date.isoformat() for row in daily_rows):
+        raise ValueError("daily stock row date does not match session")
+
+    factor_rows = by_endpoint.get(ProviderEndpoint.DAILY_FACTOR, [])
+    factor_symbols = unique_codes(factor_rows)
+    if tuple(factor_symbols) != plan_stock:
+        raise ValueError("daily factor universe does not match stock universe")
+    if any(
+        str(row.get("dividOperateDate")) != evidence.manifest.trade_date.isoformat()
+        for row in factor_rows
+    ):
+        raise ValueError("daily factor row date does not match session")
+    resolved_symbols = tuple(symbol(item.symbol) for item in evidence.manifest.factor_resolution)
+    if len(resolved_symbols) != len(set(resolved_symbols)) or tuple(resolved_symbols) != plan_stock:
+        raise ValueError("factor resolution universe does not match stock universe")
+
+    index_rows = by_endpoint.get(ProviderEndpoint.INDEX_HISTORY, [])
+    index_symbols = unique_codes(index_rows)
+    if index_symbols != ("sh.000001", "sz.399001"):
+        raise ValueError("index universe is not the approved pair")
+    if any(str(row.get("date")) != evidence.manifest.trade_date.isoformat() for row in index_rows):
+        raise ValueError("index row date does not match session")
+
+    symbols = {item: "stock" for item in plan_stock}
+    symbols.update({item: "index" for item in index_symbols})
     return tuple(sorted(symbols)), symbols
 
 
@@ -1245,7 +1310,7 @@ def evaluate_candidate_gates(
     published_resolution = evidence.manifest.factor_resolution
     symbols = tuple(_row_value(row, "symbol", _row_value(row, "code")) for row in rows)
     unique_symbols = set(symbols)
-    durable_symbols, durable_roles = _durable_universe(evidence)
+    durable_symbols, durable_roles = _durable_universe(evidence, evidence_pages)
     date_ok = all(
         _row_value(row, "trade_date", _row_value(row, "date")) == trade_date for row in rows
     )
@@ -1349,6 +1414,8 @@ def select_primary_candidate(
         raise ValueError("selection provider must be baostock")
     if candidate.trade_date != trade_date or candidate.universe_id != universe_id:
         raise ValueError("selection scope does not match candidate")
+    _validate_approved_plan(evidence)
+    _durable_universe(evidence)
     validate_candidate_lineage(candidate, evidence, gate_report)
     values = {
         "selection_id": f"selection-{_digest(candidate.model_dump(mode='json'))[:24]}",

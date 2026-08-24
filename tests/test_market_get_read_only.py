@@ -3,6 +3,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import stat
 import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -233,13 +234,15 @@ def _sqlite_schema(path: Path) -> tuple[tuple[str, str | None], ...]:
         connection.close()
 
 
-def _tree(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+def _tree(root: Path) -> tuple[tuple[str, str, int, int, int, int], ...]:
     return tuple(
         (
             str(path.relative_to(root)),
             "dir" if path.is_dir() else _sha256(path),
+            stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
             path.stat().st_mtime_ns,
             path.stat().st_size,
+            path.stat().st_ctime_ns,
         )
         for path in sorted(root.rglob("*"))
     )
@@ -251,7 +254,7 @@ class _StorageFingerprint:
     control_mtime_ns: int
     control_size: int
     control_schema: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
-    dataset_tree: tuple[tuple[str, str, int, int], ...]
+    dataset_tree: tuple[tuple[str, str, int, int, int, int], ...]
     calendar_hash: str | None = None
     calendar_mtime_ns: int | None = None
     calendar_schema: tuple[tuple[str, str | None], ...] | None = None
@@ -313,15 +316,31 @@ def test_market_consuming_gets_do_not_change_control_or_dataset(tmp_path: Path) 
         f"/api/v1/analysis/sector-rotation?as_of={AS_OF}&taxonomy_id={TAXONOMY_BAOSTOCK_INDUSTRY}",
         f"/api/v1/classification/securities?as_of={AS_OF}&symbol=sh.600000",
         f"/api/v1/analysis/fund-flow-evidence?as_of={AS_OF}",
+        "/api/v1/alerts/rules",
+        "/api/v1/alerts/events",
+        "/api/v1/portfolio/positions",
         "/api/v1/portfolio/valuation",
         "/api/v1/strategies",
     ]
     responses = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
+    stable_indexes = tuple(
+        index
+        for index, path in enumerate(paths)
+        if path not in {"/api/v1/health", "/api/v1/market/status"}
+    )
+    before_json = tuple(
+        (responses[index].status_code, responses[index].content) for index in stable_indexes
+    )
+    reread = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
 
     assert all(response.status_code < 500 for response in responses), [
         (path, response.status_code, response.text)
         for path, response in zip(paths, responses, strict=True)
     ]
+    assert (
+        tuple((reread[index].status_code, reread[index].content) for index in stable_indexes)
+        == before_json
+    )
     assert _fingerprint(control, dataset_root, calendar_path) == before
 
 

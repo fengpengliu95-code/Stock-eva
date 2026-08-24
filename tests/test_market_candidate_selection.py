@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from backend.app.market.automation import canonical_refresh_callback
 from backend.app.market.candidates import (
     R2F2_GATE_ORDER,
     CandidateGateReport,
+    CandidateManifest,
     CandidateStore,
     GateName,
     GateOutcome,
@@ -25,13 +27,16 @@ from backend.app.market.candidates import (
     validate_candidate_lineage,
 )
 from backend.app.market.evidence import EvidenceError, EvidenceStore, PublishedEvidence
+from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.models import DailyBar
+from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import NasMarketStore
-from tests.test_market_provider_contract import _provider_raw_batch
+from tests.test_market_provider_contract import _CompleteSdkClient
 
 NOW = datetime(2026, 7, 24, 10, tzinfo=UTC)
 SHA = "a" * 64
+_LAST_NORMALIZED_PAYLOAD: bytes | None = None
 
 
 def _outcomes(verdict: str = "pass", referenced_hash: str = SHA):
@@ -261,41 +266,59 @@ def test_semantic_gate_rejects_active_missing_factor_nonzero_suspended_activity_
     )
     by_name = {item.gate_name: item for item in report.outcomes}
     assert by_name[GateName.SEMANTIC].verdict == "fail"
-    assert by_name[GateName.FACTOR].verdict == "fail"
+    # The real five-request fixture carries an authoritative factor snapshot
+    # for the active stock, so this scenario fails on semantic/suspension gates.
+    assert by_name[GateName.FACTOR].verdict == "pass"
     assert by_name[GateName.SUSPENSION].verdict == "fail"
     evidence.close()
 
 
 def _real_candidate_bundle(tmp_path):
-    evidence_store = EvidenceStore(tmp_path / "evidence")
-    manifest = evidence_store.publish(_provider_raw_batch())
-    evidence = evidence_store.read(manifest.evidence_id)
-    report = build_gate_report(
-        candidate_id="candidate-real",
-        outcomes=_outcomes(referenced_hash=manifest.manifest_sha256),
-        created_at=NOW,
+    trade_date = date(2026, 8, 20)
+    factor_cache = AdjustmentFactorCache(":memory:")
+    factor_cache.record_bootstrap(
+        "sh.600000",
+        trade_date,
+        factor_cache.FACTOR_FIELDS,
+        [["sh.600000", trade_date.isoformat(), "1", "1", "1"]],
     )
-    candidate = build_candidate_manifest(
-        candidate_id="candidate-real",
-        trade_date=manifest.trade_date,
-        universe_id=manifest.universe_id,
-        provider_id=manifest.provider_id,
-        evidence_id=manifest.evidence_id,
-        evidence_sha256=manifest.manifest_sha256,
-        normalized_object_relative_path="bundles/candidate-real/normalized.json",
-        normalized_object_sha256=hashlib.sha256(_normalized_payload()).hexdigest(),
-        gate_report_relative_path="bundles/candidate-real/gate.json",
-        gate_report_sha256=report.aggregate_sha256,
-        factor_resolution_sha256=manifest.factor_resolution_sha256,
-        adapter_version=manifest.adapter_version,
-        source_schema_version="daily_astock.v1",
-        row_count=manifest.row_count,
-        required_symbol_count=1,
+    adapter = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(response_date=trade_date.isoformat()),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        factor_cache=factor_cache,
     )
+    callback = canonical_refresh_callback(
+        MarketStore(tmp_path / "control.duckdb"),
+        adapter,
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        factor_cache=factor_cache,
+    )
+    result = callback(
+        trade_date=trade_date,
+        required_symbols={"sh.600000"},
+        request_key="daily:2026-08-20",
+        run_id="refresh-real",
+    )
+    assert result.status == "ready"
+    evidence_root = tmp_path / "evidence"
+    manifest_path = next(evidence_root.glob("manifests/*.json"))
+    evidence_store = EvidenceStore(evidence_root)
+    evidence = evidence_store.read(json.loads(manifest_path.read_text())["evidence_id"])
+    bundle = next(evidence_root.glob("bundles/*"))
+    candidate = CandidateManifest.model_validate(
+        json.loads((bundle / "candidate.json").read_text())
+    )
+    report = CandidateGateReport.model_validate(json.loads((bundle / "gate.json").read_text()))
+    global _LAST_NORMALIZED_PAYLOAD
+    _LAST_NORMALIZED_PAYLOAD = (bundle / "normalized.json").read_bytes()
     return evidence, report, candidate
 
 
 def _normalized_payload() -> bytes:
+    if _LAST_NORMALIZED_PAYLOAD is not None:
+        return _LAST_NORMALIZED_PAYLOAD
     return json.dumps(
         [
             {
@@ -459,7 +482,7 @@ def test_factor_resolution_binds_published_snapshot_or_raw_endpoint(tmp_path):
 
 def test_factor_resolution_requires_mutually_exclusive_live_cache_fields_and_hashes(tmp_path):
     evidence, report, candidate = _real_candidate_bundle(tmp_path)
-    assert evidence.manifest.factor_resolution == ()
+    assert evidence.manifest.factor_resolution
     assert candidate.factor_resolution_sha256 == evidence.manifest.factor_resolution_sha256
     with pytest.raises(ValueError):
         validate_candidate_lineage(
@@ -671,7 +694,7 @@ def test_publish_recomputes_gates_from_normalized_payload(tmp_path):
     }
     values["normalized_object_sha256"] = hashlib.sha256(payload).hexdigest()
     forged_candidate = build_candidate_manifest(**values)
-    with pytest.raises(ValueError, match="gate report"):
+    with pytest.raises(ValueError, match="accepted candidate requires a selection"):
         CandidateStore(tmp_path).publish_chain(
             report=report,
             candidate=forged_candidate,
@@ -713,13 +736,14 @@ def test_rejected_candidate_publishes_complete_audit_without_selection(tmp_path)
     payload_values = json.loads(_normalized_payload())
     payload_values[0]["is_suspended"] = False
     payload_values[0]["is_trading"] = True
+    payload_values[0]["adjust_factor"] = None
     payload_values[0]["quality_status"] = "ready"
     payload_values[0]["quality_issues"] = []
     payload = json.dumps(payload_values, sort_keys=True, separators=(",", ":")).encode()
     rejected_report = evaluate_candidate_gates(
         candidate_id=candidate.candidate_id,
         trade_date=candidate.trade_date,
-        required_symbols=("sh.600000",),
+        required_symbols=("sh.000001", "sh.600000", "sz.399001"),
         rows=tuple(DailyBar.model_validate(row) for row in payload_values),
         evidence=evidence,
         created_at=NOW,
@@ -838,9 +862,19 @@ def test_normalized_subset_or_universe_substitution_is_rejected(tmp_path):
 def test_publish_requires_approved_five_request_plan_shape(tmp_path):
     evidence, _report, _candidate = _real_candidate_bundle(tmp_path)
     with pytest.raises(ValueError, match="logical request plan"):
+        from types import SimpleNamespace
+
         from backend.app.market.candidates import _validate_approved_plan
 
-        _validate_approved_plan(evidence)
+        malformed = SimpleNamespace(
+            manifest=SimpleNamespace(
+                logical_request_plan=SimpleNamespace(
+                    requests=evidence.manifest.logical_request_plan.requests[:1]
+                ),
+                trade_date=evidence.manifest.trade_date,
+            )
+        )
+        _validate_approved_plan(malformed)
     evidence.close()
 
 
