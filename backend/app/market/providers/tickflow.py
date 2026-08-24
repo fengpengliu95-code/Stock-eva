@@ -45,6 +45,7 @@ class TickFlowSourceBatch:
     adjusted: bool = False
     factor_status: str = "unavailable"
     request_count: int = 0
+    units: dict[str, str] | None = None
 
 
 def _rows(payload: Any) -> tuple[dict[str, Any], ...]:
@@ -139,6 +140,11 @@ class TickFlowAdapter:
             universe=_rows(payloads["universe"]),
             indexes=_rows(payloads["indexes"]),
             request_count=request_count,
+            units=(
+                dict(payloads.get("units", {}))
+                if isinstance(payloads.get("units", {}), dict)
+                else None
+            ),
         )
 
     def execute(
