@@ -6,6 +6,7 @@ no provider, socket, NAS or application database is touched.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -27,6 +28,8 @@ from backend.app.market.evidence import (
     open_evidence_relative,
 )
 from backend.app.market.factor_cache import AdjustmentFactorCache
+from backend.app.market.provider_health import ProviderHealthError
+from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.providers.base import EvidenceObjectKind, PaginationPolicy
 from tests.test_market_provider_contract import _provider_raw_batch
 
@@ -603,3 +606,207 @@ def test_replay_cli_rejects_credentials_token_header_cookie_url_provider_local_p
 ):
     with pytest.raises(EvidenceError):
         EvidenceReader(tmp_path).read("/etc/passwd")
+
+
+def test_task8_canonical_publish_read_normalize_uses_bound_real_adapter_and_frozen_clock(
+    tmp_path,
+):
+    store, manifest, evidence, _ = _published(tmp_path)
+    adapter = BaoStockProviderAdapter(client=object())
+    bars = adapter.normalize(evidence, normalization_clock_utc=manifest.normalization_clock_utc)
+    assert bars and bars[0].symbol == "sh.600000"
+    with pytest.raises(TypeError):
+        adapter.normalize(evidence)
+    with pytest.raises((EvidenceError, TypeError, KeyError)):
+        adapter.normalize(
+            type("OldReader", (), {"read_rows": lambda self: ({"rows": ()},)})(),
+            normalization_clock_utc=manifest.normalization_clock_utc,
+        )
+
+
+def test_task8_factor_binding_failure_is_preflight_zero_write(tmp_path):
+    with pytest.raises(EvidenceError):
+        EvidenceStore(tmp_path).publish(
+            _provider_raw_batch(),
+            factor_records=_factor_records(),
+            capture_id="capture-1",
+            factor_resolution=(),
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_task8_typed_manifest_hashes_are_recomputed_not_outer_digest_only(tmp_path):
+    _, manifest, _, _ = _published(tmp_path)
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["request_plan_hash"] = "f" * 64
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_replay_real_adapter_is_deterministic_and_does_not_read_live_factor_cache(tmp_path):
+    store, manifest, evidence, _ = _published(tmp_path)
+
+    class SentinelCache:
+        def exact_snapshot_records(self, *args, **kwargs):
+            raise AssertionError("replay must not read live factor cache")
+
+    adapter = BaoStockProviderAdapter(client=object())
+    first = store.replay(manifest.evidence_id, adapter=adapter, factor_cache=SentinelCache())
+    second = store.replay(manifest.evidence_id, adapter=adapter, factor_cache=SentinelCache())
+    assert first == second
+    assert first.semantic_match is not True
+    assert (
+        evidence.reader_identity
+        == EvidenceReader(tmp_path).read(manifest.evidence_id).reader_identity
+    )
+
+
+def test_task8_factor_binding_record_key_must_exist_in_published_snapshot(tmp_path):
+    store = EvidenceStore(tmp_path)
+    factor_manifest, _ = store.publish_factor_snapshot(_factor_records(), capture_id="capture-1")
+    binding = _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256)
+    bad_cache = binding.cache.model_copy(update={"record_key": "sh.999999.2026-08-20"})
+    values = binding.model_dump(mode="json")
+    values["cache"] = bad_cache.model_dump(mode="json")
+    values.pop("resolution_sha256")
+    bad = FactorResolutionBinding(**values, resolution_sha256=_digest(values))
+    with pytest.raises(EvidenceError):
+        store.publish(
+            _provider_raw_batch(),
+            factor_records=_factor_records(),
+            capture_id="capture-1",
+            factor_resolution=(bad,),
+        )
+
+
+def test_task8_write_crash_leaves_no_canonical_partial_or_object(monkeypatch, tmp_path):
+    import backend.app.market.evidence as evidence_module
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("injected crash")
+
+    monkeypatch.setattr(evidence_module, "_atomic_create_relative", crash)
+    with pytest.raises(KeyboardInterrupt):
+        EvidenceStore(tmp_path).publish(_provider_raw_batch())
+    assert not list(tmp_path.rglob("*.partial"))
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_task8_read_transaction_rejects_root_rename_and_replacement(monkeypatch, tmp_path):
+    store, manifest, _, _ = _published(tmp_path)
+    import backend.app.market.evidence as evidence_module
+
+    original = evidence_module._read_descriptor_fd
+    calls = 0
+
+    def replace_after_manifest(root_fd, relative, limit):
+        nonlocal calls
+        calls += 1
+        payload = original(root_fd, relative, limit)
+        if calls == 1:
+            replacement = tmp_path.parent / f"{tmp_path.name}-replacement"
+            tmp_path.rename(replacement)
+            tmp_path.mkdir()
+            for name in (
+                "objects",
+                "manifests",
+                "gates",
+                "candidates",
+                "selections",
+                "staging",
+                "orphan-audit",
+            ):
+                (tmp_path / name).mkdir()
+        return payload
+
+    monkeypatch.setattr(evidence_module, "_read_descriptor_fd", replace_after_manifest)
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_write_transaction_rejects_root_replacement(monkeypatch, tmp_path):
+    import backend.app.market.evidence as evidence_module
+
+    original = evidence_module._atomic_create_relative
+    called = False
+
+    def replace_after_first(root, relative, payload):
+        nonlocal called
+        if not called:
+            called = True
+            original(root, relative, payload)
+            replacement = tmp_path.parent / f"{tmp_path.name}-replacement"
+            tmp_path.rename(replacement)
+            tmp_path.mkdir()
+            for name in (
+                "objects",
+                "manifests",
+                "gates",
+                "candidates",
+                "selections",
+                "staging",
+                "orphan-audit",
+            ):
+                (tmp_path / name).mkdir()
+            return
+        return original(root, relative, payload)
+
+    monkeypatch.setattr(evidence_module, "_atomic_create_relative", replace_after_first)
+    with pytest.raises(EvidenceError):
+        EvidenceStore(tmp_path).publish(_provider_raw_batch())
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_task8_factor_before_after_mutation_is_preflight_zero_write(tmp_path):
+    cache = AdjustmentFactorCache(":memory:")
+    target = date(2026, 8, 20)
+    cache.record_bootstrap(
+        "sh.600000", target, cache.FACTOR_FIELDS, [["sh.600000", target.isoformat(), "1", "1", "1"]]
+    )
+    calls = 0
+
+    class ChangingCache:
+        def exact_snapshot_records(self, symbols, trade_date):
+            nonlocal calls
+            calls += 1
+            rows = cache.exact_snapshot_records(symbols, trade_date)
+            if calls == 2:
+                row = dict(rows[0])
+                row["back_adjust_factor"] = 2.0
+                row["row_fingerprint"] = AdjustmentFactorCache.snapshot_row_fingerprint(
+                    tuple(
+                        row[key]
+                        for key in (
+                            "symbol",
+                            "trade_date",
+                            "fore_adjust_factor",
+                            "back_adjust_factor",
+                            "evidence_kind",
+                            "evidence_effective_date",
+                            "evidence_observed_on",
+                            "source_row_hash",
+                            "observed_at",
+                        )
+                    )
+                )
+                return (row,)
+            return rows
+
+    with pytest.raises(ProviderHealthError):
+        publish_provider_evidence_with_factor_cache(
+            _provider_raw_batch(),
+            evidence_root=tmp_path / "evidence",
+            factor_cache=ChangingCache(),
+            factor_symbols=("sh.600000",),
+            trade_date=target,
+            lock_path=tmp_path / "locks" / "refresh.lock",
+            factor_resolution_factory=lambda _: (_factor_binding("factor", "f" * 64),),
+        )
+    assert not (tmp_path / "evidence").exists()

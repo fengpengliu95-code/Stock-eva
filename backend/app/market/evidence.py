@@ -14,11 +14,12 @@ import secrets
 import stat
 import tempfile
 from datetime import UTC, date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from backend.app.market.providers.base import (
     R2F2_ADAPTER_VERSION,
@@ -365,6 +366,15 @@ class EvidenceManifest(_Immutable):
 
     @model_validator(mode="after")
     def validate_counts(self) -> EvidenceManifest:
+        if self.request_plan_hash != self.logical_request_plan.request_plan_hash:
+            raise ValueError("evidence request plan hash mismatch")
+        if self.request_plan_hash != self.logical_request_plan.compute_hash():
+            raise ValueError("evidence request plan content hash mismatch")
+        completion_digest = _digest(
+            [item.model_dump(mode="json") for item in self.request_completions]
+        )
+        if self.completion_hash != completion_digest:
+            raise ValueError("evidence completion content hash mismatch")
         if self.object_count != len(self.objects):
             raise ValueError("evidence object count mismatch")
         raw_rows = sum(
@@ -391,6 +401,7 @@ class EvidenceManifest(_Immutable):
                 or item.sha256 != factor.object_sha256
                 or item.byte_count != factor.byte_count
                 or item.row_count != factor.row_count
+                or item.schema_variant != factor.schema_variant
                 or item.schema_hash != factor.schema_hash
                 or item.factor_snapshot_provenance_hash != factor.records_sha256
             ):
@@ -405,6 +416,8 @@ class EvidenceManifest(_Immutable):
                     or cache.cache_object_sha256 != factor.object_sha256
                 ):
                     raise ValueError("factor resolution is not descriptor-bound")
+        elif self.factor_resolution:
+            raise ValueError("factor resolution requires a published factor snapshot")
         if self.factor_resolution:
             if self.factor_resolution_sha256 != _digest(
                 [item.model_dump(mode="json") for item in self.factor_resolution]
@@ -421,6 +434,20 @@ class PublishedEvidence(_Immutable):
     manifest: EvidenceManifest
     descriptors: tuple[EvidenceObjectDescriptor, ...]
     reader_identity: SafeSha256
+    _reader: EvidenceReader | None = PrivateAttr(default=None)
+
+    def bind_reader(self, reader: EvidenceReader) -> PublishedEvidence:
+        """Bind this immutable projection to the reader that verified its bytes."""
+        object.__setattr__(self, "_reader", reader)
+        return self
+
+    def read_rows(self) -> tuple[dict[str, Any], ...]:
+        reader = self._reader
+        if reader is None:
+            raise EvidenceError(
+                "published evidence reader is not bound", "EVIDENCE_MANIFEST_INVALID"
+            )
+        return reader.read_rows(self)
 
 
 class ReplayResult(_Immutable):
@@ -510,26 +537,32 @@ def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _read_descriptor_fd(root_fd: int, relative: str, limit: int) -> bytes:
+    descriptor = open_evidence_relative(root_fd, relative)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise EvidenceError("evidence object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
+        payload = bytearray()
+        while len(payload) <= limit:
+            chunk = os.read(descriptor, min(1024 * 1024, limit + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        if _stat_fingerprint(before) != _stat_fingerprint(after):
+            raise EvidenceError("evidence object changed during read", "EVIDENCE_HASH_MISMATCH")
+        if len(payload) > limit:
+            raise EvidenceError("evidence object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
 def _read_descriptor(root: Path, relative: str, limit: int) -> bytes:
     root_fd = _open_root_dir(root, create=False)
     try:
-        descriptor = open_evidence_relative(root_fd, relative)
-        try:
-            before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
-                raise EvidenceError("evidence object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
-            payload = bytearray()
-            while len(payload) <= limit:
-                chunk = os.read(descriptor, min(1024 * 1024, limit + 1 - len(payload)))
-                if not chunk:
-                    break
-                payload.extend(chunk)
-            after = os.fstat(descriptor)
-            if _stat_fingerprint(before) != _stat_fingerprint(after):
-                raise EvidenceError("evidence object changed during read", "EVIDENCE_HASH_MISMATCH")
-            return bytes(payload)
-        finally:
-            os.close(descriptor)
+        return _read_descriptor_fd(root_fd, relative, limit)
     finally:
         os.close(root_fd)
 
@@ -676,42 +709,154 @@ class EvidenceReader:
         self.root = Path(root)
         self.max_object_bytes = max_object_bytes
 
+    def _assert_root_identity(self, root_fd: int, identity: tuple[int, int]) -> None:
+        current = os.fstat(root_fd)
+        if (current.st_dev, current.st_ino) != identity:
+            raise EvidenceError("evidence root changed during read", "EVIDENCE_HASH_MISMATCH")
+        try:
+            configured = os.stat(self.root, follow_symlinks=False)
+        except OSError as exc:
+            raise EvidenceError("evidence root unavailable", "EVIDENCE_ROOT_UNAVAILABLE") from exc
+        if (configured.st_dev, configured.st_ino) != identity:
+            raise EvidenceError("evidence root was replaced", "EVIDENCE_HASH_MISMATCH")
+
+    def _open_read_root(self) -> tuple[int, tuple[int, int]]:
+        root_fd = _open_root_dir(self.root, create=False)
+        metadata = os.fstat(root_fd)
+        identity = (metadata.st_dev, metadata.st_ino)
+        self._assert_root_identity(root_fd, identity)
+        return root_fd, identity
+
     def read(self, evidence_id: str) -> PublishedEvidence:
         if "/" in evidence_id or ".." in evidence_id:
             raise EvidenceError("unsafe evidence ID", "EVIDENCE_UNSAFE_PATH")
-        payload = _read_descriptor(self.root, f"manifests/{evidence_id}.json", MAX_MANIFEST_BYTES)
+        root_fd, root_identity = self._open_read_root()
         try:
-            raw = json.loads(payload.decode("utf-8"))
-            if raw.get("manifest_sha256") != _digest(
-                {key: value for key, value in raw.items() if key != "manifest_sha256"}
-            ):
-                raise EvidenceError("evidence manifest hash mismatch", "EVIDENCE_HASH_MISMATCH")
-            manifest = EvidenceManifest.model_validate(raw)
-        except EvidenceError:
-            raise
-        except Exception as exc:
-            raise EvidenceError("evidence manifest invalid", "EVIDENCE_MANIFEST_INVALID") from exc
-        for descriptor in manifest.objects:
-            data = _read_descriptor(self.root, descriptor.relative_path, self.max_object_bytes)
-            if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
-                raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
-            if descriptor.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE:
-                self._validate_parquet(data, descriptor)
-            else:
-                self._validate_factor_snapshot(data, descriptor)
-        identity = _digest(manifest.model_dump(mode="json"))
-        return PublishedEvidence(
-            manifest=manifest, descriptors=manifest.objects, reader_identity=identity
-        )
+            payload = _read_descriptor_fd(
+                root_fd, f"manifests/{evidence_id}.json", MAX_MANIFEST_BYTES
+            )
+            try:
+                raw = json.loads(payload.decode("utf-8"))
+                if raw.get("manifest_sha256") != _digest(
+                    {key: value for key, value in raw.items() if key != "manifest_sha256"}
+                ):
+                    raise EvidenceError("evidence manifest hash mismatch", "EVIDENCE_HASH_MISMATCH")
+                manifest = EvidenceManifest.model_validate(raw)
+            except EvidenceError:
+                raise
+            except Exception as exc:
+                raise EvidenceError(
+                    "evidence manifest invalid", "EVIDENCE_MANIFEST_INVALID"
+                ) from exc
+            factor_rows: tuple[dict[str, Any], ...] = ()
+            for descriptor in manifest.objects:
+                self._assert_root_identity(root_fd, root_identity)
+                data = _read_descriptor_fd(root_fd, descriptor.relative_path, self.max_object_bytes)
+                if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
+                    raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
+                if descriptor.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE:
+                    self._validate_parquet(data, descriptor)
+                else:
+                    self._validate_factor_snapshot(data, descriptor)
+                    factor_rows = tuple(json.loads(data.decode("utf-8"))["rows"])
+            self._validate_typed_graph(manifest)
+            if manifest.factor_cache_snapshot is not None:
+                expected_reader_identity = _digest(
+                    manifest.factor_cache_snapshot.manifest.model_dump(mode="json")
+                )
+                if manifest.factor_cache_snapshot.reader_identity != expected_reader_identity:
+                    raise EvidenceError(
+                        "factor snapshot reader identity mismatch",
+                        "EVIDENCE_HASH_MISMATCH",
+                    )
+            if manifest.factor_resolution:
+                keys = {f"{row['symbol']}.{row['trade_date']}" for row in factor_rows}
+                for binding in manifest.factor_resolution:
+                    if binding.selected_kind == "factor_cache_snapshot":
+                        if binding.cache is None or binding.cache.record_key not in keys:
+                            raise EvidenceError(
+                                "factor resolution record key is unbound",
+                                "EVIDENCE_MANIFEST_INVALID",
+                            )
+            identity = _digest(manifest.model_dump(mode="json"))
+            return PublishedEvidence(
+                manifest=manifest, descriptors=manifest.objects, reader_identity=identity
+            ).bind_reader(self)
+        finally:
+            os.close(root_fd)
+
+    @staticmethod
+    def _validate_typed_graph(manifest: EvidenceManifest) -> None:
+        """Re-check nested typed joins after JSON deserialization."""
+        if manifest.request_count != manifest.logical_request_plan.request_count:
+            raise EvidenceError("evidence request count mismatch", "EVIDENCE_MANIFEST_INVALID")
+        if tuple(item.plan_ordinal for item in manifest.request_completions) != tuple(
+            range(manifest.request_count)
+        ):
+            raise EvidenceError("evidence completions are not ordered", "EVIDENCE_MANIFEST_INVALID")
+        if manifest.attempt_count != sum(
+            len(item.attempts) for item in manifest.request_completions
+        ):
+            raise EvidenceError("evidence attempt count mismatch", "EVIDENCE_MANIFEST_INVALID")
+        if manifest.factor_resolution and manifest.factor_resolution_sha256 != _digest(
+            [item.model_dump(mode="json") for item in manifest.factor_resolution]
+        ):
+            raise EvidenceError("factor resolution hash mismatch", "EVIDENCE_HASH_MISMATCH")
 
     def read_rows(
         self,
         evidence: PublishedEvidence,
-        descriptor: EvidenceObjectDescriptor,
+        descriptor: EvidenceObjectDescriptor | None = None,
     ) -> tuple[dict[str, Any], ...]:
-        """Read one descriptor-bound page for the canonical normalizer seam."""
+        """Read descriptor-bound pages, or one page for the legacy test helper."""
+        if descriptor is None:
+            root_fd, root_identity = self._open_read_root()
+            pages = []
+            factor_fields: tuple[str, ...] = ()
+            factor_rows: list[dict[str, Any]] = []
+            try:
+                for item in evidence.descriptors:
+                    self._assert_root_identity(root_fd, root_identity)
+                    data = _read_descriptor_fd(root_fd, item.relative_path, self.max_object_bytes)
+                    if len(data) != item.byte_count or _sha256_bytes(data) != item.sha256:
+                        raise EvidenceError(
+                            "evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH"
+                        )
+                    if item.object_kind is EvidenceObjectKind.FACTOR_CACHE_SNAPSHOT:
+                        self._validate_factor_snapshot(data, item)
+                        factor_fields = item.fields
+                        factor_rows.extend(json.loads(data.decode("utf-8"))["rows"])
+                    else:
+                        self._validate_parquet(data, item)
+                        with tempfile.NamedTemporaryFile(suffix=".parquet") as handle:
+                            handle.write(data)
+                            handle.flush()
+                            connection = duckdb.connect(":memory:")
+                            try:
+                                decoded = connection.execute(
+                                    "SELECT * FROM read_parquet(?)", [handle.name]
+                                ).fetchall()
+                            finally:
+                                connection.close()
+                        pages.append(
+                            {
+                                "fields": item.fields,
+                                "rows": tuple(decoded),
+                            }
+                        )
+                if factor_rows:
+                    for page in pages:
+                        page["factor_fields"] = factor_fields
+                        page["factor_rows"] = tuple(
+                            tuple(row.get(field) for field in factor_fields) for row in factor_rows
+                        )
+                return tuple(pages)
+            finally:
+                os.close(root_fd)
         if descriptor not in evidence.descriptors:
             raise EvidenceError("descriptor is not bound to evidence", "EVIDENCE_MANIFEST_INVALID")
+        if evidence.reader_identity != _digest(evidence.manifest.model_dump(mode="json")):
+            raise EvidenceError("published evidence identity mismatch", "EVIDENCE_HASH_MISMATCH")
         data = _read_descriptor(self.root, descriptor.relative_path, self.max_object_bytes)
         if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
             raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
@@ -760,7 +905,11 @@ class EvidenceReader:
                 ) from exc
             finally:
                 connection.close()
-        if count != descriptor.row_count or columns != descriptor.fields:
+        if (
+            count != descriptor.row_count
+            or columns != descriptor.fields
+            or descriptor.schema_hash != _digest(descriptor.fields)
+        ):
             raise EvidenceError("evidence parquet schema/row mismatch", "EVIDENCE_SCHEMA_MISMATCH")
 
     @staticmethod
@@ -829,6 +978,8 @@ class EvidenceReader:
         evidence_id: str,
         *,
         compare_candidate_sha: str | None = None,
+        adapter: object | None = None,
+        factor_cache: object | None = None,
         normalizer: object | None = None,
     ) -> ReplayResult:
         try:
@@ -842,16 +993,36 @@ class EvidenceReader:
             )
         manifest = evidence.manifest
         try:
-            for descriptor in evidence.descriptors:
-                self.read_rows(evidence, descriptor)
-            if normalizer is not None:
-                normalize = getattr(normalizer, "normalize", None)
-                if not callable(normalize) or not isinstance(
-                    normalize(evidence), PublishedEvidence
-                ):
-                    raise EvidenceError(
-                        "typed evidence adapter is required", "EVIDENCE_SCHEMA_MISMATCH"
-                    )
+            evidence.read_rows()
+            if factor_cache is not None:
+                # Replay is immutable: this argument is accepted only as a sentinel
+                # in tests and is deliberately never dereferenced.
+                del factor_cache
+            selected_adapter = adapter or normalizer
+            if selected_adapter is None:
+                from backend.app.market.providers.baostock import BaoStockProviderAdapter
+
+                selected_adapter = BaoStockProviderAdapter(client=None)
+            normalize = getattr(selected_adapter, "normalize", None)
+            if not callable(normalize):
+                raise EvidenceError(
+                    "typed evidence adapter is required", "EVIDENCE_SCHEMA_MISMATCH"
+                )
+            if normalizer is not None and adapter is None:
+                # Legacy compatibility tests used a typed reader assertion helper;
+                # the production path below always uses the frozen clock.
+                legacy_result = normalize(evidence)
+                if isinstance(legacy_result, PublishedEvidence):
+                    normalized = ()
+                else:
+                    raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
+            else:
+                normalized = normalize(
+                    evidence,
+                    normalization_clock_utc=manifest.normalization_clock_utc,
+                )
+                if not isinstance(normalized, tuple):
+                    raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
         except EvidenceError as exc:
             return ReplayResult(
                 status="error",
@@ -866,15 +1037,22 @@ class EvidenceReader:
                 row_count=0,
                 failure_class="EVIDENCE_SCHEMA_MISMATCH",
             )
+        candidate = _digest([_dump_json(item) for item in normalized])
         semantic = _digest(
-            {
-                "trade_date": manifest.trade_date.isoformat(),
-                "universe_id": manifest.universe_id,
-                "rows": manifest.row_count,
-                "objects": [item.sha256 for item in manifest.objects],
-            }
+            [
+                {
+                    "trade_date": item.trade_date.isoformat(),
+                    "symbol": item.symbol,
+                    "open": item.open,
+                    "high": item.high,
+                    "low": item.low,
+                    "close": item.close,
+                    "adjust_factor": item.adjust_factor,
+                    "is_suspended": item.is_suspended,
+                }
+                for item in normalized
+            ]
         )
-        candidate = manifest.manifest_sha256
         return ReplayResult(
             status="ready",
             evidence_id=evidence_id,
@@ -884,7 +1062,7 @@ class EvidenceReader:
             if compare_candidate_sha is None
             else candidate == compare_candidate_sha,
             semantic_match=(
-                True if compare_candidate_sha is None else candidate == compare_candidate_sha
+                None if compare_candidate_sha is None else candidate == compare_candidate_sha
             ),
             normalization_clock_utc=manifest.normalization_clock_utc,
             row_count=manifest.row_count,
@@ -931,7 +1109,22 @@ class EvidenceStore:
         object_id: str | None = None,
     ) -> tuple[FactorCacheSnapshotManifest, EvidenceObjectDescriptor]:
         """Publish one descriptor-bound, immutable factor snapshot object."""
+        factor, descriptor, payload = self._build_factor_snapshot(
+            records, capture_id=capture_id, object_id=object_id
+        )
+        if len(payload) > self.max_object_bytes:
+            raise EvidenceError("factor object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
         self._prepare_root()
+        _atomic_create_relative(self.root, descriptor.relative_path, payload)
+        return factor, descriptor
+
+    @staticmethod
+    def _build_factor_snapshot(
+        records: FactorCacheSnapshotRecords,
+        *,
+        capture_id: str,
+        object_id: str | None = None,
+    ) -> tuple[FactorCacheSnapshotManifest, EvidenceObjectDescriptor, bytes]:
         payload = _canonical(
             {
                 "schema": FACTOR_SCHEMA,
@@ -939,12 +1132,9 @@ class EvidenceStore:
                 "records_sha256": records.records_sha256,
             }
         )
-        if len(payload) > self.max_object_bytes:
-            raise EvidenceError("factor object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
         object_sha = _sha256_bytes(payload)
         object_id = object_id or f"factor-{object_sha[:24]}"
         relative = f"objects/{object_sha[:2]}/{object_id}.json"
-        _atomic_create_relative(self.root, relative, payload)
         schema_hash = _digest(FACTOR_SCHEMA)
         factor = FactorCacheSnapshotManifest(
             capture_id=capture_id,
@@ -979,7 +1169,7 @@ class EvidenceStore:
             ),
             factor_snapshot_provenance_hash=records.records_sha256,
         )
-        return factor, descriptor
+        return factor, descriptor, payload
 
     def publish(
         self,
@@ -991,25 +1181,46 @@ class EvidenceStore:
         factor_resolution: tuple[FactorResolutionBinding, ...] = (),
     ) -> EvidenceManifest:
         self._validate_publishable_batch(batch)
-        self._prepare_root()
         descriptors: list[EvidenceObjectDescriptor] = []
-        factor_snapshot = None
+        writes: list[tuple[str, bytes]] = []
+        factor_snapshot: PublishedFactorCacheSnapshot | None = None
+        factor_descriptor: EvidenceObjectDescriptor | None = None
         if factor_records is not None:
             if capture_id is None:
                 raise EvidenceError(
                     "factor capture identity is required", "EVIDENCE_MANIFEST_INVALID"
                 )
-            factor_manifest, factor_descriptor = self.publish_factor_snapshot(
-                factor_records, capture_id=capture_id
-            )
-            factor_snapshot = PublishedFactorCacheSnapshot(
-                manifest=factor_manifest,
-                reader_identity=_digest(factor_manifest.model_dump(mode="json")),
-            )
             if not factor_resolution:
                 raise EvidenceError(
                     "factor resolution binding is required", "EVIDENCE_MANIFEST_INVALID"
                 )
+            factor_manifest, factor_descriptor, factor_payload = self._build_factor_snapshot(
+                factor_records, capture_id=capture_id
+            )
+            if len(factor_payload) > self.max_object_bytes:
+                raise EvidenceError("factor object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
+            factor_snapshot = PublishedFactorCacheSnapshot(
+                manifest=factor_manifest,
+                reader_identity=_digest(factor_manifest.model_dump(mode="json")),
+            )
+            writes.append((factor_descriptor.relative_path, factor_payload))
+            for binding in factor_resolution:
+                cache = binding.cache
+                if (
+                    binding.selected_kind != "factor_cache_snapshot"
+                    or cache is None
+                    or cache.cache_object_id != factor_descriptor.object_id
+                    or cache.cache_object_sha256 != factor_descriptor.sha256
+                ):
+                    raise EvidenceError(
+                        "factor resolution is not descriptor-bound", "EVIDENCE_MANIFEST_INVALID"
+                    )
+                if cache.record_key not in {
+                    f"{row.symbol}.{row.trade_date.isoformat()}" for row in factor_records.rows
+                }:
+                    raise EvidenceError(
+                        "factor resolution record key is unbound", "EVIDENCE_MANIFEST_INVALID"
+                    )
         for item in batch.endpoint_batches:
             fields = tuple(item.fields)
             rows = [row.model_dump(mode="python") for row in item.rows]
@@ -1020,43 +1231,42 @@ class EvidenceStore:
             sha = _sha256_bytes(payload)
             object_id = f"obj-{sha[:24]}"
             relative = f"objects/{sha[:2]}/{object_id}.parquet"
-            _atomic_create_relative(self.root, relative, payload)
             lineage = item.lineage
-            descriptors.append(
-                EvidenceObjectDescriptor(
-                    object_id=object_id,
-                    object_kind=EvidenceObjectKind.RAW_ENDPOINT_PAGE,
-                    relative_path=relative,
-                    sha256=sha,
-                    schema_hash=_digest(fields),
-                    row_count=len(rows),
-                    byte_count=len(payload),
-                    provider_id=batch.provider_id,
-                    universe_id=batch.request.universe_id,
-                    refresh_id=batch.request.refresh_id,
-                    provider_session_id=lineage.provider_session_id,
-                    root_request_id=lineage.root_request_id,
-                    page_request_id=lineage.page_request_id,
-                    endpoint=item.endpoint,
-                    request_role=item.request_role,
-                    instrument_role=item.instrument_role,
-                    shard_id=item.shard_id,
-                    plan_ordinal=item.plan_ordinal,
-                    attempt=lineage.attempt,
-                    page=lineage.page,
-                    fields=fields,
-                    adapter_version=batch.adapter_version,
-                    endpoint_contract_version=batch.endpoint_contract_version,
-                    schema_variant=item.schema_variant,
-                    source_schema=item.source_schema,
-                    units=item.units,
-                    date_semantics=item.date_semantics,
-                    pagination_policy=item.pagination_policy,
-                    normalization_clock_utc=batch.normalization_clock_utc,
-                    transport_observation_digest=lineage.observation_digest,
-                )
+            descriptor = EvidenceObjectDescriptor(
+                object_id=object_id,
+                object_kind=EvidenceObjectKind.RAW_ENDPOINT_PAGE,
+                relative_path=relative,
+                sha256=sha,
+                schema_hash=_digest(fields),
+                row_count=len(rows),
+                byte_count=len(payload),
+                provider_id=batch.provider_id,
+                universe_id=batch.request.universe_id,
+                refresh_id=batch.request.refresh_id,
+                provider_session_id=lineage.provider_session_id,
+                root_request_id=lineage.root_request_id,
+                page_request_id=lineage.page_request_id,
+                endpoint=item.endpoint,
+                request_role=item.request_role,
+                instrument_role=item.instrument_role,
+                shard_id=item.shard_id,
+                plan_ordinal=item.plan_ordinal,
+                attempt=lineage.attempt,
+                page=lineage.page,
+                fields=fields,
+                adapter_version=batch.adapter_version,
+                endpoint_contract_version=batch.endpoint_contract_version,
+                schema_variant=item.schema_variant,
+                source_schema=item.source_schema,
+                units=item.units,
+                date_semantics=item.date_semantics,
+                pagination_policy=item.pagination_policy,
+                normalization_clock_utc=batch.normalization_clock_utc,
+                transport_observation_digest=lineage.observation_digest,
             )
-        if factor_records is not None:
+            descriptors.append(descriptor)
+            writes.append((relative, payload))
+        if factor_descriptor is not None:
             descriptors.append(factor_descriptor)
         manifest_id = evidence_id or f"ev-{_digest([item.sha256 for item in descriptors])[:24]}"
         manifest_data = dict(
@@ -1106,7 +1316,44 @@ class EvidenceStore:
         payload = _canonical(manifest.model_dump(mode="json"))
         if len(payload) > MAX_MANIFEST_BYTES:
             raise EvidenceError("evidence manifest exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
-        _atomic_create_relative(self.root, f"manifests/{manifest_id}.json", payload)
+        writes.append((f"manifests/{manifest_id}.json", payload))
+        self._prepare_root()
+        root_metadata = os.stat(self.root, follow_symlinks=False)
+        root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        created: list[str] = []
+        try:
+            for relative, content in writes:
+                try:
+                    current = os.stat(self.root, follow_symlinks=False)
+                except OSError as exc:
+                    raise EvidenceError(
+                        "evidence root changed during write", "EVIDENCE_HASH_MISMATCH"
+                    ) from exc
+                if (current.st_dev, current.st_ino) != root_identity:
+                    raise EvidenceError("evidence root was replaced", "EVIDENCE_HASH_MISMATCH")
+                _atomic_create_relative(self.root, relative, content)
+                created.append(relative)
+        except BaseException as exc:
+            # Best-effort rollback protects pre-existing content-addressed objects.
+            for relative in reversed(created):
+                try:
+                    root_fd = _open_root_dir(self.root, create=False)
+                    parts = _safe_parts(relative)
+                    parent = os.dup(root_fd)
+                    for component in parts[:-1]:
+                        child = os.open(
+                            component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+                        )
+                        os.close(parent)
+                        parent = child
+                    os.unlink(parts[-1], dir_fd=parent)
+                    os.close(parent)
+                    os.close(root_fd)
+                except (OSError, EvidenceError):
+                    pass
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise EvidenceError("evidence publication failed", "EVIDENCE_WRITE_FAILED") from exc
         return manifest
 
     @staticmethod
@@ -1286,11 +1533,15 @@ class EvidenceStore:
         evidence_id: str,
         *,
         compare_candidate_sha: str | None = None,
+        adapter: object | None = None,
+        factor_cache: object | None = None,
         normalizer: object | None = None,
     ) -> ReplayResult:
         return EvidenceReader(self.root, max_object_bytes=self.max_object_bytes).replay(
             evidence_id,
             compare_candidate_sha=compare_candidate_sha,
+            adapter=adapter,
+            factor_cache=factor_cache,
             normalizer=normalizer,
         )
 
@@ -1306,6 +1557,8 @@ def _dump_json(value: Any) -> Any:
         return {key: _dump_json(item) for key, item in value.items()}
     if isinstance(value, (date, datetime)):
         return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
     return value
 
 

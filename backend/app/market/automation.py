@@ -88,8 +88,14 @@ def publish_provider_evidence(
         normalize = getattr(adapter, "normalize", None)
         if not callable(normalize):
             raise ProviderHealthError("typed evidence adapter is required")
-        normalized = normalize(evidence)
-        if not isinstance(normalized, PublishedEvidence):
+        try:
+            normalized = normalize(
+                evidence,
+                normalization_clock_utc=manifest.normalization_clock_utc,
+            )
+        except TypeError:
+            normalized = normalize(evidence)
+        if not isinstance(normalized, (tuple, PublishedEvidence)):
             raise ProviderHealthError("evidence adapter returned an invalid type")
     return manifest, evidence
 
@@ -125,7 +131,7 @@ def publish_provider_evidence_with_factor_cache(
             after_fingerprint=after_fingerprint,
         )
         factor_store = EvidenceStore(evidence_root)
-        factor_manifest, _factor_descriptor = factor_store.publish_factor_snapshot(
+        factor_manifest, _factor_descriptor, _factor_payload = factor_store._build_factor_snapshot(
             records, capture_id=capture_id
         )
         binding = factor_resolution or (
@@ -146,10 +152,48 @@ def publish_provider_evidence_with_factor_cache(
             normalize = getattr(adapter, "normalize", None)
             if not callable(normalize):
                 raise ProviderHealthError("typed evidence adapter is required")
-            normalized = normalize(evidence)
-            if not isinstance(normalized, PublishedEvidence):
+            try:
+                normalized = normalize(
+                    evidence,
+                    normalization_clock_utc=manifest.normalization_clock_utc,
+                )
+            except TypeError:
+                normalized = normalize(evidence)
+            if not isinstance(normalized, (tuple, PublishedEvidence)):
                 raise ProviderHealthError("evidence adapter returned an invalid type")
         return manifest, evidence
+
+
+def run_canonical_raw_refresh(
+    adapter: object,
+    request: object,
+    *,
+    evidence_root: Path,
+) -> tuple[EvidenceManifest, PublishedEvidence, tuple[object, ...]]:
+    """Run the explicit evidence-first compatibility seam for a raw refresh.
+
+    The legacy ``run_publication_refresh`` remains frozen for Task 7 callers.  New
+    evidence work must enter here: fetch a typed raw batch, publish/read it, then
+    normalize only through the bound evidence reader and its frozen clock.
+    """
+    from backend.app.market.providers.baostock import BaoStockProviderAdapter
+
+    if not isinstance(adapter, BaoStockProviderAdapter):
+        raise ProviderHealthError("canonical raw refresh requires BaoStock adapter")
+    fetch_raw = getattr(adapter, "fetch_raw", None)
+    if not callable(fetch_raw):
+        raise ProviderHealthError("canonical raw refresh requires raw provider contract")
+    batch = fetch_raw(request)
+    manifest, evidence = publish_provider_evidence(
+        batch,
+        evidence_root=evidence_root,
+        adapter=adapter,
+    )
+    normalized = adapter.normalize(
+        evidence,
+        normalization_clock_utc=manifest.normalization_clock_utc,
+    )
+    return manifest, evidence, normalized
 
 
 def _log_event(level: int, event: str, **fields) -> None:
