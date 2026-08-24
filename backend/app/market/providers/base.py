@@ -150,6 +150,7 @@ class ProviderId(StrEnum):
 class EvidenceObjectKind(StrEnum):
     RAW_ENDPOINT_PAGE = "raw_endpoint_page"
     FACTOR_CACHE_SNAPSHOT = "factor_cache_snapshot"
+    FACTOR_RESOLUTION_SNAPSHOT = "factor_resolution_snapshot"
 
 
 def _canonical(value: object) -> bytes:

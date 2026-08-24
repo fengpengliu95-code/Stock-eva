@@ -232,6 +232,23 @@ class PublishedFactorCacheSnapshot(_Immutable):
     reader_identity: SafeSha256
 
 
+class FactorResolutionSnapshotManifest(_Immutable):
+    capture_id: SafeIdentifier
+    object_id: SafeIdentifier
+    relative_path: SafeRelativePath
+    object_sha256: SafeSha256
+    byte_count: int = Field(ge=0, le=MAX_OBJECT_BYTES)
+    binding_count: int = Field(ge=0, le=MAX_ROWS)
+    schema_variant: Literal["factor-resolution-snapshot.v1"]
+    schema_hash: SafeSha256
+    bindings_sha256: SafeSha256
+
+
+class PublishedFactorResolutionSnapshot(_Immutable):
+    manifest: FactorResolutionSnapshotManifest
+    reader_identity: SafeSha256
+
+
 class LiveFactorResolution(_Immutable):
     descriptor_id: SafeIdentifier
     object_sha256: SafeSha256
@@ -303,6 +320,7 @@ class EvidenceObjectDescriptor(_Immutable):
     normalization_clock_utc: datetime
     transport_observation_digest: SafeSha256 | None = None
     factor_snapshot_provenance_hash: SafeSha256 | None = None
+    factor_resolution_provenance_hash: SafeSha256 | None = None
 
     @model_validator(mode="after")
     def validate_kind(self) -> EvidenceObjectDescriptor:
@@ -343,6 +361,15 @@ class EvidenceObjectDescriptor(_Immutable):
                 raise ValueError("factor descriptor must be local and transport-free")
             if self.factor_snapshot_provenance_hash is None:
                 raise ValueError("factor descriptor requires records hash")
+        elif self.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT:
+            if self.fields != ("binding",) or self.units:
+                raise ValueError("factor resolution descriptor schema is invalid")
+            if self.capture_id is None or any(value is not None for value in page_fields):
+                raise ValueError("factor resolution descriptor must be local and transport-free")
+            if self.factor_resolution_provenance_hash is None:
+                raise ValueError("factor resolution descriptor requires bindings hash")
+            if self.factor_snapshot_provenance_hash is not None:
+                raise ValueError("factor resolution descriptor has wrong provenance")
         if self.normalization_clock_utc.tzinfo is None:
             raise ValueError("normalization clock must be timezone-aware")
         return self
@@ -368,7 +395,8 @@ class EvidenceManifest(_Immutable):
     transport_observations: TransportObservationAggregate | None = None
     endpoint_summaries: tuple[EndpointContractSummary, ...] = ()
     factor_cache_snapshot: PublishedFactorCacheSnapshot | None = None
-    factor_resolution: tuple[FactorResolutionBinding, ...] = ()
+    factor_resolution_snapshot: PublishedFactorResolutionSnapshot | None = None
+    factor_resolution: tuple[FactorResolutionBinding, ...] = Field(default=(), exclude=True)
     factor_resolution_sha256: SafeSha256
     request_count: int = Field(ge=1, le=4096)
     attempt_count: int = Field(ge=1, le=20000)
@@ -423,7 +451,7 @@ class EvidenceManifest(_Immutable):
                 or item.factor_snapshot_provenance_hash != factor.records_sha256
             ):
                 raise ValueError("factor descriptor and manifest identity mismatch")
-            if not self.factor_resolution:
+            if not self.factor_resolution and self.factor_resolution_snapshot is None:
                 raise ValueError("factor snapshot requires a resolution binding")
             for binding in self.factor_resolution:
                 cache = getattr(binding, "cache", None)
@@ -433,10 +461,52 @@ class EvidenceManifest(_Immutable):
                     or cache.cache_object_sha256 != factor.object_sha256
                 ):
                     raise ValueError("factor resolution is not descriptor-bound")
-        elif self.factor_resolution:
+            if self.factor_resolution_snapshot is not None:
+                resolution = self.factor_resolution_snapshot.manifest
+                resolution_descriptor = tuple(
+                    item
+                    for item in self.objects
+                    if item.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT
+                )
+                if len(resolution_descriptor) != 1:
+                    raise ValueError("factor resolution descriptor cardinality mismatch")
+                item = resolution_descriptor[0]
+                if (
+                    item.capture_id != resolution.capture_id
+                    or item.object_id != resolution.object_id
+                    or item.relative_path != resolution.relative_path
+                    or item.sha256 != resolution.object_sha256
+                    or item.byte_count != resolution.byte_count
+                    or item.row_count != resolution.binding_count
+                    or item.schema_variant != resolution.schema_variant
+                    or item.schema_hash != resolution.schema_hash
+                    or item.factor_resolution_provenance_hash != resolution.bindings_sha256
+                ):
+                    raise ValueError("factor resolution descriptor and manifest mismatch")
+                if self.factor_resolution and resolution.binding_count != len(
+                    self.factor_resolution
+                ):
+                    raise ValueError("factor resolution binding count mismatch")
+            elif any(
+                item.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT
+                for item in self.objects
+            ):
+                raise ValueError("factor resolution descriptor is unbound")
+        elif self.factor_resolution or self.factor_resolution_snapshot is not None:
             raise ValueError("factor resolution requires a published factor snapshot")
-        expected_factor_resolution_hash = _digest(
-            [item.model_dump(mode="json") for item in self.factor_resolution]
+        if self.factor_resolution_snapshot is None and any(
+            item.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT
+            for item in self.objects
+        ):
+            raise ValueError("factor resolution descriptor requires a snapshot manifest")
+        expected_factor_resolution_hash = (
+            _digest([item.model_dump(mode="json") for item in self.factor_resolution])
+            if self.factor_resolution
+            else (
+                self.factor_resolution_snapshot.manifest.bindings_sha256
+                if self.factor_resolution_snapshot is not None
+                else _digest([])
+            )
         )
         if self.factor_resolution_sha256 != expected_factor_resolution_hash:
             raise ValueError("factor resolution aggregate hash mismatch")
@@ -827,6 +897,7 @@ class EvidenceReader:
                     "evidence ID content identity mismatch", "EVIDENCE_HASH_MISMATCH"
                 )
             factor_rows: tuple[dict[str, Any], ...] = ()
+            factor_resolution: tuple[FactorResolutionBinding, ...] = ()
             for descriptor in manifest.objects:
                 self._assert_root_identity(root_fd, root_identity)
                 data = _read_descriptor_fd(root_fd, descriptor.relative_path, self.max_object_bytes)
@@ -834,9 +905,30 @@ class EvidenceReader:
                     raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
                 if descriptor.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE:
                     self._validate_parquet(data, descriptor)
+                elif descriptor.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT:
+                    factor_resolution = self._validate_factor_resolution_snapshot(data, descriptor)
                 else:
                     self._validate_factor_snapshot(data, descriptor)
                     factor_rows = tuple(json.loads(data.decode("utf-8"))["rows"])
+            if manifest.factor_resolution_snapshot is not None:
+                if not factor_resolution:
+                    raise EvidenceError(
+                        "factor resolution snapshot is missing", "EVIDENCE_MANIFEST_INVALID"
+                    )
+                if _digest([item.model_dump(mode="json") for item in factor_resolution]) != (
+                    manifest.factor_resolution_sha256
+                ):
+                    raise EvidenceError(
+                        "factor resolution snapshot hash mismatch", "EVIDENCE_HASH_MISMATCH"
+                    )
+                if (
+                    len(factor_resolution)
+                    != manifest.factor_resolution_snapshot.manifest.binding_count
+                ):
+                    raise EvidenceError(
+                        "factor resolution snapshot count mismatch", "EVIDENCE_MANIFEST_INVALID"
+                    )
+                object.__setattr__(manifest, "factor_resolution", factor_resolution)
             self._validate_typed_graph(manifest)
             if manifest.factor_cache_snapshot is not None:
                 expected_reader_identity = _digest(
@@ -1111,6 +1203,8 @@ class EvidenceReader:
                         self._validate_factor_snapshot(data, item)
                         factor_fields = item.fields
                         factor_rows.extend(json.loads(data.decode("utf-8"))["rows"])
+                    elif item.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT:
+                        self._validate_factor_resolution_snapshot(data, item)
                     else:
                         self._validate_parquet(data, item)
                         with tempfile.NamedTemporaryFile(suffix=".parquet") as handle:
@@ -1180,6 +1274,11 @@ class EvidenceReader:
             self._validate_factor_snapshot(data, descriptor)
             raw = json.loads(data.decode("utf-8"))
             return tuple(raw["rows"])
+        if descriptor.object_kind is EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT:
+            return tuple(
+                item.model_dump(mode="json")
+                for item in self._validate_factor_resolution_snapshot(data, descriptor)
+            )
         self._validate_parquet(data, descriptor)
         with tempfile.NamedTemporaryFile(suffix=".parquet") as handle:
             handle.write(data)
@@ -1288,6 +1387,32 @@ class EvidenceReader:
                     raise ValueError("factor row fingerprint")
         except Exception as exc:
             raise EvidenceError("factor snapshot is invalid", "EVIDENCE_SCHEMA_MISMATCH") from exc
+
+    @staticmethod
+    def _validate_factor_resolution_snapshot(
+        data: bytes, descriptor: EvidenceObjectDescriptor
+    ) -> tuple[FactorResolutionBinding, ...]:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+            if payload.get("schema") != "factor-resolution-snapshot.v1":
+                raise ValueError("factor resolution schema")
+            bindings = tuple(
+                FactorResolutionBinding.model_validate(item) for item in payload["bindings"]
+            )
+            bindings_sha256 = payload.get("bindings_sha256")
+            if bindings_sha256 != _digest([item.model_dump(mode="json") for item in bindings]):
+                raise ValueError("factor resolution hash")
+            if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
+                raise ValueError("factor resolution object hash")
+            if len(bindings) != descriptor.row_count:
+                raise ValueError("factor resolution count")
+            if descriptor.factor_resolution_provenance_hash != bindings_sha256:
+                raise ValueError("factor resolution provenance")
+            return bindings
+        except Exception as exc:
+            raise EvidenceError(
+                "factor resolution snapshot is invalid", "EVIDENCE_SCHEMA_MISMATCH"
+            ) from exc
 
     def replay(
         self,
@@ -1554,6 +1679,56 @@ class EvidenceStore:
         )
         return factor, descriptor, payload
 
+    @staticmethod
+    def _build_factor_resolution_snapshot(
+        bindings: tuple[FactorResolutionBinding, ...],
+        *,
+        capture_id: str,
+    ) -> tuple[FactorResolutionSnapshotManifest, EvidenceObjectDescriptor, bytes]:
+        serialized = [item.model_dump(mode="json") for item in bindings]
+        bindings_sha256 = _digest(serialized)
+        payload = _canonical(
+            {
+                "schema": "factor-resolution-snapshot.v1",
+                "bindings": serialized,
+                "bindings_sha256": bindings_sha256,
+            }
+        )
+        object_sha = _sha256_bytes(payload)
+        object_id = f"factor-resolution-{object_sha[:24]}"
+        relative = f"objects/{object_sha[:2]}/{object_id}.json"
+        schema_hash = _digest(("binding",))
+        manifest = FactorResolutionSnapshotManifest(
+            capture_id=capture_id,
+            object_id=object_id,
+            relative_path=relative,
+            object_sha256=object_sha,
+            byte_count=len(payload),
+            binding_count=len(bindings),
+            schema_variant="factor-resolution-snapshot.v1",
+            schema_hash=schema_hash,
+            bindings_sha256=bindings_sha256,
+        )
+        descriptor = EvidenceObjectDescriptor(
+            object_id=object_id,
+            object_kind=EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT,
+            relative_path=relative,
+            sha256=object_sha,
+            schema_hash=schema_hash,
+            row_count=len(bindings),
+            byte_count=len(payload),
+            provider_id=ProviderId.BAOSTOCK,
+            universe_id="factor-resolution",
+            refresh_id=capture_id,
+            capture_id=capture_id,
+            fields=("binding",),
+            schema_variant="factor-resolution-snapshot.v1",
+            source_schema="factor-resolution-snapshot.v1",
+            normalization_clock_utc=datetime(1970, 1, 1, tzinfo=UTC),
+            factor_resolution_provenance_hash=bindings_sha256,
+        )
+        return manifest, descriptor, payload
+
     def publish(
         self,
         batch: ProviderRawBatch,
@@ -1568,6 +1743,8 @@ class EvidenceStore:
         writes: list[tuple[str, bytes]] = []
         factor_snapshot: PublishedFactorCacheSnapshot | None = None
         factor_descriptor: EvidenceObjectDescriptor | None = None
+        factor_resolution_snapshot: PublishedFactorResolutionSnapshot | None = None
+        factor_resolution_descriptor: EvidenceObjectDescriptor | None = None
         if factor_records is not None:
             if capture_id is None:
                 raise EvidenceError(
@@ -1707,6 +1884,22 @@ class EvidenceStore:
             writes.append((relative, payload))
         if factor_descriptor is not None:
             descriptors.append(factor_descriptor)
+        resolution_bindings = tuple(factor_resolution or getattr(batch, "factor_resolution", ()))
+        if resolution_bindings:
+            if factor_snapshot is None or capture_id is None:
+                raise EvidenceError(
+                    "factor resolution requires a factor snapshot",
+                    "EVIDENCE_MANIFEST_INVALID",
+                )
+            resolution_manifest, factor_resolution_descriptor, resolution_payload = (
+                self._build_factor_resolution_snapshot(resolution_bindings, capture_id=capture_id)
+            )
+            factor_resolution_snapshot = PublishedFactorResolutionSnapshot(
+                manifest=resolution_manifest,
+                reader_identity=_digest(resolution_manifest.model_dump(mode="json")),
+            )
+            descriptors.append(factor_resolution_descriptor)
+            writes.append((factor_resolution_descriptor.relative_path, resolution_payload))
         manifest_id = evidence_id or "ev-pending"
         manifest_data = dict(
             evidence_id=manifest_id,
@@ -1728,11 +1921,12 @@ class EvidenceStore:
             transport_observations=batch.transport_observations,
             endpoint_summaries=batch.endpoint_summaries,
             factor_cache_snapshot=factor_snapshot,
-            factor_resolution=(factor_resolution or getattr(batch, "factor_resolution", ())),
+            factor_resolution_snapshot=factor_resolution_snapshot,
+            factor_resolution=resolution_bindings,
             factor_resolution_sha256=(
-                getattr(batch, "factor_resolution_sha256", _digest([]))
-                if not factor_resolution
-                else _digest([item.model_dump(mode="json") for item in factor_resolution])
+                _digest([item.model_dump(mode="json") for item in resolution_bindings])
+                if resolution_bindings
+                else _digest([])
             ),
             request_count=batch.logical_request_plan.request_count,
             attempt_count=sum(len(item.attempts) for item in batch.request_completions),

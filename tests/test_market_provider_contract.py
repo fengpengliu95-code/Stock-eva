@@ -2661,3 +2661,12 @@ def test_login_operation_cannot_be_reused_as_query_root_completion() -> None:
         BaoStockProviderAdapter(
             client=_DuplicateOperationClient(), max_attempts=1, min_request_interval_seconds=0
         ).fetch_raw(_provider_request())
+
+
+def test_evidence_object_kind_resolution_is_additive_without_changing_task7_members() -> None:
+    assert provider_base.EvidenceObjectKind.RAW_ENDPOINT_PAGE.value == "raw_endpoint_page"
+    assert provider_base.EvidenceObjectKind.FACTOR_CACHE_SNAPSHOT.value == "factor_cache_snapshot"
+    assert (
+        provider_base.EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT.value
+        == "factor_resolution_snapshot"
+    )

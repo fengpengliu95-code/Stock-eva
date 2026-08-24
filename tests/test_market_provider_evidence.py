@@ -108,6 +108,64 @@ def _factor_binding(object_id: str, object_sha: str) -> FactorResolutionBinding:
     return FactorResolutionBinding(**values, resolution_sha256=_digest(serialized))
 
 
+def _large_factor_records(count: int) -> FactorCacheSnapshotRecords:
+    rows = []
+    for index in range(count):
+        symbol = f"sh.{index + 1:06d}"
+        values = (
+            symbol,
+            "2026-08-20",
+            1.0,
+            1.0,
+            "bootstrap",
+            "2026-08-20",
+            "2026-08-20",
+            f"{index:064x}"[-64:],
+            "2026-08-20T00:00:00+00:00",
+        )
+        row = {
+            "symbol": values[0],
+            "trade_date": values[1],
+            "fore_adjust_factor": values[2],
+            "back_adjust_factor": values[3],
+            "evidence_kind": values[4],
+            "evidence_effective_date": values[5],
+            "evidence_observed_on": values[6],
+            "source_row_hash": values[7],
+            "observed_at": values[8],
+            "row_fingerprint": AdjustmentFactorCache.snapshot_row_fingerprint(values),
+        }
+        rows.append(row)
+    return factor_snapshot_records_from_cache(
+        rows, before_fingerprint="e" * 64, after_fingerprint="e" * 64
+    )
+
+
+def _large_factor_bindings(records: FactorCacheSnapshotRecords, object_id: str, object_sha: str):
+    bindings = []
+    for row in records.rows:
+        values = {
+            "plan_ordinal": 0,
+            "symbol": row.symbol,
+            "trade_date": row.trade_date,
+            "selected_kind": "factor_cache_snapshot",
+            "selected_value_semantic_hash": _factor_value_semantic_hash(
+                row.model_dump(mode="python")
+            ),
+            "live": None,
+            "cache": CacheFactorResolution(
+                cache_object_id=object_id,
+                cache_object_sha256=object_sha,
+                record_key=f"{row.symbol}.{row.trade_date.isoformat()}",
+            ),
+        }
+        candidate = FactorResolutionBinding.model_construct(**values, resolution_sha256="0" * 64)
+        serialized = candidate.model_dump(mode="json")
+        serialized.pop("resolution_sha256", None)
+        bindings.append(FactorResolutionBinding(**values, resolution_sha256=_digest(serialized)))
+    return tuple(bindings)
+
+
 def _descriptor(tmp_path: Path, *, kind=EvidenceObjectKind.RAW_ENDPOINT_PAGE, **updates):
     values = dict(
         object_id="obj-1",
@@ -176,6 +234,66 @@ def _descriptor(tmp_path: Path, *, kind=EvidenceObjectKind.RAW_ENDPOINT_PAGE, **
 
 def test_raw_evidence_is_content_addressed_and_idempotent(tmp_path):
     assert EvidenceStore(tmp_path).root == tmp_path
+
+
+@pytest.mark.parametrize("binding_count", (4091, 4092, 5000))
+def test_task8_external_resolution_red_manifest_oversize_before_sidecar(binding_count, tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _large_factor_records(binding_count)
+    factor_manifest, _descriptor, _payload = store._build_factor_snapshot(
+        records, capture_id="capture-large"
+    )
+    manifest = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-large",
+        factor_resolution=_large_factor_bindings(
+            records, factor_manifest.object_id, factor_manifest.object_sha256
+        ),
+    )
+    evidence = store.read(manifest.evidence_id)
+    manifest_bytes = (tmp_path / "manifests" / f"{manifest.evidence_id}.json").stat().st_size
+    resolution_descriptor = next(
+        item for item in manifest.objects if item.object_kind.value == "factor_resolution_snapshot"
+    )
+    assert manifest_bytes <= 1024 * 1024
+    assert resolution_descriptor.byte_count <= 64 * 1024 * 1024
+    assert resolution_descriptor.byte_count > 1024 * 1024
+    assert len(evidence.manifest.factor_resolution) == binding_count
+    assert evidence.manifest.factor_resolution_sha256 == _digest(
+        [item.model_dump(mode="json") for item in evidence.manifest.factor_resolution]
+    )
+
+
+def test_task8_resolution_sidecar_cas_is_idempotent_and_tamper_evident(tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _large_factor_records(32)
+    factor_manifest, _descriptor, _payload = store._build_factor_snapshot(
+        records, capture_id="capture-sidecar"
+    )
+    bindings = _large_factor_bindings(
+        records, factor_manifest.object_id, factor_manifest.object_sha256
+    )
+    first = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-sidecar",
+        factor_resolution=bindings,
+    )
+    second = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-sidecar",
+        factor_resolution=bindings,
+    )
+    assert first.evidence_id == second.evidence_id
+    resolution = next(
+        item for item in first.objects if item.object_kind.value == "factor_resolution_snapshot"
+    )
+    path = tmp_path / resolution.relative_path
+    path.write_bytes(path.read_bytes() + b"x")
+    with pytest.raises(EvidenceError):
+        store.read(first.evidence_id)
 
 
 def test_changed_bytes_create_distinct_evidence_without_overwrite(tmp_path):
@@ -439,7 +557,7 @@ def test_manifest_object_count_includes_optional_factor_descriptor(tmp_path):
             _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),
         ),
     )
-    assert enriched.object_count == manifest.object_count + 1
+    assert enriched.object_count == manifest.object_count + 2
 
 
 def test_manifest_row_count_excludes_factor_snapshot_rows(tmp_path):
@@ -535,8 +653,9 @@ def test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache(tm
     )
     assert calls == 2
     assert manifest.factor_cache_snapshot is not None
-    assert evidence.descriptors[-1].capture_id == manifest.factor_cache_snapshot.manifest.capture_id
-    assert evidence.descriptors[-1].object_kind.value == "factor_cache_snapshot"
+    assert evidence.descriptors[-2].capture_id == manifest.factor_cache_snapshot.manifest.capture_id
+    assert evidence.descriptors[-2].object_kind.value == "factor_cache_snapshot"
+    assert evidence.descriptors[-1].object_kind.value == "factor_resolution_snapshot"
 
 
 def test_factor_cache_snapshot_records_match_current_table_and_model_copy_is_read_only(tmp_path):
@@ -1127,17 +1246,19 @@ def test_task8_reader_recomputes_selected_factor_value_hash(tmp_path):
             _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),
         ),
     )
-    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
-    raw = json.loads(path.read_text())
-    binding = raw["factor_resolution"][0]
+    resolution_descriptor = next(
+        item for item in manifest.objects if item.object_kind.value == "factor_resolution_snapshot"
+    )
+    resolution_path = tmp_path / resolution_descriptor.relative_path
+    resolution = json.loads(resolution_path.read_text())
+    binding = resolution["bindings"][0]
     binding["selected_value_semantic_hash"] = "f" * 64
     binding.pop("resolution_sha256", None)
     binding["resolution_sha256"] = _digest(binding)
-    raw["factor_resolution_sha256"] = _digest(raw["factor_resolution"])
-    raw["manifest_sha256"] = _digest(
-        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    resolution["bindings_sha256"] = _digest(resolution["bindings"])
+    resolution_path.write_text(
+        json.dumps(resolution, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
-    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     with pytest.raises(EvidenceError):
         EvidenceReader(tmp_path).read(manifest.evidence_id)
 

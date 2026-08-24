@@ -369,44 +369,29 @@ def test_real_service_due_route_uses_one_raw_fetch_and_one_normalize(tmp_path: P
         for item in manifest["logical_request_plan"]["requests"]
         if item["endpoint"] == "daily_factor"
     )
-    assert {item["plan_ordinal"] for item in manifest["factor_resolution"]} == {factor_ordinal}
+    resolution_descriptor = next(
+        item for item in manifest["objects"] if item["object_kind"] == "factor_resolution_snapshot"
+    )
+    resolution_path = tmp_path / "evidence" / resolution_descriptor["relative_path"]
+    original_resolution = json.loads(resolution_path.read_text())
+    assert {item["plan_ordinal"] for item in original_resolution["bindings"]} == {factor_ordinal}
     manifest_id = manifest["evidence_id"]
-    manifest_path = tmp_path / "evidence" / "manifests" / f"{manifest_id}.json"
-    original_manifest = json.loads(manifest_path.read_text())
     for bad_ordinal in (0, 999):
-        forged = json.loads(json.dumps(original_manifest))
-        forged_binding = forged["factor_resolution"][0]
+        forged = json.loads(json.dumps(original_resolution))
+        forged_binding = forged["bindings"][0]
         forged_binding["plan_ordinal"] = bad_ordinal
-        binding_core = dict(forged_binding)
-        binding_core.pop("resolution_sha256", None)
-        forged_binding["resolution_sha256"] = hashlib.sha256(
-            json.dumps(
-                binding_core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode()
-        ).hexdigest()
-        forged["factor_resolution_sha256"] = hashlib.sha256(
-            json.dumps(
-                forged["factor_resolution"],
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        forged["manifest_sha256"] = hashlib.sha256(
-            json.dumps(
-                {key: value for key, value in forged.items() if key != "manifest_sha256"},
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        manifest_path.write_text(
+        resolution_path.write_text(
             json.dumps(forged, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         )
         with pytest.raises(EvidenceError):
             EvidenceReader(tmp_path / "evidence").read(manifest_id)
-        manifest_path.write_text(
-            json.dumps(original_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        resolution_path.write_text(
+            json.dumps(
+                original_resolution,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
 
