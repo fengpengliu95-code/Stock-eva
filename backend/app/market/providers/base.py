@@ -920,6 +920,8 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw endpoint batch cardinality mismatch")
         page_key = tuple[str, str, str, str, int, int, int, int]
         projection_key = tuple[str, str, str, str, int, int, int]
+        capture_identity = tuple[str, str, str]
+        query_capture_namespace: set[capture_identity] = set()
         attempt_page_index: dict[page_key, Literal["query_root", "page"]] = {}
         attempt_projection_keys: dict[
             projection_key, tuple[page_key, Literal["query_root", "page"]]
@@ -927,7 +929,21 @@ class ProviderRawBatch(_ContractModel):
         for completion in self.request_completions:
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
             for attempt in completion.attempts:
+                query_capture_namespace.add(
+                    (
+                        self.request.refresh_id,
+                        attempt.provider_session_id,
+                        attempt.root_request_id,
+                    )
+                )
                 for page, page_request_id in attempt.page_request_ids:
+                    query_capture_namespace.add(
+                        (
+                            self.request.refresh_id,
+                            attempt.provider_session_id,
+                            page_request_id,
+                        )
+                    )
                     if page == 1 and page_request_id != attempt.root_request_id:
                         raise ValueError("page one must bind its query root")
                     if page > 1 and page_request_id == attempt.root_request_id:
@@ -1160,9 +1176,25 @@ class ProviderRawBatch(_ContractModel):
                 raise ValueError("duplicate or conflicting transport lineage projection")
             lineage_index[key] = lineage
         projection_index: dict[projection_key, TransportObservationProjection] = {}
+        capture_families: dict[capture_identity, Literal["login_audit", "query"]] = {}
         for projection in self.transport_observations.observations:
+            identity = (
+                projection.refresh_id,
+                projection.provider_session_id,
+                projection.request_id,
+            )
             if projection.lineage_kind == "login_audit":
+                if identity in query_capture_namespace:
+                    raise ValueError("login capture identity collides with query namespace")
+                previous_family = capture_families.get(identity)
+                if previous_family == "query":
+                    raise ValueError("capture identity crosses login and query families")
+                capture_families[identity] = "login_audit"
                 continue
+            previous_family = capture_families.get(identity)
+            if previous_family == "login_audit":
+                raise ValueError("capture identity crosses login and query families")
+            capture_families[identity] = "query"
             key = (
                 projection.refresh_id,
                 projection.provider_session_id,

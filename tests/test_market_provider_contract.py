@@ -2117,6 +2117,143 @@ def _append_projection_for_attempt(
     )
 
 
+def _rebind_login_capture_identity(
+    raw: ProviderRawBatch, *, full_query_identity: bool
+) -> ProviderRawBatch:
+    login = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
+    )
+    query = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.lineage_kind == "query_root" and item.protocol_stage is ProtocolStage.COMPLETE
+    )
+    values = login.model_dump(mode="python")
+    values.update(
+        refresh_id=query.refresh_id,
+        provider_session_id=query.provider_session_id,
+        request_id=query.request_id,
+    )
+    if full_query_identity:
+        values.update(
+            endpoint=query.endpoint,
+            plan_ordinal=query.plan_ordinal,
+            attempt=query.attempt,
+            page=query.page,
+        )
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    rebound = TransportObservationProjection.model_validate(values)
+    observations = tuple(
+        rebound if item.observation_digest == login.observation_digest else item
+        for item in raw.transport_observations.observations
+    )
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+def _append_login_protocol_stage(raw: ProviderRawBatch) -> ProviderRawBatch:
+    login = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
+    )
+    values = login.model_dump(mode="python")
+    values.update(protocol_stage=ProtocolStage.OPERATION, end_marker_seen=False)
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    extra = TransportObservationProjection.model_validate(values)
+    observations = (*raw.transport_observations.observations, extra)
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+def _rebind_capture_lineage_kind(
+    raw: ProviderRawBatch, *, source_kind: str, target_kind: str
+) -> ProviderRawBatch:
+    target = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.lineage_kind == source_kind and item.protocol_stage is ProtocolStage.COMPLETE
+    )
+    values = target.model_dump(mode="python")
+    values["lineage_kind"] = target_kind
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    rebound = TransportObservationProjection.model_validate(values)
+    observations = tuple(
+        rebound if item.observation_digest == target.observation_digest else item
+        for item in raw.transport_observations.observations
+    )
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+@pytest.mark.parametrize("full_query_identity", (True, False))
+def test_login_capture_identity_cannot_collide_with_query_namespace(
+    full_query_identity: bool,
+) -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="login capture identity collides with query"):
+        _rebind_login_capture_identity(raw, full_query_identity=full_query_identity)
+
+
+def test_login_capture_identity_and_multiple_login_protocol_stages_are_allowed() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    rebound = _append_login_protocol_stage(raw)
+    login_identities = {
+        (item.refresh_id, item.provider_session_id, item.request_id)
+        for item in rebound.transport_observations.observations
+        if item.lineage_kind == "login_audit"
+    }
+    assert len(login_identities) == 1
+    assert {
+        item.protocol_stage
+        for item in rebound.transport_observations.observations
+        if item.lineage_kind == "login_audit"
+    } == {ProtocolStage.COMPLETE, ProtocolStage.OPERATION}
+
+
+def test_query_complete_cannot_be_reclassified_as_login_audit() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="login capture identity collides with query"):
+        _rebind_capture_lineage_kind(raw, source_kind="query_root", target_kind="login_audit")
+
+
+def test_login_capture_reclassified_as_query_requires_attempt_binding() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="bound to an attempt"):
+        _rebind_capture_lineage_kind(raw, source_kind="login_audit", target_kind="query_root")
+
+
 @pytest.mark.parametrize(
     ("endpoint", "projection_plan_ordinal", "request_id", "page"),
     (
@@ -2176,10 +2313,18 @@ def test_complete_login_audit_is_allowed_without_raw_page_lineage() -> None:
     raw = BaoStockProviderAdapter(
         client=_LoginCompleteAuditClient(), max_attempts=1, min_request_interval_seconds=0
     ).fetch_raw(_provider_request())
-    assert any(
-        item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
+    login = next(
+        item
         for item in raw.transport_observations.observations
+        if item.lineage_kind == "login_audit" and item.protocol_stage is ProtocolStage.COMPLETE
     )
+    query = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.lineage_kind == "query_root" and item.protocol_stage is ProtocolStage.COMPLETE
+    )
+    assert login.provider_session_id == query.provider_session_id
+    assert login.request_id != query.request_id
 
 
 @pytest.mark.parametrize(
@@ -2309,6 +2454,13 @@ def test_capture_registry_active_relogin_and_multipage_kinds_are_scope_authorita
     assert any(
         item.lineage_kind == "login_audit" and item.plan_ordinal == 1 for item in observations
     )
+    login_scopes = {
+        (item.provider_session_id, item.request_id)
+        for item in observations
+        if item.lineage_kind == "login_audit"
+    }
+    assert len({session_id for session_id, _ in login_scopes}) >= 2
+    assert len({request_id for _, request_id in login_scopes}) >= 2
     pages = [
         item
         for item in observations
