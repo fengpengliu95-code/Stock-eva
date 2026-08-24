@@ -4,7 +4,7 @@
 **Date:** 2026-08-24 (Asia/Shanghai)
 **Status:** **SPEC READY / IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO** — this revision closes independent-review findings; no implementation or real provider window has run
 **Decision authority:** User-authorized offline specification only. Real canary, credentials, account/points, cost/terms acceptance and the 20-session window require a separate explicit external authorization.
-**Baseline:** clean worktree at `428e890e35b7cedfd45efa810309032e1c7c10e6`; this document is a planning artifact and does not claim implementation, provider qualification or R2-F3 GO.
+**Historical R2-F2 baseline reference:** `428e890e35b7cedfd45efa810309032e1c7c10e6`; it is not the current HEAD or an R2-F3 implementation base. This document is a planning artifact and does not claim implementation, provider qualification or R2-F3 GO.
 **Scope:** R2-F3 Tasks 10–13: provider registry, explicit-canary adapters, complete-session normalization/reconciliation, and isolated shadow scheduling/reporting.
 
 **Review remediation:** This revision is documentation-only remediation for independent review
@@ -24,7 +24,7 @@ BaoStock primary -> Normalize -> Quality Gate -> Immutable Parquet -> SHA-256
                          +-- independent shadow evidence/candidate/reconciliation report
 ```
 
-The current R2-F2 contracts are deliberately BaoStock-only at this baseline:
+The historical R2-F2 contracts were deliberately BaoStock-only at that baseline:
 
 - `backend/app/market/providers/base.py::ProviderId` admits only `baostock`, and
   `provider_registry()` rejects any other value.
@@ -189,6 +189,10 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   It MUST read the plan, every evidence attempt ref, every terminal report ordinal and the
   evidence/candidate manifests, then assert exact endpoint/endpoint-class/request/page identity,
   order/count/row/hash equality. Any fake digest or field mismatch MUST rollback both CAS updates.
+- FR-30: Every terminal-attestation INSERT MUST use the deterministic ShadowRegistry writer
+  bootstrap, which registers the allowlisted canonical-JSON UDF and authorizer before migrations.
+  The trigger MUST call the UDF for all four canonical preimage blobs; an unregistered raw SQLite
+  write MUST fail closed with `OperationalError`, and reader connections MUST be query-only.
 
 ## Non-Functional Requirements
 
@@ -415,6 +419,13 @@ values, every endpoint/endpoint-class/request/page identity is exact and ordered
 digest, endpoint/request/page/count/row/content-hash mismatch rolls back without version changes.
 An attestation referencing an `evidence_ready` report (even with matching object hashes) is
 rejected; only a `success` report with `report_version >= 2` and terminal attempt identity passes.
+
+### AC-20: Registered terminal writer only (FR-30)
+
+Given a raw SQLite connection without the frozen UDF or a reader/query-only connection
+When it attempts a terminal attestation INSERT
+Then SQLite fails closed before mutation; the registered ShadowRegistry terminal writer alone can
+insert after the UDF, authorizer, digest and terminal-session gates pass.
 
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 
@@ -705,6 +716,8 @@ ShadowTerminalAttestation:
   attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
   session_report_id, session_report_version, attempt_ordinal_closure_sha256, request_plan_sha256,
   completion_sha256, report_digest_sha256, evidence_sha256, candidate_sha256,
+  request_plan_canonical_json, completion_canonical_json,
+  attempt_ordinal_closure_canonical_json, report_digest_canonical_json,
   terminal_outcome(success), immutable_version
   # immutable relation graph; exactly one per provider/job/window/session
 ```
@@ -724,7 +737,8 @@ request has `ordinal,request_id,endpoint,endpoint_class,final_attempt_id,final_o
 and each page ref has `ordinal,page_identity,object_ref,content_sha256,row_count`; and
 `attempt_ordinal_closure_sha256` covers the exact ordered ordinal set plus
 `ordinal,attempt_id,endpoint,endpoint_class,request_id,page_identities,page_refs,page_count,
-row_count,page_hashes`. The source of truth is respectively the immutable request plan, the
+row_count,page_hashes`; `report_digest_sha256` covers `session_report_id,report_version,reports[]`,
+where each report has `report_id,attempt_id,ordinal,outcome,report_sha256`. The source of truth is respectively the immutable request plan, the
 committed evidence completion/manifest, and the evidence attempt refs joined to terminal reports.
 The validator recomputes all three and compares them with the evidence manifest, candidate
 manifest, session report and attestation before either state CAS.
@@ -889,6 +903,7 @@ mutating the canonical root. Re-enabling requires a new reviewed contract/terms 
 | FR-24–FR-27, H2/H8 | complete success graph, all-outcome sanitized reports, exact logical-request closure and qualification transaction | Task11/13 missing/unreadable/hash-mismatch, four outcome exclusion, multi-request/page, full transaction/crash/recovery probes |
 | FR-28, H/M lifecycle | evidence_ready → candidate → terminal attestation → completed/qualified state machine | Task11 evidence-ready, Task12 candidate-pending, Task13 attestation, direct-bypass and stale/crash rollback probes |
 | FR-29, terminal closure | canonical plan/completion/ordinal digests and exact page graph | Task13 recomputation, fake-digest and endpoint/request/page/count/row/content-hash rollback probes |
+| FR-30, terminal write gate | registered canonical-JSON UDF, authorizer and query-only reader | registered legal transaction, raw unregistered INSERT, reader write and missing-terminal-report probes |
 | NFR-3–NFR-6, H7, storage table | hash/CAS/dirfd/root/SQLite contract | storage/concurrency/TOCTOU/read-only fingerprints |
 | M2 | golden R2-F2 manifest/evidence/candidate/selection/GET byte/hash/reader fixtures | named regression in every Task 10–13 focused command and independent review |
 | NFR-9 | compatibility matrix and AC-10 | old manifest/hash/selection/GET byte and semantic regression |

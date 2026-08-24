@@ -3,7 +3,7 @@
 **Author:** Codex delivery team — implementation-plan owner
 **Date:** 2026-08-24 (Asia/Shanghai)
 **Status:** **SPEC READY / IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO** — documentation-only remediation; no Task 10–13 implementation or real provider window is claimed
-**Exact planning base:** 428e890e35b7cedfd45efa810309032e1c7c10e6, clean in worktree codex/r2-f3-shadow-bakeoff
+**Historical R2-F2 baseline reference:** 428e890e35b7cedfd45efa810309032e1c7c10e6; not the current HEAD and not the current R2-F3 implementation base. The current document lineage is carried by its review commits.
 **Design authority:** [R2-F3 Shadow Provider Bake-off Design](2026-08-24-stock-eva-r2f3-shadow-bakeoff-design.md)
 **Parent authority:** [R2-F roadmap](2026-08-12-stock-eva-r2f-data-reliability-roadmap.md), [R2-F implementation](2026-08-12-stock-eva-r2f-data-reliability-implementation.md), [R2-F2 design](2026-08-21-stock-eva-r2f2-provider-evidence-design.md), and [R2-F2 implementation](2026-08-21-stock-eva-r2f2-provider-evidence-implementation.md)
 
@@ -205,6 +205,98 @@ discovered -> canary -> shadow -> qualified
 canary/shadow/qualified -> quarantined
 quarantined -> canary only after a new reviewed version
 ~~~
+
+### Deterministic terminal UDF/bootstrap contract
+
+The terminal attestation gate is not a writer-only convention. Every writable registry connection
+is constructed by `ShadowRegistryTerminalWriter.open()` in this exact order: (1) open the bounded
+descriptor-bound DB and verify its regular-file fingerprint, (2) register
+`shadow_sha256_canonical_json(domain TEXT, canonical_json BLOB) -> TEXT` and
+`shadow_validate_terminal_graph(request_plan_json BLOB, request_plan_sha256 TEXT,
+completion_json BLOB, completion_sha256 TEXT, closure_json BLOB, closure_sha256 TEXT,
+report_json BLOB, report_sha256 TEXT) -> INTEGER`, both deterministic, (3) install the
+role-aware authorizer, (4) set `foreign_keys=ON`, `journal_mode=DELETE`, `synchronous=FULL` and
+bounded busy timeout, and only then (5) run migrations/transactions. No payload, token or URL is
+logged by either UDF and neither UDF performs network or filesystem I/O.
+
+This is the executable reference algorithm used by the UDFs:
+
+~~~python
+import hashlib, json, sqlite3, unicodedata
+
+_DOMAINS = {
+    "request-plan": {"job_id", "provider_id", "window_id", "requests"},
+    "completion": {"job_id", "provider_id", "window_id", "session_id", "evidence_id",
+                    "request_plan_sha256", "requests"},
+    "attempt-ordinal-closure": {"exact_ordinal_set", "ordinals"},
+    "report-digest": {"session_report_id", "report_version", "reports"},
+}
+_PREFIX = {d: f"stock-eva/r2f3/{d}/v1\\n".encode() for d in _DOMAINS}
+
+def _nfc(value):
+    if isinstance(value, str): return unicodedata.normalize("NFC", value)
+    if isinstance(value, list): return [_nfc(v) for v in value]
+    if isinstance(value, dict): return {k: _nfc(v) for k, v in value.items()}
+    return value
+
+def _canonical(domain, raw):
+    if domain not in _DOMAINS or not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError("invalid canonical-json input")
+    raw = bytes(raw)
+    obj = json.loads(raw.decode("utf-8"))
+    if not isinstance(obj, dict) or set(obj) != _DOMAINS[domain] or any(v is None for v in obj.values()):
+        raise ValueError("wrong field set or nullable success value")
+    canonical = (json.dumps(_nfc(obj), ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":")) + "\\n").encode("utf-8")
+    if canonical != raw:
+        raise ValueError("non-canonical bytes")
+    return canonical
+
+def shadow_sha256_canonical_json(domain, canonical_json):
+    return hashlib.sha256(_PREFIX[domain] + _canonical(domain, canonical_json)).hexdigest()
+
+def shadow_validate_terminal_graph(plan_json, plan_sha, completion_json, completion_sha,
+                                   closure_json, closure_sha, report_json, report_sha):
+    try:
+        values = (("request-plan", plan_json, plan_sha), ("completion", completion_json, completion_sha),
+                  ("attempt-ordinal-closure", closure_json, closure_sha),
+                  ("report-digest", report_json, report_sha))
+        return int(all(shadow_sha256_canonical_json(d, b) == h for d, b, h in values))
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        return 0
+
+TERMINAL_TABLES = frozenset({"shadow_attempt_report", "session_report", "shadow_terminal_attestation"})
+WRITE_ACTIONS = frozenset({sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+                           sqlite3.SQLITE_ALTER_TABLE, sqlite3.SQLITE_DROP_TABLE})
+
+def shadow_authorizer(role):
+    def authorize(action, arg1, arg2, dbname, source):
+        if action in WRITE_ACTIONS and (role == "reader" or
+                                        (arg1 in TERMINAL_TABLES and role != "terminal_writer")):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    return authorize
+
+def open_shadow_registry(role, path):
+    conn = sqlite3.connect(path)
+    conn.create_function("shadow_sha256_canonical_json", 2, shadow_sha256_canonical_json,
+                         deterministic=True)
+    conn.create_function("shadow_validate_terminal_graph", 8, shadow_validate_terminal_graph,
+                         deterministic=True)
+    conn.set_authorizer(shadow_authorizer(role))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
+    if role == "reader": conn.execute("PRAGMA query_only=ON")
+    return conn
+~~~
+
+The four BLOB columns on `shadow_terminal_attestation` preserve these exact canonical bytes. The
+single `terminal_attestation_gate` INSERT trigger calls `shadow_validate_terminal_graph` and then
+checks terminal-session identity and evidence/candidate hashes. A raw SQLite connection that did
+not register the UDF receives `OperationalError: no such function: shadow_validate_terminal_graph`
+before mutation. A reader is additionally denied by `query_only` and the authorizer; only the
+terminal-writer role can write the three terminal tables.
 
 failover_enabled is not a Task 10 state. SQLite initialization/migration is explicit and writer
 owned in the independent local registry DB. provider_shadow_root is independent from
@@ -518,6 +610,10 @@ CREATE TABLE shadow_terminal_attestation (
   candidate_id TEXT NOT NULL,
   session_report_id TEXT NOT NULL,
   session_report_version INTEGER NOT NULL CHECK (session_report_version >= 1),
+  request_plan_canonical_json BLOB NOT NULL CHECK (length(request_plan_canonical_json) <= 1048576),
+  completion_canonical_json BLOB NOT NULL CHECK (length(completion_canonical_json) <= 1048576),
+  attempt_ordinal_closure_canonical_json BLOB NOT NULL CHECK (length(attempt_ordinal_closure_canonical_json) <= 1048576),
+  report_digest_canonical_json BLOB NOT NULL CHECK (length(report_digest_canonical_json) <= 1048576),
   attempt_ordinal_closure_sha256 TEXT NOT NULL CHECK (length(attempt_ordinal_closure_sha256) = 64),
   request_plan_sha256 TEXT NOT NULL CHECK (length(request_plan_sha256) = 64),
   completion_sha256 TEXT NOT NULL CHECK (length(completion_sha256) = 64),
@@ -578,9 +674,15 @@ BEGIN
   ) THEN RAISE(ABORT, 'success_requires_terminal_attempt') END;
 END;
 
-CREATE TRIGGER terminal_attestation_requires_terminal_session
+CREATE TRIGGER terminal_attestation_gate
 BEFORE INSERT ON shadow_terminal_attestation
 BEGIN
+  SELECT CASE WHEN shadow_validate_terminal_graph(
+    NEW.request_plan_canonical_json, NEW.request_plan_sha256,
+    NEW.completion_canonical_json, NEW.completion_sha256,
+    NEW.attempt_ordinal_closure_canonical_json, NEW.attempt_ordinal_closure_sha256,
+    NEW.report_digest_canonical_json, NEW.report_digest_sha256
+  ) <> 1 THEN RAISE(ABORT, 'terminal_digest_mismatch') END;
   SELECT CASE WHEN NOT EXISTS (
     SELECT 1 FROM session_report s
      WHERE s.session_report_id=NEW.session_report_id AND s.provider_id=NEW.provider_id
@@ -588,11 +690,6 @@ BEGIN
        AND s.report_version=NEW.session_report_version AND s.outcome='success'
        AND s.terminal_attestation_id=NEW.attestation_id
   ) THEN RAISE(ABORT, 'attestation_requires_terminal_success_session') END;
-END;
-
-CREATE TRIGGER terminal_attestation_hash_match
-BEFORE INSERT ON shadow_terminal_attestation
-BEGIN
   SELECT CASE WHEN NOT EXISTS (
     SELECT 1 FROM shadow_evidence_ref e
      WHERE e.evidence_id=NEW.evidence_id AND e.provider_id=NEW.provider_id
@@ -728,16 +825,58 @@ before eligibility is true:
 
 ```text
 BEGIN IMMEDIATE;
+SELECT job_id, provider_id, window_id, state_version, lease_owner
+  FROM shadow_job
+ WHERE job_id=:job_id AND provider_id=:provider_id AND window_id=:window_id
+   AND run_status='leased' AND state_version=:expected_job_state_version;
+-- exactly one row is required; otherwise ROLLBACK
+SELECT provider_id, window_id, state_version
+  FROM qualification_window
+ WHERE provider_id=:provider_id AND window_id=:window_id
+   AND state_version=:expected_window_state_version;
+-- exactly one row is required; otherwise ROLLBACK
+FOR each ordinal in the immutable plan exact_ordinal_set:
+INSERT INTO shadow_attempt_report (
+  attempt_id, report_id, job_id, provider_id, window_id, session_id, request_id,
+  endpoint, endpoint_class, logical_request_ordinal, attempt_number, version_vector_sha256,
+  outcome, started_at, completed_at, coverage_expected, coverage_observed, request_count,
+  retry_count, rate_limit_count, failure_class, page_identities_json, page_count, row_count,
+  terminal_marker, durable_report_ref, report_sha256, evidence_refs_json, evidence_id,
+  evidence_sha256, candidate_sha256, terminal_session_report_id, state_version
+) VALUES (
+  :attempt_id, :report_id, :job_id, :provider_id, :window_id, :session_id, :request_id,
+  :endpoint, :endpoint_class, :logical_request_ordinal, :attempt_number, :version_vector_sha256,
+  'success', :started_at, :completed_at, :coverage_expected, :coverage_observed, :request_count,
+  :retry_count, :rate_limit_count, :failure_class, :page_identities_json, :page_count, :row_count,
+  1, :durable_report_ref, :report_sha256, :evidence_refs_json, :evidence_id,
+  :evidence_sha256, :candidate_sha256, :session_report_id, :attempt_state_version
+);
+END FOR;
+INSERT INTO session_report (
+  session_report_id, provider_id, job_id, window_id, session_id, successful_attempt_id,
+  evidence_id, candidate_id, terminal_attestation_id, report_version, trade_date, outcome,
+  calendar_generation, calendar_sha256, universe_sha256, version_vector_sha256, evidence_sha256,
+  candidate_sha256, report_ref, report_sha256, state_version
+) VALUES (
+  :session_report_id, :provider_id, :job_id, :window_id, :session_id, :primary_attempt_id,
+  :evidence_id, :candidate_id, :attestation_id, :terminal_report_version, :trade_date, 'success',
+  :calendar_generation, :calendar_sha256, :universe_sha256, :version_vector_sha256,
+  :evidence_sha256, :candidate_sha256, :report_ref, :report_sha256, :session_state_version
+);
 CALL `terminal_graph_validator` with the exact plan, refs, terminal reports and proposed
 attestation values; a mismatch executes ROLLBACK before any insert or CAS;
 INSERT INTO shadow_terminal_attestation (
   attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
-  session_report_id, session_report_version, attempt_ordinal_closure_sha256,
+  session_report_id, session_report_version, request_plan_canonical_json,
+  completion_canonical_json, attempt_ordinal_closure_canonical_json, report_digest_canonical_json,
+  attempt_ordinal_closure_sha256,
   request_plan_sha256, completion_sha256, report_digest_sha256, evidence_sha256,
   candidate_sha256, terminal_outcome, immutable_version
 ) VALUES (
   :attestation_id, :provider_id, :job_id, :window_id, :session_id, :evidence_id, :candidate_id,
-  :session_report_id, :session_report_version, :attempt_ordinal_closure_sha256,
+  :session_report_id, :session_report_version, :request_plan_canonical_json,
+  :completion_canonical_json, :attempt_ordinal_closure_canonical_json, :report_digest_canonical_json,
+  :attempt_ordinal_closure_sha256,
   :request_plan_sha256, :completion_sha256, :report_digest_sha256, :evidence_sha256,
   :candidate_sha256, :terminal_outcome, :immutable_version
 );
@@ -848,6 +987,9 @@ sanitized report, immutable evidence bundle and `ShadowEvidenceAttemptRef` rows,
 job to that state under CAS), and creates no terminal attestation. It is valid evidence, not a
 qualification result. Task 12 reads that evidence, normalizes/reconciles it and writes the complete
 candidate/quality bundle and `ShadowCandidateRef`; it still does not complete the job/window.
+An `evidence_ready` report/session is immutable: Task 13 MUST NOT update it in place or change its
+outcome/version. It inserts new terminal attempt rows linked to a new `session_report` with
+`report_version >= 2`, and only that new terminal identity may carry the attestation FK.
 Task 13 reruns the terminal validator, creates a new immutable terminal `ShadowAttemptReport` /
 `session_report` version with candidate IDs/hashes, inserts exactly one
 `ShadowTerminalAttestation`, then in the same transaction CAS-updates job to `completed` and the
@@ -879,6 +1021,8 @@ stored. The exact field lists are:
 * ordinal closure: exact sorted ordinal set and each
   `ordinal,attempt_id,endpoint,endpoint_class,request_id,page_identities,page_refs,page_count,
   row_count,page_hashes`.
+* report digest: `session_report_id,report_version,reports[]`; each report:
+  `report_id,attempt_id,ordinal,outcome,report_sha256`.
 
 The plan digest comes from the immutable request plan; completion comes from the committed evidence
 completion and manifest; ordinal closure comes from evidence attempt refs joined to terminal report
@@ -972,12 +1116,16 @@ closure, evidence, candidate = terminal_graph_validator(
 )
 INSERT INTO shadow_terminal_attestation (
   attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
-  session_report_id, session_report_version, attempt_ordinal_closure_sha256,
+  session_report_id, session_report_version, request_plan_canonical_json,
+  completion_canonical_json, attempt_ordinal_closure_canonical_json, report_digest_canonical_json,
+  attempt_ordinal_closure_sha256,
   request_plan_sha256, completion_sha256, report_digest_sha256, evidence_sha256,
   candidate_sha256, terminal_outcome, immutable_version
 ) VALUES (
   :attestation_id, :provider_id, :job_id, :window_id, :session_id, :evidence_id, :candidate_id,
-  :session_report_id, :session_report_version, :attempt_ordinal_closure_sha256,
+  :session_report_id, :session_report_version, :request_plan_canonical_json,
+  :completion_canonical_json, :attempt_ordinal_closure_canonical_json, :report_digest_canonical_json,
+  :attempt_ordinal_closure_sha256,
   :request_plan_sha256, :completion_sha256, :report_digest_sha256, :evidence_sha256,
   :candidate_sha256, :terminal_outcome, :immutable_version
 );
@@ -1393,6 +1541,10 @@ def test_terminal_graph_rejects_fake_digest_and_endpoint_class_request_page_coun
 def test_fake_attestation_from_evidence_ready_session_is_rejected(tmp_path): ...
 def test_each_terminal_attestation_digest_mismatch_rolls_back_job_and_window_versions(tmp_path): ...
 def test_legal_terminal_success_report_version_and_attestation_pass(tmp_path): ...
+def test_registered_udf_legal_terminal_transaction_is_executable(tmp_path): ...
+def test_raw_connection_without_terminal_udf_fails_operational_error(tmp_path): ...
+def test_reader_authorizer_and_query_only_reject_terminal_write(tmp_path): ...
+def test_missing_terminal_report_cannot_attach_attestation(tmp_path): ...
 ~~~
 
 Run RED:
