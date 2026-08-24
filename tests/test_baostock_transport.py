@@ -217,17 +217,32 @@ class PartialSendSocket:
 
 
 def test_upstream_send_msg_accepts_partial_send_while_patch_must_use_sendall() -> None:
+    import importlib.util
+
     import baostock.common.contants as constants
     import baostock.common.context as context
     import baostock.data.messageheader as messageheader
     import baostock.util.socketutil as socketutil
+
+    # Earlier characterization tests intentionally install the production
+    # transport patch globally. Load the pinned SDK source under an isolated
+    # module name so this assertion always exercises pristine upstream
+    # ``send()``, without restoring or uninstalling the checked patch.
+    source_path = socketutil.__file__
+    assert source_path is not None
+    spec = importlib.util.spec_from_file_location(
+        "_stock_eva_pristine_baostock_socketutil", source_path
+    )
+    assert spec is not None and spec.loader is not None
+    pristine_socketutil = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pristine_socketutil)
 
     response = messageheader.to_message_header("01", 2).encode() + b"ok" + b"<![CDATA[]]>\n"
     connection = PartialSendSocket(response)
     previous = getattr(context, "default_socket", None)
     context.default_socket = connection
     try:
-        assert socketutil.send_msg("request") == response.decode()
+        assert pristine_socketutil.send_msg("request") == response.decode()
     finally:
         context.default_socket = previous
 
