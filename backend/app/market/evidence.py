@@ -378,6 +378,10 @@ class EvidenceManifest(_Immutable):
 
     @model_validator(mode="after")
     def validate_counts(self) -> EvidenceManifest:
+        if self.adapter_version != R2F2_ADAPTER_VERSION:
+            raise ValueError("unknown evidence adapter version")
+        if self.endpoint_contract_version != R2F2_ENDPOINT_CONTRACT_VERSION:
+            raise ValueError("unknown evidence endpoint contract version")
         if self.request_plan_hash != self.logical_request_plan.request_plan_hash:
             raise ValueError("evidence request plan hash mismatch")
         if self.request_plan_hash != self.logical_request_plan.compute_hash():
@@ -447,6 +451,7 @@ class PublishedEvidence(_Immutable):
     descriptors: tuple[EvidenceObjectDescriptor, ...]
     reader_identity: SafeSha256
     _reader: EvidenceReader | None = PrivateAttr(default=None)
+    _closed: bool = PrivateAttr(default=False)
 
     def bind_reader(self, reader: EvidenceReader) -> PublishedEvidence:
         """Bind this immutable projection to the reader that verified its bytes."""
@@ -454,6 +459,8 @@ class PublishedEvidence(_Immutable):
         return self
 
     def read_rows(self) -> tuple[dict[str, Any], ...]:
+        if self._closed:
+            raise EvidenceError("published evidence reader is closed", "EVIDENCE_ROOT_UNAVAILABLE")
         reader = self._reader
         if reader is None:
             raise EvidenceError(
@@ -462,6 +469,9 @@ class PublishedEvidence(_Immutable):
         return reader.read_rows(self)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        object.__setattr__(self, "_closed", True)
         reader = self._reader
         if reader is not None:
             reader.close()
@@ -928,12 +938,98 @@ class EvidenceReader:
             if actual != expected:
                 raise EvidenceError("descriptor typed graph mismatch", "EVIDENCE_MANIFEST_INVALID")
 
+            completion = manifest.request_completions[descriptor.plan_ordinal]
+            if completion.successful_attempt is None:
+                raise EvidenceError(
+                    "descriptor has no successful attempt", "EVIDENCE_MANIFEST_INVALID"
+                )
+            final = next(
+                item
+                for item in completion.attempts
+                if item.attempt == completion.successful_attempt
+            )
+            expected_page_request = dict(final.page_request_ids).get(descriptor.page)
+            if (
+                descriptor.attempt != final.attempt
+                or descriptor.root_request_id != final.root_request_id
+                or descriptor.provider_session_id != final.provider_session_id
+                or descriptor.page_request_id != expected_page_request
+            ):
+                raise EvidenceError(
+                    "descriptor completion join mismatch", "EVIDENCE_MANIFEST_INVALID"
+                )
+            if manifest.transport_observations is None:
+                raise EvidenceError(
+                    "descriptor observations are missing", "EVIDENCE_MANIFEST_INVALID"
+                )
+            matching_lineage = tuple(
+                item
+                for item in manifest.transport_lineage
+                if (
+                    item.refresh_id == descriptor.refresh_id
+                    and item.provider_session_id == descriptor.provider_session_id
+                    and item.root_request_id == descriptor.root_request_id
+                    and item.page_request_id == descriptor.page_request_id
+                    and item.endpoint == descriptor.endpoint
+                    and item.plan_ordinal == descriptor.plan_ordinal
+                    and item.attempt == descriptor.attempt
+                    and item.page == descriptor.page
+                    and item.observation_digest == descriptor.transport_observation_digest
+                )
+            )
+            matching_observation = tuple(
+                item
+                for item in manifest.transport_observations.observations
+                if (
+                    item.refresh_id == descriptor.refresh_id
+                    and item.provider_session_id == descriptor.provider_session_id
+                    and item.request_id == descriptor.page_request_id
+                    and item.endpoint == descriptor.endpoint
+                    and item.plan_ordinal == descriptor.plan_ordinal
+                    and item.attempt == descriptor.attempt
+                    and item.page == descriptor.page
+                    and item.protocol_stage.value == "complete"
+                    and item.outcome.value == "success"
+                    and item.end_marker_seen
+                    and item.observation_digest == descriptor.transport_observation_digest
+                )
+            )
+            if len(matching_lineage) != 1 or len(matching_observation) != 1:
+                raise EvidenceError(
+                    "descriptor lineage join is not one-to-one", "EVIDENCE_MANIFEST_INVALID"
+                )
+
+        raw_descriptors = tuple(
+            item
+            for item in manifest.objects
+            if item.object_kind is EvidenceObjectKind.RAW_ENDPOINT_PAGE
+        )
+        if len(manifest.transport_lineage) != len(raw_descriptors) or len(
+            {
+                (
+                    item.refresh_id,
+                    item.provider_session_id,
+                    item.root_request_id,
+                    item.page_request_id,
+                    item.endpoint,
+                    item.plan_ordinal,
+                    item.attempt,
+                    item.page,
+                    item.observation_digest,
+                )
+                for item in manifest.transport_lineage
+            }
+        ) != len(raw_descriptors):
+            raise EvidenceError("lineage cardinality mismatch", "EVIDENCE_MANIFEST_INVALID")
+
     def read_rows(
         self,
         evidence: PublishedEvidence,
         descriptor: EvidenceObjectDescriptor | None = None,
     ) -> tuple[dict[str, Any], ...]:
         """Read descriptor-bound pages, or one page for the legacy test helper."""
+        if evidence._closed:
+            raise EvidenceError("published evidence reader is closed", "EVIDENCE_ROOT_UNAVAILABLE")
         if descriptor is None:
             owns_fd = self._held_root_fd is None
             if owns_fd:
@@ -1153,13 +1249,12 @@ class EvidenceReader:
             compare_adapter_version is not None
             and compare_adapter_version != manifest.adapter_version
         ):
-            if compare_semantic_sha is None:
-                return ReplayResult(
-                    status="error",
-                    evidence_id=evidence_id,
-                    row_count=0,
-                    failure_class="REPLAY_NONDETERMINISTIC",
-                )
+            return ReplayResult(
+                status="error",
+                evidence_id=evidence_id,
+                row_count=0,
+                failure_class="REPLAY_NONDETERMINISTIC",
+            )
         try:
             evidence.read_rows()
             if factor_cache is not None:
@@ -1415,6 +1510,22 @@ class EvidenceStore:
             factor_manifest, factor_descriptor, factor_payload = self._build_factor_snapshot(
                 factor_records, capture_id=capture_id
             )
+            expected_keys = {
+                f"{row.symbol}.{row.trade_date.isoformat()}" for row in factor_records.rows
+            }
+            binding_keys = tuple(
+                binding.cache.record_key
+                for binding in factor_resolution
+                if binding.cache is not None
+            )
+            if (
+                len(binding_keys) != len(factor_resolution)
+                or len(binding_keys) != len(set(binding_keys))
+                or set(binding_keys) != expected_keys
+            ):
+                raise EvidenceError(
+                    "factor resolution cardinality is not exact", "EVIDENCE_MANIFEST_INVALID"
+                )
             if len(factor_payload) > self.max_object_bytes:
                 raise EvidenceError("factor object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
             factor_snapshot = PublishedFactorCacheSnapshot(
@@ -1438,6 +1549,21 @@ class EvidenceStore:
                 }:
                     raise EvidenceError(
                         "factor resolution record key is unbound", "EVIDENCE_MANIFEST_INVALID"
+                    )
+                selected = next(
+                    row
+                    for row in factor_records.rows
+                    if f"{row.symbol}.{row.trade_date.isoformat()}" == cache.record_key
+                )
+                selected_data = selected.model_dump(mode="python")
+                if (
+                    binding.symbol != selected.symbol
+                    or binding.trade_date != selected.trade_date
+                    or binding.selected_value_semantic_hash
+                    != _factor_value_semantic_hash(selected_data)
+                ):
+                    raise EvidenceError(
+                        "factor selected value binding is invalid", "EVIDENCE_HASH_MISMATCH"
                     )
         for item in batch.endpoint_batches:
             fields = tuple(item.fields)

@@ -89,7 +89,6 @@ def publish_provider_evidence(
     raw_batch,
     *,
     evidence_root: Path,
-    adapter: object | None = None,
 ) -> tuple[EvidenceManifest, PublishedEvidence]:
     """Publish and immediately reopen one validated provider batch.
 
@@ -100,16 +99,6 @@ def publish_provider_evidence(
     store = EvidenceStore(evidence_root)
     manifest = store.publish(raw_batch)
     evidence = store.read(manifest.evidence_id)
-    if adapter is not None:
-        normalize = getattr(adapter, "normalize", None)
-        if not callable(normalize):
-            raise ProviderHealthError("typed evidence adapter is required")
-        normalized = normalize(
-            evidence,
-            normalization_clock_utc=manifest.normalization_clock_utc,
-        )
-        if not isinstance(normalized, (tuple, PublishedEvidence)):
-            raise ProviderHealthError("evidence adapter returned an invalid type")
     return manifest, evidence
 
 
@@ -122,8 +111,7 @@ def publish_provider_evidence_with_factor_cache(
     trade_date: date,
     lock_path: Path,
     factor_resolution=(),
-    factor_resolution_factory: Callable[[object], tuple] | None = None,
-    adapter: object | None = None,
+    factor_resolution_factory: Callable[[object, object], tuple] | None = None,
     _lock_held: bool = False,
 ) -> tuple[EvidenceManifest, PublishedEvidence]:
     """Capture factors and publish evidence under the existing refresh lock only."""
@@ -150,7 +138,7 @@ def publish_provider_evidence_with_factor_cache(
             records, capture_id=capture_id
         )
         binding = factor_resolution or (
-            factor_resolution_factory(factor_manifest)
+            factor_resolution_factory(records, factor_manifest)
             if factor_resolution_factory is not None
             else getattr(raw_batch, "factor_resolution", ())
         )
@@ -163,16 +151,6 @@ def publish_provider_evidence_with_factor_cache(
             factor_resolution=tuple(binding),
         )
         evidence = factor_store.read(manifest.evidence_id)
-        if adapter is not None:
-            normalize = getattr(adapter, "normalize", None)
-            if not callable(normalize):
-                raise ProviderHealthError("typed evidence adapter is required")
-            normalized = normalize(
-                evidence,
-                normalization_clock_utc=manifest.normalization_clock_utc,
-            )
-            if not isinstance(normalized, (tuple, PublishedEvidence)):
-                raise ProviderHealthError("evidence adapter returned an invalid type")
         return manifest, evidence
 
 
@@ -186,7 +164,7 @@ def run_canonical_raw_refresh(
     factor_symbols: tuple[str, ...] = (),
     trade_date: date | None = None,
     factor_resolution=(),
-    factor_resolution_factory: Callable[[object], tuple] | None = None,
+    factor_resolution_factory: Callable[[object, object], tuple] | None = None,
     _lock_held: bool = False,
     validate_batch: Callable[[object], None] | None = None,
 ) -> tuple[EvidenceManifest, PublishedEvidence, tuple[object, ...]]:
@@ -220,14 +198,12 @@ def run_canonical_raw_refresh(
                 lock_path=lock_path,
                 factor_resolution=factor_resolution,
                 factor_resolution_factory=factor_resolution_factory,
-                adapter=adapter,
                 _lock_held=True,
             )
         else:
             manifest, evidence = publish_provider_evidence(
                 batch,
                 evidence_root=evidence_root,
-                adapter=adapter,
             )
         normalized = adapter.normalize(
             evidence,
@@ -376,22 +352,24 @@ def canonical_refresh_callback(
                 raise ProviderHealthError("canonical universe changed during raw refresh")
 
         def factor_bindings(
+            records: object,
             _factor_manifest: EvidenceManifest,
         ) -> tuple[FactorResolutionBinding, ...]:
-            rows = factor_cache.exact_snapshot_records(main_symbols, trade_date)
+            rows = records.rows
             bindings = []
             for ordinal, row in enumerate(rows):
+                row_data = row.model_dump(mode="python")
                 cache = CacheFactorResolution(
                     cache_object_id=_factor_manifest.object_id,
                     cache_object_sha256=_factor_manifest.object_sha256,
-                    record_key=f"{row['symbol']}.{row['trade_date']}",
+                    record_key=f"{row_data['symbol']}.{row_data['trade_date']}",
                 )
                 values = {
                     "plan_ordinal": ordinal,
-                    "symbol": row["symbol"],
-                    "trade_date": date.fromisoformat(str(row["trade_date"])),
+                    "symbol": row_data["symbol"],
+                    "trade_date": date.fromisoformat(str(row_data["trade_date"])),
                     "selected_kind": "factor_cache_snapshot",
-                    "selected_value_semantic_hash": _factor_value_semantic_hash(row),
+                    "selected_value_semantic_hash": _factor_value_semantic_hash(row_data),
                     "live": None,
                     "cache": cache,
                 }
