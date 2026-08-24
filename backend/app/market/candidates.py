@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from backend.app.market.baostock import _is_main_board
 from backend.app.market.evidence import (
     EvidenceError,
     PublishedEvidence,
@@ -1192,6 +1193,12 @@ def _durable_universe(
         return values
 
     all_stock = unique_codes(by_endpoint.get(ProviderEndpoint.ALL_STOCK, []))
+    all_stock_rows = by_endpoint.get(ProviderEndpoint.ALL_STOCK, [])
+    for row, code in zip(all_stock_rows, all_stock, strict=True):
+        if not _is_main_board(code):
+            raise ValueError("provider all-stock universe contains a non-main-board symbol")
+        if row.get("tradeStatus") != "1":
+            raise ValueError("provider all-stock universe contains a non-trading symbol")
     requests = evidence.manifest.logical_request_plan.requests
     plan_stock = tuple(requests[1].symbols)
     if tuple(all_stock) != plan_stock:

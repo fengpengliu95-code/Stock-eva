@@ -28,7 +28,8 @@ from backend.app.market.candidates import (
 )
 from backend.app.market.evidence import EvidenceError, EvidenceStore, PublishedEvidence
 from backend.app.market.factor_cache import AdjustmentFactorCache
-from backend.app.market.models import DailyBar
+from backend.app.market.models import DailyBar, RefreshResult
+from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import NasMarketStore
@@ -354,19 +355,120 @@ def _normalized_payload() -> bytes:
     ).encode()
 
 
-def _tree_fingerprint(root: Path) -> dict[str, tuple[bytes, int]]:
-    return {
-        str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+@pytest.mark.parametrize(
+    ("code", "trade_status"),
+    (
+        ("sh.300001", "1"),
+        ("sh.600000", "0"),
+        ("sh.600000", "2"),
+        ("sh.600000", ""),
+        ("sh.600000", None),
+    ),
+)
+def test_durable_universe_rejects_non_main_or_nontrading_all_stock_rows(
+    tmp_path,
+    monkeypatch,
+    code,
+    trade_status,
+):
+    from backend.app.market.candidates import _durable_universe
+
+    evidence, _report, _candidate = _real_candidate_bundle(tmp_path)
+    reader = evidence._reader
+    assert reader is not None
+    original = reader.read_rows
+
+    def altered(bound_evidence, descriptor=None):
+        pages = list(original(bound_evidence, descriptor))
+        if descriptor is None:
+            page = dict(pages[0])
+            fields = tuple(page["fields"])
+            row = list(page["rows"][0])
+            row[fields.index("code")] = code
+            row[fields.index("tradeStatus")] = trade_status
+            page["rows"] = (tuple(row),)
+            pages[0] = page
+        return tuple(pages)
+
+    monkeypatch.setattr(reader, "read_rows", altered)
+    with pytest.raises(ValueError, match="universe"):
+        _durable_universe(evidence)
+    evidence.close()
+
+
+def _tree_fingerprint(root: Path) -> tuple[tuple[str, str, bytes, int, int, int], ...]:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        if path.is_symlink():
+            kind = "symlink"
+            content = path.readlink().as_posix().encode()
+        elif path.is_dir():
+            kind = "dir"
+            content = b""
+        else:
+            kind = "file"
+            content = path.read_bytes()
+        entries.append(
+            (
+                str(path.relative_to(root)),
+                kind,
+                content,
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+        )
+    return tuple(entries)
 
 
 def test_legacy_baostock_rows_and_manifests_decode_without_rewrite(tmp_path):
-    evidence, _report, _candidate = _real_candidate_bundle(tmp_path)
-    assert evidence.manifest.provider_id.value == "baostock"
-    assert evidence.read_rows()
-    evidence.close()
+    payload = json.loads((Path(__file__).parent / "fixtures" / "baostock_daily.json").read_text())
+    bars = normalize_baostock_rows(
+        fields=payload["daily_fields"],
+        rows=payload["daily_rows"],
+        factor_fields=payload["factor_fields"],
+        factor_rows=payload["factor_rows"],
+        ingested_at=datetime(2026, 7, 24, 10, tzinfo=UTC),
+    )
+    dataset_root = tmp_path / "legacy-dataset"
+    dataset_root.mkdir()
+    (dataset_root / ".stock-eva-dataset.json").write_text(
+        '{"dataset":"stock-eva-market","schema_version":2}'
+    )
+    (dataset_root / "manifest.json").write_text(
+        '{"dataset":"stock-eva-market","schema_version":2,"generation":"legacy","files":[]}'
+    )
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb"),
+        dataset_root,
+        tmp_path / "staging",
+    )
+    result = RefreshResult(
+        run_id="legacy-fixture",
+        request_key="daily:baostock:2026-07-23:legacy",
+        requested_date=date(2026, 7, 23),
+        source="baostock",
+        status="ready",
+        requested_count=len(bars),
+        succeeded_count=len(bars),
+        coverage_ratio=1,
+        started_at=datetime(2026, 7, 24, 10, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
+    )
+    store.save_refresh(bars, result, publish=True)
+    manifest_path = dataset_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for item in manifest["files"]:
+        item.pop("source", None)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+    before = _tree_fingerprint(dataset_root)
+    rows, columns = store._query(
+        "SELECT symbol, trade_date, source FROM daily_bars ORDER BY symbol"
+    )
+    assert "symbol" in columns and rows
+    assert any(row[0] == "sh.600000" for row in rows)
+    assert _tree_fingerprint(dataset_root) == before
 
 
 def test_new_candidate_references_exact_evidence_universe_and_gate_hashes(tmp_path):
