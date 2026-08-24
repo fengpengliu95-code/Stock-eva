@@ -14,10 +14,11 @@ import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
+from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market.shadow_registry_schema import (
     MIGRATION_ID,
@@ -90,6 +91,30 @@ class QualificationWindow(BaseModel):
     calendar_generation: str
     calendar_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     state_version: int = Field(ge=0)
+
+
+class ConfirmedCalendarSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider_id: ShadowProviderId
+    window_id: str
+    version_vector_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    calendar_generation: str
+    calendar_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_id: str
+    adapter_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reconciliation_policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sessions: tuple[date, ...]
+
+    @model_validator(mode="after")
+    def validate_sessions(self) -> ConfirmedCalendarSnapshot:
+        if tuple(sorted(set(self.sessions))) != self.sessions:
+            raise ValueError("confirmed sessions must be sorted and unique")
+        return self
+
+
+class ConfirmedCalendarReader(Protocol):
+    def read(self, provider_id: str, window_id: str) -> ConfirmedCalendarSnapshot: ...
 
 
 def _authorizer(role: str):
@@ -176,28 +201,66 @@ class ShadowRegistry:
             )
             initialize_registry(self._memory_connection)
             return
-        self._validate_existing_ancestors(self.path.parent)
-        if not self.path.parent.is_dir():
+        physical_path = self._trusted_physical_path(self.path)
+        self._validate_existing_ancestors(physical_path.parent)
+        if not physical_path.parent.is_dir():
             raise RegistryUnavailable("registry parent unavailable")
-        if self.path.is_symlink() or self.lock_path.is_symlink():
-            raise RegistryUnavailable("registry path unavailable")
-        if self.path.exists() and self.path.stat().st_mode & 0o777 != 0o600:
-            raise RegistryUnavailable("registry permissions unavailable")
-        if not self.lock_path.exists():
-            fd = os.open(
-                self.lock_path,
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            os.close(fd)
-        os.chmod(self.lock_path, 0o600)
+        parent_info = physical_path.parent.stat()
+        if parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o777 != 0o700:
+            raise RegistryUnavailable("registry parent permissions unavailable")
+        if physical_path.is_symlink() or self._trusted_physical_path(self.lock_path).is_symlink():
+            raise RegistryUnavailable("registry basename unavailable")
+        parent_fd = os.open(
+            physical_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            self._open_or_create_private_file(parent_fd, physical_path.name + ".lock")
+        finally:
+            os.close(parent_fd)
         with self._lock(shared=False):
-            connection = self._open_writer()
+            parent_fd = os.open(
+                physical_path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
+                self._open_or_create_private_file(parent_fd, physical_path.name)
+            finally:
+                os.close(parent_fd)
+            guard_fd, guarded_path, before = self._open_guard_descriptor()
+            connection = None
+            try:
+                connection = self._open_writer(physical_path)
                 initialize_registry(connection)
             finally:
-                connection.close()
-        os.chmod(self.path, 0o600)
+                if connection is not None:
+                    connection.close()
+                try:
+                    self._verify_guard_descriptor(guard_fd, guarded_path, before)
+                finally:
+                    os.close(guard_fd)
+
+    @staticmethod
+    def _open_or_create_private_file(parent_fd: int, name: str) -> None:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            try:
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                fd = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+        except OSError as exc:
+            raise RegistryUnavailable("registry basename unavailable") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600:
+                raise RegistryUnavailable("registry permissions unavailable")
+        finally:
+            os.close(fd)
 
     def _has_schema(self, connection: sqlite3.Connection) -> bool:
         try:
@@ -212,13 +275,18 @@ class ShadowRegistry:
         if self._memory:
             yield
             return
+        lock_path = self._trusted_physical_path(self.lock_path)
+        self._validate_existing_ancestors(lock_path.parent)
         if (
-            self.lock_path.is_symlink()
-            or not self.lock_path.is_file()
-            or self.lock_path.stat().st_mode & 0o777 != 0o600
+            lock_path.is_symlink()
+            or not lock_path.is_file()
+            or lock_path.stat().st_mode & 0o777 != 0o600
         ):
             raise RegistryUnavailable("registry lock unavailable")
-        fd = os.open(self.lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(
+            lock_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
             fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
             yield
@@ -228,12 +296,48 @@ class ShadowRegistry:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def _open_writer(self) -> sqlite3.Connection:
-        if not self._memory and self.path.exists() and self.path.stat().st_mode & 0o777 != 0o600:
-            raise RegistryUnavailable("registry permissions unavailable")
+    def _open_writer(self, path: Path | None = None) -> sqlite3.Connection:
+        if not self._memory:
+            path = path or self._trusted_physical_path(self.path)
+            if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
+                raise RegistryUnavailable("registry permissions unavailable")
         return getattr(self, "_memory_connection", None) or ShadowRegistryTerminalWriter.open(
-            self.path
+            path or self.path
         )
+
+    def _open_guard_descriptor(self) -> tuple[int, Path, tuple[int, int, int, int]]:
+        physical_path = self._trusted_physical_path(self.path)
+        self._validate_existing_ancestors(physical_path.parent)
+        parent_fd = os.open(
+            physical_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            fd = os.open(
+                physical_path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600:
+            os.close(fd)
+            raise RegistryUnavailable("registry permissions unavailable")
+        return fd, physical_path, (info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns)
+
+    @staticmethod
+    def _verify_guard_descriptor(fd: int, path: Path, before: tuple[int, int, int, int]) -> None:
+        after = os.fstat(fd)
+        current = os.stat(path)
+        after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_ctime_ns)
+        current_identity = (current.st_dev, current.st_ino, current.st_mode, current.st_ctime_ns)
+        if (
+            path.is_symlink()
+            or after_identity[:3] != before[:3]
+            or current_identity[:3] != before[:3]
+        ):
+            raise RegistryUnavailable("registry basename changed during transaction")
 
     @staticmethod
     def _validate_existing_ancestors(path: Path) -> None:
@@ -339,24 +443,38 @@ class ShadowRegistry:
 
     def _with_transaction(self, callback):
         with self._lock(shared=False):
-            connection = self._open_writer()
+            guard_fd = None
+            connection = None
             try:
+                if self._memory:
+                    connection = self._open_writer()
+                else:
+                    guard_fd, physical_path, before = self._open_guard_descriptor()
+                    connection = self._open_writer(physical_path)
                 connection.execute("BEGIN IMMEDIATE")
                 result = callback(connection)
                 connection.commit()
+                if guard_fd is not None:
+                    self._verify_guard_descriptor(guard_fd, physical_path, before)
                 return result
             except RegistryUnavailable:
-                connection.rollback()
+                if connection is not None:
+                    connection.rollback()
                 raise
             except ValueError:
-                connection.rollback()
+                if connection is not None:
+                    connection.rollback()
                 raise
             except (sqlite3.DatabaseError, OSError) as exc:
-                connection.rollback()
+                if connection is not None:
+                    connection.rollback()
                 raise RegistryUnavailable("registry transaction unavailable") from exc
             finally:
                 if not self._memory:
-                    connection.close()
+                    if connection is not None:
+                        connection.close()
+                    if guard_fd is not None:
+                        os.close(guard_fd)
 
     @staticmethod
     def _record_values(record: ShadowProviderRecord) -> tuple[object, ...]:
@@ -466,6 +584,10 @@ class ShadowRegistry:
                         current.terms_evidence_hash,
                         vector[0] if vector else None,
                     ),
+                )
+                connection.execute(
+                    "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',state_version=state_version+1 WHERE provider_id=?",
+                    (provider_id,),
                 )
             cursor = connection.execute(
                 "UPDATE provider_record SET admission_state=?, state_version=state_version+1 WHERE provider_id=? AND state_version=?",
@@ -936,96 +1058,80 @@ class ShadowRegistry:
             )
         )
 
-    def record_session(
-        self, provider_id: str, window_id: str, *, success: bool
-    ) -> QualificationWindow:
-        raise RegistryUnavailable("session requires verified terminal evidence")
-
-    def record_verified_session(
+    def qualify_window(
         self,
         provider_id: str,
         window_id: str,
         *,
-        trade_date: str,
-        calendar_generation: str,
-        calendar_sha256: str,
-        session_report_id: str,
-        terminal_attestation_id: str,
+        calendar_reader: ConfirmedCalendarReader,
         expected_provider_state_version: int,
         expected_window_state_version: int,
     ) -> QualificationWindow:
+        try:
+            snapshot = calendar_reader.read(provider_id, window_id)
+        except (OSError, ValueError, TypeError, RegistryUnavailable) as exc:
+            raise RegistryUnavailable("confirmed calendar snapshot unavailable") from exc
+        if not isinstance(snapshot, ConfirmedCalendarSnapshot):
+            raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+
         def update(connection):
             provider = self._query_record(connection, provider_id)
+            current = self._window(connection, provider_id, window_id)
             if provider.admission_state is not AdmissionState.SHADOW:
                 raise RegistryUnavailable("provider is not shadow-qualified")
             if provider.state_version != expected_provider_state_version:
                 raise RegistryUnavailable("stale registry state")
-            current = self._window(connection, provider_id, window_id)
             if current.state_version != expected_window_state_version:
                 raise RegistryUnavailable("stale qualification state")
-            try:
-                parsed_date = date.fromisoformat(trade_date)
-            except ValueError as exc:
-                raise RegistryUnavailable("calendar confirmation unavailable") from exc
-            verified = connection.execute(
+            if (
+                snapshot.provider_id != provider.provider_id
+                or snapshot.window_id != window_id
+                or snapshot.version_vector_sha256 != current.version_vector_sha256
+                or snapshot.calendar_generation != current.calendar_generation
+                or snapshot.calendar_sha256 != current.calendar_sha256
+                or snapshot.adapter_hash != provider.adapter_hash
+                or snapshot.reconciliation_policy_hash != provider.reconciliation_policy_hash
+                or len(snapshot.sessions) < 20
+            ):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            expected_sessions = snapshot.sessions[-20:]
+            rows = connection.execute(
                 """
-                SELECT s.trade_date,s.calendar_generation,s.calendar_sha256
+                SELECT s.trade_date
                 FROM session_report s
                 JOIN shadow_terminal_attestation t
                   ON t.session_report_id=s.session_report_id
                  AND t.provider_id=s.provider_id AND t.job_id=s.job_id
                  AND t.window_id=s.window_id AND t.session_id=s.session_id
                  AND t.attestation_id=s.terminal_attestation_id
-                WHERE s.session_report_id=? AND s.terminal_attestation_id=?
-                  AND s.provider_id=? AND s.window_id=? AND s.outcome='success'
-                  AND s.trade_date=? AND s.calendar_generation=? AND s.calendar_sha256=?
+                JOIN shadow_job j
+                  ON j.job_id=s.job_id AND j.provider_id=s.provider_id
+                 AND j.window_id=s.window_id
+                WHERE s.provider_id=? AND s.window_id=? AND s.outcome='success'
+                  AND s.version_vector_sha256=? AND j.version_vector_sha256=?
+                  AND j.universe_id=?
+                ORDER BY s.trade_date
                 """,
                 (
-                    session_report_id,
-                    terminal_attestation_id,
                     provider_id,
                     window_id,
-                    trade_date,
-                    calendar_generation,
-                    calendar_sha256,
+                    snapshot.version_vector_sha256,
+                    snapshot.version_vector_sha256,
+                    snapshot.universe_id,
                 ),
-            ).fetchone()
-            if verified is None:
-                raise RegistryUnavailable("terminal session unavailable")
-            try:
-                connection.execute(
-                    "INSERT INTO qualification_session VALUES (?,?,?,?,?,?,?)",
-                    (
-                        provider_id,
-                        window_id,
-                        trade_date,
-                        session_report_id,
-                        terminal_attestation_id,
-                        calendar_generation,
-                        calendar_sha256,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise RegistryUnavailable("duplicate qualification session") from exc
-            dates = [
-                date.fromisoformat(row[0])
-                for row in connection.execute(
-                    "SELECT trade_date FROM qualification_session WHERE provider_id=? AND window_id=? ORDER BY trade_date DESC",
-                    (provider_id, window_id),
-                ).fetchall()
-            ]
-            count = 0
-            for index, observed in enumerate(dates):
-                if index and dates[index - 1] - observed != timedelta(days=1):
-                    break
-                count += 1
-            # The calendar confirmation graph is the source of truth; this date check
-            # prevents a gap or duplicate from inflating the 20-session window.
-            if count == 0 or dates[0] != parsed_date:
-                raise RegistryUnavailable("calendar sequence unavailable")
+            ).fetchall()
+            observed_sessions = tuple(date.fromisoformat(row[0]) for row in rows)
+            if observed_sessions[-20:] != expected_sessions or len(observed_sessions) < 20:
+                raise RegistryUnavailable("terminal calendar sequence unavailable")
             cursor = connection.execute(
-                "UPDATE qualification_window SET consecutive_sessions=?,window_state=?,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
-                (min(count, 20), "observing", provider_id, window_id, current.state_version),
+                "UPDATE qualification_window SET consecutive_sessions=20,window_start=?,window_end=?,window_state='observing',state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
+                (
+                    expected_sessions[0].isoformat(),
+                    expected_sessions[-1].isoformat(),
+                    provider_id,
+                    window_id,
+                    expected_window_state_version,
+                ),
             )
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale qualification state")
@@ -1041,22 +1147,14 @@ class ShadowRegistry:
         calendar_generation: str,
         calendar_sha256: str,
         *,
-        expected_provider_state_version: int | None = None,
-        expected_window_state_version: int | None = None,
+        expected_provider_state_version: int,
+        expected_window_state_version: int,
     ) -> QualificationWindow:
         def update(connection):
             provider = self._query_record(connection, provider_id)
             current = self._window(connection, provider_id, window_id)
-            expected_provider = (
-                provider.state_version
-                if expected_provider_state_version is None
-                else expected_provider_state_version
-            )
-            expected_window = (
-                current.state_version
-                if expected_window_state_version is None
-                else expected_window_state_version
-            )
+            expected_provider = expected_provider_state_version
+            expected_window = expected_window_state_version
             if (
                 provider.state_version != expected_provider
                 or current.state_version != expected_window

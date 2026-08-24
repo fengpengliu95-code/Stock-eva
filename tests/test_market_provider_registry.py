@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import json
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -168,8 +170,7 @@ def test_qualification_requires_exactly_twenty_consecutive_sessions():
     registry.put_terms_evidence(terms)
     registry.attach_terms_to_provider("tickflow", terms)
     window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
-    with pytest.raises(RegistryUnavailable):
-        registry.record_session("tickflow", window.window_id, success=True)
+    assert not hasattr(registry, "record_session")
     assert window.window_state == "observing"
 
 
@@ -384,11 +385,9 @@ def test_h3_generic_transition_cannot_qualify_without_verified_terminal_graph():
     registry.put_provider(_record())
     registry.put_terms_evidence(terms)
     registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
     with pytest.raises(ValueError):
         registry.transition("tickflow", "qualified", expected_state_version=1)
-    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
-    with pytest.raises(RegistryUnavailable):
-        registry.record_session("tickflow", window.window_id, success=True)
     with pytest.raises(RegistryUnavailable):
         registry.promote_qualified(
             "tickflow",
@@ -534,21 +533,8 @@ def test_round2_session_count_requires_verified_terminal_report_and_unique_calen
     terms = _terms()
     registry.put_terms_evidence(terms)
     registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
-    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
-    with pytest.raises(RegistryUnavailable):
-        registry.record_session("tickflow", window.window_id, success=True)
-    with pytest.raises(RegistryUnavailable):
-        registry.record_verified_session(
-            "tickflow",
-            window.window_id,
-            trade_date="2026-08-21",
-            calendar_generation="cal-1",
-            calendar_sha256=_sha("calendar"),
-            session_report_id="missing",
-            terminal_attestation_id="missing",
-            expected_provider_state_version=1,
-            expected_window_state_version=0,
-        )
+    assert not hasattr(registry, "record_session")
+    assert hasattr(registry, "qualify_window")
 
 
 def test_round2_quarantine_reopen_requires_new_reviewed_version():
@@ -557,7 +543,9 @@ def test_round2_quarantine_reopen_requires_new_reviewed_version():
     registry.put_provider(_record())
     terms = _terms()
     registry.put_terms_evidence(terms)
-    attached = registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    attached = registry.attach_terms_to_provider(
+        "tickflow", terms, expected_state_version=0, expected_window_state_version=0
+    )
     canary = registry.transition(
         "tickflow", "canary", expected_state_version=attached.state_version
     )
@@ -633,10 +621,14 @@ def test_round2_descriptor_read_rejects_mode_and_trusted_tmp_alias_is_physical(t
 
 def test_round2_golden_objects_are_real_r2f2_models_and_get_is_real_response_model():
     import json
+    from datetime import datetime
 
     from fastapi.testclient import TestClient
 
+    import backend.app.api.market as market_api
     from backend.app.main import app
+    from backend.app.market.calendar import SHANGHAI, get_trading_calendar
+    from backend.app.market.calendar_sync import CalendarSyncState
     from backend.app.market.candidates import CandidateManifest, SessionSelection
     from backend.app.market.evidence import EvidenceManifest, EvidenceReader
 
@@ -647,12 +639,37 @@ def test_round2_golden_objects_are_real_r2f2_models_and_get_is_real_response_mod
     evidence = EvidenceReader(root).read("ev-2ce5ef73d443e9e13ffce1d4")
     assert evidence.manifest.evidence_id == "ev-2ce5ef73d443e9e13ffce1d4"
     evidence.close()
-    with TestClient(app) as client:
-        response = client.get("/api/v1/market/provider-status")
-    assert response.content + b"\n" == (
-        b'{"status":"unavailable","provider":null,"state":null,'
-        b'"unavailable_reason":"registry_missing","report_id":null}\n'
+
+    class _Store:
+        def published_refresh(self):
+            return None
+
+        def scheduler_state(self):
+            return None
+
+    settings = Settings(
+        _env_file=None,
+        local_market_dataset_root=None,
+        nas_market_dataset_root=None,
+        market_continuity_start_date=None,
+        auto_refresh_enabled=False,
+        scheduled_refresh_enabled=False,
     )
+    app.dependency_overrides[market_api.get_market_store] = lambda: _Store()
+    app.dependency_overrides[market_api.get_trading_calendar] = get_trading_calendar
+    app.dependency_overrides[market_api.get_market_clock] = lambda: (
+        lambda: datetime(2026, 8, 24, 18, 30, tzinfo=SHANGHAI)
+    )
+    app.dependency_overrides[market_api.get_settings] = lambda: settings
+    app.dependency_overrides[market_api.get_calendar_sync_store] = lambda: type(
+        "_Sync", (), {"state": lambda self: CalendarSyncState()}
+    )()
+    try:
+        with TestClient(app) as client:
+            response = client.get("/api/v1/market/status")
+        assert response.content + b"\n" == (root / "GET.json").read_bytes()
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_round2_terminal_attestation_is_append_only_at_sql_and_reader_authorizer_layers():
@@ -691,3 +708,366 @@ def test_round2_cli_and_api_share_safe_shadow_root_unavailable_reason(
     )
     assert cli.main() == 1
     assert '"unavailable_reason": "shadow_root_unavailable"' in capsys.readouterr().out
+
+
+def test_round3_legacy_0001_without_checksum_is_upgraded_before_checksum_select(tmp_path):
+    from backend.app.market.providers.registry import ShadowRegistryTerminalWriter
+    from backend.app.market.shadow_registry_schema import REGISTRY_DDL
+
+    path = tmp_path / "provider_registry.sqlite3"
+    legacy_ddl = REGISTRY_DDL.replace(",\n checksum TEXT NOT NULL CHECK(length(checksum)=64)", "")
+    connection = ShadowRegistryTerminalWriter.open(path)
+    connection.executescript(legacy_ddl)
+    connection.execute(
+        "INSERT INTO schema_migration VALUES (?,?,datetime('now'))",
+        ("r2f3-registry-0001", 1),
+    )
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    ShadowRegistry(path).initialize()
+    upgraded = sqlite3.connect(path)
+    assert "checksum" in {row[1] for row in upgraded.execute("PRAGMA table_info(schema_migration)")}
+    assert upgraded.execute(
+        "SELECT migration_id FROM schema_migration ORDER BY schema_version"
+    ).fetchall() == [("r2f3-registry-0001",), ("r2f3-registry-0002",)]
+    upgraded.close()
+
+
+def test_round3_terminal_success_graph_uses_deferred_fk_and_legal_insert_order():
+    from backend.app.market.shadow_registry_schema import REGISTRY_DDL
+
+    assert "DEFERRABLE INITIALLY DEFERRED" in REGISTRY_DDL
+    assert "attestation_requires_terminal_success_session" not in REGISTRY_DDL
+
+
+def test_round3_legal_terminal_success_transaction_inserts_session_then_attestation():
+    from backend.app.market.shadow_registry_schema import canonical_digest
+
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    canary = registry.transition(
+        "tickflow", "canary", expected_state_version=attached.state_version
+    )
+    registry.transition("tickflow", "shadow", expected_state_version=canary.state_version)
+    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
+    connection = registry._memory_connection
+    evidence_sha = _sha("evidence")
+    candidate_sha = _sha("candidate")
+
+    def canonical(domain, payload):
+        raw = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        return raw, canonical_digest(domain, raw)
+
+    request_plan, request_plan_sha = canonical(
+        "request-plan",
+        {
+            "job_id": "job-1",
+            "provider_id": "tickflow",
+            "window_id": window.window_id,
+            "requests": [],
+        },
+    )
+    completion, completion_sha = canonical(
+        "completion",
+        {
+            "job_id": "job-1",
+            "provider_id": "tickflow",
+            "window_id": window.window_id,
+            "session_id": "session-1",
+            "evidence_id": "evidence-1",
+            "request_plan_sha256": request_plan_sha,
+            "requests": [],
+        },
+    )
+    closure, closure_sha = canonical(
+        "attempt-ordinal-closure", {"exact_ordinal_set": [], "ordinals": []}
+    )
+    report_digest, report_sha = canonical(
+        "report-digest", {"session_report_id": "report-1", "report_version": 2, "reports": []}
+    )
+    connection.execute("BEGIN")
+    connection.execute(
+        "INSERT INTO shadow_job VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "job-1",
+            "tickflow",
+            window.window_id,
+            "2026-08-24",
+            "universe-1",
+            "generation-1",
+            _sha("manifest"),
+            _sha("vector"),
+            None,
+            None,
+            None,
+            None,
+            "leased",
+            "owner",
+            None,
+            0,
+            0,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO shadow_evidence_ref VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "evidence-1",
+            "job-1",
+            "tickflow",
+            window.window_id,
+            "session-1",
+            completion_sha,
+            evidence_sha,
+            "bundle",
+            _sha("bundle"),
+            None,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO shadow_candidate_ref VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "candidate-1",
+            "evidence-1",
+            "job-1",
+            "tickflow",
+            window.window_id,
+            "session-1",
+            "candidate",
+            candidate_sha,
+            "quality",
+            _sha("quality"),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO session_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "report-1",
+            "tickflow",
+            "job-1",
+            window.window_id,
+            "session-1",
+            "attempt-1",
+            "evidence-1",
+            "candidate-1",
+            "att-1",
+            2,
+            "2026-08-24",
+            "success",
+            "cal-1",
+            _sha("calendar"),
+            _sha("universe"),
+            _sha("vector"),
+            evidence_sha,
+            candidate_sha,
+            "report",
+            _sha("report"),
+            0,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO shadow_attempt_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+        ",?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "attempt-1",
+            "attempt-report-1",
+            "job-1",
+            "tickflow",
+            window.window_id,
+            "session-1",
+            "request-1",
+            "daily",
+            "daily",
+            0,
+            0,
+            _sha("vector"),
+            "success",
+            "2026-08-24T08:00:00Z",
+            "2026-08-24T08:01:00Z",
+            1,
+            1,
+            1,
+            0,
+            0,
+            "",
+            "[1]",
+            1,
+            1,
+            1,
+            "report",
+            _sha("attempt-report"),
+            '[{"evidence_id":"evidence-1"}]',
+            "evidence-1",
+            evidence_sha,
+            candidate_sha,
+            "report-1",
+            0,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO shadow_terminal_attestation VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+        ",?,?,?,?)",
+        (
+            "att-1",
+            "tickflow",
+            "job-1",
+            window.window_id,
+            "session-1",
+            "evidence-1",
+            "candidate-1",
+            "report-1",
+            2,
+            request_plan,
+            completion,
+            closure,
+            report_digest,
+            closure_sha,
+            request_plan_sha,
+            completion_sha,
+            report_sha,
+            evidence_sha,
+            candidate_sha,
+            "success",
+            1,
+        ),
+    )
+    connection.commit()
+    assert connection.execute(
+        "SELECT 1 FROM shadow_terminal_attestation WHERE attestation_id='att-1'"
+    ).fetchone() == (1,)
+
+
+def test_round3_qualification_requires_confirmed_calendar_reader_not_raw_dates():
+    from backend.app.market.providers.registry import ConfirmedCalendarReader
+
+    signature = inspect.signature(ShadowRegistry.qualify_window)
+    assert "calendar_reader" in signature.parameters
+    assert "trade_date" not in signature.parameters
+    assert "calendar_generation" not in signature.parameters
+    assert "calendar_sha256" not in signature.parameters
+    assert ConfirmedCalendarReader is not None
+
+
+def test_round3_calendar_reader_fake_rejects_weekend_holiday_unknown_and_mismatch():
+    from datetime import date, timedelta
+
+    from backend.app.market.providers.registry import ConfirmedCalendarSnapshot
+
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider("tickflow", terms, expected_state_version=0)
+    canary = registry.transition(
+        "tickflow", "canary", expected_state_version=attached.state_version
+    )
+    registry.transition("tickflow", "shadow", expected_state_version=canary.state_version)
+    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
+
+    class RejectingReader:
+        def __init__(self, reason):
+            self.reason = reason
+
+        def read(self, _provider_id, _window_id):
+            raise RegistryUnavailable(self.reason)
+
+    for reason in ("weekend", "holiday", "unknown"):
+        with pytest.raises(RegistryUnavailable, match="confirmed calendar snapshot unavailable"):
+            registry.qualify_window(
+                "tickflow",
+                window.window_id,
+                calendar_reader=RejectingReader(reason),
+                expected_provider_state_version=3,
+                expected_window_state_version=0,
+            )
+
+    snapshot = ConfirmedCalendarSnapshot(
+        provider_id=ShadowProviderId.TICKFLOW,
+        window_id=window.window_id,
+        version_vector_sha256=_sha("different-vector"),
+        calendar_generation="cal-1",
+        calendar_sha256=_sha("calendar"),
+        universe_id="universe-1",
+        adapter_hash=_sha("adapter"),
+        reconciliation_policy_hash=_sha("policy"),
+        sessions=tuple(date(2026, 7, 1) + timedelta(days=index) for index in range(20)),
+    )
+
+    class MismatchReader:
+        def read(self, _provider_id, _window_id):
+            return snapshot
+
+    with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
+        registry.qualify_window(
+            "tickflow",
+            window.window_id,
+            calendar_reader=MismatchReader(),
+            expected_provider_state_version=3,
+            expected_window_state_version=0,
+        )
+
+
+def test_round3_quarantine_atomically_resets_every_window_and_preserves_old_vector():
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    window = registry.ensure_window("tickflow", _sha("old-vector"), "cal-1", _sha("calendar"))
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider(
+        "tickflow", terms, expected_state_version=0, expected_window_state_version=0
+    )
+    quarantined = registry.transition(
+        "tickflow", "canary", expected_state_version=attached.state_version
+    )
+    registry.ensure_window("tickflow", _sha("second-vector"), "cal-2", _sha("calendar-2"))
+    registry.transition("tickflow", "quarantined", expected_state_version=quarantined.state_version)
+    reset = registry.read_window("tickflow", window.window_id)
+    assert reset.consecutive_sessions == 0
+    assert reset.window_state == "reset"
+    assert registry._memory_connection.execute(
+        "SELECT version_vector_sha256 FROM quarantine_snapshot WHERE provider_id='tickflow'"
+    ).fetchone()[0] == _sha("old-vector")
+
+
+def test_round3_writer_precreates_private_0600_basename_before_sqlite_connect(
+    tmp_path, monkeypatch
+):
+    import backend.app.market.providers.registry as registry_module
+
+    path = tmp_path / "provider_registry.sqlite3"
+    original_connect = registry_module.sqlite3.connect
+
+    def checked_connect(*args, **kwargs):
+        assert path.is_file()
+        assert path.stat().st_mode & 0o777 == 0o600
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module.sqlite3, "connect", checked_connect)
+    ShadowRegistry(path).initialize()
+    assert path.stat().st_mode & 0o777 == 0o600
+
+    symlink_path = tmp_path / "symlink.sqlite3"
+    target = tmp_path / "external.sqlite3"
+    target.write_bytes(b"external")
+    symlink_path.symlink_to(target)
+    before = target.read_bytes()
+    with pytest.raises(RegistryUnavailable):
+        ShadowRegistry(symlink_path).initialize()
+    assert target.read_bytes() == before
+    assert not symlink_path.with_name("symlink.sqlite3.lock").exists()
+
+
+def test_round3_reset_requires_both_expected_versions_and_record_session_is_removed():
+    parameters = inspect.signature(ShadowRegistry.reset_window_if_version_changed).parameters
+    assert parameters["expected_provider_state_version"].default is inspect.Parameter.empty
+    assert parameters["expected_window_state_version"].default is inspect.Parameter.empty
+    assert not hasattr(ShadowRegistry, "record_session")

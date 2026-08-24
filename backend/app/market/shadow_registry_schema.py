@@ -109,13 +109,6 @@ BEGIN
   NEW.report_digest_canonical_json,NEW.report_digest_sha256
  ) <> 1 THEN RAISE(ABORT,'terminal_digest_mismatch') END;
  SELECT CASE WHEN NOT EXISTS (
-   SELECT 1 FROM session_report s WHERE s.session_report_id=NEW.session_report_id
-    AND s.provider_id=NEW.provider_id AND s.job_id=NEW.job_id
-    AND s.window_id=NEW.window_id AND s.session_id=NEW.session_id
-    AND s.report_version=NEW.session_report_version AND s.outcome='success'
-    AND s.terminal_attestation_id=NEW.attestation_id
- ) THEN RAISE(ABORT,'attestation_requires_terminal_success_session') END;
- SELECT CASE WHEN NOT EXISTS (
    SELECT 1 FROM shadow_evidence_ref e WHERE e.evidence_id=NEW.evidence_id
     AND e.provider_id=NEW.provider_id AND e.job_id=NEW.job_id
     AND e.window_id=NEW.window_id AND e.session_id=NEW.session_id
@@ -144,17 +137,6 @@ BEGIN
     AND c.candidate_sha256=NEW.candidate_sha256
  ) THEN RAISE(ABORT,'session_hash_mismatch') END;
 END;
-CREATE TRIGGER session_report_success_requires_terminal_attempt BEFORE INSERT ON session_report
-WHEN NEW.outcome='success'
-BEGIN
- SELECT CASE WHEN NOT EXISTS (
-   SELECT 1 FROM shadow_attempt_report a WHERE a.attempt_id=NEW.successful_attempt_id
-    AND a.provider_id=NEW.provider_id AND a.job_id=NEW.job_id
-    AND a.window_id=NEW.window_id AND a.session_id=NEW.session_id
-    AND a.outcome='success' AND a.terminal_marker=1
-    AND a.terminal_session_report_id=NEW.session_report_id
- ) THEN RAISE(ABORT,'success_requires_terminal_attempt') END;
-END;
 CREATE TRIGGER evidence_ready_requires_pending_normalization BEFORE INSERT ON shadow_attempt_report
 WHEN NEW.outcome='evidence_ready'
 BEGIN
@@ -173,6 +155,39 @@ BEGIN
  ) THEN RAISE(ABORT,'candidate_attach_after_terminal') END;
 END;
 """
+
+# The terminal/session cycle is intentionally deferred so a terminal success can
+# be persisted as one transaction: session first, attestation second, commit last.
+REGISTRY_DDL = (
+    REGISTRY_DDL.replace(
+        "FOREIGN KEY(terminal_attestation_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES shadow_terminal_attestation(attestation_id,provider_id,job_id,window_id,session_id)",
+        "FOREIGN KEY(terminal_attestation_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES shadow_terminal_attestation(attestation_id,provider_id,job_id,window_id,session_id) "
+        "DEFERRABLE INITIALLY DEFERRED",
+    )
+    .replace(
+        "FOREIGN KEY(session_report_id,provider_id,job_id,window_id,session_id,session_report_version) "
+        "REFERENCES session_report(session_report_id,provider_id,job_id,window_id,session_id,report_version)",
+        "FOREIGN KEY(session_report_id,provider_id,job_id,window_id,session_id,session_report_version) "
+        "REFERENCES session_report(session_report_id,provider_id,job_id,window_id,session_id,report_version) "
+        "DEFERRABLE INITIALLY DEFERRED",
+    )
+    .replace(
+        "FOREIGN KEY(successful_attempt_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES shadow_attempt_report(attempt_id,provider_id,job_id,window_id,session_id)",
+        "FOREIGN KEY(successful_attempt_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES shadow_attempt_report(attempt_id,provider_id,job_id,window_id,session_id) "
+        "DEFERRABLE INITIALLY DEFERRED",
+    )
+    .replace(
+        "FOREIGN KEY(terminal_session_report_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES session_report(session_report_id,provider_id,job_id,window_id,session_id)",
+        "FOREIGN KEY(terminal_session_report_id,provider_id,job_id,window_id,session_id) "
+        "REFERENCES session_report(session_report_id,provider_id,job_id,window_id,session_id) "
+        "DEFERRABLE INITIALLY DEFERRED",
+    )
+)
 
 MIGRATION_0002_DDL = r"""
 CREATE TABLE IF NOT EXISTS review_object (
@@ -314,6 +329,27 @@ def initialize_registry(connection: sqlite3.Connection) -> None:
                     MIGRATION_CHECKSUMS[MIGRATION_IDS[0]],
                 ),
             )
+        else:
+            migration_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(schema_migration)")
+            }
+            if "checksum" not in migration_columns:
+                connection.execute("ALTER TABLE schema_migration ADD COLUMN checksum TEXT")
+                legacy_rows = connection.execute(
+                    "SELECT migration_id,schema_version FROM schema_migration"
+                ).fetchall()
+                for migration_id, _schema_version in legacy_rows:
+                    checksum = MIGRATION_CHECKSUMS.get(migration_id)
+                    if checksum is None:
+                        raise sqlite3.DatabaseError("unknown legacy registry migration")
+                    connection.execute(
+                        "UPDATE schema_migration SET checksum=? WHERE migration_id=?",
+                        (checksum, migration_id),
+                    )
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS schema_migration_checksum_idx "
+                    "ON schema_migration(migration_id,checksum)"
+                )
         rows = connection.execute(
             "SELECT migration_id,schema_version,checksum FROM schema_migration ORDER BY schema_version"
         ).fetchall()
