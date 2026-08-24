@@ -684,8 +684,8 @@ UPDATE shadow_job SET run_status=?, lease_owner=?, lease_expires_at=?,
 -- require rowcount == 1, else ROLLBACK; then COMMIT
 
 BEGIN IMMEDIATE;
-INSERT INTO shadow_attempt_report (...) VALUES (...);
-INSERT INTO session_report (...) VALUES (...);
+PERSIST `shadow_attempt_report` with every column in the frozen DDL projection;
+PERSIST `session_report` with every column in the frozen DDL projection;
 UPDATE qualification_window SET consecutive_sessions=?, state_version=state_version+1
   WHERE provider_id=? AND window_id=? AND state_version=?;
 -- require the UPDATE rowcount == 1; any failure ROLLBACKs all inserts and leaves the window intact
@@ -701,19 +701,27 @@ before eligibility is true:
 
 ```text
 BEGIN IMMEDIATE;
+CALL `terminal_graph_validator` with the exact plan, refs, terminal reports and proposed
+attestation values; a mismatch executes ROLLBACK before any insert or CAS;
+INSERT INTO shadow_terminal_attestation (
+  attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
+  session_report_id, session_report_version, attempt_ordinal_closure_sha256,
+  request_plan_sha256, completion_sha256, report_digest_sha256, evidence_sha256,
+  candidate_sha256, terminal_outcome, immutable_version
+) VALUES (
+  :attestation_id, :provider_id, :job_id, :window_id, :session_id, :evidence_id, :candidate_id,
+  :session_report_id, :session_report_version, :attempt_ordinal_closure_sha256,
+  :request_plan_sha256, :completion_sha256, :report_digest_sha256, :evidence_sha256,
+  :candidate_sha256, :terminal_outcome, :immutable_version
+);
 UPDATE shadow_job SET run_status='completed', successful_evidence_sha256=?,
-  successful_candidate_sha256=?, completion_sha256=?, state_version=state_version+1
-  WHERE job_id=? AND provider_id=? AND window_id=? AND run_status='leased'
+  successful_candidate_sha256=?, completion_sha256=?, terminal_attestation_id=?,
+  state_version=state_version+1
+  WHERE job_id=? AND provider_id=? AND window_id=? AND run_status='pending_normalization'
     AND state_version=?;                         -- rowcount == 1
-INSERT INTO shadow_attempt_report (...success report..., evidence_sha256=?, candidate_sha256=?);
-INSERT INTO shadow_evidence_ref (...provider/job/window/session..., completion_sha256=?);
-INSERT INTO shadow_evidence_attempt_ref (...one row for every exact ordinal...);
-INSERT INTO shadow_candidate_ref (...provider/job/window/session/evidence...);
-INSERT INTO session_report (...successful_attempt_id,evidence_id,candidate_id,
-  evidence_sha256,candidate_sha256...);
 UPDATE qualification_window SET window_state=?, consecutive_sessions=?,
   last_session_report_id=?, qualification_evidence_sha256=?, qualification_candidate_sha256=?,
-  state_version=state_version+1
+  terminal_attestation_id=?, state_version=state_version+1
   WHERE provider_id=? AND window_id=? AND state_version=?; -- rowcount == 1
 COMMIT;
 ```
@@ -825,17 +833,43 @@ that exact report ID, not a naming convention or a singular `successful_attempt_
 only a backward-compatible primary-attempt projection. Thus a multi-request terminal graph cannot
 silently omit an ordinal.
 
+### Frozen terminal digest preimages
+
+The implementation uses the design's canonical JSON contract exactly: recursively NFC-normalize all
+strings, reject extra/missing keys and `null` in successful objects, encode UTF-8 with
+`ensure_ascii=false`, `sort_keys=true`, compact `(',', ':')` separators and one final LF. The
+preimages are `b"stock-eva/r2f3/request-plan/v1\\n" + plan_json`,
+`b"stock-eva/r2f3/completion/v1\\n" + completion_json`, and
+`b"stock-eva/r2f3/attempt-ordinal-closure/v1\\n" + closure_json`; SHA-256 lowercase hex is
+stored. The exact field lists are:
+
+* plan: `job_id,provider_id,window_id,requests[]`; each request:
+  `ordinal,request_id,endpoint,endpoint_class,role,trade_date,symbol_or_index_shard,
+  schema_contract_hash,unit_contract_hash,request_hash`;
+* completion: `job_id,provider_id,window_id,session_id,evidence_id,request_plan_sha256,requests[]`;
+  each request: `ordinal,request_id,endpoint,endpoint_class,final_attempt_id,final_outcome,page_refs[]`;
+  each page: `ordinal,page_identity,object_ref,content_sha256,row_count`;
+* ordinal closure: exact sorted ordinal set and each
+  `ordinal,attempt_id,endpoint,endpoint_class,request_id,page_identities,page_refs,page_count,
+  row_count,page_hashes`.
+
+The plan digest comes from the immutable request plan; completion comes from the committed evidence
+completion and manifest; ordinal closure comes from evidence attempt refs joined to terminal report
+rows. The validator recomputes each digest and requires equality with the evidence manifest,
+candidate manifest, session report and attestation fields before writing any terminal row.
+
 The terminal graph validator and transaction are frozen as executable pseudocode. The validator
 does not write; it is called inside the terminal `BEGIN IMMEDIATE` before either state CAS:
 
 ```python
-def terminal_graph_validator(conn, identity, expected_versions):
+def terminal_graph_validator(conn, identity, expected_versions, attestation_values):
     job, window, session = load_same_identity(conn, identity)
     plan = load_plan(identity.job_id)  # exact ordinal set + request_plan_sha256
     refs = conn.execute("""
       SELECT r.logical_request_ordinal, r.attempt_id, r.endpoint, r.request_id,
              r.page_refs_json, r.page_count, r.row_count,
-             a.outcome, a.page_identities_json, a.evidence_sha256, a.candidate_sha256,
+             a.endpoint AS attempt_endpoint, a.endpoint_class, a.outcome,
+             a.page_identities_json, a.evidence_sha256, a.candidate_sha256,
              a.evidence_id, a.report_sha256
         FROM shadow_evidence_attempt_ref r
         JOIN shadow_attempt_report a ON
@@ -847,8 +881,8 @@ def terminal_graph_validator(conn, identity, expected_versions):
     assert {r.logical_request_ordinal for r in refs} == plan.exact_ordinal_set
     terminal_rows = conn.execute("""
       SELECT logical_request_ordinal, attempt_id, endpoint, request_id,
-             page_identities_json, page_count, row_count, evidence_id, evidence_sha256, candidate_sha256,
-             report_sha256
+             endpoint_class, page_identities_json, page_count, row_count, evidence_id,
+             evidence_sha256, candidate_sha256, report_sha256
         FROM shadow_attempt_report
        WHERE provider_id=? AND job_id=? AND window_id=? AND session_id=?
          AND outcome='success' AND terminal_marker=1
@@ -858,29 +892,58 @@ def terminal_graph_validator(conn, identity, expected_versions):
     assert {r.logical_request_ordinal for r in terminal_rows} == plan.exact_ordinal_set
     for r in refs:
         assert r.outcome == "evidence_ready"
-        assert r.evidence_id == identity.evidence_id
-        terminal = terminal_rows[r.logical_request_ordinal]
-        assert r.endpoint == plan[r.logical_request_ordinal].endpoint
-        assert r.request_id == plan[r.logical_request_ordinal].request_id
-        assert terminal.endpoint == r.endpoint and terminal.request_id == r.request_id
-        assert terminal.evidence_sha256 == session.evidence_sha256
-        assert terminal.evidence_id == identity.evidence_id
-        assert terminal.candidate_sha256 == session.candidate_sha256
-        assert contiguous(r.page_refs_json, r.page_count)
-        assert same_pages(r.page_refs_json, r.page_identities_json)
-        assert row_sum(r.page_refs_json) == r.row_count
-        assert sha256_pages(r.page_refs_json) == manifest_page_hash(identity.evidence_id, r.logical_request_ordinal)
+    assert r.evidence_id == identity.evidence_id
+    terminal = terminal_rows[r.logical_request_ordinal]
+    assert r.endpoint == plan[r.logical_request_ordinal].endpoint
+    assert r.endpoint == r.attempt_endpoint == plan[r.logical_request_ordinal].endpoint
+    assert r.endpoint_class == plan[r.logical_request_ordinal].endpoint_class
+    assert r.request_id == plan[r.logical_request_ordinal].request_id
+    assert terminal.endpoint == r.endpoint and terminal.endpoint_class == r.endpoint_class
+    assert terminal.request_id == r.request_id
+    assert terminal.evidence_sha256 == session.evidence_sha256
+    assert terminal.evidence_id == identity.evidence_id
+    assert terminal.candidate_sha256 == session.candidate_sha256
+    refs_pages = decode_ordered_page_refs(r.page_refs_json)
+    report_pages = decode_ordered_page_identities(r.page_identities_json)
+    terminal_pages = decode_ordered_page_identities(terminal.page_identities_json)
+    manifest_pages = load_manifest_pages(identity.evidence_id, r.logical_request_ordinal)
+    assert refs_pages == manifest_pages
+    assert report_pages == [p.page_identity for p in refs_pages]
+    assert terminal_pages == report_pages
+    assert r.page_count == terminal.page_count == len(refs_pages)
+    assert r.row_count == terminal.row_count == sum(p.row_count for p in refs_pages)
+    assert page_content_hashes(refs_pages) == manifest_page_hashes(manifest_pages)
+    assert page_object_refs(refs_pages) == manifest_page_object_refs(manifest_pages)
     evidence = descriptor_read_and_hash(identity.evidence_bundle)
     candidate = descriptor_read_and_hash(identity.candidate_bundle)
     assert evidence.sha256 == session.evidence_sha256
     assert candidate.sha256 == session.candidate_sha256
     assert candidate.evidence_sha256 == evidence.sha256
+    assert recompute_request_plan_sha256(plan) == plan.request_plan_sha256
+    assert recompute_completion_sha256(plan, refs, evidence.manifest) == evidence.completion_sha256
+    closure = recompute_attempt_ordinal_closure_sha256(plan, refs, terminal_rows, evidence.manifest)
+    assert closure == attestation_values.attempt_ordinal_closure_sha256
+    assert evidence.completion_sha256 == attestation_values.completion_sha256
+    assert candidate.evidence_sha256 == evidence.sha256 == attestation_values.evidence_sha256
+    assert candidate.candidate_sha256 == session.candidate_sha256 == attestation_values.candidate_sha256
     assert report_digest(refs, terminal_rows, session) == session.report_sha256
-    return closure_digest(plan, refs), evidence, candidate
+    return closure, evidence, candidate
 
 BEGIN IMMEDIATE
-closure, evidence, candidate = terminal_graph_validator(conn, identity, expected_versions)
-INSERT INTO shadow_terminal_attestation (...closure, evidence, candidate, report digest...);
+closure, evidence, candidate = terminal_graph_validator(
+    conn, identity, expected_versions, attestation_values
+)
+INSERT INTO shadow_terminal_attestation (
+  attestation_id, provider_id, job_id, window_id, session_id, evidence_id, candidate_id,
+  session_report_id, session_report_version, attempt_ordinal_closure_sha256,
+  request_plan_sha256, completion_sha256, report_digest_sha256, evidence_sha256,
+  candidate_sha256, terminal_outcome, immutable_version
+) VALUES (
+  :attestation_id, :provider_id, :job_id, :window_id, :session_id, :evidence_id, :candidate_id,
+  :session_report_id, :session_report_version, :attempt_ordinal_closure_sha256,
+  :request_plan_sha256, :completion_sha256, :report_digest_sha256, :evidence_sha256,
+  :candidate_sha256, :terminal_outcome, :immutable_version
+);
 UPDATE shadow_job SET run_status='completed', terminal_attestation_id=?, state_version=state_version+1
  WHERE job_id=? AND provider_id=? AND window_id=? AND state_version=?;  # rowcount == 1
 UPDATE qualification_window SET window_state=?, terminal_attestation_id=?, state_version=state_version+1
@@ -963,9 +1026,10 @@ parameters and run before any candidate write):
 ```python
 plan = load_plan(job_id)  # exact ordinal set + request_plan_hash
 refs = conn.execute("""
-  SELECT r.logical_request_ordinal, r.attempt_id, r.endpoint, r.request_id,
+      SELECT r.logical_request_ordinal, r.attempt_id, r.endpoint, r.request_id,
          r.page_refs_json, r.page_count, r.row_count,
-         a.outcome, a.page_identities_json, a.evidence_sha256, a.candidate_sha256
+         a.endpoint_class, a.outcome, a.page_identities_json, a.evidence_id,
+         a.evidence_sha256, a.candidate_sha256
     FROM shadow_evidence_attempt_ref AS r
     JOIN shadow_attempt_report AS a
       ON (a.attempt_id, a.provider_id, a.job_id, a.window_id, a.session_id,
@@ -977,14 +1041,17 @@ refs = conn.execute("""
 """, identity).fetchall()
 assert {r.ordinal for r in refs} == plan.exact_ordinal_set
 for r in refs:
-    assert r.outcome == "success" and r.endpoint == plan[r.ordinal].endpoint
+    assert r.outcome == "evidence_ready" and r.endpoint == plan[r.ordinal].endpoint
+    assert r.endpoint_class == plan[r.ordinal].endpoint_class
+    assert r.evidence_id == evidence_id
     assert r.request_id == plan[r.ordinal].request_id
     assert page_ids(r.page_refs_json) == contiguous_page_ids(r.page_count)
     assert page_ids(r.page_refs_json) == page_ids(r.page_identities_json)
     assert r.row_count == sum(page_rows(r.page_refs_json))
     assert sha256_objects(r.page_refs_json) == manifest_page_hash(evidence_id, r.ordinal)
 assert bidirectional_manifest_pages(evidence_id, refs)
-assert sha256_completion(plan, refs) == evidence_completion_sha(evidence_id)
+assert recompute_request_plan_sha256(plan) == plan.request_plan_sha256
+assert recompute_completion_sha256(plan, refs, evidence_manifest) == evidence_completion_sha(evidence_id)
 ```
 
 The validator rejects a failed attempt selected as final, a missing/duplicate/out-of-order page,
@@ -1284,6 +1351,8 @@ def test_completed_without_terminal_attestation_is_rejected_by_sql_and_validator
 def test_qualified_without_terminal_attestation_is_rejected_by_sql_and_validator(tmp_path): ...
 def test_session_hash_mismatch_rejects_terminal_attestation(tmp_path): ...
 def test_terminal_validator_runs_before_both_cas_and_zero_writes_on_failure(tmp_path): ...
+def test_terminal_graph_recomputes_request_plan_completion_and_ordinal_closure_sha256(tmp_path): ...
+def test_terminal_graph_rejects_fake_digest_and_endpoint_class_request_page_count_row_or_hash_mismatch(tmp_path): ...
 ~~~
 
 Run RED:

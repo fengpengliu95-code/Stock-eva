@@ -184,6 +184,11 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   without completing the job; only Task 13 may create one immutable terminal attestation and a new
   terminal report version before CAS transitions to `completed`/`qualified`. Direct status bypasses
   MUST be rejected by SQL constraints and the terminal validator.
+- FR-29: Terminal validation MUST recompute and compare canonical `request_plan_sha256`,
+  `completion_sha256` and `attempt_ordinal_closure_sha256` from frozen UTF-8/NFC JSON preimages.
+  It MUST read the plan, every evidence attempt ref, every terminal report ordinal and the
+  evidence/candidate manifests, then assert exact endpoint/endpoint-class/request/page identity,
+  order/count/row/hash equality. Any fake digest or field mismatch MUST rollback both CAS updates.
 
 ## Non-Functional Requirements
 
@@ -401,6 +406,14 @@ When SQL and the terminal validator inspect it
 Then the sanitized durable report remains queryable, but page identities/refs/counts/rows and
 evidence/candidate hashes are empty/null and no qualification attestation can reference it.
 
+### AC-19: Terminal digest and page closure (FR-29)
+
+Given a multi-request completion with retries and an immutable candidate
+When the terminal validator recomputes the plan, completion and ordinal-closure preimages
+Then NFC/UTF-8 canonical bytes and SHA-256 values match the evidence/candidate/session/attestation
+values, every endpoint/endpoint-class/request/page identity is exact and ordered, and any fake
+digest, endpoint/request/page/count/row/content-hash mismatch rolls back without version changes.
+
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 
 Given missing/corrupt registry, shadow root, job store, canonical descriptor, or candidate bundle
@@ -586,7 +599,7 @@ ShadowAttempt:
   final_page_refs, sanitized_orphan_audit_id
 
 ShadowLogicalRequest:
-  ordinal, request_id, provider_id, endpoint, role, trade_date, symbol_or_index_shard,
+  ordinal, request_id, provider_id, endpoint, endpoint_class, role, trade_date, symbol_or_index_shard,
   schema_contract_hash, unit_contract_hash, request_hash
 
 ShadowLogicalRequestPlan:
@@ -693,6 +706,26 @@ ShadowTerminalAttestation:
   terminal_outcome(success), immutable_version
   # immutable relation graph; exactly one per provider/job/window/session
 ```
+
+The three terminal digests have one canonical serialization contract. Each preimage is UTF-8 JSON
+after recursive Unicode NFC normalization, with only the listed fields, no omitted or extra keys,
+no implicit defaults, and no `null` in a successful plan/completion/closure. Objects use
+`ensure_ascii=false`, `sort_keys=true`, compact separators `(',', ':')`, and exactly one final LF;
+the domain-separated prefixes are respectively
+`stock-eva/r2f3/request-plan/v1\n`, `stock-eva/r2f3/completion/v1\n`, and
+`stock-eva/r2f3/attempt-ordinal-closure/v1\n`. `request_plan_sha256` covers
+`job_id,provider_id,window_id,requests[]`, where each request has exactly
+`ordinal,request_id,endpoint,endpoint_class,role,trade_date,symbol_or_index_shard,
+schema_contract_hash,unit_contract_hash,request_hash`; `completion_sha256` covers
+`job_id,provider_id,window_id,session_id,evidence_id,request_plan_sha256,requests[]`, where each
+request has `ordinal,request_id,endpoint,endpoint_class,final_attempt_id,final_outcome,page_refs[]`
+and each page ref has `ordinal,page_identity,object_ref,content_sha256,row_count`; and
+`attempt_ordinal_closure_sha256` covers the exact ordered ordinal set plus
+`ordinal,attempt_id,endpoint,endpoint_class,request_id,page_identities,page_refs,page_count,
+row_count,page_hashes`. The source of truth is respectively the immutable request plan, the
+committed evidence completion/manifest, and the evidence attempt refs joined to terminal reports.
+The validator recomputes all three and compares them with the evidence manifest, candidate
+manifest, session report and attestation before either state CAS.
 
 Terminal success eligibility is a graph, not a job/window hash projection. Every terminal ordinal
 report is composite-bound to the immutable session-report version through
@@ -853,6 +886,7 @@ mutating the canonical root. Re-enabling requires a new reviewed contract/terms 
 | FR-14–FR-18, FR-22–FR-23, H4/H8, NFR-1, NFR-7–NFR-14 | durable job outbox, released-lock handoff, scanner, leases, reports, reset transaction | Task13 ordering/crash/lease/CAS/session-vector and golden GET/selection tests |
 | FR-24–FR-27, H2/H8 | complete success graph, all-outcome sanitized reports, exact logical-request closure and qualification transaction | Task11/13 missing/unreadable/hash-mismatch, four outcome exclusion, multi-request/page, full transaction/crash/recovery probes |
 | FR-28, H/M lifecycle | evidence_ready → candidate → terminal attestation → completed/qualified state machine | Task11 evidence-ready, Task12 candidate-pending, Task13 attestation, direct-bypass and stale/crash rollback probes |
+| FR-29, terminal closure | canonical plan/completion/ordinal digests and exact page graph | Task13 recomputation, fake-digest and endpoint/request/page/count/row/content-hash rollback probes |
 | NFR-3–NFR-6, H7, storage table | hash/CAS/dirfd/root/SQLite contract | storage/concurrency/TOCTOU/read-only fingerprints |
 | M2 | golden R2-F2 manifest/evidence/candidate/selection/GET byte/hash/reader fixtures | named regression in every Task 10–13 focused command and independent review |
 | NFR-9 | compatibility matrix and AC-10 | old manifest/hash/selection/GET byte and semantic regression |
