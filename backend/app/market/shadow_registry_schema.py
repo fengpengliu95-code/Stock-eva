@@ -130,6 +130,22 @@ BEGIN
     AND s.evidence_sha256=NEW.evidence_sha256
     AND s.candidate_sha256=NEW.candidate_sha256
  ) THEN RAISE(ABORT,'attestation_requires_terminal_success_session') END;
+ SELECT CASE WHEN NOT EXISTS (
+   SELECT 1 FROM session_report s
+   JOIN shadow_attempt_report a ON a.attempt_id=s.successful_attempt_id
+    AND a.provider_id=s.provider_id AND a.job_id=s.job_id
+    AND a.window_id=s.window_id AND a.session_id=s.session_id
+   WHERE s.session_report_id=NEW.session_report_id
+    AND s.provider_id=NEW.provider_id AND s.job_id=NEW.job_id
+    AND s.window_id=NEW.window_id AND s.session_id=NEW.session_id
+    AND s.successful_attempt_id=a.attempt_id
+    AND s.report_version=NEW.session_report_version
+    AND a.outcome='success' AND a.terminal_marker=1
+    AND a.terminal_session_report_id=NEW.session_report_id
+    AND a.evidence_id=NEW.evidence_id
+    AND a.evidence_sha256=NEW.evidence_sha256
+    AND a.candidate_sha256=NEW.candidate_sha256
+ ) THEN RAISE(ABORT,'attestation_requires_successful_terminal_attempt') END;
 END;
 CREATE TRIGGER session_report_hash_match BEFORE INSERT ON session_report
 WHEN NEW.outcome IN ('evidence_ready','success')
@@ -290,6 +306,7 @@ _ACCEPTED_LEGACY_SCHEMA_FINGERPRINTS = frozenset(
     {
         # Current canonical 0001 with its checksum column removed.
         "4d5817883d7a171327b66355447cff445b2bedc12a8df690fcde008da16577aa",
+        "ead14dea2d7c22805b572f4251a3454828a051a99ce4ceca7f616f0e0d2f9496",
         # The exact reviewed round-2 0001 schema (pre-deferred-FK spelling).
         "132a7e6ac31fca439668f4a11928793eab34792ac5bc7983badaf34d0ed7c053",
     }

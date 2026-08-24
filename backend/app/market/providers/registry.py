@@ -119,6 +119,14 @@ class ConfirmedCalendarSnapshot(BaseModel):
         return self
 
 
+class _ConfirmedCalendarPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    authority_provenance: str = Field(min_length=1)
+    generation: str = Field(min_length=1)
+    configs: tuple[dict[str, object], ...] = Field(min_length=1)
+
+
 class VerifiedConfirmedCalendarReader:
     """Descriptor-bound reader for the reviewed confirmed trading calendar."""
 
@@ -143,9 +151,9 @@ class VerifiedConfirmedCalendarReader:
         source_schema_hash: str,
         normalizer_hash: str,
         reconciliation_policy_hash: str,
-        calendar_generation: str | None = None,
+        calendar_generation: str,
         calendar_sha256: str | None = None,
-        authority_provenance: str = "reviewed-confirmed-calendar",
+        authority_provenance: str,
     ) -> None:
         self.calendar_path = Path(calendar_path)
         self.provider_id = provider_id
@@ -161,6 +169,8 @@ class VerifiedConfirmedCalendarReader:
         self.calendar_generation = calendar_generation
         self.calendar_sha256 = calendar_sha256
         self.authority_provenance = authority_provenance
+        if not calendar_generation or not authority_provenance:
+            raise ValueError("verified calendar descriptor metadata is invalid")
         for value in (
             version_vector_sha256,
             universe_sha256,
@@ -243,20 +253,25 @@ class VerifiedConfirmedCalendarReader:
         raw, _fingerprint = self._read_verified()
         try:
             payload = json.loads(raw.decode("utf-8"))
-            raw_configs = payload if isinstance(payload, list) else [payload]
-            payload_generation = payload.get("generation") if isinstance(payload, dict) else None
-            payload_provenance = (
-                payload.get("authority_provenance") if isinstance(payload, dict) else None
-            )
-            if self.calendar_generation is not None and payload_generation not in (
-                None,
-                self.calendar_generation,
+            if not isinstance(payload, dict):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            validated = _ConfirmedCalendarPayload.model_validate(payload)
+            if (
+                validated.generation != self.calendar_generation
+                or validated.authority_provenance != self.authority_provenance
             ):
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
-            if payload_provenance not in (None, self.authority_provenance):
+            expected_config_keys = {
+                "year",
+                "status",
+                "published_on",
+                "sources",
+                "closed_dates",
+            }
+            if any(set(config) != expected_config_keys for config in validated.configs):
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
             calendar = TradingCalendar(
-                [CalendarConfig.model_validate(item) for item in raw_configs]
+                [CalendarConfig.model_validate(item) for item in validated.configs]
             )
             sessions: list[date] = []
             for config in calendar.configs.values():
@@ -266,9 +281,7 @@ class VerifiedConfirmedCalendarReader:
                 if confirmed is None:
                     raise RegistryUnavailable("confirmed calendar snapshot unavailable")
                 sessions.extend(confirmed)
-            generation = (
-                self.calendar_generation or payload_generation or hashlib.sha256(raw).hexdigest()
-            )
+            generation = self.calendar_generation
             calendar_sha256 = hashlib.sha256(raw).hexdigest()
             if self.calendar_sha256 is not None and self.calendar_sha256 != calendar_sha256:
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
@@ -514,6 +527,8 @@ class ShadowRegistry:
             before = os.fstat(config_fd)
             if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o777 != 0o600:
                 raise RegistryUnavailable("registry permissions unavailable")
+            if before.st_nlink != 1:
+                raise RegistryUnavailable("registry hardlink unavailable")
             os.link(
                 physical_path.name,
                 alias_name,
@@ -527,7 +542,11 @@ class ShadowRegistry:
                 dir_fd=parent_fd,
             )
             alias_info = os.fstat(alias_fd)
-            if (alias_info.st_dev, alias_info.st_ino) != (before.st_dev, before.st_ino):
+            if (
+                (alias_info.st_dev, alias_info.st_ino) != (before.st_dev, before.st_ino)
+                or alias_info.st_nlink != 2
+                or os.fstat(config_fd).st_nlink != 2
+            ):
                 raise RegistryUnavailable("registry basename identity unavailable")
         except (OSError, ValueError) as exc:
             if alias_fd is not None:
@@ -563,29 +582,51 @@ class ShadowRegistry:
             except FileNotFoundError:
                 pass
             raise
-        return connection, (config_fd, alias_fd, alias_path, before)
+        return connection, (config_fd, alias_fd, alias_path, physical_path, before)
 
     @staticmethod
     def _close_bound_writer(bound) -> None:
-        config_fd, alias_fd, alias_path, before = bound
+        config_fd, alias_fd, alias_path, configured_path, before = bound
+        safe_to_unlink = False
         try:
             current = os.fstat(config_fd)
             if (current.st_dev, current.st_ino, current.st_mode) != (
                 before.st_dev,
                 before.st_ino,
                 before.st_mode,
-            ):
+            ) or current.st_nlink != 2:
                 raise RegistryUnavailable("registry basename changed")
             alias_info = os.fstat(alias_fd)
-            if (alias_info.st_dev, alias_info.st_ino) != (before.st_dev, before.st_ino):
+            if (alias_info.st_dev, alias_info.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ) or alias_info.st_nlink != 2:
                 raise RegistryUnavailable("registry alias changed")
+            configured = os.stat(configured_path, follow_symlinks=False)
+            if not stat.S_ISREG(configured.st_mode) or (configured.st_dev, configured.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ):
+                raise RegistryUnavailable("registry basename changed")
+            safe_to_unlink = True
         finally:
             os.close(alias_fd)
             os.close(config_fd)
+        if safe_to_unlink:
             try:
                 alias_path.unlink()
             except FileNotFoundError:
-                pass
+                raise RegistryUnavailable("registry alias unavailable") from None
+            try:
+                restored = os.stat(configured_path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(restored.st_mode)
+                    or (restored.st_dev, restored.st_ino) != (before.st_dev, before.st_ino)
+                    or restored.st_nlink != 1
+                ):
+                    raise RegistryUnavailable("registry alias cleanup unavailable")
+            except OSError as exc:
+                raise RegistryUnavailable("registry alias cleanup unavailable") from exc
 
     def _open_guard_descriptor(self) -> tuple[int, Path, tuple[int, int, int, int]]:
         physical_path = self._trusted_physical_path(self.path)

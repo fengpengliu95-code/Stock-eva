@@ -773,6 +773,15 @@ def test_round4_terminal_gate_asserts_success_report_identity_and_version():
     assert "evidence_ready" in REGISTRY_DDL
 
 
+def test_round5_terminal_gate_requires_successful_attempt_reverse_identity():
+    from backend.app.market.shadow_registry_schema import REGISTRY_DDL
+
+    assert "s.successful_attempt_id=a.attempt_id" in REGISTRY_DDL
+    assert "terminal_marker=1" in REGISTRY_DDL
+    assert "terminal_session_report_id=NEW.session_report_id" in REGISTRY_DDL
+    assert "a.attempt_id=s.successful_attempt_id" in REGISTRY_DDL
+
+
 def test_round4_qualification_requires_verified_calendar_reader(tmp_path):
     from backend.app.market.providers.registry import VerifiedConfirmedCalendarReader
 
@@ -812,7 +821,16 @@ def test_round4_verified_calendar_reader_reads_nofollow_json_and_confirmed_sessi
         ],
         "closed_dates": ["2026-01-01"],
     }
-    calendar_path.write_text(json.dumps(payload), encoding="utf-8")
+    calendar_path.write_text(
+        json.dumps(
+            {
+                "authority_provenance": "reviewed-authority-1",
+                "generation": "generation-1",
+                "configs": [payload],
+            }
+        ),
+        encoding="utf-8",
+    )
     digest = _sha("calendar")
     reader = VerifiedConfirmedCalendarReader(
         calendar_path,
@@ -826,6 +844,8 @@ def test_round4_verified_calendar_reader_reads_nofollow_json_and_confirmed_sessi
         source_schema_hash=_sha("schema"),
         normalizer_hash=_sha("normalizer"),
         reconciliation_policy_hash=_sha("policy"),
+        calendar_generation="generation-1",
+        authority_provenance="reviewed-authority-1",
         calendar_sha256=hashlib.sha256(calendar_path.read_bytes()).hexdigest(),
     )
     snapshot = reader.read("tickflow", "window-1")
@@ -834,6 +854,76 @@ def test_round4_verified_calendar_reader_reads_nofollow_json_and_confirmed_sessi
     assert all(session.weekday() < 5 for session in snapshot.sessions)
     with pytest.raises(TypeError, match="immutable"):
         reader.universe_id = "forged"
+
+
+def test_round5_existing_external_hardlink_is_rejected_without_mutation(tmp_path):
+    parent = tmp_path / "shadow"
+    parent.mkdir(mode=0o700)
+    path = parent / "provider_registry.sqlite3"
+    external = tmp_path / "external.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE sentinel (value TEXT)")
+    connection.execute("INSERT INTO sentinel VALUES ('untouched')")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+    external.hardlink_to(path)
+    before = path.read_bytes()
+    identity = path.stat().st_ino
+
+    with pytest.raises(RegistryUnavailable, match="link"):
+        ShadowRegistry(path).initialize()
+    assert path.stat().st_ino == identity
+    assert path.read_bytes() == before
+    assert external.read_bytes() == before
+
+
+def test_round5_calendar_payload_requires_frozen_authority_wrapper(tmp_path):
+    from backend.app.market.providers.registry import VerifiedConfirmedCalendarReader
+
+    calendar_path = tmp_path / "calendar.json"
+    config = {
+        "year": 2026,
+        "status": "confirmed",
+        "published_on": "2026-01-01",
+        "sources": [
+            {"exchange": "SSE", "title": "reviewed", "url": "https://example.invalid"},
+            {"exchange": "SZSE", "title": "reviewed", "url": "https://example.invalid"},
+        ],
+        "closed_dates": [],
+    }
+    calendar_path.write_text(json.dumps(config), encoding="utf-8")
+    kwargs = dict(
+        provider_id="tickflow",
+        window_id="window-1",
+        version_vector_sha256=_sha("vector"),
+        universe_id="universe-1",
+        universe_sha256=_sha("universe"),
+        adapter_hash=_sha("adapter"),
+        endpoint_contract_hash=_sha("endpoint"),
+        source_schema_hash=_sha("schema"),
+        normalizer_hash=_sha("normalizer"),
+        reconciliation_policy_hash=_sha("policy"),
+        calendar_generation="generation-1",
+        authority_provenance="reviewed-authority-1",
+    )
+    reader = VerifiedConfirmedCalendarReader(calendar_path, **kwargs)
+    with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
+        reader.read("tickflow", "window-1")
+
+    calendar_path.write_text(
+        json.dumps(
+            {
+                "authority_provenance": "reviewed-authority-1",
+                "generation": "generation-1",
+                "configs": [config],
+                "unexpected": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
+        reader.read("tickflow", "window-1")
 
 
 def test_round4_configured_basename_swap_before_connect_does_not_write_external(
