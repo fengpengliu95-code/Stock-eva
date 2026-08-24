@@ -83,6 +83,16 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _factor_value_semantic_hash(row: dict[str, Any]) -> str:
+    """Hash the exact value selected by the BaoStock normalization contract."""
+    return _digest(
+        {
+            "record_key": f"{row['symbol']}.{row['trade_date']}",
+            "back_adjust_factor": row["back_adjust_factor"],
+        }
+    )
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -451,6 +461,17 @@ class PublishedEvidence(_Immutable):
             )
         return reader.read_rows(self)
 
+    def close(self) -> None:
+        reader = self._reader
+        if reader is not None:
+            reader.close()
+
+    def __enter__(self) -> PublishedEvidence:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
 
 class ReplayResult(_Immutable):
     status: Literal["ready", "unavailable", "error"]
@@ -717,6 +738,20 @@ class EvidenceReader:
     def __init__(self, root: Path | str, *, max_object_bytes: int = MAX_OBJECT_BYTES) -> None:
         self.root = Path(root)
         self.max_object_bytes = max_object_bytes
+        self._held_root_fd: int | None = None
+        self._held_root_identity: tuple[int, int] | None = None
+
+    def close(self) -> None:
+        if self._held_root_fd is not None:
+            try:
+                os.close(self._held_root_fd)
+            except OSError:
+                pass
+            self._held_root_fd = None
+            self._held_root_identity = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def _assert_root_identity(self, root_fd: int, identity: tuple[int, int]) -> None:
         current = os.fstat(root_fd)
@@ -739,6 +774,7 @@ class EvidenceReader:
     def read(self, evidence_id: str) -> PublishedEvidence:
         if "/" in evidence_id or ".." in evidence_id:
             raise EvidenceError("unsafe evidence ID", "EVIDENCE_UNSAFE_PATH")
+        self.close()
         root_fd, root_identity = self._open_read_root()
         try:
             payload = _read_descriptor_fd(
@@ -779,20 +815,50 @@ class EvidenceReader:
                         "EVIDENCE_HASH_MISMATCH",
                     )
             if manifest.factor_resolution:
-                keys = {f"{row['symbol']}.{row['trade_date']}" for row in factor_rows}
+                keys = [f"{row['symbol']}.{row['trade_date']}" for row in factor_rows]
+                if len(keys) != len(set(keys)):
+                    raise EvidenceError(
+                        "factor snapshot has duplicate record keys", "EVIDENCE_MANIFEST_INVALID"
+                    )
                 for binding in manifest.factor_resolution:
                     if binding.selected_kind == "factor_cache_snapshot":
-                        if binding.cache is None or binding.cache.record_key not in keys:
+                        if binding.cache is None or binding.cache.record_key not in set(keys):
                             raise EvidenceError(
                                 "factor resolution record key is unbound",
                                 "EVIDENCE_MANIFEST_INVALID",
                             )
+                        selected = next(
+                            row
+                            for row in factor_rows
+                            if f"{row['symbol']}.{row['trade_date']}" == binding.cache.record_key
+                        )
+                        if binding.selected_value_semantic_hash != _factor_value_semantic_hash(
+                            selected
+                        ):
+                            raise EvidenceError(
+                                "factor selected value hash mismatch", "EVIDENCE_HASH_MISMATCH"
+                            )
+                if len(manifest.factor_resolution) != len(
+                    set(
+                        binding.cache.record_key
+                        for binding in manifest.factor_resolution
+                        if binding.cache is not None
+                    )
+                ):
+                    raise EvidenceError(
+                        "factor resolution has duplicate bindings", "EVIDENCE_MANIFEST_INVALID"
+                    )
             identity = _digest(manifest.model_dump(mode="json"))
-            return PublishedEvidence(
+            evidence = PublishedEvidence(
                 manifest=manifest, descriptors=manifest.objects, reader_identity=identity
             ).bind_reader(self)
+            self._held_root_fd = root_fd
+            self._held_root_identity = root_identity
+            root_fd = -1
+            return evidence
         finally:
-            os.close(root_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
 
     @staticmethod
     def _validate_typed_graph(manifest: EvidenceManifest) -> None:
@@ -811,6 +877,56 @@ class EvidenceReader:
             [item.model_dump(mode="json") for item in manifest.factor_resolution]
         ):
             raise EvidenceError("factor resolution hash mismatch", "EVIDENCE_HASH_MISMATCH")
+        from backend.app.market.providers.base import endpoint_contract_for
+
+        for descriptor in manifest.objects:
+            if descriptor.object_kind is not EvidenceObjectKind.RAW_ENDPOINT_PAGE:
+                continue
+            if descriptor.plan_ordinal is None or descriptor.plan_ordinal >= manifest.request_count:
+                raise EvidenceError(
+                    "descriptor plan ordinal is unbound", "EVIDENCE_MANIFEST_INVALID"
+                )
+            logical = manifest.logical_request_plan.requests[descriptor.plan_ordinal]
+            try:
+                contract = endpoint_contract_for(
+                    logical.endpoint, logical.instrument_role, logical.schema_variant
+                )
+            except ValueError as exc:
+                raise EvidenceError(
+                    "descriptor endpoint contract is unknown", "EVIDENCE_MANIFEST_INVALID"
+                ) from exc
+            expected = (
+                manifest.provider_id,
+                manifest.universe_id,
+                manifest.adapter_version,
+                manifest.endpoint_contract_version,
+                logical.endpoint,
+                logical.request_role,
+                logical.instrument_role,
+                logical.schema_variant,
+                contract.schema_variant,
+                contract.fields,
+                contract.units,
+                contract.date_semantics,
+                contract.pagination_policy,
+            )
+            actual = (
+                descriptor.provider_id,
+                descriptor.universe_id,
+                descriptor.adapter_version,
+                descriptor.endpoint_contract_version,
+                descriptor.endpoint,
+                descriptor.request_role,
+                descriptor.instrument_role,
+                descriptor.schema_variant,
+                descriptor.source_schema,
+                descriptor.fields,
+                descriptor.units,
+                descriptor.date_semantics,
+                descriptor.pagination_policy,
+            )
+            if actual != expected:
+                raise EvidenceError("descriptor typed graph mismatch", "EVIDENCE_MANIFEST_INVALID")
 
     def read_rows(
         self,
@@ -819,7 +935,13 @@ class EvidenceReader:
     ) -> tuple[dict[str, Any], ...]:
         """Read descriptor-bound pages, or one page for the legacy test helper."""
         if descriptor is None:
-            root_fd, root_identity = self._open_read_root()
+            owns_fd = self._held_root_fd is None
+            if owns_fd:
+                root_fd, root_identity = self._open_read_root()
+            else:
+                root_fd = self._held_root_fd
+                root_identity = self._held_root_identity
+                assert root_fd is not None and root_identity is not None
             pages = []
             factor_fields: tuple[str, ...] = ()
             factor_rows: list[dict[str, Any]] = []
@@ -879,12 +1001,19 @@ class EvidenceReader:
                         )
                 return tuple(pages)
             finally:
-                os.close(root_fd)
+                if owns_fd:
+                    os.close(root_fd)
         if descriptor not in evidence.descriptors:
             raise EvidenceError("descriptor is not bound to evidence", "EVIDENCE_MANIFEST_INVALID")
         if evidence.reader_identity != _digest(evidence.manifest.model_dump(mode="json")):
             raise EvidenceError("published evidence identity mismatch", "EVIDENCE_HASH_MISMATCH")
-        data = _read_descriptor(self.root, descriptor.relative_path, self.max_object_bytes)
+        if self._held_root_fd is not None and self._held_root_identity is not None:
+            self._assert_root_identity(self._held_root_fd, self._held_root_identity)
+            data = _read_descriptor_fd(
+                self._held_root_fd, descriptor.relative_path, self.max_object_bytes
+            )
+        else:
+            data = _read_descriptor(self.root, descriptor.relative_path, self.max_object_bytes)
         if len(data) != descriptor.byte_count or _sha256_bytes(data) != descriptor.sha256:
             raise EvidenceError("evidence object hash mismatch", "EVIDENCE_HASH_MISMATCH")
         if descriptor.object_kind is EvidenceObjectKind.FACTOR_CACHE_SNAPSHOT:
@@ -1005,6 +1134,8 @@ class EvidenceReader:
         evidence_id: str,
         *,
         compare_candidate_sha: str | None = None,
+        compare_semantic_sha: str | None = None,
+        compare_adapter_version: str | None = None,
         adapter: object | None = None,
         factor_cache: object | None = None,
     ) -> ReplayResult:
@@ -1018,6 +1149,17 @@ class EvidenceReader:
                 failure_class=exc.failure_class,
             )
         manifest = evidence.manifest
+        if (
+            compare_adapter_version is not None
+            and compare_adapter_version != manifest.adapter_version
+        ):
+            if compare_semantic_sha is None:
+                return ReplayResult(
+                    status="error",
+                    evidence_id=evidence_id,
+                    row_count=0,
+                    failure_class="REPLAY_NONDETERMINISTIC",
+                )
         try:
             evidence.read_rows()
             if factor_cache is not None:
@@ -1070,15 +1212,41 @@ class EvidenceReader:
                 for item in normalized
             ]
         )
+        byte_match = None if compare_candidate_sha is None else candidate == compare_candidate_sha
+        semantic_match = None if compare_semantic_sha is None else semantic == compare_semantic_sha
+        if byte_match is False:
+            return ReplayResult(
+                status="error",
+                evidence_id=evidence_id,
+                candidate_sha256=candidate,
+                semantic_hash=semantic,
+                byte_match=False,
+                semantic_match=semantic_match,
+                normalization_clock_utc=manifest.normalization_clock_utc,
+                row_count=manifest.row_count,
+                trade_date=manifest.trade_date,
+                failure_class="REPLAY_NONDETERMINISTIC",
+            )
+        if semantic_match is False:
+            return ReplayResult(
+                status="error",
+                evidence_id=evidence_id,
+                candidate_sha256=candidate,
+                semantic_hash=semantic,
+                byte_match=byte_match,
+                semantic_match=False,
+                normalization_clock_utc=manifest.normalization_clock_utc,
+                row_count=manifest.row_count,
+                trade_date=manifest.trade_date,
+                failure_class="REPLAY_SEMANTIC_MISMATCH",
+            )
         return ReplayResult(
             status="ready",
             evidence_id=evidence_id,
             candidate_sha256=candidate,
             semantic_hash=semantic,
-            byte_match=None
-            if compare_candidate_sha is None
-            else candidate == compare_candidate_sha,
-            semantic_match=(None),
+            byte_match=byte_match,
+            semantic_match=semantic_match,
             normalization_clock_utc=manifest.normalization_clock_utc,
             row_count=manifest.row_count,
             trade_date=manifest.trade_date,
@@ -1598,12 +1766,16 @@ class EvidenceStore:
         evidence_id: str,
         *,
         compare_candidate_sha: str | None = None,
+        compare_semantic_sha: str | None = None,
+        compare_adapter_version: str | None = None,
         adapter: object | None = None,
         factor_cache: object | None = None,
     ) -> ReplayResult:
         return EvidenceReader(self.root, max_object_bytes=self.max_object_bytes).replay(
             evidence_id,
             compare_candidate_sha=compare_candidate_sha,
+            compare_semantic_sha=compare_semantic_sha,
+            compare_adapter_version=compare_adapter_version,
             adapter=adapter,
             factor_cache=factor_cache,
         )
@@ -1626,10 +1798,19 @@ def _dump_json(value: Any) -> Any:
 
 
 def replay_cli_payload(
-    root: Path | str, evidence_id: str, compare_candidate_sha: str | None = None
+    root: Path | str,
+    evidence_id: str,
+    compare_candidate_sha: str | None = None,
+    compare_semantic_sha: str | None = None,
+    compare_adapter_version: str | None = None,
 ) -> dict[str, Any]:
     """Return the strictly bounded public replay projection."""
-    result = EvidenceReader(root).replay(evidence_id, compare_candidate_sha=compare_candidate_sha)
+    result = EvidenceReader(root).replay(
+        evidence_id,
+        compare_candidate_sha=compare_candidate_sha,
+        compare_semantic_sha=compare_semantic_sha,
+        compare_adapter_version=compare_adapter_version,
+    )
     return result.model_dump(mode="json")
 
 

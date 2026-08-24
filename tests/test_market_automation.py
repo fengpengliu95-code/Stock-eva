@@ -252,6 +252,42 @@ class CompleteProvider:
         )
 
 
+def test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch(tmp_path: Path):
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    calls = []
+
+    def canonical(**kwargs):
+        calls.append(kwargs)
+        target = kwargs["trade_date"]
+        return RefreshResult(
+            run_id=kwargs["run_id"],
+            request_key=kwargs["request_key"],
+            run_kind="daily",
+            requested_date=target,
+            source="baostock",
+            status="ready",
+            requested_count=1,
+            succeeded_count=1,
+            coverage_ratio=1,
+            started_at=datetime(2026, 7, 23, 10, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 23, 10, 1, tzinfo=UTC),
+        )
+
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        canonical_refresh=canonical,
+    )
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    assert outcome.result is not None and outcome.result.status == "ready"
+    assert len(calls) == 1
+    assert provider.fetch_calls == 0
+
+
 def test_automation_optional_continuity_dependency_preserves_legacy_behavior_exactly(
     tmp_path: Path,
 ) -> None:

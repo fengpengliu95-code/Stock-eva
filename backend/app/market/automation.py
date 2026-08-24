@@ -15,14 +15,18 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from backend.app.market.baostock import INDEX_SYMBOLS
+from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
 from backend.app.market.evidence import (
+    CacheFactorResolution,
     EvidenceManifest,
     EvidenceStore,
+    FactorResolutionBinding,
     PublishedEvidence,
+    _digest,
+    _factor_value_semantic_hash,
     factor_snapshot_records_from_cache,
 )
 from backend.app.market.failures import (
@@ -43,6 +47,18 @@ from backend.app.market.provider_transport import (
     ProviderEndpoint,
     TransportObservation,
     TransportOutcome,
+)
+from backend.app.market.providers.base import (
+    ExpectedLogicalRequest,
+    ExpectedLogicalRequestPlan,
+    InstrumentRole,
+    PaginationPolicy,
+    ProviderId,
+    ProviderRequest,
+    RequestRole,
+)
+from backend.app.market.providers.base import (
+    ProviderEndpoint as ContractProviderEndpoint,
 )
 from backend.app.market.store import MarketStore
 
@@ -170,6 +186,9 @@ def run_canonical_raw_refresh(
     factor_symbols: tuple[str, ...] = (),
     trade_date: date | None = None,
     factor_resolution=(),
+    factor_resolution_factory: Callable[[object], tuple] | None = None,
+    _lock_held: bool = False,
+    validate_batch: Callable[[object], None] | None = None,
 ) -> tuple[EvidenceManifest, PublishedEvidence, tuple[object, ...]]:
     """Run the explicit evidence-first compatibility seam for a raw refresh.
 
@@ -184,8 +203,11 @@ def run_canonical_raw_refresh(
     fetch_raw = getattr(adapter, "fetch_raw", None)
     if not callable(fetch_raw):
         raise ProviderHealthError("canonical raw refresh requires raw provider contract")
-    with RefreshRunLock(lock_path):
+    lock_context = nullcontext() if _lock_held else RefreshRunLock(lock_path)
+    with lock_context:
         batch = fetch_raw(request)
+        if validate_batch is not None:
+            validate_batch(batch)
         if factor_cache is not None:
             if not factor_symbols or trade_date is None:
                 raise ProviderHealthError("canonical factor capture requires symbols and date")
@@ -197,6 +219,7 @@ def run_canonical_raw_refresh(
                 trade_date=trade_date,
                 lock_path=lock_path,
                 factor_resolution=factor_resolution,
+                factor_resolution_factory=factor_resolution_factory,
                 adapter=adapter,
                 _lock_held=True,
             )
@@ -211,6 +234,234 @@ def run_canonical_raw_refresh(
             normalization_clock_utc=manifest.normalization_clock_utc,
         )
     return manifest, evidence, normalized
+
+
+def build_canonical_raw_request(
+    adapter: object,
+    *,
+    trade_date: date,
+    refresh_id: str,
+    required_symbols: set[str],
+) -> ProviderRequest:
+    """Build the complete, typed daily raw plan used by automatic refresh."""
+    inspection = adapter.inspect_main_board(trade_date)
+    main_symbols = tuple(sorted(set(inspection.main_board_symbols)))
+    if not main_symbols:
+        raise ProviderHealthError("canonical universe inspection is empty")
+    if not set(required_symbols).issubset(main_symbols):
+        raise ProviderHealthError("required symbols are outside canonical universe")
+    session_symbols = tuple(sorted(set(main_symbols) | set(INDEX_SYMBOLS)))
+    requests: list[ExpectedLogicalRequest] = []
+
+    def add(
+        endpoint: ContractProviderEndpoint,
+        role: RequestRole,
+        instrument: InstrumentRole | None,
+        variant: str,
+        symbols: tuple[str, ...],
+    ) -> None:
+        ordinal = len(requests)
+        requests.append(
+            ExpectedLogicalRequest(
+                plan_ordinal=ordinal,
+                endpoint=endpoint,
+                request_role=role,
+                instrument_role=instrument,
+                schema_variant=variant,
+                shard_id=f"daily-{ordinal}",
+                symbols=symbols,
+                start_date=trade_date,
+                end_date=trade_date,
+                pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+            )
+        )
+
+    add(
+        ContractProviderEndpoint.ALL_STOCK,
+        RequestRole.UNIVERSE,
+        InstrumentRole.STOCK,
+        "all_stock.market.v1",
+        (),
+    )
+    add(
+        ContractProviderEndpoint.DAILY_ASTOCK,
+        RequestRole.DAILY_STOCK,
+        InstrumentRole.STOCK,
+        "daily_astock.v1",
+        main_symbols,
+    )
+    add(
+        ContractProviderEndpoint.DAILY_FACTOR,
+        RequestRole.DAILY_FACTOR,
+        InstrumentRole.STOCK,
+        "daily_factor.v1",
+        main_symbols,
+    )
+    for symbol in main_symbols:
+        add(
+            ContractProviderEndpoint.ADJUST_FACTOR,
+            RequestRole.ADJUST_FACTOR,
+            InstrumentRole.STOCK,
+            "adjust_factor.session.v1",
+            (symbol,),
+        )
+    for symbol in INDEX_SYMBOLS:
+        add(
+            ContractProviderEndpoint.INDEX_HISTORY,
+            RequestRole.INDEX_HISTORY,
+            InstrumentRole.INDEX,
+            "index_history.session.v1",
+            (symbol,),
+        )
+    plan = ExpectedLogicalRequestPlan(
+        requests=tuple(requests),
+        request_count=len(requests),
+        request_plan_hash=_digest([item.model_dump(mode="json") for item in requests]),
+    )
+    return ProviderRequest(
+        provider_id=ProviderId.BAOSTOCK,
+        refresh_id=refresh_id,
+        trade_date=trade_date,
+        universe_id="all-main-board",
+        session_symbols=session_symbols,
+        logical_request_plan=plan,
+    )
+
+
+def canonical_refresh_callback(
+    store: MarketStore,
+    adapter: object,
+    *,
+    evidence_root: Path,
+    lock_path: Path,
+    factor_cache: object,
+) -> Callable[..., RefreshResult]:
+    """Return the automatic evidence-first refresh operation.
+
+    The callback is invoked while ``MarketAutomationService`` owns the refresh
+    lock.  It deliberately never calls the legacy provider ``fetch`` method.
+    """
+
+    def execute(
+        *,
+        trade_date: date,
+        required_symbols: set[str],
+        request_key: str,
+        run_id: str,
+        before_store: Callable[[], None] | None = None,
+    ) -> RefreshResult:
+        request = build_canonical_raw_request(
+            adapter,
+            trade_date=trade_date,
+            refresh_id=run_id,
+            required_symbols=required_symbols,
+        )
+        stock_request = next(
+            item
+            for item in request.logical_request_plan.requests
+            if item.endpoint is ContractProviderEndpoint.DAILY_ASTOCK
+        )
+        main_symbols = stock_request.symbols
+
+        def validate_universe(batch: object) -> None:
+            universe = tuple(
+                item
+                for item in batch.endpoint_batches
+                if item.endpoint is ContractProviderEndpoint.ALL_STOCK
+            )
+            if len(universe) != 1:
+                raise ProviderHealthError("canonical universe page is missing")
+            actual = tuple(row.code for row in universe[0].rows)
+            if actual != main_symbols:
+                raise ProviderHealthError("canonical universe changed during raw refresh")
+
+        def factor_bindings(
+            _factor_manifest: EvidenceManifest,
+        ) -> tuple[FactorResolutionBinding, ...]:
+            rows = factor_cache.exact_snapshot_records(main_symbols, trade_date)
+            bindings = []
+            for ordinal, row in enumerate(rows):
+                cache = CacheFactorResolution(
+                    cache_object_id=_factor_manifest.object_id,
+                    cache_object_sha256=_factor_manifest.object_sha256,
+                    record_key=f"{row['symbol']}.{row['trade_date']}",
+                )
+                values = {
+                    "plan_ordinal": ordinal,
+                    "symbol": row["symbol"],
+                    "trade_date": date.fromisoformat(str(row["trade_date"])),
+                    "selected_kind": "factor_cache_snapshot",
+                    "selected_value_semantic_hash": _factor_value_semantic_hash(row),
+                    "live": None,
+                    "cache": cache,
+                }
+                candidate = FactorResolutionBinding.model_construct(
+                    **values,
+                    resolution_sha256="0" * 64,
+                )
+                serialized = candidate.model_dump(mode="json")
+                serialized.pop("resolution_sha256", None)
+                bindings.append(
+                    FactorResolutionBinding(
+                        **values,
+                        resolution_sha256=_digest(serialized),
+                    )
+                )
+            if not bindings:
+                raise ProviderHealthError("canonical factor snapshot is empty")
+            return tuple(bindings)
+
+        try:
+            manifest, _evidence, bars = run_canonical_raw_refresh(
+                adapter,
+                request,
+                evidence_root=evidence_root,
+                lock_path=lock_path,
+                factor_cache=factor_cache,
+                factor_symbols=main_symbols,
+                trade_date=trade_date,
+                factor_resolution_factory=factor_bindings,
+                validate_batch=validate_universe,
+                _lock_held=True,
+            )
+            normalized = ProviderBatch(
+                bars=list(bars),
+                expected_symbols=list(request.session_symbols),
+                failed_symbols=[],
+            )
+            return run_publication_refresh(
+                store,
+                adapter,
+                trade_date=trade_date,
+                required_symbols=required_symbols,
+                request_key=request_key,
+                run_id=run_id,
+                before_store=before_store,
+                normalized_batch=normalized,
+            )
+        except Exception as error:
+            failure = market_failure_from_exception(error, stage="fetch")
+            return RefreshResult(
+                run_id=run_id,
+                request_key=request_key,
+                run_kind="daily",
+                requested_date=trade_date,
+                source="baostock",
+                status="error",
+                requested_count=0,
+                succeeded_count=0,
+                coverage_ratio=0,
+                failed_symbols=[],
+                quality_issues=legacy_failure_quality_issues(failure),
+                error_message=public_failure_message(failure),
+                failure_stage=failure.failure_stage,
+                failure_class=failure.failure_class,
+                retryable=failure.retryable,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+
+    return execute
 
 
 def _log_event(level: int, event: str, **fields) -> None:
@@ -548,6 +799,7 @@ def run_publication_refresh(
     run_id: str | None = None,
     run_kind: Literal["daily", "backfill", "repair"] = "daily",
     before_store: Callable[[], None] | None = None,
+    normalized_batch=None,
 ) -> RefreshResult:
     """Fetch to canonical staging, validate all gates, then move the pointer."""
     started_at = datetime.now(UTC)
@@ -616,7 +868,11 @@ def run_publication_refresh(
         return result
 
     try:
-        batch = provider.fetch(trade_date, symbols=None)
+        batch = (
+            normalized_batch
+            if normalized_batch is not None
+            else provider.fetch(trade_date, symbols=None)
+        )
         failure_stage = "validate"
         loaded = {bar.symbol for bar in batch.bars}
         expected = set(batch.expected_symbols)
@@ -729,6 +985,7 @@ class MarketAutomationService:
         continuity: ContinuityCoordinator | None = None,
         repair_enabled: bool = False,
         repair_executor=None,
+        canonical_refresh: Callable[..., RefreshResult] | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -741,6 +998,7 @@ class MarketAutomationService:
         self.continuity = continuity
         self.repair_enabled = repair_enabled
         self.repair_executor = repair_executor
+        self.canonical_refresh = canonical_refresh
         self.last_continuity_decision: ContinuityDecision | None = None
         self.last_repair_result: RepairExecutionResult | None = None
         self.policy = SchedulePolicy(calendar)
@@ -954,15 +1212,24 @@ class MarketAutomationService:
                 self.store.save_scheduler_state(state)
                 return AutomationOutcome(decision=decision, state=state)
 
-            result = run_publication_refresh(
-                self.store,
-                self.provider,
-                trade_date=target,
-                required_symbols=self.required_symbols(),
-                request_key=request_key,
-                run_id=refresh_id,
-                before_store=collector.resolve_touched_endpoints,
-            )
+            if self.canonical_refresh is not None:
+                result = self.canonical_refresh(
+                    trade_date=target,
+                    required_symbols=self.required_symbols(),
+                    request_key=request_key,
+                    run_id=refresh_id,
+                    before_store=collector.resolve_touched_endpoints,
+                )
+            else:
+                result = run_publication_refresh(
+                    self.store,
+                    self.provider,
+                    trade_date=target,
+                    required_symbols=self.required_symbols(),
+                    request_key=request_key,
+                    run_id=refresh_id,
+                    before_store=collector.resolve_touched_endpoints,
+                )
         if result.status == "ready":
             state = running.model_copy(
                 update={

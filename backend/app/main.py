@@ -12,6 +12,7 @@ from backend.app.market.automation import (
     MarketAutomationService,
     RefreshAlreadyRunning,
     RefreshRunLock,
+    canonical_refresh_callback,
     collect_required_symbols,
     get_market_clock,
     run_automation_loop,
@@ -31,6 +32,7 @@ from backend.app.market.continuity import (
     RepairRetryPolicy,
 )
 from backend.app.market.provider_health import SQLiteProviderHealthStore
+from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
@@ -87,6 +89,21 @@ async def lifespan(_: FastAPI):
         factor_cache_path=str(layout.local_paths.factor_cache_database),
         socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
     )
+    canonical_refresh = None
+    if hasattr(provider, "client") and hasattr(provider, "factor_cache"):
+        canonical_adapter = BaoStockProviderAdapter(
+            client=provider.client,
+            factor_cache=provider.factor_cache,
+            min_request_interval_seconds=settings.auto_refresh_min_request_interval_seconds,
+            socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+        )
+        canonical_refresh = canonical_refresh_callback(
+            control_store,
+            canonical_adapter,
+            evidence_root=layout.provider_evidence_root,
+            lock_path=layout.market_refresh_lock,
+            factor_cache=provider.factor_cache,
+        )
     continuity = None
     repair_executor = None
     if (
@@ -153,6 +170,7 @@ async def lifespan(_: FastAPI):
         continuity=coordinator if repair_executor is not None else None,
         repair_enabled=(repair_executor is not None),
         repair_executor=repair_executor,
+        canonical_refresh=canonical_refresh,
     )
     calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
     calendar_service = CalendarSyncService(

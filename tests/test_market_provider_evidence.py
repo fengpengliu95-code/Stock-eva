@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.app.market.automation import (
+    canonical_refresh_callback,
     publish_provider_evidence_with_factor_cache,
     run_canonical_raw_refresh,
 )
@@ -27,6 +29,7 @@ from backend.app.market.evidence import (
     FactorCacheSnapshotRecords,
     FactorResolutionBinding,
     _digest,
+    _factor_value_semantic_hash,
     factor_snapshot_records_from_cache,
     open_evidence_relative,
 )
@@ -34,7 +37,8 @@ from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.provider_health import ProviderHealthError
 from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.providers.base import EvidenceObjectKind, PaginationPolicy
-from tests.test_market_provider_contract import _provider_raw_batch
+from backend.app.market.store import MarketStore
+from tests.test_market_provider_contract import _CompleteSdkClient, _provider_raw_batch
 
 
 def _clock() -> datetime:
@@ -89,7 +93,9 @@ def _factor_binding(object_id: str, object_sha: str) -> FactorResolutionBinding:
         "symbol": "sh.600000",
         "trade_date": date(2026, 8, 20),
         "selected_kind": "factor_cache_snapshot",
-        "selected_value_semantic_hash": "f" * 64,
+        "selected_value_semantic_hash": _factor_value_semantic_hash(
+            _factor_records().rows[0].model_dump(mode="python")
+        ),
         "live": None,
         "cache": cache,
     }
@@ -654,6 +660,34 @@ def test_task8_canonical_raw_refresh_is_real_adapter_and_lock_bound(monkeypatch,
     assert bars and bars[0].symbol == "sh.600000"
 
 
+def test_task8_automatic_canonical_callback_uses_real_raw_adapter_fixture(tmp_path):
+    target = date(2026, 8, 20)
+    factor_cache = AdjustmentFactorCache(":memory:")
+    factor_cache.record_bootstrap(
+        "sh.600000",
+        target,
+        factor_cache.FACTOR_FIELDS,
+        [["sh.600000", target.isoformat(), "1", "1", "1"]],
+    )
+    adapter = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    )
+    callback = canonical_refresh_callback(
+        MarketStore(tmp_path / "market.duckdb"),
+        adapter,
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        factor_cache=factor_cache,
+    )
+    result = callback(
+        trade_date=target,
+        required_symbols={"sh.600000"},
+        request_key="daily:fixture",
+        run_id="fixture-refresh",
+    )
+    assert result.status == "ready"
+
+
 def test_task8_factor_binding_failure_is_preflight_zero_write(tmp_path):
     with pytest.raises(EvidenceError):
         EvidenceStore(tmp_path).publish(
@@ -712,7 +746,7 @@ def test_task8_empty_factor_resolution_hash_is_recomputed_not_arbitrary(tmp_path
 def test_task8_semantic_hash_is_independent_from_byte_candidate_hash(tmp_path):
     store, manifest, _, _ = _published(tmp_path)
     result = store.replay(manifest.evidence_id, compare_candidate_sha="f" * 64)
-    assert result.status == "ready"
+    assert result.status == "error"
     assert result.candidate_sha256 != result.semantic_hash
     assert result.byte_match is False
     assert result.semantic_match is None
@@ -776,6 +810,28 @@ def test_task8_post_create_crash_rolls_back_created_by_transaction(monkeypatch, 
     assert not list(tmp_path.rglob("*.json"))
 
 
+@pytest.mark.parametrize("crash", (KeyboardInterrupt, SystemExit, OSError))
+def test_task8_post_create_crash_variants_leave_no_evidence(monkeypatch, tmp_path, crash):
+    import backend.app.market.evidence as evidence_module
+
+    original = evidence_module._atomic_create_relative
+    calls = 0
+
+    def crash_after_first(root, relative, payload, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise crash("injected post-create crash")
+        return original(root, relative, payload, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "_atomic_create_relative", crash_after_first)
+    with pytest.raises((KeyboardInterrupt, SystemExit, OSError, EvidenceError)):
+        EvidenceStore(tmp_path).publish(_provider_raw_batch())
+    assert not list(tmp_path.rglob("*.partial"))
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
 def test_task8_read_transaction_rejects_root_rename_and_replacement(monkeypatch, tmp_path):
     store, manifest, _, _ = _published(tmp_path)
     import backend.app.market.evidence as evidence_module
@@ -806,6 +862,78 @@ def test_task8_read_transaction_rejects_root_rename_and_replacement(monkeypatch,
     monkeypatch.setattr(evidence_module, "_read_descriptor_fd", replace_after_manifest)
     with pytest.raises(EvidenceError):
         EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_published_reader_rejects_copy_replacement_after_read(tmp_path):
+    store, manifest, evidence, _ = _published(tmp_path)
+    renamed = tmp_path.parent / f"{tmp_path.name}-renamed"
+    tmp_path.rename(renamed)
+    shutil.copytree(renamed, tmp_path)
+    with pytest.raises(EvidenceError):
+        evidence.read_rows()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("provider_id", "not-baostock"),
+        ("universe_id", "wrong-universe"),
+        ("source_schema", "wrong-schema.v9"),
+        ("schema_variant", "wrong-variant.v9"),
+        ("adapter_version", "wrong-adapter.v9"),
+        ("units", []),
+    ),
+)
+def test_task8_reader_rebuilds_typed_descriptor_graph(tmp_path, field, value):
+    _, manifest, _, _ = _published(tmp_path)
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["objects"][0][field] = value
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_reader_recomputes_selected_factor_value_hash(tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _factor_records()
+    factor_manifest, _ = store.publish_factor_snapshot(records, capture_id="capture-1")
+    manifest = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-1",
+        factor_resolution=(
+            _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),
+        ),
+    )
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    binding = raw["factor_resolution"][0]
+    binding["selected_value_semantic_hash"] = "f" * 64
+    binding.pop("resolution_sha256", None)
+    binding["resolution_sha256"] = _digest(binding)
+    raw["factor_resolution_sha256"] = _digest(raw["factor_resolution"])
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_replay_supports_explicit_semantic_compare(tmp_path):
+    store, manifest, _, _ = _published(tmp_path)
+    result = store.replay(manifest.evidence_id)
+    compared = store.replay(
+        manifest.evidence_id,
+        compare_semantic_sha=result.semantic_hash,
+        compare_adapter_version=manifest.adapter_version,
+    )
+    assert compared.status == "ready"
+    assert compared.semantic_match is True
 
 
 def test_task8_write_transaction_rejects_root_replacement(monkeypatch, tmp_path):

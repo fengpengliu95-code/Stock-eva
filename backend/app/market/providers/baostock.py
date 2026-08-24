@@ -403,9 +403,12 @@ class BaoStockProviderAdapter:
             raise TypeError("normalization requires a published evidence reader")
         bars: list[DailyBar] = []
         for item in tuple(evidence.read_rows()):
+            fields = tuple(item["fields"])
+            if "date" not in fields or "adjustflag" not in fields:
+                continue
             bars.extend(
                 normalize_baostock_rows(
-                    fields=item["fields"],
+                    fields=fields,
                     rows=item["rows"],
                     factor_fields=item.get("factor_fields", ()),
                     factor_rows=item.get("factor_rows", ()),

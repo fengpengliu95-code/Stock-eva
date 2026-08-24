@@ -24,6 +24,7 @@ from backend.app.market.automation import (
     MarketAutomationService,
     RefreshAlreadyRunning,
     RefreshRunLock,
+    canonical_refresh_callback,
     collect_required_symbols,
     get_market_clock,
     run_publication_refresh,
@@ -71,6 +72,7 @@ from backend.app.market.provider_health import (
     ProviderHealth,
     SQLiteProviderHealthStore,
 )
+from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
@@ -396,6 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--evidence-id", required=True, type=_evidence_id)
     replay.add_argument("--compare-candidate-sha", type=_sha256_argument)
+    replay.add_argument("--compare-semantic-sha", type=_sha256_argument)
+    replay.add_argument("--compare-adapter-version")
     provider_canary.add_argument(
         "--index-symbol",
         required=True,
@@ -754,6 +758,8 @@ def main() -> int:
                 get_settings().provider_evidence_root,
                 args.evidence_id,
                 args.compare_candidate_sha,
+                args.compare_semantic_sha,
+                args.compare_adapter_version,
             )
         except Exception:
             payload = {
@@ -1509,6 +1515,21 @@ def main() -> int:
                 factor_cache_path=str(layout.local_paths.factor_cache_database),
                 socket_timeout_seconds=socket_timeout_seconds,
             )
+            canonical_refresh = None
+            if hasattr(provider, "client") and hasattr(provider, "factor_cache"):
+                canonical_adapter = BaoStockProviderAdapter(
+                    client=provider.client,
+                    factor_cache=provider.factor_cache,
+                    min_request_interval_seconds=settings.auto_refresh_min_request_interval_seconds,
+                    socket_timeout_seconds=socket_timeout_seconds,
+                )
+                canonical_refresh = canonical_refresh_callback(
+                    store,
+                    canonical_adapter,
+                    evidence_root=layout.provider_evidence_root,
+                    lock_path=layout.market_refresh_lock,
+                    factor_cache=provider.factor_cache,
+                )
             user_store = UserStore(layout.local_paths.user_database)
             continuity = None
             coordinator = None
@@ -1581,6 +1602,7 @@ def main() -> int:
                 continuity=coordinator,
                 repair_enabled=(repair_executor is not None),
                 repair_executor=repair_executor,
+                canonical_refresh=canonical_refresh,
             )
             outcome = service.run_due_once(now)
             provider_health = health_store.provider_health()
