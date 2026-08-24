@@ -1,8 +1,10 @@
 from collections.abc import Callable
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 
 from backend.app.api.storage import get_storage_readiness
 from backend.app.config import Settings, get_settings
@@ -20,6 +22,8 @@ from backend.app.market.continuity import (
 )
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.provider_health import SQLiteProviderHealthStore
+from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
+from backend.app.market.providers.shadow_contracts import AdmissionState, ShadowProviderId
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
@@ -37,6 +41,59 @@ from backend.app.storage.models import StorageReadiness
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+class UnavailableReason(StrEnum):
+    REGISTRY_MISSING = "registry_missing"
+    REGISTRY_SCHEMA_INVALID = "registry_schema_invalid"
+    SHADOW_ROOT_UNAVAILABLE = "shadow_root_unavailable"
+    JOB_STORE_UNAVAILABLE = "job_store_unavailable"
+    CANONICAL_DESCRIPTOR_CHANGED = "canonical_descriptor_changed"
+    CANDIDATE_DESCRIPTOR_CHANGED = "candidate_descriptor_changed"
+    SELECTION_BINDING_INVALID = "selection_binding_invalid"
+    EVIDENCE_INCOMPLETE = "evidence_incomplete"
+    VERSION_VECTOR_DRIFT = "version_vector_drift"
+    CALENDAR_SNAPSHOT_INVALID = "calendar_snapshot_invalid"
+
+
+class ShadowProviderStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["ready", "unavailable"]
+    provider: ShadowProviderId | None = None
+    state: AdmissionState | None = None
+    unavailable_reason: UnavailableReason | None = None
+    report_id: str | None = None
+
+
+@router.get("/provider-status", response_model=ShadowProviderStatusResponse)
+def market_provider_status(
+    settings: Annotated[Settings, Depends(get_settings)],
+    provider_id: ShadowProviderId | None = None,
+) -> ShadowProviderStatusResponse:
+    """Read-only shadow status; this path never initializes or migrates registry state."""
+    if provider_id is None:
+        return ShadowProviderStatusResponse(
+            status="unavailable", unavailable_reason=UnavailableReason.REGISTRY_MISSING
+        )
+    path = StorageLayout(settings).provider_registry_database
+    if not path.is_file():
+        return ShadowProviderStatusResponse(
+            status="unavailable",
+            provider=provider_id,
+            unavailable_reason=UnavailableReason.REGISTRY_MISSING,
+        )
+    try:
+        record = ShadowRegistry(path).read_status(provider_id.value)
+    except RegistryUnavailable:
+        return ShadowProviderStatusResponse(
+            status="unavailable",
+            provider=provider_id,
+            unavailable_reason=UnavailableReason.REGISTRY_SCHEMA_INVALID,
+        )
+    return ShadowProviderStatusResponse(
+        status="ready", provider=record.provider_id, state=record.admission_state
+    )
 
 
 def get_calendar_sync_store(

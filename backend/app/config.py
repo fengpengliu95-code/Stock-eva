@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
     regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
     provider_health_database_name: str = "provider_health.sqlite3"
+    provider_registry_database_name: str = "provider_registry.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
@@ -42,6 +43,16 @@ class Settings(BaseSettings):
     provider_evidence_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
     provider_evidence_max_rows: int = Field(default=10_000_000, ge=1)
     provider_evidence_contract_version: str = "r2f2-evidence-v1"
+    provider_shadow_root: Path = Path("var/provider-shadow")
+    provider_shadow_enabled: bool = False
+    provider_shadow_max_object_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    provider_shadow_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
+    provider_shadow_max_rows: int = Field(default=10_000_000, ge=1)
+    provider_shadow_max_requests: int = Field(default=256, ge=1, le=10_000)
+    provider_shadow_request_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+    provider_shadow_execute_enabled: bool = False
+    provider_tickflow_token_env_name: str = "STOCK_EVA_TICKFLOW_TOKEN"
+    provider_tushare_token_env_name: str = "STOCK_EVA_TUSHARE_TOKEN"
     nas_market_dataset_root: Path | None = None
     local_market_dataset_root: Path | None = None
     supplemental_data_dir: Path | None = None
@@ -93,6 +104,54 @@ class Settings(BaseSettings):
     def validate_evidence_contract_version(cls, value: str) -> str:
         if value != "r2f2-evidence-v1":
             raise ValueError("provider evidence contract version is unsupported")
+        return value
+
+    @field_validator("provider_registry_database_name")
+    @classmethod
+    def validate_provider_registry_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("provider registry database name must be a local .sqlite3 basename")
+        return value
+
+    @field_validator("provider_shadow_max_object_bytes")
+    @classmethod
+    def validate_shadow_object_bound(cls, value: int) -> int:
+        if value != 64 * 1024 * 1024:
+            raise ValueError("provider shadow object bound is fixed")
+        return value
+
+    @field_validator("provider_shadow_max_manifest_bytes")
+    @classmethod
+    def validate_shadow_manifest_bound(cls, value: int) -> int:
+        if value != 1 * 1024 * 1024:
+            raise ValueError("provider shadow manifest bound is fixed")
+        return value
+
+    @field_validator("provider_shadow_max_rows")
+    @classmethod
+    def validate_shadow_row_bound(cls, value: int) -> int:
+        if value != 10_000_000:
+            raise ValueError("provider shadow row bound is fixed")
+        return value
+
+    @field_validator("provider_tickflow_token_env_name")
+    @classmethod
+    def validate_tickflow_token_env_name(cls, value: str) -> str:
+        if value != "STOCK_EVA_TICKFLOW_TOKEN":
+            raise ValueError("tickflow credential environment mapping is fixed")
+        return value
+
+    @field_validator("provider_tushare_token_env_name")
+    @classmethod
+    def validate_tushare_token_env_name(cls, value: str) -> str:
+        if value != "STOCK_EVA_TUSHARE_TOKEN":
+            raise ValueError("tushare credential environment mapping is fixed")
         return value
 
     @field_validator("user_database_name", "portfolio_database_name")

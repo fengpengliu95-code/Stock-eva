@@ -46,6 +46,43 @@ class StorageLayout:
         return self.local_paths.provider_health_database
 
     @property
+    def provider_registry_database(self) -> Path:
+        return self.settings.local_control_dir / self.settings.provider_registry_database_name
+
+    @property
+    def provider_registry_lock(self) -> Path:
+        return self.provider_registry_database.with_name(
+            self.provider_registry_database.name + ".lock"
+        )
+
+    @property
+    def provider_shadow_root(self) -> Path:
+        return self.settings.provider_shadow_root
+
+    @property
+    def provider_shadow_staging(self) -> Path:
+        return self.provider_shadow_root / "staging"
+
+    @property
+    def provider_shadow_bundles(self) -> Path:
+        return self.provider_shadow_root / "bundles"
+
+    def provider_shadow_attempt_staging(self, nonce: str) -> Path:
+        if not nonce or "/" in nonce or "\\" in nonce or nonce in {".", ".."}:
+            raise ValueError("shadow staging nonce must be a basename")
+        return self.provider_shadow_staging / nonce
+
+    def provider_shadow_bundle(self, evidence_id: str) -> Path:
+        if (
+            not evidence_id
+            or "/" in evidence_id
+            or "\\" in evidence_id
+            or evidence_id in {".", ".."}
+        ):
+            raise ValueError("shadow evidence ID must be a basename")
+        return self.provider_shadow_bundles / evidence_id
+
+    @property
     def provider_evidence_root(self) -> Path:
         return self.settings.provider_evidence_root
 

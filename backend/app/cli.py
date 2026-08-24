@@ -73,6 +73,8 @@ from backend.app.market.provider_health import (
     SQLiteProviderHealthStore,
 )
 from backend.app.market.providers.baostock import BaoStockProviderAdapter
+from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
+from backend.app.market.providers.shadow_contracts import ShadowProviderId
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
@@ -417,6 +419,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="acknowledge six independent endpoint probes and their reported actual requests",
     )
+    provider_status = subparsers.add_parser(
+        "market-provider-status",
+        help="read-only status of the isolated shadow provider registry",
+    )
+    provider_status.add_argument(
+        "--provider",
+        choices=tuple(item.value for item in ShadowProviderId),
+    )
     calendar_sync = subparsers.add_parser(
         "calendar-sync",
         help="plan or execute versioned BaoStock checks of the official calendar",
@@ -752,6 +762,46 @@ def main() -> int:
         return 2
     if args.command == "market-continuity":
         return _market_continuity_command(args)
+    if args.command == "market-provider-status":
+        settings = get_settings()
+        provider = args.provider
+        if provider is None:
+            payload = {
+                "status": "unavailable",
+                "provider": None,
+                "state": None,
+                "unavailable_reason": "registry_missing",
+                "writes": False,
+                "provider_requests": 0,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
+        path = StorageLayout(settings).provider_registry_database
+        try:
+            record = ShadowRegistry(path).read_status(provider)
+            payload = {
+                "status": "ready",
+                "provider": record.provider_id.value,
+                "state": record.admission_state.value,
+                "unavailable_reason": None,
+                "writes": False,
+                "provider_requests": 0,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+        except RegistryUnavailable:
+            payload = {
+                "status": "unavailable",
+                "provider": provider,
+                "state": None,
+                "unavailable_reason": "registry_missing"
+                if not path.exists()
+                else "registry_schema_invalid",
+                "writes": False,
+                "provider_requests": 0,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
     if args.command == "market-provider-replay":
         try:
             payload = replay_cli_payload(
