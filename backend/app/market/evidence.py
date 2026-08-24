@@ -132,6 +132,8 @@ class FactorCacheSnapshotRecords(_Immutable):
             raise ValueError("factor snapshot row count mismatch")
         if self.records_sha256 != _digest([row.model_dump(mode="json") for row in self.rows]):
             raise ValueError("factor snapshot records hash mismatch")
+        if self.before_fingerprint != self.after_fingerprint:
+            raise ValueError("factor snapshot changed during capture")
         symbols = tuple(row.symbol for row in self.rows)
         if symbols != tuple(sorted(set(symbols))):
             raise ValueError("factor snapshot rows must be ordered and unique")
@@ -418,11 +420,11 @@ class EvidenceManifest(_Immutable):
                     raise ValueError("factor resolution is not descriptor-bound")
         elif self.factor_resolution:
             raise ValueError("factor resolution requires a published factor snapshot")
-        if self.factor_resolution:
-            if self.factor_resolution_sha256 != _digest(
-                [item.model_dump(mode="json") for item in self.factor_resolution]
-            ):
-                raise ValueError("factor resolution aggregate hash mismatch")
+        expected_factor_resolution_hash = _digest(
+            [item.model_dump(mode="json") for item in self.factor_resolution]
+        )
+        if self.factor_resolution_sha256 != expected_factor_resolution_hash:
+            raise ValueError("factor resolution aggregate hash mismatch")
         manifest = self.model_dump(mode="json")
         manifest.pop("manifest_sha256", None)
         if self.manifest_sha256 != _digest(manifest):
@@ -605,11 +607,18 @@ def _open_or_create_directory(parent: int, component: str) -> int:
             ) from exc
 
 
-def _atomic_create_relative(root: Path, relative: str, payload: bytes) -> None:
+def _atomic_create_relative(
+    root: Path,
+    relative: str,
+    payload: bytes,
+    *,
+    root_fd: int | None = None,
+) -> None:
     """Create a content-addressed object through descriptor-bound directories."""
     parts = _safe_parts(relative)
-    root_fd = _open_root_dir(root, create=False)
-    parent = os.dup(root_fd)
+    owned_root_fd = root_fd is None
+    opened_root_fd = _open_root_dir(root, create=False) if owned_root_fd else os.dup(root_fd)
+    parent = os.dup(opened_root_fd)
     try:
         for component in parts[:-1]:
             child = _open_or_create_directory(parent, component)
@@ -674,7 +683,7 @@ def _atomic_create_relative(root: Path, relative: str, payload: bytes) -> None:
         raise EvidenceError("content-addressed path is unsafe", "EVIDENCE_UNSAFE_PATH") from exc
     finally:
         os.close(parent)
-        os.close(root_fd)
+        os.close(opened_root_fd)
 
 
 def _parquet_bytes(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> bytes:
@@ -844,6 +853,24 @@ class EvidenceReader:
                                 "rows": tuple(decoded),
                             }
                         )
+                if factor_rows and evidence.manifest.factor_resolution:
+                    rows_by_key = {
+                        f"{row['symbol']}.{row['trade_date']}": row for row in factor_rows
+                    }
+                    factor_fields = ("code", "dividOperateDate", "backAdjustFactor")
+                    factor_rows = [
+                        rows_by_key[binding.cache.record_key]
+                        for binding in evidence.manifest.factor_resolution
+                        if binding.cache is not None and binding.cache.record_key in rows_by_key
+                    ]
+                    factor_rows = [
+                        {
+                            "code": row["symbol"],
+                            "dividOperateDate": row["trade_date"],
+                            "backAdjustFactor": row["back_adjust_factor"],
+                        }
+                        for row in factor_rows
+                    ]
                 if factor_rows:
                     for page in pages:
                         page["factor_fields"] = factor_fields
@@ -980,7 +1007,6 @@ class EvidenceReader:
         compare_candidate_sha: str | None = None,
         adapter: object | None = None,
         factor_cache: object | None = None,
-        normalizer: object | None = None,
     ) -> ReplayResult:
         try:
             evidence = self.read(evidence_id)
@@ -998,7 +1024,7 @@ class EvidenceReader:
                 # Replay is immutable: this argument is accepted only as a sentinel
                 # in tests and is deliberately never dereferenced.
                 del factor_cache
-            selected_adapter = adapter or normalizer
+            selected_adapter = adapter
             if selected_adapter is None:
                 from backend.app.market.providers.baostock import BaoStockProviderAdapter
 
@@ -1008,21 +1034,12 @@ class EvidenceReader:
                 raise EvidenceError(
                     "typed evidence adapter is required", "EVIDENCE_SCHEMA_MISMATCH"
                 )
-            if normalizer is not None and adapter is None:
-                # Legacy compatibility tests used a typed reader assertion helper;
-                # the production path below always uses the frozen clock.
-                legacy_result = normalize(evidence)
-                if isinstance(legacy_result, PublishedEvidence):
-                    normalized = ()
-                else:
-                    raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
-            else:
-                normalized = normalize(
-                    evidence,
-                    normalization_clock_utc=manifest.normalization_clock_utc,
-                )
-                if not isinstance(normalized, tuple):
-                    raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
+            normalized = normalize(
+                evidence,
+                normalization_clock_utc=manifest.normalization_clock_utc,
+            )
+            if not isinstance(normalized, tuple):
+                raise EvidenceError("adapter normalization failed", "EVIDENCE_SCHEMA_MISMATCH")
         except EvidenceError as exc:
             return ReplayResult(
                 status="error",
@@ -1061,9 +1078,7 @@ class EvidenceReader:
             byte_match=None
             if compare_candidate_sha is None
             else candidate == compare_candidate_sha,
-            semantic_match=(
-                None if compare_candidate_sha is None else candidate == compare_candidate_sha
-            ),
+            semantic_match=(None),
             normalization_clock_utc=manifest.normalization_clock_utc,
             row_count=manifest.row_count,
             trade_date=manifest.trade_date,
@@ -1085,6 +1100,10 @@ class EvidenceStore:
         self.max_rows = max_rows
 
     def _prepare_root(self) -> None:
+        root_fd = self._prepare_root_fd()
+        os.close(root_fd)
+
+    def _prepare_root_fd(self) -> int:
         root_fd = _open_root_dir(self.root, create=True)
         try:
             for name in (
@@ -1098,8 +1117,36 @@ class EvidenceStore:
             ):
                 child = _open_or_create_directory(root_fd, name)
                 os.close(child)
-        finally:
+        except BaseException:
             os.close(root_fd)
+            raise
+        return root_fd
+
+    @staticmethod
+    def _unlink_relative_fd(root_fd: int, relative: str) -> None:
+        parts = _safe_parts(relative)
+        parent = os.dup(root_fd)
+        try:
+            for component in parts[:-1]:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent,
+                )
+                os.close(parent)
+                parent = child
+            os.unlink(parts[-1], dir_fd=parent)
+        finally:
+            os.close(parent)
+
+    @staticmethod
+    def _relative_exists_fd(root_fd: int, relative: str) -> bool:
+        try:
+            descriptor = open_evidence_relative(root_fd, relative)
+        except EvidenceError:
+            return False
+        os.close(descriptor)
+        return True
 
     def publish_factor_snapshot(
         self,
@@ -1114,8 +1161,11 @@ class EvidenceStore:
         )
         if len(payload) > self.max_object_bytes:
             raise EvidenceError("factor object exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
-        self._prepare_root()
-        _atomic_create_relative(self.root, descriptor.relative_path, payload)
+        root_fd = self._prepare_root_fd()
+        try:
+            _atomic_create_relative(self.root, descriptor.relative_path, payload, root_fd=root_fd)
+        finally:
+            os.close(root_fd)
         return factor, descriptor
 
     @staticmethod
@@ -1290,7 +1340,7 @@ class EvidenceStore:
             factor_cache_snapshot=factor_snapshot,
             factor_resolution=(factor_resolution or getattr(batch, "factor_resolution", ())),
             factor_resolution_sha256=(
-                getattr(batch, "factor_resolution_sha256", "0" * 64)
+                getattr(batch, "factor_resolution_sha256", _digest([]))
                 if not factor_resolution
                 else _digest([item.model_dump(mode="json") for item in factor_resolution])
             ),
@@ -1317,43 +1367,58 @@ class EvidenceStore:
         if len(payload) > MAX_MANIFEST_BYTES:
             raise EvidenceError("evidence manifest exceeds bound", "EVIDENCE_OBJECT_OVERSIZE")
         writes.append((f"manifests/{manifest_id}.json", payload))
-        self._prepare_root()
-        root_metadata = os.stat(self.root, follow_symlinks=False)
+        root_fd = self._prepare_root_fd()
+        root_metadata = os.fstat(root_fd)
         root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         created: list[str] = []
+        preexisting = {
+            relative for relative, _content in writes if self._relative_exists_fd(root_fd, relative)
+        }
         try:
             for relative, content in writes:
                 try:
-                    current = os.stat(self.root, follow_symlinks=False)
+                    current = os.fstat(root_fd)
+                    configured = os.stat(self.root, follow_symlinks=False)
                 except OSError as exc:
                     raise EvidenceError(
                         "evidence root changed during write", "EVIDENCE_HASH_MISMATCH"
                     ) from exc
-                if (current.st_dev, current.st_ino) != root_identity:
+                if (current.st_dev, current.st_ino) != root_identity or (
+                    configured.st_dev,
+                    configured.st_ino,
+                ) != root_identity:
                     raise EvidenceError("evidence root was replaced", "EVIDENCE_HASH_MISMATCH")
-                _atomic_create_relative(self.root, relative, content)
+                _atomic_create_relative(self.root, relative, content, root_fd=root_fd)
                 created.append(relative)
+            current = os.fstat(root_fd)
+            configured = os.stat(self.root, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != root_identity or (
+                configured.st_dev,
+                configured.st_ino,
+            ) != root_identity:
+                raise EvidenceError("evidence root was replaced", "EVIDENCE_HASH_MISMATCH")
         except BaseException as exc:
             # Best-effort rollback protects pre-existing content-addressed objects.
-            for relative in reversed(created):
+            expected_payloads = dict(writes)
+            for relative in reversed(tuple(expected_payloads)):
+                if relative in preexisting:
+                    continue
                 try:
-                    root_fd = _open_root_dir(self.root, create=False)
-                    parts = _safe_parts(relative)
-                    parent = os.dup(root_fd)
-                    for component in parts[:-1]:
-                        child = os.open(
-                            component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-                        )
-                        os.close(parent)
-                        parent = child
-                    os.unlink(parts[-1], dir_fd=parent)
-                    os.close(parent)
-                    os.close(root_fd)
+                    descriptor = open_evidence_relative(root_fd, relative)
+                    try:
+                        expected = expected_payloads[relative]
+                        _read_existing_fd(descriptor, expected)
+                    finally:
+                        os.close(descriptor)
+                    self._unlink_relative_fd(root_fd, relative)
                 except (OSError, EvidenceError):
                     pass
             if isinstance(exc, KeyboardInterrupt):
+                os.close(root_fd)
                 raise
+            os.close(root_fd)
             raise EvidenceError("evidence publication failed", "EVIDENCE_WRITE_FAILED") from exc
+        os.close(root_fd)
         return manifest
 
     @staticmethod
@@ -1535,14 +1600,12 @@ class EvidenceStore:
         compare_candidate_sha: str | None = None,
         adapter: object | None = None,
         factor_cache: object | None = None,
-        normalizer: object | None = None,
     ) -> ReplayResult:
         return EvidenceReader(self.root, max_object_bytes=self.max_object_bytes).replay(
             evidence_id,
             compare_candidate_sha=compare_candidate_sha,
             adapter=adapter,
             factor_cache=factor_cache,
-            normalizer=normalizer,
         )
 
 

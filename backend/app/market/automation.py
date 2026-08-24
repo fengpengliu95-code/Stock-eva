@@ -88,13 +88,10 @@ def publish_provider_evidence(
         normalize = getattr(adapter, "normalize", None)
         if not callable(normalize):
             raise ProviderHealthError("typed evidence adapter is required")
-        try:
-            normalized = normalize(
-                evidence,
-                normalization_clock_utc=manifest.normalization_clock_utc,
-            )
-        except TypeError:
-            normalized = normalize(evidence)
+        normalized = normalize(
+            evidence,
+            normalization_clock_utc=manifest.normalization_clock_utc,
+        )
         if not isinstance(normalized, (tuple, PublishedEvidence)):
             raise ProviderHealthError("evidence adapter returned an invalid type")
     return manifest, evidence
@@ -111,9 +108,11 @@ def publish_provider_evidence_with_factor_cache(
     factor_resolution=(),
     factor_resolution_factory: Callable[[object], tuple] | None = None,
     adapter: object | None = None,
+    _lock_held: bool = False,
 ) -> tuple[EvidenceManifest, PublishedEvidence]:
     """Capture factors and publish evidence under the existing refresh lock only."""
-    with RefreshRunLock(lock_path):
+    lock_context = nullcontext() if _lock_held else RefreshRunLock(lock_path)
+    with lock_context:
         capture_id = uuid.uuid4().hex
         before_rows = factor_cache.exact_snapshot_records(factor_symbols, trade_date)
         before_fingerprint = hashlib.sha256(
@@ -152,13 +151,10 @@ def publish_provider_evidence_with_factor_cache(
             normalize = getattr(adapter, "normalize", None)
             if not callable(normalize):
                 raise ProviderHealthError("typed evidence adapter is required")
-            try:
-                normalized = normalize(
-                    evidence,
-                    normalization_clock_utc=manifest.normalization_clock_utc,
-                )
-            except TypeError:
-                normalized = normalize(evidence)
+            normalized = normalize(
+                evidence,
+                normalization_clock_utc=manifest.normalization_clock_utc,
+            )
             if not isinstance(normalized, (tuple, PublishedEvidence)):
                 raise ProviderHealthError("evidence adapter returned an invalid type")
         return manifest, evidence
@@ -169,6 +165,11 @@ def run_canonical_raw_refresh(
     request: object,
     *,
     evidence_root: Path,
+    lock_path: Path,
+    factor_cache: object | None = None,
+    factor_symbols: tuple[str, ...] = (),
+    trade_date: date | None = None,
+    factor_resolution=(),
 ) -> tuple[EvidenceManifest, PublishedEvidence, tuple[object, ...]]:
     """Run the explicit evidence-first compatibility seam for a raw refresh.
 
@@ -183,16 +184,32 @@ def run_canonical_raw_refresh(
     fetch_raw = getattr(adapter, "fetch_raw", None)
     if not callable(fetch_raw):
         raise ProviderHealthError("canonical raw refresh requires raw provider contract")
-    batch = fetch_raw(request)
-    manifest, evidence = publish_provider_evidence(
-        batch,
-        evidence_root=evidence_root,
-        adapter=adapter,
-    )
-    normalized = adapter.normalize(
-        evidence,
-        normalization_clock_utc=manifest.normalization_clock_utc,
-    )
+    with RefreshRunLock(lock_path):
+        batch = fetch_raw(request)
+        if factor_cache is not None:
+            if not factor_symbols or trade_date is None:
+                raise ProviderHealthError("canonical factor capture requires symbols and date")
+            manifest, evidence = publish_provider_evidence_with_factor_cache(
+                batch,
+                evidence_root=evidence_root,
+                factor_cache=factor_cache,
+                factor_symbols=factor_symbols,
+                trade_date=trade_date,
+                lock_path=lock_path,
+                factor_resolution=factor_resolution,
+                adapter=adapter,
+                _lock_held=True,
+            )
+        else:
+            manifest, evidence = publish_provider_evidence(
+                batch,
+                evidence_root=evidence_root,
+                adapter=adapter,
+            )
+        normalized = adapter.normalize(
+            evidence,
+            normalization_clock_utc=manifest.normalization_clock_utc,
+        )
     return manifest, evidence, normalized
 
 

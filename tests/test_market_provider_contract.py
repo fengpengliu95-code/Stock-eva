@@ -1268,10 +1268,30 @@ def test_baostock_compatibility_produces_existing_daily_bar_semantics() -> None:
                 },
             )
 
-    adapter = BaoStockProviderAdapter(client=_NetworkSentinelClient())
-    bars = adapter.normalize(Evidence(), normalization_clock_utc=NOW)
-    assert bars[0].close == 10.5
-    assert bars[0].adjust_factor == 0.8
+    with pytest.raises(TypeError):
+        BaoStockProviderAdapter(client=_NetworkSentinelClient()).normalize(
+            Evidence(), normalization_clock_utc=NOW
+        )
+
+
+def test_baostock_normalize_rejects_mutable_raw_duck_type_even_with_legal_page_shape() -> None:
+    payload = json.loads((Path(__file__).parent / "fixtures" / "baostock_daily.json").read_text())
+
+    class MutableRaw:
+        def read_rows(self):
+            return (
+                {
+                    "fields": payload["daily_fields"],
+                    "rows": payload["daily_rows"],
+                    "factor_fields": payload["factor_fields"],
+                    "factor_rows": payload["factor_rows"],
+                },
+            )
+
+    with pytest.raises(TypeError):
+        BaoStockProviderAdapter(client=_NetworkSentinelClient()).normalize(
+            MutableRaw(), normalization_clock_utc=NOW
+        )
 
 
 def test_daily_schema_preserves_legal_suspended_empty_activity_and_factor() -> None:

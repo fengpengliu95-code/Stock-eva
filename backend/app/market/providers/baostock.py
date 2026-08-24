@@ -395,7 +395,11 @@ class BaoStockProviderAdapter:
     def normalize(
         self, evidence: object, *, normalization_clock_utc: datetime
     ) -> tuple[DailyBar, ...]:
-        if not hasattr(evidence, "read_rows"):
+        # Runtime import keeps the provider contract independent of Task 8's
+        # storage module while rejecting mutable/raw duck-typed objects.
+        from backend.app.market.evidence import PublishedEvidence
+
+        if not isinstance(evidence, PublishedEvidence):
             raise TypeError("normalization requires a published evidence reader")
         bars: list[DailyBar] = []
         for item in tuple(evidence.read_rows()):

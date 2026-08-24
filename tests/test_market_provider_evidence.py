@@ -14,7 +14,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.app.market.automation import publish_provider_evidence_with_factor_cache
+from backend.app.market.automation import (
+    publish_provider_evidence_with_factor_cache,
+    run_canonical_raw_refresh,
+)
 from backend.app.market.evidence import (
     CacheFactorResolution,
     EvidenceError,
@@ -97,14 +100,6 @@ def _factor_binding(object_id: str, object_sha: str) -> FactorResolutionBinding:
     serialized = candidate.model_dump(mode="json")
     serialized.pop("resolution_sha256", None)
     return FactorResolutionBinding(**values, resolution_sha256=_digest(serialized))
-
-
-class _TypedReaderAdapter:
-    def normalize(self, evidence):
-        from backend.app.market.evidence import PublishedEvidence
-
-        assert isinstance(evidence, PublishedEvidence)
-        return evidence
 
 
 def _descriptor(tmp_path: Path, *, kind=EvidenceObjectKind.RAW_ENDPOINT_PAGE, **updates):
@@ -245,9 +240,12 @@ def test_offline_replay_has_zero_network_and_zero_canonical_pointer_writes(tmp_p
     store, manifest, evidence, _ = _published(tmp_path)
     reader = EvidenceReader(tmp_path)
     rows = reader.read_rows(evidence, manifest.objects[0])
-    replay = store.replay(manifest.evidence_id, normalizer=_TypedReaderAdapter())
+    replay = store.replay(
+        manifest.evidence_id,
+        adapter=BaoStockProviderAdapter(client=object()),
+    )
     assert replay.status == "ready"
-    assert _TypedReaderAdapter().normalize(evidence).manifest.evidence_id == manifest.evidence_id
+    assert replay.normalization_clock_utc == manifest.normalization_clock_utc
     assert rows and rows[0]["code"] == "sh.600000"
 
 
@@ -257,7 +255,7 @@ def test_replay_is_deterministic_and_matches_online_candidate(tmp_path):
     second = store.replay(manifest.evidence_id, compare_candidate_sha="f" * 64)
     assert first == second
     assert first.byte_match is False
-    assert first.semantic_match is False
+    assert first.semantic_match is None
 
 
 def test_replay_injects_frozen_normalization_clock_and_excludes_invocation_time(tmp_path):
@@ -497,7 +495,7 @@ def test_factor_snapshot_replay_opens_descriptor_dirfd_and_rejects_live_cache(tm
         factor_resolution_factory=lambda factor_manifest: (
             _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),
         ),
-        adapter=_TypedReaderAdapter(),
+        adapter=BaoStockProviderAdapter(client=object()),
     )
     assert calls == 2
     assert manifest.factor_cache_snapshot is not None
@@ -624,6 +622,38 @@ def test_task8_canonical_publish_read_normalize_uses_bound_real_adapter_and_froz
         )
 
 
+def test_task8_real_adapter_resolves_published_factor_snapshot_to_provider_factor_rows(tmp_path):
+    store = EvidenceStore(tmp_path)
+    records = _factor_records()
+    factor_manifest, _ = store.publish_factor_snapshot(records, capture_id="capture-1")
+    manifest = store.publish(
+        _provider_raw_batch(),
+        factor_records=records,
+        capture_id="capture-1",
+        factor_resolution=(
+            _factor_binding(factor_manifest.object_id, factor_manifest.object_sha256),
+        ),
+    )
+    evidence = store.read(manifest.evidence_id)
+    bars = BaoStockProviderAdapter(client=object()).normalize(
+        evidence, normalization_clock_utc=manifest.normalization_clock_utc
+    )
+    assert bars and bars[0].adjust_factor == 1.0
+
+
+def test_task8_canonical_raw_refresh_is_real_adapter_and_lock_bound(monkeypatch, tmp_path):
+    adapter = BaoStockProviderAdapter(client=object())
+    monkeypatch.setattr(adapter, "fetch_raw", lambda request: _provider_raw_batch())
+    manifest, evidence, bars = run_canonical_raw_refresh(
+        adapter,
+        object(),
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+    )
+    assert manifest.evidence_id == evidence.manifest.evidence_id
+    assert bars and bars[0].symbol == "sh.600000"
+
+
 def test_task8_factor_binding_failure_is_preflight_zero_write(tmp_path):
     with pytest.raises(EvidenceError):
         EvidenceStore(tmp_path).publish(
@@ -666,6 +696,28 @@ def test_task8_replay_real_adapter_is_deterministic_and_does_not_read_live_facto
     )
 
 
+def test_task8_empty_factor_resolution_hash_is_recomputed_not_arbitrary(tmp_path):
+    _, manifest, _, _ = _published(tmp_path)
+    path = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    raw = json.loads(path.read_text())
+    raw["factor_resolution_sha256"] = "f" * 64
+    raw["manifest_sha256"] = _digest(
+        {key: value for key, value in raw.items() if key != "manifest_sha256"}
+    )
+    path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(EvidenceError):
+        EvidenceReader(tmp_path).read(manifest.evidence_id)
+
+
+def test_task8_semantic_hash_is_independent_from_byte_candidate_hash(tmp_path):
+    store, manifest, _, _ = _published(tmp_path)
+    result = store.replay(manifest.evidence_id, compare_candidate_sha="f" * 64)
+    assert result.status == "ready"
+    assert result.candidate_sha256 != result.semantic_hash
+    assert result.byte_match is False
+    assert result.semantic_match is None
+
+
 def test_task8_factor_binding_record_key_must_exist_in_published_snapshot(tmp_path):
     store = EvidenceStore(tmp_path)
     factor_manifest, _ = store.publish_factor_snapshot(_factor_records(), capture_id="capture-1")
@@ -684,6 +736,12 @@ def test_task8_factor_binding_record_key_must_exist_in_published_snapshot(tmp_pa
         )
 
 
+def test_task8_standalone_factor_snapshot_rejects_forged_before_after_fingerprints(tmp_path):
+    with pytest.raises(ValueError):
+        records = _factor_records().model_copy(update={"after_fingerprint": "f" * 64})
+        EvidenceStore(tmp_path).publish_factor_snapshot(records, capture_id="capture-1")
+
+
 def test_task8_write_crash_leaves_no_canonical_partial_or_object(monkeypatch, tmp_path):
     import backend.app.market.evidence as evidence_module
 
@@ -694,6 +752,26 @@ def test_task8_write_crash_leaves_no_canonical_partial_or_object(monkeypatch, tm
     with pytest.raises(KeyboardInterrupt):
         EvidenceStore(tmp_path).publish(_provider_raw_batch())
     assert not list(tmp_path.rglob("*.partial"))
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_task8_post_create_crash_rolls_back_created_by_transaction(monkeypatch, tmp_path):
+    import backend.app.market.evidence as evidence_module
+
+    original = evidence_module._atomic_create_relative
+    calls = 0
+
+    def crash_after_first(root, relative, payload, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("injected post-create crash")
+        return original(root, relative, payload, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "_atomic_create_relative", crash_after_first)
+    with pytest.raises(KeyboardInterrupt):
+        EvidenceStore(tmp_path).publish(_provider_raw_batch())
     assert not list(tmp_path.rglob("*.parquet"))
     assert not list(tmp_path.rglob("*.json"))
 
