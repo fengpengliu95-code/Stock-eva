@@ -394,12 +394,17 @@ def test_new_canonical_manifest_requires_lineage_for_new_entries(tmp_path):
         gate_report=report,
         evidence=evidence,
     )
-    with pytest.raises(TypeError, match="evidence"):
-        CandidateStore(tmp_path / "candidates").publish_selection(
+    root = tmp_path / "candidates"
+    root.mkdir()
+    with pytest.raises(AttributeError, match="publish_selection"):
+        CandidateStore(root).publish_selection(
             selection,
             candidate=candidate,
             gate_report=report,
+            evidence=evidence,
         )
+    assert not (root / "selections").exists()
+    assert not (root / "bundles").exists()
     evidence.close()
 
 
@@ -827,6 +832,15 @@ def test_normalized_subset_or_universe_substitution_is_rejected(tmp_path):
             evidence=evidence,
             normalized_payload=payload,
         )
+    evidence.close()
+
+
+def test_publish_requires_approved_five_request_plan_shape(tmp_path):
+    evidence, _report, _candidate = _real_candidate_bundle(tmp_path)
+    with pytest.raises(ValueError, match="logical request plan"):
+        from backend.app.market.candidates import _validate_approved_plan
+
+        _validate_approved_plan(evidence)
     evidence.close()
 
 

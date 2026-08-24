@@ -428,17 +428,55 @@ class PublishedCandidateRejection(_Immutable):
             "candidate.json": _canonical(self.candidate.model_dump(mode="json")),
         }
         for name, payload in expected.items():
+            try:
+                CandidateStore(Path(self.root_path))._assert_root(root_fd, identity)
+            except OSError as exc:
+                raise EvidenceError(
+                    "rejection audit root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+                ) from exc
             descriptor = open_evidence_relative(root_fd, f"{self.bundle_relative_path}/{name}")
             try:
                 info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise EvidenceError(
+                        "rejection audit file is not regular", "EVIDENCE_UNSAFE_PATH"
+                    )
                 data = os.read(descriptor, info.st_size + 1)
+                after = os.fstat(descriptor)
+                if (after.st_dev, after.st_ino, after.st_size, after.st_ctime_ns) != (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_ctime_ns,
+                ):
+                    raise EvidenceError(
+                        "rejection audit changed during read", "EVIDENCE_HASH_MISMATCH"
+                    )
             finally:
                 os.close(descriptor)
             if data != payload:
                 raise EvidenceError("rejection audit changed", "EVIDENCE_HASH_MISMATCH")
+            try:
+                CandidateStore(Path(self.root_path))._assert_root(root_fd, identity)
+            except OSError as exc:
+                raise EvidenceError(
+                    "rejection audit root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+                ) from exc
+        try:
+            CandidateStore(Path(self.root_path))._assert_root(root_fd, identity)
+        except OSError as exc:
+            raise EvidenceError(
+                "rejection audit root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+            ) from exc
         normalized = CandidateStore._readback(
             root_fd, f"{self.bundle_relative_path}/normalized.json"
         )
+        try:
+            CandidateStore(Path(self.root_path))._assert_root(root_fd, identity)
+        except OSError as exc:
+            raise EvidenceError(
+                "rejection audit root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+            ) from exc
         if hashlib.sha256(normalized).hexdigest() != self.candidate.normalized_object_sha256:
             raise EvidenceError("rejection normalized object changed", "EVIDENCE_HASH_MISMATCH")
         return self
@@ -802,31 +840,6 @@ class CandidateStore:
                 root_identity=identity,
             )
 
-    def publish_selection(
-        self,
-        selection: SessionSelection,
-        *,
-        candidate: CandidateManifest,
-        gate_report: CandidateGateReport,
-        evidence: PublishedEvidence,
-    ) -> Path:
-        validate_candidate_lineage(candidate, evidence, gate_report)
-        if selection.selected_candidate_id != candidate.candidate_id:
-            raise ValueError("selection candidate lineage mismatch")
-        if selection.candidate_manifest_sha256 != candidate.manifest_sha256:
-            raise ValueError("selection candidate hash mismatch")
-        if selection.gate_report_sha256 != gate_report.aggregate_sha256:
-            raise ValueError("selection gate hash mismatch")
-        if selection.evidence_sha256 != candidate.evidence_sha256:
-            raise ValueError("selection evidence hash mismatch")
-        with self._bound_root() as (fd, identity):
-            return self._write_once(
-                f"selections/{selection.selection_id}.json",
-                self._payload(selection),
-                root_fd=fd,
-                root_identity=identity,
-            )
-
     def publish_chain(
         self,
         *,
@@ -850,6 +863,8 @@ class CandidateStore:
             rows = tuple(DailyBar.model_validate(item) for item in decoded)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("normalized candidate object is invalid") from exc
+        if evidence.manifest.universe_id == "all-main-board":
+            _validate_approved_plan(evidence)
         durable_symbols, _durable_roles = _durable_universe(evidence)
         if (
             len(rows) != candidate.row_count
@@ -1147,6 +1162,57 @@ def _durable_universe(evidence: PublishedEvidence) -> tuple[tuple[str, ...], dic
     if not symbols:
         raise ValueError("durable universe is empty")
     return tuple(sorted(symbols)), symbols
+
+
+def _validate_approved_plan(evidence: PublishedEvidence) -> None:
+    requests = evidence.manifest.logical_request_plan.requests
+    if len(requests) != 5:
+        raise ValueError("logical request plan must contain exactly five requests")
+    expected = (
+        (ProviderEndpoint.ALL_STOCK, "universe", "stock", "all_stock.market.v1", ()),
+        (ProviderEndpoint.DAILY_ASTOCK, "daily_stock", "stock", "daily_astock.v1", None),
+        (ProviderEndpoint.DAILY_FACTOR, "daily_factor", "stock", "daily_factor.v1", None),
+        (
+            ProviderEndpoint.INDEX_HISTORY,
+            "index_history",
+            "index",
+            "index_history.session.v1",
+            ("sh.000001",),
+        ),
+        (
+            ProviderEndpoint.INDEX_HISTORY,
+            "index_history",
+            "index",
+            "index_history.session.v1",
+            ("sz.399001",),
+        ),
+    )
+    stock_symbols = requests[1].symbols
+    if not stock_symbols:
+        raise ValueError("logical request plan daily stock symbols are empty")
+    for ordinal, (request, shape) in enumerate(zip(requests, expected, strict=True)):
+        endpoint, request_role, role, schema, symbols = shape
+        if request.plan_ordinal != ordinal or request.endpoint is not endpoint:
+            raise ValueError("logical request plan ordinal or endpoint is invalid")
+        if request.schema_variant != schema:
+            raise ValueError("logical request plan schema is invalid")
+        if request.request_role.value != request_role:
+            raise ValueError("logical request plan request role is invalid")
+        if request.instrument_role is None or request.instrument_role.value != role:
+            raise ValueError("logical request plan role is invalid")
+        if (
+            request.start_date != request.end_date
+            or request.start_date != evidence.manifest.trade_date
+        ):
+            raise ValueError("logical request plan date is invalid")
+        if symbols is not None and request.symbols != symbols:
+            raise ValueError("logical request plan symbol cardinality is invalid")
+    if requests[0].symbols or requests[1].instrument_role.value != "stock":
+        raise ValueError("logical request plan universe shape is invalid")
+    if requests[2].symbols != stock_symbols:
+        raise ValueError("logical request plan factor symbols do not match daily stock")
+    if len(stock_symbols) != len(set(stock_symbols)):
+        raise ValueError("logical request plan has duplicate stock symbols")
 
 
 def evaluate_candidate_gates(
