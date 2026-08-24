@@ -13,6 +13,7 @@ import re
 import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 from typing import Any, Protocol
 
@@ -246,6 +247,67 @@ class HttpResult:
     payload: Any
     attempts: int
     request_count: int
+
+
+@dataclass(frozen=True)
+class AuthorizedCanarySession:
+    """The sole network execution capability for a shadow provider."""
+
+    provider_id: str
+    registry_path: Path
+    external_authorization_id: str
+    transport: HttpTransport
+
+    def execute(self, adapter: Any, trade_date: Any, *, symbols: tuple[str, ...] = ()) -> Any:
+        if getattr(adapter, "PROVIDER_ID", None) != self.provider_id:
+            raise CanaryPermissionError("authorized session provider mismatch")
+        if self.provider_id == "tushare":
+            from .tushare import TushareExecutionBlocked
+
+            raise TushareExecutionBlocked("tushare official HTTPS is unproven")
+        from .registry import ShadowRegistry
+
+        client: BoundedHttpClient | None = None
+        payloads: dict[str, Any] = {}
+        for endpoint in adapter.ENDPOINTS:
+            registry = ShadowRegistry(self.registry_path)
+            permit = build_canary_permit(
+                self.provider_id,
+                registry,
+                external_authorization_id=self.external_authorization_id,
+                adapter_hash=adapter.ADAPTER_HASH,
+                endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
+                source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
+            )
+            if client is None:
+                client = BoundedHttpClient(self.transport)
+            payloads[endpoint] = client.request_json(
+                endpoint,
+                params=adapter.request_params(endpoint, trade_date, symbols),
+                headers=permit.headers(),
+            )
+        return adapter.parse(
+            trade_date, payloads, request_count=client.request_count if client else 0
+        )
+
+
+def build_authorized_canary_session(
+    provider_id: str,
+    registry_path: Path | str,
+    *,
+    external_authorization_id: str,
+    transport: HttpTransport,
+) -> AuthorizedCanarySession:
+    if provider_id not in {"tickflow", "tushare"}:
+        raise CanaryPermissionError("provider descriptor unavailable")
+    if not _valid_authorization_id(external_authorization_id):
+        raise CanaryPermissionError("external authorization is invalid")
+    return AuthorizedCanarySession(
+        provider_id=provider_id,
+        registry_path=Path(registry_path),
+        external_authorization_id=external_authorization_id,
+        transport=transport,
+    )
 
 
 def _safe_identity(value: str) -> str:

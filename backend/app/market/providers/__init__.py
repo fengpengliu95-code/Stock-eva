@@ -44,12 +44,14 @@ from .base import (
     validate_safe_relative_path,
 )
 from .http import (
+    AuthorizedCanarySession,
     BoundedHTTPClient,
     BoundedHttpClient,
     CanaryPermissionError,
     HttpPolicy,
     HttpRequestPolicy,
     ProviderHttpError,
+    build_authorized_canary_session,
     build_canary_permit,
 )
 from .tickflow import (
@@ -73,7 +75,9 @@ __all__ = [
     "BaoStockProviderAdapter",
     "BoundedHttpClient",
     "CanaryPermissionError",
+    "AuthorizedCanarySession",
     "build_canary_permit",
+    "build_authorized_canary_session",
     "BoundedHTTPClient",
     "HttpPolicy",
     "HttpRequestPolicy",

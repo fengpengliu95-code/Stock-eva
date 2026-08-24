@@ -243,8 +243,11 @@ def test_recovery_only_removes_owned_staging_and_writes_sanitized_audit(tmp_path
     )
     (staging / "raw-provider-secret").write_text("secret-token")
     result = store.recover_orphans()
-    assert result.removed == 1
-    assert not staging.exists()
+    # An owner marker without a canonical manifest/COMMIT is incomplete and
+    # therefore fail-closed: recovery must not delete a forged staging entry.
+    assert result.removed == 0
+    assert result.skipped == 1
+    assert staging.exists()
     assert "secret-token" not in result.model_dump_json()
 
 
@@ -265,7 +268,7 @@ def test_reader_rejects_hardlinks_extra_files_and_mutation(tmp_path):
         ),
     )
     final = tmp_path / "bundles" / bundle.evidence_id
-    page = next((final / "pages").iterdir())
+    page = next(path for path in (final / "pages").rglob("*.json"))
     (final / "hardlink").hardlink_to(page)
     with pytest.raises(RuntimeError):
         ShadowEvidenceReader(tmp_path).read(bundle.evidence_id)

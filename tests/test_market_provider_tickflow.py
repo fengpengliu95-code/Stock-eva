@@ -1,6 +1,7 @@
 """Offline RED/GREEN contract tests for the TickFlow shadow adapter."""
 
 import copy
+import hashlib
 import json
 from datetime import date
 
@@ -8,9 +9,17 @@ import pytest
 
 from backend.app.market.providers.http import (
     BoundedHttpClient,
+    CanaryPermissionError,
     HttpPolicy,
     ProviderHttpError,
     _CanaryPermit,
+    build_authorized_canary_session,
+)
+from backend.app.market.providers.registry import ShadowRegistry, exact_credential_env
+from backend.app.market.providers.shadow_contracts import (
+    AdmissionState,
+    ShadowProviderRecord,
+    TermsEvidence,
 )
 from backend.app.market.providers.tickflow import TickFlowAdapter
 
@@ -46,9 +55,18 @@ def test_tickflow_requests_unadjusted_daily_and_universe_without_inference():
             FakeResponse(payload={"data": [{"symbol": "sh.000001"}]}),
         ]
     )
-    adapter = TickFlowAdapter(BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)))
-    with pytest.raises(PermissionError):
-        adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
+    adapter = TickFlowAdapter()
+    result = adapter.parse(
+        date(2026, 8, 20),
+        {
+            "daily": {"data": [{"date": "2026-08-20", "symbol": "sh.600000", "close": 10}]},
+            "universe": {"data": [{"symbol": "sh.600000"}]},
+            "indexes": {"data": [{"symbol": "sh.000001"}]},
+        },
+        request_count=3,
+    )
+    assert result.daily[0]["close"] == 10
+    assert result.adjusted is False
     assert client.calls == []
 
 
@@ -77,7 +95,7 @@ def test_http_client_has_bounded_timeout_retry_after_and_request_budget():
 
 def test_canary_plan_makes_zero_network_calls(tmp_path):
     client = FakeClient([])
-    adapter = TickFlowAdapter(BoundedHttpClient(client), plan_only=True)
+    adapter = TickFlowAdapter(plan_only=True)
     plan = adapter.plan(date(2026, 8, 20), symbols=("sh.600000",))
     assert plan.request_count >= 1
     assert client.calls == []
@@ -94,22 +112,18 @@ def test_http_or_token_never_enters_exception_or_evidence():
 
 def test_public_tickflow_fetch_is_plan_only_and_never_networks_without_permit():
     client = FakeClient([])
-    adapter = TickFlowAdapter(BoundedHttpClient(client))
-    with pytest.raises(PermissionError):
-        adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
+    adapter = TickFlowAdapter()
+    assert adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",)).request_count == 3
     assert client.calls == []
 
 
 def test_unissued_permit_constructor_object_new_and_copy_are_rejected_before_network():
     client = FakeClient([])
-    adapter = TickFlowAdapter(BoundedHttpClient(client))
     with pytest.raises(PermissionError):
         _CanaryPermit("tickflow", "external")
     forged = object.__new__(_CanaryPermit)
-    with pytest.raises(PermissionError):
-        adapter.fetch(date(2026, 8, 20), permit=forged)
     with pytest.raises((PermissionError, TypeError)):
-        adapter.fetch(date(2026, 8, 20), permit=copy.copy(forged))
+        copy.copy(forged)
     assert client.calls == []
 
 
@@ -136,3 +150,69 @@ def test_http_rejects_empty_content_even_when_json_method_claims_payload():
     with pytest.raises(ProviderHttpError) as captured:
         BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)).request_json("daily")
     assert captured.value.failure_class == "malformed_json"
+
+
+def test_authorized_session_revalidates_real_canary_registry_before_fake_transport(
+    tmp_path, monkeypatch
+):
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    registry = ShadowRegistry(tmp_path / "provider-registry.sqlite3")
+    registry.initialize()
+    registry.put_provider(
+        ShadowProviderRecord(
+            provider_id="tickflow",
+            admission_state=AdmissionState.DISCOVERED,
+            adapter_hash=TickFlowAdapter.ADAPTER_HASH,
+            endpoint_contract_hash=TickFlowAdapter.ENDPOINT_CONTRACT_HASH,
+            source_schema_hash=TickFlowAdapter.SOURCE_SCHEMA_HASH,
+            normalizer_hash=digest("normalizer"),
+            reconciliation_policy_hash=digest("policy"),
+            credential_env_name=exact_credential_env("tickflow"),
+            intended_use="internal research",
+            retention_decision="local bounded",
+            quota_contract="pending",
+            required_fields_json="[]",
+            unit_contract_json="{}",
+            state_version=0,
+            quarantine_reason=None,
+        )
+    )
+    terms = TermsEvidence.build(
+        terms_evidence_id="terms-tickflow",
+        provider_id="tickflow",
+        official_url_allowlist=("https://example.invalid/terms",),
+        content_object_relpath="terms.txt",
+        content_bytes=b"reviewed terms",
+        contract_version="r2f3-terms-v1",
+        as_of_date="2026-08-25",
+        reviewer="reviewer-1",
+        review_id="review-1",
+        approved_intended_use="internal research",
+        approved_retention="local bounded",
+        approved_credential_mode="environment-only",
+        approved_quota_decision="pending-canary",
+    )
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider("tickflow", terms)
+    registry.transition("tickflow", "canary", expected_state_version=attached.state_version)
+    monkeypatch.setenv("STOCK_EVA_TICKFLOW_TOKEN", "fake-token")
+    transport = FakeClient([FakeResponse(payload={"data": []}) for _ in range(3)])
+    session = build_authorized_canary_session(
+        "tickflow",
+        registry.path,
+        external_authorization_id="auth-round3",
+        transport=transport,
+    )
+    result = TickFlowAdapter().execute(date(2026, 8, 20), session=session)
+    assert result.request_count == 3
+    assert len(transport.calls) == 3
+    assert all(
+        call[2]["headers"] == {"Authorization": "Bearer fake-token"} for call in transport.calls
+    )
+    monkeypatch.setenv("STOCK_EVA_TICKFLOW_TOKEN", "fake-token-2")
+    registry.transition("tickflow", "quarantined", expected_state_version=2)
+    with pytest.raises(CanaryPermissionError):
+        TickFlowAdapter().execute(date(2026, 8, 20), session=session)
+    assert len(transport.calls) == 3

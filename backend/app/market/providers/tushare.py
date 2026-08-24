@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import BoundedHttpClient, CanaryPermissionError, _CanaryPermit, _check_canary_permit
+from .http import AuthorizedCanarySession
 
 ADAPTER_HASH = "4" * 64
 ENDPOINT_CONTRACT_HASH = "5" * 64
@@ -103,6 +103,10 @@ def _validate_daily(rows: tuple[dict[str, Any], ...], trade_date: date) -> None:
 
 
 class TushareAdapter:
+    PROVIDER_ID = "tushare"
+    ADAPTER_HASH = ADAPTER_HASH
+    ENDPOINT_CONTRACT_HASH = ENDPOINT_CONTRACT_HASH
+    SOURCE_SCHEMA_HASH = SOURCE_SCHEMA_HASH
     ENDPOINTS = (
         "daily",
         "adj_factor",
@@ -127,13 +131,7 @@ class TushareAdapter:
         ),
     }
 
-    def __init__(
-        self,
-        http_client: BoundedHttpClient | None = None,
-        *,
-        plan_only: bool = False,
-    ) -> None:
-        self.http = http_client
+    def __init__(self, *, plan_only: bool = True) -> None:
         self.plan_only = plan_only
 
     def source_contract(self, endpoint: str) -> TushareSourceContract:
@@ -165,49 +163,14 @@ class TushareAdapter:
             request_count=len(requests),
         )
 
-    def fetch(
-        self,
-        trade_date: date,
-        *,
-        symbols: tuple[str, ...] = (),
-        permit: _CanaryPermit | None = None,
-    ) -> TushareSourceBatch | TusharePlan:
-        if not OFFICIAL_HTTPS_PROVEN:
-            raise CanaryPermissionError("tushare official HTTPS is unproven")
-        checked = _check_canary_permit(
-            permit,
-            provider_id="tushare",
-            adapter_hash=ADAPTER_HASH,
-            endpoint_contract_hash=ENDPOINT_CONTRACT_HASH,
-            source_schema_hash=SOURCE_SCHEMA_HASH,
-        )
-        return self._fetch_with_permit(trade_date, symbols=symbols, permit=checked)
+    def request_params(
+        self, endpoint: str, trade_date: date, symbols: tuple[str, ...]
+    ) -> dict[str, str]:
+        return {"trade_date": trade_date.strftime("%Y%m%d"), "ts_code": ",".join(symbols)}
 
-    def _fetch_with_permit(
-        self,
-        trade_date: date,
-        *,
-        symbols: tuple[str, ...] = (),
-        permit: _CanaryPermit,
-    ) -> TushareSourceBatch | TusharePlan:
-        if not OFFICIAL_HTTPS_PROVEN:
-            raise CanaryPermissionError("tushare official HTTPS is unproven")
-        plan = self.plan(trade_date, symbols=symbols)
-        if self.plan_only:
-            return plan
-        if self.http is None:
-            raise ValueError("shadow HTTP client is required")
-        headers = permit.headers()
-        params = {"trade_date": trade_date.strftime("%Y%m%d"), "ts_code": ",".join(symbols)}
-        payloads = {
-            endpoint: self.http.request_json(
-                endpoint,
-                method="POST",
-                json_body={"api_name": endpoint, **params},
-                headers=headers,
-            )
-            for endpoint in self.ENDPOINTS
-        }
+    def parse(
+        self, trade_date: date, payloads: dict[str, Any], *, request_count: int = 0
+    ) -> TushareSourceBatch:
         daily = _rows(payloads["daily"])
         _validate_daily(daily, trade_date)
         return TushareSourceBatch(
@@ -218,7 +181,7 @@ class TushareAdapter:
             trade_cal=_rows(payloads["trade_cal"]),
             index_daily=_rows(payloads["index_daily"]),
             stock_basic=_rows(payloads["stock_basic"]),
-            request_count=self.http.request_count,
+            request_count=request_count,
         )
 
     def execute(
@@ -226,25 +189,16 @@ class TushareAdapter:
         trade_date: date,
         *,
         symbols: tuple[str, ...] = (),
-        permit: _CanaryPermit | None = None,
+        session: AuthorizedCanarySession | None = None,
     ) -> TushareSourceBatch:
-        # The permit factory has already checked terms, static HTTPS and the closed env map.
         if not OFFICIAL_HTTPS_PROVEN:
             raise TushareExecutionBlocked("tushare official HTTPS is unproven")
-        try:
-            checked = _check_canary_permit(
-                permit,
-                provider_id="tushare",
-                adapter_hash=ADAPTER_HASH,
-                endpoint_contract_hash=ENDPOINT_CONTRACT_HASH,
-                source_schema_hash=SOURCE_SCHEMA_HASH,
-            )
-        except CanaryPermissionError as exc:
-            raise TushareExecutionBlocked("private canary permit required") from exc
-        result = self._fetch_with_permit(trade_date, symbols=symbols, permit=checked)
-        if isinstance(result, TusharePlan):
-            raise TushareExecutionBlocked("shadow HTTP client unavailable")
-        return result
+        if session is None:
+            raise TushareExecutionBlocked("authorized canary session required")
+        return session.execute(self, trade_date, symbols=symbols)
+
+    def fetch(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TusharePlan:
+        return self.plan(trade_date, symbols=symbols)
 
     run = fetch
     TushareProvider = None

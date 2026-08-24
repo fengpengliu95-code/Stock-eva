@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import BoundedHttpClient, _CanaryPermit, _check_canary_permit
+from .http import AuthorizedCanarySession
 
 ADAPTER_HASH = "1" * 64
 ENDPOINT_CONTRACT_HASH = "2" * 64
@@ -88,10 +88,13 @@ def _validate_daily(rows: tuple[dict[str, Any], ...], trade_date: date) -> None:
 
 
 class TickFlowAdapter:
+    PROVIDER_ID = "tickflow"
+    ADAPTER_HASH = ADAPTER_HASH
+    ENDPOINT_CONTRACT_HASH = ENDPOINT_CONTRACT_HASH
+    SOURCE_SCHEMA_HASH = SOURCE_SCHEMA_HASH
     ENDPOINTS = ("daily", "universe", "indexes")
 
-    def __init__(self, http_client: BoundedHttpClient | None = None, *, plan_only: bool = False):
-        self.http = http_client
+    def __init__(self, *, plan_only: bool = True):
         self.plan_only = plan_only
 
     def plan(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TickFlowPlan:
@@ -120,45 +123,14 @@ class TickFlowAdapter:
     def canary_plan(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TickFlowPlan:
         return self.plan(trade_date, symbols=symbols)
 
-    def fetch(
-        self,
-        trade_date: date,
-        *,
-        symbols: tuple[str, ...] = (),
-        permit: _CanaryPermit | None = None,
-    ) -> TickFlowSourceBatch | TickFlowPlan:
-        checked = _check_canary_permit(
-            permit,
-            provider_id="tickflow",
-            adapter_hash=ADAPTER_HASH,
-            endpoint_contract_hash=ENDPOINT_CONTRACT_HASH,
-            source_schema_hash=SOURCE_SCHEMA_HASH,
-        )
-        return self._fetch_with_permit(trade_date, symbols=symbols, permit=checked)
+    def request_params(
+        self, endpoint: str, trade_date: date, symbols: tuple[str, ...]
+    ) -> dict[str, str]:
+        return {"trade_date": trade_date.isoformat(), "symbols": ",".join(symbols)}
 
-    def _fetch_with_permit(
-        self,
-        trade_date: date,
-        *,
-        symbols: tuple[str, ...] = (),
-        permit: _CanaryPermit,
-    ) -> TickFlowSourceBatch | TickFlowPlan:
-        plan = self.plan(trade_date, symbols=symbols)
-        if self.plan_only:
-            return plan
-        if self.http is None:
-            raise ValueError("shadow HTTP client is required")
-        headers = permit.headers()
-        payloads: dict[str, Any] = {}
-        for endpoint in self.ENDPOINTS:
-            payloads[endpoint] = self.http.request_json(
-                endpoint,
-                params={
-                    "trade_date": trade_date.isoformat(),
-                    "symbols": ",".join(symbols),
-                },
-                headers=headers,
-            )
+    def parse(
+        self, trade_date: date, payloads: dict[str, Any], *, request_count: int = 0
+    ) -> TickFlowSourceBatch:
         daily = _rows(payloads["daily"])
         _validate_daily(daily, trade_date)
         return TickFlowSourceBatch(
@@ -166,13 +138,25 @@ class TickFlowAdapter:
             daily=daily,
             universe=_rows(payloads["universe"]),
             indexes=_rows(payloads["indexes"]),
-            request_count=self.http.request_count,
+            request_count=request_count,
         )
+
+    def execute(
+        self,
+        trade_date: date,
+        *,
+        symbols: tuple[str, ...] = (),
+        session: AuthorizedCanarySession,
+    ) -> TickFlowSourceBatch:
+        return session.execute(self, trade_date, symbols=symbols)
+
+    def fetch(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TickFlowPlan:
+        return self.plan(trade_date, symbols=symbols)
 
     def run(
         self, trade_date: date, *, symbols: tuple[str, ...] = ()
     ) -> TickFlowSourceBatch | TickFlowPlan:
-        return self.fetch(trade_date, symbols=symbols)
+        return self.plan(trade_date, symbols=symbols)
 
 
 # Short aliases are useful to callers that name the source rather than the adapter role.

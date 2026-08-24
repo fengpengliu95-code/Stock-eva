@@ -19,7 +19,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
 
 class ShadowEvidenceUnavailable(RuntimeError):
@@ -84,6 +84,25 @@ def _page_content_sha(page: dict[str, Any]) -> str:
     return _sha(
         _json_bytes({"page_identity": page.get("page_identity"), "rows": page.get("rows", [])})
     )
+
+
+def canonical_page_object_ref(
+    ordinal: int, request_id: str, page_identity: str, page_sequence: int
+) -> str:
+    if ordinal < 0 or page_sequence < 1 or not request_id or not page_identity:
+        raise ShadowEvidenceUnavailable("shadow page identity unavailable")
+    digest = _sha(
+        b"stock-eva/r2f3/page-ref/v1\n"
+        + _json_bytes(
+            {
+                "ordinal": ordinal,
+                "request_id": request_id,
+                "page_identity": page_identity,
+                "page_sequence": page_sequence,
+            }
+        )
+    )[:16]
+    return f"pages/{ordinal:06d}-{page_sequence:06d}-{digest}.json"
 
 
 class _Frozen(BaseModel):
@@ -248,7 +267,12 @@ def _completion_contract_values(completion: ShadowRequestCompletion) -> dict[str
             {
                 "ordinal": ordinal,
                 "page_identity": page["page_identity"],
-                "object_ref": page.get("object_ref", f"pages/{completion.ordinal}-{ordinal}.json"),
+                "object_ref": page.get(
+                    "object_ref",
+                    canonical_page_object_ref(
+                        completion.ordinal, completion.request_id, page["page_identity"], ordinal
+                    ),
+                ),
                 "content_sha256": page.get(
                     "content_sha256",
                     _page_content_sha({"page_identity": page["page_identity"], "rows": rows}),
@@ -280,11 +304,11 @@ def _shadow_completion_digest_values(completion: ShadowCompletion) -> dict[str, 
 
 
 class ShadowCompletion(_Frozen):
-    session_id: str = "session-offline"
-    job_id: str = "job-offline"
-    provider_id: str = ""
-    window_id: str = "window-offline"
-    evidence_id: str
+    session_id: str = Field(default="session-offline", pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    job_id: str = Field(default="job-offline", pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    provider_id: str = Field(default="", pattern=r"^[A-Za-z0-9._-]{0,64}$")
+    window_id: str = Field(default="window-offline", pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    evidence_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
     request_plan_sha256: str
     requests: tuple[ShadowRequestCompletion, ...] = Field(min_length=1)
     exact_ordinal_set: frozenset[int] | None = None
@@ -397,6 +421,19 @@ class ShadowEvidenceBundle(_Frozen):
     evidence_ready: bool = True
 
 
+class ShadowOwner(_Frozen):
+    """Canonical staging ownership marker used by recovery and the reader."""
+
+    nonce: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    evidence_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    job_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    provider_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    window_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    session_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    plan_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    completion_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class ShadowRecoveryResult(_Frozen):
     removed: int = Field(ge=0)
     skipped: int = Field(ge=0)
@@ -441,8 +478,9 @@ class ShadowEvidenceControlSink:
         self,
         *,
         evidence: ShadowEvidenceBundle,
+        reader: ShadowEvidenceReader,
         plan: ShadowLogicalRequestPlan,
-        completions: Iterable[ShadowRequestCompletion],
+        completion: ShadowCompletion,
         attempts: Iterable[ShadowAttempt],
         session_id: str,
         trade_date: date,
@@ -453,26 +491,66 @@ class ShadowEvidenceControlSink:
         bundle_ref: str | None = None,
         bundle_sha256: str | None = None,
     ) -> ShadowControlResult:
-        completion_items = tuple(completions)
-        attempt_by_id = {item.attempt_id: item for item in attempts}
+        verified_evidence, descriptor = reader.read_descriptor(evidence.evidence_id)
+        if verified_evidence != evidence:
+            raise ShadowEvidenceUnavailable("shadow evidence reader mismatch")
+        if (
+            completion.evidence_id != evidence.evidence_id
+            or completion.request_plan_sha256 != plan.request_plan_sha256
+            or completion.provider_id != plan.provider_id
+            or completion.window_id != plan.window_id
+            or completion.job_id != plan.job_id
+        ):
+            raise ShadowEvidenceUnavailable("shadow completion identity mismatch")
+        completion_items = tuple(completion.requests)
+        attempt_items = tuple(attempts)
+        attempt_by_id = {item.attempt_id: item for item in attempt_items}
         if (
             len(completion_items) != len(plan.requests)
             or {item.ordinal for item in completion_items} != plan.exact_ordinal_set
         ):
             raise ShadowEvidenceUnavailable("shadow completion is incomplete")
+        if (
+            descriptor.get("plan_requests")
+            != [_request_contract_values(item) for item in plan.requests]
+            or descriptor.get("completion") != _shadow_completion_digest_values(completion)
+            or descriptor.get("plan_sha256") != plan.request_plan_sha256
+            or descriptor.get("completion_sha256") != completion.completion_sha256
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence descriptor mismatch")
+        if len({item.attempt_id for item in attempt_items}) != len(attempt_items):
+            raise ShadowEvidenceUnavailable("shadow attempt identity is duplicated")
+        attempts_by_ordinal: dict[int, list[ShadowAttempt]] = {}
+        for item in attempt_items:
+            attempts_by_ordinal.setdefault(item.ordinal, []).append(item)
         reports: list[ShadowAttemptReport] = []
         refs: list[tuple[ShadowRequestCompletion, ShadowAttempt]] = []
+        observed_page_refs: list[str] = []
+        observed_rows = 0
         for completion in sorted(completion_items, key=lambda item: item.ordinal):
             request = plan.requests[completion.ordinal]
             attempt = attempt_by_id.get(completion.final_attempt_id)
+            history = attempts_by_ordinal.get(completion.ordinal, [])
             if (
                 attempt is None
+                or not history
+                or [item.attempt_number for item in history] != list(range(1, len(history) + 1))
+                or history[-1].attempt_id != completion.final_attempt_id
+                or any(item.outcome == "success" for item in history[:-1])
+                or any(item.pages or item.final_page_refs for item in history[:-1])
                 or attempt.outcome != "success"
                 or attempt.ordinal != completion.ordinal
                 or completion.request_id != request.request_id
                 or completion.endpoint != request.endpoint
+                or completion.endpoint_class != request.endpoint_class
+                or completion.outcome != "success"
+                or not completion.final_success
             ):
                 raise ShadowEvidenceUnavailable("shadow final attempt unavailable")
+            if tuple(attempt.pages) != tuple(completion.pages):
+                raise ShadowEvidenceUnavailable("shadow final page history mismatch")
+            observed_page_refs.extend(page["page_identity"] for page in completion.pages)
+            observed_rows += sum(len(page.get("rows", [])) for page in completion.pages)
             page_ids = tuple(str(page["page_identity"]) for page in completion.pages)
             row_count = sum(len(page.get("rows", [])) for page in completion.pages)
             report_id = f"report-{_safe(session_id)}-{completion.ordinal:06d}"
@@ -504,6 +582,30 @@ class ShadowEvidenceControlSink:
             )
             reports.append(report)
             refs.append((completion, attempt))
+        if tuple(observed_page_refs) != evidence.page_refs or observed_rows != len(evidence.rows):
+            raise ShadowEvidenceUnavailable("shadow evidence aggregate mismatch")
+        expected_pages = []
+        for item in sorted(completion_items, key=lambda value: value.ordinal):
+            for page_number, page in enumerate(item.pages, start=1):
+                expected_ref = canonical_page_object_ref(
+                    item.ordinal, item.request_id, page["page_identity"], page_number
+                )
+                expected_pages.append(
+                    {
+                        "ordinal": item.ordinal,
+                        "page_identity": page["page_identity"],
+                        "object_ref": expected_ref,
+                        "relative_path": expected_ref,
+                        "content_sha256": _page_content_sha(page),
+                        "row_count": len(page.get("rows", [])),
+                    }
+                )
+        if (
+            descriptor.get("pages") != expected_pages
+            or descriptor.get("page_refs") != observed_page_refs
+            or descriptor.get("row_count") != observed_rows
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence page descriptor mismatch")
         reports_tuple = tuple(reports)
         session_report_id = f"session-report-{_safe(session_id)}-v1"
         report_json, report_sha = self._report_digest(session_report_id, reports_tuple)
@@ -670,7 +772,12 @@ class ShadowEvidenceControlSink:
         safe_session = _safe(session_id)
         if trade_date is None:
             raise ShadowEvidenceUnavailable("shadow failure trade date is required")
-        ordinals_tuple = tuple(sorted(set(int(item) for item in ordinals)))
+        raw_ordinals = tuple(ordinals)
+        if any(type(item) is not int for item in raw_ordinals):
+            raise ShadowEvidenceUnavailable("shadow failure ordinal closure is invalid")
+        if len(set(raw_ordinals)) != len(raw_ordinals):
+            raise ShadowEvidenceUnavailable("shadow failure ordinal closure is duplicated")
+        ordinals_tuple = tuple(sorted(raw_ordinals))
         if not ordinals_tuple or frozenset(ordinals_tuple) != plan.exact_ordinal_set:
             raise ShadowEvidenceUnavailable("shadow failure closure is incomplete")
         if (safe_job, safe_provider, safe_window) != (
@@ -679,6 +786,9 @@ class ShadowEvidenceControlSink:
             plan.window_id,
         ):
             raise ShadowEvidenceUnavailable("shadow failure identity mismatch")
+        plan_dates = {request.trade_date for request in plan.requests}
+        if len(plan_dates) != 1 or trade_date not in plan_dates:
+            raise ShadowEvidenceUnavailable("shadow failure trade date mismatch")
         reports = tuple(
             ShadowAttemptReport(
                 report_id=f"report-{safe_session}-{ordinal:06d}",
@@ -688,8 +798,8 @@ class ShadowEvidenceControlSink:
                 window_id=safe_window,
                 session_id=safe_session,
                 logical_request_ordinal=ordinal,
-                request_id=f"request-{ordinal:06d}",
-                endpoint_class="unknown",
+                request_id=plan.requests[ordinal].request_id,
+                endpoint_class=plan.requests[ordinal].endpoint_class,
                 outcome=outcome,
                 failure_class="provider_failure" if outcome == "failure" else outcome,
                 durable_report_ref=f"session/{safe_session}",
@@ -730,7 +840,7 @@ class ShadowEvidenceControlSink:
                         report.window_id,
                         report.session_id,
                         report.request_id,
-                        "unknown",
+                        report.endpoint_class,
                         report.endpoint_class,
                         report.logical_request_ordinal,
                         1,
@@ -877,30 +987,113 @@ class ShadowEvidenceManifest(_Frozen):
 def _open_verified(path: Path, *, max_bytes: int) -> bytes:
     # macOS exposes /var and /tmp as system symlinks.  Resolve only these trusted
     # aliases before the no-follow ancestor walk; user-created symlinks remain rejected.
-    absolute = Path(os.path.abspath(path))
-    if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
-        path = Path("/private/var", *absolute.parts[2:])
-    elif absolute.parts[1:2] == ("tmp",) and Path("/tmp").is_symlink():
-        path = Path("/private/tmp", *absolute.parts[2:])
-    if path.name in {".", ".."} or "/" in path.name:
+    path = _physical_path(path)
+    if not path.is_absolute() or path.name in {".", ".."} or "/" in path.name:
         raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+    directory_fds: list[int] = []
     try:
-        for ancestor in reversed(path.parents):
-            info = os.lstat(ancestor)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        current_fd = os.open(
+            "/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        directory_fds.append(current_fd)
+        before_dirs = [os.fstat(current_fd)]
+        for component in path.parts[1:-1]:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            directory_fds.append(current_fd)
+            before_dirs.append(os.fstat(current_fd))
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fds[-1],
+        )
     except OSError:
+        for open_fd in reversed(directory_fds):
+            os.close(open_fd)
         raise ShadowEvidenceUnavailable("shadow evidence unavailable") from None
     try:
-        parent_fd = os.open(
-            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > max_bytes
+            or before.st_mode & 0o022
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        data = os.read(fd, max_bytes + 1)
+        after = os.fstat(fd)
+        after_dirs = [os.fstat(open_fd) for open_fd in directory_fds]
+        if any(
+            (old.st_dev, old.st_ino, old.st_mode, old.st_ctime_ns)
+            != (new.st_dev, new.st_ino, new.st_mode, new.st_ctime_ns)
+            for old, new in zip(before_dirs, after_dirs, strict=True)
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        if len(data) > max_bytes or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        return data
+    finally:
+        os.close(fd)
+        for open_fd in reversed(directory_fds):
+            os.close(open_fd)
+
+
+def _open_directory_fd(path: Path) -> int:
+    """Open every directory component without following a user-controlled link."""
+    physical = _physical_path(path)
+    if not physical.is_absolute():
+        raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+    fds: list[int] = []
+    try:
+        current = os.open(
+            "/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
-        fd = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        fds.append(current)
+        for component in physical.parts[1:]:
+            current = os.open(
+                component,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current,
+            )
+            fds.append(current)
+        info = os.fstat(current)
+        if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 2:
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        result = os.dup(current)
     except OSError:
         raise ShadowEvidenceUnavailable("shadow evidence unavailable") from None
     finally:
-        if "parent_fd" in locals():
-            os.close(parent_fd)
+        for open_fd in reversed(fds):
+            os.close(open_fd)
+    return result
+
+
+def _read_verified_at(directory_fd: int, name: str, *, max_bytes: int) -> bytes:
+    if not name or "/" in name or name in {".", ".."}:
+        raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+    try:
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+    except OSError:
+        raise ShadowEvidenceUnavailable("shadow evidence unavailable") from None
     try:
         before = os.fstat(fd)
         if (
@@ -1005,6 +1198,31 @@ def _mkdir_chain(path: Path) -> None:
         current /= component
 
 
+def _mkdir_exclusive(path: Path) -> None:
+    """Create one owned directory through its already-trusted parent fd."""
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+        child_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            info = os.fstat(child_fd)
+            if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 2:
+                raise ShadowEvidenceUnavailable("shadow staging unavailable")
+            os.fsync(child_fd)
+        finally:
+            os.close(child_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _exclusive_rename(source: Path, destination: Path) -> None:
     if destination.exists():
         raise FileExistsError(destination)
@@ -1081,34 +1299,127 @@ class ShadowEvidenceStore:
         for entry in os.scandir(self.staging):
             try:
                 info = entry.stat(follow_symlinks=False)
-                if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 1:
+                if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 2:
                     skipped += 1
                     continue
                 owner = Path(entry.path) / "OWNER"
                 marker = _open_verified(owner, max_bytes=4096)
                 values = json.loads(marker.decode("utf-8"))
-                if (
-                    set(values)
-                    != {
-                        "nonce",
+                owner_model = ShadowOwner.model_validate(values)
+                if owner_model.nonce != entry.name:
+                    skipped += 1
+                    continue
+                manifest_raw = _open_verified(
+                    Path(entry.path) / "manifest.json", max_bytes=self.max_object_bytes
+                )
+                manifest = json.loads(manifest_raw.decode("utf-8"))
+                required_manifest = {
+                    "evidence_id",
+                    "nonce",
+                    "job_id",
+                    "plan_sha256",
+                    "completion_sha256",
+                    "provider_id",
+                    "window_id",
+                    "session_id",
+                    "plan_requests",
+                    "completion",
+                    "page_refs",
+                    "pages",
+                    "row_count",
+                    "manifest_sha256",
+                    "rows",
+                }
+                if set(manifest) != required_manifest:
+                    skipped += 1
+                    continue
+                if any(
+                    manifest[key] != getattr(owner_model, key)
+                    for key in (
                         "evidence_id",
+                        "nonce",
                         "job_id",
                         "provider_id",
                         "window_id",
                         "session_id",
                         "plan_sha256",
                         "completion_sha256",
-                    }
-                    or values["nonce"] != entry.name
-                    or not _safe(values["evidence_id"])
-                    or not _safe(values["job_id"])
+                    )
                 ):
                     skipped += 1
                     continue
-                descendants = list(os.walk(entry.path, topdown=True, followlinks=False))
-                if any(Path(path).is_symlink() for path, _dirs, _files in descendants):
+                plan_requests = tuple(
+                    ShadowLogicalRequest.model_validate(
+                        {
+                            **request,
+                            "job_id": owner_model.job_id,
+                            "provider_id": owner_model.provider_id,
+                            "window_id": owner_model.window_id,
+                        }
+                    )
+                    for request in manifest["plan_requests"]
+                )
+                plan_model = ShadowLogicalRequestPlan.model_validate(
+                    {
+                        "job_id": owner_model.job_id,
+                        "provider_id": owner_model.provider_id,
+                        "window_id": owner_model.window_id,
+                        "requests": plan_requests,
+                        "request_plan_sha256": owner_model.plan_sha256,
+                    }
+                )
+                if plan_model.request_plan_sha256 != owner_model.plan_sha256:
                     skipped += 1
                     continue
+                if owner_model.completion_sha256 != _sha(
+                    b"stock-eva/r2f3/completion/v1\n" + _json_bytes(manifest["completion"])
+                ):
+                    skipped += 1
+                    continue
+                manifest_values = {
+                    key: manifest[key]
+                    for key in (
+                        "evidence_id",
+                        "nonce",
+                        "job_id",
+                        "plan_sha256",
+                        "completion_sha256",
+                        "page_refs",
+                        "pages",
+                        "row_count",
+                        "provider_id",
+                        "window_id",
+                        "session_id",
+                        "plan_requests",
+                        "completion",
+                    )
+                }
+                if manifest["manifest_sha256"] != _sha(
+                    b"stock-eva/r2f3/shadow-evidence/v1\n" + _json_bytes(manifest_values)
+                ):
+                    skipped += 1
+                    continue
+                commit = _open_verified(Path(entry.path) / "COMMIT", max_bytes=128)
+                if commit != f"COMMIT\n{manifest['manifest_sha256']}\n".encode():
+                    skipped += 1
+                    continue
+                for child in os.scandir(entry.path):
+                    child_info = child.stat(follow_symlinks=False)
+                    if child.is_symlink():
+                        raise ShadowEvidenceUnavailable("shadow staging unavailable")
+                    if child.is_dir(follow_symlinks=False):
+                        if child.name != "pages":
+                            raise ShadowEvidenceUnavailable("shadow staging unavailable")
+                        for page in os.scandir(child.path):
+                            page_info = page.stat(follow_symlinks=False)
+                            if (
+                                page.is_symlink()
+                                or not stat.S_ISREG(page_info.st_mode)
+                                or page_info.st_nlink != 1
+                            ):
+                                raise ShadowEvidenceUnavailable("shadow staging unavailable")
+                    elif not stat.S_ISREG(child_info.st_mode) or child_info.st_nlink != 1:
+                        raise ShadowEvidenceUnavailable("shadow staging unavailable")
                 shutil.rmtree(entry.path)
                 removed += 1
             except Exception:
@@ -1142,8 +1453,10 @@ class ShadowEvidenceStore:
             durable_report_ref="audit/report.json",
         )
         path = self.audit / f"{report.report_id}.json"
-        path.write_bytes(report.canonical_bytes())
-        os.chmod(path, 0o600)
+        try:
+            _write_private_file(path, report.canonical_bytes())
+        except FileExistsError:
+            raise ShadowEvidenceUnavailable("shadow audit identity unavailable") from None
         return report
 
     def publish(
@@ -1176,6 +1489,8 @@ class ShadowEvidenceStore:
         ) != len(plan_obj.requests):
             raise ShadowEvidenceUnavailable("shadow completion is incomplete")
         by_id = {item.attempt_id: item for item in attempt_items}
+        if len(by_id) != len(attempt_items):
+            raise ShadowEvidenceUnavailable("shadow attempt identity is duplicated")
         by_ordinal: dict[int, list[ShadowAttempt]] = {}
         for attempt in attempt_items:
             by_ordinal.setdefault(attempt.ordinal, []).append(attempt)
@@ -1228,10 +1543,10 @@ class ShadowEvidenceStore:
         rows: list[dict[str, Any]] = []
         page_refs: list[str] = []
         page_descriptors: list[dict[str, Any]] = []
-        nonce = f"{evidence_id}-{secrets.token_hex(8)}"
+        nonce = secrets.token_hex(16)
         staging = self.staging / nonce
         try:
-            staging.mkdir(mode=0o700)
+            _mkdir_exclusive(staging)
         except FileExistsError:
             raise ShadowEvidenceUnavailable("shadow staging identity unavailable") from None
         owner = staging / "OWNER"
@@ -1251,14 +1566,19 @@ class ShadowEvidenceStore:
             ),
         )
         pages = staging / "pages"
-        pages.mkdir(mode=0o700)
+        _mkdir_exclusive(pages)
         try:
             for completion in sorted(completion_items, key=lambda item: item.ordinal):
                 attempt = by_id[completion.final_attempt_id]
                 rows.extend(dict(row) for row in attempt.rows)
                 for page_number, page in enumerate(completion.pages, start=1):
                     page_id = str(page["page_identity"])
-                    expected_object_ref = f"pages/{completion.ordinal}-{page_number}.json"
+                    expected_object_ref = canonical_page_object_ref(
+                        completion.ordinal,
+                        completion.request_id,
+                        page["page_identity"],
+                        page_number,
+                    )
                     expected_content_sha = _page_content_sha(page)
                     if (
                         page.get("object_ref", expected_object_ref) != expected_object_ref
@@ -1268,7 +1588,8 @@ class ShadowEvidenceStore:
                         or page.get("ordinal", page_number) != page_number
                     ):
                         raise ShadowEvidenceUnavailable("shadow page descriptor mismatch")
-                    page_path = pages / f"{completion.ordinal}-{page_number}.json"
+                    page_path = staging / expected_object_ref
+                    _mkdir_chain(page_path.parent)
                     payload = _json_bytes(page)
                     if len(payload) > self.max_object_bytes:
                         raise ShadowEvidenceUnavailable("shadow object exceeds bound")
@@ -1279,7 +1600,7 @@ class ShadowEvidenceStore:
                             "ordinal": completion.ordinal,
                             "page_identity": page_id,
                             "object_ref": _safe_object_ref(expected_object_ref),
-                            "relative_path": f"pages/{completion.ordinal}-{page_number}.json",
+                            "relative_path": expected_object_ref,
                             "content_sha256": expected_content_sha,
                             "row_count": len(page.get("rows", [])),
                         }
@@ -1291,7 +1612,9 @@ class ShadowEvidenceStore:
                 len(page.get("rows", [])) for item in completion_items for page in item.pages
             )
             if (
-                completion_model.aggregate_page_count != aggregate_pages
+                aggregate_pages < 1
+                or aggregate_page_rows < 1
+                or completion_model.aggregate_page_count != aggregate_pages
                 or completion_model.aggregate_row_count != aggregate_page_rows
                 or len(rows) != aggregate_page_rows
             ):
@@ -1368,6 +1691,46 @@ class ShadowEvidenceReader:
     def __init__(self, root: Path | str, *, max_object_bytes: int = 64 * 1024 * 1024):
         self.root = Path(root)
         self.max_object_bytes = max_object_bytes
+
+    def read_descriptor(self, evidence_id: str) -> tuple[ShadowEvidenceBundle, dict[str, Any]]:
+        """Return the revalidated bundle plus its canonical descriptor for control sinks."""
+        bundle = self.read(evidence_id)
+        raw = _open_verified(
+            _physical_path(self.root) / "bundles" / _safe(evidence_id) / "manifest.json",
+            max_bytes=self.max_object_bytes,
+        )
+        try:
+            descriptor = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable") from None
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("manifest_sha256") != bundle.manifest_sha256
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        expected_values = {
+            key: descriptor.get(key)
+            for key in (
+                "evidence_id",
+                "nonce",
+                "job_id",
+                "plan_sha256",
+                "completion_sha256",
+                "page_refs",
+                "pages",
+                "row_count",
+                "provider_id",
+                "window_id",
+                "session_id",
+                "plan_requests",
+                "completion",
+            )
+        }
+        if descriptor.get("manifest_sha256") != _sha(
+            b"stock-eva/r2f3/shadow-evidence/v1\n" + _json_bytes(expected_values)
+        ):
+            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+        return bundle, descriptor
 
     def read(self, evidence_id: str) -> ShadowEvidenceBundle:
         try:
@@ -1502,6 +1865,7 @@ class ShadowEvidenceReader:
             if (
                 not isinstance(payload["rows"], list)
                 or len(payload["rows"]) != payload["row_count"]
+                or not payload["rows"]
             ):
                 raise ShadowEvidenceUnavailable("shadow evidence unavailable")
             page_rows_total = 0
@@ -1512,20 +1876,55 @@ class ShadowEvidenceReader:
             pages = payload["pages"]
             if (
                 not isinstance(pages, list)
+                or not pages
                 or [item.get("page_identity") for item in pages] != payload["page_refs"]
             ):
                 raise ShadowEvidenceUnavailable("shadow evidence unavailable")
-            expected_files = {Path(item["relative_path"]).name for item in pages}
+            request_ids = {
+                int(item["ordinal"]): item["request_id"]
+                for item in payload["plan_requests"]
+                if isinstance(item, dict)
+                and isinstance(item.get("ordinal"), int)
+                and isinstance(item.get("request_id"), str)
+            }
+            expected_files = {item["relative_path"] for item in pages}
             actual_files = set()
-            for entry in os.scandir(pages_dir):
-                info = entry.stat(follow_symlinks=False)
-                if (
-                    entry.name in actual_files
-                    or not stat.S_ISREG(info.st_mode)
-                    or info.st_nlink != 1
-                ):
-                    raise ShadowEvidenceUnavailable("shadow evidence unavailable")
-                actual_files.add(entry.name)
+            page_raw_by_ref: dict[str, bytes] = {}
+            bundle_fd = _open_directory_fd(bundle)
+            try:
+                pages_fd = os.open(
+                    "pages",
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=bundle_fd,
+                )
+                try:
+                    pages_before = os.fstat(pages_fd)
+                    for entry in os.scandir(pages_fd):
+                        info = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+                        relative_ref = f"pages/{entry.name}"
+                        actual_files.add(relative_ref)
+                        page_raw_by_ref[relative_ref] = _read_verified_at(
+                            pages_fd, entry.name, max_bytes=self.max_object_bytes
+                        )
+                    pages_after = os.fstat(pages_fd)
+                    if (
+                        pages_before.st_dev,
+                        pages_before.st_ino,
+                        pages_before.st_mode,
+                        pages_before.st_ctime_ns,
+                    ) != (
+                        pages_after.st_dev,
+                        pages_after.st_ino,
+                        pages_after.st_mode,
+                        pages_after.st_ctime_ns,
+                    ):
+                        raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+                finally:
+                    os.close(pages_fd)
+            finally:
+                os.close(bundle_fd)
             if actual_files != expected_files:
                 raise ShadowEvidenceUnavailable("shadow evidence unavailable")
             seen_page_ids: set[str] = set()
@@ -1558,12 +1957,25 @@ class ShadowEvidenceReader:
                 ):
                     raise ShadowEvidenceUnavailable("shadow evidence unavailable")
                 page_number = int(page_identity.rsplit(":page-", 1)[1])
+                expected_object_ref = canonical_page_object_ref(
+                    item["ordinal"],
+                    request_ids.get(item["ordinal"], ""),
+                    page_identity,
+                    page_number,
+                )
+                if (
+                    item["object_ref"] != expected_object_ref
+                    or item["relative_path"] != expected_object_ref
+                    or Path(item["relative_path"]).name != expected_object_ref.rsplit("/", 1)[1]
+                ):
+                    raise ShadowEvidenceUnavailable("shadow evidence unavailable")
                 if page_number != page_ordinals.get(item["ordinal"], 0) + 1:
                     raise ShadowEvidenceUnavailable("shadow evidence unavailable")
                 page_ordinals[item["ordinal"]] = page_number
                 seen_page_ids.add(page_identity)
-                page_path = bundle / item["relative_path"]
-                page_raw = _open_verified(page_path, max_bytes=self.max_object_bytes)
+                page_raw = page_raw_by_ref.get(item["relative_path"])
+                if page_raw is None:
+                    raise ShadowEvidenceUnavailable("shadow evidence unavailable")
                 page = json.loads(page_raw.decode("utf-8"))
                 if (
                     not isinstance(page, dict)
@@ -1576,6 +1988,55 @@ class ShadowEvidenceReader:
                 page_rows_total += item["row_count"]
             if page_rows_total != payload["row_count"]:
                 raise ShadowEvidenceUnavailable("shadow evidence unavailable")
+            plan_requests = tuple(
+                ShadowLogicalRequest.model_validate(
+                    {
+                        **request,
+                        "job_id": payload["job_id"],
+                        "provider_id": payload["provider_id"],
+                        "window_id": payload["window_id"],
+                    }
+                )
+                for request in payload["plan_requests"]
+            )
+            ShadowLogicalRequestPlan.model_validate(
+                {
+                    "job_id": payload["job_id"],
+                    "provider_id": payload["provider_id"],
+                    "window_id": payload["window_id"],
+                    "requests": plan_requests,
+                    "request_plan_sha256": payload["plan_sha256"],
+                }
+            )
+            completion_requests = []
+            for item in payload["completion"]["requests"]:
+                completion_requests.append(
+                    ShadowRequestCompletion(
+                        ordinal=item["ordinal"],
+                        request_id=item["request_id"],
+                        endpoint=item["endpoint"],
+                        endpoint_class=item["endpoint_class"],
+                        final_attempt_id=item["final_attempt_id"],
+                        outcome=item["final_outcome"],
+                        pages=[
+                            {
+                                **page,
+                                "rows": [],
+                            }
+                            for page in item["page_refs"]
+                        ],
+                        completion_sha256=_sha(
+                            b"stock-eva/r2f3/completion/v1\n" + _json_bytes(item)
+                        ),
+                    )
+                )
+            ShadowCompletion.model_validate(
+                {
+                    **payload["completion"],
+                    "requests": completion_requests,
+                    "completion_sha256": payload["completion_sha256"],
+                }
+            )
             return ShadowEvidenceBundle(
                 evidence_id=evidence_id,
                 completion_sha256=payload["completion_sha256"],
