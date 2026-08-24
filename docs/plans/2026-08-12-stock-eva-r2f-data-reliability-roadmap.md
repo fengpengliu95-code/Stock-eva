@@ -1,7 +1,7 @@
 # Stock EVA R2-F Data Reliability Foundation Version Roadmap
 
-**Author:** Codex root architecture lead  
-**Date:** 2026-08-12 (Asia/Shanghai)  
+**Author:** Codex root architecture lead
+**Date:** 2026-08-12 (Asia/Shanghai)
 **Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
 architecture amendment is **Approved** at reviewed authority `52039a0` plus this approval metadata
 commit. The third-round independent IDENTITY SPEC REVIEW returned **GO (H0/M0/L1)**, and the user
@@ -11,8 +11,8 @@ Task 7 rounds `6390366`, `c977a40`, `fea5678` remain NO-GO history. The dedicate
 design/implementation documents are the only contract authority; deployment and the R2-F0
 production gate remain closed.
 
-**Decision authority:** User approved the revised data-reliability priority on 2026-08-12  
-**Scope:** R2-F0 through R2-F5  
+**Decision authority:** User approved the revised data-reliability priority on 2026-08-12
+**Scope:** R2-F0 through R2-F5
 **Detailed execution plan:**
 `docs/plans/2026-08-12-stock-eva-r2f-data-reliability-implementation.md`
 
@@ -216,16 +216,17 @@ admission_state
 `admission_state` is one of:
 
 ```text
-discovered -> canary -> shadow -> qualified -> failover_enabled
-                                   |             |
-                                   v             v
-                              quarantined <------+
+discovered -> canary -> shadow -> qualified
+               |          |          |
+               v          v          v
+            quarantined <-------------+
 ```
 
 Only `qualified` providers may be considered by selection. Only an explicit configuration change
-may move a qualified provider to `failover_enabled`. Schema drift, material reconciliation drift,
-credential failure, repeated rate limiting or changed terms automatically quarantines the
-provider; it never silently promotes another unreviewed provider.
+in the separately governed R2-F4 stage may move a qualified provider to `failover_enabled`.
+R2-F3 has no `failover_enabled` registry state, selection path or authority. Schema drift, material
+reconciliation drift, credential failure, repeated rate limiting or changed terms automatically
+quarantines the provider; it never silently promotes another unreviewed provider.
 
 ### 6.2 Immutable provider evidence
 
@@ -402,6 +403,13 @@ only the legal final `next()` returning `has_row=False` produces `pagination_ter
 exhaustion is a protocol failure. `fea5678` and the earlier Task 7 rounds remain non-delivery history.
 
 ### R2-F3 — Shadow Bake-off
+
+The dedicated R2-F3 specifications
+([design](2026-08-24-stock-eva-r2f3-shadow-bakeoff-design.md) and
+[implementation](2026-08-24-stock-eva-r2f3-shadow-bakeoff-implementation.md)) supersede this
+umbrella subsection where they conflict. Their current status is **SPEC READY /
+IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO**. `failover_enabled` is owned only by R2-F4; R2-F3
+may end at `qualified` shadow evidence and never writes canonical selection/failover.
 
 **Scope**
 

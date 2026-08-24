@@ -686,6 +686,13 @@ not delete evidence, rewrite Parquet/manifests or edit the pointer by hand.
 
 ## R2-F3 — Shadow Provider Bake-off
 
+The dedicated R2-F3 specifications
+([design](2026-08-24-stock-eva-r2f3-shadow-bakeoff-design.md) and
+[implementation](2026-08-24-stock-eva-r2f3-shadow-bakeoff-implementation.md)) supersede this
+umbrella R2-F3 section wherever they differ. Their current status is **SPEC READY /
+IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO**. R2-F3 has no `failover_enabled` state or
+canonical fallback authority; that state is owned only by R2-F4.
+
 ### Task 10: Add provider qualification and secret-safe configuration
 
 **Files:**
@@ -703,15 +710,15 @@ Add state-transition tests for:
 
 ```python
 AdmissionState = Literal[
-    "discovered", "canary", "shadow", "qualified", "failover_enabled", "quarantined"
+    "discovered", "canary", "shadow", "qualified", "quarantined"
 ]
 ```
 
 Only these transitions are legal:
 
 ```text
-discovered -> canary -> shadow -> qualified -> failover_enabled
-canary/shadow/qualified/failover_enabled -> quarantined
+discovered -> canary -> shadow -> qualified
+canary/shadow/qualified -> quarantined
 quarantined -> canary only after a new reviewed adapter/contract/terms version
 ```
 

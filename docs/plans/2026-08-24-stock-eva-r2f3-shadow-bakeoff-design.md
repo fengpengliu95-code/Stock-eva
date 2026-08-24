@@ -2,10 +2,16 @@
 
 **Author:** Codex delivery team — specification owner
 **Date:** 2026-08-24 (Asia/Shanghai)
-**Status:** **CODE GO / SHADOW WINDOW PENDING** — specification and offline implementation may proceed; no real provider window has run
+**Status:** **SPEC READY / IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO** — this revision closes independent-review findings; no implementation or real provider window has run
 **Decision authority:** User-authorized offline specification only. Real canary, credentials, account/points, cost/terms acceptance and the 20-session window require a separate explicit external authorization.
 **Baseline:** clean worktree at `428e890e35b7cedfd45efa810309032e1c7c10e6`; this document is a planning artifact and does not claim implementation, provider qualification or R2-F3 GO.
 **Scope:** R2-F3 Tasks 10–13: provider registry, explicit-canary adapters, complete-session normalization/reconciliation, and isolated shadow scheduling/reporting.
+
+**Review remediation:** This revision is documentation-only remediation for independent review
+H8/M2. The dedicated documents supersede the umbrella R2-F3 prose where they conflict. `CODE GO /
+SHADOW WINDOW PENDING` is reachable only after Tasks 10–13 offline RED/GREEN, full checks and
+independent review; the current status is **CODE NO-GO**. `failover_enabled` belongs to R2-F4 and
+is not an R2-F3 registry state or authority gate.
 
 ## Context
 
@@ -39,6 +45,20 @@ it or tempt a canonical-writer change. No dynamic plugin import is introduced. A
 may add `tickflow`/`tushare` to a static provider vocabulary only after a model/persisted-field
 compatibility review; that migration MUST leave all BaoStock v1 bytes, hashes, readers and
 `primary_ready` selections unchanged.
+
+### Independent review closure matrix (H8/M2 remediation)
+
+| Finding | Closed specification contract | Required regression/transaction/file evidence |
+|---|---|---|
+| H1 status/authority | Current status is SPEC READY / IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO; only clean Tasks 10–13 review may reach CODE GO/PENDING; failover_enabled is R2-F4-only | metadata/status assertions, dedicated-doc supersession, no Task10 execution |
+| H2 evidence lifecycle | `shadow_evidence.py`: ShadowAttempt/Completion, Store/Reader, final-success-only, atomic COMMIT bundle, crash/cancel/orphan audit | final-attempt, crash/cancel/orphan, marker atomicity and bounded-reader tests |
+| H3 comparison integrity | `shadow_candidates.py` quality/store/reader plus `canonical_comparison.py` descriptor-bound snapshot with exact Dataset/R2-F2/hash/date/universe bindings | every descriptor mutation returns unavailable; zero-write snapshot tests |
+| H4 scheduling transaction | ShadowJobStore durable outbox; pointer/manifest commit then lock release then bounded handoff; scanner, independent lease/CAS/worker | ordering, handoff-failure, scanner recovery, crash lease and idempotence tests |
+| H5 credentials/terms | exact env map, immutable TermsEvidence URL/bytes hash/version/as-of/reviewer/review ID/approved decisions; discovered until closed | reject before client construction, no-network/no-write tests and secret grep |
+| H7 registry safety | frozen migration IDs/DDL/PRAGMA/permissions/lock order/CAS; descriptor-bound bytes + deserialize `:memory:` reader; fixed shadow root limits/atomic protocol | schema/migration/TOCTOU/fingerprint/reader capability tests |
+| H8 session evidence | ConfirmedSessionSnapshot, all-outcome ShadowAttemptReport, version vector, same SQLite transaction/CAS reset retaining history | gap/failure/drift reset and all outcome report tests |
+| M1 API contract | frozen Python response model, UnavailableReason enum, explicit response_model and named zero-write tests | missing/corrupt DB/root/descriptor GET fingerprint tests |
+| M2 compatibility | every Task has named golden R2-F2 manifest/evidence/candidate/selection/GET bytes/hash/reader regression | Task10–13 focused commands and independent review fixture |
 
 ### Official-facts contract ledger (as of 2026-08-24)
 
@@ -110,6 +130,26 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   material mismatch, or material version/config change MUST reset the window.
 - FR-18: No R2-F3 GO may be declared without a completed real authorized shadow window. Offline
   code completion is exactly `CODE GO / SHADOW WINDOW PENDING`.
+- FR-19: The shadow evidence writer MUST expose `ShadowEvidenceStore` and `ShadowEvidenceReader`
+  with `ShadowAttempt`/`ShadowCompletion` models. It MUST use successful-attempt-only semantics:
+  failed partial rows/bytes are discarded in memory, final bundles commit atomically, crash/cancel
+  leaves only a sanitized orphan audit, and no orphan is readable as evidence.
+- FR-20: `ShadowCandidateStore`/`ShadowCandidateReader` MUST persist a `ShadowQualityReport` and
+  complete candidate bundle in the shadow root; a failed or incomplete candidate MUST have no
+  comparison snapshot or canonical side effect.
+- FR-21: `CanonicalComparisonSnapshot` MUST be descriptor-bound, read-only and bind the exact
+  current canonical dataset manifest generation/identity, trade-date partition hash/row count,
+  R2-F2 publication lineage, `CandidateStore` bundle `selection.json` selection ID/SHA-256,
+  candidate/evidence/gate/factor/normalized hashes, trade date and universe. Any change or mismatch
+  during comparison MUST return `unavailable`.
+- FR-22: Shadow scheduling MUST use a durable `ShadowJobStore` outbox. The canonical pointer and
+  manifest MUST commit before `RefreshRunLock` release; only after release may a nonblocking bounded
+  handoff occur. A scanner MUST recover published-but-unenqueued sessions from immutable canonical
+  manifests. Worker lease/cancel/crash/retry is independent and idempotent.
+- FR-23: Each attempt MUST produce a `ShadowAttemptReport` with outcome `success`, `failure`,
+  `skip`, `unavailable` or `mismatch`; `ConfirmedSessionSnapshot` MUST freeze exact calendar
+  generation/hash and next confirmed sessions. Attempt, session and qualification-window reset
+  state MUST update in one SQLite transaction/CAS and retain every prior report.
 
 ## Non-Functional Requirements
 
@@ -142,11 +182,21 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   occurs in the code/spec gate.
 - **NFR-12 (reviewability):** Every task has RED then GREEN evidence, bounded files/commit, an
   independent review gate, and explicit authority status.
+- **NFR-13 (transaction ordering):** No shadow work may run inside the canonical post-publication
+  lock; canonical outcome is determined first, handoff failure cannot change/delay it, and durable
+  outbox recovery is the source of truth.
+- **NFR-14 (API compatibility):** Python response models MUST be frozen/extra-forbid, use an
+  allowlisted `UnavailableReason` enum and explicit `response_model`; zero-write API tests MUST be
+  named for missing DB/root, corrupt state, and every descriptor mismatch.
+- **NFR-15 (migration safety):** Registry schema/migration IDs, DDL constraints, PRAGMA/version
+  checks, lock path/order, CAS state version, ancestor/basename no-follow checks, fstat/fingerprint
+  and permission/TOCTOU rules MUST be frozen before code.
 
 ## Acceptance Criteria
 
 The numbered criteria below collectively cover FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8,
-FR-9, FR-10, FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17 and FR-18.
+FR-9, FR-10, FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21,
+FR-22 and FR-23.
 
 ### AC-1: Registry isolation and transitions (FR-1–FR-4, NFR-5, NFR-6)
 
@@ -226,6 +276,47 @@ When a canary/shadow failure is serialized
 Then only allowlisted class, bounded counts and safe IDs remain; a grep/fingerprint test finds none
 of the injected values in logs, reports, evidence, manifests or CLI output.
 
+### AC-12: Shadow evidence crash and cancellation (FR-9, FR-19, NFR-3–NFR-4)
+
+Given a retry with a partial first attempt, a process crash during bundle publication, cancellation,
+or a completed bundle whose object commit is interrupted
+When `ShadowEvidenceStore` and `ShadowEvidenceReader` recover
+Then only final successful attempt pages are readable, failed/partial bytes are discarded, the
+bundle has one atomic commit marker, orphan audit is sanitized and bounded, and the reader returns
+`unavailable` for incomplete/orphan bundles without writing.
+
+### AC-13: Candidate and canonical comparison binding (FR-20–FR-21, NFR-9, NFR-14)
+
+Given a complete shadow candidate and a current canonical publication
+When `CanonicalComparisonSnapshot` is opened and any dataset manifest generation/identity,
+partition hash/row count, R2-F2 lineage, selection ID/SHA, candidate/evidence/gate/factor/normalized
+hash, date or universe changes
+Then the descriptor-bound read-only reader returns `unavailable`, performs zero writes/provider
+calls, and never compares stale or mixed-source data.
+
+### AC-14: Durable post-release handoff (FR-22, NFR-7, NFR-13)
+
+Given a canonical refresh that commits its manifest and pointer while holding `RefreshRunLock`
+When the lock is released and shadow handoff/enqueue/worker fails, is cancelled, or the process dies
+Then the canonical result and timing are already final and unchanged, the durable job remains
+pending/reclaimable, a later scanner recovers every published-but-unenqueued manifest, and no
+post-publication lock-held work delays canonical availability.
+
+### AC-15: Confirmed sessions and transactional reset (FR-17, FR-23, NFR-5, NFR-8)
+
+Given a confirmed calendar snapshot and a sequence containing success, failure, skip, unavailable,
+mismatch, a date gap or a version-vector drift
+When the attempt/session/window transaction commits
+Then every `ShadowAttemptReport` is retained, the exact session vector is recorded, any gap/failure/
+drift resets qualification atomically with the CAS state version, and no prior report is deleted.
+
+### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
+
+Given missing/corrupt registry, shadow root, job store, canonical descriptor, or candidate bundle
+When `GET /api/v1/market/provider-status` or a comparison/status plan runs
+Then the frozen response model returns an allowlisted `UnavailableReason`, uses the declared
+`response_model`, and named fingerprint tests prove zero file/DB/schema/mtime/network writes.
+
 ## Edge Cases
 
 - EC-1: Missing or corrupt registry DB/table returns `unavailable` and performs zero writes.
@@ -256,6 +347,20 @@ of the injected values in logs, reports, evidence, manifests or CLI output.
   window and cannot inherit qualification.
 - EC-16: GET/status on an uninitialized shadow root does not initialize it, migrate it or mutate
   its mtime.
+- EC-17: `ShadowEvidenceStore` sees a crash/cancel after object create but before bundle commit;
+  reader rejects the orphan and only bounded orphan audit remains.
+- EC-18: A failed retry has rows in memory but no final success; no shadow manifest, candidate or
+  quality report is written.
+- EC-19: Candidate comparison sees an R2-F2 selection bundle with changed `selection.json` bytes,
+  selection ID or SHA; it returns `unavailable` and does not read another bundle.
+- EC-20: Canonical pointer commit succeeds but enqueue handoff fails after lock release; scanner
+  recovers the immutable manifest and enqueues idempotently.
+- EC-21: Worker lease expires after process crash; a later worker reclaims it under CAS and a
+  duplicate completion cannot create a second report.
+- EC-22: Calendar generation changes or a confirmed-session gap appears; window resets in one
+  transaction while prior reports remain queryable.
+- EC-23: Tushare lacks official HTTPS proof or approved TermsEvidence at client construction;
+  `execute` rejects before constructing the HTTP client and performs zero network/write operations.
 
 ## API Contracts
 
@@ -277,6 +382,20 @@ Without `--execute`, all commands are zero-network/zero-write plans. Execution r
 state, env-only credentials, a bounded request plan and a non-secret external authorization ID.
 The promote command is unavailable until real 20-session evidence is present; it never enables
 failover.
+
+Credential mapping is a closed static map and is not configurable:
+
+```text
+tickflow -> STOCK_EVA_TICKFLOW_TOKEN
+tushare  -> STOCK_EVA_TUSHARE_TOKEN
+```
+
+The token factory reads only the mapped environment variable after admission/TermsEvidence checks;
+the token value is never put into `ShadowProviderRecord`, `TermsEvidence`, request models, URLs,
+exceptions, logs or output. Any arbitrary env name, CLI token, missing approved TermsEvidence,
+unapproved intended use/retention/quota, or Tushare HTTPS proof failure rejects before HTTP-client
+construction and performs zero network/write operations. Initial TickFlow and Tushare states are
+`discovered`.
 
 ### HTTP
 
@@ -309,6 +428,34 @@ response bytes and rows. Allowed classes are `transport_timeout`, `transport_con
 `coverage`, `reconciliation`, `storage`, `internal`. Raw status bodies, URLs with query secrets,
 SQL and local paths are never returned.
 
+### Frozen Python API response contract
+
+```python
+class UnavailableReason(StrEnum):
+    REGISTRY_MISSING = "registry_missing"
+    REGISTRY_SCHEMA_INVALID = "registry_schema_invalid"
+    SHADOW_ROOT_UNAVAILABLE = "shadow_root_unavailable"
+    JOB_STORE_UNAVAILABLE = "job_store_unavailable"
+    CANONICAL_DESCRIPTOR_CHANGED = "canonical_descriptor_changed"
+    CANDIDATE_DESCRIPTOR_CHANGED = "candidate_descriptor_changed"
+    SELECTION_BINDING_INVALID = "selection_binding_invalid"
+    EVIDENCE_INCOMPLETE = "evidence_incomplete"
+    VERSION_VECTOR_DRIFT = "version_vector_drift"
+    CALENDAR_SNAPSHOT_INVALID = "calendar_snapshot_invalid"
+
+class ShadowProviderStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    status: Literal["ready", "unavailable"]
+    provider: ShadowProviderId | None
+    state: ShadowAdmissionState | None
+    unavailable_reason: UnavailableReason | None
+    report_id: SafeIdentifier | None
+```
+
+The API route MUST declare `response_model=ShadowProviderStatusResponse`; all unavailable paths
+must map to this model and never serialize an arbitrary exception. Named zero-write tests cover
+each enum reason and missing/corrupt state.
+
 ## Data Models
 
 All shadow models are immutable, `extra="forbid"`, finite-number validated, safe-path validated,
@@ -325,15 +472,60 @@ ShadowProviderRecord:
   unit_contract, admission_state, window_id, window_start, window_end,
   successful_sessions, quarantined_reason
 
+TermsEvidence:
+  terms_evidence_id, provider_id, official_url_allowlist, content_bytes_sha256,
+  contract_version, as_of_date, reviewer, review_id, approved_intended_use,
+  approved_retention, approved_credential_mode, approved_quota_decision
+
+ConfirmedSessionSnapshot:
+  snapshot_id, calendar_generation, calendar_sha256, confirmed_next_sessions,
+  universe_id, universe_sha256, captured_at, snapshot_sha256
+
+ShadowAttempt:
+  attempt_id, job_id, provider_id, trade_date, universe_id, attempt_number,
+  started_at, completed_at, outcome, request_count, retry_count, failure_class,
+  final_page_refs, sanitized_orphan_audit_id
+
+ShadowCompletion:
+  job_id, successful_attempt_id, evidence_id, completion_sha256, committed_at
+
+ShadowAttemptReport:
+  report_id, attempt_id, outcome(success|failure|skip|unavailable|mismatch),
+  timing, coverage, request/retry/rate-limit counts, failure_class, evidence/candidate/report hashes
+
+VersionVector:
+  adapter_hash, endpoint_contract_hash, source_schema_hash, normalizer_hash,
+  reconciliation_policy_hash, terms_evidence_hash, universe_hash, calendar_hash,
+  config_hash
+
+CanonicalComparisonSnapshot:
+  snapshot_id, dataset_manifest_generation, dataset_manifest_sha256,
+  trade_date_partition_sha256, trade_date_row_count, r2f2_publication_lineage,
+  selection_id, selection_sha256, candidate_sha256, evidence_sha256, gate_sha256,
+  factor_sha256, normalized_sha256, trade_date, universe_id, version_vector,
+  snapshot_sha256
+
+ShadowJob:
+  job_id, canonical_manifest_generation, canonical_manifest_sha256, trade_date,
+  universe_id, state(pending|leased|completed|failed|cancelled), lease_owner,
+  lease_expires_at, attempts, state_version, job_sha256
+
 ShadowEvidenceManifest:
   evidence_id, provider_id, adapter_version, endpoint_contract_version, trade_date, universe_id,
   request_plan_hash, final_attempt_ids, source_object_refs, object_count, row_count,
-  request_count, retry_count, rate_limit_count, source_schema_hash, manifest_sha256
+  request_count, retry_count, rate_limit_count, source_schema_hash, schema_version,
+  bundle_relative_path, bundle_commit_sha256, orphan_audit_id, manifest_sha256
+
+ShadowQualityReport:
+  quality_report_id, candidate_id, trade_date, universe_id, gate_version, ordered_gate_outcomes,
+  expected_symbol_count, loaded_symbol_count, suspended_count, failed_symbols, verdict,
+  input_evidence_sha256, report_sha256
 
 ShadowCandidateManifest:
   candidate_id, provider_id, trade_date, universe_id, evidence_id, evidence_sha256,
   normalized_object_ref, normalized_object_sha256, quality_report_ref, quality_report_sha256,
-  source_schema_version, adapter_version, row_count, expected_symbol_count, status, manifest_sha256
+  source_schema_version, adapter_version, row_count, expected_symbol_count, bundle_commit_sha256,
+  status, manifest_sha256
 
 ShadowReconciliationReport:
   reconciliation_id, policy_version, trade_date, universe_id, left_candidate_id,
@@ -357,11 +549,56 @@ ShadowSessionReport:
 | R2-F2 candidates/selections/canonical data | existing candidate/canonical roots | canonical writer | unchanged; secondary MUST NOT write |
 | User DB/NAS | existing production paths | other subsystems | no R2-F3 operation |
 
-`schema_version` is stored in the registry and each shadow manifest. The writer initializes/migrates
-explicitly; readers open `file:...?...mode=ro`, validate schema, and return `unavailable` on
-missing/corrupt state. Migrations are additive, versioned, and never rewrite immutable shadow
-objects or R2-F2 files. `provider_shadow_root` has no symlinks, dirfd/no-follow traversal,
-bounded object/manifest sizes, hash verification and atomic create/no-clobber semantics.
+`schema_version` is stored in the registry and each shadow manifest. The frozen registry migration
+ledger is:
+
+| Migration ID | DDL / invariant | Rollback |
+|---|---|---|
+| `r2f3-registry-0001` | `meta(schema_version TEXT PRIMARY KEY, migration_id TEXT NOT NULL, created_at TEXT NOT NULL)`; `provider_record(provider_id TEXT PRIMARY KEY CHECK(provider_id IN ('tickflow','tushare')), admission_state TEXT NOT NULL CHECK(admission_state IN ('discovered','canary','shadow','qualified','quarantined')), adapter_hash TEXT NOT NULL, endpoint_contract_hash TEXT NOT NULL, source_schema_hash TEXT NOT NULL, normalizer_hash TEXT NOT NULL, reconciliation_policy_hash TEXT NOT NULL, terms_evidence_hash TEXT NOT NULL, credential_env_name TEXT NOT NULL, state_version INTEGER NOT NULL CHECK(state_version >= 0))`; `qualification_window(provider_id TEXT PRIMARY KEY, window_id TEXT NOT NULL, window_start TEXT, window_end TEXT, consecutive_sessions INTEGER NOT NULL CHECK(consecutive_sessions >= 0), version_vector_json TEXT NOT NULL)`; `shadow_job(job_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, universe_id TEXT NOT NULL, canonical_manifest_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','leased','completed','failed','cancelled')), lease_owner TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL CHECK(attempts >= 0), state_version INTEGER NOT NULL CHECK(state_version >= 0))`; `shadow_attempt_report(report_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','skip','unavailable','mismatch')), report_sha256 TEXT NOT NULL)`; foreign keys and unique `(provider_id, trade_date, universe_id, window_id)` prevent duplicate completion. | Stop readers, retain immutable DB backup and shadow objects, restore previous registry DB copy; never delete/rewrite canonical data. |
+| `r2f3-registry-0002` | Add-only `terms_evidence` fields/table with `official_url_allowlist_json`, `content_bytes_sha256`, `contract_version`, `as_of_date`, `reviewer`, `review_id`, approved intended-use/retention/credential/quota decisions; existing rows remain `discovered` until populated. | Reopen `0001` read-only; no destructive down-migration. |
+
+Writer initialization MUST use PRAGMA `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`,
+`busy_timeout` bounded, and a checked `schema_version`/migration ID. It MUST create the DB only
+inside a safe absolute ancestor whose ancestors are regular directories, and the DB must be a
+regular 0600 file. The writer lock is `provider_registry.sqlite3.lock`; global lock order is
+`provider_registry.sqlite3.lock` -> registry SQLite transaction -> shadow bundle lock. It MUST NOT
+acquire `RefreshRunLock` or run under a canonical publication lock. Every transition uses
+`BEGIN IMMEDIATE`, expected `state_version`, one CAS UPDATE, and commit; conflict rolls back and
+returns a sanitized retry/unavailable result. Migration failure rolls back the transaction and
+leaves the prior schema/state readable.
+
+The read protocol is descriptor-bound: open the DB parent and basename with `openat/O_NOFOLLOW`,
+require regular 0600, read bounded bytes, record before/after `fstat` plus device/inode/size/mtime
+fingerprint, then call `sqlite3.Connection.deserialize()` into `:memory:` for read-only schema and
+status queries. If deserialize is unavailable, the capability is `unavailable`; there is no
+fallback to a pathname SQLite reader. A changed fingerprint, symlink, unsafe ancestor, permission
+or schema mismatch is `unavailable` with zero persistent writes.
+
+`provider_shadow_root` is fixed to `registry-independent/shadow/{provider}/{trade_date}/`; only
+safe provider/date components are accepted. It has bounded object/manifest/report bytes and rows,
+regular-file/0600 permissions, no symlinks, dirfd + `O_NOFOLLOW` reads, pre/post fstat identity
+checks, SHA-256 and atomic compare-create. A bundle publishes objects first, then one canonical
+`bundle.json` and `COMMIT` marker via same-directory fsync+rename; the marker is the sole readable
+commit authority. Crash/cancel audit is append-only, sanitized, bounded, and never readable as a
+candidate/evidence object.
+
+`ShadowEvidenceStore`/`ShadowEvidenceReader` are descriptor-bound. A `ShadowAttempt` may retain
+only safe IDs, counts, outcome and failure class while rows live in memory. `ShadowCompletion`
+names the one final successful attempt. Reader validates object hashes, schema, row counts, page
+ordering, completion marker, manifest hash and final-attempt IDs before returning evidence.
+
+`ShadowCandidateStore`/`ShadowCandidateReader` publish/read `ShadowQualityReport`, normalized object,
+candidate manifest and one atomic candidate bundle in the same shadow-root safety protocol. A
+`CanonicalComparisonReader.capture(trade_date)` takes one immutable canonical Dataset manifest
+snapshot, exact generation/identity and BaoStock partition path/SHA/row count, then descriptor-bound
+reads the R2-F2 `candidate.json`, `gate.json`, `selection.json`, `normalized.json` and
+`EvidenceReader`. It re-runs existing validators and bidirectionally verifies selection ID/SHA,
+candidate/evidence/gate/factor/normalized hashes, date/universe/provider, nine R2-F2 lineage
+fields (`provider_id`, `universe_id`, `evidence_id`, `evidence_sha256`, `candidate_id`,
+`candidate_manifest_sha256`, `gate_report_sha256`, `adapter_version`, `source_schema_version`),
+and partition bar semantics; it rechecks dataset identity before returning the frozen
+`CanonicalComparisonSnapshot`. Missing legacy lineage, any change, or any mismatch is
+`unavailable`; it never guesses or changes canonical fields.
 
 ### Compatibility matrix
 
@@ -408,7 +645,8 @@ Markdown link/heading check are required.
 
 1. **Specification gate:** independent review of both docs, exact clean base, no production files.
 2. **Offline code gate:** Tasks 10–13 RED then GREEN with synthetic fixtures, full repository tests,
-   Ruff/format/diff checks and independent review. Result is `CODE GO / SHADOW WINDOW PENDING`.
+   Ruff/format/diff checks and independent review. Only a clean gate may change the status to
+   `CODE GO / SHADOW WINDOW PENDING`; the current specification status is `R2-F3 CODE NO-GO`.
 3. **External authorization gate:** user explicitly approves provider, account/points/cost/terms,
    legal use, exact date/window, request budget, credential env names, HTTPS transport (if any),
    evidence retention and isolated root. Without it, do not execute.
@@ -433,19 +671,22 @@ mutating the canonical root. Re-enabling requires a new reviewed contract/terms 
 
 | Requirement | Design evidence | Planned verification |
 |---|---|---|
-| FR-1–FR-4, NFR-2, NFR-5 | shadow enum/registry/secret boundary | Task10 registry RED/GREEN, serialization and missing-DB tests |
-| FR-5–FR-7, FR-9–FR-10 | provider contract ledger, adapter/evidence model | Task11 captured-response tests, no-network/no-secret tests |
-| FR-8, FR-11–FR-13 | complete-candidate and policy gates | Task12 unit/suspension/factor/reconciliation tests |
-| FR-14–FR-18, NFR-1, NFR-7–NFR-12 | scheduler, 20-session and authority gates | Task13 isolation/reset/report tests and independent review |
-| NFR-3–NFR-6, storage table | hash/CAS/dirfd/root/SQLite contract | storage/concurrency/TOCTOU/read-only fingerprints |
+| FR-1–FR-4, FR-5–FR-7, H5, H7, NFR-2, NFR-5, NFR-15 | shadow enum/registry/TermsEvidence/secret boundary and frozen SQLite protocol | Task10 registry RED/GREEN, exact env mapping, terms rejection-before-client, migration/DDL/PRAGMA/CAS/reader safety tests |
+| FR-9, FR-19, H2, NFR-3–NFR-4 | `shadow_evidence.py` successful-attempt-only store/reader and atomic bundle | Task11 final-attempt, crash/cancel/orphan, bounded bytes/hash/dirfd and golden evidence tests |
+| FR-8, FR-11–FR-13, FR-20–FR-21, H3 | `shadow_candidates.py`, `canonical_comparison.py`, quality and descriptor binding | Task12 complete-candidate, golden candidate/selection, snapshot drift/unavailable and no-write tests |
+| FR-14–FR-18, FR-22–FR-23, H4/H8, NFR-1, NFR-7–NFR-14 | durable job outbox, released-lock handoff, scanner, leases, reports, reset transaction | Task13 ordering/crash/lease/CAS/session-vector and golden GET/selection tests |
+| NFR-3–NFR-6, H7, storage table | hash/CAS/dirfd/root/SQLite contract | storage/concurrency/TOCTOU/read-only fingerprints |
+| M2 | golden R2-F2 manifest/evidence/candidate/selection/GET byte/hash/reader fixtures | named regression in every Task 10–13 focused command and independent review |
 | NFR-9 | compatibility matrix and AC-10 | old manifest/hash/selection/GET byte and semantic regression |
-| EC-1–EC-16 | numbered edge-case matrix | focused failure fixtures; no external calls |
+| EC-1–EC-23 | numbered edge-case matrix | focused failure fixtures; crash/orphan/descriptor drift/outbox/lease/reset/terms gates; no external calls |
 | API/Data models | CLI/HTTP/TypeScript and immutable model block | schema round-trip, sanitized output and CLI plan tests |
 | Out-of-scope/rollback | explicit boundaries above | static diff, authorization checklist, rollback drill |
 
 ## Review Decision
 
-This document is a specification only. At this baseline the decision is **APPROVED FOR OFFLINE
-TASK 10–13 PLANNING**, **CODE GO / SHADOW WINDOW PENDING**, and **R2-F3 GO = NO-GO** until an
-authorized real 20-session window is completed. No provider request, credential, account, NAS,
-production or canonical mutation is authorized by this document.
+This document is a specification only. At this baseline the decision is **SPEC READY / IMPLEMENTATION
+NOT STARTED / R2-F3 CODE NO-GO**. It may be used to review a future offline implementation, but
+only a clean Tasks 10–13 RED/GREEN/full-check/independent-review gate may produce **CODE GO /
+SHADOW WINDOW PENDING**; a real authorized 20-session window is additionally required for R2-F3
+GO. No provider request, credential, account, NAS, production or canonical mutation is authorized
+by this document.
