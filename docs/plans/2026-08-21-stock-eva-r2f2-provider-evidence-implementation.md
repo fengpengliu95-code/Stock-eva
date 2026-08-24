@@ -690,6 +690,11 @@ Create/modify only:
 - Create `tests/test_market_candidate_selection.py`
 - Modify `tests/test_market_data.py`
 - Modify `tests/test_market_get_read_only.py`
+- Modify `backend/app/market/automation.py` (review-authorized production evidence route wiring)
+- Modify `tests/test_market_automation.py` (review-authorized production route coverage)
+
+The two automation files are a bounded whitelist correction for Task 9 production routing; this
+does not add an acceptance artifact or alter the Task 9 data/provider contracts.
 
 No old Parquet/manifest fixture or deployed object may be rewritten. `docs/acceptance/release-2-r2f2.md`
 is created only in the final acceptance closure commit after all code/review evidence exists; it is

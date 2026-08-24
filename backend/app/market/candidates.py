@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+from contextlib import contextmanager
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market.evidence import EvidenceError, EvidenceReader, PublishedEvidence
 from backend.app.market.providers.base import (
     BoundedText,
     ProviderId,
@@ -250,30 +253,193 @@ class CandidateStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
 
-    def _write_once(self, relative: str, payload: bytes) -> Path:
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
+    @contextmanager
+    def _bound_root(self):
         try:
-            with path.open("xb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except FileExistsError:
-            if path.read_bytes() != payload:
-                raise ValueError("immutable candidate artifact collision") from None
-        return path
+            root_fd = os.open(
+                self.root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError as exc:
+            raise EvidenceError(
+                "candidate root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+            ) from exc
+        identity = os.fstat(root_fd)
+        expected = (identity.st_dev, identity.st_ino)
+        try:
+            self._assert_root(root_fd, expected)
+            yield root_fd, expected
+        finally:
+            os.close(root_fd)
+
+    def _assert_root(self, root_fd: int, expected: tuple[int, int]) -> None:
+        current = os.fstat(root_fd)
+        if (current.st_dev, current.st_ino) != expected:
+            raise EvidenceError("candidate root changed during publish", "EVIDENCE_HASH_MISMATCH")
+        try:
+            configured = os.stat(self.root, follow_symlinks=False)
+        except OSError as exc:
+            raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH") from exc
+        if (configured.st_dev, configured.st_ino) != expected:
+            raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH")
+
+    @staticmethod
+    def _parts(relative: str) -> tuple[str, ...]:
+        parts = tuple(relative.split("/"))
+        if not parts or any(not part or part in {".", ".."} for part in parts):
+            raise EvidenceError("unsafe candidate path", "EVIDENCE_UNSAFE_PATH")
+        return parts
+
+    @staticmethod
+    def _mkdir_open(parent: int, component: str) -> int:
+        try:
+            return os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+        except FileNotFoundError:
+            try:
+                os.mkdir(component, 0o700, dir_fd=parent)
+                return os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent,
+                )
+            except OSError as exc:
+                raise EvidenceError(
+                    "candidate artifact directory is unsafe", "EVIDENCE_UNSAFE_PATH"
+                ) from exc
+        except OSError as exc:
+            raise EvidenceError(
+                "candidate artifact directory is unsafe", "EVIDENCE_UNSAFE_PATH"
+            ) from exc
+
+    def _write_once(
+        self,
+        relative: str,
+        payload: bytes,
+        *,
+        root_fd: int,
+        root_identity: tuple[int, int],
+    ) -> Path:
+        self._assert_root(root_fd, root_identity)
+        parts = self._parts(relative)
+        parent = os.dup(root_fd)
+        created: tuple[int, str] | None = None
+        try:
+            for component in parts[:-1]:
+                child = self._mkdir_open(parent, component)
+                os.close(parent)
+                parent = child
+            name = parts[-1]
+            try:
+                existing = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                try:
+                    data = os.read(existing, len(payload) + 1)
+                    if data != payload:
+                        raise ValueError("immutable candidate artifact collision")
+                finally:
+                    os.close(existing)
+            else:
+                staging = self._mkdir_open(root_fd, "staging")
+                try:
+                    temp_name = f"candidate-{os.getpid()}-{id(payload)}.partial"
+                    temp = os.open(
+                        temp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=staging,
+                    )
+                    created = (staging, temp_name)
+                    try:
+                        os.write(temp, payload)
+                        os.fsync(temp)
+                    finally:
+                        os.close(temp)
+                    try:
+                        os.link(
+                            temp_name,
+                            name,
+                            src_dir_fd=staging,
+                            dst_dir_fd=parent,
+                            follow_symlinks=False,
+                        )
+                        os.fsync(parent)
+                    except FileExistsError:
+                        existing = os.open(
+                            name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=parent,
+                        )
+                        try:
+                            if os.read(existing, len(payload) + 1) != payload:
+                                raise ValueError("immutable candidate artifact collision")
+                        finally:
+                            os.close(existing)
+                    os.unlink(temp_name, dir_fd=staging)
+                    created = None
+                finally:
+                    os.close(staging)
+            self._assert_root(root_fd, root_identity)
+            path = self.root / relative
+            readback = self._readback(root_fd, relative)
+            if readback != payload:
+                raise EvidenceError(
+                    "candidate artifact readback mismatch", "EVIDENCE_HASH_MISMATCH"
+                )
+            return path
+        except BaseException:
+            if created is not None:
+                try:
+                    os.unlink(created[1], dir_fd=created[0])
+                except OSError:
+                    pass
+            raise
+        finally:
+            os.close(parent)
+
+    @staticmethod
+    def _readback(root_fd: int, relative: str) -> bytes:
+        from backend.app.market.evidence import open_evidence_relative
+
+        descriptor = open_evidence_relative(root_fd, relative)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise EvidenceError("candidate artifact is not regular", "EVIDENCE_UNSAFE_PATH")
+            return os.read(descriptor, info.st_size + 1)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _payload(model: BaseModel) -> bytes:
         return _canonical(model.model_dump(mode="json"))
 
     def publish_gate_report(self, report: CandidateGateReport) -> Path:
-        return self._write_once(f"gates/{report.gate_report_id}.json", self._payload(report))
+        with self._bound_root() as (fd, identity):
+            return self._write_once(
+                f"gates/{report.gate_report_id}.json",
+                self._payload(report),
+                root_fd=fd,
+                root_identity=identity,
+            )
 
     def publish_candidate(self, candidate: CandidateManifest) -> Path:
-        return self._write_once(
-            f"candidates/{candidate.candidate_id}.json", self._payload(candidate)
-        )
+        with self._bound_root() as (fd, identity):
+            return self._write_once(
+                f"candidates/{candidate.candidate_id}.json",
+                self._payload(candidate),
+                root_fd=fd,
+                root_identity=identity,
+            )
 
     def publish_selection(
         self,
@@ -281,7 +447,7 @@ class CandidateStore:
         *,
         candidate: CandidateManifest,
         gate_report: CandidateGateReport,
-        evidence: Any | None = None,
+        evidence: PublishedEvidence,
     ) -> Path:
         validate_candidate_lineage(candidate, evidence, gate_report)
         if selection.selected_candidate_id != candidate.candidate_id:
@@ -292,9 +458,13 @@ class CandidateStore:
             raise ValueError("selection gate hash mismatch")
         if selection.evidence_sha256 != candidate.evidence_sha256:
             raise ValueError("selection evidence hash mismatch")
-        return self._write_once(
-            f"selections/{selection.selection_id}.json", self._payload(selection)
-        )
+        with self._bound_root() as (fd, identity):
+            return self._write_once(
+                f"selections/{selection.selection_id}.json",
+                self._payload(selection),
+                root_fd=fd,
+                root_identity=identity,
+            )
 
     def publish_chain(
         self,
@@ -302,18 +472,47 @@ class CandidateStore:
         report: CandidateGateReport,
         candidate: CandidateManifest,
         selection: SessionSelection,
-        evidence: Any | None = None,
+        evidence: PublishedEvidence,
+        normalized_payload: bytes | None = None,
         after_selection: Any | None = None,
     ) -> SessionSelection:
         """Publish gate → candidate → selection; callback runs only after selection."""
         validate_candidate_lineage(candidate, evidence, report)
-        self.publish_gate_report(report)
-        self.publish_candidate(candidate)
-        self.publish_selection(
-            selection, candidate=candidate, gate_report=report, evidence=evidence
-        )
-        if after_selection is not None:
-            after_selection(selection)
+        with self._bound_root() as (fd, identity):
+            if normalized_payload is not None:
+                if (
+                    hashlib.sha256(normalized_payload).hexdigest()
+                    != candidate.normalized_object_sha256
+                ):
+                    raise ValueError("normalized candidate object hash mismatch")
+                self._write_once(
+                    candidate.normalized_object_relative_path,
+                    normalized_payload,
+                    root_fd=fd,
+                    root_identity=identity,
+                )
+            self._write_once(
+                f"gates/{report.gate_report_id}.json",
+                self._payload(report),
+                root_fd=fd,
+                root_identity=identity,
+            )
+            self._write_once(
+                f"candidates/{candidate.candidate_id}.json",
+                self._payload(candidate),
+                root_fd=fd,
+                root_identity=identity,
+            )
+            self._write_once(
+                f"selections/{selection.selection_id}.json",
+                self._payload(selection),
+                root_fd=fd,
+                root_identity=identity,
+            )
+            self._assert_root(fd, identity)
+            if after_selection is not None:
+                after_selection(selection)
+            self._assert_root(fd, identity)
         return selection
 
 
@@ -362,27 +561,35 @@ def _as_candidate(value: CandidateManifest | dict[str, Any]) -> CandidateManifes
 
 def validate_candidate_lineage(
     candidate: CandidateManifest,
-    evidence: Any,
+    evidence: PublishedEvidence,
     gate_report: CandidateGateReport,
 ) -> None:
     """Validate the complete candidate -> evidence/gate identity join."""
-    manifest = getattr(evidence, "manifest", evidence)
+    if not isinstance(evidence, PublishedEvidence):
+        raise ValueError("candidate lineage requires bound PublishedEvidence")
+    try:
+        evidence.read_rows()
+    except EvidenceError as exc:
+        raise ValueError("published evidence readback failed") from exc
+    manifest = evidence.manifest
     expected = {
-        "evidence_id": getattr(manifest, "evidence_id", None),
-        "evidence_sha256": getattr(manifest, "manifest_sha256", None),
-        "trade_date": getattr(manifest, "trade_date", None),
-        "universe_id": getattr(manifest, "universe_id", None),
-        "provider_id": getattr(manifest, "provider_id", None),
-        "adapter_version": getattr(manifest, "adapter_version", None),
-        "factor_resolution_sha256": getattr(manifest, "factor_resolution_sha256", None),
+        "evidence_id": manifest.evidence_id,
+        "evidence_sha256": manifest.manifest_sha256,
+        "trade_date": manifest.trade_date,
+        "universe_id": manifest.universe_id,
+        "provider_id": manifest.provider_id,
+        "adapter_version": manifest.adapter_version,
+        "factor_resolution_sha256": manifest.factor_resolution_sha256,
     }
     for field, value in expected.items():
-        if value is not None and getattr(candidate, field) != value:
+        if getattr(candidate, field) != value:
             raise ValueError(f"candidate {field} lineage mismatch")
     if gate_report.candidate_id != candidate.candidate_id:
         raise ValueError("candidate gate report identity mismatch")
     if gate_report.aggregate_sha256 != candidate.gate_report_sha256:
         raise ValueError("candidate gate report hash mismatch")
+    if any(manifest.manifest_sha256 not in item.referenced_hashes for item in gate_report.outcomes):
+        raise ValueError("candidate gate report is not bound to published evidence")
     if candidate.status == "accepted" and gate_report.verdict != "pass":
         raise ValueError("accepted candidate requires a passing gate report")
 
@@ -399,20 +606,40 @@ def evaluate_candidate_gates(
     trade_date: date,
     required_symbols: tuple[str, ...],
     rows: tuple[Any, ...],
-    evidence: Any | None,
-    factor_resolution: tuple[Any, ...] = (),
+    evidence: PublishedEvidence,
+    factor_resolution: tuple[Any, ...] | None = None,
     created_at: datetime,
     gate_version: str = "r2f2-gates.v1",
 ) -> CandidateGateReport:
     """Evaluate the ten gates from typed/readback inputs in their fixed order."""
+    if not isinstance(evidence, PublishedEvidence):
+        raise ValueError("candidate gates require bound PublishedEvidence")
+    try:
+        evidence_pages = evidence.read_rows()
+        reader = evidence._reader
+        if reader is None:
+            raise EvidenceError("published evidence has no reader", "EVIDENCE_MANIFEST_INVALID")
+        replay_reader = EvidenceReader(reader.root)
+        try:
+            replay = replay_reader.replay(evidence.manifest.evidence_id)
+        finally:
+            replay_reader.close()
+    except EvidenceError as exc:
+        raise ValueError("candidate evidence readback failed") from exc
+    if (
+        factor_resolution is not None
+        and tuple(factor_resolution) != evidence.manifest.factor_resolution
+    ):
+        raise ValueError("candidate factor resolution is not the published snapshot")
+    published_resolution = evidence.manifest.factor_resolution
     symbols = tuple(_row_value(row, "symbol", _row_value(row, "code")) for row in rows)
     unique_symbols = set(symbols)
     date_ok = all(
         _row_value(row, "trade_date", _row_value(row, "date")) == trade_date for row in rows
     )
     coverage_ok = len(rows) == len(required_symbols) and len(unique_symbols) == len(rows)
-    semantic_ok = True
-    suspension_ok = True
+    semantic_ok = bool(rows)
+    suspension_ok = bool(rows)
     for row in rows:
         security_type = _row_value(row, "security_type", "stock")
         suspended = bool(_row_value(row, "is_suspended", False))
@@ -423,18 +650,16 @@ def evaluate_candidate_gates(
             suspension_ok = False
         elif any(float(_row_value(row, field, 0) or 0) != 0 for field in ("volume", "amount")):
             suspension_ok = False
-    evidence_manifest = getattr(evidence, "manifest", evidence)
-    evidence_ok = evidence_manifest is not None and bool(
-        getattr(evidence_manifest, "manifest_sha256", None)
-    )
-    completions = tuple(getattr(evidence_manifest, "request_completions", ()))
+    evidence_manifest = evidence.manifest
+    evidence_ok = bool(evidence_manifest.manifest_sha256) and bool(evidence.reader_identity)
+    completions = tuple(evidence_manifest.request_completions)
     transport_ok = bool(evidence_ok and completions) and all(
         str(getattr(getattr(item, "final_outcome", None), "value", "")) == "success"
-        for item in getattr(evidence_manifest, "request_completions", ())
+        for item in completions
     )
     factor_keys = {
         (getattr(item, "symbol", None), getattr(item, "trade_date", None))
-        for item in factor_resolution
+        for item in published_resolution
     }
     factor_ok = all(
         (_row_value(row, "symbol"), trade_date) in factor_keys
@@ -442,17 +667,28 @@ def evaluate_candidate_gates(
         if _row_value(row, "security_type", "stock") == "stock"
         and not bool(_row_value(row, "is_suspended", False))
     )
+    raw_descriptors = tuple(
+        item for item in evidence.manifest.objects if item.object_kind.value == "raw_endpoint_page"
+    )
+    descriptor_fields_ok = len(evidence_pages) == len(raw_descriptors) and all(
+        tuple(page.get("fields", ())) == tuple(descriptor.fields)
+        for page, descriptor in zip(evidence_pages, raw_descriptors, strict=True)
+    )
+    replay_ok = (
+        replay.status == "ready"
+        and replay.normalization_clock_utc == evidence_manifest.normalization_clock_utc
+    )
     checks = (
         transport_ok,
-        True,
+        descriptor_fields_ok,
         date_ok,
         unique_symbols == set(required_symbols),
         coverage_ok,
         semantic_ok,
         factor_ok,
         suspension_ok,
-        evidence_ok,
-        True,
+        evidence_ok and replay_ok,
+        replay_ok,
     )
     outcomes = tuple(
         GateOutcome(
@@ -462,9 +698,7 @@ def evaluate_candidate_gates(
             bounded_metrics=(("rows", len(rows)), ("required_symbols", len(required_symbols))),
             failure_class=None if passed else "semantic",
             referenced_hashes=tuple(
-                item
-                for item in (getattr(evidence_manifest, "manifest_sha256", None),)
-                if item is not None
+                item for item in (evidence_manifest.manifest_sha256,) if item is not None
             ),
         )
         for name, passed in zip(R2F2_GATE_ORDER, checks, strict=True)
@@ -484,8 +718,8 @@ def select_primary_candidate(
     candidates: tuple[CandidateManifest | dict[str, Any], ...],
     selected_at: datetime,
     reason: SelectionReason = SelectionReason.PRIMARY_READY,
-    gate_report: CandidateGateReport | None = None,
-    evidence: Any | None = None,
+    gate_report: CandidateGateReport,
+    evidence: PublishedEvidence,
 ) -> SessionSelection:
     if reason is not SelectionReason.PRIMARY_READY:
         raise ValueError("qualified fallback is reserved and rejected")
@@ -498,8 +732,7 @@ def select_primary_candidate(
         raise ValueError("selection provider must be baostock")
     if candidate.trade_date != trade_date or candidate.universe_id != universe_id:
         raise ValueError("selection scope does not match candidate")
-    if gate_report is not None:
-        validate_candidate_lineage(candidate, evidence, gate_report)
+    validate_candidate_lineage(candidate, evidence, gate_report)
     values = {
         "selection_id": f"selection-{_digest(candidate.model_dump(mode='json'))[:24]}",
         "trade_date": trade_date,

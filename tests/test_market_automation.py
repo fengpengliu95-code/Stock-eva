@@ -362,6 +362,9 @@ def test_real_service_due_route_uses_one_raw_fetch_and_one_normalize(tmp_path: P
     assert outcome.result is not None and outcome.result.status == "ready"
     assert raw_calls == normalize_calls == 1
     assert legacy_fetch_calls == 0
+    assert list((tmp_path / "evidence" / "candidates").glob("*.json"))
+    assert list((tmp_path / "evidence" / "gates").glob("*.json"))
+    assert list((tmp_path / "evidence" / "selections").glob("*.json"))
     manifest_path = next((tmp_path / "evidence" / "manifests").glob("*.json"))
     manifest = json.loads(manifest_path.read_text())
     factor_ordinal = next(

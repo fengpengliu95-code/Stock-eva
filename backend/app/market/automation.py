@@ -18,6 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
+from backend.app.market.candidates import (
+    CandidateStore,
+    build_candidate_manifest,
+    evaluate_candidate_gates,
+    select_primary_candidate,
+)
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
 from backend.app.market.evidence import (
     CacheFactorResolution,
@@ -447,22 +453,114 @@ def canonical_refresh_callback(
                         expected_symbols=list(request.session_symbols),
                         failed_symbols=[],
                     )
-                    return run_publication_refresh(
-                        store,
-                        adapter,
+                    if before_store is not None:
+                        before_store()
+                    gate_report = evaluate_candidate_gates(
+                        candidate_id=f"candidate-{manifest.evidence_id[3:]}",
                         trade_date=trade_date,
-                        required_symbols=required_symbols,
-                        request_key=request_key,
-                        run_id=run_id,
-                        before_store=before_store,
-                        normalized_batch=normalized,
+                        required_symbols=tuple(request.session_symbols),
+                        rows=tuple(normalized.bars),
+                        evidence=evidence,
+                        factor_resolution=manifest.factor_resolution,
+                        created_at=datetime.now(UTC),
                     )
+                    if gate_report.verdict != "pass":
+                        raise ProviderHealthError("canonical candidate gates did not pass")
+                    normalized_payload = json.dumps(
+                        [item.model_dump(mode="json") for item in normalized.bars],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    normalized_hash = hashlib.sha256(normalized_payload).hexdigest()
+                    candidate = build_candidate_manifest(
+                        candidate_id=f"candidate-{manifest.evidence_id[3:]}",
+                        trade_date=trade_date,
+                        universe_id=manifest.universe_id,
+                        provider_id=manifest.provider_id,
+                        evidence_id=manifest.evidence_id,
+                        evidence_sha256=manifest.manifest_sha256,
+                        normalized_object_relative_path=(
+                            f"candidates/{manifest.evidence_id}.normalized.json"
+                        ),
+                        normalized_object_sha256=normalized_hash,
+                        gate_report_relative_path=f"gates/{gate_report.gate_report_id}.json",
+                        gate_report_sha256=gate_report.aggregate_sha256,
+                        factor_resolution_sha256=manifest.factor_resolution_sha256,
+                        adapter_version=manifest.adapter_version,
+                        source_schema_version="daily_astock.v1",
+                        row_count=len(normalized.bars),
+                        required_symbol_count=len(request.session_symbols),
+                    )
+                    selection = select_primary_candidate(
+                        trade_date=trade_date,
+                        universe_id=manifest.universe_id,
+                        candidates=(candidate,),
+                        selected_at=datetime.now(UTC),
+                        gate_report=gate_report,
+                        evidence=evidence,
+                    )
+                    CandidateStore(evidence_root).publish_chain(
+                        report=gate_report,
+                        candidate=candidate,
+                        selection=selection,
+                        evidence=evidence,
+                        normalized_payload=normalized_payload,
+                    )
+                    result = RefreshResult(
+                        run_id=run_id,
+                        request_key=request_key,
+                        run_kind="daily",
+                        requested_date=trade_date,
+                        source="baostock",
+                        status="ready",
+                        requested_count=len(request.session_symbols),
+                        succeeded_count=len(normalized.bars),
+                        coverage_ratio=1.0,
+                        failed_symbols=[],
+                        quality_issues=[],
+                        started_at=datetime.now(UTC),
+                        completed_at=datetime.now(UTC),
+                    )
+                    publication_lineage = {
+                        "provider_id": candidate.provider_id.value,
+                        "universe_id": candidate.universe_id,
+                        "evidence_id": candidate.evidence_id,
+                        "evidence_sha256": candidate.evidence_sha256,
+                        "candidate_id": candidate.candidate_id,
+                        "candidate_manifest_sha256": candidate.manifest_sha256,
+                        "gate_report_sha256": candidate.gate_report_sha256,
+                        "adapter_version": candidate.adapter_version,
+                        "source_schema_version": candidate.source_schema_version,
+                    }
+                    if isinstance(store, MarketStore):
+                        # The in-memory/control store has no dataset pointer.  Production
+                        # NasMarketStore takes the lineage and selection below as mandatory.
+                        store.save_refresh(normalized.bars, result, publish=True)
+                    else:
+                        store.save_refresh(
+                            normalized.bars,
+                            result,
+                            publish=True,
+                            publication_lineage=publication_lineage,
+                            selection=selection,
+                        )
+                    return result
                 finally:
                     evidence.close()
             except Exception as error:
                 return failure_result(error)
 
-    return execute
+    locked_execute = execute
+
+    def execute_with_lock(**kwargs):
+        lock_held = bool(kwargs.pop("_lock_held", False))
+        lease = nullcontext() if lock_held else RefreshRunLock(lock_path)
+        with lease:
+            return locked_execute(**kwargs)
+
+    execute_with_lock._refresh_lock_held = True
+    return execute_with_lock
 
 
 def _log_event(level: int, event: str, **fields) -> None:
@@ -1215,12 +1313,17 @@ class MarketAutomationService:
                 return AutomationOutcome(decision=decision, state=state)
 
             if self.canonical_refresh is not None:
+                canonical_kwargs = {
+                    "trade_date": target,
+                    "required_symbols": self.required_symbols(),
+                    "request_key": request_key,
+                    "run_id": refresh_id,
+                    "before_store": collector.resolve_touched_endpoints,
+                }
+                if getattr(self.canonical_refresh, "_refresh_lock_held", False):
+                    canonical_kwargs["_lock_held"] = True
                 result = self.canonical_refresh(
-                    trade_date=target,
-                    required_symbols=self.required_symbols(),
-                    request_key=request_key,
-                    run_id=refresh_id,
-                    before_store=collector.resolve_touched_endpoints,
+                    **canonical_kwargs,
                 )
             else:
                 with provider_scope():
