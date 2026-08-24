@@ -691,7 +691,8 @@ The dedicated R2-F3 specifications
 [implementation](2026-08-24-stock-eva-r2f3-shadow-bakeoff-implementation.md)) supersede this
 umbrella R2-F3 section wherever they differ. Their current status is **SPEC READY /
 IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO**. R2-F3 has no `failover_enabled` state or
-canonical fallback authority; that state is owned only by R2-F4.
+canonical fallback authority; R2-F3 selection is **none**. The general
+`qualified -> failover_enabled` transition is an R2-F4 portfolio rule owned only by R2-F4.
 
 ### Task 10: Add provider qualification and secret-safe configuration
 

@@ -222,9 +222,10 @@ discovered -> canary -> shadow -> qualified
             quarantined <-------------+
 ```
 
-Only `qualified` providers may be considered by selection. Only an explicit configuration change
-in the separately governed R2-F4 stage may move a qualified provider to `failover_enabled`.
-R2-F3 has no `failover_enabled` registry state, selection path or authority. Schema drift, material
+Only `qualified` providers may be considered by selection. The general `qualified ->
+failover_enabled` transition is an R2-F4 portfolio rule, owned by the separately governed R2-F4
+stage. R2-F3 selection is **none** and has no `failover_enabled` registry state, selection path or
+authority. Schema drift, material
 reconciliation drift, credential failure, repeated rate limiting or changed terms automatically
 quarantines the provider; it never silently promotes another unreviewed provider.
 

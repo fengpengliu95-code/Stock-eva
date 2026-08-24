@@ -97,9 +97,14 @@ availability, legality, data quality, or a stable schema. No provider is endorse
 - FR-7: TickFlow MUST remain `discovered` until unadjusted daily bars, universe/index coverage,
   factor/corporate-action evidence, suspension semantics, units, quota and retention are proven.
   Adjusted close alone MUST NOT satisfy the canonical factor contract.
-- FR-8: A shadow attempt MUST capture one complete `(trade_date, universe_id)` candidate per
-  provider. Symbol-level source mixing, partial candidate promotion and cross-session stitching
-  MUST be rejected.
+- FR-8: A shadow plan MUST expand into immutable `ShadowLogicalRequest` records. Each record has
+  an ordinal, provider endpoint, role, exact trade date, symbol/index shard, schema/unit contract
+  and request hash. A request may have retries, but a `ShadowRequestCompletion` is publishable
+  only with one unique final success and contiguous final page identities; a failed attempt has
+  zero durable page/object references and zero durable rows. A `ShadowCompletion` binds the exact
+  ordinal set, request-plan hash and aggregate counts, and every ordinal MUST finalize before a
+  candidate exists. Symbol-level source mixing, partial candidate promotion and cross-session
+  stitching MUST be rejected.
 - FR-9: Shadow evidence MUST retain only final successful attempt pages/rows; failed partial
   payloads MUST be discarded and MUST NOT become evidence, candidate, report or quarantine object.
   Sanitized failure counters/IDs MAY remain in control audit.
@@ -131,13 +136,18 @@ availability, legality, data quality, or a stable schema. No provider is endorse
 - FR-18: No R2-F3 GO may be declared without a completed real authorized shadow window. Offline
   code completion is exactly `CODE GO / SHADOW WINDOW PENDING`.
 - FR-19: The shadow evidence writer MUST expose `ShadowEvidenceStore` and `ShadowEvidenceReader`
-  with `ShadowAttempt`/`ShadowCompletion` models. It MUST use successful-attempt-only semantics:
+  with `ShadowLogicalRequest/Plan`, `ShadowAttemptCompletion`, `ShadowRequestCompletion`,
+  `ShadowAttempt` and `ShadowCompletion` models. It MUST use successful-attempt-only semantics:
   failed partial rows/bytes are discarded in memory, final bundles commit atomically, crash/cancel
-  leaves only a sanitized orphan audit, and no orphan is readable as evidence.
+  leaves only a sanitized orphan audit, and no orphan is readable as evidence. The staging bundle
+  owns every object, manifest and `COMMIT`; no raw object is visible in a global root before the
+  exclusive directory rename.
 - FR-20: `ShadowCandidateStore`/`ShadowCandidateReader` MUST persist a `ShadowQualityReport` and
   complete candidate bundle in the shadow root; a failed or incomplete candidate MUST have no
   comparison snapshot or canonical side effect.
-- FR-21: `CanonicalComparisonSnapshot` MUST be descriptor-bound, read-only and bind the exact
+- FR-21: `canonical_comparison.py` MUST expose a descriptor-bound, read-only
+  `CanonicalCandidateReader` and a closeable `PublishedCanonicalComparison` capability (with
+  `CanonicalComparisonSnapshot` as its frozen value). It MUST bind the exact
   current canonical dataset manifest generation/identity, trade-date partition hash/row count,
   R2-F2 publication lineage, `CandidateStore` bundle `selection.json` selection ID/SHA-256,
   candidate/evidence/gate/factor/normalized hashes, trade date and universe. Any change or mismatch
@@ -150,6 +160,15 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   `skip`, `unavailable` or `mismatch`; `ConfirmedSessionSnapshot` MUST freeze exact calendar
   generation/hash and next confirmed sessions. Attempt, session and qualification-window reset
   state MUST update in one SQLite transaction/CAS and retain every prior report.
+- FR-24: `run_due_once` MUST determine its canonical outcome inside `RefreshRunLock`, release the
+  lock, then make only a nonblocking bounded `shadow_handoff.offer(outcome)` call. Handoff/worker
+  failure is a sanitized drop and cannot alter or delay the returned canonical outcome. A separate
+  `ShadowScheduler.run_once` and bounded scanner process the durable outbox later.
+- FR-25: `ConfirmedCalendarReader` MUST derive an exact confirmed-session snapshot from each
+  involved year's canonical `CalendarConfig` dump, official-source metadata and closed dates;
+  unknown years are unavailable. Attempt/session bundles publish and release their bundle lock
+  before one registry exclusive CAS transaction inserts refs and updates/resets the qualification
+  window; all history remains queryable.
 
 ## Non-Functional Requirements
 
@@ -163,10 +182,14 @@ availability, legality, data quality, or a stable schema. No provider is endorse
 - **NFR-4 (integrity):** Shadow files MUST use SHA-256, bounded sizes/rows, safe relative paths,
   dirfd + no-follow reads, atomic compare-create and immutable content-addressed objects.
 - **NFR-5 (persistence isolation):** Registry state MUST use an explicitly initialized independent
-  `provider_registry.sqlite3` local control DB; readers use SQLite URI read-only. Missing DB/table,
-  corrupt schema or failed migration is `unavailable` with zero writes.
-- **NFR-6 (concurrency):** One writer owns registry migrations and shadow publication. CAS/no-clobber
-  object writes and an explicit writer lock MUST prevent duplicate session finalization.
+  `provider_registry.sqlite3` local control DB. Its writer uses `journal_mode=DELETE`,
+  `synchronous=FULL`, `foreign_keys=ON` and an existing 0600 lock file; its reader takes a shared
+  lock, copies bounded bytes through descriptor/fingerprint checks and deserializes to `:memory:`.
+  Missing DB/table, journal/lock contention, corrupt schema or failed migration is `unavailable`
+  with zero writes; pathname/URI readers are forbidden.
+- **NFR-6 (concurrency):** Registry and shadow bundle locks are never held together. Network work
+  takes no registry lock; bundle publish/release precedes registry CAS attach. CAS/no-clobber object
+  writes and an explicit writer lock MUST prevent duplicate session finalization.
 - **NFR-7 (availability):** Shadow work MUST be bounded and cancelable; it MUST never extend the
   canonical availability deadline or block BaoStock publication.
 - **NFR-8 (observability):** Reports MUST include all successes and failures, request counts,
@@ -285,6 +308,13 @@ Then only final successful attempt pages are readable, failed/partial bytes are 
 bundle has one atomic commit marker, orphan audit is sanitized and bounded, and the reader returns
 `unavailable` for incomplete/orphan bundles without writing.
 
+Given a plan with multiple endpoints and an early partial page, followed by retries that succeed
+with different page identities
+When the request and completion validators run
+Then they require the exact ordinal set, one final success for every ordinal, contiguous terminal
+pages and a bidirectional completion/page/object binding; duplicate, missing or out-of-order pages
+remain unavailable and cannot publish.
+
 ### AC-13: Candidate and canonical comparison binding (FR-20–FR-21, NFR-9, NFR-14)
 
 Given a complete shadow candidate and a current canonical publication
@@ -294,7 +324,7 @@ hash, date or universe changes
 Then the descriptor-bound read-only reader returns `unavailable`, performs zero writes/provider
 calls, and never compares stale or mixed-source data.
 
-### AC-14: Durable post-release handoff (FR-22, NFR-7, NFR-13)
+### AC-14: Durable post-release handoff (FR-22, FR-24, NFR-7, NFR-13)
 
 Given a canonical refresh that commits its manifest and pointer while holding `RefreshRunLock`
 When the lock is released and shadow handoff/enqueue/worker fails, is cancelled, or the process dies
@@ -302,13 +332,24 @@ Then the canonical result and timing are already final and unchanged, the durabl
 pending/reclaimable, a later scanner recovers every published-but-unenqueued manifest, and no
 post-publication lock-held work delays canonical availability.
 
-### AC-15: Confirmed sessions and transactional reset (FR-17, FR-23, NFR-5, NFR-8)
+Given `run_due_once` returns either a run or a ready/non-run decision
+When the handoff is offered
+Then the offer occurs only after the lock scope, with zero wait and an idempotency key; busy or
+worker failure is a safe log/drop and the original return value is unchanged.
+
+### AC-15: Confirmed sessions and transactional reset (FR-17, FR-23, FR-25, NFR-5, NFR-8)
 
 Given a confirmed calendar snapshot and a sequence containing success, failure, skip, unavailable,
 mismatch, a date gap or a version-vector drift
 When the attempt/session/window transaction commits
 Then every `ShadowAttemptReport` is retained, the exact session vector is recorded, any gap/failure/
 drift resets qualification atomically with the CAS state version, and no prior report is deleted.
+
+Given an involved year absent from the canonical CalendarConfig/official metadata or a crash after
+report-bundle rename but before registry CAS
+When `ConfirmedCalendarReader` or the recovery scanner runs
+Then it returns unavailable for the unknown year, or attaches/deduplicates the committed bundle
+without changing the qualification window; a failed DB commit leaves the window unchanged.
 
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 
@@ -474,6 +515,7 @@ ShadowProviderRecord:
 
 TermsEvidence:
   terms_evidence_id, provider_id, official_url_allowlist, content_bytes_sha256,
+  bounded_content_object_ref, content_object_sha256,
   contract_version, as_of_date, reviewer, review_id, approved_intended_use,
   approved_retention, approved_credential_mode, approved_quota_decision
 
@@ -486,12 +528,31 @@ ShadowAttempt:
   started_at, completed_at, outcome, request_count, retry_count, failure_class,
   final_page_refs, sanitized_orphan_audit_id
 
+ShadowLogicalRequest:
+  ordinal, request_id, provider_id, endpoint, role, trade_date, symbol_or_index_shard,
+  schema_contract_hash, unit_contract_hash, request_hash
+
+ShadowLogicalRequestPlan:
+  plan_id, job_id, request_plan_hash, requests[ShadowLogicalRequest], exact_ordinal_set
+
+ShadowAttemptCompletion:
+  ordinal, attempt_id, request_id, session_id, outcome, page_identities, page_count,
+  row_count, terminal_marker, evidence_refs, evidence_sha256
+  # failure|skip|unavailable|mismatch => evidence_refs/evidence_sha256/page rows are zero/null
+
+ShadowRequestCompletion:
+  ordinal, request_id, attempt_ids, final_attempt_id, final_success, contiguous_page_refs,
+  completion_sha256
+
 ShadowCompletion:
-  job_id, successful_attempt_id, evidence_id, completion_sha256, committed_at
+  job_id, request_plan_hash, exact_ordinal_set, request_completions, aggregate_page_count,
+  aggregate_row_count, evidence_id, completion_sha256, committed_at
 
 ShadowAttemptReport:
   report_id, attempt_id, outcome(success|failure|skip|unavailable|mismatch),
-  timing, coverage, request/retry/rate-limit counts, failure_class, evidence/candidate/report hashes
+  timing, coverage, request/retry/rate-limit counts, failure_class,
+  evidence_sha256(nullable unless success), candidate_sha256(nullable unless success),
+  report_sha256(nullable only for pre-persist failure; required for durable report)
 
 VersionVector:
   adapter_hash, endpoint_contract_hash, source_schema_hash, normalizer_hash,
@@ -505,16 +566,24 @@ CanonicalComparisonSnapshot:
   factor_sha256, normalized_sha256, trade_date, universe_id, version_vector,
   snapshot_sha256
 
+PublishedCanonicalComparison:
+  capability_id, frozen CanonicalComparisonSnapshot, opened_roots, descriptor_fingerprints,
+  closed, verify_before_reconcile, verify_after_reconcile, close()
+
 ShadowJob:
-  job_id, canonical_manifest_generation, canonical_manifest_sha256, trade_date,
-  universe_id, state(pending|leased|completed|failed|cancelled), lease_owner,
+  job_id, provider_id, window_id, version_vector_sha256, canonical_manifest_generation,
+  canonical_manifest_sha256, trade_date, universe_id,
+  state(pending|leased|completed|failed|cancelled|unavailable), lease_owner,
   lease_expires_at, attempts, state_version, job_sha256
 
 ShadowEvidenceManifest:
   evidence_id, provider_id, adapter_version, endpoint_contract_version, trade_date, universe_id,
-  request_plan_hash, final_attempt_ids, source_object_refs, object_count, row_count,
+  request_plan_hash, completion_sha256, final_attempt_ids, source_object_refs, page_identities,
+  object_count, row_count,
   request_count, retry_count, rate_limit_count, source_schema_hash, schema_version,
   bundle_relative_path, bundle_commit_sha256, orphan_audit_id, manifest_sha256
+  # each completion/page/object reference is checked both directions; a page/object absent from
+  # completion or a completion ref absent from this manifest is unavailable
 
 ShadowQualityReport:
   quality_report_id, candidate_id, trade_date, universe_id, gate_version, ordered_gate_outcomes,
@@ -537,68 +606,78 @@ ShadowSessionReport:
   shadow_started_at, shadow_completed_at, request_count, retry_count, coverage_ratio,
   quality_verdict, reconciliation_status, failure_class, evidence_sha256, candidate_sha256,
   report_sha256, window_id
+  # evidence_sha256/candidate_sha256 are nullable for failure/skip/unavailable/mismatch; success
+  # requires both plus the report hash, and validators reject the opposite combination
 ```
 
 ### Storage and migration
 
 | Artifact | Location | Owner | Allowed operation |
 |---|---|---|---|
-| Registry | explicit local `provider_registry.sqlite3` | single registry writer | additive schema migration under writer lock; read-only URI readers |
+| Registry | configured absolute local-control `provider_registry.sqlite3` plus sibling lock | single registry writer | additive migration under exclusive lock; descriptor-copy `:memory:` readers |
 | Shadow evidence/objects/reports | explicit `provider_shadow_root` | shadow writer | bounded no-follow content-addressed atomic compare-create |
 | R2-F2 provider evidence | existing `provider_evidence_root` | canonical writer | unchanged; secondary MUST NOT write |
 | R2-F2 candidates/selections/canonical data | existing candidate/canonical roots | canonical writer | unchanged; secondary MUST NOT write |
 | User DB/NAS | existing production paths | other subsystems | no R2-F3 operation |
 
 `schema_version` is stored in the registry and each shadow manifest. The frozen registry migration
-ledger is:
+ledger is executable, not pseudocode: the canonical fenced SQL is in the implementation Task 10
+section and is compiled against SQLite before implementation starts.
 
 | Migration ID | DDL / invariant | Rollback |
 |---|---|---|
-| `r2f3-registry-0001` | `meta(schema_version TEXT PRIMARY KEY, migration_id TEXT NOT NULL, created_at TEXT NOT NULL)`; `provider_record(provider_id TEXT PRIMARY KEY CHECK(provider_id IN ('tickflow','tushare')), admission_state TEXT NOT NULL CHECK(admission_state IN ('discovered','canary','shadow','qualified','quarantined')), adapter_hash TEXT NOT NULL, endpoint_contract_hash TEXT NOT NULL, source_schema_hash TEXT NOT NULL, normalizer_hash TEXT NOT NULL, reconciliation_policy_hash TEXT NOT NULL, terms_evidence_hash TEXT NOT NULL, credential_env_name TEXT NOT NULL, state_version INTEGER NOT NULL CHECK(state_version >= 0))`; `qualification_window(provider_id TEXT PRIMARY KEY, window_id TEXT NOT NULL, window_start TEXT, window_end TEXT, consecutive_sessions INTEGER NOT NULL CHECK(consecutive_sessions >= 0), version_vector_json TEXT NOT NULL)`; `shadow_job(job_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, universe_id TEXT NOT NULL, canonical_manifest_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','leased','completed','failed','cancelled')), lease_owner TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL CHECK(attempts >= 0), state_version INTEGER NOT NULL CHECK(state_version >= 0))`; `shadow_attempt_report(report_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','skip','unavailable','mismatch')), report_sha256 TEXT NOT NULL)`; foreign keys and unique `(provider_id, trade_date, universe_id, window_id)` prevent duplicate completion. | Stop readers, retain immutable DB backup and shadow objects, restore previous registry DB copy; never delete/rewrite canonical data. |
-| `r2f3-registry-0002` | Add-only `terms_evidence` fields/table with `official_url_allowlist_json`, `content_bytes_sha256`, `contract_version`, `as_of_date`, `reviewer`, `review_id`, approved intended-use/retention/credential/quota decisions; existing rows remain `discovered` until populated. | Reopen `0001` read-only; no destructive down-migration. |
+| `r2f3-registry-0001` | Creates `schema_migration`, `terms_evidence`, `provider_record`, `qualification_window`, `shadow_job`, `shadow_attempt_report`, `session_report`, `shadow_evidence_ref` and `shadow_candidate_ref`, with exact FK/UNIQUE/CHECK definitions in Task 10 SQL. | Stop readers, retain immutable DB backup and shadow objects, restore previous registry DB copy; never delete/rewrite canonical data. |
+| `r2f3-registry-0002` | Add-only review-object compatibility migration; existing providers remain `discovered` until `terms_evidence_hash` and review fields are non-null and validator-approved. | Reopen `0001` read-only; no destructive down-migration. |
 
-Writer initialization MUST use PRAGMA `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`,
+Writer initialization MUST use PRAGMA `foreign_keys=ON`, `journal_mode=DELETE`, `synchronous=FULL`,
 `busy_timeout` bounded, and a checked `schema_version`/migration ID. It MUST create the DB only
 inside a safe absolute ancestor whose ancestors are regular directories, and the DB must be a
-regular 0600 file. The writer lock is `provider_registry.sqlite3.lock`; global lock order is
-`provider_registry.sqlite3.lock` -> registry SQLite transaction -> shadow bundle lock. It MUST NOT
-acquire `RefreshRunLock` or run under a canonical publication lock. Every transition uses
+regular 0600 file and pre-created `provider_registry.sqlite3.lock` must also be 0600. The writer
+opens that existing lock with `O_NOFOLLOW` and takes an exclusive flock for every transaction. It
+MUST NOT acquire `RefreshRunLock` or run under a canonical publication lock. Every transition uses
 `BEGIN IMMEDIATE`, expected `state_version`, one CAS UPDATE, and commit; conflict rolls back and
-returns a sanitized retry/unavailable result. Migration failure rolls back the transaction and
-leaves the prior schema/state readable.
+returns a sanitized retry/unavailable result. SQLite's DELETE journal recovers a crashed writer on
+the next exclusive writer transaction; migration failure rolls back and leaves prior schema/state
+readable.
 
-The read protocol is descriptor-bound: open the DB parent and basename with `openat/O_NOFOLLOW`,
-require regular 0600, read bounded bytes, record before/after `fstat` plus device/inode/size/mtime
-fingerprint, then call `sqlite3.Connection.deserialize()` into `:memory:` for read-only schema and
-status queries. If deserialize is unavailable, the capability is `unavailable`; there is no
-fallback to a pathname SQLite reader. A changed fingerprint, symlink, unsafe ancestor, permission
-or schema mismatch is `unavailable` with zero persistent writes.
+The reader opens the already-existing lock with `O_NOFOLLOW` (never creates it), takes a shared
+flock, then opens the DB basename through its parent descriptor with `O_NOFOLLOW`, requires a
+regular 0600 file, copies bounded bytes, records before/after `fstat` plus device/inode/size/mtime
+fingerprint, and calls `sqlite3.Connection.deserialize()` into `:memory:` for read-only schema and
+status queries. If a journal is present, the lock cannot be acquired, deserialize is unavailable,
+or any identity changes, the capability is `unavailable` with zero persistent writes. There is no
+fallback to a pathname or URI SQLite reader.
 
-`provider_shadow_root` is fixed to `registry-independent/shadow/{provider}/{trade_date}/`; only
-safe provider/date components are accepted. It has bounded object/manifest/report bytes and rows,
-regular-file/0600 permissions, no symlinks, dirfd + `O_NOFOLLOW` reads, pre/post fstat identity
-checks, SHA-256 and atomic compare-create. A bundle publishes objects first, then one canonical
-`bundle.json` and `COMMIT` marker via same-directory fsync+rename; the marker is the sole readable
-commit authority. Crash/cancel audit is append-only, sanitized, bounded, and never readable as a
-candidate/evidence object.
+`provider_shadow_root` is a configured absolute path, validated for safe regular ancestors and
+bounded limits. Its fixed layout is `staging/<attempt-owned-nonce>/` and `bundles/<evidence_id>/`;
+staging contains every payload object, manifest and `COMMIT`. Every file and the directory are
+fsynced, then the writer exclusively atomically renames the complete directory into
+`bundles/<evidence_id>`. Readers inspect bundles only and require `COMMIT`; no global raw-object
+root exists. Pre-rename crash/cancel leaves staging residue; owner-marker+dirfd/inode recovery
+removes payload and emits only sanitized audit JSON. Post-rename/pre-DB is a legal committed final
+success; deterministic scanning may attach it by job/evidence identity or quarantine/delete under
+approved retention, but it can never become a candidate without registry attach.
 
 `ShadowEvidenceStore`/`ShadowEvidenceReader` are descriptor-bound. A `ShadowAttempt` may retain
 only safe IDs, counts, outcome and failure class while rows live in memory. `ShadowCompletion`
-names the one final successful attempt. Reader validates object hashes, schema, row counts, page
-ordering, completion marker, manifest hash and final-attempt IDs before returning evidence.
+names the exact request-plan ordinal set and its per-ordinal final successful attempts. Reader
+validates object hashes, schema, row counts, page ordering, completion marker, manifest hash,
+bidirectional page/object refs and final-attempt IDs before returning evidence.
 
 `ShadowCandidateStore`/`ShadowCandidateReader` publish/read `ShadowQualityReport`, normalized object,
 candidate manifest and one atomic candidate bundle in the same shadow-root safety protocol. A
-`CanonicalComparisonReader.capture(trade_date)` takes one immutable canonical Dataset manifest
-snapshot, exact generation/identity and BaoStock partition path/SHA/row count, then descriptor-bound
-reads the R2-F2 `candidate.json`, `gate.json`, `selection.json`, `normalized.json` and
-`EvidenceReader`. It re-runs existing validators and bidirectionally verifies selection ID/SHA,
-candidate/evidence/gate/factor/normalized hashes, date/universe/provider, nine R2-F2 lineage
-fields (`provider_id`, `universe_id`, `evidence_id`, `evidence_sha256`, `candidate_id`,
-`candidate_manifest_sha256`, `gate_report_sha256`, `adapter_version`, `source_schema_version`),
-and partition bar semantics; it rechecks dataset identity before returning the frozen
-`CanonicalComparisonSnapshot`. Missing legacy lineage, any change, or any mismatch is
-`unavailable`; it never guesses or changes canonical fields.
+`CanonicalCandidateReader` in `canonical_comparison.py` opens one dataset root plus candidate and
+evidence roots, and allows only the four read-only files `candidate.json`, `gate.json`,
+`selection.json` and `normalized.json`. It records root, bundle and every descriptor's identity,
+fstat and hash before and after reading, uses `EvidenceReader`, re-runs existing public model
+validators, and bidirectionally verifies the dataset manifest/generation, exact BaoStock partition
+SHA/row count, nine R2-F2 lineage fields (`provider_id`, `universe_id`, `evidence_id`,
+`evidence_sha256`, `candidate_id`, `candidate_manifest_sha256`, `gate_report_sha256`,
+`adapter_version`, `source_schema_version`), every candidate/evidence/gate/factor/normalized hash,
+date and universe. `PublishedCanonicalComparison.verify()` repeats the manifest identity check
+before and after reconciliation; `close()` invalidates the capability. Missing lineage, any
+TOCTOU/mixed-generation change or mismatch is `unavailable`; it never guesses or changes
+canonical fields.
 
 ### Compatibility matrix
 
