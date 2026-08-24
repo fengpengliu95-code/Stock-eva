@@ -292,12 +292,11 @@ def _minimal_owned_tree(tmp_path):
 
 def test_orphan_cleanup_stops_on_partial_delete_and_reports_residual(tmp_path, monkeypatch):
     staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
-    original_unlink = shadow_module.os.unlink
-
-    def fail_unlink(*args, **kwargs):
-        raise OSError("injected cleanup failure")
-
-    monkeypatch.setattr(shadow_module.os, "unlink", fail_unlink)
+    monkeypatch.setattr(
+        shadow_module,
+        "_write_residual_marker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected marker failure")),
+    )
     try:
         with pytest.raises(ShadowEvidenceCleanupFailed):
             shadow_module._remove_owned_tree(
@@ -308,7 +307,6 @@ def test_orphan_cleanup_stops_on_partial_delete_and_reports_residual(tmp_path, m
                 allowed_page_names={"page.json"},
             )
     finally:
-        monkeypatch.setattr(shadow_module.os, "unlink", original_unlink)
         os.close(entry_fd)
         os.close(parent_fd)
     assert (staging / "owned").exists()
@@ -341,6 +339,11 @@ def test_orphan_cleanup_keeps_fixed_tombstone_and_is_idempotent(tmp_path, monkey
     staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
     rmdir_calls = []
     monkeypatch.setattr(shadow_module.os, "rmdir", lambda *args, **kwargs: rmdir_calls.append(args))
+    monkeypatch.setattr(
+        shadow_module.os,
+        "unlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unlink forbidden")),
+    )
     try:
         assert not shadow_module._remove_owned_tree(
             parent_fd,
@@ -350,19 +353,23 @@ def test_orphan_cleanup_keeps_fixed_tombstone_and_is_idempotent(tmp_path, monkey
             allowed_page_names={"page.json"},
         )
         assert sorted(path.name for path in (staging / "owned").iterdir()) == [
-            "CLEANED_RESIDUAL",
+            "COMMIT",
+            "OWNER",
+            "QUARANTINED_RESIDUAL",
+            "manifest.json",
             "pages",
         ]
         assert sorted(path.name for path in (staging / "owned" / "pages").iterdir()) == [
-            ".CLEANED_RESIDUAL"
+            "page.json"
         ]
-        marker_bytes = (staging / "owned" / "CLEANED_RESIDUAL").read_bytes()
+        marker_bytes = (staging / "owned" / "QUARANTINED_RESIDUAL").read_bytes()
         assert len(marker_bytes) < 256
         assert json.loads(marker_bytes) == {
             "evidence_id": "evidence-1",
-            "nested": "pages/.CLEANED_RESIDUAL",
+            "job_id": "job-1",
             "nonce": "owned",
-            "status": "CLEANED_RESIDUAL",
+            "reason": "POSIX_NO_FD_DELETE",
+            "status": "QUARANTINED_RESIDUAL",
         }
         assert not shadow_module._remove_owned_tree(
             parent_fd,
@@ -371,7 +378,7 @@ def test_orphan_cleanup_keeps_fixed_tombstone_and_is_idempotent(tmp_path, monkey
             expected,
             allowed_page_names=set(),
         )
-        assert (staging / "owned" / "CLEANED_RESIDUAL").read_bytes() == marker_bytes
+        assert (staging / "owned" / "QUARANTINED_RESIDUAL").read_bytes() == marker_bytes
         assert rmdir_calls == []
     finally:
         os.close(entry_fd)
@@ -392,15 +399,19 @@ def test_recovery_skips_cleaned_tombstone_without_growth(tmp_path):
         os.close(entry_fd)
         os.close(parent_fd)
     store = ShadowEvidenceStore(tmp_path)
-    marker = (staging / "owned" / "CLEANED_RESIDUAL").read_bytes()
+    marker = (staging / "owned" / "QUARANTINED_RESIDUAL").read_bytes()
     first = store.recover_orphans()
     second = store.recover_orphans()
-    assert first.contents_cleaned is True
+    assert first.contents_cleaned is False
     assert first.residual_directory is True
-    assert second.contents_cleaned is True
-    assert (staging / "owned" / "CLEANED_RESIDUAL").read_bytes() == marker
+    assert first.quarantined is True
+    assert second.quarantined is True
+    assert (staging / "owned" / "QUARANTINED_RESIDUAL").read_bytes() == marker
     assert sorted(path.name for path in (staging / "owned").iterdir()) == [
-        "CLEANED_RESIDUAL",
+        "COMMIT",
+        "OWNER",
+        "QUARANTINED_RESIDUAL",
+        "manifest.json",
         "pages",
     ]
 
@@ -409,21 +420,20 @@ def test_orphan_cleanup_final_foreign_race_leaves_foreign_and_displaced(tmp_path
     staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
     entry = staging / "owned"
     displaced = staging / "displaced"
-    original_stat = shadow_module.os.stat
-    calls = 0
+    original_write = shadow_module._write_residual_marker
+    swapped = False
 
-    def race_stat(path, *args, **kwargs):
-        nonlocal calls
-        if path == "owned" and kwargs.get("dir_fd") == parent_fd:
-            calls += 1
-            if calls == 2:
-                os.rename(entry, displaced)
-                entry.mkdir()
-        return original_stat(path, *args, **kwargs)
+    def race_marker(directory_fd, name, payload):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            os.rename(entry, displaced)
+            entry.mkdir()
+        return original_write(directory_fd, name, payload)
 
-    monkeypatch.setattr(shadow_module.os, "stat", race_stat)
+    monkeypatch.setattr(shadow_module, "_write_residual_marker", race_marker)
     try:
-        assert shadow_module._remove_owned_tree(
+        assert not shadow_module._remove_owned_tree(
             parent_fd,
             entry_fd,
             "owned",
@@ -436,6 +446,8 @@ def test_orphan_cleanup_final_foreign_race_leaves_foreign_and_displaced(tmp_path
     assert entry.exists()
     assert displaced.exists()
     assert not any(entry.iterdir())
+    assert (displaced / "QUARANTINED_RESIDUAL").exists()
+    assert (displaced / "pages" / "page.json").exists()
 
 
 def test_orphan_cleanup_pages_foreign_race_keeps_foreign_and_displaced_marker(
@@ -445,20 +457,21 @@ def test_orphan_cleanup_pages_foreign_race_keeps_foreign_and_displaced_marker(
     entry = staging / "owned"
     pages = entry / "pages"
     displaced_pages = entry / "pages-displaced"
-    original_stat = shadow_module.os.stat
+    original_open = shadow_module.os.open
     swapped = False
 
-    def race_pages_stat(path, *args, **kwargs):
+    def race_pages_open(path, *args, **kwargs):
         nonlocal swapped
+        result = original_open(path, *args, **kwargs)
         if path == "pages" and kwargs.get("dir_fd") == entry_fd and not swapped:
             swapped = True
             os.rename(pages, displaced_pages)
             pages.mkdir()
-        return original_stat(path, *args, **kwargs)
+        return result
 
-    monkeypatch.setattr(shadow_module.os, "stat", race_pages_stat)
+    monkeypatch.setattr(shadow_module.os, "open", race_pages_open)
     try:
-        assert shadow_module._remove_owned_tree(
+        assert not shadow_module._remove_owned_tree(
             parent_fd,
             entry_fd,
             "owned",
@@ -470,8 +483,9 @@ def test_orphan_cleanup_pages_foreign_race_keeps_foreign_and_displaced_marker(
         os.close(parent_fd)
     assert pages.exists()
     assert displaced_pages.exists()
-    assert (displaced_pages / ".CLEANED_RESIDUAL").exists()
-    assert not (pages / ".CLEANED_RESIDUAL").exists()
+    assert (displaced_pages / "page.json").exists()
+    assert (entry / "QUARANTINED_RESIDUAL").exists()
+    assert not (pages / "page.json").exists()
 
 
 def test_reader_rejects_hardlinks_extra_files_and_mutation(tmp_path):

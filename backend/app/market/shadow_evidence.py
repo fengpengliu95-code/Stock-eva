@@ -450,10 +450,11 @@ class ShadowRecoveryResult(_Frozen):
     skipped: int = Field(ge=0)
     cleanup_failed: int = Field(default=0, ge=0)
     residual: bool = False
-    outcome: Literal["complete", "cleanup_failed"] = "complete"
+    outcome: Literal["complete", "cleanup_failed", "quarantined"] = "complete"
     contents_cleaned: bool = False
     residual_directory: bool = False
     conflict: bool = False
+    quarantined: bool = False
     audit_id: str
 
 
@@ -1253,8 +1254,8 @@ def _read_residual_marker(directory_fd: int, name: str) -> dict[str, Any] | None
     return marker if isinstance(marker, dict) else None
 
 
-def _cleaned_marker(entry_fd: int, entry_name: str) -> bool:
-    marker = _read_residual_marker(entry_fd, "CLEANED_RESIDUAL")
+def _quarantined_marker(entry_fd: int, owner: ShadowOwner, entry_name: str) -> bool:
+    marker = _read_residual_marker(entry_fd, "QUARANTINED_RESIDUAL")
     if marker is None:
         return False
     try:
@@ -1262,15 +1263,12 @@ def _cleaned_marker(entry_fd: int, entry_name: str) -> bool:
     except ValueError:
         return False
     return (
-        set(marker)
-        in (
-            {"nonce", "evidence_id", "status"},
-            {"nonce", "evidence_id", "status", "nested"},
-        )
+        set(marker) == {"nonce", "evidence_id", "job_id", "status", "reason"}
         and marker.get("nonce") == entry_name
-        and marker.get("evidence_id") == evidence_id
-        and marker.get("status") == "CLEANED_RESIDUAL"
-        and marker.get("nested", "pages/.CLEANED_RESIDUAL") == "pages/.CLEANED_RESIDUAL"
+        and marker.get("evidence_id") == evidence_id == owner.evidence_id
+        and marker.get("job_id") == owner.job_id
+        and marker.get("status") == "QUARANTINED_RESIDUAL"
+        and marker.get("reason") == "POSIX_NO_FD_DELETE"
     )
 
 
@@ -1301,51 +1299,32 @@ def _remove_owned_tree(
     *,
     allowed_page_names: set[str],
 ) -> bool:
-    """Clean a validated orphan using only recovery-held descriptors.
+    """Quarantine a validated orphan without deleting filesystem entries.
 
-    The caller owns and closes ``staging_fd`` and ``entry_fd``.  This function never
-    reopens the entry by name or removes its directory.  The cleaned directory is a
-    fail-closed tombstone because POSIX/macOS has no fd-bound ``rmdir`` operation.
-    Returns whether the parent name changed during cleanup; a foreign replacement is
-    never followed or removed.
+    POSIX/macOS provide no fd-bound unlink/rmdir operation. Raw provider objects remain
+    isolated in staging for authorized Task13/manual maintenance. Only a bounded marker
+    is written through the held entry descriptor.
     """
 
     def fail() -> ShadowEvidenceCleanupFailed:
         return ShadowEvidenceCleanupFailed("shadow orphan cleanup failed")
 
     try:
-        if _cleaned_marker(entry_fd, entry_name):
+        owner = json.loads(_read_verified_at(entry_fd, "OWNER", max_bytes=4096).decode("utf-8"))
+        owner_model = ShadowOwner.model_validate(owner)
+        if owner_model.nonce != entry_name:
+            raise fail()
+        if _quarantined_marker(entry_fd, owner_model, entry_name):
             return False
         if _cleanup_identity(os.fstat(entry_fd)) != expected_identity:
             raise fail()
         names = {entry.name for entry in os.scandir(entry_fd)}
         if names != {"OWNER", "COMMIT", "manifest.json", "pages"}:
             raise fail()
-        root_files: list[str] = []
-        owner = json.loads(_read_verified_at(entry_fd, "OWNER", max_bytes=4096).decode("utf-8"))
-        if (
-            set(owner)
-            != {
-                "nonce",
-                "evidence_id",
-                "job_id",
-                "provider_id",
-                "window_id",
-                "session_id",
-                "plan_sha256",
-                "completion_sha256",
-            }
-            or owner.get("nonce") != entry_name
-            or not isinstance(owner.get("evidence_id"), str)
-            or not owner["evidence_id"]
-            or not _safe(owner["evidence_id"])
-        ):
-            raise fail()
         for name in ("OWNER", "COMMIT", "manifest.json"):
             info = os.stat(name, dir_fd=entry_fd, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise fail()
-            root_files.append(name)
         pages_fd = os.open(
             "pages",
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1355,78 +1334,31 @@ def _remove_owned_tree(
             pages_info = os.fstat(pages_fd)
             if not stat.S_ISDIR(pages_info.st_mode) or pages_info.st_nlink < 2:
                 raise fail()
-            expected_pages_identity = _cleanup_identity(pages_info)
             page_entries = list(os.scandir(pages_fd))
-            nested_marker = _read_residual_marker(pages_fd, ".CLEANED_RESIDUAL")
-            pages_cleaned = False
-            if nested_marker is not None:
-                if (
-                    set(nested_marker) != {"nonce", "evidence_id", "status"}
-                    or nested_marker.get("nonce") != entry_name
-                    or nested_marker.get("evidence_id") != owner["evidence_id"]
-                    or nested_marker.get("status") != "CLEANED_RESIDUAL"
-                ):
-                    raise fail()
-                pages_cleaned = True
-                if {entry.name for entry in page_entries} != {".CLEANED_RESIDUAL"}:
-                    raise fail()
-            else:
-                if {entry.name for entry in page_entries} != allowed_page_names:
-                    raise fail()
-                for page in page_entries:
-                    info = page.stat(follow_symlinks=False)
-                    if page.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                        raise fail()
-            if _cleanup_identity(os.fstat(entry_fd)) != expected_identity:
+            if {entry.name for entry in page_entries} != allowed_page_names:
                 raise fail()
-            parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
-            if _cleanup_identity(parent_info) != expected_identity:
+            for page in page_entries:
+                info = page.stat(follow_symlinks=False)
+                if page.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise fail()
+            entry_info = os.fstat(entry_fd)
+            if (entry_info.st_dev, entry_info.st_ino, entry_info.st_mode) != expected_identity[:3]:
                 raise fail()
-            if not pages_cleaned:
-                for page in page_entries:
-                    os.unlink(page.name, dir_fd=pages_fd)
-                nested_marker_payload = _json_bytes(
-                    {
-                        "nonce": entry_name,
-                        "evidence_id": owner["evidence_id"],
-                        "status": "CLEANED_RESIDUAL",
-                    }
-                )
-                _write_residual_marker(pages_fd, ".CLEANED_RESIDUAL", nested_marker_payload)
-                os.fsync(pages_fd)
-            pages_parent_info = os.stat("pages", dir_fd=entry_fd, follow_symlinks=False)
-            pages_conflict = (
-                pages_parent_info.st_dev,
-                pages_parent_info.st_ino,
-                pages_parent_info.st_mode,
-            ) != expected_pages_identity[:3]
         finally:
             os.close(pages_fd)
-        for name in root_files:
-            os.unlink(name, dir_fd=entry_fd)
-        os.fsync(entry_fd)
-        parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
-        # Removing children necessarily updates the directory ctime.  The stable
-        # parent identity still must be the held inode/type; ctime was checked before
-        # any deletion and is retained in the expected tuple for that preflight.
-        conflict = (
-            parent_info.st_dev,
-            parent_info.st_ino,
-            parent_info.st_mode,
-        ) != expected_identity[:3]
-        conflict = conflict or pages_conflict
         marker = _json_bytes(
             {
                 "nonce": entry_name,
-                "evidence_id": owner["evidence_id"],
-                "status": "CLEANED_RESIDUAL",
-                "nested": "pages/.CLEANED_RESIDUAL",
+                "evidence_id": owner_model.evidence_id,
+                "job_id": owner_model.job_id,
+                "status": "QUARANTINED_RESIDUAL",
+                "reason": "POSIX_NO_FD_DELETE",
             }
         )
-        _write_residual_marker(entry_fd, "CLEANED_RESIDUAL", marker)
+        _write_residual_marker(entry_fd, "QUARANTINED_RESIDUAL", marker)
         os.fsync(entry_fd)
         os.fsync(staging_fd)
-        return conflict
+        return False
     except ShadowEvidenceCleanupFailed:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1537,6 +1469,7 @@ class ShadowEvidenceStore:
         contents_cleaned = False
         residual_directory = False
         conflict = False
+        quarantined = False
         staging_fd = _open_directory_fd(self.staging)
         for entry in os.scandir(staging_fd):
             entry_fd: int | None = None
@@ -1550,15 +1483,15 @@ class ShadowEvidenceStore:
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=staging_fd,
                 )
-                if _cleaned_marker(entry_fd, entry.name):
-                    contents_cleaned = True
-                    residual_directory = True
-                    continue
                 marker = _read_verified_at(entry_fd, "OWNER", max_bytes=4096)
                 values = json.loads(marker.decode("utf-8"))
                 owner_model = ShadowOwner.model_validate(values)
                 if owner_model.nonce != entry.name:
                     skipped += 1
+                    continue
+                if _quarantined_marker(entry_fd, owner_model, entry.name):
+                    residual_directory = True
+                    quarantined = True
                     continue
                 manifest_raw = _read_verified_at(
                     entry_fd, "manifest.json", max_bytes=self.max_object_bytes
@@ -1724,8 +1657,8 @@ class ShadowEvidenceStore:
                     _cleanup_identity(info),
                     allowed_page_names=allowed_page_names,
                 )
-                contents_cleaned = True
                 residual_directory = True
+                quarantined = True
                 conflict = conflict or cleanup_conflict
             except ShadowEvidenceCleanupFailed:
                 cleanup_failed += 1
@@ -1749,10 +1682,15 @@ class ShadowEvidenceStore:
                 "skipped": skipped,
                 "cleanup_failed": cleanup_failed,
                 "residual": residual,
-                "outcome": "cleanup_failed" if cleanup_failed else "complete",
+                "outcome": (
+                    "cleanup_failed"
+                    if cleanup_failed
+                    else ("quarantined" if quarantined else "complete")
+                ),
                 "contents_cleaned": contents_cleaned,
                 "residual_directory": residual_directory,
                 "conflict": conflict,
+                "quarantined": quarantined,
             }
         )
         _write_private_file(audit, payload)
@@ -1761,10 +1699,15 @@ class ShadowEvidenceStore:
             skipped=skipped,
             cleanup_failed=cleanup_failed,
             residual=residual,
-            outcome="cleanup_failed" if cleanup_failed else "complete",
+            outcome=(
+                "cleanup_failed"
+                if cleanup_failed
+                else ("quarantined" if quarantined else "complete")
+            ),
             contents_cleaned=contents_cleaned,
             residual_directory=residual_directory,
             conflict=conflict,
+            quarantined=quarantined,
             audit_id=audit_id,
         )
 
