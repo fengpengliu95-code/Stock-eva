@@ -315,6 +315,11 @@ Then they require the exact ordinal set, one final success for every ordinal, co
 pages and a bidirectional completion/page/object binding; duplicate, missing or out-of-order pages
 remain unavailable and cannot publish.
 
+Given a failure, skip, unavailable or mismatch outcome
+When its attempt report is committed
+Then a bounded sanitized durable report ref/hash is retained, while page/row/evidence/candidate
+refs are empty/null; only a fully successful completion may create evidence or a candidate.
+
 ### AC-13: Candidate and canonical comparison binding (FR-20–FR-21, NFR-9, NFR-14)
 
 Given a complete shadow candidate and a current canonical publication
@@ -507,17 +512,17 @@ ShadowProviderId = tickflow | tushare
 ShadowAdmissionState = discovered | canary | shadow | qualified | quarantined
 
 ShadowProviderRecord:
-  provider_id, adapter_version, endpoint_contract_version, source_schema_version,
-  reconciliation_policy_version, terms_reviewed_at, terms_evidence_hash, intended_use,
-  retention_allowed, credential_mode, credential_env_name, quota_contract, required_fields,
-  unit_contract, admission_state, window_id, window_start, window_end,
-  successful_sessions, quarantined_reason
+  provider_id, admission_state, adapter_hash, endpoint_contract_hash, source_schema_hash,
+  normalizer_hash, reconciliation_policy_hash, terms_evidence_hash(nullable only when discovered),
+  terms_review_id(nullable only when discovered), credential_env_name, intended_use,
+  retention_decision, quota_contract, required_fields_json, unit_contract_json, state_version,
+  quarantine_reason
 
 TermsEvidence:
-  terms_evidence_id, provider_id, official_url_allowlist, content_bytes_sha256,
-  bounded_content_object_ref, content_object_sha256,
+  terms_evidence_id, provider_id, official_url_allowlist_json, content_bytes_sha256,
+  content_object_relpath,
   contract_version, as_of_date, reviewer, review_id, approved_intended_use,
-  approved_retention, approved_credential_mode, approved_quota_decision
+  approved_retention, approved_credential_mode, approved_quota_decision, manifest_sha256
 
 ConfirmedSessionSnapshot:
   snapshot_id, calendar_generation, calendar_sha256, confirmed_next_sessions,
@@ -536,9 +541,10 @@ ShadowLogicalRequestPlan:
   plan_id, job_id, request_plan_hash, requests[ShadowLogicalRequest], exact_ordinal_set
 
 ShadowAttemptCompletion:
-  ordinal, attempt_id, request_id, session_id, outcome, page_identities, page_count,
+  ordinal, attempt_id, request_id, endpoint, session_id, outcome, page_identities, page_count,
   row_count, terminal_marker, evidence_refs, evidence_sha256
-  # failure|skip|unavailable|mismatch => evidence_refs/evidence_sha256/page rows are zero/null
+  # failure|skip|unavailable|mismatch => evidence_refs/evidence_sha256/page rows are zero/null;
+  # durable sanitized report ref/hash is still required
 
 ShadowRequestCompletion:
   ordinal, request_id, attempt_ids, final_attempt_id, final_success, contiguous_page_refs,
@@ -548,11 +554,17 @@ ShadowCompletion:
   job_id, request_plan_hash, exact_ordinal_set, request_completions, aggregate_page_count,
   aggregate_row_count, evidence_id, completion_sha256, committed_at
 
+ShadowEvidenceAttemptRef:
+  evidence_id, provider_id, job_id, window_id, session_id, ordinal, attempt_id, endpoint,
+  request_id, page_refs, page_count, row_count
+  # one evidence has one final ref per ordinal; the composite identity is checked in both
+  # directions against ShadowAttemptReport and ShadowEvidenceManifest
+
 ShadowAttemptReport:
   report_id, attempt_id, outcome(success|failure|skip|unavailable|mismatch),
   timing, coverage, request/retry/rate-limit counts, failure_class,
   evidence_sha256(nullable unless success), candidate_sha256(nullable unless success),
-  report_sha256(nullable only for pre-persist failure; required for durable report)
+  durable_report_ref, report_sha256 (required for every durable outcome; sanitized payload only)
 
 VersionVector:
   adapter_hash, endpoint_contract_hash, source_schema_hash, normalizer_hash,
@@ -626,7 +638,7 @@ section and is compiled against SQLite before implementation starts.
 
 | Migration ID | DDL / invariant | Rollback |
 |---|---|---|
-| `r2f3-registry-0001` | Creates `schema_migration`, `terms_evidence`, `provider_record`, `qualification_window`, `shadow_job`, `shadow_attempt_report`, `session_report`, `shadow_evidence_ref` and `shadow_candidate_ref`, with exact FK/UNIQUE/CHECK definitions in Task 10 SQL. | Stop readers, retain immutable DB backup and shadow objects, restore previous registry DB copy; never delete/rewrite canonical data. |
+| `r2f3-registry-0001` | Creates `schema_migration`, `terms_evidence`, `provider_record`, `qualification_window`, `shadow_job`, `shadow_attempt_report`, `session_report`, `shadow_evidence_ref`, `shadow_evidence_attempt_ref` and `shadow_candidate_ref`, with exact composite FK/UNIQUE/CHECK definitions in Task 10 SQL. | Stop readers, retain immutable DB backup and shadow objects, restore previous registry DB copy; never delete/rewrite canonical data. |
 | `r2f3-registry-0002` | Add-only review-object compatibility migration; existing providers remain `discovered` until `terms_evidence_hash` and review fields are non-null and validator-approved. | Reopen `0001` read-only; no destructive down-migration. |
 
 Writer initialization MUST use PRAGMA `foreign_keys=ON`, `journal_mode=DELETE`, `synchronous=FULL`,
