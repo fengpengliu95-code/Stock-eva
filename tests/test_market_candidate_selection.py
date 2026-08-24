@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import UTC, date, datetime
 
 import pytest
@@ -8,6 +10,7 @@ from backend.app.market.candidates import (
     CandidateStore,
     GateName,
     GateOutcome,
+    PublishedSelection,
     SelectionReason,
     SessionSelection,
     build_candidate_manifest,
@@ -31,7 +34,7 @@ def _outcomes(verdict: str = "pass", referenced_hash: str = SHA):
             gate_name=name,
             gate_version="r2f2-gates.v1",
             verdict=verdict,
-            bounded_metrics=(("rows", 1),),
+            bounded_metrics=(("rows", 1), ("required_symbols", 1)),
             referenced_hashes=(referenced_hash,),
         )
         for name in R2F2_GATE_ORDER
@@ -135,20 +138,16 @@ def test_selection_publish_order_never_moves_pointer_early(tmp_path) -> None:
         gate_report=report,
         evidence=evidence,
     )
-    observations = []
-
-    def canonical_callback(_selection):
-        assert (tmp_path / f"selections/{selection.selection_id}.json").is_file()
-        observations.append("canonical")
-
-    CandidateStore(tmp_path).publish_chain(
+    published = CandidateStore(tmp_path).publish_chain(
         report=report,
         candidate=candidate,
         selection=selection,
         evidence=evidence,
-        after_selection=canonical_callback,
+        normalized_payload=_normalized_payload(),
     )
-    assert observations == ["canonical"]
+    assert isinstance(published, PublishedSelection)
+    assert published.selection.selection_id == selection.selection_id
+    published.verify()
 
 
 def test_missing_legacy_source_decodes_as_baostock_in_memory(tmp_path) -> None:
@@ -211,6 +210,7 @@ def test_candidate_lineage_mismatch_is_rejected_before_selection_write(tmp_path)
             ),
             selection=selection,
             evidence=evidence,
+            normalized_payload=_normalized_payload(),
         )
     assert not (tmp_path / "selections").exists()
 
@@ -274,9 +274,9 @@ def _real_candidate_bundle(tmp_path):
         provider_id=manifest.provider_id,
         evidence_id=manifest.evidence_id,
         evidence_sha256=manifest.manifest_sha256,
-        normalized_object_relative_path="candidates/real.parquet",
-        normalized_object_sha256=SHA,
-        gate_report_relative_path="gates/real.json",
+        normalized_object_relative_path="bundles/candidate-real/normalized.json",
+        normalized_object_sha256=hashlib.sha256(_normalized_payload()).hexdigest(),
+        gate_report_relative_path="bundles/candidate-real/gate.json",
         gate_report_sha256=report.aggregate_sha256,
         factor_resolution_sha256=manifest.factor_resolution_sha256,
         adapter_version=manifest.adapter_version,
@@ -285,6 +285,42 @@ def _real_candidate_bundle(tmp_path):
         required_symbol_count=1,
     )
     return evidence, report, candidate
+
+
+def _normalized_payload() -> bytes:
+    return json.dumps(
+        [
+            {
+                "trade_date": "2026-08-20",
+                "symbol": "sh.600000",
+                "security_type": "stock",
+                "exchange": "sh",
+                "board": "main",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "preclose": 10.0,
+                "volume": 0.0,
+                "amount": 0.0,
+                "turnover_rate": None,
+                "pct_change": None,
+                "adjust_factor": None,
+                "price_adjustment": "none",
+                "is_trading": False,
+                "is_suspended": True,
+                "is_st": False,
+                "source": "baostock",
+                "source_record_id": "sh.600000-2026-08-20",
+                "ingested_at": "2026-08-20T08:00:00Z",
+                "quality_status": "partial",
+                "quality_issues": ["suspended_placeholder"],
+            }
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
 
 def test_legacy_baostock_rows_and_manifests_decode_without_rewrite(tmp_path):
@@ -414,13 +450,56 @@ def test_factor_resolution_requires_mutually_exclusive_live_cache_fields_and_has
 
 
 def test_existing_market_analysis_alert_user_and_api_json_remain_compatible(tmp_path):
+    from datetime import datetime
+
     from backend.app.alert.models import AlertRuleRecord
     from backend.app.analysis.models import SecurityAnalysisResponse
+    from backend.app.market.models import MarketSummary
     from backend.app.user.models import PositionCreate
 
-    assert SecurityAnalysisResponse.model_config.get("extra") in {None, "ignore", "forbid"}
-    assert AlertRuleRecord.model_config.get("extra") in {None, "ignore", "forbid"}
-    assert PositionCreate.model_config.get("extra") in {None, "ignore", "forbid"}
+    analysis = SecurityAnalysisResponse.model_validate(
+        {
+            "symbol": "sh.600000",
+            "status": "empty",
+            "as_of": None,
+            "formula_version": "analysis.v1",
+            "series": [],
+        }
+    )
+    alert = AlertRuleRecord.model_validate(
+        {
+            "id": "alert-1",
+            "name": "close",
+            "watchlist_id": "watch-1",
+            "strategy_id": "strategy-1",
+            "strategy_version": 1,
+            "strategy_version_id": "strategy-1.v1",
+            "created_at": NOW,
+        }
+    )
+    position = PositionCreate.model_validate(
+        {
+            "symbol": "SH.600000",
+            "quantity": "10",
+            "avg_cost": "10.5",
+            "as_of_date": "2026-08-20",
+        }
+    )
+    summary = MarketSummary.model_validate(
+        {
+            "status": "empty",
+            "as_of": None,
+            "source": None,
+            "completeness": {"requested": 0, "loaded": 0, "failed": 0},
+            "freshness": {"evaluated": False},
+            "breadth": {},
+            "turnover": {"coverage": 0},
+            "indexes": [],
+        }
+    )
+    for model in (analysis, alert, position, summary):
+        assert type(model).model_validate_json(model.model_dump_json()) == model
+    assert datetime.fromisoformat(alert.model_dump(mode="json")["created_at"])
 
 
 def test_get_reads_and_legacy_manifest_reads_are_write_free(tmp_path):
@@ -443,7 +522,7 @@ def test_candidate_store_rejects_symlinked_artifact_directory(tmp_path):
     outside.mkdir()
     root = tmp_path / "candidate-root"
     root.mkdir()
-    (root / "gates").symlink_to(outside, target_is_directory=True)
+    (root / "bundles").symlink_to(outside, target_is_directory=True)
     selection = select_primary_candidate(
         trade_date=candidate.trade_date,
         universe_id=candidate.universe_id,
@@ -454,7 +533,11 @@ def test_candidate_store_rejects_symlinked_artifact_directory(tmp_path):
     )
     with pytest.raises(EvidenceError):
         CandidateStore(root).publish_chain(
-            report=report, candidate=candidate, selection=selection, evidence=evidence
+            report=report,
+            candidate=candidate,
+            selection=selection,
+            evidence=evidence,
+            normalized_payload=_normalized_payload(),
         )
     assert not list(outside.iterdir())
     evidence.close()
@@ -471,7 +554,7 @@ def test_candidate_store_cas_collision_is_rejected_without_overwrite(tmp_path):
     evidence.close()
 
 
-def test_failed_candidate_callback_preserves_audit_and_never_moves_pointer(tmp_path):
+def test_candidate_callback_api_is_removed_and_bundle_is_atomic(tmp_path):
     evidence, report, candidate = _real_candidate_bundle(tmp_path)
     (tmp_path / "candidate-root").mkdir()
     selection = select_primary_candidate(
@@ -483,22 +566,20 @@ def test_failed_candidate_callback_preserves_audit_and_never_moves_pointer(tmp_p
         evidence=evidence,
     )
 
-    def fail(_selection):
-        raise RuntimeError("pointer callback must be after selection")
-
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TypeError, match="after_selection"):
         CandidateStore(tmp_path / "candidate-root").publish_chain(
             report=report,
             candidate=candidate,
             selection=selection,
             evidence=evidence,
-            after_selection=fail,
+            normalized_payload=_normalized_payload(),
+            after_selection=lambda _selection: None,
         )
-    assert (tmp_path / "candidate-root" / "selections" / f"{selection.selection_id}.json").is_file()
+    assert not (tmp_path / "candidate-root" / "bundles").exists()
     evidence.close()
 
 
-def test_candidate_store_fails_closed_on_root_replacement_after_selection(tmp_path):
+def test_candidate_store_fails_closed_on_selection_path_tamper(tmp_path):
     evidence, report, candidate = _real_candidate_bundle(tmp_path)
     selection = select_primary_candidate(
         trade_date=candidate.trade_date,
@@ -510,18 +591,95 @@ def test_candidate_store_fails_closed_on_root_replacement_after_selection(tmp_pa
     )
     root = tmp_path / "candidate-root"
     root.mkdir()
-
-    def replace(_selection):
-        renamed = tmp_path / "candidate-old"
-        root.rename(renamed)
-        root.mkdir()
-
+    published = CandidateStore(root).publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=_normalized_payload(),
+    )
+    assert published is not None
+    selection_path = root / f"bundles/{candidate.candidate_id}/selection.json"
+    selection_path.write_bytes(b"tampered")
     with pytest.raises(EvidenceError):
-        CandidateStore(root).publish_chain(
+        published.verify()
+    published.close()
+    evidence.close()
+
+
+def test_candidate_store_walks_each_ancestor_without_following_symlink(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    outside = tmp_path / "outside-root"
+    outside.mkdir()
+    ancestor = tmp_path / "ancestor-link"
+    ancestor.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(EvidenceError):
+        CandidateStore(ancestor / "candidate-root").publish_chain(
             report=report,
             candidate=candidate,
             selection=selection,
             evidence=evidence,
-            after_selection=replace,
+            normalized_payload=_normalized_payload(),
         )
+    assert not list(outside.iterdir())
+    evidence.close()
+
+
+def test_publish_recomputes_gates_from_normalized_payload(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    forged = json.loads(_normalized_payload())
+    forged[0]["is_suspended"] = False
+    forged[0]["is_trading"] = True
+    forged[0]["quality_status"] = "ready"
+    forged[0]["quality_issues"] = []
+    payload = json.dumps(forged, sort_keys=True, separators=(",", ":")).encode()
+    values = {
+        key: value
+        for key, value in candidate.model_dump(mode="python").items()
+        if key != "manifest_sha256"
+    }
+    values["normalized_object_sha256"] = hashlib.sha256(payload).hexdigest()
+    forged_candidate = build_candidate_manifest(**values)
+    with pytest.raises(ValueError, match="gate report"):
+        CandidateStore(tmp_path).publish_chain(
+            report=report,
+            candidate=forged_candidate,
+            selection=None,
+            evidence=evidence,
+            normalized_payload=payload,
+        )
+    assert not (tmp_path / "bundles").exists()
+    evidence.close()
+
+
+def test_published_selection_model_copy_cannot_forge_capability(tmp_path):
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    selection = select_primary_candidate(
+        trade_date=candidate.trade_date,
+        universe_id=candidate.universe_id,
+        candidates=(candidate,),
+        selected_at=NOW,
+        gate_report=report,
+        evidence=evidence,
+    )
+    published = CandidateStore(tmp_path).publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=_normalized_payload(),
+    )
+    assert published is not None
+    forged = published.model_copy(update={"selection_sha256": "b" * 64})
+    with pytest.raises(EvidenceError):
+        forged.verify()
+    published.close()
     evidence.close()

@@ -2267,16 +2267,21 @@ class MarketStore:
             self._validate_ready_publication(result)
             self._validate_local_publication_bars(bars, result)
             if publication_lineage is not None:
-                if selection is None:
+                from backend.app.market.candidates import PublishedSelection
+
+                if not isinstance(selection, PublishedSelection):
                     raise ValueError("canonical publication requires a verified selection")
+                selection.verify()
+                selected = selection.selection
                 if (
-                    getattr(selection, "evidence_sha256", None)
-                    != publication_lineage.get("evidence_sha256")
-                    or getattr(selection, "candidate_manifest_sha256", None)
+                    selected.evidence_sha256 != publication_lineage.get("evidence_sha256")
+                    or selected.candidate_manifest_sha256
                     != publication_lineage.get("candidate_manifest_sha256")
-                    or getattr(selection, "gate_report_sha256", None)
-                    != publication_lineage.get("gate_report_sha256")
-                    or getattr(selection, "trade_date", None) != result.requested_date
+                    or selected.gate_report_sha256 != publication_lineage.get("gate_report_sha256")
+                    or selected.trade_date != result.requested_date
+                    or selected.selected_candidate_id != publication_lineage.get("candidate_id")
+                    or selected.selected_provider_id.value != publication_lineage.get("provider_id")
+                    or selected.universe_id != publication_lineage.get("universe_id")
                 ):
                     raise ValueError("canonical publication lineage does not match selection")
         self._save_refresh(bars, result, publish=publish, capture_published_bars=publish)

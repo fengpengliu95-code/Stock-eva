@@ -23,7 +23,7 @@ from uuid import uuid4
 import duckdb
 from pydantic import ValidationError
 
-from backend.app.market.candidates import SessionSelection
+from backend.app.market.candidates import PublishedSelection
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
 from backend.app.storage.models import (
@@ -902,7 +902,7 @@ class NasMarketStore:
         *,
         publish: bool | None = None,
         publication_lineage: dict[str, object] | None = None,
-        selection: SessionSelection | None = None,
+        selection: PublishedSelection | None = None,
     ) -> None:
         self._ensure_writable()
         publish = result.status == "ready" if publish is None else publish
@@ -911,14 +911,18 @@ class NasMarketStore:
             MarketStore._validate_local_publication_bars(bars, result)
             if publication_lineage is not None:
                 lineage = self._validate_publication_lineage(publication_lineage)
-                if selection is None:
+                if not isinstance(selection, PublishedSelection):
                     raise DatasetError("canonical pointer requires a verified selection")
+                selection.verify()
+                selected = selection.selection
                 if (
-                    selection.evidence_sha256 != lineage["evidence_sha256"]
-                    or selection.candidate_manifest_sha256 != lineage["candidate_manifest_sha256"]
-                    or selection.gate_report_sha256 != lineage["gate_report_sha256"]
-                    or selection.selected_provider_id.value != lineage["provider_id"]
-                    or selection.trade_date != result.requested_date
+                    selected.evidence_sha256 != lineage["evidence_sha256"]
+                    or selected.candidate_manifest_sha256 != lineage["candidate_manifest_sha256"]
+                    or selected.gate_report_sha256 != lineage["gate_report_sha256"]
+                    or selected.selected_provider_id.value != lineage["provider_id"]
+                    or selected.selected_candidate_id != lineage["candidate_id"]
+                    or selected.universe_id != lineage["universe_id"]
+                    or selected.trade_date != result.requested_date
                 ):
                     raise DatasetError("canonical selection lineage does not match publication")
             self._publish_bars(bars, publication_lineage=publication_lineage)

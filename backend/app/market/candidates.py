@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import stat
 from contextlib import contextmanager
+from ctypes import CDLL, c_char_p, c_int, c_uint
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from backend.app.market.evidence import EvidenceError, EvidenceReader, PublishedEvidence
+from backend.app.market.evidence import (
+    EvidenceError,
+    EvidenceReader,
+    PublishedEvidence,
+    _factor_value_semantic_hash,
+)
+from backend.app.market.models import DailyBar
 from backend.app.market.providers.base import (
     BoundedText,
+    ProviderEndpoint,
     ProviderId,
     SafeFailureClass,
     SafeIdentifier,
@@ -247,6 +257,116 @@ class SessionSelection(_Immutable):
         return self
 
 
+def _open_root_path(path: Path) -> int:
+    """Open every ancestor without following a symlink."""
+    absolute = Path(os.path.abspath(path))
+    descriptor = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for component in absolute.parts[1:]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class PublishedSelection(_Immutable):
+    """A short-lived capability proving an immutable selection bundle readback."""
+
+    selection: SessionSelection
+    root_path: str
+    bundle_relative_path: SafeRelativePath
+    selection_sha256: SafeSha256
+    _root_fd: int | None = PrivateAttr(default=None)
+    _root_identity: tuple[int, int] | None = PrivateAttr(default=None)
+    _selection_bytes: bytes = PrivateAttr(default=b"")
+
+    @classmethod
+    def bind(
+        cls,
+        selection: SessionSelection,
+        *,
+        root_path: Path,
+        bundle_relative_path: str,
+        root_fd: int,
+        root_identity: tuple[int, int],
+        selection_bytes: bytes,
+    ) -> PublishedSelection:
+        value = cls(
+            selection=selection,
+            root_path=str(root_path),
+            bundle_relative_path=bundle_relative_path,
+            selection_sha256=hashlib.sha256(selection_bytes).hexdigest(),
+        )
+        object.__setattr__(value, "_root_fd", os.dup(root_fd))
+        object.__setattr__(value, "_root_identity", root_identity)
+        object.__setattr__(value, "_selection_bytes", bytes(selection_bytes))
+        return value
+
+    def verify(self) -> PublishedSelection:
+        root_fd = self._root_fd
+        identity = self._root_identity
+        if root_fd is None or identity is None:
+            raise EvidenceError("selection capability is closed", "EVIDENCE_ROOT_UNAVAILABLE")
+        current = os.fstat(root_fd)
+        if (current.st_dev, current.st_ino) != identity:
+            raise EvidenceError("candidate root changed", "EVIDENCE_HASH_MISMATCH")
+        fresh = _open_root_path(Path(self.root_path))
+        try:
+            configured = os.fstat(fresh)
+            if (configured.st_dev, configured.st_ino) != identity:
+                raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH")
+        finally:
+            os.close(fresh)
+        expected = _canonical(self.selection.model_dump(mode="json"))
+        if (
+            expected != self._selection_bytes
+            or hashlib.sha256(expected).hexdigest() != self.selection_sha256
+        ):
+            raise EvidenceError("selection capability bytes mismatch", "EVIDENCE_HASH_MISMATCH")
+        from backend.app.market.evidence import open_evidence_relative
+
+        descriptor = open_evidence_relative(root_fd, f"{self.bundle_relative_path}/selection.json")
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != len(self._selection_bytes):
+                raise EvidenceError("selection bundle is invalid", "EVIDENCE_HASH_MISMATCH")
+            payload = os.read(descriptor, info.st_size + 1)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_ctime_ns) != (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_ctime_ns,
+            ):
+                raise EvidenceError(
+                    "selection bundle changed during read", "EVIDENCE_HASH_MISMATCH"
+                )
+        finally:
+            os.close(descriptor)
+        if payload != self._selection_bytes:
+            raise EvidenceError("selection bundle changed", "EVIDENCE_HASH_MISMATCH")
+        return self
+
+    def close(self) -> None:
+        descriptor = self._root_fd
+        if descriptor is not None:
+            object.__setattr__(self, "_root_fd", None)
+            os.close(descriptor)
+
+    def __enter__(self) -> PublishedSelection:
+        return self.verify()
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 class CandidateStore:
     """Small immutable JSON projection store under the evidence root."""
 
@@ -256,10 +376,7 @@ class CandidateStore:
     @contextmanager
     def _bound_root(self):
         try:
-            root_fd = os.open(
-                self.root,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
+            root_fd = _open_root_path(self.root)
         except OSError as exc:
             raise EvidenceError(
                 "candidate root is unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
@@ -277,11 +394,15 @@ class CandidateStore:
         if (current.st_dev, current.st_ino) != expected:
             raise EvidenceError("candidate root changed during publish", "EVIDENCE_HASH_MISMATCH")
         try:
-            configured = os.stat(self.root, follow_symlinks=False)
+            fresh = _open_root_path(self.root)
         except OSError as exc:
             raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH") from exc
-        if (configured.st_dev, configured.st_ino) != expected:
-            raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH")
+        try:
+            configured = os.fstat(fresh)
+            if (configured.st_dev, configured.st_ino) != expected:
+                raise EvidenceError("candidate root was replaced", "EVIDENCE_HASH_MISMATCH")
+        finally:
+            os.close(fresh)
 
     @staticmethod
     def _parts(relative: str) -> tuple[str, ...]:
@@ -407,6 +528,81 @@ class CandidateStore:
             os.close(parent)
 
     @staticmethod
+    def _write_staged(parent: int, name: str, payload: bytes) -> None:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent,
+        )
+        try:
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise EvidenceError("candidate artifact write was short", "EVIDENCE_HASH_MISMATCH")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        try:
+            if os.read(descriptor, len(payload) + 1) != payload:
+                raise EvidenceError(
+                    "candidate artifact readback mismatch", "EVIDENCE_HASH_MISMATCH"
+                )
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _rename_exclusive(
+        source_parent: int,
+        source: str,
+        destination_parent: int,
+        destination: str,
+    ) -> None:
+        try:
+            libc = CDLL(None, use_errno=True)
+            renameatx_np = libc.renameatx_np
+        except AttributeError as exc:
+            raise EvidenceError(
+                "atomic bundle publication is unavailable", "EVIDENCE_WRITE_FAILED"
+            ) from exc
+        renameatx_np.argtypes = [c_int, c_char_p, c_int, c_char_p, c_uint]
+        renameatx_np.restype = c_int
+        if (
+            renameatx_np(
+                source_parent,
+                source.encode(),
+                destination_parent,
+                destination.encode(),
+                0x00000004,
+            )
+            != 0
+        ):
+            error = OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            if error.errno == getattr(os, "EEXIST", 17):
+                raise FileExistsError(destination)
+            raise error
+
+    @staticmethod
+    def _remove_owned_stage(parent: int, name: str) -> None:
+        try:
+            stage = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+        except OSError:
+            return
+        try:
+            for child in ("normalized.json", "gate.json", "candidate.json", "selection.json"):
+                try:
+                    os.unlink(child, dir_fd=stage)
+                except FileNotFoundError:
+                    pass
+            os.rmdir(name, dir_fd=parent)
+        finally:
+            os.close(stage)
+
+    @staticmethod
     def _readback(root_fd: int, relative: str) -> bytes:
         from backend.app.market.evidence import open_evidence_relative
 
@@ -415,7 +611,18 @@ class CandidateStore:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
                 raise EvidenceError("candidate artifact is not regular", "EVIDENCE_UNSAFE_PATH")
-            return os.read(descriptor, info.st_size + 1)
+            data = os.read(descriptor, info.st_size + 1)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_ctime_ns) != (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_ctime_ns,
+            ):
+                raise EvidenceError(
+                    "candidate artifact changed during read", "EVIDENCE_HASH_MISMATCH"
+                )
+            return data
         finally:
             os.close(descriptor)
 
@@ -471,49 +678,117 @@ class CandidateStore:
         *,
         report: CandidateGateReport,
         candidate: CandidateManifest,
-        selection: SessionSelection,
+        selection: SessionSelection | None,
         evidence: PublishedEvidence,
-        normalized_payload: bytes | None = None,
-        after_selection: Any | None = None,
-    ) -> SessionSelection:
-        """Publish gate → candidate → selection; callback runs only after selection."""
+        normalized_payload: bytes,
+    ) -> PublishedSelection | None:
+        """Publish one immutable candidate bundle and return its verification capability."""
         validate_candidate_lineage(candidate, evidence, report)
+        if not normalized_payload:
+            raise ValueError("normalized candidate object is mandatory")
+        normalized_sha = hashlib.sha256(normalized_payload).hexdigest()
+        if normalized_sha != candidate.normalized_object_sha256:
+            raise ValueError("normalized candidate object hash mismatch")
+        try:
+            decoded = json.loads(normalized_payload.decode("utf-8"))
+            if not isinstance(decoded, list) or not decoded:
+                raise ValueError("normalized candidate object must contain rows")
+            rows = tuple(DailyBar.model_validate(item) for item in decoded)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("normalized candidate object is invalid") from exc
+        symbols = tuple(sorted({row.symbol for row in rows}))
+        if len(rows) != candidate.row_count or len(symbols) != candidate.required_symbol_count:
+            raise ValueError("normalized candidate object cardinality mismatch")
+        if any(row.trade_date != candidate.trade_date for row in rows):
+            raise ValueError("normalized candidate object date mismatch")
+        bundle = f"bundles/{candidate.candidate_id}"
+        if candidate.normalized_object_relative_path != f"{bundle}/normalized.json":
+            raise ValueError("normalized candidate path is not descriptor-bound")
+        if candidate.gate_report_relative_path != f"{bundle}/gate.json":
+            raise ValueError("gate report path is not descriptor-bound")
+        if candidate.source_schema_version != "daily_astock.v1":
+            raise ValueError("normalized candidate schema is unsupported")
+        recomputed = evaluate_candidate_gates(
+            candidate_id=candidate.candidate_id,
+            trade_date=candidate.trade_date,
+            required_symbols=symbols,
+            rows=rows,
+            evidence=evidence,
+            factor_resolution=evidence.manifest.factor_resolution,
+            created_at=report.created_at,
+            gate_version=report.gate_version,
+        )
+        if report.model_dump(mode="json") != recomputed.model_dump(mode="json"):
+            raise ValueError("caller gate report does not match durable readback facts")
+        expected_status = "accepted" if recomputed.verdict == "pass" else "rejected"
+        if candidate.status != expected_status:
+            raise ValueError("candidate status does not match recomputed gates")
+        if candidate.status == "accepted":
+            if selection is None:
+                raise ValueError("accepted candidate requires a selection")
+            if selection.selected_candidate_id != candidate.candidate_id:
+                raise ValueError("selection candidate lineage mismatch")
+            if selection.candidate_manifest_sha256 != candidate.manifest_sha256:
+                raise ValueError("selection candidate hash mismatch")
+            if selection.gate_report_sha256 != report.aggregate_sha256:
+                raise ValueError("selection gate hash mismatch")
+            if selection.evidence_sha256 != candidate.evidence_sha256:
+                raise ValueError("selection evidence hash mismatch")
         with self._bound_root() as (fd, identity):
-            if normalized_payload is not None:
-                if (
-                    hashlib.sha256(normalized_payload).hexdigest()
-                    != candidate.normalized_object_sha256
-                ):
-                    raise ValueError("normalized candidate object hash mismatch")
-                self._write_once(
-                    candidate.normalized_object_relative_path,
-                    normalized_payload,
+            bundle_payloads = {
+                "normalized.json": normalized_payload,
+                "gate.json": self._payload(report),
+                "candidate.json": self._payload(candidate),
+            }
+            if candidate.status == "accepted":
+                bundle_payloads["selection.json"] = self._payload(selection)
+            staging = self._mkdir_open(fd, "staging")
+            bundles = self._mkdir_open(fd, "bundles")
+            stage_name = f"candidate-bundle-{uuid4().hex}"
+            stage = None
+            published = False
+            try:
+                os.mkdir(stage_name, 0o700, dir_fd=staging)
+                stage = os.open(
+                    stage_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=staging,
+                )
+                for name, payload in bundle_payloads.items():
+                    self._write_staged(stage, name, payload)
+                os.fsync(stage)
+                os.fsync(staging)
+                try:
+                    self._rename_exclusive(staging, stage_name, bundles, candidate.candidate_id)
+                    published = True
+                except FileExistsError:
+                    existing = {
+                        name: self._readback(fd, f"{bundle}/{name}") for name in bundle_payloads
+                    }
+                    if any(existing[name] != payload for name, payload in bundle_payloads.items()):
+                        raise ValueError("immutable candidate bundle collision") from None
+                self._assert_root(fd, identity)
+                if candidate.status != "accepted":
+                    return None
+                selection_bytes = bundle_payloads["selection.json"]
+                assert selection is not None
+                capability = PublishedSelection.bind(
+                    selection,
+                    root_path=self.root,
+                    bundle_relative_path=bundle,
                     root_fd=fd,
                     root_identity=identity,
+                    selection_bytes=selection_bytes,
                 )
-            self._write_once(
-                f"gates/{report.gate_report_id}.json",
-                self._payload(report),
-                root_fd=fd,
-                root_identity=identity,
-            )
-            self._write_once(
-                f"candidates/{candidate.candidate_id}.json",
-                self._payload(candidate),
-                root_fd=fd,
-                root_identity=identity,
-            )
-            self._write_once(
-                f"selections/{selection.selection_id}.json",
-                self._payload(selection),
-                root_fd=fd,
-                root_identity=identity,
-            )
-            self._assert_root(fd, identity)
-            if after_selection is not None:
-                after_selection(selection)
-            self._assert_root(fd, identity)
-        return selection
+                capability.verify()
+                return capability
+            finally:
+                if stage is not None:
+                    os.close(stage)
+                if not published:
+                    self._remove_owned_stage(staging, stage_name)
+                os.close(bundles)
+                os.close(staging)
 
 
 def build_gate_report(
@@ -559,6 +834,76 @@ def _as_candidate(value: CandidateManifest | dict[str, Any]) -> CandidateManifes
     )
 
 
+def _validate_factor_resolution(evidence: PublishedEvidence) -> None:
+    """Recheck factor snapshot identity at the canonical publication seam."""
+    manifest = evidence.manifest
+    if evidence.reader_identity != _digest(manifest.model_dump(mode="json")):
+        raise ValueError("published evidence reader identity mismatch")
+    bindings = tuple(manifest.factor_resolution)
+    expected_resolution_hash = (
+        _digest([item.model_dump(mode="json") for item in bindings]) if bindings else _digest([])
+    )
+    if manifest.factor_resolution_sha256 != expected_resolution_hash:
+        raise ValueError("factor resolution aggregate hash mismatch")
+    snapshot = manifest.factor_cache_snapshot
+    factor_rows: dict[str, dict[str, Any]] = {}
+    if snapshot is not None:
+        if snapshot.reader_identity != _digest(snapshot.manifest.model_dump(mode="json")):
+            raise ValueError("factor snapshot reader identity mismatch")
+    for binding in bindings:
+        if binding.selected_kind == "factor_cache_snapshot":
+            if snapshot is None or binding.cache is None or binding.live is not None:
+                raise ValueError("factor binding source is not mutually exclusive")
+            if (
+                binding.cache.cache_object_id != snapshot.manifest.object_id
+                or binding.cache.cache_object_sha256 != snapshot.manifest.object_sha256
+                or binding.cache.record_key != f"{binding.symbol}.{binding.trade_date}"
+            ):
+                raise ValueError("factor binding is not descriptor-bound")
+        else:
+            if binding.live is None or binding.cache is not None:
+                raise ValueError("factor live/cache source is not mutually exclusive")
+            if binding.live.row_key != f"{binding.symbol}.{binding.trade_date}":
+                raise ValueError("factor live binding key mismatch")
+        if binding.plan_ordinal >= manifest.logical_request_plan.request_count:
+            raise ValueError("factor binding plan ordinal is unbound")
+        logical = manifest.logical_request_plan.requests[binding.plan_ordinal]
+        expected_endpoint = (
+            ProviderEndpoint.DAILY_FACTOR
+            if binding.selected_kind == "factor_cache_snapshot"
+            else binding.live.endpoint
+        )
+        if (
+            logical.endpoint is not expected_endpoint
+            or binding.symbol not in logical.symbols
+            or binding.trade_date != manifest.trade_date
+        ):
+            raise ValueError("factor binding is outside the logical request")
+    if bindings:
+        try:
+            for page in evidence.read_rows():
+                for row in page.get("factor_rows", ()):
+                    fields = tuple(page.get("factor_fields", ()))
+                    item = dict(zip(fields, row, strict=True))
+                    if "code" in item:
+                        factor_rows[f"{item['code']}.{item['dividOperateDate']}"] = {
+                            "symbol": item["code"],
+                            "trade_date": item["dividOperateDate"],
+                            "back_adjust_factor": item["backAdjustFactor"],
+                        }
+        except (EvidenceError, TypeError, ValueError) as exc:
+            raise ValueError("factor snapshot readback failed") from exc
+        if len(factor_rows) != len(bindings):
+            raise ValueError("factor snapshot cardinality mismatch")
+        for binding in bindings:
+            key = f"{binding.symbol}.{binding.trade_date}"
+            row = factor_rows.get(key)
+            if row is None or binding.selected_value_semantic_hash != _factor_value_semantic_hash(
+                row
+            ):
+                raise ValueError("factor selected value identity mismatch")
+
+
 def validate_candidate_lineage(
     candidate: CandidateManifest,
     evidence: PublishedEvidence,
@@ -571,6 +916,7 @@ def validate_candidate_lineage(
         evidence.read_rows()
     except EvidenceError as exc:
         raise ValueError("published evidence readback failed") from exc
+    _validate_factor_resolution(evidence)
     manifest = evidence.manifest
     expected = {
         "evidence_id": manifest.evidence_id,
@@ -762,6 +1108,7 @@ __all__ = [
     "GateOutcome",
     "R2F2_GATE_EVIDENCE",
     "R2F2_GATE_ORDER",
+    "PublishedSelection",
     "SelectionReason",
     "SessionSelection",
     "build_candidate_manifest",

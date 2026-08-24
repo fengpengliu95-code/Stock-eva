@@ -447,6 +447,7 @@ def canonical_refresh_callback(
                     validate_batch=validate_universe,
                     _lock_held=True,
                 )
+                published_selection = None
                 try:
                     normalized = ProviderBatch(
                         bars=list(bars),
@@ -481,10 +482,12 @@ def canonical_refresh_callback(
                         evidence_id=manifest.evidence_id,
                         evidence_sha256=manifest.manifest_sha256,
                         normalized_object_relative_path=(
-                            f"candidates/{manifest.evidence_id}.normalized.json"
+                            f"bundles/candidate-{manifest.evidence_id[3:]}/normalized.json"
                         ),
                         normalized_object_sha256=normalized_hash,
-                        gate_report_relative_path=f"gates/{gate_report.gate_report_id}.json",
+                        gate_report_relative_path=(
+                            f"bundles/candidate-{manifest.evidence_id[3:]}/gate.json"
+                        ),
                         gate_report_sha256=gate_report.aggregate_sha256,
                         factor_resolution_sha256=manifest.factor_resolution_sha256,
                         adapter_version=manifest.adapter_version,
@@ -500,13 +503,15 @@ def canonical_refresh_callback(
                         gate_report=gate_report,
                         evidence=evidence,
                     )
-                    CandidateStore(evidence_root).publish_chain(
+                    published_selection = CandidateStore(evidence_root).publish_chain(
                         report=gate_report,
                         candidate=candidate,
                         selection=selection,
                         evidence=evidence,
                         normalized_payload=normalized_payload,
                     )
+                    if published_selection is None:
+                        raise ProviderHealthError("accepted candidate bundle was not published")
                     result = RefreshResult(
                         run_id=run_id,
                         request_key=request_key,
@@ -538,10 +543,12 @@ def canonical_refresh_callback(
                         result,
                         publish=True,
                         publication_lineage=publication_lineage,
-                        selection=selection,
+                        selection=published_selection,
                     )
                     return result
                 finally:
+                    if published_selection is not None:
+                        published_selection.close()
                     evidence.close()
             except Exception as error:
                 return failure_result(error)
