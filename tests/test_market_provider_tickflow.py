@@ -8,11 +8,11 @@ from datetime import date
 import pytest
 
 from backend.app.market.providers.http import (
-    AuthorizedCanarySession,
     BoundedHttpClient,
     CanaryPermissionError,
     HttpPolicy,
     ProviderHttpError,
+    _AuthorizedCanarySession,
     _CanaryPermit,
     build_authorized_canary_session,
 )
@@ -220,19 +220,18 @@ def test_authorized_session_revalidates_real_canary_registry_before_fake_transpo
     assert len(transport.calls) == 3
 
 
-def test_authorized_session_has_no_public_constructor_or_duck_execution_authority():
-    with pytest.raises(PermissionError):
-        AuthorizedCanarySession(
-            provider_id="tickflow",
-            registry_path="/does/not/exist",
-            external_authorization_id="auth-round4",
-            expected_state_version=2,
-            expected_terms_evidence_hash="a" * 64,
-            expected_terms_review_id="review-1",
-            credential_env_name="STOCK_EVA_TICKFLOW_TOKEN",
-            environ={},
-            client_factory=lambda: FakeClient([]),
-        )
+def test_private_session_object_is_not_execution_authority_or_duck_typed():
+    forged = _AuthorizedCanarySession(
+        provider_id="tickflow",
+        registry_path="/does/not/exist",
+        external_authorization_id="auth-round4",
+        expected_state_version=2,
+        expected_terms_evidence_hash="a" * 64,
+        expected_terms_review_id="review-1",
+        credential_env_name="STOCK_EVA_TICKFLOW_TOKEN",
+        environ={},
+        client_factory=lambda: FakeClient([]),
+    )
 
     class DuckSession:
         def execute(self, *_args, **_kwargs):
@@ -241,9 +240,5 @@ def test_authorized_session_has_no_public_constructor_or_duck_execution_authorit
     with pytest.raises((PermissionError, TypeError)):
         TickFlowAdapter().execute(date(2026, 8, 20), session=DuckSession())
 
-    forged = object.__new__(AuthorizedCanarySession)
-    object.__setattr__(forged, "provider_id", "tickflow")
-    object.__setattr__(forged, "registry_path", "/does/not/exist")
-    object.__setattr__(forged, "external_authorization_id", "auth-round4")
     with pytest.raises(PermissionError):
         TickFlowAdapter().execute(date(2026, 8, 20), session=forged)

@@ -44,9 +44,9 @@ from .base import (
     validate_safe_relative_path,
 )
 from .http import (
-    AuthorizedCanarySession,
     BoundedHTTPClient,
     BoundedHttpClient,
+    CanaryExecutor,
     CanaryPermissionError,
     HttpPolicy,
     HttpRequestPolicy,
@@ -75,7 +75,7 @@ __all__ = [
     "BaoStockProviderAdapter",
     "BoundedHttpClient",
     "CanaryPermissionError",
-    "AuthorizedCanarySession",
+    "CanaryExecutor",
     "build_canary_permit",
     "build_authorized_canary_session",
     "BoundedHTTPClient",

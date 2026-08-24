@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import AuthorizedCanarySession
+from .http import CanaryExecutor, _AuthorizedCanarySession
 
 ADAPTER_HASH = "4" * 64
 ENDPOINT_CONTRACT_HASH = "5" * 64
@@ -189,11 +189,11 @@ class TushareAdapter:
         trade_date: date,
         *,
         symbols: tuple[str, ...] = (),
-        session: AuthorizedCanarySession | None = None,
+        session: CanaryExecutor | None = None,
     ) -> TushareSourceBatch:
         if not OFFICIAL_HTTPS_PROVEN:
             raise TushareExecutionBlocked("tushare official HTTPS is unproven")
-        if type(session) is not AuthorizedCanarySession:
+        if type(session) is not _AuthorizedCanarySession:
             raise TushareExecutionBlocked("authorized canary session required")
         return session.execute(self, trade_date, symbols=symbols)
 

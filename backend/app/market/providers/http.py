@@ -24,6 +24,12 @@ class HttpTransport(Protocol):
     def request(self, method: str, endpoint: str, **kwargs: Any) -> Any: ...
 
 
+class CanaryExecutor(Protocol):
+    """Opaque executor interface; construction is not an authorization decision."""
+
+    def execute(self, adapter: Any, trade_date: Any, *, symbols: tuple[str, ...] = ()) -> Any: ...
+
+
 class HttpPolicy(BaseModel):
     """Fixed bounds shared by both secondary provider adapters."""
 
@@ -274,12 +280,13 @@ class HttpResult:
     request_count: int
 
 
-_SESSION_ISSUER = object()
-
-
 @dataclass(frozen=True, init=False)
-class AuthorizedCanarySession:
-    """The sole network execution capability for a shadow provider."""
+class _AuthorizedCanarySession:
+    """Descriptor-bound executor; only ``execute`` performs the authority gate.
+
+    This private name and same-process object identity are not security controls.  Every
+    request reopens the concrete registry and revalidates the reviewed descriptor.
+    """
 
     provider_id: str
     registry_path: Path
@@ -288,13 +295,12 @@ class AuthorizedCanarySession:
     expected_terms_evidence_hash: str
     expected_terms_review_id: str
     credential_env_name: str
-    _environ: Mapping[str, str] = field(repr=False)
+    _credential_reader: Callable[[str], str] = field(repr=False)
     _client_factory: Callable[[], HttpTransport] = field(repr=False)
 
     def __init__(
         self,
         *,
-        _issuer: object | None = None,
         provider_id: str,
         registry_path: Path,
         external_authorization_id: str,
@@ -305,8 +311,6 @@ class AuthorizedCanarySession:
         environ: Mapping[str, str],
         client_factory: Callable[[], HttpTransport],
     ) -> None:
-        if _issuer is not _SESSION_ISSUER:
-            raise CanaryPermissionError("authorized session factory required")
         object.__setattr__(self, "provider_id", provider_id)
         object.__setattr__(self, "registry_path", registry_path)
         object.__setattr__(self, "external_authorization_id", external_authorization_id)
@@ -314,7 +318,8 @@ class AuthorizedCanarySession:
         object.__setattr__(self, "expected_terms_evidence_hash", expected_terms_evidence_hash)
         object.__setattr__(self, "expected_terms_review_id", expected_terms_review_id)
         object.__setattr__(self, "credential_env_name", credential_env_name)
-        object.__setattr__(self, "_environ", environ)
+        # Keep only a lookup closure, never the credential mapping or token itself.
+        object.__setattr__(self, "_credential_reader", lambda name: environ.get(name, ""))
         object.__setattr__(self, "_client_factory", client_factory)
 
     def execute(self, adapter: Any, trade_date: Any, *, symbols: tuple[str, ...] = ()) -> Any:
@@ -348,7 +353,9 @@ class AuthorizedCanarySession:
                 adapter_hash=adapter.ADAPTER_HASH,
                 endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
                 source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
-                environ=self._environ,
+                environ={
+                    self.credential_env_name: self._credential_reader(self.credential_env_name)
+                },
             )
             if client is None:
                 client = BoundedHttpClient(self._client_factory())
@@ -369,7 +376,7 @@ def build_authorized_canary_session(
     external_authorization_id: str,
     environ: Mapping[str, str],
     client_factory: Callable[[], HttpTransport],
-) -> AuthorizedCanarySession:
+) -> CanaryExecutor:
     from .registry import ShadowRegistry
     from .shadow_contracts import exact_credential_env
 
@@ -401,8 +408,7 @@ def build_authorized_canary_session(
     )
     if record.credential_env_name != exact_credential_env(provider_id):
         raise CanaryPermissionError("provider credential mapping unavailable")
-    return AuthorizedCanarySession(
-        _issuer=_SESSION_ISSUER,
+    return _AuthorizedCanarySession(
         provider_id=provider_id,
         registry_path=Path(registry_obj.path),
         external_authorization_id=external_authorization_id,

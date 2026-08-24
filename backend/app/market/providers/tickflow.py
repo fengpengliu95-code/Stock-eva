@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import AuthorizedCanarySession
+from .http import CanaryExecutor, _AuthorizedCanarySession
 
 ADAPTER_HASH = "1" * 64
 ENDPOINT_CONTRACT_HASH = "2" * 64
@@ -146,9 +146,9 @@ class TickFlowAdapter:
         trade_date: date,
         *,
         symbols: tuple[str, ...] = (),
-        session: AuthorizedCanarySession,
+        session: CanaryExecutor,
     ) -> TickFlowSourceBatch:
-        if type(session) is not AuthorizedCanarySession:
+        if type(session) is not _AuthorizedCanarySession:
             raise PermissionError("authorized canary session required")
         return session.execute(self, trade_date, symbols=symbols)
 

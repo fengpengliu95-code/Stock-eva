@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from datetime import date
 
 import pytest
@@ -11,6 +12,7 @@ from backend.app.market.shadow_evidence import (
     ShadowAttempt,
     ShadowAttemptReport,
     ShadowCompletion,
+    ShadowEvidenceCleanupFailed,
     ShadowEvidenceReader,
     ShadowEvidenceStore,
     ShadowEvidenceUnavailable,
@@ -248,6 +250,72 @@ def test_recovery_only_removes_owned_staging_and_writes_sanitized_audit(tmp_path
     assert result.skipped == 1
     assert staging.exists()
     assert "secret-token" not in result.model_dump_json()
+
+
+def _minimal_owned_tree(tmp_path):
+    staging = tmp_path / "staging"
+    entry = staging / "owned"
+    pages = entry / "pages"
+    pages.mkdir(parents=True)
+    for name in ("OWNER", "COMMIT", "manifest.json"):
+        (entry / name).write_bytes(b"owned")
+    (pages / "page.json").write_bytes(b"page")
+    parent_fd = os.open(staging, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    entry_fd = os.open(
+        "owned",
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    info = os.fstat(entry_fd)
+    expected = (info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns)
+    return staging, parent_fd, entry_fd, expected
+
+
+def test_orphan_cleanup_stops_on_partial_delete_and_reports_residual(tmp_path, monkeypatch):
+    staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
+    original_unlink = shadow_module.os.unlink
+
+    def fail_unlink(*args, **kwargs):
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(shadow_module.os, "unlink", fail_unlink)
+    try:
+        with pytest.raises(ShadowEvidenceCleanupFailed):
+            shadow_module._remove_owned_tree(
+                parent_fd,
+                entry_fd,
+                "owned",
+                expected,
+                allowed_page_names={"page.json"},
+            )
+    finally:
+        monkeypatch.setattr(shadow_module.os, "unlink", original_unlink)
+        os.close(entry_fd)
+        os.close(parent_fd)
+    assert (staging / "owned").exists()
+    assert (staging / "owned" / "pages" / "page.json").exists()
+
+
+def test_orphan_cleanup_never_deletes_foreign_parent_replacement(tmp_path):
+    staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
+    entry = staging / "owned"
+    displaced = staging / "displaced"
+    os.rename(entry, displaced)
+    entry.mkdir()
+    try:
+        with pytest.raises(ShadowEvidenceCleanupFailed):
+            shadow_module._remove_owned_tree(
+                parent_fd,
+                entry_fd,
+                "owned",
+                expected,
+                allowed_page_names={"page.json"},
+            )
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+    assert entry.exists()
+    assert displaced.exists()
 
 
 def test_reader_rejects_hardlinks_extra_files_and_mutation(tmp_path):

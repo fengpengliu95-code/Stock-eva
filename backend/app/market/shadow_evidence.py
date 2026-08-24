@@ -25,6 +25,12 @@ class ShadowEvidenceUnavailable(RuntimeError):
     """Sanitized unavailable result for missing/corrupt/orphan shadow evidence."""
 
 
+class ShadowEvidenceCleanupFailed(ShadowEvidenceUnavailable):
+    """Owned orphan cleanup stopped with residual data still present."""
+
+    residual = True
+
+
 def _json_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
@@ -442,6 +448,9 @@ class ShadowOwner(_Frozen):
 class ShadowRecoveryResult(_Frozen):
     removed: int = Field(ge=0)
     skipped: int = Field(ge=0)
+    cleanup_failed: int = Field(default=0, ge=0)
+    residual: bool = False
+    outcome: Literal["complete", "cleanup_failed"] = "complete"
     audit_id: str
 
 
@@ -1228,23 +1237,40 @@ def _mkdir_exclusive(path: Path) -> None:
         os.close(parent_fd)
 
 
+def _cleanup_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns)
+
+
 def _remove_owned_tree(
-    parent_path: Path | int, entry_name: str, *, allowed_page_names: set[str]
+    staging_fd: int,
+    entry_fd: int,
+    entry_name: str,
+    expected_identity: tuple[int, int, int, int],
+    *,
+    allowed_page_names: set[str],
 ) -> None:
-    """Remove one validated staging tree through held no-follow directory fds."""
-    parent_fd = (
-        _open_directory_fd(parent_path) if not isinstance(parent_path, int) else os.dup(parent_path)
-    )
-    entry_fd = os.open(
-        entry_name,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent_fd,
-    )
-    before = os.fstat(entry_fd)
+    """Remove a validated orphan using only recovery-held descriptors.
+
+    The caller owns and closes ``staging_fd`` and ``entry_fd``.  This function never
+    reopens the entry by name; a parent-name identity mismatch leaves both the held
+    original and any foreign replacement untouched.
+    """
+
+    def fail() -> ShadowEvidenceCleanupFailed:
+        return ShadowEvidenceCleanupFailed("shadow orphan cleanup failed")
+
     try:
+        if _cleanup_identity(os.fstat(entry_fd)) != expected_identity:
+            raise fail()
         names = {entry.name for entry in os.scandir(entry_fd)}
         if names != {"OWNER", "COMMIT", "manifest.json", "pages"}:
-            raise ShadowEvidenceUnavailable("shadow staging identity unavailable")
+            raise fail()
+        root_files: list[str] = []
+        for name in ("OWNER", "COMMIT", "manifest.json"):
+            info = os.stat(name, dir_fd=entry_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise fail()
+            root_files.append(name)
         pages_fd = os.open(
             "pages",
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1253,43 +1279,63 @@ def _remove_owned_tree(
         try:
             page_entries = list(os.scandir(pages_fd))
             if {entry.name for entry in page_entries} != allowed_page_names:
-                raise ShadowEvidenceUnavailable("shadow staging identity unavailable")
+                raise fail()
             for page in page_entries:
                 info = page.stat(follow_symlinks=False)
                 if page.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise ShadowEvidenceUnavailable("shadow staging identity unavailable")
-            after_scan = os.fstat(entry_fd)
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_ctime_ns,
-                before.st_nlink,
-            ) != (
-                after_scan.st_dev,
-                after_scan.st_ino,
-                after_scan.st_mode,
-                after_scan.st_ctime_ns,
-                after_scan.st_nlink,
-            ):
-                raise ShadowEvidenceUnavailable("shadow staging identity changed")
+                    raise fail()
+            if _cleanup_identity(os.fstat(entry_fd)) != expected_identity:
+                raise fail()
+            parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
+            if _cleanup_identity(parent_info) != expected_identity:
+                raise fail()
             for page in page_entries:
                 os.unlink(page.name, dir_fd=pages_fd)
             os.fsync(pages_fd)
         finally:
             os.close(pages_fd)
-        for name in ("OWNER", "COMMIT", "manifest.json"):
-            info = os.stat(name, dir_fd=entry_fd, follow_symlinks=False)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise ShadowEvidenceUnavailable("shadow staging identity unavailable")
+        for name in root_files:
             os.unlink(name, dir_fd=entry_fd)
         os.rmdir("pages", dir_fd=entry_fd)
         os.fsync(entry_fd)
+        parent_info = os.stat(entry_name, dir_fd=staging_fd, follow_symlinks=False)
+        # Removing children necessarily updates the directory ctime.  The stable
+        # parent identity still must be the held inode/type; ctime was checked before
+        # any deletion and is retained in the expected tuple for that preflight.
+        if (parent_info.st_dev, parent_info.st_ino, parent_info.st_mode) != expected_identity[:3]:
+            raise fail()
+        os.rmdir(entry_name, dir_fd=staging_fd)
+        os.fsync(staging_fd)
+    except ShadowEvidenceCleanupFailed:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise fail() from exc
+
+
+def _remove_owned_tree_by_name(
+    staging_path: Path, entry_name: str, *, allowed_page_names: set[str]
+) -> None:
+    """Compatibility wrapper for the idempotent writer path."""
+    staging_fd = _open_directory_fd(staging_path)
+    entry_fd: int | None = None
+    try:
+        entry_fd = os.open(
+            entry_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=staging_fd,
+        )
+        expected = _cleanup_identity(os.fstat(entry_fd))
+        _remove_owned_tree(
+            staging_fd,
+            entry_fd,
+            entry_name,
+            expected,
+            allowed_page_names=allowed_page_names,
+        )
     finally:
-        os.close(entry_fd)
-    os.rmdir(entry_name, dir_fd=parent_fd)
-    os.fsync(parent_fd)
-    os.close(parent_fd)
+        if entry_fd is not None:
+            os.close(entry_fd)
+        os.close(staging_fd)
 
 
 def _exclusive_rename(source: Path, destination: Path) -> None:
@@ -1365,6 +1411,8 @@ class ShadowEvidenceStore:
         self._prepare_root()
         removed = 0
         skipped = 0
+        cleanup_failed = 0
+        residual = False
         staging_fd = _open_directory_fd(self.staging)
         for entry in os.scandir(staging_fd):
             entry_fd: int | None = None
@@ -1543,10 +1591,18 @@ class ShadowEvidenceStore:
                 }
                 _remove_owned_tree(
                     staging_fd,
+                    entry_fd,
                     entry.name,
+                    _cleanup_identity(info),
                     allowed_page_names=allowed_page_names,
                 )
                 removed += 1
+            except ShadowEvidenceCleanupFailed:
+                cleanup_failed += 1
+                residual = True
+                # Cleanup is best-effort and non-rollback: once identity or deletion
+                # fails, leave every remaining staging entry for a later audit/retry.
+                break
             except Exception:
                 skipped += 1
             finally:
@@ -1556,9 +1612,25 @@ class ShadowEvidenceStore:
         os.close(staging_fd)
         audit_id = f"audit-{secrets.token_hex(8)}"
         audit = self.audit / f"{audit_id}.json"
-        payload = _json_bytes({"audit_id": audit_id, "removed": removed, "skipped": skipped})
+        payload = _json_bytes(
+            {
+                "audit_id": audit_id,
+                "removed": removed,
+                "skipped": skipped,
+                "cleanup_failed": cleanup_failed,
+                "residual": residual,
+                "outcome": "cleanup_failed" if cleanup_failed else "complete",
+            }
+        )
         _write_private_file(audit, payload)
-        return ShadowRecoveryResult(removed=removed, skipped=skipped, audit_id=audit_id)
+        return ShadowRecoveryResult(
+            removed=removed,
+            skipped=skipped,
+            cleanup_failed=cleanup_failed,
+            residual=residual,
+            outcome="cleanup_failed" if cleanup_failed else "complete",
+            audit_id=audit_id,
+        )
 
     def record_failure(
         self, attempt_id: str, *, outcome: str = "failure", error: str = ""
@@ -1790,7 +1862,7 @@ class ShadowEvidenceStore:
                     and existing.rows == tuple(rows)
                     and existing.page_refs == tuple(page_refs)
                 ):
-                    _remove_owned_tree(
+                    _remove_owned_tree_by_name(
                         self.staging,
                         nonce,
                         allowed_page_names={
