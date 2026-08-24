@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -24,13 +25,14 @@ import backend.app.market.store as market_store_module
 from backend.app.api.market import get_market_store
 from backend.app.config import get_settings
 from backend.app.main import app
-from backend.app.market.automation import canonical_refresh_callback
+from backend.app.market.automation import build_canonical_raw_request, canonical_refresh_callback
 from backend.app.market.baostock import BaoStockProvider, ProviderBatch
 from backend.app.market.baostock_vendor import (
     emit_terminal_observation,
     transport_observation_sink,
 )
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
+from backend.app.market.evidence import EvidenceError, EvidenceReader
 from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.failures import MarketFailure, MarketFailureError
 from backend.app.market.models import RefreshResult
@@ -360,6 +362,70 @@ def test_real_service_due_route_uses_one_raw_fetch_and_one_normalize(tmp_path: P
     assert outcome.result is not None and outcome.result.status == "ready"
     assert raw_calls == normalize_calls == 1
     assert legacy_fetch_calls == 0
+    manifest_path = next((tmp_path / "evidence" / "manifests").glob("*.json"))
+    manifest = json.loads(manifest_path.read_text())
+    factor_ordinal = next(
+        item["plan_ordinal"]
+        for item in manifest["logical_request_plan"]["requests"]
+        if item["endpoint"] == "daily_factor"
+    )
+    assert {item["plan_ordinal"] for item in manifest["factor_resolution"]} == {factor_ordinal}
+    manifest_id = manifest["evidence_id"]
+    manifest_path = tmp_path / "evidence" / "manifests" / f"{manifest_id}.json"
+    original_manifest = json.loads(manifest_path.read_text())
+    for bad_ordinal in (0, 999):
+        forged = json.loads(json.dumps(original_manifest))
+        forged_binding = forged["factor_resolution"][0]
+        forged_binding["plan_ordinal"] = bad_ordinal
+        binding_core = dict(forged_binding)
+        binding_core.pop("resolution_sha256", None)
+        forged_binding["resolution_sha256"] = hashlib.sha256(
+            json.dumps(
+                binding_core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        forged["factor_resolution_sha256"] = hashlib.sha256(
+            json.dumps(
+                forged["factor_resolution"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        forged["manifest_sha256"] = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in forged.items() if key != "manifest_sha256"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        manifest_path.write_text(
+            json.dumps(forged, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        with pytest.raises(EvidenceError):
+            EvidenceReader(tmp_path / "evidence").read(manifest_id)
+        manifest_path.write_text(
+            json.dumps(original_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+
+
+@pytest.mark.parametrize("symbol_count", (4091, 4092, 5000))
+def test_task8_canonical_plan_has_fixed_capacity_without_adjust_factor_shards(symbol_count):
+    symbols = tuple(f"sh.{index:06d}" for index in range(1, symbol_count + 1))
+    adapter = SimpleNamespace(
+        inspect_main_board=lambda _trade_date: SimpleNamespace(main_board_symbols=symbols)
+    )
+    request = build_canonical_raw_request(
+        adapter,
+        trade_date=date(2026, 8, 20),
+        refresh_id="plan-refresh",
+        required_symbols={symbols[0]},
+    )
+    assert request.logical_request_plan.request_count == 5
+    assert not any(
+        item.endpoint.value == "adjust_factor" for item in request.logical_request_plan.requests
+    )
 
 
 def test_automation_optional_continuity_dependency_preserves_legacy_behavior_exactly(

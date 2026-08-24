@@ -221,6 +221,16 @@ def test_task8_reader_rejects_rehashed_manifest_with_changed_refresh_identity(tm
         EvidenceReader(tmp_path).read(manifest.evidence_id)
 
 
+def test_task8_reader_requires_requested_manifest_filename_identity(tmp_path):
+    store, manifest, _, _ = _published(tmp_path)
+    original = tmp_path / "manifests" / f"{manifest.evidence_id}.json"
+    renamed_id = "ev-renamed"
+    renamed = tmp_path / "manifests" / f"{renamed_id}.json"
+    original.rename(renamed)
+    with pytest.raises(EvidenceError):
+        store.read(renamed_id)
+
+
 def test_evidence_rejects_secret_header_cookie_url_path_and_exception_fields(tmp_path):
     with pytest.raises(ValueError):
         _descriptor(tmp_path, relative_path="https://token")

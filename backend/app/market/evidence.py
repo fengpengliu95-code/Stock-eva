@@ -802,6 +802,11 @@ class EvidenceReader:
             )
             try:
                 raw = json.loads(payload.decode("utf-8"))
+                if raw.get("evidence_id") != evidence_id:
+                    raise EvidenceError(
+                        "requested evidence ID does not match manifest ID",
+                        "EVIDENCE_HASH_MISMATCH",
+                    )
                 if raw.get("manifest_sha256") != _digest(
                     {key: value for key, value in raw.items() if key != "manifest_sha256"}
                 ):
@@ -848,7 +853,39 @@ class EvidenceReader:
                     raise EvidenceError(
                         "factor snapshot has duplicate record keys", "EVIDENCE_MANIFEST_INVALID"
                     )
+                factor_requests = tuple(
+                    item
+                    for item in manifest.logical_request_plan.requests
+                    if item.endpoint is ProviderEndpoint.DAILY_FACTOR
+                )
                 for binding in manifest.factor_resolution:
+                    if factor_requests and binding.plan_ordinal >= manifest.request_count:
+                        raise EvidenceError(
+                            "factor resolution plan ordinal is unbound",
+                            "EVIDENCE_MANIFEST_INVALID",
+                        )
+                    if factor_requests:
+                        logical = manifest.logical_request_plan.requests[binding.plan_ordinal]
+                        expected_endpoint = (
+                            ProviderEndpoint.DAILY_FACTOR
+                            if binding.selected_kind == "factor_cache_snapshot"
+                            else binding.live.endpoint
+                        )
+                        if logical.endpoint is not expected_endpoint:
+                            raise EvidenceError(
+                                "factor resolution endpoint is unbound",
+                                "EVIDENCE_MANIFEST_INVALID",
+                            )
+                        if binding.symbol not in logical.symbols:
+                            raise EvidenceError(
+                                "factor resolution symbol is outside its plan",
+                                "EVIDENCE_MANIFEST_INVALID",
+                            )
+                        if binding.trade_date != manifest.trade_date:
+                            raise EvidenceError(
+                                "factor resolution date is outside its plan",
+                                "EVIDENCE_MANIFEST_INVALID",
+                            )
                     if binding.selected_kind == "factor_cache_snapshot":
                         if binding.cache is None or binding.cache.record_key not in set(keys):
                             raise EvidenceError(
@@ -1598,6 +1635,31 @@ class EvidenceStore:
                     raise EvidenceError(
                         "factor selected value binding is invalid", "EVIDENCE_HASH_MISMATCH"
                     )
+                factor_requests = tuple(
+                    item
+                    for item in batch.logical_request_plan.requests
+                    if item.endpoint is ProviderEndpoint.DAILY_FACTOR
+                )
+                if factor_requests:
+                    if binding.plan_ordinal >= batch.logical_request_plan.request_count:
+                        raise EvidenceError(
+                            "factor resolution plan ordinal is unbound",
+                            "EVIDENCE_MANIFEST_INVALID",
+                        )
+                    logical = batch.logical_request_plan.requests[binding.plan_ordinal]
+                    if logical.endpoint is not ProviderEndpoint.DAILY_FACTOR:
+                        raise EvidenceError(
+                            "factor resolution endpoint is unbound",
+                            "EVIDENCE_MANIFEST_INVALID",
+                        )
+                    if (
+                        binding.symbol not in logical.symbols
+                        or binding.trade_date != batch.request.trade_date
+                    ):
+                        raise EvidenceError(
+                            "factor resolution is outside its plan",
+                            "EVIDENCE_MANIFEST_INVALID",
+                        )
         for item in batch.endpoint_batches:
             fields = tuple(item.fields)
             rows = [row.model_dump(mode="python") for row in item.rows]

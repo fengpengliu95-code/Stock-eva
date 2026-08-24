@@ -281,14 +281,6 @@ def build_canonical_raw_request(
         "daily_factor.v1",
         main_symbols,
     )
-    for symbol in main_symbols:
-        add(
-            ContractProviderEndpoint.ADJUST_FACTOR,
-            RequestRole.ADJUST_FACTOR,
-            InstrumentRole.STOCK,
-            "adjust_factor.session.v1",
-            (symbol,),
-        )
     for symbol in INDEX_SYMBOLS:
         add(
             ContractProviderEndpoint.INDEX_HISTORY,
@@ -398,7 +390,12 @@ def canonical_refresh_callback(
         ) -> tuple[FactorResolutionBinding, ...]:
             rows = records.rows
             bindings = []
-            for ordinal, row in enumerate(rows):
+            factor_plan_ordinal = next(
+                item.plan_ordinal
+                for item in request.logical_request_plan.requests
+                if item.endpoint is ContractProviderEndpoint.DAILY_FACTOR
+            )
+            for _ordinal, row in enumerate(rows):
                 row_data = row.model_dump(mode="python")
                 cache = CacheFactorResolution(
                     cache_object_id=_factor_manifest.object_id,
@@ -406,7 +403,7 @@ def canonical_refresh_callback(
                     record_key=f"{row_data['symbol']}.{row_data['trade_date']}",
                 )
                 values = {
-                    "plan_ordinal": ordinal,
+                    "plan_ordinal": factor_plan_ordinal,
                     "symbol": row_data["symbol"],
                     "trade_date": date.fromisoformat(str(row_data["trade_date"])),
                     "selected_kind": "factor_cache_snapshot",
