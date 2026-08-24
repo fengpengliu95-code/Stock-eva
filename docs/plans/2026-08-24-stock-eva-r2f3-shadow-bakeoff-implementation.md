@@ -293,13 +293,16 @@ CREATE TABLE qualification_window (
     (qualification_evidence_sha256 IS NULL OR length(qualification_evidence_sha256) = 64),
   qualification_candidate_sha256 TEXT CHECK
     (qualification_candidate_sha256 IS NULL OR length(qualification_candidate_sha256) = 64),
+  terminal_attestation_id TEXT,
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
   CHECK (window_state <> 'qualified' OR
     (last_session_report_id IS NOT NULL AND qualification_evidence_sha256 IS NOT NULL AND
-     qualification_candidate_sha256 IS NOT NULL)),
+     qualification_candidate_sha256 IS NOT NULL AND terminal_attestation_id IS NOT NULL)),
   PRIMARY KEY (provider_id, window_id),
   UNIQUE (provider_id),
-  FOREIGN KEY (provider_id) REFERENCES provider_record(provider_id)
+  FOREIGN KEY (provider_id) REFERENCES provider_record(provider_id),
+  FOREIGN KEY (terminal_attestation_id, provider_id, window_id)
+    REFERENCES shadow_terminal_attestation(attestation_id, provider_id, window_id)
 );
 
 CREATE TABLE shadow_job (
@@ -316,8 +319,9 @@ CREATE TABLE shadow_job (
   successful_candidate_sha256 TEXT CHECK
     (successful_candidate_sha256 IS NULL OR length(successful_candidate_sha256) = 64),
   completion_sha256 TEXT CHECK (completion_sha256 IS NULL OR length(completion_sha256) = 64),
+  terminal_attestation_id TEXT,
   run_status TEXT NOT NULL CHECK
-    (run_status IN ('pending', 'leased', 'completed', 'failed', 'cancelled', 'unavailable')),
+    (run_status IN ('pending', 'leased', 'pending_normalization', 'completed', 'failed', 'cancelled', 'unavailable')),
   lease_owner TEXT,
   lease_expires_at TEXT,
   attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
@@ -326,8 +330,10 @@ CREATE TABLE shadow_job (
   UNIQUE (job_id, provider_id, window_id),
   CHECK (run_status NOT IN ('completed') OR
     (successful_evidence_sha256 IS NOT NULL AND successful_candidate_sha256 IS NOT NULL AND
-     completion_sha256 IS NOT NULL)),
-  FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id)
+     completion_sha256 IS NOT NULL AND terminal_attestation_id IS NOT NULL)),
+  FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
+  FOREIGN KEY (terminal_attestation_id, provider_id, job_id, window_id)
+    REFERENCES shadow_terminal_attestation(attestation_id, provider_id, job_id, window_id)
 );
 
 CREATE TABLE shadow_attempt_report (
@@ -343,7 +349,7 @@ CREATE TABLE shadow_attempt_report (
   logical_request_ordinal INTEGER NOT NULL CHECK (logical_request_ordinal >= 0),
   attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
   version_vector_sha256 TEXT NOT NULL CHECK (length(version_vector_sha256) = 64),
-  outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'skip', 'unavailable', 'mismatch')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('evidence_ready', 'success', 'failure', 'skip', 'unavailable', 'mismatch')),
   started_at TEXT NOT NULL,
   completed_at TEXT NOT NULL,
   coverage_expected INTEGER NOT NULL CHECK (coverage_expected >= 0),
@@ -359,23 +365,36 @@ CREATE TABLE shadow_attempt_report (
   durable_report_ref TEXT NOT NULL,
   report_sha256 TEXT NOT NULL CHECK (length(report_sha256) = 64),
   evidence_refs_json TEXT NOT NULL,
+  evidence_id TEXT,
   evidence_sha256 TEXT CHECK (evidence_sha256 IS NULL OR length(evidence_sha256) = 64),
   candidate_sha256 TEXT CHECK (candidate_sha256 IS NULL OR length(candidate_sha256) = 64),
+  terminal_session_report_id TEXT,
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
-  CHECK (outcome = 'success' OR
-         (page_identities_json = '[]' AND page_count = 0 AND row_count = 0 AND
-          evidence_refs_json = '[]' AND evidence_sha256 IS NULL AND candidate_sha256 IS NULL AND
-          terminal_marker = 0)),
+  CHECK ((outcome IN ('failure', 'skip', 'unavailable', 'mismatch') AND
+          page_identities_json = '[]' AND page_count = 0 AND row_count = 0 AND
+          evidence_refs_json = '[]' AND evidence_id IS NULL AND evidence_sha256 IS NULL AND candidate_sha256 IS NULL AND
+          terminal_marker = 0) OR
+         (outcome IN ('evidence_ready', 'success') AND terminal_marker = 1 AND
+          page_identities_json <> '[]' AND evidence_refs_json <> '[]')),
+  CHECK (outcome <> 'evidence_ready' OR
+    (terminal_marker = 1 AND evidence_id IS NOT NULL AND evidence_sha256 IS NOT NULL AND candidate_sha256 IS NULL AND
+     terminal_session_report_id IS NULL)),
   CHECK (outcome <> 'success' OR
-         (terminal_marker = 1 AND page_identities_json <> '[]' AND evidence_refs_json <> '[]')),
-  CHECK (outcome <> 'success' OR
-    (evidence_sha256 IS NOT NULL AND candidate_sha256 IS NOT NULL)),
+    (terminal_marker = 1 AND evidence_id IS NOT NULL AND evidence_sha256 IS NOT NULL AND candidate_sha256 IS NOT NULL AND
+     terminal_session_report_id IS NOT NULL)),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
+  FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id)
+    DEFERRABLE INITIALLY DEFERRED,
   UNIQUE (attempt_id),
   UNIQUE (attempt_id, provider_id, job_id, window_id, session_id),
   UNIQUE (attempt_id, provider_id, job_id, window_id, session_id, logical_request_ordinal),
-  UNIQUE (job_id, provider_id, window_id, session_id, logical_request_ordinal, attempt_number)
+  UNIQUE (job_id, provider_id, window_id, session_id, logical_request_ordinal, attempt_number),
+  UNIQUE (terminal_session_report_id, provider_id, job_id, window_id, session_id, logical_request_ordinal),
+  FOREIGN KEY (terminal_session_report_id, provider_id, job_id, window_id, session_id)
+    REFERENCES session_report(session_report_id, provider_id, job_id, window_id, session_id)
+    DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE TABLE session_report (
@@ -387,8 +406,10 @@ CREATE TABLE session_report (
   successful_attempt_id TEXT,
   evidence_id TEXT,
   candidate_id TEXT,
+  terminal_attestation_id TEXT,
+  report_version INTEGER NOT NULL CHECK (report_version >= 1),
   trade_date TEXT NOT NULL,
-  outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'skip', 'unavailable', 'mismatch')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('evidence_ready', 'success', 'failure', 'skip', 'unavailable', 'mismatch')),
   calendar_generation TEXT NOT NULL,
   calendar_sha256 TEXT NOT NULL CHECK (length(calendar_sha256) = 64),
   universe_sha256 TEXT NOT NULL CHECK (length(universe_sha256) = 64),
@@ -398,20 +419,33 @@ CREATE TABLE session_report (
   report_ref TEXT NOT NULL,
   report_sha256 TEXT NOT NULL CHECK (length(report_sha256) = 64),
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
-  CHECK (outcome = 'success' OR (evidence_sha256 IS NULL AND candidate_sha256 IS NULL)),
-  CHECK (outcome <> 'success' OR
-    (successful_attempt_id IS NOT NULL AND evidence_id IS NOT NULL AND candidate_id IS NOT NULL AND
-     evidence_sha256 IS NOT NULL AND candidate_sha256 IS NOT NULL)),
-  UNIQUE (provider_id, window_id, trade_date),
+  CHECK ((outcome IN ('failure', 'skip', 'unavailable', 'mismatch') AND
+          successful_attempt_id IS NULL AND evidence_id IS NULL AND candidate_id IS NULL AND
+          terminal_attestation_id IS NULL AND evidence_sha256 IS NULL AND candidate_sha256 IS NULL) OR
+         (outcome = 'evidence_ready' AND successful_attempt_id IS NOT NULL AND evidence_id IS NOT NULL AND
+          candidate_id IS NULL AND terminal_attestation_id IS NULL AND evidence_sha256 IS NOT NULL AND
+          candidate_sha256 IS NULL) OR
+         (outcome = 'success' AND successful_attempt_id IS NOT NULL AND evidence_id IS NOT NULL AND
+          candidate_id IS NOT NULL AND terminal_attestation_id IS NOT NULL AND evidence_sha256 IS NOT NULL AND
+          candidate_sha256 IS NOT NULL)),
+  UNIQUE (provider_id, window_id, trade_date, report_version),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
   FOREIGN KEY (successful_attempt_id, provider_id, job_id, window_id, session_id)
     REFERENCES shadow_attempt_report(attempt_id, provider_id, job_id, window_id, session_id),
   FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id)
     REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id, evidence_sha256)
+    REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id, evidence_sha256),
   FOREIGN KEY (candidate_id, provider_id, job_id, window_id, session_id)
     REFERENCES shadow_candidate_ref(candidate_id, provider_id, job_id, window_id, session_id),
-  UNIQUE (session_report_id, provider_id, job_id, window_id, session_id)
+  FOREIGN KEY (candidate_id, provider_id, job_id, window_id, session_id, candidate_sha256)
+    REFERENCES shadow_candidate_ref(candidate_id, provider_id, job_id, window_id, session_id, candidate_sha256),
+  FOREIGN KEY (terminal_attestation_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_terminal_attestation(attestation_id, provider_id, job_id, window_id, session_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  UNIQUE (session_report_id, provider_id, job_id, window_id, session_id),
+  UNIQUE (session_report_id, provider_id, job_id, window_id, session_id, report_version)
 );
 
 CREATE TABLE shadow_evidence_ref (
@@ -421,10 +455,12 @@ CREATE TABLE shadow_evidence_ref (
   window_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   completion_sha256 TEXT NOT NULL CHECK (length(completion_sha256) = 64),
+  evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
   bundle_ref TEXT NOT NULL,
   bundle_sha256 TEXT NOT NULL CHECK (length(bundle_sha256) = 64),
   attached_session_report_id TEXT,
   UNIQUE (evidence_id, provider_id, job_id, window_id, session_id),
+  UNIQUE (evidence_id, provider_id, job_id, window_id, session_id, evidence_sha256),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
   FOREIGN KEY (attached_session_report_id, provider_id, job_id, window_id, session_id)
@@ -466,8 +502,104 @@ CREATE TABLE shadow_candidate_ref (
   FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id)
     REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
-  UNIQUE (candidate_id, provider_id, job_id, window_id, session_id)
+  UNIQUE (candidate_id, provider_id, job_id, window_id, session_id),
+  UNIQUE (candidate_id, provider_id, job_id, window_id, session_id, candidate_sha256)
 );
+
+CREATE TABLE shadow_terminal_attestation (
+  attestation_id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  window_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  session_report_id TEXT NOT NULL,
+  session_report_version INTEGER NOT NULL CHECK (session_report_version >= 1),
+  attempt_ordinal_closure_sha256 TEXT NOT NULL CHECK (length(attempt_ordinal_closure_sha256) = 64),
+  request_plan_sha256 TEXT NOT NULL CHECK (length(request_plan_sha256) = 64),
+  completion_sha256 TEXT NOT NULL CHECK (length(completion_sha256) = 64),
+  report_digest_sha256 TEXT NOT NULL CHECK (length(report_digest_sha256) = 64),
+  evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+  candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256) = 64),
+  terminal_outcome TEXT NOT NULL CHECK (terminal_outcome = 'success'),
+  immutable_version INTEGER NOT NULL CHECK (immutable_version >= 1),
+  UNIQUE (attestation_id, provider_id, job_id, window_id),
+  UNIQUE (attestation_id, provider_id, window_id),
+  UNIQUE (attestation_id, provider_id, job_id, window_id, session_id),
+  UNIQUE (provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (job_id, provider_id, window_id)
+    REFERENCES shadow_job(job_id, provider_id, window_id),
+  FOREIGN KEY (provider_id, window_id)
+    REFERENCES qualification_window(provider_id, window_id),
+  FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id, evidence_sha256)
+    REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id, evidence_sha256),
+  FOREIGN KEY (candidate_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_candidate_ref(candidate_id, provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (candidate_id, provider_id, job_id, window_id, session_id, candidate_sha256)
+    REFERENCES shadow_candidate_ref(candidate_id, provider_id, job_id, window_id, session_id, candidate_sha256),
+  FOREIGN KEY (session_report_id, provider_id, job_id, window_id, session_id, session_report_version)
+    REFERENCES session_report(session_report_id, provider_id, job_id, window_id, session_id, report_version)
+    DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TRIGGER session_report_hash_match
+BEFORE INSERT ON session_report
+WHEN NEW.outcome IN ('evidence_ready', 'success')
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_evidence_ref e
+     WHERE e.evidence_id=NEW.evidence_id AND e.provider_id=NEW.provider_id
+       AND e.job_id=NEW.job_id AND e.window_id=NEW.window_id AND e.session_id=NEW.session_id
+       AND e.evidence_sha256=NEW.evidence_sha256
+  ) THEN RAISE(ABORT, 'session_hash_mismatch') END;
+  SELECT CASE WHEN NEW.outcome='success' AND NOT EXISTS (
+    SELECT 1 FROM shadow_candidate_ref c
+     WHERE c.candidate_id=NEW.candidate_id AND c.provider_id=NEW.provider_id
+       AND c.job_id=NEW.job_id AND c.window_id=NEW.window_id AND c.session_id=NEW.session_id
+       AND c.candidate_sha256=NEW.candidate_sha256
+  ) THEN RAISE(ABORT, 'session_hash_mismatch') END;
+END;
+
+CREATE TRIGGER terminal_attestation_hash_match
+BEFORE INSERT ON shadow_terminal_attestation
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_evidence_ref e
+     WHERE e.evidence_id=NEW.evidence_id AND e.provider_id=NEW.provider_id
+       AND e.job_id=NEW.job_id AND e.window_id=NEW.window_id AND e.session_id=NEW.session_id
+       AND e.evidence_sha256=NEW.evidence_sha256
+  ) THEN RAISE(ABORT, 'attestation_evidence_hash_mismatch') END;
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_candidate_ref c
+     WHERE c.candidate_id=NEW.candidate_id AND c.provider_id=NEW.provider_id
+       AND c.job_id=NEW.job_id AND c.window_id=NEW.window_id AND c.session_id=NEW.session_id
+       AND c.candidate_sha256=NEW.candidate_sha256
+  ) THEN RAISE(ABORT, 'attestation_candidate_hash_mismatch') END;
+END;
+
+CREATE TRIGGER evidence_ready_requires_pending_normalization
+BEFORE INSERT ON shadow_attempt_report
+WHEN NEW.outcome = 'evidence_ready'
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_job j
+     WHERE j.job_id=NEW.job_id AND j.provider_id=NEW.provider_id AND j.window_id=NEW.window_id
+       AND j.run_status='pending_normalization'
+  ) THEN RAISE(ABORT, 'evidence_ready_requires_pending_normalization') END;
+END;
+
+CREATE TRIGGER candidate_attach_requires_nonterminal_job
+BEFORE INSERT ON shadow_candidate_ref
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM shadow_job j
+     WHERE j.job_id=NEW.job_id AND j.provider_id=NEW.provider_id AND j.window_id=NEW.window_id
+       AND j.run_status IN ('leased', 'pending_normalization')
+  ) THEN RAISE(ABORT, 'candidate_attach_after_terminal') END;
+END;
 ```
 
 The lock file is initialized before any reader can run (`0600`, regular, safe ancestor). Writer
@@ -659,8 +791,8 @@ canonical field order is:
 report_id, attempt_id, job_id, provider_id, window_id, session_id, logical_request_ordinal,
 request_id, endpoint_class, outcome, started_at, completed_at, coverage_expected,
 coverage_observed, request_count, retry_count, rate_limit_count, failure_class,
-page_identities, page_count, row_count, evidence_refs, evidence_sha256, candidate_sha256,
-durable_report_ref, report_sha256
+page_identities, page_count, row_count, evidence_refs, evidence_id, evidence_sha256,
+candidate_sha256, terminal_session_report_id, durable_report_ref, report_sha256
 ```
 
 The object is UTF-8 JSON with `ensure_ascii=false`, compact separators, `sort_keys=false`, one LF,
@@ -672,6 +804,94 @@ JSON `endpoint_class`; it is also repeated in `shadow_evidence_attempt_ref` for 
 For success, page/evidence/candidate fields are complete and non-null; for failure/skip/
 unavailable/mismatch, page identities/refs/counts/rows and evidence/candidate hashes are exactly
 empty/null while timing, coverage, retry/rate-limit counts and sanitized failure class remain.
+
+### Cross-task lifecycle boundary
+
+Task 11's successful adapter/evidence result is explicitly `evidence_ready`: it writes the
+sanitized report, immutable evidence bundle and `ShadowEvidenceAttemptRef` rows, but sets
+`candidate_sha256=NULL`, leaves `shadow_job.run_status` at `pending_normalization` (or returns the
+job to that state under CAS), and creates no terminal attestation. It is valid evidence, not a
+qualification result. Task 12 reads that evidence, normalizes/reconciles it and writes the complete
+candidate/quality bundle and `ShadowCandidateRef`; it still does not complete the job/window.
+Task 13 reruns the terminal validator, creates a new immutable terminal `ShadowAttemptReport` /
+`session_report` version with candidate IDs/hashes, inserts exactly one
+`ShadowTerminalAttestation`, then in the same transaction CAS-updates job to `completed` and the
+window to `qualified`/next observing state. Reader/status paths filter terminal eligibility by the
+attestation relation, never by a bare hash or nullable field.
+
+Each Task 13 per-ordinal terminal attempt report carries `terminal_session_report_id` and is
+therefore composite-FK-bound to that immutable `session_report` version. The validator queries
+that exact report ID, not a naming convention or a singular `successful_attempt_id`; the latter is
+only a backward-compatible primary-attempt projection. Thus a multi-request terminal graph cannot
+silently omit an ordinal.
+
+The terminal graph validator and transaction are frozen as executable pseudocode. The validator
+does not write; it is called inside the terminal `BEGIN IMMEDIATE` before either state CAS:
+
+```python
+def terminal_graph_validator(conn, identity, expected_versions):
+    job, window, session = load_same_identity(conn, identity)
+    plan = load_plan(identity.job_id)  # exact ordinal set + request_plan_sha256
+    refs = conn.execute("""
+      SELECT r.logical_request_ordinal, r.attempt_id, r.endpoint, r.request_id,
+             r.page_refs_json, r.page_count, r.row_count,
+             a.outcome, a.page_identities_json, a.evidence_sha256, a.candidate_sha256,
+             a.evidence_id, a.report_sha256
+        FROM shadow_evidence_attempt_ref r
+        JOIN shadow_attempt_report a ON
+          (a.attempt_id,a.provider_id,a.job_id,a.window_id,a.session_id,a.logical_request_ordinal)=
+          (r.attempt_id,r.provider_id,r.job_id,r.window_id,r.session_id,r.logical_request_ordinal)
+       WHERE r.evidence_id=? AND r.provider_id=? AND r.job_id=? AND r.window_id=? AND r.session_id=?
+       ORDER BY r.logical_request_ordinal
+    """, identity.evidence_tuple).fetchall()
+    assert {r.logical_request_ordinal for r in refs} == plan.exact_ordinal_set
+    terminal_rows = conn.execute("""
+      SELECT logical_request_ordinal, attempt_id, endpoint, request_id,
+             page_identities_json, page_count, row_count, evidence_id, evidence_sha256, candidate_sha256,
+             report_sha256
+        FROM shadow_attempt_report
+       WHERE provider_id=? AND job_id=? AND window_id=? AND session_id=?
+         AND outcome='success' AND terminal_marker=1
+         AND terminal_session_report_id=?
+       ORDER BY logical_request_ordinal
+    """, identity.session_tuple + (identity.session_report_id,)).fetchall()
+    assert {r.logical_request_ordinal for r in terminal_rows} == plan.exact_ordinal_set
+    for r in refs:
+        assert r.outcome == "evidence_ready"
+        assert r.evidence_id == identity.evidence_id
+        terminal = terminal_rows[r.logical_request_ordinal]
+        assert r.endpoint == plan[r.logical_request_ordinal].endpoint
+        assert r.request_id == plan[r.logical_request_ordinal].request_id
+        assert terminal.endpoint == r.endpoint and terminal.request_id == r.request_id
+        assert terminal.evidence_sha256 == session.evidence_sha256
+        assert terminal.evidence_id == identity.evidence_id
+        assert terminal.candidate_sha256 == session.candidate_sha256
+        assert contiguous(r.page_refs_json, r.page_count)
+        assert same_pages(r.page_refs_json, r.page_identities_json)
+        assert row_sum(r.page_refs_json) == r.row_count
+        assert sha256_pages(r.page_refs_json) == manifest_page_hash(identity.evidence_id, r.logical_request_ordinal)
+    evidence = descriptor_read_and_hash(identity.evidence_bundle)
+    candidate = descriptor_read_and_hash(identity.candidate_bundle)
+    assert evidence.sha256 == session.evidence_sha256
+    assert candidate.sha256 == session.candidate_sha256
+    assert candidate.evidence_sha256 == evidence.sha256
+    assert report_digest(refs, terminal_rows, session) == session.report_sha256
+    return closure_digest(plan, refs), evidence, candidate
+
+BEGIN IMMEDIATE
+closure, evidence, candidate = terminal_graph_validator(conn, identity, expected_versions)
+INSERT INTO shadow_terminal_attestation (...closure, evidence, candidate, report digest...);
+UPDATE shadow_job SET run_status='completed', terminal_attestation_id=?, state_version=state_version+1
+ WHERE job_id=? AND provider_id=? AND window_id=? AND state_version=?;  # rowcount == 1
+UPDATE qualification_window SET window_state=?, terminal_attestation_id=?, state_version=state_version+1
+ WHERE provider_id=? AND window_id=? AND state_version=?;                  # rowcount == 1
+COMMIT
+```
+
+Any missing ordinal, non-final attempt, endpoint/request/page/count/hash mismatch, unreadable
+descriptor, evidence/candidate mismatch, report digest mismatch, stale version or failed CAS
+executes `ROLLBACK`; no attestation, terminal report, job/window version or qualification history
+changes. This validator is run again by the recovery scanner before attaching a post-rename orphan.
 
 ### RED
 
@@ -693,6 +913,7 @@ def test_one_evidence_binds_multiple_final_attempt_refs_by_ordinal_endpoint_requ
 def test_failure_skip_unavailable_mismatch_persist_sanitized_report_without_evidence_or_candidate(tmp_path): ...
 def test_failed_attempt_cannot_be_selected_as_final_completion(tmp_path): ...
 def test_completion_rejects_endpoint_request_page_count_row_count_or_hash_mismatch(tmp_path): ...
+def test_task11_evidence_ready_is_legal_but_not_terminal_or_qualifying(tmp_path): ...
 def test_shadow_evidence_crash_cancel_and_orphan_are_unreadable(tmp_path): ...
 def test_shadow_evidence_bundle_commit_marker_is_atomic_and_idempotent(tmp_path): ...
 ~~~
@@ -890,6 +1111,7 @@ def test_canonical_comparison_drift_returns_unavailable_and_zero_write(tmp_path)
 def test_canonical_candidate_reader_rejects_root_bundle_and_fd_toctou(tmp_path): ...
 def test_published_canonical_comparison_verify_before_after_and_close_capability(tmp_path): ...
 def test_canonical_comparison_rejects_mixed_generation_or_lineage(tmp_path): ...
+def test_task12_candidate_attach_requires_evidence_ready_and_keeps_job_nonterminal(tmp_path): ...
 ~~~
 
 Run RED:
@@ -1007,6 +1229,9 @@ git commit -m "feat(market): reconcile complete shadow candidates"
   window evaluation.
 - Create backend/app/market/shadow_jobs.py containing durable ShadowJobStore outbox, lease/CAS,
   recovery scanner and immutable ConfirmedSessionSnapshot/ShadowAttemptReport persistence.
+- Create backend/app/market/shadow_terminal.py containing the read-only terminal graph validator,
+  immutable `ShadowTerminalAttestation` writer and terminal report-version protocol; it is the only
+  code allowed to perform the qualification eligibility check.
 - Create backend/app/market/shadow_calendar.py containing `ConfirmedCalendarReader` (or modify
   `calendar.py` only additively) to read exact involved-year CalendarConfig dumps, official-source
   metadata and closed dates and produce generation/hash/exact next confirmed sessions.
@@ -1055,6 +1280,10 @@ def test_success_terminal_transaction_attaches_all_refs_before_window_eligibilit
 def test_failure_terminal_transaction_keeps_report_but_no_evidence_candidate(tmp_path): ...
 def test_crash_before_after_bundle_db_and_orphan_recovery_preserve_versions(tmp_path): ...
 def test_success_missing_unreadable_or_hash_mismatch_rolls_back_job_session_and_window(tmp_path): ...
+def test_completed_without_terminal_attestation_is_rejected_by_sql_and_validator(tmp_path): ...
+def test_qualified_without_terminal_attestation_is_rejected_by_sql_and_validator(tmp_path): ...
+def test_session_hash_mismatch_rejects_terminal_attestation(tmp_path): ...
+def test_terminal_validator_runs_before_both_cas_and_zero_writes_on_failure(tmp_path): ...
 ~~~
 
 Run RED:
@@ -1100,7 +1329,9 @@ durable expected symbol/index set in `PublishedCanonicalComparison`, not a fresh
 Each confirmed session begins with immutable ConfirmedSessionSnapshot containing exact calendar
 generation/hash, next confirmed sessions, universe hash and capture identity. Every attempt emits a
 ShadowAttemptReport outcome success/failure/skip/unavailable/mismatch with timing, request/retry/
-rate-limit counts, coverage, version vector and all relevant hashes. The attempt/session report
+rate-limit counts, coverage, version vector and all relevant hashes. `evidence_ready` is retained
+as a nonterminal Task 11 outcome; only the later terminal report version carries candidate/attestation
+hashes. The attempt/session report
 bundle is durably published and its bundle lock released before one exclusive registry transaction/
 CAS inserts attempt/session refs and updates or resets qualification_window; any gap, failure,
 unavailable/mismatch or adapter/endpoint/source-schema/normalizer/reconcile/terms/universe/
@@ -1134,11 +1365,13 @@ uv run --extra dev pytest -q tests/test_market_shadow.py \
   tests/test_market_shadow_jobs.py tests/test_r2f2_golden_compat.py \
   --basetemp=/tmp/stock-eva-r2f3-shadow-green
 uv run --extra dev ruff check backend/app/market/shadow_scheduler.py backend/app/market/shadow_jobs.py \
+  backend/app/market/shadow_terminal.py \
   backend/app/market/automation.py backend/app/market/providers/registry.py \
   backend/app/api/market.py backend/app/cli.py tests/test_market_shadow.py \
   tests/test_market_get_read_only.py tests/test_market_shadow_jobs.py \
   tests/test_r2f2_golden_compat.py
 uv run --extra dev ruff format --check backend/app/market/shadow_scheduler.py backend/app/market/shadow_jobs.py \
+  backend/app/market/shadow_terminal.py \
   backend/app/market/automation.py backend/app/market/providers/registry.py \
   backend/app/api/market.py backend/app/cli.py tests/test_market_shadow.py \
   tests/test_market_get_read_only.py tests/test_market_shadow_jobs.py \
@@ -1152,6 +1385,7 @@ reporting. Commit:
 
 ~~~bash
 git add backend/app/market/shadow_scheduler.py backend/app/market/shadow_jobs.py \
+  backend/app/market/shadow_terminal.py \
   backend/app/market/automation.py \
   backend/app/market/providers/registry.py backend/app/api/market.py backend/app/cli.py \
   tests/test_market_shadow.py tests/test_market_shadow_jobs.py \
@@ -1232,8 +1466,6 @@ no mixed sources, no secret output, zero-network dry-run, no automatic failover,
 status **SPEC READY / IMPLEMENTATION NOT STARTED / R2-F3 CODE NO-GO**. Any High/Medium finding
 requires a new documentation or RED->GREEN fix/review commit. No reviewer may convert the offline
 gate into R2-F3 GO without the real authorized window.
-Any High/Medium finding requires a new RED->GREEN fix/review commit. No reviewer may convert the
-offline gate into R2-F3 GO without the real authorized window.
 
 ## Definition of Done
 
