@@ -1,19 +1,18 @@
 # R2-F2 offline acceptance record
 
 This is the offline code-acceptance record for the reviewed R2-F2 tree. It is
-not provider, production, deployment, or release authorization. The record is
-deliberately evidence-first: the universal suite passed, but the exact focused
-matrix required by the approved plan did not pass in its prescribed order, so
-the required `R2-F2 OFFLINE CODE GO` line is not emitted.
+not provider, production, deployment, or release authorization. The universal
+and exact prescribed focused gates pass at the current code HEAD, so this
+record emits `R2-F2 OFFLINE CODE GO` for offline code only.
 
 ## Reviewed identity and authority
 
-- Exact code under test before this document: `04f9bece240a5d6f90af8b71bb432a96c35889ca` (`fix(market): validate provider universe rows`).
+- Exact code under test: `3fb03a1e29d130d7a82857f309d28cd6c631843f` (`test(transport): isolate pristine upstream characterization`).
 - Approved identity authority: `52039a07d678d4fec19632deeb39bca8b6c159a7`.
 - Independent identity review authority: `69ffb9885eb775acab1734c46ce28b54535bcbf6`.
 - Design validator authority is the design document only; its score is not implementation evidence.
 - Architecture is Option A: one descriptor-bound root transaction and CAS publication. A1 content identity is used for evidence/manifest identity; no alternate publication architecture is enabled.
-- Task 7, Task 8, and Task 9 were independently recorded as High/Medium-zero review GO at the reviewed code baseline. That review status is separate from the exact closure command gate below; the focused-order failure remains visible and blocks a closure GO.
+- Task 7, Task 8, and Task 9 were independently recorded as High/Medium-zero review GO at the reviewed code baseline. The prior focused-order RED is retained below as historical evidence and is closed by the test-only `3fb03a1` change.
 
 ## Commands and exact results
 
@@ -22,29 +21,31 @@ socket, NAS, LaunchAgent, installation, or production operation was performed.
 
 | Gate | Command / base temp | Result |
 | --- | --- | --- |
-| Universal | `uv run --offline --extra dev pytest -q --basetemp=/tmp/stock-eva-r2f2-full-final` | exit `0`; `1677 passed`, `0 failed` |
+| Universal | `uv run --offline --extra dev pytest -q --basetemp=/tmp/stock-eva-r2f2-full-final-rerun` | exit `0`; `1677 passed`, `0 failed`; collect-only total `1677` |
 | Ruff | `uv run --offline --extra dev ruff check backend tests` | exit `0`; `All checks passed!` |
 | Format | `uv run --offline --extra dev ruff format --check backend tests` | exit `0`; `152 files already formatted` |
 | Diff | `git diff --check` | exit `0` |
 | Design-only validator | `uv run --offline python /Users/finlay/.codex/skills/claude-skills--engineering/spec-driven-workflow/scripts/spec_validator.py --file docs/plans/2026-08-21-stock-eva-r2f2-provider-evidence-design.md --strict` | exit `0`; score `100/100`, Grade A, errors `0`, warnings `0`, info `0` |
-| Focused matrix, prescribed order | `uv run --offline --extra dev pytest -q tests/test_market_provider_contract.py tests/test_market_provider_evidence.py tests/test_market_candidate_selection.py tests/test_market_data.py tests/test_market_get_read_only.py tests/test_baostock_transport.py tests/test_baostock_provider.py tests/test_market_reliability.py --basetemp=/tmp/stock-eva-r2f2-acceptance` | exit `1`; `470 passed, 1 failed` of `471` |
-| Focused failing test alone | `uv run --offline --extra dev pytest -q tests/test_baostock_transport.py::test_upstream_send_msg_accepts_partial_send_while_patch_must_use_sendall --basetemp=/tmp/stock-eva-r2f2-acceptance-single` | exit `0`; `1 passed` |
-| Focused matrix, transport/provider first | same eight files, with `test_baostock_transport.py` and `test_baostock_provider.py` first, `--basetemp=/tmp/stock-eva-r2f2-acceptance-reordered` | exit `0`; `471 passed` |
+| Focused matrix, prescribed order | `uv run --offline --extra dev pytest -q tests/test_market_provider_contract.py tests/test_market_provider_evidence.py tests/test_market_candidate_selection.py tests/test_market_data.py tests/test_market_get_read_only.py tests/test_baostock_transport.py tests/test_baostock_provider.py tests/test_market_reliability.py --basetemp=/tmp/stock-eva-r2f2-acceptance-rerun` | exit `0`; `471 passed`, `0 failed` of `471` |
+| Focused collection | same eight files with `--collect-only -q` | exit `0`; `471` |
 
-The prescribed focused failure is
-`tests/test_baostock_transport.py::test_upstream_send_msg_accepts_partial_send_while_patch_must_use_sendall`:
-it expected `connection.send_calls == 1` and observed `0`. The isolated and
-reordered passes demonstrate order-sensitive global test state, but do not
-convert the prescribed focused command into a pass. The initial validator
-attempt used the mistyped non-existent filename
+Historical RED before `3fb03a1`: at code HEAD
+`04f9bece240a5d6f90af8b71bb432a96c35889ca`, the exact prescribed focused order
+was `470 passed, 1 failed`, exit `1`, in
+`test_upstream_send_msg_accepts_partial_send_while_patch_must_use_sendall`
+(`connection.send_calls` was `0`, expected `1`). The test passed alone and the
+matrix passed when transport/provider files ran first, proving order-sensitive
+global state. `3fb03a1` isolates the pristine upstream characterization; the
+same prescribed order now passes `471/471`, exit `0`, as recorded above. The
+initial validator attempt used the mistyped non-existent filename
 `docs/plans/2026-08-21-stock-eva-provider-evidence-design.md` and exited `2`;
 the exact corrected design-only command and result are recorded above.
 
 ## Bounded implementation history
 
-`git log` verified the following authority-to-HEAD sequence. No production file
-or fixture was changed for this acceptance document; the only new file is this
-document.
+`git log` verified the following authority-to-HEAD sequence. For this update
+only this acceptance document changed; `3fb03a1` is the preceding test-only
+focused-gate repair.
 
 ```text
 69ffb98 docs(plan): approve R2-F2 identity contract
@@ -81,14 +82,16 @@ c6f65f0 fix(market): enforce approved candidate plan shape
 04a8df0 fix(market): enforce evidence-derived candidate universe
 5bfafb0 fix(market): move compatibility coverage to read-only routes
 04f9bec fix(market): validate provider universe rows
+78e8615 docs(acceptance): close R2-F2 offline delivery
+3fb03a1 test(transport): isolate pristine upstream characterization
 ```
 
 The historical review record includes the original Task 7/8/9 NO-GO rounds
 and their subsequent bounded repair cycles. Those findings were not hidden:
 identity/cardinality, evidence transaction/replay, factor sidecar, production
 scope, selection lineage, and candidate-plan issues are represented by the
-repair commits above. The remaining closure observation is the focused test
-order coupling described above, not a silently waived gate.
+repair commits above. The former focused test-order coupling is explicitly
+closed by `3fb03a1`; its RED and GREEN evidence remains in this record.
 
 ## Evidence, candidate, and selection proof
 
@@ -127,9 +130,9 @@ records, ordered gate aggregate, one complete candidate, mixed-provider
 rejection, fallback rejection, new-manifest lineage, old-pointer preservation,
 lineage mismatch, semantic gates, selection ordering, public compatibility,
 read-only legacy paths, published factor resolution, and mutually exclusive
-factor sources. The universal suite ran all of these. The focused matrix
-failure is unrelated to these selection assertions but blocks the prescribed
-closure command.
+factor sources. The universal and current focused suites ran all of these. The
+historical focused failure was unrelated to these selection assertions and is
+closed by `3fb03a1`; the current prescribed matrix is green.
 
 The exact 17 mandatory names from the implementation plan are present (not
 replaced by a parameterized surrogate):
@@ -324,20 +327,18 @@ writer, returning to BaoStock-only compatibility mode, and retaining the last
 known legacy canonical pointer; it does not delete evidence, rewrite fixtures,
 or activate a second source.
 
-Known Low limitation: the prescribed focused matrix has order-sensitive global
-transport-test state. Its failing test passes alone and in the transport-first
-ordering, but the approved exact ordering exits 1. This is recorded as a
-closure blocker, not hidden by the reordered result. Existing supplemental
-AKShare-related code is outside the R2-F2 canonical route and is not a second
-provider/failover authorization. The threat boundary remains local typed
-evidence, descriptor-bound storage, and offline fixtures; real credentials,
-provider transport, network/NAS, LaunchAgent and production execution are not
-tested or authorized.
+Known Low boundary: existing supplemental AKShare-related code is outside the
+R2-F2 canonical route and is not a second-provider/failover authorization. The
+former focused transport-ordering limitation was fixed by `3fb03a1` and the
+prescribed order now passes. The threat boundary remains local typed evidence,
+descriptor-bound storage, and offline fixtures; real credentials, provider
+transport, network/NAS, LaunchAgent and production execution are not tested or
+authorized.
 
 `REAL PROVIDER AND PRODUCTION EXECUTION NOT AUTHORIZED`.
 
-`R2-F3`, provider qualification, shadow/second source, failover, and any
-external operation remain disabled and out of scope. Because the prescribed
-focused gate exited 1, `R2-F2 OFFLINE CODE GO` is intentionally not asserted.
-This document records the evidence and the blocking condition; it is not a
-final production verdict and does not start R2-F3.
+`R2-F2 OFFLINE CODE GO` — offline code gates only. `REAL PROVIDER AND
+PRODUCTION EXECUTION NOT AUTHORIZED` remains in force. `R2-F3`, provider
+qualification, shadow/second source, failover, and any external operation
+remain disabled and out of scope. This document does not start R2-F3 or
+authorize external execution.
