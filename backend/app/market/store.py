@@ -2259,11 +2259,26 @@ class MarketStore:
         result: RefreshResult,
         *,
         publish: bool | None = None,
+        publication_lineage: dict[str, object] | None = None,
+        selection: object | None = None,
     ) -> None:
         publish = result.status == "ready" if publish is None else publish
         if publish:
             self._validate_ready_publication(result)
             self._validate_local_publication_bars(bars, result)
+            if publication_lineage is not None:
+                if selection is None:
+                    raise ValueError("canonical publication requires a verified selection")
+                if (
+                    getattr(selection, "evidence_sha256", None)
+                    != publication_lineage.get("evidence_sha256")
+                    or getattr(selection, "candidate_manifest_sha256", None)
+                    != publication_lineage.get("candidate_manifest_sha256")
+                    or getattr(selection, "gate_report_sha256", None)
+                    != publication_lineage.get("gate_report_sha256")
+                    or getattr(selection, "trade_date", None) != result.requested_date
+                ):
+                    raise ValueError("canonical publication lineage does not match selection")
         self._save_refresh(bars, result, publish=publish, capture_published_bars=publish)
 
     def save_external_publication(self, result: RefreshResult) -> None:

@@ -533,18 +533,13 @@ def canonical_refresh_callback(
                         "adapter_version": candidate.adapter_version,
                         "source_schema_version": candidate.source_schema_version,
                     }
-                    if isinstance(store, MarketStore):
-                        # The in-memory/control store has no dataset pointer.  Production
-                        # NasMarketStore takes the lineage and selection below as mandatory.
-                        store.save_refresh(normalized.bars, result, publish=True)
-                    else:
-                        store.save_refresh(
-                            normalized.bars,
-                            result,
-                            publish=True,
-                            publication_lineage=publication_lineage,
-                            selection=selection,
-                        )
+                    store.save_refresh(
+                        normalized.bars,
+                        result,
+                        publish=True,
+                        publication_lineage=publication_lineage,
+                        selection=selection,
+                    )
                     return result
                 finally:
                     evidence.close()
