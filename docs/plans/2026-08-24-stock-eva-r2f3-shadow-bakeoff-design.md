@@ -169,6 +169,15 @@ availability, legality, data quality, or a stable schema. No provider is endorse
   unknown years are unavailable. Attempt/session bundles publish and release their bundle lock
   before one registry exclusive CAS transaction inserts refs and updates/resets the qualification
   window; all history remains queryable.
+- FR-26: A success is eligible for qualification only when one complete transaction proves a
+  readable `ShadowEvidenceManifest`, `ShadowEvidenceAttemptRef` for every exact ordinal,
+  `ShadowCandidateManifest`, successful attempt/session/job refs, and qualification-window hashes.
+  Evidence SHA, candidate SHA, completion/page/count/row/hash and all composite identities MUST
+  agree bidirectionally. Missing, unreadable or mismatched hashes are unavailable and cannot be
+  repaired by nullable columns.
+- FR-27: Failure, skip, unavailable and mismatch reports MUST retain a complete sanitized durable
+  report but have empty page identities/refs/counts/rows and null evidence/candidate hashes; no such
+  outcome is eligible for evidence, candidate or qualification.
 
 ## Non-Functional Requirements
 
@@ -356,6 +365,22 @@ When `ConfirmedCalendarReader` or the recovery scanner runs
 Then it returns unavailable for the unknown year, or attaches/deduplicates the committed bundle
 without changing the qualification window; a failed DB commit leaves the window unchanged.
 
+### AC-17: Complete success graph and all-outcome exclusion (FR-26–FR-27, NFR-3–NFR-6)
+
+Given a successful job with multiple logical requests and a final candidate
+When the qualification transaction validates its evidence, attempt refs, candidate, session, job
+and window
+Then every exact ordinal has one final success with contiguous pages and matching counts/rows/hashes,
+all composite identities and readable objects agree bidirectionally, and non-null evidence/candidate/
+completion hashes are attached at every success boundary. Missing, unreadable or mismatched data
+rolls back the complete transaction and returns unavailable.
+
+Given each of `failure`, `skip`, `unavailable` and `mismatch`
+When the durable attempt/session report is committed
+Then its canonical sanitized JSON contains timing/coverage/retry/rate-limit/failure fields and a
+report hash, but page identities/refs/counts/rows and evidence/candidate hashes are empty/null;
+SQL/model validators reject any attempt to attach evidence, candidate or qualification.
+
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 
 Given missing/corrupt registry, shadow root, job store, canonical descriptor, or candidate bundle
@@ -407,6 +432,13 @@ Then the frozen response model returns an allowlisted `UnavailableReason`, uses 
   transaction while prior reports remain queryable.
 - EC-23: Tushare lacks official HTTPS proof or approved TermsEvidence at client construction;
   `execute` rejects before constructing the HTTP client and performs zero network/write operations.
+- EC-24: A success attempt/session/job/window has a missing, unreadable or mismatched evidence or
+  candidate object/hash; the terminal transaction rolls back and qualification remains unchanged.
+- EC-25: Any failure, skip, unavailable or mismatch report carries page IDs, page refs, rows/counts
+  or evidence/candidate hashes; the durable report is retained but SQL/model validation rejects it.
+- EC-26: A crash before bundle rename, after bundle rename before DB, after an attach insert, or
+  before either CAS leaves no partial qualification; recovery attaches only a committed deterministic
+  bundle or reconciles the already committed row idempotently.
 
 ## API Contracts
 
@@ -561,10 +593,18 @@ ShadowEvidenceAttemptRef:
   # directions against ShadowAttemptReport and ShadowEvidenceManifest
 
 ShadowAttemptReport:
-  report_id, attempt_id, outcome(success|failure|skip|unavailable|mismatch),
-  timing, coverage, request/retry/rate-limit counts, failure_class,
+  report_id, attempt_id, job_id, provider_id, window_id, session_id, logical_request_ordinal,
+  request_id, endpoint_class, outcome(success|failure|skip|unavailable|mismatch), started_at,
+  completed_at, coverage_expected, coverage_observed, request_count, retry_count,
+  rate_limit_count, failure_class, page_identities, page_count, row_count, evidence_refs,
   evidence_sha256(nullable unless success), candidate_sha256(nullable unless success),
   durable_report_ref, report_sha256 (required for every durable outcome; sanitized payload only)
+
+QualificationWindow:
+  provider_id, window_id, window_state(observing|qualified|reset), consecutive_sessions,
+  version_vector_sha256, calendar_generation, calendar_sha256, last_session_report_id,
+  qualification_evidence_sha256(nullable unless qualified),
+  qualification_candidate_sha256(nullable unless qualified), state_version
 
 VersionVector:
   adapter_hash, endpoint_contract_hash, source_schema_hash, normalizer_hash,
@@ -586,7 +626,9 @@ ShadowJob:
   job_id, provider_id, window_id, version_vector_sha256, canonical_manifest_generation,
   canonical_manifest_sha256, trade_date, universe_id,
   state(pending|leased|completed|failed|cancelled|unavailable), lease_owner,
-  lease_expires_at, attempts, state_version, job_sha256
+  lease_expires_at, attempts, successful_evidence_sha256(nullable unless completed),
+  successful_candidate_sha256(nullable unless completed), completion_sha256(nullable unless completed),
+  state_version, job_sha256
 
 ShadowEvidenceManifest:
   evidence_id, provider_id, adapter_version, endpoint_contract_version, trade_date, universe_id,
@@ -616,10 +658,11 @@ ShadowReconciliationReport:
 ShadowSessionReport:
   session_report_id, provider_id, trade_date, universe_id, canonical_attempt_at,
   shadow_started_at, shadow_completed_at, request_count, retry_count, coverage_ratio,
-  quality_verdict, reconciliation_status, failure_class, evidence_sha256, candidate_sha256,
-  report_sha256, window_id
+  quality_verdict, reconciliation_status, failure_class, successful_attempt_id,
+  evidence_id, candidate_id, evidence_sha256, candidate_sha256, report_sha256, window_id
   # evidence_sha256/candidate_sha256 are nullable for failure/skip/unavailable/mismatch; success
-  # requires both plus the report hash, and validators reject the opposite combination
+  # requires both IDs and hashes plus the report hash; validators require readable evidence and
+  # candidate bundles and reject the opposite combination
 ```
 
 ### Storage and migration
@@ -675,6 +718,13 @@ only safe IDs, counts, outcome and failure class while rows live in memory. `Sha
 names the exact request-plan ordinal set and its per-ordinal final successful attempts. Reader
 validates object hashes, schema, row counts, page ordering, completion marker, manifest hash,
 bidirectional page/object refs and final-attempt IDs before returning evidence.
+
+SQL state checks are part of this contract: a success attempt, completed job, successful session or
+qualified window cannot satisfy its CHECKs with nullable evidence/candidate/completion fields. The
+application validator then opens each referenced bundle read-only, recomputes hashes and verifies
+the same hash at attempt, session, job and window levels; missing/unreadable/mismatch is unavailable
+and the transaction is rolled back. Failure-class rows are the only rows allowed to retain null
+evidence/candidate fields.
 
 `ShadowCandidateStore`/`ShadowCandidateReader` publish/read `ShadowQualityReport`, normalized object,
 candidate manifest and one atomic candidate bundle in the same shadow-root safety protocol. A
@@ -766,6 +816,7 @@ mutating the canonical root. Re-enabling requires a new reviewed contract/terms 
 | FR-9, FR-19, H2, NFR-3–NFR-4 | `shadow_evidence.py` successful-attempt-only store/reader and atomic bundle | Task11 final-attempt, crash/cancel/orphan, bounded bytes/hash/dirfd and golden evidence tests |
 | FR-8, FR-11–FR-13, FR-20–FR-21, H3 | `shadow_candidates.py`, `canonical_comparison.py`, quality and descriptor binding | Task12 complete-candidate, golden candidate/selection, snapshot drift/unavailable and no-write tests |
 | FR-14–FR-18, FR-22–FR-23, H4/H8, NFR-1, NFR-7–NFR-14 | durable job outbox, released-lock handoff, scanner, leases, reports, reset transaction | Task13 ordering/crash/lease/CAS/session-vector and golden GET/selection tests |
+| FR-24–FR-27, H2/H8 | complete success graph, all-outcome sanitized reports, exact logical-request closure and qualification transaction | Task11/13 missing/unreadable/hash-mismatch, four outcome exclusion, multi-request/page, full transaction/crash/recovery probes |
 | NFR-3–NFR-6, H7, storage table | hash/CAS/dirfd/root/SQLite contract | storage/concurrency/TOCTOU/read-only fingerprints |
 | M2 | golden R2-F2 manifest/evidence/candidate/selection/GET byte/hash/reader fixtures | named regression in every Task 10–13 focused command and independent review |
 | NFR-9 | compatibility matrix and AC-10 | old manifest/hash/selection/GET byte and semantic regression |

@@ -166,6 +166,8 @@ def test_registry_cas_uses_begin_immediate_update_where_state_version_and_rowcou
 def test_registry_stale_writer_rolls_back_without_state_or_history_loss(tmp_path): ...
 def test_registry_composite_provider_window_job_session_cross_bind_is_rejected(tmp_path): ...
 def test_terms_evidence_provider_hash_review_fk_and_model_sql_roundtrip(tmp_path): ...
+def test_terms_evidence_canonical_bytes_manifest_hash_and_content_hash_are_frozen(tmp_path): ...
+def test_terms_evidence_descriptor_mutation_symlink_size_or_hash_mismatch_is_unavailable(tmp_path): ...
 def test_r2f2_golden_compatibility_is_byte_hash_reader_and_get_stable(tmp_path): ...
 ~~~
 
@@ -285,7 +287,16 @@ CREATE TABLE qualification_window (
   version_vector_sha256 TEXT NOT NULL CHECK (length(version_vector_sha256) = 64),
   calendar_generation TEXT NOT NULL,
   calendar_sha256 TEXT NOT NULL CHECK (length(calendar_sha256) = 64),
+  window_state TEXT NOT NULL CHECK (window_state IN ('observing', 'qualified', 'reset')),
+  last_session_report_id TEXT,
+  qualification_evidence_sha256 TEXT CHECK
+    (qualification_evidence_sha256 IS NULL OR length(qualification_evidence_sha256) = 64),
+  qualification_candidate_sha256 TEXT CHECK
+    (qualification_candidate_sha256 IS NULL OR length(qualification_candidate_sha256) = 64),
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
+  CHECK (window_state <> 'qualified' OR
+    (last_session_report_id IS NOT NULL AND qualification_evidence_sha256 IS NOT NULL AND
+     qualification_candidate_sha256 IS NOT NULL)),
   PRIMARY KEY (provider_id, window_id),
   UNIQUE (provider_id),
   FOREIGN KEY (provider_id) REFERENCES provider_record(provider_id)
@@ -300,6 +311,11 @@ CREATE TABLE shadow_job (
   canonical_manifest_generation TEXT NOT NULL,
   canonical_manifest_sha256 TEXT NOT NULL CHECK (length(canonical_manifest_sha256) = 64),
   version_vector_sha256 TEXT NOT NULL CHECK (length(version_vector_sha256) = 64),
+  successful_evidence_sha256 TEXT CHECK
+    (successful_evidence_sha256 IS NULL OR length(successful_evidence_sha256) = 64),
+  successful_candidate_sha256 TEXT CHECK
+    (successful_candidate_sha256 IS NULL OR length(successful_candidate_sha256) = 64),
+  completion_sha256 TEXT CHECK (completion_sha256 IS NULL OR length(completion_sha256) = 64),
   run_status TEXT NOT NULL CHECK
     (run_status IN ('pending', 'leased', 'completed', 'failed', 'cancelled', 'unavailable')),
   lease_owner TEXT,
@@ -308,37 +324,56 @@ CREATE TABLE shadow_job (
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
   UNIQUE (provider_id, window_id, trade_date, universe_id),
   UNIQUE (job_id, provider_id, window_id),
+  CHECK (run_status NOT IN ('completed') OR
+    (successful_evidence_sha256 IS NOT NULL AND successful_candidate_sha256 IS NOT NULL AND
+     completion_sha256 IS NOT NULL)),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id)
 );
 
 CREATE TABLE shadow_attempt_report (
   attempt_id TEXT PRIMARY KEY,
+  report_id TEXT NOT NULL UNIQUE,
   job_id TEXT NOT NULL,
   provider_id TEXT NOT NULL,
   window_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   request_id TEXT NOT NULL,
   endpoint TEXT NOT NULL,
+  endpoint_class TEXT NOT NULL,
   logical_request_ordinal INTEGER NOT NULL CHECK (logical_request_ordinal >= 0),
   attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
   version_vector_sha256 TEXT NOT NULL CHECK (length(version_vector_sha256) = 64),
   outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'skip', 'unavailable', 'mismatch')),
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL,
+  coverage_expected INTEGER NOT NULL CHECK (coverage_expected >= 0),
+  coverage_observed INTEGER NOT NULL CHECK (coverage_observed >= 0),
+  request_count INTEGER NOT NULL CHECK (request_count >= 0),
+  retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
+  rate_limit_count INTEGER NOT NULL CHECK (rate_limit_count >= 0),
+  failure_class TEXT NOT NULL,
   page_identities_json TEXT NOT NULL,
   page_count INTEGER NOT NULL CHECK (page_count >= 0),
   row_count INTEGER NOT NULL CHECK (row_count >= 0),
   terminal_marker INTEGER NOT NULL CHECK (terminal_marker IN (0, 1)),
   durable_report_ref TEXT NOT NULL,
-  durable_report_sha256 TEXT NOT NULL CHECK (length(durable_report_sha256) = 64),
+  report_sha256 TEXT NOT NULL CHECK (length(report_sha256) = 64),
   evidence_refs_json TEXT NOT NULL,
   evidence_sha256 TEXT CHECK (evidence_sha256 IS NULL OR length(evidence_sha256) = 64),
+  candidate_sha256 TEXT CHECK (candidate_sha256 IS NULL OR length(candidate_sha256) = 64),
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
   CHECK (outcome = 'success' OR
-         (page_count = 0 AND row_count = 0 AND evidence_refs_json = '[]' AND
-          evidence_sha256 IS NULL AND terminal_marker = 0)),
-  CHECK (outcome <> 'success' OR terminal_marker = 1),
+         (page_identities_json = '[]' AND page_count = 0 AND row_count = 0 AND
+          evidence_refs_json = '[]' AND evidence_sha256 IS NULL AND candidate_sha256 IS NULL AND
+          terminal_marker = 0)),
+  CHECK (outcome <> 'success' OR
+         (terminal_marker = 1 AND page_identities_json <> '[]' AND evidence_refs_json <> '[]')),
+  CHECK (outcome <> 'success' OR
+    (evidence_sha256 IS NOT NULL AND candidate_sha256 IS NOT NULL)),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
   UNIQUE (attempt_id),
+  UNIQUE (attempt_id, provider_id, job_id, window_id, session_id),
   UNIQUE (attempt_id, provider_id, job_id, window_id, session_id, logical_request_ordinal),
   UNIQUE (job_id, provider_id, window_id, session_id, logical_request_ordinal, attempt_number)
 );
@@ -349,6 +384,9 @@ CREATE TABLE session_report (
   job_id TEXT NOT NULL,
   window_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
+  successful_attempt_id TEXT,
+  evidence_id TEXT,
+  candidate_id TEXT,
   trade_date TEXT NOT NULL,
   outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'skip', 'unavailable', 'mismatch')),
   calendar_generation TEXT NOT NULL,
@@ -361,9 +399,18 @@ CREATE TABLE session_report (
   report_sha256 TEXT NOT NULL CHECK (length(report_sha256) = 64),
   state_version INTEGER NOT NULL CHECK (state_version >= 0),
   CHECK (outcome = 'success' OR (evidence_sha256 IS NULL AND candidate_sha256 IS NULL)),
+  CHECK (outcome <> 'success' OR
+    (successful_attempt_id IS NOT NULL AND evidence_id IS NOT NULL AND candidate_id IS NOT NULL AND
+     evidence_sha256 IS NOT NULL AND candidate_sha256 IS NOT NULL)),
   UNIQUE (provider_id, window_id, trade_date),
   FOREIGN KEY (provider_id, window_id) REFERENCES qualification_window(provider_id, window_id),
   FOREIGN KEY (job_id, provider_id, window_id) REFERENCES shadow_job(job_id, provider_id, window_id),
+  FOREIGN KEY (successful_attempt_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_attempt_report(attempt_id, provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (evidence_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_evidence_ref(evidence_id, provider_id, job_id, window_id, session_id),
+  FOREIGN KEY (candidate_id, provider_id, job_id, window_id, session_id)
+    REFERENCES shadow_candidate_ref(candidate_id, provider_id, job_id, window_id, session_id),
   UNIQUE (session_report_id, provider_id, job_id, window_id, session_id)
 );
 
@@ -464,6 +511,22 @@ TermsEvidence row, serialize/read it through the descriptor-copy projection, and
 field equality plus the composite `(provider_id, manifest_sha256, review_id)` FK. A discovered row
 round-trips with both terms fields NULL; canary/shadow/qualified serialization rejects either NULL.
 
+The canonical TermsEvidence serialization is frozen as follows. `official_url_allowlist_json` is a
+JSON array of exact URL strings in lexical order; content bytes are the exact bounded object bytes,
+with no newline normalization. The canonical field order is
+`terms_evidence_id,provider_id,official_url_allowlist_json,content_object_relpath,
+content_bytes_sha256,contract_version,as_of_date,reviewer,review_id,approved_intended_use,
+approved_retention,approved_credential_mode,approved_quota_decision`. Encode the object with
+UTF-8, `ensure_ascii=false`, `separators=(",", ":")`, `sort_keys=false`, followed by exactly one
+LF. The manifest preimage is
+`b"stock-eva/r2f3/terms-evidence/v1\\n" + canonical_json_bytes`; its lowercase hex SHA-256 is
+`manifest_sha256`. `content_bytes_sha256` is SHA-256 over the exact content object bytes only.
+Changing URL order/content bytes/version/as-of/reviewer/review/approval or any newline changes the
+manifest; changing provider or review ID cannot reuse the old composite FK. The descriptor reader
+opens the configured object through an ancestor dirfd with `O_NOFOLLOW`, records regular-file
+identity/size before and after, enforces the bounded size, hashes the bytes, then projects the SQL
+row. Any mutation, symlink, size overflow or hash mismatch is unavailable with zero writes.
+
 The following CAS transaction shapes are frozen for implementation (the `?` values are bound,
 never interpolated). Every writer starts with `BEGIN IMMEDIATE`; it commits only when
 `cursor.rowcount == 1`, otherwise it executes `ROLLBACK` and returns stale/unavailable. Reports
@@ -499,6 +562,40 @@ COMMIT;
 
 Task 10 must run two connections with the same starting version: exactly one CAS succeeds, the
 stale writer gets rowcount zero and rolls back, and no partial report/window mutation remains.
+
+Task 13 freezes the terminal transaction as one unit. A successful leased job uses the expected
+`job_state_version` and `window_state_version`; all inserts and both CAS updates must succeed
+before eligibility is true:
+
+```text
+BEGIN IMMEDIATE;
+UPDATE shadow_job SET run_status='completed', successful_evidence_sha256=?,
+  successful_candidate_sha256=?, completion_sha256=?, state_version=state_version+1
+  WHERE job_id=? AND provider_id=? AND window_id=? AND run_status='leased'
+    AND state_version=?;                         -- rowcount == 1
+INSERT INTO shadow_attempt_report (...success report..., evidence_sha256=?, candidate_sha256=?);
+INSERT INTO shadow_evidence_ref (...provider/job/window/session..., completion_sha256=?);
+INSERT INTO shadow_evidence_attempt_ref (...one row for every exact ordinal...);
+INSERT INTO shadow_candidate_ref (...provider/job/window/session/evidence...);
+INSERT INTO session_report (...successful_attempt_id,evidence_id,candidate_id,
+  evidence_sha256,candidate_sha256...);
+UPDATE qualification_window SET window_state=?, consecutive_sessions=?,
+  last_session_report_id=?, qualification_evidence_sha256=?, qualification_candidate_sha256=?,
+  state_version=state_version+1
+  WHERE provider_id=? AND window_id=? AND state_version=?; -- rowcount == 1
+COMMIT;
+```
+
+The failure/skip/unavailable/mismatch terminal transaction uses the same expected versions and
+`BEGIN IMMEDIATE`, inserts the complete sanitized report and session row with all evidence/candidate
+fields null, updates `shadow_job.run_status` to `failed`/`unavailable`, resets the window and
+commits; it contains no evidence/candidate insert. Any exception, missing object, unreadable bundle,
+hash mismatch, FK/CHECK error or CAS rowcount other than one executes `ROLLBACK`. Crash points are
+specified before bundle rename, after bundle rename before DB, after each insert, before each CAS,
+and after DB commit. Recovery scans committed bundles by deterministic job/evidence identity,
+attaches an orphan only through the same idempotent transaction, and reconciles a DB-committed row
+against its bundle; a pre-commit crash leaves the prior job/window version unchanged. Lease recovery
+may move expired `leased` to `pending` under its own CAS, but it cannot qualify a session.
 
 Run GREEN/checks:
 
@@ -555,6 +652,27 @@ through shadow types: a ShadowRequestPlan predicts logical calls, each attempt r
 sanitized counts/IDs, and only final successful source-shaped pages enter ShadowEvidenceManifest.
 This avoids the current global BaoStock constants while preserving their safety semantics.
 
+`ShadowAttemptReport` is a frozen sanitized JSON object, not an arbitrary exception dump. Its
+canonical field order is:
+
+```text
+report_id, attempt_id, job_id, provider_id, window_id, session_id, logical_request_ordinal,
+request_id, endpoint_class, outcome, started_at, completed_at, coverage_expected,
+coverage_observed, request_count, retry_count, rate_limit_count, failure_class,
+page_identities, page_count, row_count, evidence_refs, evidence_sha256, candidate_sha256,
+durable_report_ref, report_sha256
+```
+
+The object is UTF-8 JSON with `ensure_ascii=false`, compact separators, `sort_keys=false`, one LF,
+and no secret/token/raw payload. `report_sha256` is SHA-256 of the domain-separated canonical
+preimage `b"stock-eva/r2f3/shadow-attempt-report/v1\\n" + json_bytes` (the hash field itself is
+excluded from the preimage). The SQL projection must round-trip every field and hash exactly.
+The SQL `endpoint` column is a bounded endpoint identity (never a URL/token) and projects to the
+JSON `endpoint_class`; it is also repeated in `shadow_evidence_attempt_ref` for ordinal binding.
+For success, page/evidence/candidate fields are complete and non-null; for failure/skip/
+unavailable/mismatch, page identities/refs/counts/rows and evidence/candidate hashes are exactly
+empty/null while timing, coverage, retry/rate-limit counts and sanitized failure class remain.
+
 ### RED
 
 Freeze synthetic contract tests first:
@@ -573,6 +691,8 @@ def test_multi_endpoint_partial_and_different_retry_successes_publish_contiguous
 def test_duplicate_missing_or_out_of_order_final_pages_are_unavailable(tmp_path): ...
 def test_one_evidence_binds_multiple_final_attempt_refs_by_ordinal_endpoint_request_and_pages(tmp_path): ...
 def test_failure_skip_unavailable_mismatch_persist_sanitized_report_without_evidence_or_candidate(tmp_path): ...
+def test_failed_attempt_cannot_be_selected_as_final_completion(tmp_path): ...
+def test_completion_rejects_endpoint_request_page_count_row_count_or_hash_mismatch(tmp_path): ...
 def test_shadow_evidence_crash_cancel_and_orphan_are_unreadable(tmp_path): ...
 def test_shadow_evidence_bundle_commit_marker_is_atomic_and_idempotent(tmp_path): ...
 ~~~
@@ -615,6 +735,41 @@ bidirectional: every completion ordinal/page identity must name exactly one obje
 manifest page/object must be named by the completion; otherwise the whole evidence is unavailable.
 The
 CLI plan is:
+
+The executable validator/projection is frozen as this read-only algorithm (all queries are bound
+parameters and run before any candidate write):
+
+```python
+plan = load_plan(job_id)  # exact ordinal set + request_plan_hash
+refs = conn.execute("""
+  SELECT r.logical_request_ordinal, r.attempt_id, r.endpoint, r.request_id,
+         r.page_refs_json, r.page_count, r.row_count,
+         a.outcome, a.page_identities_json, a.evidence_sha256, a.candidate_sha256
+    FROM shadow_evidence_attempt_ref AS r
+    JOIN shadow_attempt_report AS a
+      ON (a.attempt_id, a.provider_id, a.job_id, a.window_id, a.session_id,
+          a.logical_request_ordinal) =
+         (r.attempt_id, r.provider_id, r.job_id, r.window_id, r.session_id,
+          r.logical_request_ordinal)
+   WHERE r.evidence_id=? AND r.provider_id=? AND r.job_id=? AND r.window_id=? AND r.session_id=?
+   ORDER BY r.logical_request_ordinal
+""", identity).fetchall()
+assert {r.ordinal for r in refs} == plan.exact_ordinal_set
+for r in refs:
+    assert r.outcome == "success" and r.endpoint == plan[r.ordinal].endpoint
+    assert r.request_id == plan[r.ordinal].request_id
+    assert page_ids(r.page_refs_json) == contiguous_page_ids(r.page_count)
+    assert page_ids(r.page_refs_json) == page_ids(r.page_identities_json)
+    assert r.row_count == sum(page_rows(r.page_refs_json))
+    assert sha256_objects(r.page_refs_json) == manifest_page_hash(evidence_id, r.ordinal)
+assert bidirectional_manifest_pages(evidence_id, refs)
+assert sha256_completion(plan, refs) == evidence_completion_sha(evidence_id)
+```
+
+The validator rejects a failed attempt selected as final, a missing/duplicate/out-of-order page,
+an endpoint or request-id mismatch, a page count/row count/hash mismatch, an ordinal outside the
+plan, a missing ordinal, or any manifest object not named by the completion. Named tests cover each
+counterexample and prove zero candidate/evidence publication on failure.
 
 ~~~text
 market-provider-canary --provider tickflow|tushare --date YYYY-MM-DD
@@ -690,9 +845,31 @@ version and stops the branch. The canonical pointer remains unchanged.
   DailyBar.source, RefreshResult.source, MarketSummary.source or canonical quality fields.
 - Create tests/test_market_shadow_normalize.py and tests/test_market_reconciliation.py; update
   provider tests only for source-contract assertions.
-- Create tests/test_market_shadow_candidates.py and tests/test_market_canonical_comparison.py,
-- including only read-only comparison tests; the fixed `tests/fixtures/r2f2_golden/**` and
-  `tests/test_r2f2_golden_compat.py` are in this Task 12 whitelist for invocation, never rewrite.
+- Create tests/test_market_shadow_candidates.py and tests/test_market_canonical_comparison.py;
+  these are read-only comparison tests. The fixed `tests/fixtures/r2f2_golden/**` and
+  `tests/test_r2f2_golden_compat.py` are in the Task 12 whitelist for invocation, never rewrite.
+
+Task 12's machine-checkable whitelist is exactly the following path set (fixture prefix is
+read-only and the golden module may only be invoked):
+
+```text
+backend/app/market/shadow_normalize.py
+backend/app/market/shadow_reconciliation.py
+backend/app/market/shadow_candidates.py
+backend/app/market/canonical_comparison.py
+backend/app/market/providers/tickflow.py
+backend/app/market/providers/tushare.py
+backend/app/market/models.py
+tests/test_market_shadow_normalize.py
+tests/test_market_reconciliation.py
+tests/test_market_shadow_candidates.py
+tests/test_market_canonical_comparison.py
+tests/test_r2f2_golden_compat.py                 # invoke named test only
+tests/fixtures/r2f2_golden/**                    # read-only; no serializer writes
+```
+
+No other provider, canonical writer, fixture, selection or evidence path is in the Task 12
+whitelist.
 
 ### RED
 
@@ -817,7 +994,7 @@ git add backend/app/market/shadow_normalize.py \
   tests/test_market_shadow_normalize.py tests/test_market_reconciliation.py \
   tests/test_market_shadow_candidates.py tests/test_market_canonical_comparison.py \
   tests/test_market_provider_tickflow.py tests/test_market_provider_tushare.py \
-  tests/test_r2f2_golden_compat.py tests/fixtures/r2f2_golden/sha256sums.txt \
+  tests/test_r2f2_golden_compat.py tests/fixtures/r2f2_golden/** \
   tests/test_market_provider_contract.py
 git commit -m "feat(market): reconcile complete shadow candidates"
 ~~~
@@ -874,6 +1051,10 @@ def test_gap_failure_or_version_drift_resets_window_in_one_transaction(tmp_path)
 def test_confirmed_calendar_unknown_year_is_unavailable_and_universe_hash_is_durable(tmp_path): ...
 def test_bundle_before_db_crash_scanner_attaches_or_dedupes_without_window_mutation(tmp_path): ...
 def test_shadow_calendar_reader_is_distinct_from_continuity_protocol(tmp_path): ...
+def test_success_terminal_transaction_attaches_all_refs_before_window_eligibility(tmp_path): ...
+def test_failure_terminal_transaction_keeps_report_but_no_evidence_candidate(tmp_path): ...
+def test_crash_before_after_bundle_db_and_orphan_recovery_preserve_versions(tmp_path): ...
+def test_success_missing_unreadable_or_hash_mismatch_rolls_back_job_session_and_window(tmp_path): ...
 ~~~
 
 Run RED:
