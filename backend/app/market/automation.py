@@ -19,7 +19,12 @@ from backend.app.market.baostock import INDEX_SYMBOLS
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
-from backend.app.market.evidence import EvidenceManifest, EvidenceStore, PublishedEvidence
+from backend.app.market.evidence import (
+    EvidenceManifest,
+    EvidenceStore,
+    PublishedEvidence,
+    factor_snapshot_records_from_cache,
+)
 from backend.app.market.failures import (
     MarketFailure,
     legacy_failure_quality_issues,
@@ -68,6 +73,7 @@ def publish_provider_evidence(
     raw_batch,
     *,
     evidence_root: Path,
+    adapter: object | None = None,
 ) -> tuple[EvidenceManifest, PublishedEvidence]:
     """Publish and immediately reopen one validated provider batch.
 
@@ -77,7 +83,73 @@ def publish_provider_evidence(
     """
     store = EvidenceStore(evidence_root)
     manifest = store.publish(raw_batch)
-    return manifest, store.read(manifest.evidence_id)
+    evidence = store.read(manifest.evidence_id)
+    if adapter is not None:
+        normalize = getattr(adapter, "normalize", None)
+        if not callable(normalize):
+            raise ProviderHealthError("typed evidence adapter is required")
+        normalized = normalize(evidence)
+        if not isinstance(normalized, PublishedEvidence):
+            raise ProviderHealthError("evidence adapter returned an invalid type")
+    return manifest, evidence
+
+
+def publish_provider_evidence_with_factor_cache(
+    raw_batch,
+    *,
+    evidence_root: Path,
+    factor_cache,
+    factor_symbols: tuple[str, ...],
+    trade_date: date,
+    lock_path: Path,
+    factor_resolution=(),
+    factor_resolution_factory: Callable[[object], tuple] | None = None,
+    adapter: object | None = None,
+) -> tuple[EvidenceManifest, PublishedEvidence]:
+    """Capture factors and publish evidence under the existing refresh lock only."""
+    with RefreshRunLock(lock_path):
+        capture_id = uuid.uuid4().hex
+        before_rows = factor_cache.exact_snapshot_records(factor_symbols, trade_date)
+        before_fingerprint = hashlib.sha256(
+            json.dumps(before_rows, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        after_rows = factor_cache.exact_snapshot_records(factor_symbols, trade_date)
+        after_fingerprint = hashlib.sha256(
+            json.dumps(after_rows, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        if before_fingerprint != after_fingerprint or before_rows != after_rows:
+            raise ProviderHealthError("factor snapshot changed during evidence capture")
+        records = factor_snapshot_records_from_cache(
+            list(after_rows),
+            before_fingerprint=before_fingerprint,
+            after_fingerprint=after_fingerprint,
+        )
+        factor_store = EvidenceStore(evidence_root)
+        factor_manifest, _factor_descriptor = factor_store.publish_factor_snapshot(
+            records, capture_id=capture_id
+        )
+        binding = factor_resolution or (
+            factor_resolution_factory(factor_manifest)
+            if factor_resolution_factory is not None
+            else getattr(raw_batch, "factor_resolution", ())
+        )
+        if not binding:
+            raise ProviderHealthError("factor resolution binding is required")
+        manifest = factor_store.publish(
+            raw_batch,
+            factor_records=records,
+            capture_id=capture_id,
+            factor_resolution=tuple(binding),
+        )
+        evidence = factor_store.read(manifest.evidence_id)
+        if adapter is not None:
+            normalize = getattr(adapter, "normalize", None)
+            if not callable(normalize):
+                raise ProviderHealthError("typed evidence adapter is required")
+            normalized = normalize(evidence)
+            if not isinstance(normalized, PublishedEvidence):
+                raise ProviderHealthError("evidence adapter returned an invalid type")
+        return manifest, evidence
 
 
 def _log_event(level: int, event: str, **fields) -> None:
