@@ -2209,6 +2209,54 @@ def _rebind_capture_lineage_kind(
     )
 
 
+def _append_operation_projection(raw: ProviderRawBatch, **updates: Any) -> ProviderRawBatch:
+    target = next(
+        item
+        for item in raw.transport_observations.observations
+        if item.protocol_stage is ProtocolStage.OPERATION and item.lineage_kind == "query_root"
+    )
+    values = target.model_dump(mode="python")
+    values.update(updates)
+    values.pop("observation_digest")
+    candidate = TransportObservationProjection.model_construct(
+        **values, observation_digest="0" * 64
+    )
+    values["observation_digest"] = candidate.compute_digest()
+    extra = TransportObservationProjection.model_validate(values)
+    observations = (*raw.transport_observations.observations, extra)
+    return raw.model_copy(
+        update={
+            "transport_observations": TransportObservationAggregate.from_observations(observations)
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"endpoint": ProviderEndpoint.TRADE_DATES},
+        {"plan_ordinal": 1},
+        {"attempt": 2},
+        {"page": 2},
+        {"lineage_kind": "page"},
+    ),
+)
+def test_every_unbound_operation_projection_is_rejected(updates: dict[str, Any]) -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="operation"):
+        _append_operation_projection(raw, **updates)
+
+
+def test_duplicate_operation_digest_is_rejected() -> None:
+    raw = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(_provider_request())
+    with pytest.raises(ValueError, match="operation"):
+        _append_operation_projection(raw)
+
+
 @pytest.mark.parametrize("full_query_identity", (True, False))
 def test_login_capture_identity_cannot_collide_with_query_namespace(
     full_query_identity: bool,

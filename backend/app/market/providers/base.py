@@ -920,6 +920,7 @@ class ProviderRawBatch(_ContractModel):
             raise ValueError("raw endpoint batch cardinality mismatch")
         page_key = tuple[str, str, str, str, int, int, int, int]
         projection_key = tuple[str, str, str, str, int, int, int]
+        expected_operation_index: dict[projection_key, tuple[str, TransportOutcome]] = {}
         capture_identity = tuple[str, str, str]
         query_capture_namespace: set[capture_identity] = set()
         attempt_page_index: dict[page_key, Literal["query_root", "page"]] = {}
@@ -974,6 +975,21 @@ class ProviderRawBatch(_ContractModel):
                     if pkey in attempt_projection_keys:
                         raise ValueError("duplicate authoritative attempt projection key")
                     attempt_projection_keys[pkey] = (key, kind)
+                operation_key = (
+                    self.request.refresh_id,
+                    attempt.provider_session_id,
+                    attempt.root_request_id,
+                    logical.endpoint.value,
+                    completion.plan_ordinal,
+                    attempt.attempt,
+                    1,
+                )
+                if operation_key in expected_operation_index:
+                    raise ValueError("duplicate authoritative operation key")
+                expected_operation_index[operation_key] = (
+                    attempt.operation_observation_digest,
+                    attempt.outcome,
+                )
         expected_pages: dict[page_key, Literal["query_root", "page"]] = {}
         expected_projection_keys: dict[
             projection_key, tuple[page_key, Literal["query_root", "page"]]
@@ -1092,24 +1108,6 @@ class ProviderRawBatch(_ContractModel):
         for completion in self.request_completions:
             batches = batches_by_ordinal.get(completion.plan_ordinal, [])
             logical = self.logical_request_plan.requests[completion.plan_ordinal]
-            for attempt in completion.attempts:
-                operation_matches = tuple(
-                    projection
-                    for projection in self.transport_observations.observations
-                    if projection.observation_digest == attempt.operation_observation_digest
-                    and projection.protocol_stage is ProtocolStage.OPERATION
-                    and projection.request_id == attempt.root_request_id
-                    and projection.endpoint is logical.endpoint
-                    and projection.plan_ordinal == completion.plan_ordinal
-                    and projection.attempt == attempt.attempt
-                    and projection.page == 1
-                    and projection.refresh_id == self.request.refresh_id
-                    and projection.provider_session_id == attempt.provider_session_id
-                    and projection.lineage_kind == "query_root"
-                    and projection.outcome is attempt.outcome
-                )
-                if len(operation_matches) != 1:
-                    raise ValueError("operation digest must resolve one authoritative query root")
             if completion.final_outcome is TransportOutcome.ERROR:
                 if completion.row_count != 0 or batches:
                     raise ValueError("failed completion cannot persist source rows")
@@ -1175,6 +1173,7 @@ class ProviderRawBatch(_ContractModel):
             if key in lineage_index:
                 raise ValueError("duplicate or conflicting transport lineage projection")
             lineage_index[key] = lineage
+        operation_index: dict[projection_key, TransportObservationProjection] = {}
         projection_index: dict[projection_key, TransportObservationProjection] = {}
         capture_families: dict[capture_identity, Literal["login_audit", "query"]] = {}
         for projection in self.transport_observations.observations:
@@ -1195,6 +1194,29 @@ class ProviderRawBatch(_ContractModel):
             if previous_family == "login_audit":
                 raise ValueError("capture identity crosses login and query families")
             capture_families[identity] = "query"
+            if projection.protocol_stage is ProtocolStage.OPERATION:
+                if projection.lineage_kind != "query_root":
+                    raise ValueError("operation projection must use query_root lineage")
+                key = (
+                    projection.refresh_id,
+                    projection.provider_session_id,
+                    projection.request_id,
+                    projection.endpoint.value,
+                    projection.plan_ordinal,
+                    projection.attempt,
+                    projection.page,
+                )
+                expected = expected_operation_index.get(key)
+                if (
+                    expected is None
+                    or projection.observation_digest != expected[0]
+                    or projection.outcome is not expected[1]
+                ):
+                    raise ValueError("operation projection does not bind authoritative attempt")
+                if key in operation_index:
+                    raise ValueError("duplicate or conflicting operation projection")
+                operation_index[key] = projection
+                continue
             key = (
                 projection.refresh_id,
                 projection.provider_session_id,
@@ -1217,6 +1239,8 @@ class ProviderRawBatch(_ContractModel):
                 if key in projection_index:
                     raise ValueError("duplicate or conflicting successful page projection")
                 projection_index[key] = projection
+        if set(operation_index) != set(expected_operation_index):
+            raise ValueError("operation projections do not exactly match attempts")
         if set(lineage_index) != set(expected_pages):
             raise ValueError("transport lineage does not exactly match successful pages")
         if set(batch_lineage_index) != set(expected_pages):
