@@ -385,7 +385,8 @@ Create/modify only:
 - Modify `backend/app/market/factor_cache.py` (strict read-only snapshot API only; no schema migration)
 - Create `backend/app/market/evidence.py`
 - Modify `backend/app/market/providers/baostock.py` (strict `PublishedEvidence` normalization input
-  gate only; no transport, pagination or provider-request changes)
+  gate plus transparent `refresh_operation(refresh_id)` context delegation only; no transport,
+  pagination or provider-request changes)
 - Modify `backend/app/market/automation.py`
 - Modify `backend/app/main.py` (production automation dependency wiring only)
 - Modify `backend/app/cli.py`
@@ -398,8 +399,9 @@ Create/modify only:
 This two-file exception is required to make the already-approved breaking contract enforceable:
 the incumbent adapter used duck typing (`hasattr(read_rows)`) and therefore could accept a mutable
 raw object even when every Task 8 caller was correct.  The adapter change MUST be limited to a
-runtime-safe exact `PublishedEvidence` input check and the corresponding contract tests; it MUST
-NOT change fetch, transport, pagination, endpoint or identity behavior.
+runtime-safe exact `PublishedEvidence` input check, transparent delegation of the existing
+refresh-operation context needed to share one production refresh ID, and the corresponding
+contract tests; it MUST NOT change fetch, transport, pagination, endpoint or identity behavior.
 
 The `main.py`/automation-test exception is similarly bounded: Task 8 cannot replace the production
 canonical seam while the API lifespan still constructs and routes only the legacy normalized
@@ -519,6 +521,12 @@ Required behavior:
   not require a prefetch page total.
   Failed-attempt rows, payloads and page bytes are discarded in memory and never enter staging,
   object, manifest or hash; only sanitized transport observations may survive for audit.
+- Persist the authoritative `ProviderRequest.refresh_id` once on `EvidenceManifest`. Derive
+  `evidence_id` from the canonical typed manifest core (all persisted fields except
+  `evidence_id` and `manifest_sha256`) and verify that derivation on every read. This content
+  identity is the independent anchor for descriptor/completion/transport lineage: coordinated
+  edits plus recomputed inner and outer hashes cannot continue to occupy the original evidence
+  ID/path.
 - Every raw-page descriptor MUST have `capture_id=None`, retain actual `provider_session_id`,
   query-root `root_request_id` and page `page_request_id`, and bind the closed join key
   `(refresh_id, provider_session_id, root_request_id, page_request_id, endpoint, attempt, page)`

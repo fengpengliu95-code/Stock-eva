@@ -1220,6 +1220,7 @@ class EvidenceManifest(BaseModel):
     endpoint_contract_version: Literal["r2f2-endpoints.v1"]
     trade_date: date
     universe_id: SafeIdentifier
+    refresh_id: SafeIdentifier  # authoritative ProviderRequest refresh identity
     requested_at: datetime
     completed_at: datetime
     normalization_clock_utc: datetime
