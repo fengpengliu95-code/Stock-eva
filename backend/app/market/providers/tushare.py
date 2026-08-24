@@ -14,7 +14,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import BoundedHttpClient
+from .http import BoundedHttpClient, CanaryPermissionError, _CanaryPermit
+
+ADAPTER_HASH = "4" * 64
+ENDPOINT_CONTRACT_HASH = "5" * 64
+SOURCE_SCHEMA_HASH = "6" * 64
+OFFICIAL_HTTPS_PROVEN = False
 
 
 class TushareExecutionBlocked(RuntimeError):
@@ -53,6 +58,7 @@ class TushareSourceBatch:
     suspend_d: tuple[dict[str, Any], ...]
     trade_cal: tuple[dict[str, Any], ...]
     index_daily: tuple[dict[str, Any], ...]
+    stock_basic: tuple[dict[str, Any], ...]
     request_count: int
 
 
@@ -97,7 +103,14 @@ def _validate_daily(rows: tuple[dict[str, Any], ...], trade_date: date) -> None:
 
 
 class TushareAdapter:
-    ENDPOINTS = ("daily", "adj_factor", "suspend_d", "trade_cal", "index_daily")
+    ENDPOINTS = (
+        "daily",
+        "adj_factor",
+        "suspend_d",
+        "trade_cal",
+        "index_daily",
+        "stock_basic",
+    )
     _CONTRACTS = {
         "daily": TushareSourceContract(
             endpoint="daily",
@@ -109,6 +122,9 @@ class TushareAdapter:
         "index_daily": TushareSourceContract(
             endpoint="index_daily", units={"vol": "lots", "amount": "thousand_cny"}
         ),
+        "stock_basic": TushareSourceContract(
+            endpoint="stock_basic", units={"list_status": "source"}
+        ),
     }
 
     def __init__(
@@ -116,13 +132,9 @@ class TushareAdapter:
         http_client: BoundedHttpClient | None = None,
         *,
         plan_only: bool = False,
-        terms_approved: bool = False,
-        official_https_proof: bool = False,
     ) -> None:
         self.http = http_client
         self.plan_only = plan_only
-        self.terms_approved = terms_approved
-        self.official_https_proof = official_https_proof
 
     def source_contract(self, endpoint: str) -> TushareSourceContract:
         try:
@@ -133,6 +145,7 @@ class TushareAdapter:
     def plan(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TusharePlan:
         requests = tuple(
             ShadowLogicalRequest(
+                provider_id="tushare",
                 ordinal=ordinal,
                 request_id=f"tushare-{endpoint}-{trade_date.isoformat()}-{ordinal}",
                 endpoint=endpoint,
@@ -153,8 +166,27 @@ class TushareAdapter:
         )
 
     def fetch(
-        self, trade_date: date, *, symbols: tuple[str, ...] = ()
+        self,
+        trade_date: date,
+        *,
+        symbols: tuple[str, ...] = (),
+        permit: _CanaryPermit | None = None,
     ) -> TushareSourceBatch | TusharePlan:
+        if not OFFICIAL_HTTPS_PROVEN:
+            raise CanaryPermissionError("tushare official HTTPS is unproven")
+        if permit is None or permit.provider_id != "tushare":
+            raise CanaryPermissionError("tushare canary permit required")
+        return self._fetch_with_permit(trade_date, symbols=symbols, permit=permit)
+
+    def _fetch_with_permit(
+        self,
+        trade_date: date,
+        *,
+        symbols: tuple[str, ...] = (),
+        permit: _CanaryPermit,
+    ) -> TushareSourceBatch | TusharePlan:
+        if not OFFICIAL_HTTPS_PROVEN:
+            raise CanaryPermissionError("tushare official HTTPS is unproven")
         plan = self.plan(trade_date, symbols=symbols)
         if self.plan_only:
             return plan
@@ -163,7 +195,10 @@ class TushareAdapter:
         params = {"trade_date": trade_date.strftime("%Y%m%d"), "ts_code": ",".join(symbols)}
         payloads = {
             endpoint: self.http.request_json(
-                endpoint, method="POST", json_body={"api_name": endpoint, **params}
+                endpoint,
+                method="POST",
+                json_body={"api_name": endpoint, **params},
+                headers=permit.headers(),
             )
             for endpoint in self.ENDPOINTS
         }
@@ -176,6 +211,7 @@ class TushareAdapter:
             suspend_d=_rows(payloads["suspend_d"]),
             trade_cal=_rows(payloads["trade_cal"]),
             index_daily=_rows(payloads["index_daily"]),
+            stock_basic=_rows(payloads["stock_basic"]),
             request_count=self.http.request_count,
         )
 
@@ -184,18 +220,17 @@ class TushareAdapter:
         trade_date: date,
         *,
         symbols: tuple[str, ...] = (),
-        external_authorization_id: str | None = None,
+        permit: _CanaryPermit | None = None,
     ) -> TushareSourceBatch:
-        # This gate is deliberately before any token/env lookup or HTTP invocation.
-        if not external_authorization_id:
-            raise TushareExecutionBlocked("external authorization is required")
-        if not self.terms_approved:
-            raise TushareExecutionBlocked("terms evidence unavailable")
-        if not self.official_https_proof:
-            raise TushareExecutionBlocked("official HTTPS transport proof unavailable")
-        if self.http is None:
+        # The permit factory has already checked terms, static HTTPS and the closed env map.
+        if not OFFICIAL_HTTPS_PROVEN:
+            raise TushareExecutionBlocked("tushare official HTTPS is unproven")
+        if permit is None or permit.provider_id != "tushare":
+            raise TushareExecutionBlocked("private canary permit required")
+        result = self._fetch_with_permit(trade_date, symbols=symbols, permit=permit)
+        if isinstance(result, TusharePlan):
             raise TushareExecutionBlocked("shadow HTTP client unavailable")
-        return self.fetch(trade_date, symbols=symbols)  # type: ignore[return-value]
+        return result
 
     run = fetch
     TushareProvider = None

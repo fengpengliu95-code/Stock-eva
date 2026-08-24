@@ -8,6 +8,7 @@ from backend.app.market.providers.http import (
     BoundedHttpClient,
     HttpPolicy,
     ProviderHttpError,
+    _CanaryPermit,
 )
 from backend.app.market.providers.tickflow import TickFlowAdapter
 
@@ -44,7 +45,11 @@ def test_tickflow_requests_unadjusted_daily_and_universe_without_inference():
         ]
     )
     adapter = TickFlowAdapter(BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)))
-    result = adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
+    result = adapter.fetch(
+        date(2026, 8, 20),
+        symbols=("sh.600000",),
+        permit=_CanaryPermit("tickflow", "test"),
+    )
     assert result.daily[0]["close"] == 10
     assert result.adjusted is False
     assert [call[1] for call in client.calls] == ["daily", "universe", "indexes"]
@@ -88,3 +93,11 @@ def test_http_or_token_never_enters_exception_or_evidence():
         BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)).request_json("daily")
     assert "secret" not in str(captured.value)
     assert "http" not in str(captured.value).lower()
+
+
+def test_public_tickflow_fetch_is_plan_only_and_never_networks_without_permit():
+    client = FakeClient([])
+    adapter = TickFlowAdapter(BoundedHttpClient(client))
+    with pytest.raises(PermissionError):
+        adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
+    assert client.calls == []

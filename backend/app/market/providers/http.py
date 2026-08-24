@@ -8,6 +8,7 @@ path network-free and makes all transport limits visible in one place.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -65,6 +66,107 @@ class ProviderHttpError(RuntimeError):
         self.request_count = request_count
         # Keep the text deliberately small.  Callers can use the typed fields for audit.
         super().__init__(f"provider request failed: {failure_class}")
+
+
+class CanaryPermissionError(PermissionError):
+    """A provider request was attempted without the private canary capability."""
+
+
+class _CanaryPermit:
+    """Non-serializable, module-private authority passed to one adapter invocation."""
+
+    __slots__ = ("_provider_id", "_authorization_id", "_token")
+
+    def __init__(self, provider_id: str, authorization_id: str, token: str = "") -> None:
+        self._provider_id = provider_id
+        self._authorization_id = authorization_id
+        self._token = token
+
+    @property
+    def provider_id(self) -> str:
+        return self._provider_id
+
+    @property
+    def authorization_id(self) -> str:
+        return self._authorization_id
+
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"} if self._token else {}
+
+    def __repr__(self) -> str:
+        return "<private-canary-permit>"
+
+    def __getstate__(self):
+        raise TypeError("canary permits are not serializable")
+
+    def __reduce__(self):
+        raise TypeError("canary permits are not serializable")
+
+
+def _valid_authorization_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value))
+
+
+def build_canary_permit(
+    provider_id: str,
+    registry: Any,
+    *,
+    external_authorization_id: str,
+    adapter_hash: str,
+    endpoint_contract_hash: str,
+    source_schema_hash: str,
+) -> _CanaryPermit:
+    """Validate the Task10 descriptor before reading the closed credential env map."""
+    from .shadow_contracts import STATIC_PROVIDER_CONTRACTS, exact_credential_env
+
+    if not _valid_authorization_id(external_authorization_id):
+        raise CanaryPermissionError("external authorization is invalid")
+    if provider_id not in STATIC_PROVIDER_CONTRACTS:
+        raise CanaryPermissionError("provider descriptor unavailable")
+    contract = STATIC_PROVIDER_CONTRACTS[provider_id]
+    record = registry.read_status(provider_id)
+    if record.admission_state.value != "canary":
+        raise CanaryPermissionError("provider is not admitted for canary")
+    if (
+        record.adapter_hash != adapter_hash
+        or record.endpoint_contract_hash != endpoint_contract_hash
+        or record.source_schema_hash != source_schema_hash
+        or record.credential_env_name != exact_credential_env(provider_id)
+        or not record.terms_evidence_hash
+        or not record.terms_review_id
+    ):
+        raise CanaryPermissionError("provider descriptor version unavailable")
+    # Resolve the reviewed terms row through the registry's descriptor-bound reader.  The
+    # token is deliberately not read until every static and reviewed decision passes.
+    with registry._lock(shared=True):
+        connection = registry._connection_for_read()
+        try:
+            row = connection.execute(
+                "SELECT terms_evidence_id FROM terms_evidence WHERE provider_id=? "
+                "AND manifest_sha256=? AND review_id=?",
+                (provider_id, record.terms_evidence_hash, record.terms_review_id),
+            ).fetchone()
+        finally:
+            if not getattr(registry, "_memory", False):
+                connection.close()
+    if row is None:
+        raise CanaryPermissionError("reviewed terms evidence unavailable")
+    terms = registry.read_terms_evidence(row[0])
+    if (
+        terms.manifest_sha256 != record.terms_evidence_hash
+        or terms.review_id != record.terms_review_id
+        or terms.approved_credential_mode != "environment-only"
+        or terms.approved_intended_use != record.intended_use
+        or terms.approved_retention != record.retention_decision
+        or not terms.approved_quota_decision
+        or (contract.requires_official_https_proof and not contract.official_https_proven)
+    ):
+        raise CanaryPermissionError("reviewed provider decisions unavailable")
+    env_name = exact_credential_env(provider_id, requested=record.credential_env_name)
+    token = os.environ.get(env_name, "")
+    if not token:
+        raise CanaryPermissionError("provider credential unavailable")
+    return _CanaryPermit(provider_id, external_authorization_id, token)
 
 
 @dataclass(frozen=True)
@@ -178,7 +280,7 @@ class BoundedHttpClient:
                     identity,
                     params=dict(params or {}),
                     json=dict(json_body or {}) if json_body is not None else None,
-                    headers={},  # caller headers are intentionally not echoed/persisted
+                    headers=dict(headers or {}),  # headers are never persisted or echoed
                     timeout=self.policy.timeout,
                 )
             except TimeoutError:

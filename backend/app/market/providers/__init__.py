@@ -46,9 +46,11 @@ from .base import (
 from .http import (
     BoundedHTTPClient,
     BoundedHttpClient,
+    CanaryPermissionError,
     HttpPolicy,
     HttpRequestPolicy,
     ProviderHttpError,
+    build_canary_permit,
 )
 from .tickflow import (
     TickFlowAdapter,
@@ -70,6 +72,8 @@ __all__ = [
     "BaoStockDailyBarAdapter",
     "BaoStockProviderAdapter",
     "BoundedHttpClient",
+    "CanaryPermissionError",
+    "build_canary_permit",
     "BoundedHTTPClient",
     "HttpPolicy",
     "HttpRequestPolicy",

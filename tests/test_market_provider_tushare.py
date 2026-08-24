@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from backend.app.market.providers.http import BoundedHttpClient, HttpPolicy
+from backend.app.market.providers.http import BoundedHttpClient, HttpPolicy, _CanaryPermit
 from backend.app.market.providers.tushare import TushareAdapter, TushareExecutionBlocked
 
 
@@ -37,19 +37,16 @@ def test_tushare_daily_units_are_raw_lots_and_thousand_cny():
     assert daily.normalization_required is True
 
 
-def test_tushare_daily_adj_factor_suspend_calendar_index_calls_share_session():
+def test_tushare_static_https_gate_precedes_fake_http_transport():
     client = FakeClient()
     adapter = TushareAdapter(BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)))
-    result = adapter.fetch(date(2026, 8, 20), symbols=("000001.SZ",))
-    assert result.request_count == 5
-    assert {call[2]["json"]["trade_date"] for call in client.calls} == {"20260820"}
-    assert [call[1] for call in client.calls] == [
-        "daily",
-        "adj_factor",
-        "suspend_d",
-        "trade_cal",
-        "index_daily",
-    ]
+    with pytest.raises(PermissionError):
+        adapter.fetch(
+            date(2026, 8, 20),
+            symbols=("000001.SZ",),
+            permit=_CanaryPermit("tushare", "test"),
+        )
+    assert client.calls == []
 
 
 def test_tushare_execute_rejects_before_http_client_when_https_or_terms_unapproved():
@@ -58,3 +55,8 @@ def test_tushare_execute_rejects_before_http_client_when_https_or_terms_unapprov
     with pytest.raises(TushareExecutionBlocked):
         adapter.execute(date(2026, 8, 20), symbols=("000001.SZ",))
     assert client.calls == []
+
+
+def test_tushare_boolean_authority_flags_are_not_constructor_arguments():
+    with pytest.raises(TypeError):
+        TushareAdapter(terms_approved=True, official_https_proof=True)
