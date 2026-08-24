@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from time import sleep
@@ -75,12 +76,41 @@ class CanaryPermissionError(PermissionError):
 class _CanaryPermit:
     """Non-serializable, module-private authority passed to one adapter invocation."""
 
-    __slots__ = ("_provider_id", "_authorization_id", "_token")
+    __slots__ = (
+        "_provider_id",
+        "_authorization_id",
+        "_token",
+        "_adapter_hash",
+        "_endpoint_contract_hash",
+        "_source_schema_hash",
+        "_terms_review_id",
+        "_seal",
+        "__weakref__",
+    )
 
-    def __init__(self, provider_id: str, authorization_id: str, token: str = "") -> None:
+    def __init__(
+        self,
+        provider_id: str,
+        authorization_id: str,
+        token: str = "",
+        *,
+        _seal: object | None = None,
+        _adapter_hash: str = "",
+        _endpoint_contract_hash: str = "",
+        _source_schema_hash: str = "",
+        _terms_review_id: str = "",
+    ) -> None:
+        if _seal is not _PERMIT_SEAL:
+            raise CanaryPermissionError("canary permit issuer required")
         self._provider_id = provider_id
         self._authorization_id = authorization_id
         self._token = token
+        self._adapter_hash = _adapter_hash
+        self._endpoint_contract_hash = _endpoint_contract_hash
+        self._source_schema_hash = _source_schema_hash
+        self._terms_review_id = _terms_review_id
+        self._seal = _PERMIT_SEAL
+        _ISSUED_PERMITS.add(self)
 
     @property
     def provider_id(self) -> str:
@@ -91,7 +121,9 @@ class _CanaryPermit:
         return self._authorization_id
 
     def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        token = self._token
+        self._token = None
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     def __repr__(self) -> str:
         return "<private-canary-permit>"
@@ -101,6 +133,35 @@ class _CanaryPermit:
 
     def __reduce__(self):
         raise TypeError("canary permits are not serializable")
+
+
+_PERMIT_SEAL = object()
+_ISSUED_PERMITS: weakref.WeakSet[_CanaryPermit] = weakref.WeakSet()
+
+
+def _check_canary_permit(
+    permit: object,
+    *,
+    provider_id: str,
+    adapter_hash: str,
+    endpoint_contract_hash: str,
+    source_schema_hash: str,
+    terms_review_id: str | None = None,
+    authorization_id: str | None = None,
+) -> _CanaryPermit:
+    if type(permit) is not _CanaryPermit or permit not in _ISSUED_PERMITS:
+        raise CanaryPermissionError("canary permit is not issued")
+    if (
+        permit._seal is not _PERMIT_SEAL
+        or permit._provider_id != provider_id
+        or permit._adapter_hash != adapter_hash
+        or permit._endpoint_contract_hash != endpoint_contract_hash
+        or permit._source_schema_hash != source_schema_hash
+        or (terms_review_id is not None and permit._terms_review_id != terms_review_id)
+        or (authorization_id is not None and permit._authorization_id != authorization_id)
+    ):
+        raise CanaryPermissionError("canary permit descriptor mismatch")
+    return permit
 
 
 def _valid_authorization_id(value: str) -> bool:
@@ -166,7 +227,16 @@ def build_canary_permit(
     token = os.environ.get(env_name, "")
     if not token:
         raise CanaryPermissionError("provider credential unavailable")
-    return _CanaryPermit(provider_id, external_authorization_id, token)
+    return _CanaryPermit(
+        provider_id,
+        external_authorization_id,
+        token,
+        _seal=_PERMIT_SEAL,
+        _adapter_hash=adapter_hash,
+        _endpoint_contract_hash=endpoint_contract_hash,
+        _source_schema_hash=source_schema_hash,
+        _terms_review_id=record.terms_review_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -344,19 +414,24 @@ class BoundedHttpClient:
                     attempts=attempts,
                     request_count=self.request_count,
                 )
+            if not content:
+                raise ProviderHttpError(
+                    "malformed_json",
+                    endpoint=identity,
+                    status_code=status,
+                    attempts=attempts,
+                    request_count=self.request_count,
+                )
             try:
-                payload = response.json()
-            except Exception:
-                try:
-                    payload = json.loads(content.decode("utf-8"))
-                except Exception:
-                    raise ProviderHttpError(
-                        "malformed_json",
-                        endpoint=identity,
-                        status_code=status,
-                        attempts=attempts,
-                        request_count=self.request_count,
-                    ) from None
+                payload = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                raise ProviderHttpError(
+                    "malformed_json",
+                    endpoint=identity,
+                    status_code=status,
+                    attempts=attempts,
+                    request_count=self.request_count,
+                ) from None
             if _row_count(payload) > self.policy.max_rows:
                 raise ProviderHttpError(
                     "row_budget_exhausted",

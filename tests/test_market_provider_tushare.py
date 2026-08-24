@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from backend.app.market.providers.http import BoundedHttpClient, HttpPolicy, _CanaryPermit
+from backend.app.market.providers.http import BoundedHttpClient, HttpPolicy
 from backend.app.market.providers.tushare import TushareAdapter, TushareExecutionBlocked
 
 
@@ -41,11 +41,7 @@ def test_tushare_static_https_gate_precedes_fake_http_transport():
     client = FakeClient()
     adapter = TushareAdapter(BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)))
     with pytest.raises(PermissionError):
-        adapter.fetch(
-            date(2026, 8, 20),
-            symbols=("000001.SZ",),
-            permit=_CanaryPermit("tushare", "test"),
-        )
+        adapter.fetch(date(2026, 8, 20), symbols=("000001.SZ",))
     assert client.calls == []
 
 

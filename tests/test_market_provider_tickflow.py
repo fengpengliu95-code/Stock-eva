@@ -1,5 +1,7 @@
 """Offline RED/GREEN contract tests for the TickFlow shadow adapter."""
 
+import copy
+import json
 from datetime import date
 
 import pytest
@@ -17,7 +19,7 @@ class FakeResponse:
     def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
         self.headers = headers or {}
-        self.content = payload if isinstance(payload, bytes) else b"{}"
+        self.content = payload if isinstance(payload, bytes) else json.dumps(payload or {}).encode()
         self._payload = payload if payload is not None else {}
 
     def json(self):
@@ -45,14 +47,9 @@ def test_tickflow_requests_unadjusted_daily_and_universe_without_inference():
         ]
     )
     adapter = TickFlowAdapter(BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)))
-    result = adapter.fetch(
-        date(2026, 8, 20),
-        symbols=("sh.600000",),
-        permit=_CanaryPermit("tickflow", "test"),
-    )
-    assert result.daily[0]["close"] == 10
-    assert result.adjusted is False
-    assert [call[1] for call in client.calls] == ["daily", "universe", "indexes"]
+    with pytest.raises(PermissionError):
+        adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
+    assert client.calls == []
 
 
 def test_tickflow_factor_or_corporate_action_requirement_is_explicit():
@@ -101,3 +98,41 @@ def test_public_tickflow_fetch_is_plan_only_and_never_networks_without_permit():
     with pytest.raises(PermissionError):
         adapter.fetch(date(2026, 8, 20), symbols=("sh.600000",))
     assert client.calls == []
+
+
+def test_unissued_permit_constructor_object_new_and_copy_are_rejected_before_network():
+    client = FakeClient([])
+    adapter = TickFlowAdapter(BoundedHttpClient(client))
+    with pytest.raises(PermissionError):
+        _CanaryPermit("tickflow", "external")
+    forged = object.__new__(_CanaryPermit)
+    with pytest.raises(PermissionError):
+        adapter.fetch(date(2026, 8, 20), permit=forged)
+    with pytest.raises((PermissionError, TypeError)):
+        adapter.fetch(date(2026, 8, 20), permit=copy.copy(forged))
+    assert client.calls == []
+
+
+def test_http_uses_bounded_content_bytes_not_response_json_method():
+    class LyingResponse(FakeResponse):
+        def json(self):
+            return {"token": "secret", "wrong": True}
+
+    client = FakeClient([LyingResponse(payload={"data": [{"ok": True}]})])
+    result = BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)).request_json("daily")
+    assert result == {"data": [{"ok": True}]}
+
+
+def test_http_rejects_empty_content_even_when_json_method_claims_payload():
+    class EmptyContentResponse(FakeResponse):
+        content = b""
+
+        def json(self):
+            return {"data": []}
+
+    response = EmptyContentResponse(payload={"data": []})
+    response.content = b""
+    client = FakeClient([response])
+    with pytest.raises(ProviderHttpError) as captured:
+        BoundedHttpClient(client, policy=HttpPolicy(max_attempts=1)).request_json("daily")
+    assert captured.value.failure_class == "malformed_json"

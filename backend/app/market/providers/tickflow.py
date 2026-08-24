@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..shadow_evidence import ShadowLogicalRequest
-from .http import BoundedHttpClient, CanaryPermissionError, _CanaryPermit
+from .http import BoundedHttpClient, _CanaryPermit, _check_canary_permit
 
 ADAPTER_HASH = "1" * 64
 ENDPOINT_CONTRACT_HASH = "2" * 64
@@ -127,9 +127,14 @@ class TickFlowAdapter:
         symbols: tuple[str, ...] = (),
         permit: _CanaryPermit | None = None,
     ) -> TickFlowSourceBatch | TickFlowPlan:
-        if permit is None or permit.provider_id != "tickflow":
-            raise CanaryPermissionError("tickflow canary permit required")
-        return self._fetch_with_permit(trade_date, symbols=symbols, permit=permit)
+        checked = _check_canary_permit(
+            permit,
+            provider_id="tickflow",
+            adapter_hash=ADAPTER_HASH,
+            endpoint_contract_hash=ENDPOINT_CONTRACT_HASH,
+            source_schema_hash=SOURCE_SCHEMA_HASH,
+        )
+        return self._fetch_with_permit(trade_date, symbols=symbols, permit=checked)
 
     def _fetch_with_permit(
         self,
@@ -143,6 +148,7 @@ class TickFlowAdapter:
             return plan
         if self.http is None:
             raise ValueError("shadow HTTP client is required")
+        headers = permit.headers()
         payloads: dict[str, Any] = {}
         for endpoint in self.ENDPOINTS:
             payloads[endpoint] = self.http.request_json(
@@ -151,7 +157,7 @@ class TickFlowAdapter:
                     "trade_date": trade_date.isoformat(),
                     "symbols": ",".join(symbols),
                 },
-                headers=permit.headers(),
+                headers=headers,
             )
         daily = _rows(payloads["daily"])
         _validate_daily(daily, trade_date)
