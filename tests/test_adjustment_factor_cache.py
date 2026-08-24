@@ -513,3 +513,22 @@ def test_daily_event_rejects_every_non_finite_factor_without_advancing_stream(
 
     assert cache.stream_through() is None
     assert cache.exact_snapshots(["sh.600000"], target) == {}
+
+
+def test_exact_snapshot_records_is_one_read_only_projection(tmp_path: Path) -> None:
+    target = date(2026, 7, 23)
+    cache = AdjustmentFactorCache(tmp_path / "factors.sqlite3")
+    cache.record_bootstrap(
+        "sh.600000",
+        target,
+        FACTOR_FIELDS,
+        [["sh.600000", target.isoformat(), "1", "1", "1"]],
+    )
+    before = (tmp_path / "factors.sqlite3").stat().st_mtime_ns
+    records = cache.exact_snapshot_records(["sh.600000"], target)
+    after = (tmp_path / "factors.sqlite3").stat().st_mtime_ns
+
+    assert len(records) == 1
+    assert records[0]["symbol"] == "sh.600000"
+    assert len(records[0]["row_fingerprint"]) == 64
+    assert before == after

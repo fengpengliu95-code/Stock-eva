@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
+    provider_evidence_root: Path = Path("var/evidence")
+    provider_evidence_enabled: bool = False
+    provider_evidence_max_object_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    provider_evidence_max_manifest_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
+    provider_evidence_max_rows: int = Field(default=10_000_000, ge=1)
+    provider_evidence_contract_version: str = "r2f2-evidence-v1"
     nas_market_dataset_root: Path | None = None
     local_market_dataset_root: Path | None = None
     supplemental_data_dir: Path | None = None
@@ -60,6 +66,34 @@ class Settings(BaseSettings):
     market_repair_max_attempts: int = Field(default=4, ge=1, le=20)
     market_repair_lease_seconds: int = Field(default=1800, ge=60, le=86400)
     market_repair_retry_base_seconds: int = Field(default=3600, ge=900, le=86400)
+
+    @field_validator("provider_evidence_max_object_bytes")
+    @classmethod
+    def validate_evidence_object_bound(cls, value: int) -> int:
+        if value != 64 * 1024 * 1024:
+            raise ValueError("provider evidence object bound is fixed")
+        return value
+
+    @field_validator("provider_evidence_max_manifest_bytes")
+    @classmethod
+    def validate_evidence_manifest_bound(cls, value: int) -> int:
+        if value != 1 * 1024 * 1024:
+            raise ValueError("provider evidence manifest bound is fixed")
+        return value
+
+    @field_validator("provider_evidence_max_rows")
+    @classmethod
+    def validate_evidence_row_bound(cls, value: int) -> int:
+        if value != 10_000_000:
+            raise ValueError("provider evidence row bound is fixed")
+        return value
+
+    @field_validator("provider_evidence_contract_version")
+    @classmethod
+    def validate_evidence_contract_version(cls, value: str) -> str:
+        if value != "r2f2-evidence-v1":
+            raise ValueError("provider evidence contract version is unsupported")
+        return value
 
     @field_validator("user_database_name", "portfolio_database_name")
     @classmethod

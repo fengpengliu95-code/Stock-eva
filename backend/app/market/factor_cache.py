@@ -203,6 +203,76 @@ class AdjustmentFactorCache:
             self._close(connection)
         return {str(symbol): float(factor) for symbol, factor in rows}
 
+    @staticmethod
+    def snapshot_row_fingerprint(row: Sequence[object]) -> str:
+        """Return a stable digest for the exact snapshot projection.
+
+        The helper is deliberately independent of the cache writer.  It hashes
+        only the nine columns exposed by ``exact_snapshot_records`` and uses a
+        canonical JSON representation so an equivalent SQLite value has the
+        same identity across processes.
+        """
+        import json
+
+        if len(row) != 9:
+            raise FactorCacheError("factor snapshot row shape is invalid")
+        payload = json.dumps(
+            list(row), ensure_ascii=False, sort_keys=False, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def exact_snapshot_records(
+        self,
+        symbols: Sequence[str],
+        trade_date: date,
+    ) -> tuple[dict[str, object], ...]:
+        """Read exact factor snapshot rows without initializing or mutating the cache.
+
+        This is intentionally a separate API from ``exact_snapshots``: callers
+        receive the complete current table projection, including provenance,
+        and can fingerprint it before and after an online capture.  The method
+        performs one SELECT and never invokes any cache writer or schema setup.
+        """
+        unique = tuple(sorted(set(str(symbol).lower() for symbol in symbols)))
+        if not unique:
+            return ()
+        placeholders = ",".join("?" for _ in unique)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT symbol, trade_date, fore_adjust_factor, back_adjust_factor,
+                       evidence_kind, evidence_effective_date, evidence_observed_on,
+                       source_row_hash, observed_at
+                FROM factor_snapshots
+                WHERE trade_date = ? AND symbol IN ({placeholders})
+                ORDER BY symbol, trade_date
+                """,
+                [trade_date.isoformat(), *unique],
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise FactorCacheError("factor snapshot read failed") from exc
+        finally:
+            self._close(connection)
+        result: list[dict[str, object]] = []
+        for row in rows:
+            values = tuple(row)
+            result.append(
+                {
+                    "symbol": str(values[0]),
+                    "trade_date": str(values[1]),
+                    "fore_adjust_factor": float(values[2]),
+                    "back_adjust_factor": (None if values[3] is None else float(values[3])),
+                    "evidence_kind": str(values[4]),
+                    "evidence_effective_date": str(values[5]),
+                    "evidence_observed_on": (None if values[6] is None else str(values[6])),
+                    "source_row_hash": str(values[7]),
+                    "observed_at": str(values[8]),
+                    "row_fingerprint": self.snapshot_row_fingerprint(values),
+                }
+            )
+        return tuple(result)
+
     def record_bootstrap(
         self,
         symbol: str,

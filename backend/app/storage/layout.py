@@ -45,6 +45,22 @@ class StorageLayout:
     def provider_health_database(self) -> Path:
         return self.local_paths.provider_health_database
 
+    @property
+    def provider_evidence_root(self) -> Path:
+        return self.settings.provider_evidence_root
+
+    @property
+    def provider_evidence_objects(self) -> Path:
+        return self.provider_evidence_root / "objects"
+
+    @property
+    def provider_evidence_manifests(self) -> Path:
+        return self.provider_evidence_root / "manifests"
+
+    @property
+    def provider_evidence_staging(self) -> Path:
+        return self.provider_evidence_root / "staging"
+
     def ensure_local_runtime_dirs(self) -> None:
         paths = self.local_paths
         for path in (

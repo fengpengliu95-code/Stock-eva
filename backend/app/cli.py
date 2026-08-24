@@ -50,6 +50,7 @@ from backend.app.market.continuity import (
     RepairQueueSnapshot,
     RepairRetryPolicy,
 )
+from backend.app.market.evidence import replay_cli_payload
 from backend.app.market.factor_cache import AdjustmentFactorCache
 from backend.app.market.failures import (
     MarketFailure,
@@ -166,6 +167,18 @@ def _socket_timeout_value(value: str) -> float:
 def _provider_canary_symbol(value: str) -> str:
     if re.fullmatch(r"(?:sh|sz)\.\d{6}", value) is None:
         raise argparse.ArgumentTypeError("provider canary symbol is invalid")
+    return value
+
+
+def _evidence_id(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+        raise argparse.ArgumentTypeError("evidence ID is invalid")
+    return value
+
+
+def _sha256_argument(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("candidate SHA-256 is invalid")
     return value
 
 
@@ -377,6 +390,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=_provider_canary_symbol,
     )
+    replay = subparsers.add_parser(
+        "market-provider-replay",
+        help="replay one local, immutable provider evidence manifest",
+    )
+    replay.add_argument("--evidence-id", required=True, type=_evidence_id)
+    replay.add_argument("--compare-candidate-sha", type=_sha256_argument)
     provider_canary.add_argument(
         "--index-symbol",
         required=True,
@@ -729,6 +748,28 @@ def main() -> int:
         return 2
     if args.command == "market-continuity":
         return _market_continuity_command(args)
+    if args.command == "market-provider-replay":
+        try:
+            payload = replay_cli_payload(
+                get_settings().provider_evidence_root,
+                args.evidence_id,
+                args.compare_candidate_sha,
+            )
+        except Exception:
+            payload = {
+                "status": "unavailable",
+                "evidence_id": args.evidence_id,
+                "candidate_sha256": None,
+                "semantic_hash": None,
+                "byte_match": None,
+                "semantic_match": None,
+                "normalization_clock_utc": None,
+                "row_count": 0,
+                "trade_date": None,
+                "failure_class": "EVIDENCE_ROOT_UNAVAILABLE",
+            }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if payload.get("status") == "ready" else 1
     if args.command == "provider-canary":
         report_arguments = {
             "trade_date": args.trade_date,

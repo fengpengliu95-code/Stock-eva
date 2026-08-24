@@ -22,6 +22,7 @@ from backend.app.main import app
 from backend.app.market.automation import RefreshRunLock
 from backend.app.market.calendar_sync import CalendarSyncStore
 from backend.app.market.continuity import ContinuityStatusSummary, ContinuityUnavailable
+from backend.app.market.evidence import EvidenceReader
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.store import MarketStore, MarketStoreReadError
@@ -64,6 +65,13 @@ def _empty_dataset(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_market_get_missing_provider_evidence_root_is_write_free(tmp_path: Path) -> None:
+    root = tmp_path / "evidence"
+    result = EvidenceReader(root).replay("missing")
+    assert result.status == "unavailable"
+    assert not root.exists()
 
 
 def _bars():

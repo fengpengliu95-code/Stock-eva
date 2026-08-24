@@ -19,6 +19,7 @@ from backend.app.market.baostock import INDEX_SYMBOLS
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
 from backend.app.market.continuity import ContinuityDecision, RepairExecutionResult
+from backend.app.market.evidence import EvidenceManifest, EvidenceStore, PublishedEvidence
 from backend.app.market.failures import (
     MarketFailure,
     legacy_failure_quality_issues,
@@ -61,6 +62,22 @@ _TRANSPORT_ERROR_PRIORITY = {
         )
     )
 }
+
+
+def publish_provider_evidence(
+    raw_batch,
+    *,
+    evidence_root: Path,
+) -> tuple[EvidenceManifest, PublishedEvidence]:
+    """Publish and immediately reopen one validated provider batch.
+
+    The helper is intentionally narrow: it does not fetch, retry, normalize,
+    select or move a canonical pointer.  Callers must already hold the
+    existing ``RefreshRunLock`` and supply only the final-success batch.
+    """
+    store = EvidenceStore(evidence_root)
+    manifest = store.publish(raw_batch)
+    return manifest, store.read(manifest.evidence_id)
 
 
 def _log_event(level: int, event: str, **fields) -> None:
