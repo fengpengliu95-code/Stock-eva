@@ -192,7 +192,8 @@ availability, legality, data quality, or a stable schema. No provider is endorse
 - FR-30: Every terminal-attestation INSERT MUST use the deterministic ShadowRegistry writer
   bootstrap, which registers the allowlisted canonical-JSON UDF and authorizer before migrations.
   The trigger MUST call the UDF for all four canonical preimage blobs; an unregistered raw SQLite
-  write MUST fail closed with `OperationalError`, and reader connections MUST be query-only.
+  write MUST fail closed with `OperationalError`, and reader connections MUST be query-only. All
+  attempt and session reports are append-only: DB UPDATE and DELETE triggers MUST abort.
 
 ## Non-Functional Requirements
 
@@ -425,7 +426,8 @@ rejected; only a `success` report with `report_version >= 2` and terminal attemp
 Given a raw SQLite connection without the frozen UDF or a reader/query-only connection
 When it attempts a terminal attestation INSERT
 Then SQLite fails closed before mutation; the registered ShadowRegistry terminal writer alone can
-insert after the UDF, authorizer, digest and terminal-session gates pass.
+insert after the UDF, authorizer, digest and terminal-session gates pass; UPDATE/DELETE against
+either attempt or session reports is rejected as append-only mutation.
 
 ### AC-16: Frozen API response and zero-write boundary (NFR-14, NFR-15)
 

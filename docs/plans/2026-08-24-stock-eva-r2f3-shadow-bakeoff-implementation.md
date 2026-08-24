@@ -231,7 +231,7 @@ _DOMAINS = {
     "attempt-ordinal-closure": {"exact_ordinal_set", "ordinals"},
     "report-digest": {"session_report_id", "report_version", "reports"},
 }
-_PREFIX = {d: f"stock-eva/r2f3/{d}/v1\\n".encode() for d in _DOMAINS}
+_PREFIX = {d: f"stock-eva/r2f3/{d}/v1\n".encode() for d in _DOMAINS}
 
 def _nfc(value):
     if isinstance(value, str): return unicodedata.normalize("NFC", value)
@@ -247,7 +247,7 @@ def _canonical(domain, raw):
     if not isinstance(obj, dict) or set(obj) != _DOMAINS[domain] or any(v is None for v in obj.values()):
         raise ValueError("wrong field set or nullable success value")
     canonical = (json.dumps(_nfc(obj), ensure_ascii=False, sort_keys=True,
-                            separators=(",", ":")) + "\\n").encode("utf-8")
+                            separators=(",", ":")) + "\n").encode("utf-8")
     if canonical != raw:
         raise ValueError("non-canonical bytes")
     return canonical
@@ -674,6 +674,30 @@ BEGIN
   ) THEN RAISE(ABORT, 'success_requires_terminal_attempt') END;
 END;
 
+CREATE TRIGGER shadow_attempt_report_immutable_update
+BEFORE UPDATE ON shadow_attempt_report
+BEGIN
+  SELECT RAISE(ABORT, 'shadow_attempt_report_append_only');
+END;
+
+CREATE TRIGGER shadow_attempt_report_immutable_delete
+BEFORE DELETE ON shadow_attempt_report
+BEGIN
+  SELECT RAISE(ABORT, 'shadow_attempt_report_append_only');
+END;
+
+CREATE TRIGGER session_report_immutable_update
+BEFORE UPDATE ON session_report
+BEGIN
+  SELECT RAISE(ABORT, 'session_report_append_only');
+END;
+
+CREATE TRIGGER session_report_immutable_delete
+BEFORE DELETE ON session_report
+BEGIN
+  SELECT RAISE(ABORT, 'session_report_append_only');
+END;
+
 CREATE TRIGGER terminal_attestation_gate
 BEFORE INSERT ON shadow_terminal_attestation
 BEGIN
@@ -739,6 +763,9 @@ directions: `job/provider/window/session` in the job, attempt, evidence, attempt
 candidate rows; `evidence_id` and completion/bundle SHA in the evidence refs; and candidate/evidence
 quality hashes in the candidate ref. SQLite enforces the identity FKs/UNIQUEs; the frozen models
 enforce the cross-object SHA and ordinal/page/ref equality before any candidate publication.
+The four append-only triggers reject every UPDATE and DELETE on `shadow_attempt_report` and
+`session_report`, including attempts to mutate an `evidence_ready` row into terminal success. The
+authorizer independently denies those writes for reader/non-terminal-writer roles.
 
 ### Python/SQL round-trip contract (Task 10)
 
@@ -775,7 +802,7 @@ content_bytes_sha256,contract_version,as_of_date,reviewer,review_id,approved_int
 approved_retention,approved_credential_mode,approved_quota_decision`. Encode the object with
 UTF-8, `ensure_ascii=false`, `separators=(",", ":")`, `sort_keys=false`, followed by exactly one
 LF. The manifest preimage is
-`b"stock-eva/r2f3/terms-evidence/v1\\n" + canonical_json_bytes`; its lowercase hex SHA-256 is
+`b"stock-eva/r2f3/terms-evidence/v1\n" + canonical_json_bytes`; its lowercase hex SHA-256 is
 `manifest_sha256`. `content_bytes_sha256` is SHA-256 over the exact content object bytes only.
 Changing URL order/content bytes/version/as-of/reviewer/review/approval or any newline changes the
 manifest; changing provider or review ID cannot reuse the old composite FK. The descriptor reader
@@ -971,7 +998,7 @@ candidate_sha256, terminal_session_report_id, durable_report_ref, report_sha256
 
 The object is UTF-8 JSON with `ensure_ascii=false`, compact separators, `sort_keys=false`, one LF,
 and no secret/token/raw payload. `report_sha256` is SHA-256 of the domain-separated canonical
-preimage `b"stock-eva/r2f3/shadow-attempt-report/v1\\n" + json_bytes` (the hash field itself is
+preimage `b"stock-eva/r2f3/shadow-attempt-report/v1\n" + json_bytes` (the hash field itself is
 excluded from the preimage). The SQL projection must round-trip every field and hash exactly.
 The SQL `endpoint` column is a bounded endpoint identity (never a URL/token) and projects to the
 JSON `endpoint_class`; it is also repeated in `shadow_evidence_attempt_ref` for ordinal binding.
@@ -1007,9 +1034,9 @@ silently omit an ordinal.
 The implementation uses the design's canonical JSON contract exactly: recursively NFC-normalize all
 strings, reject extra/missing keys and `null` in successful objects, encode UTF-8 with
 `ensure_ascii=false`, `sort_keys=true`, compact `(',', ':')` separators and one final LF. The
-preimages are `b"stock-eva/r2f3/request-plan/v1\\n" + plan_json`,
-`b"stock-eva/r2f3/completion/v1\\n" + completion_json`, and
-`b"stock-eva/r2f3/attempt-ordinal-closure/v1\\n" + closure_json`; SHA-256 lowercase hex is
+preimages are `b"stock-eva/r2f3/request-plan/v1\n" + plan_json`,
+`b"stock-eva/r2f3/completion/v1\n" + completion_json`, and
+`b"stock-eva/r2f3/attempt-ordinal-closure/v1\n" + closure_json`; SHA-256 lowercase hex is
 stored. The exact field lists are:
 
 * plan: `job_id,provider_id,window_id,requests[]`; each request:
@@ -1545,6 +1572,8 @@ def test_registered_udf_legal_terminal_transaction_is_executable(tmp_path): ...
 def test_raw_connection_without_terminal_udf_fails_operational_error(tmp_path): ...
 def test_reader_authorizer_and_query_only_reject_terminal_write(tmp_path): ...
 def test_missing_terminal_report_cannot_attach_attestation(tmp_path): ...
+def test_reference_udf_accepts_real_lf_and_rejects_literal_backslash_n(tmp_path): ...
+def test_attempt_and_session_report_update_delete_are_append_only_rejected(tmp_path): ...
 ~~~
 
 Run RED:
