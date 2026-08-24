@@ -91,10 +91,19 @@ class StorageLayout:
         root = self.provider_shadow_root
         if not root.is_absolute():
             raise RegistryUnavailable("shadow root unavailable")
+
+        def physical(path: Path) -> Path:
+            absolute = Path(os.path.abspath(path))
+            if absolute.parts[1:2] == ("tmp",) and Path("/tmp").is_symlink():
+                return Path("/private/tmp", *absolute.parts[2:])
+            if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
+                return Path("/private/var", *absolute.parts[2:])
+            return absolute
+
         canonical = tuple(canonical_roots) + (self.provider_evidence_root,)
-        root_resolved = Path(os.path.abspath(root))
+        root_resolved = physical(root)
         for candidate in canonical:
-            candidate_resolved = Path(os.path.abspath(candidate))
+            candidate_resolved = physical(candidate)
             if root_resolved == candidate_resolved:
                 raise RegistryUnavailable("shadow root overlaps canonical root")
             try:
@@ -107,8 +116,8 @@ class StorageLayout:
                 raise RegistryUnavailable("shadow root overlaps canonical root")
             except ValueError:
                 pass
-        current = Path(root.anchor)
-        for component in root.parts[1:]:
+        current = Path(root_resolved.anchor)
+        for component in root_resolved.parts[1:]:
             current /= component
             try:
                 info = os.lstat(current)
@@ -116,7 +125,7 @@ class StorageLayout:
                 raise RegistryUnavailable("shadow root unavailable") from None
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise RegistryUnavailable("shadow root unavailable")
-        if root.stat().st_mode & 0o002:
+        if root_resolved.stat().st_mode & 0o002:
             raise RegistryUnavailable("shadow root permissions unavailable")
         return root
 

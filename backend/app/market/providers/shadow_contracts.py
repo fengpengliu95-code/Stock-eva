@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 _TOKEN_ENV = {"tickflow": "STOCK_EVA_TICKFLOW_TOKEN", "tushare": "STOCK_EVA_TUSHARE_TOKEN"}
+MAX_TERMS_EVIDENCE_BYTES = 64 * 1024 * 1024
 _PROVIDERS = frozenset(_TOKEN_ENV)
 _TERMS_FIELDS = (
     "terms_evidence_id",
@@ -83,6 +85,8 @@ class TermsEvidence(_Immutable):
 
     @classmethod
     def build(cls, *, content_bytes: bytes, official_url_allowlist: tuple[str, ...], **values: Any):
+        if len(content_bytes) > MAX_TERMS_EVIDENCE_BYTES:
+            raise ValueError("terms evidence object exceeds fixed bound")
         digest = hashlib.sha256(bytes(content_bytes)).hexdigest()
         urls = tuple(sorted(official_url_allowlist))
         provider_id = ShadowProviderId(values.pop("provider_id"))
@@ -154,22 +158,24 @@ class ShadowProviderContract(_Immutable):
     official_https_proven: bool = False
 
 
-STATIC_PROVIDER_CONTRACTS: dict[ShadowProviderId, ShadowProviderContract] = {
-    ShadowProviderId.TICKFLOW: ShadowProviderContract(
-        provider_id=ShadowProviderId.TICKFLOW,
-        credential_env_name=_TOKEN_ENV["tickflow"],
-        endpoint_contract_version="r2f3-tickflow-discovery-v1",
-        source_schema_version="undiscovered",
-        requires_official_https_proof=False,
-    ),
-    ShadowProviderId.TUSHARE: ShadowProviderContract(
-        provider_id=ShadowProviderId.TUSHARE,
-        credential_env_name=_TOKEN_ENV["tushare"],
-        endpoint_contract_version="r2f3-tushare-discovery-v1",
-        source_schema_version="undiscovered",
-        requires_official_https_proof=True,
-    ),
-}
+STATIC_PROVIDER_CONTRACTS = MappingProxyType(
+    {
+        ShadowProviderId.TICKFLOW: ShadowProviderContract(
+            provider_id=ShadowProviderId.TICKFLOW,
+            credential_env_name=_TOKEN_ENV["tickflow"],
+            endpoint_contract_version="r2f3-tickflow-discovery-v1",
+            source_schema_version="undiscovered",
+            requires_official_https_proof=False,
+        ),
+        ShadowProviderId.TUSHARE: ShadowProviderContract(
+            provider_id=ShadowProviderId.TUSHARE,
+            credential_env_name=_TOKEN_ENV["tushare"],
+            endpoint_contract_version="r2f3-tushare-discovery-v1",
+            source_schema_version="undiscovered",
+            requires_official_https_proof=True,
+        ),
+    }
+)
 
 # Names used by the design and by read-only callers; this remains a static map.
 ShadowAdmissionState = AdmissionState
@@ -216,7 +222,6 @@ def make_token(
     provider_record: ShadowProviderRecord,
     terms_evidence: TermsEvidence,
     *,
-    provider_contract: ShadowProviderContract | None = None,
     environ: dict[str, str] | None = None,
 ) -> str:
     """Resolve the exact environment variable only after reviewed admission gates pass."""
@@ -227,11 +232,9 @@ def make_token(
     ):
         raise TermsEvidenceUnavailable("reviewed provider projection unavailable")
     provider_id = provider_record.provider_id.value
-    frozen_contract = STATIC_PROVIDER_CONTRACTS[provider_record.provider_id]
-    contract = provider_contract or frozen_contract
+    contract = STATIC_PROVIDER_CONTRACTS[provider_record.provider_id]
     if (
-        contract != frozen_contract
-        or contract.provider_id != provider_record.provider_id
+        contract.provider_id != provider_record.provider_id
         or provider_record.terms_evidence_hash != terms_evidence.manifest_sha256
         or provider_record.terms_review_id != terms_evidence.review_id
         or terms_evidence.approved_credential_mode != "environment-only"

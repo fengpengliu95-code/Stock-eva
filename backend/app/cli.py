@@ -776,7 +776,30 @@ def main() -> int:
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
-        path = StorageLayout(settings).provider_registry_database
+        layout = StorageLayout(settings)
+        try:
+            layout.validate_provider_shadow_root(
+                canonical_roots=tuple(
+                    root
+                    for root in (
+                        settings.local_market_dataset_root,
+                        settings.nas_market_dataset_root,
+                    )
+                    if root is not None
+                )
+            )
+        except RegistryUnavailable:
+            payload = {
+                "status": "unavailable",
+                "provider": provider,
+                "state": None,
+                "unavailable_reason": "shadow_root_unavailable",
+                "writes": False,
+                "provider_requests": 0,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
+        path = layout.provider_registry_database
         try:
             record = ShadowRegistry(path).read_status(provider)
             payload = {

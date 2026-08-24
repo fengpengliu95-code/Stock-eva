@@ -18,7 +18,8 @@ MAX_CANONICAL_BYTES = 1_048_576
 
 REGISTRY_DDL = r"""
 CREATE TABLE schema_migration (
- migration_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL UNIQUE CHECK(schema_version > 0), applied_at TEXT NOT NULL
+ migration_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL UNIQUE CHECK(schema_version > 0), applied_at TEXT NOT NULL,
+ checksum TEXT NOT NULL CHECK(length(checksum)=64)
 );
 CREATE TABLE terms_evidence (
  terms_evidence_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL CHECK(provider_id IN ('tickflow','tushare')),
@@ -97,6 +98,8 @@ CREATE TRIGGER shadow_attempt_report_immutable_update BEFORE UPDATE ON shadow_at
 CREATE TRIGGER shadow_attempt_report_immutable_delete BEFORE DELETE ON shadow_attempt_report BEGIN SELECT RAISE(ABORT,'shadow_attempt_report_append_only'); END;
 CREATE TRIGGER session_report_immutable_update BEFORE UPDATE ON session_report BEGIN SELECT RAISE(ABORT,'session_report_append_only'); END;
 CREATE TRIGGER session_report_immutable_delete BEFORE DELETE ON session_report BEGIN SELECT RAISE(ABORT,'session_report_append_only'); END;
+CREATE TRIGGER terminal_attestation_immutable_update BEFORE UPDATE ON shadow_terminal_attestation BEGIN SELECT RAISE(ABORT,'terminal_attestation_append_only'); END;
+CREATE TRIGGER terminal_attestation_immutable_delete BEFORE DELETE ON shadow_terminal_attestation BEGIN SELECT RAISE(ABORT,'terminal_attestation_append_only'); END;
 CREATE TRIGGER terminal_attestation_gate BEFORE INSERT ON shadow_terminal_attestation
 BEGIN
  SELECT CASE WHEN shadow_validate_terminal_graph(
@@ -171,6 +174,57 @@ BEGIN
 END;
 """
 
+MIGRATION_0002_DDL = r"""
+CREATE TABLE IF NOT EXISTS review_object (
+ review_object_id TEXT PRIMARY KEY,
+ provider_id TEXT NOT NULL CHECK(provider_id IN ('tickflow','tushare')),
+ terms_evidence_hash TEXT NOT NULL CHECK(length(terms_evidence_hash)=64),
+ adapter_hash TEXT NOT NULL CHECK(length(adapter_hash)=64),
+ version_vector_sha256 TEXT NOT NULL CHECK(length(version_vector_sha256)=64),
+ reviewed_at TEXT NOT NULL,
+ UNIQUE(provider_id, terms_evidence_hash, adapter_hash, version_vector_sha256)
+);
+CREATE TABLE IF NOT EXISTS qualification_session (
+ provider_id TEXT NOT NULL,
+ window_id TEXT NOT NULL,
+ trade_date TEXT NOT NULL,
+ session_report_id TEXT NOT NULL UNIQUE,
+ terminal_attestation_id TEXT NOT NULL UNIQUE,
+ calendar_generation TEXT NOT NULL,
+ calendar_sha256 TEXT NOT NULL CHECK(length(calendar_sha256)=64),
+ PRIMARY KEY(provider_id, window_id, trade_date),
+ FOREIGN KEY(provider_id, window_id) REFERENCES qualification_window(provider_id, window_id)
+);
+CREATE TABLE IF NOT EXISTS quarantine_snapshot (
+ provider_id TEXT PRIMARY KEY,
+ adapter_hash TEXT NOT NULL CHECK(length(adapter_hash)=64),
+ terms_evidence_hash TEXT,
+ version_vector_sha256 TEXT,
+ FOREIGN KEY(provider_id) REFERENCES provider_record(provider_id)
+);
+"""
+
+MIGRATION_SQL = {
+    "r2f3-registry-0001": REGISTRY_DDL,
+    "r2f3-registry-0002": MIGRATION_0002_DDL,
+}
+MIGRATION_CHECKSUMS = {
+    migration_id: hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    for migration_id, sql in MIGRATION_SQL.items()
+}
+
+
+def _execute_script_transactionally(connection: sqlite3.Connection, script: str) -> None:
+    """Execute complete SQLite statements without executescript's implicit COMMIT."""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            connection.execute(pending)
+            pending = ""
+    if pending.strip():
+        raise sqlite3.DatabaseError("incomplete registry migration")
+
 
 def _nfc(value: Any) -> Any:
     if value is None:
@@ -242,14 +296,47 @@ def shadow_validate_terminal_graph(*values: Any) -> int:
 
 
 def initialize_registry(connection: sqlite3.Connection) -> None:
+    if not isinstance(connection, sqlite3.Connection):
+        raise TypeError("registry bootstrap requires an open file SQLite connection")
     connection.execute("PRAGMA foreign_keys=ON")
     try:
         connection.execute("BEGIN IMMEDIATE")
-        connection.executescript(REGISTRY_DDL)
-        connection.executemany(
-            "INSERT INTO schema_migration VALUES (?,?,datetime('now'))",
-            [(migration_id, index) for index, migration_id in enumerate(MIGRATION_IDS, start=1)],
-        )
+        has_migrations = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migration'"
+        ).fetchone()
+        if not has_migrations:
+            _execute_script_transactionally(connection, REGISTRY_DDL)
+            connection.execute(
+                "INSERT INTO schema_migration VALUES (?,?,datetime('now'),?)",
+                (
+                    MIGRATION_IDS[0],
+                    1,
+                    MIGRATION_CHECKSUMS[MIGRATION_IDS[0]],
+                ),
+            )
+        rows = connection.execute(
+            "SELECT migration_id,schema_version,checksum FROM schema_migration ORDER BY schema_version"
+        ).fetchall()
+        if (
+            not rows
+            or rows[0][0] != MIGRATION_IDS[0]
+            or rows[0][2] != MIGRATION_CHECKSUMS[MIGRATION_IDS[0]]
+        ):
+            raise sqlite3.DatabaseError("registry migration checksum mismatch")
+        if len(rows) == 1:
+            for statement in MIGRATION_0002_DDL.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migration VALUES (?,?,datetime('now'),?)",
+                (MIGRATION_IDS[1], 2, MIGRATION_CHECKSUMS[MIGRATION_IDS[1]]),
+            )
+        elif len(rows) != 2 or rows[-1] != (
+            MIGRATION_IDS[1],
+            2,
+            MIGRATION_CHECKSUMS[MIGRATION_IDS[1]],
+        ):
+            raise sqlite3.DatabaseError("registry migration state unavailable")
         connection.commit()
     except sqlite3.DatabaseError:
         connection.rollback()

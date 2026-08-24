@@ -14,6 +14,7 @@ import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -26,6 +27,7 @@ from backend.app.market.shadow_registry_schema import (
 )
 
 from .shadow_contracts import (
+    MAX_TERMS_EVIDENCE_BYTES,
     AdmissionState,
     ShadowProviderId,
     ShadowProviderRecord,
@@ -55,13 +57,11 @@ def make_token(
     provider_record: ShadowProviderRecord,
     terms_evidence: TermsEvidence,
     *,
-    provider_contract=None,
     environ=None,
 ) -> str:
     return _make_token(
         provider_record,
         terms_evidence,
-        provider_contract=provider_contract,
         environ=environ,
     )
 
@@ -70,13 +70,11 @@ def resolve_provider_credential(
     provider_record: ShadowProviderRecord,
     terms_evidence: TermsEvidence,
     *,
-    provider_contract=None,
     environ=None,
 ) -> str:
     return _make_token(
         provider_record,
         terms_evidence,
-        provider_contract=provider_contract,
         environ=environ,
     )
 
@@ -123,7 +121,9 @@ class ShadowRegistryTerminalWriter:
     """The only public writable terminal connection bootstrap."""
 
     @staticmethod
-    def open(path: Path | str) -> sqlite3.Connection:
+    def open(path: Path | str, *, allow_memory: bool = False) -> sqlite3.Connection:
+        if str(path) == ":memory:" and not allow_memory:
+            raise ValueError("registry writer requires an explicit file path")
         connection = sqlite3.connect(str(path))
         connection.create_function(
             "shadow_sha256_canonical_json", 2, shadow_sha256_canonical_json, deterministic=True
@@ -167,11 +167,13 @@ class ShadowRegistry:
 
     def initialize(self) -> None:
         if self._memory:
-            connection = ShadowRegistryTerminalWriter.open(":memory:")
+            connection = ShadowRegistryTerminalWriter.open(":memory:", allow_memory=True)
             initialize_registry(connection)
             connection.close()
             # A memory registry is intentionally used by tests through one connection below.
-            self._memory_connection = ShadowRegistryTerminalWriter.open(":memory:")
+            self._memory_connection = ShadowRegistryTerminalWriter.open(
+                ":memory:", allow_memory=True
+            )
             initialize_registry(self._memory_connection)
             return
         self._validate_existing_ancestors(self.path.parent)
@@ -182,14 +184,19 @@ class ShadowRegistry:
         if self.path.exists() and self.path.stat().st_mode & 0o777 != 0o600:
             raise RegistryUnavailable("registry permissions unavailable")
         if not self.lock_path.exists():
-            self.lock_path.touch(mode=0o600)
+            fd = os.open(
+                self.lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.close(fd)
         os.chmod(self.lock_path, 0o600)
-        connection = self._open_writer()
-        try:
-            if not self._has_schema(connection):
+        with self._lock(shared=False):
+            connection = self._open_writer()
+            try:
                 initialize_registry(connection)
-        finally:
-            connection.close()
+            finally:
+                connection.close()
         os.chmod(self.path, 0o600)
 
     def _has_schema(self, connection: sqlite3.Connection) -> bool:
@@ -247,17 +254,31 @@ class ShadowRegistry:
             if current.exists() and not current.is_dir():
                 raise RegistryUnavailable("registry ancestor unavailable")
 
+    @staticmethod
+    def _trusted_physical_path(path: Path) -> Path:
+        absolute = Path(os.path.abspath(path))
+        if absolute.parts[1:2] == ("tmp",) and Path("/tmp").is_symlink():
+            return Path("/private/tmp", *absolute.parts[2:])
+        if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
+            return Path("/private/var", *absolute.parts[2:])
+        return absolute
+
     def _connection_for_read(self) -> sqlite3.Connection:
         if self._memory:
             return self._memory_connection
-        if self.path.is_symlink() or not self.path.parent.is_dir():
+        physical_path = self._trusted_physical_path(self.path)
+        self._validate_existing_ancestors(physical_path.parent)
+        if physical_path.is_symlink() or not physical_path.parent.is_dir():
             raise RegistryUnavailable("registry unavailable")
-        if self.path.with_name(self.path.name + "-journal").exists():
+        if physical_path.with_name(physical_path.name + "-journal").exists():
             raise RegistryUnavailable("registry journal unavailable")
-        parent_fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        parent_fd = os.open(
+            physical_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
             fd = os.open(
-                self.path.name,
+                physical_path.name,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=parent_fd,
             )
@@ -273,11 +294,20 @@ class ShadowRegistry:
             raise RegistryUnavailable("registry unavailable") from exc
         finally:
             os.close(parent_fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
             after.st_dev,
             after.st_ino,
+            after.st_mode,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ):
             raise RegistryUnavailable("registry changed during read")
         if len(data) > 32 * 1024 * 1024 or not data.startswith(b"SQLite format 3"):
@@ -423,6 +453,20 @@ class ShadowRegistry:
                 raise RegistryUnavailable("stale registry state")
             if state == AdmissionState.QUALIFIED and current.terms_evidence_hash is None:
                 raise ValueError("terms evidence is required")
+            if state is AdmissionState.QUARANTINED:
+                vector = connection.execute(
+                    "SELECT version_vector_sha256 FROM qualification_window WHERE provider_id=?",
+                    (provider_id,),
+                ).fetchone()
+                connection.execute(
+                    "INSERT OR REPLACE INTO quarantine_snapshot VALUES (?,?,?,?)",
+                    (
+                        provider_id,
+                        current.adapter_hash,
+                        current.terms_evidence_hash,
+                        vector[0] if vector else None,
+                    ),
+                )
             cursor = connection.execute(
                 "UPDATE provider_record SET admission_state=?, state_version=state_version+1 WHERE provider_id=? AND state_version=?",
                 (state.value, provider_id, expected_state_version),
@@ -433,10 +477,28 @@ class ShadowRegistry:
 
         return self._with_transaction(update)
 
-    def reopen_quarantined(self, record: ShadowProviderRecord) -> ShadowProviderRecord:
+    def reopen_quarantined(
+        self, record: ShadowProviderRecord, *, version_vector_sha256: str
+    ) -> ShadowProviderRecord:
         current = self.read_status(record.provider_id.value)
         if current.admission_state != AdmissionState.QUARANTINED:
             raise ValueError("provider is not quarantined")
+        with self._lock(shared=True):
+            connection = self._connection_for_read()
+            try:
+                snapshot = connection.execute(
+                    "SELECT adapter_hash,terms_evidence_hash,version_vector_sha256 FROM quarantine_snapshot WHERE provider_id=?",
+                    (record.provider_id.value,),
+                ).fetchone()
+            finally:
+                if not self._memory:
+                    connection.close()
+        if snapshot is None or (
+            record.adapter_hash == snapshot[0]
+            or record.terms_evidence_hash == snapshot[1]
+            or version_vector_sha256 == snapshot[2]
+        ):
+            raise RegistryUnavailable("new reviewed quarantine version required")
         values = record.model_copy(
             update={
                 "state_version": current.state_version,
@@ -462,6 +524,9 @@ class ShadowRegistry:
             )
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale registry state")
+            connection.execute(
+                "DELETE FROM quarantine_snapshot WHERE provider_id=?", (values.provider_id.value,)
+            )
             return self._query_record(connection, values.provider_id.value)
 
         return self._with_transaction(update)
@@ -469,12 +534,13 @@ class ShadowRegistry:
     def put_terms_evidence(self, evidence: TermsEvidence) -> None:
         if not evidence._content_bytes:
             raise TermsEvidenceUnavailable("terms object unavailable")
-        self._validate_existing_ancestors(self.terms_object_root)
-        if not self.terms_object_root.exists():
-            self.terms_object_root.mkdir(parents=True, exist_ok=True)
-        if self.terms_object_root.is_symlink():
+        terms_root = self._trusted_physical_path(self.terms_object_root)
+        self._validate_existing_ancestors(terms_root)
+        if not terms_root.exists():
+            terms_root.mkdir(parents=True, exist_ok=True)
+        if terms_root.is_symlink():
             raise TermsEvidenceUnavailable("terms object root unavailable")
-        target = self.terms_object_root / evidence.content_object_relpath
+        target = terms_root / evidence.content_object_relpath
         self._validate_existing_ancestors(target.parent)
         if not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -506,8 +572,26 @@ class ShadowRegistry:
                 fd = -1
             if fd >= 0:
                 try:
+                    before = os.fstat(fd)
+                    if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o777 != 0o600:
+                        raise TermsEvidenceUnavailable("terms object permissions unavailable")
                     current_bytes = os.read(fd, len(evidence._content_bytes) + 1)
-                    if current_bytes != evidence._content_bytes:
+                    after = os.fstat(fd)
+                    if current_bytes != evidence._content_bytes or (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_mode,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    ) != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mode,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
                         raise TermsEvidenceUnavailable("terms object changed")
                 finally:
                     os.close(fd)
@@ -545,6 +629,7 @@ class ShadowRegistry:
         evidence: TermsEvidence,
         *,
         expected_state_version: int | None = None,
+        expected_window_state_version: int | None = None,
     ) -> ShadowProviderRecord:
         if evidence.provider_id.value != provider_id:
             raise ValueError("terms/provider binding mismatch")
@@ -556,6 +641,14 @@ class ShadowRegistry:
             )
             if current.state_version != expected:
                 raise RegistryUnavailable("stale registry state")
+            window_row = connection.execute(
+                "SELECT state_version FROM qualification_window WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+            if window_row is not None and expected_window_state_version is None:
+                raise RegistryUnavailable("qualification window CAS is required")
+            if window_row is not None and window_row[0] != expected_window_state_version:
+                raise RegistryUnavailable("stale qualification state")
             changed = (current.terms_evidence_hash, current.terms_review_id) != (
                 evidence.manifest_sha256,
                 evidence.review_id,
@@ -566,12 +659,12 @@ class ShadowRegistry:
             )
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale registry state")
-            if changed:
+            if changed and window_row is not None:
                 reset = connection.execute(
-                    "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',state_version=state_version+1 WHERE provider_id=?",
-                    (provider_id,),
+                    "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',state_version=state_version+1 WHERE provider_id=? AND state_version=?",
+                    (provider_id, expected_window_state_version),
                 )
-                if reset.rowcount not in (0, 1):
+                if reset.rowcount != 1:
                     raise RegistryUnavailable("qualification reset unavailable")
             return self._query_record(connection, provider_id)
 
@@ -582,6 +675,7 @@ class ShadowRegistry:
         record: ShadowProviderRecord,
         *,
         expected_state_version: int,
+        expected_window_state_version: int | None = None,
     ) -> ShadowProviderRecord:
         """CAS a reviewed material contract change and reset its window atomically."""
 
@@ -589,6 +683,14 @@ class ShadowRegistry:
             current = self._query_record(connection, record.provider_id.value)
             if current.state_version != expected_state_version:
                 raise RegistryUnavailable("stale registry state")
+            window_row = connection.execute(
+                "SELECT state_version FROM qualification_window WHERE provider_id=?",
+                (record.provider_id.value,),
+            ).fetchone()
+            if window_row is not None and expected_window_state_version is None:
+                raise RegistryUnavailable("qualification window CAS is required")
+            if window_row is not None and window_row[0] != expected_window_state_version:
+                raise RegistryUnavailable("stale qualification state")
             changed = current.model_dump(mode="json")
             proposed = record.model_dump(mode="json")
             changed.pop("state_version", None)
@@ -620,10 +722,10 @@ class ShadowRegistry:
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale registry state")
             reset = connection.execute(
-                "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',state_version=state_version+1 WHERE provider_id=?",
-                (record.provider_id.value,),
+                "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',state_version=state_version+1 WHERE provider_id=? AND state_version=?",
+                (record.provider_id.value, expected_window_state_version),
             )
-            if reset.rowcount not in (0, 1):
+            if reset.rowcount != 1:
                 raise RegistryUnavailable("qualification reset unavailable")
             return self._query_record(connection, record.provider_id.value)
 
@@ -651,6 +753,8 @@ class ShadowRegistry:
         def promote(connection):
             current = self._query_record(connection, provider_id)
             window = self._window(connection, provider_id, window_id)
+            if current.admission_state is not AdmissionState.SHADOW:
+                raise RegistryUnavailable("provider is not shadow-qualified")
             if window.consecutive_sessions != 20:
                 raise RegistryUnavailable("qualification window unavailable")
             attestation = connection.execute(
@@ -667,12 +771,12 @@ class ShadowRegistry:
             if attestation is None:
                 raise RegistryUnavailable("terminal attestation unavailable")
             cursor = connection.execute(
-                "UPDATE provider_record SET admission_state='qualified',state_version=state_version+1 WHERE provider_id=? AND state_version=?",
+                "UPDATE provider_record SET admission_state='qualified',state_version=state_version+1 WHERE provider_id=? AND admission_state='shadow' AND state_version=?",
                 (provider_id, current.state_version),
             )
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale registry state")
-            connection.execute(
+            window_cursor = connection.execute(
                 "UPDATE qualification_window SET window_state='qualified',last_session_report_id=?,qualification_evidence_sha256=?,qualification_candidate_sha256=?,terminal_attestation_id=?,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
                 (
                     session_report_id,
@@ -684,6 +788,8 @@ class ShadowRegistry:
                     window.state_version,
                 ),
             )
+            if window_cursor.rowcount != 1:
+                raise RegistryUnavailable("stale qualification state")
             return self._query_record(connection, provider_id)
 
         return self._with_transaction(promote)
@@ -700,11 +806,17 @@ class ShadowRegistry:
             finally:
                 if not self._memory:
                     connection.close()
-        target = self.terms_object_root / row[3]
+        terms_root = self._trusted_physical_path(self.terms_object_root)
+        target = terms_root / row[3]
         try:
+            self._validate_existing_ancestors(terms_root)
+            self._validate_existing_ancestors(target.parent)
             if target.is_symlink() or not target.parent.is_dir():
                 raise RegistryUnavailable("terms evidence changed")
-            parent_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            parent_fd = os.open(
+                target.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
                 fd = os.open(
                     target.name,
@@ -713,7 +825,7 @@ class ShadowRegistry:
                 )
                 try:
                     before = os.fstat(fd)
-                    content = os.read(fd, 64 * 1024 * 1024 + 1)
+                    content = os.read(fd, MAX_TERMS_EVIDENCE_BYTES + 1)
                     after = os.fstat(fd)
                 finally:
                     os.close(fd)
@@ -721,14 +833,24 @@ class ShadowRegistry:
                 os.close(parent_fd)
             if (
                 not stat.S_ISREG(before.st_mode)
+                or before.st_mode & 0o777 != 0o600
+                or before.st_size > MAX_TERMS_EVIDENCE_BYTES
                 or (
                     before.st_dev,
                     before.st_ino,
+                    before.st_mode,
                     before.st_size,
                     before.st_mtime_ns,
                     before.st_ctime_ns,
                 )
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
                 or hashlib.sha256(content).hexdigest() != row[4]
             ):
                 raise RegistryUnavailable("terms evidence changed")
@@ -817,17 +939,93 @@ class ShadowRegistry:
     def record_session(
         self, provider_id: str, window_id: str, *, success: bool
     ) -> QualificationWindow:
+        raise RegistryUnavailable("session requires verified terminal evidence")
+
+    def record_verified_session(
+        self,
+        provider_id: str,
+        window_id: str,
+        *,
+        trade_date: str,
+        calendar_generation: str,
+        calendar_sha256: str,
+        session_report_id: str,
+        terminal_attestation_id: str,
+        expected_provider_state_version: int,
+        expected_window_state_version: int,
+    ) -> QualificationWindow:
         def update(connection):
+            provider = self._query_record(connection, provider_id)
+            if provider.admission_state is not AdmissionState.SHADOW:
+                raise RegistryUnavailable("provider is not shadow-qualified")
+            if provider.state_version != expected_provider_state_version:
+                raise RegistryUnavailable("stale registry state")
             current = self._window(connection, provider_id, window_id)
-            count = current.consecutive_sessions + 1 if success else 0
-            state = "qualified" if count >= 20 else "observing" if success else "reset"
-            # A real terminal report supplies evidence/candidate/attestation fields; this
-            # lightweight evaluator only records the observation count until that boundary.
-            if state == "qualified":
-                state = "observing"
+            if current.state_version != expected_window_state_version:
+                raise RegistryUnavailable("stale qualification state")
+            try:
+                parsed_date = date.fromisoformat(trade_date)
+            except ValueError as exc:
+                raise RegistryUnavailable("calendar confirmation unavailable") from exc
+            verified = connection.execute(
+                """
+                SELECT s.trade_date,s.calendar_generation,s.calendar_sha256
+                FROM session_report s
+                JOIN shadow_terminal_attestation t
+                  ON t.session_report_id=s.session_report_id
+                 AND t.provider_id=s.provider_id AND t.job_id=s.job_id
+                 AND t.window_id=s.window_id AND t.session_id=s.session_id
+                 AND t.attestation_id=s.terminal_attestation_id
+                WHERE s.session_report_id=? AND s.terminal_attestation_id=?
+                  AND s.provider_id=? AND s.window_id=? AND s.outcome='success'
+                  AND s.trade_date=? AND s.calendar_generation=? AND s.calendar_sha256=?
+                """,
+                (
+                    session_report_id,
+                    terminal_attestation_id,
+                    provider_id,
+                    window_id,
+                    trade_date,
+                    calendar_generation,
+                    calendar_sha256,
+                ),
+            ).fetchone()
+            if verified is None:
+                raise RegistryUnavailable("terminal session unavailable")
+            try:
+                connection.execute(
+                    "INSERT INTO qualification_session VALUES (?,?,?,?,?,?,?)",
+                    (
+                        provider_id,
+                        window_id,
+                        trade_date,
+                        session_report_id,
+                        terminal_attestation_id,
+                        calendar_generation,
+                        calendar_sha256,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RegistryUnavailable("duplicate qualification session") from exc
+            dates = [
+                date.fromisoformat(row[0])
+                for row in connection.execute(
+                    "SELECT trade_date FROM qualification_session WHERE provider_id=? AND window_id=? ORDER BY trade_date DESC",
+                    (provider_id, window_id),
+                ).fetchall()
+            ]
+            count = 0
+            for index, observed in enumerate(dates):
+                if index and dates[index - 1] - observed != timedelta(days=1):
+                    break
+                count += 1
+            # The calendar confirmation graph is the source of truth; this date check
+            # prevents a gap or duplicate from inflating the 20-session window.
+            if count == 0 or dates[0] != parsed_date:
+                raise RegistryUnavailable("calendar sequence unavailable")
             cursor = connection.execute(
                 "UPDATE qualification_window SET consecutive_sessions=?,window_state=?,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
-                (count, state, provider_id, window_id, current.state_version),
+                (min(count, 20), "observing", provider_id, window_id, current.state_version),
             )
             if cursor.rowcount != 1:
                 raise RegistryUnavailable("stale qualification state")
@@ -842,15 +1040,40 @@ class ShadowRegistry:
         version_vector_sha256: str,
         calendar_generation: str,
         calendar_sha256: str,
+        *,
+        expected_provider_state_version: int | None = None,
+        expected_window_state_version: int | None = None,
     ) -> QualificationWindow:
         def update(connection):
+            provider = self._query_record(connection, provider_id)
             current = self._window(connection, provider_id, window_id)
+            expected_provider = (
+                provider.state_version
+                if expected_provider_state_version is None
+                else expected_provider_state_version
+            )
+            expected_window = (
+                current.state_version
+                if expected_window_state_version is None
+                else expected_window_state_version
+            )
+            if (
+                provider.state_version != expected_provider
+                or current.state_version != expected_window
+            ):
+                raise RegistryUnavailable("stale qualification state")
             if (
                 current.version_vector_sha256,
                 current.calendar_generation,
                 current.calendar_sha256,
             ) == (version_vector_sha256, calendar_generation, calendar_sha256):
                 return current
+            provider_cursor = connection.execute(
+                "UPDATE provider_record SET state_version=state_version+1 WHERE provider_id=? AND state_version=?",
+                (provider_id, expected_provider),
+            )
+            if provider_cursor.rowcount != 1:
+                raise RegistryUnavailable("stale registry state")
             cursor = connection.execute(
                 "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',version_vector_sha256=?,calendar_generation=?,calendar_sha256=?,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
                 (
@@ -859,7 +1082,7 @@ class ShadowRegistry:
                     calendar_sha256,
                     provider_id,
                     window_id,
-                    current.state_version,
+                    expected_window,
                 ),
             )
             if cursor.rowcount != 1:
