@@ -387,17 +387,25 @@ Create/modify only:
 - Modify `backend/app/market/providers/baostock.py` (strict `PublishedEvidence` normalization input
   gate only; no transport, pagination or provider-request changes)
 - Modify `backend/app/market/automation.py`
+- Modify `backend/app/main.py` (production automation dependency wiring only)
 - Modify `backend/app/cli.py`
 - Create `tests/test_market_provider_evidence.py`
 - Modify `tests/test_adjustment_factor_cache.py`
 - Modify `tests/test_market_get_read_only.py`
 - Modify `tests/test_market_provider_contract.py` (real adapter rejection/acceptance coverage only)
+- Modify `tests/test_market_automation.py` (production canonical-seam routing coverage only)
 
 This two-file exception is required to make the already-approved breaking contract enforceable:
 the incumbent adapter used duck typing (`hasattr(read_rows)`) and therefore could accept a mutable
 raw object even when every Task 8 caller was correct.  The adapter change MUST be limited to a
 runtime-safe exact `PublishedEvidence` input check and the corresponding contract tests; it MUST
 NOT change fetch, transport, pagination, endpoint or identity behavior.
+
+The `main.py`/automation-test exception is similarly bounded: Task 8 cannot replace the production
+canonical seam while the API lifespan still constructs and routes only the legacy normalized
+provider.  It may wire the approved raw adapter/evidence dependencies and prove the routing change,
+but MUST NOT change scheduler policy, circuit behavior, LaunchAgent cadence, post-publish analysis,
+candidate selection or the canonical pointer chain.
 
 Evidence-specific Pydantic models, factor snapshot serialization and replay projection remain in
 `backend/app/market/evidence.py`; the only factor-cache code allowed here is the strict read-only
@@ -623,9 +631,10 @@ git diff --check
 git add backend/app/config.py backend/app/storage/layout.py backend/app/market/factor_cache.py \
   backend/app/market/evidence.py \
   backend/app/market/providers/baostock.py \
-  backend/app/market/automation.py backend/app/cli.py \
+  backend/app/market/automation.py backend/app/main.py backend/app/cli.py \
   tests/test_market_provider_evidence.py tests/test_adjustment_factor_cache.py \
-  tests/test_market_get_read_only.py tests/test_market_provider_contract.py
+  tests/test_market_get_read_only.py tests/test_market_provider_contract.py \
+  tests/test_market_automation.py
 git commit -m "feat(market): persist replayable provider evidence"
 ```
 
