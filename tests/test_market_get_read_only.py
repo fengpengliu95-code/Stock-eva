@@ -194,6 +194,50 @@ def _api_get(path: str, settings: Settings, *, raise_app_exceptions: bool = True
         app.dependency_overrides.clear()
 
 
+def test_existing_market_analysis_alert_user_and_api_json_remain_compatible(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root)
+    control = _publish_fixture(settings, dataset_root)
+    before_tree = _tree(dataset_root)
+    paths = (
+        "/api/v1/market/summary",
+        f"/api/v1/securities/sh.600000/analysis?start={AS_OF}&end={AS_OF}",
+        "/api/v1/alerts/rules",
+        "/api/v1/alerts/events",
+        "/api/v1/portfolio/positions",
+    )
+    first = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
+    second = [_api_get(path, settings, raise_app_exceptions=False) for path in paths]
+    assert all(response.status_code < 500 for response in first), [
+        (path, response.status_code, response.text)
+        for path, response in zip(paths, first, strict=True)
+    ]
+    assert tuple((item.status_code, item.content) for item in first) == tuple(
+        (item.status_code, item.content) for item in second
+    )
+    assert _tree(dataset_root) == before_tree
+    assert control.is_file()
+
+
+def test_get_reads_and_legacy_manifest_reads_are_write_free(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "dataset"
+    settings = _settings(tmp_path, dataset_root)
+    _empty_dataset(dataset_root)
+    manifest = dataset_root / "manifest.json"
+    original = manifest.read_bytes()
+    before_tree = _tree(dataset_root)
+    store = NasMarketStore(
+        MarketStore(settings.market_data_dir / settings.market_database_name),
+        dataset_root,
+        settings.local_staging_dir,
+    )
+    assert store._manifest()["files"] == []
+    assert manifest.read_bytes() == original
+    assert _tree(dataset_root) == before_tree
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
