@@ -911,19 +911,103 @@ def test_round5_calendar_payload_requires_frozen_authority_wrapper(tmp_path):
     with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
         reader.read("tickflow", "window-1")
 
-    calendar_path.write_text(
-        json.dumps(
+
+def test_round6_calendar_rejects_nested_source_extra_and_duplicate_keys(tmp_path):
+    from backend.app.market.providers.registry import VerifiedConfirmedCalendarReader
+
+    calendar_path = tmp_path / "calendar.json"
+    config = {
+        "year": 2026,
+        "status": "confirmed",
+        "published_on": "2026-01-01",
+        "sources": [
             {
-                "authority_provenance": "reviewed-authority-1",
-                "generation": "generation-1",
-                "configs": [config],
-                "unexpected": True,
-            }
-        ),
+                "exchange": "SSE",
+                "title": "reviewed",
+                "url": "https://example.invalid",
+                "unexpected": "reject",
+            },
+            {"exchange": "SZSE", "title": "reviewed", "url": "https://example.invalid"},
+        ],
+        "closed_dates": [],
+    }
+    payload = {
+        "authority_provenance": "reviewed-authority-1",
+        "generation": "generation-1",
+        "configs": [config],
+    }
+    calendar_path.write_text(json.dumps(payload), encoding="utf-8")
+    reader = VerifiedConfirmedCalendarReader(
+        calendar_path,
+        provider_id="tickflow",
+        window_id="window-1",
+        version_vector_sha256=_sha("vector"),
+        universe_id="universe-1",
+        universe_sha256=_sha("universe"),
+        adapter_hash=_sha("adapter"),
+        endpoint_contract_hash=_sha("endpoint"),
+        source_schema_hash=_sha("schema"),
+        normalizer_hash=_sha("normalizer"),
+        reconciliation_policy_hash=_sha("policy"),
+        calendar_generation="generation-1",
+        authority_provenance="reviewed-authority-1",
+    )
+    with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
+        reader.read("tickflow", "window-1")
+    config["sources"][0].pop("unexpected")
+    calendar_path.write_text(
+        '{"authority_provenance":"reviewed-authority-1",'
+        '"generation":"generation-1","generation":"generation-1",'
+        f'"configs":[{json.dumps(config)}]}}',
         encoding="utf-8",
     )
     with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
         reader.read("tickflow", "window-1")
+
+
+def test_round6_basename_symlink_race_restores_original_inode_and_alias(tmp_path, monkeypatch):
+    import backend.app.market.providers.registry as registry_module
+
+    parent = tmp_path / "shadow"
+    parent.mkdir(mode=0o700)
+    path = parent / "provider_registry.sqlite3"
+    external = tmp_path / "external.sqlite3"
+    external_connection = sqlite3.connect(external)
+    external_connection.execute("CREATE TABLE sentinel (value TEXT)")
+    external_connection.execute("INSERT INTO sentinel VALUES ('untouched')")
+    external_connection.commit()
+    external_connection.close()
+    original_connection = sqlite3.connect(path)
+    original_connection.execute("CREATE TABLE original (value TEXT)")
+    original_connection.commit()
+    original_connection.close()
+    path.chmod(0o600)
+    original_inode = path.stat().st_ino
+    external_bytes = external.read_bytes()
+    real_connect = registry_module.sqlite3.connect
+    swapped = False
+
+    def swap_before_connect(open_path, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(open_path).parent == parent:
+            swapped = True
+            path.unlink()
+            path.symlink_to(external)
+        return real_connect(open_path, **kwargs)
+
+    monkeypatch.setattr(registry_module.sqlite3, "connect", swap_before_connect)
+    with pytest.raises(RegistryUnavailable, match="basename"):
+        ShadowRegistry(path).initialize()
+    assert swapped
+    assert path.is_file() and not path.is_symlink()
+    assert path.stat().st_ino == original_inode
+    restored_connection = sqlite3.connect(path)
+    assert restored_connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='schema_migration'"
+    ).fetchone() == (1,)
+    restored_connection.close()
+    assert external.read_bytes() == external_bytes
+    assert not list(parent.glob(".provider_registry.sqlite3.bound-*"))
 
 
 def test_round4_configured_basename_swap_before_connect_does_not_write_external(

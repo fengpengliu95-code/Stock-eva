@@ -127,6 +127,15 @@ class _ConfirmedCalendarPayload(BaseModel):
     configs: tuple[dict[str, object], ...] = Field(min_length=1)
 
 
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate calendar payload key")
+        result[key] = value
+    return result
+
+
 class VerifiedConfirmedCalendarReader:
     """Descriptor-bound reader for the reviewed confirmed trading calendar."""
 
@@ -252,7 +261,7 @@ class VerifiedConfirmedCalendarReader:
             raise RegistryUnavailable("confirmed calendar snapshot unavailable")
         raw, _fingerprint = self._read_verified()
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
             if not isinstance(payload, dict):
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
             validated = _ConfirmedCalendarPayload.model_validate(payload)
@@ -270,6 +279,34 @@ class VerifiedConfirmedCalendarReader:
             }
             if any(set(config) != expected_config_keys for config in validated.configs):
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            for config in validated.configs:
+                if (
+                    isinstance(config["year"], bool)
+                    or not isinstance(config["year"], int)
+                    or config["status"] != "confirmed"
+                    or not isinstance(config["published_on"], str)
+                    or not isinstance(config["sources"], list)
+                    or not isinstance(config["closed_dates"], list)
+                    or any(not isinstance(item, str) for item in config["closed_dates"])
+                ):
+                    raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+                for source in config["sources"]:
+                    if not isinstance(source, dict) or set(source) not in (
+                        {"exchange", "title", "url"},
+                        {"exchange", "title", "url", "notice_no"},
+                    ):
+                        raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+                    if (
+                        source.get("exchange") not in {"SSE", "SZSE"}
+                        or not isinstance(source.get("title"), str)
+                        or not isinstance(source.get("url"), str)
+                        or (
+                            "notice_no" in source
+                            and source["notice_no"] is not None
+                            and not isinstance(source["notice_no"], str)
+                        )
+                    ):
+                        raise RegistryUnavailable("confirmed calendar snapshot unavailable")
             calendar = TradingCalendar(
                 [CalendarConfig.model_validate(item) for item in validated.configs]
             )
@@ -588,26 +625,40 @@ class ShadowRegistry:
     def _close_bound_writer(bound) -> None:
         config_fd, alias_fd, alias_path, configured_path, before = bound
         safe_to_unlink = False
+        restore_conflict = False
         try:
             current = os.fstat(config_fd)
             if (current.st_dev, current.st_ino, current.st_mode) != (
                 before.st_dev,
                 before.st_ino,
                 before.st_mode,
-            ) or current.st_nlink != 2:
+            ) or current.st_nlink not in (1, 2):
                 raise RegistryUnavailable("registry basename changed")
             alias_info = os.fstat(alias_fd)
             if (alias_info.st_dev, alias_info.st_ino) != (
                 before.st_dev,
                 before.st_ino,
-            ) or alias_info.st_nlink != 2:
+            ) or alias_info.st_nlink not in (1, 2):
                 raise RegistryUnavailable("registry alias changed")
-            configured = os.stat(configured_path, follow_symlinks=False)
-            if not stat.S_ISREG(configured.st_mode) or (configured.st_dev, configured.st_ino) != (
-                before.st_dev,
-                before.st_ino,
+            try:
+                configured = os.stat(configured_path, follow_symlinks=False)
+            except FileNotFoundError:
+                configured = None
+            if (
+                configured is None
+                or stat.S_ISLNK(configured.st_mode)
+                or not stat.S_ISREG(configured.st_mode)
             ):
+                restore_conflict = True
+            elif (configured.st_dev, configured.st_ino) != (before.st_dev, before.st_ino):
                 raise RegistryUnavailable("registry basename changed")
+            if restore_conflict:
+                if alias_info.st_nlink != 1:
+                    raise RegistryUnavailable("registry alias identity unavailable")
+                ShadowRegistry._restore_bound_basename(alias_path, configured_path, before)
+                raise RegistryUnavailable("registry basename changed")
+            if current.st_nlink != 2 or alias_info.st_nlink != 2:
+                raise RegistryUnavailable("registry alias identity unavailable")
             safe_to_unlink = True
         finally:
             os.close(alias_fd)
@@ -627,6 +678,54 @@ class ShadowRegistry:
                     raise RegistryUnavailable("registry alias cleanup unavailable")
             except OSError as exc:
                 raise RegistryUnavailable("registry alias cleanup unavailable") from exc
+
+    @staticmethod
+    def _restore_bound_basename(alias_path: Path, configured_path: Path, before) -> None:
+        parent_fd = os.open(
+            alias_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            try:
+                current = os.stat(
+                    configured_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                current = None
+            if current is not None and not stat.S_ISLNK(current.st_mode):
+                raise RegistryUnavailable("registry foreign basename retained")
+            if current is not None:
+                os.unlink(configured_path.name, dir_fd=parent_fd)
+            os.link(
+                alias_path.name,
+                configured_path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            restored = os.stat(
+                configured_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (restored.st_dev, restored.st_ino) != (before.st_dev, before.st_ino):
+                raise RegistryUnavailable("registry basename restore unavailable")
+            os.fsync(parent_fd)
+            os.unlink(alias_path.name, dir_fd=parent_fd)
+            restored = os.stat(
+                configured_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if restored.st_nlink != 1:
+                raise RegistryUnavailable("registry basename restore unavailable")
+            os.fsync(parent_fd)
+        except (OSError, ValueError) as exc:
+            raise RegistryUnavailable("registry basename restore unavailable") from exc
+        finally:
+            os.close(parent_fd)
 
     def _open_guard_descriptor(self) -> tuple[int, Path, tuple[int, int, int, int]]:
         physical_path = self._trusted_physical_path(self.path)
