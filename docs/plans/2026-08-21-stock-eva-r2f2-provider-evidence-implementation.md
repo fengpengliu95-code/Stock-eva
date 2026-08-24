@@ -383,6 +383,8 @@ Create/modify only:
 - Modify `backend/app/config.py`
 - Modify `backend/app/storage/layout.py`
 - Modify `backend/app/market/factor_cache.py` (strict read-only snapshot API only; no schema migration)
+- Modify `backend/app/market/providers/base.py` (add only the approved
+  `EvidenceObjectKind.FACTOR_RESOLUTION_SNAPSHOT` enum value; no other Task 7 contract change)
 - Create `backend/app/market/evidence.py`
 - Modify `backend/app/market/providers/baostock.py` (strict `PublishedEvidence` normalization input
   gate plus transparent `refresh_operation(refresh_id)` context delegation only; no transport,
@@ -402,6 +404,10 @@ raw object even when every Task 8 caller was correct.  The adapter change MUST b
 runtime-safe exact `PublishedEvidence` input check, transparent delegation of the existing
 refresh-operation context needed to share one production refresh ID, and the corresponding
 contract tests; it MUST NOT change fetch, transport, pagination, endpoint or identity behavior.
+
+The provider-base exception preserves single ownership of `EvidenceObjectKind`. It authorizes
+exactly one additive enum value for the immutable factor-resolution sidecar and no validator,
+identity, pagination, request, completion or transport-contract change.
 
 The `main.py`/automation-test exception is similarly bounded: Task 8 cannot replace the production
 canonical seam while the API lifespan still constructs and routes only the legacy normalized
@@ -648,7 +654,7 @@ git diff --check
 
 ```bash
 git add backend/app/config.py backend/app/storage/layout.py backend/app/market/factor_cache.py \
-  backend/app/market/evidence.py \
+  backend/app/market/providers/base.py backend/app/market/evidence.py \
   backend/app/market/providers/baostock.py \
   backend/app/market/automation.py backend/app/main.py backend/app/cli.py \
   tests/test_market_provider_evidence.py tests/test_adjustment_factor_cache.py \
