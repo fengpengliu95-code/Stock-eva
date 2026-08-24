@@ -257,7 +257,26 @@ def _minimal_owned_tree(tmp_path):
     entry = staging / "owned"
     pages = entry / "pages"
     pages.mkdir(parents=True)
-    for name in ("OWNER", "COMMIT", "manifest.json"):
+    staging.chmod(0o700)
+    entry.chmod(0o700)
+    (entry / "OWNER").write_text(
+        json.dumps(
+            {
+                "nonce": "owned",
+                "evidence_id": "evidence-1",
+                "job_id": "job-1",
+                "provider_id": "tickflow",
+                "window_id": "window-1",
+                "session_id": "session-1",
+                "plan_sha256": "0" * 64,
+                "completion_sha256": "1" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    for name in ("COMMIT", "manifest.json"):
         (entry / name).write_bytes(b"owned")
     (pages / "page.json").write_bytes(b"page")
     parent_fd = os.open(staging, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -316,6 +335,94 @@ def test_orphan_cleanup_never_deletes_foreign_parent_replacement(tmp_path):
         os.close(parent_fd)
     assert entry.exists()
     assert displaced.exists()
+
+
+def test_orphan_cleanup_keeps_fixed_tombstone_and_is_idempotent(tmp_path):
+    staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
+    try:
+        assert not shadow_module._remove_owned_tree(
+            parent_fd,
+            entry_fd,
+            "owned",
+            expected,
+            allowed_page_names={"page.json"},
+        )
+        assert sorted(path.name for path in (staging / "owned").iterdir()) == ["CLEANED_RESIDUAL"]
+        marker_bytes = (staging / "owned" / "CLEANED_RESIDUAL").read_bytes()
+        assert len(marker_bytes) < 256
+        assert json.loads(marker_bytes) == {
+            "evidence_id": "evidence-1",
+            "nonce": "owned",
+            "status": "CLEANED_RESIDUAL",
+        }
+        assert not shadow_module._remove_owned_tree(
+            parent_fd,
+            entry_fd,
+            "owned",
+            expected,
+            allowed_page_names=set(),
+        )
+        assert (staging / "owned" / "CLEANED_RESIDUAL").read_bytes() == marker_bytes
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+
+
+def test_recovery_skips_cleaned_tombstone_without_growth(tmp_path):
+    staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
+    try:
+        shadow_module._remove_owned_tree(
+            parent_fd,
+            entry_fd,
+            "owned",
+            expected,
+            allowed_page_names={"page.json"},
+        )
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+    store = ShadowEvidenceStore(tmp_path)
+    marker = (staging / "owned" / "CLEANED_RESIDUAL").read_bytes()
+    first = store.recover_orphans()
+    second = store.recover_orphans()
+    assert first.contents_cleaned is True
+    assert first.residual_directory is True
+    assert second.contents_cleaned is True
+    assert (staging / "owned" / "CLEANED_RESIDUAL").read_bytes() == marker
+    assert sorted(path.name for path in (staging / "owned").iterdir()) == ["CLEANED_RESIDUAL"]
+
+
+def test_orphan_cleanup_final_foreign_race_leaves_foreign_and_displaced(tmp_path, monkeypatch):
+    staging, parent_fd, entry_fd, expected = _minimal_owned_tree(tmp_path)
+    entry = staging / "owned"
+    displaced = staging / "displaced"
+    original_stat = shadow_module.os.stat
+    calls = 0
+
+    def race_stat(path, *args, **kwargs):
+        nonlocal calls
+        if path == "owned" and kwargs.get("dir_fd") == parent_fd:
+            calls += 1
+            if calls == 2:
+                os.rename(entry, displaced)
+                entry.mkdir()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(shadow_module.os, "stat", race_stat)
+    try:
+        assert shadow_module._remove_owned_tree(
+            parent_fd,
+            entry_fd,
+            "owned",
+            expected,
+            allowed_page_names={"page.json"},
+        )
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+    assert entry.exists()
+    assert displaced.exists()
+    assert not any(entry.iterdir())
 
 
 def test_reader_rejects_hardlinks_extra_files_and_mutation(tmp_path):
