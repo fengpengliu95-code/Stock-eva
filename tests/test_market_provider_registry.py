@@ -735,11 +735,146 @@ def test_round3_legacy_0001_without_checksum_is_upgraded_before_checksum_select(
     upgraded.close()
 
 
+def test_round4_legacy_schema_fingerprint_rejects_arbitrary_ddl(tmp_path):
+    """A missing checksum is only repairable for the frozen historical schema."""
+    from backend.app.market.providers.registry import ShadowRegistryTerminalWriter
+
+    path = tmp_path / "provider_registry.sqlite3"
+    legacy_ddl = REGISTRY_DDL.replace(",\n checksum TEXT NOT NULL CHECK(length(checksum)=64)", "")
+    # This is deliberately a plausible registry with an unreviewed extra index.
+    legacy_ddl += "\nCREATE INDEX unreviewed_ddl ON provider_record(provider_id);\n"
+    connection = ShadowRegistryTerminalWriter.open(path)
+    connection.executescript(legacy_ddl)
+    connection.execute(
+        "INSERT INTO schema_migration VALUES (?,?,datetime('now'))",
+        ("r2f3-registry-0001", 1),
+    )
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with pytest.raises(RegistryUnavailable, match="migration"):
+        ShadowRegistry(path).initialize()
+    check = sqlite3.connect(path)
+    assert check.execute(
+        "SELECT migration_id FROM schema_migration ORDER BY schema_version"
+    ).fetchall() == [("r2f3-registry-0001",)]
+    check.close()
+
+
+def test_round4_terminal_gate_asserts_success_report_identity_and_version():
+    from backend.app.market.shadow_registry_schema import REGISTRY_DDL
+
+    assert "attestation_requires_terminal_success_session" in REGISTRY_DDL
+    assert "outcome='success'" in REGISTRY_DDL
+    assert "report_version>=2" in REGISTRY_DDL
+    assert "terminal_attestation_id=NEW.attestation_id" in REGISTRY_DDL
+    assert "session_report_id=NEW.session_report_id" in REGISTRY_DDL
+    assert "evidence_ready" in REGISTRY_DDL
+
+
+def test_round4_qualification_requires_verified_calendar_reader(tmp_path):
+    from backend.app.market.providers.registry import VerifiedConfirmedCalendarReader
+
+    assert VerifiedConfirmedCalendarReader is not None
+    signature = inspect.signature(ShadowRegistry.qualify_window)
+    assert signature.parameters["calendar_reader"].annotation in (
+        VerifiedConfirmedCalendarReader,
+        "VerifiedConfirmedCalendarReader",
+    )
+
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    window = registry.ensure_window("tickflow", _sha("vector"), "cal-1", _sha("calendar"))
+    fake = type("FakeReader", (), {"read": lambda self, *_: None})()
+    with pytest.raises(RegistryUnavailable, match="confirmed calendar"):
+        registry.qualify_window(
+            "tickflow",
+            window.window_id,
+            calendar_reader=fake,
+            expected_provider_state_version=0,
+            expected_window_state_version=0,
+        )
+
+
+def test_round4_verified_calendar_reader_reads_nofollow_json_and_confirmed_sessions(tmp_path):
+    from backend.app.market.providers.registry import VerifiedConfirmedCalendarReader
+
+    calendar_path = tmp_path / "confirmed-calendar.json"
+    payload = {
+        "year": 2026,
+        "status": "confirmed",
+        "published_on": "2026-01-01",
+        "sources": [
+            {"exchange": "SSE", "title": "reviewed", "url": "https://example.invalid"},
+            {"exchange": "SZSE", "title": "reviewed", "url": "https://example.invalid"},
+        ],
+        "closed_dates": ["2026-01-01"],
+    }
+    calendar_path.write_text(json.dumps(payload), encoding="utf-8")
+    digest = _sha("calendar")
+    reader = VerifiedConfirmedCalendarReader(
+        calendar_path,
+        provider_id="tickflow",
+        window_id="window-1",
+        version_vector_sha256=_sha("vector"),
+        universe_id="universe-1",
+        universe_sha256=_sha("universe"),
+        adapter_hash=_sha("adapter"),
+        endpoint_contract_hash=_sha("endpoint"),
+        source_schema_hash=_sha("schema"),
+        normalizer_hash=_sha("normalizer"),
+        reconciliation_policy_hash=_sha("policy"),
+        calendar_sha256=hashlib.sha256(calendar_path.read_bytes()).hexdigest(),
+    )
+    snapshot = reader.read("tickflow", "window-1")
+    assert snapshot.calendar_sha256 != digest
+    assert len(snapshot.sessions) >= 20
+    assert all(session.weekday() < 5 for session in snapshot.sessions)
+    with pytest.raises(TypeError, match="immutable"):
+        reader.universe_id = "forged"
+
+
+def test_round4_configured_basename_swap_before_connect_does_not_write_external(
+    tmp_path, monkeypatch
+):
+    import backend.app.market.providers.registry as registry_module
+
+    parent = tmp_path / "shadow"
+    parent.mkdir(mode=0o700)
+    path = parent / "provider_registry.sqlite3"
+    external = tmp_path / "external.sqlite3"
+    external_connection = sqlite3.connect(external)
+    external_connection.execute("CREATE TABLE sentinel (value TEXT)")
+    external_connection.execute("INSERT INTO sentinel VALUES ('untouched')")
+    external_connection.commit()
+    external_connection.close()
+    original = external.read_bytes()
+    real_connect = registry_module.sqlite3.connect
+    swapped = False
+
+    def swap_before_connect(open_path, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(open_path).parent == parent:
+            swapped = True
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            path.symlink_to(external)
+        return real_connect(open_path, **kwargs)
+
+    monkeypatch.setattr(registry_module.sqlite3, "connect", swap_before_connect)
+    with pytest.raises(RegistryUnavailable):
+        ShadowRegistry(path).initialize()
+    assert external.read_bytes() == original
+    assert swapped
+
+
 def test_round3_terminal_success_graph_uses_deferred_fk_and_legal_insert_order():
     from backend.app.market.shadow_registry_schema import REGISTRY_DDL
 
     assert "DEFERRABLE INITIALLY DEFERRED" in REGISTRY_DDL
-    assert "attestation_requires_terminal_success_session" not in REGISTRY_DDL
+    assert "attestation_requires_terminal_success_session" in REGISTRY_DDL
 
 
 def test_round3_legal_terminal_success_transaction_inserts_session_then_attestation():

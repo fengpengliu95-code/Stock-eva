@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import stat
 import tempfile
@@ -16,10 +17,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market.calendar import CalendarConfig, TradingCalendar
 from backend.app.market.shadow_registry_schema import (
     MIGRATION_ID,
     initialize_registry,
@@ -105,6 +106,11 @@ class ConfirmedCalendarSnapshot(BaseModel):
     adapter_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     reconciliation_policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     sessions: tuple[date, ...]
+    endpoint_contract_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_schema_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    normalizer_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    universe_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    authority_provenance: str | None = None
 
     @model_validator(mode="after")
     def validate_sessions(self) -> ConfirmedCalendarSnapshot:
@@ -113,8 +119,182 @@ class ConfirmedCalendarSnapshot(BaseModel):
         return self
 
 
-class ConfirmedCalendarReader(Protocol):
-    def read(self, provider_id: str, window_id: str) -> ConfirmedCalendarSnapshot: ...
+class VerifiedConfirmedCalendarReader:
+    """Descriptor-bound reader for the reviewed confirmed trading calendar."""
+
+    _MAX_BYTES = 1_048_576
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise TypeError("verified calendar descriptor is immutable")
+        object.__setattr__(self, name, value)
+
+    def __init__(
+        self,
+        calendar_path: Path | str,
+        *,
+        provider_id: str,
+        window_id: str,
+        version_vector_sha256: str,
+        universe_id: str,
+        universe_sha256: str,
+        adapter_hash: str,
+        endpoint_contract_hash: str,
+        source_schema_hash: str,
+        normalizer_hash: str,
+        reconciliation_policy_hash: str,
+        calendar_generation: str | None = None,
+        calendar_sha256: str | None = None,
+        authority_provenance: str = "reviewed-confirmed-calendar",
+    ) -> None:
+        self.calendar_path = Path(calendar_path)
+        self.provider_id = provider_id
+        self.window_id = window_id
+        self.version_vector_sha256 = version_vector_sha256
+        self.universe_id = universe_id
+        self.universe_sha256 = universe_sha256
+        self.adapter_hash = adapter_hash
+        self.endpoint_contract_hash = endpoint_contract_hash
+        self.source_schema_hash = source_schema_hash
+        self.normalizer_hash = normalizer_hash
+        self.reconciliation_policy_hash = reconciliation_policy_hash
+        self.calendar_generation = calendar_generation
+        self.calendar_sha256 = calendar_sha256
+        self.authority_provenance = authority_provenance
+        for value in (
+            version_vector_sha256,
+            universe_sha256,
+            adapter_hash,
+            endpoint_contract_hash,
+            source_schema_hash,
+            normalizer_hash,
+            reconciliation_policy_hash,
+        ):
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError("verified calendar descriptor hash is invalid")
+        self._sealed = True
+
+    @staticmethod
+    def _validate_ancestors(path: Path) -> Path:
+        absolute = Path(os.path.abspath(path))
+        if absolute.parts[1:2] == ("tmp",) and Path("/tmp").is_symlink():
+            absolute = Path("/private/tmp", *absolute.parts[2:])
+        if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
+            absolute = Path("/private/var", *absolute.parts[2:])
+        ancestors = list(absolute.parents)
+        for ancestor in reversed(ancestors):
+            info = os.lstat(ancestor)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+        return absolute
+
+    def _read_verified(self) -> tuple[bytes, object]:
+        path = self._validate_ancestors(self.calendar_path)
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o022:
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, min(131072, self._MAX_BYTES - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > self._MAX_BYTES:
+                    raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+                chunks.append(chunk)
+            after = os.fstat(fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            return b"".join(chunks), before
+        finally:
+            os.close(fd)
+
+    def read(self, provider_id: str, window_id: str) -> ConfirmedCalendarSnapshot:
+        if provider_id != self.provider_id or window_id != self.window_id:
+            raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+        raw, _fingerprint = self._read_verified()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            raw_configs = payload if isinstance(payload, list) else [payload]
+            payload_generation = payload.get("generation") if isinstance(payload, dict) else None
+            payload_provenance = (
+                payload.get("authority_provenance") if isinstance(payload, dict) else None
+            )
+            if self.calendar_generation is not None and payload_generation not in (
+                None,
+                self.calendar_generation,
+            ):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            if payload_provenance not in (None, self.authority_provenance):
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            calendar = TradingCalendar(
+                [CalendarConfig.model_validate(item) for item in raw_configs]
+            )
+            sessions: list[date] = []
+            for config in calendar.configs.values():
+                confirmed = calendar.confirmed_open_sessions(
+                    date(config.year, 1, 1), date(config.year, 12, 31)
+                )
+                if confirmed is None:
+                    raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+                sessions.extend(confirmed)
+            generation = (
+                self.calendar_generation or payload_generation or hashlib.sha256(raw).hexdigest()
+            )
+            calendar_sha256 = hashlib.sha256(raw).hexdigest()
+            if self.calendar_sha256 is not None and self.calendar_sha256 != calendar_sha256:
+                raise RegistryUnavailable("confirmed calendar snapshot unavailable")
+            return ConfirmedCalendarSnapshot(
+                provider_id=provider_id,
+                window_id=window_id,
+                version_vector_sha256=self.version_vector_sha256,
+                calendar_generation=generation,
+                calendar_sha256=calendar_sha256,
+                universe_id=self.universe_id,
+                adapter_hash=self.adapter_hash,
+                reconciliation_policy_hash=self.reconciliation_policy_hash,
+                sessions=tuple(sorted(set(sessions))),
+                endpoint_contract_hash=self.endpoint_contract_hash,
+                source_schema_hash=self.source_schema_hash,
+                normalizer_hash=self.normalizer_hash,
+                universe_sha256=self.universe_sha256,
+                authority_provenance=self.authority_provenance,
+            )
+        except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RegistryUnavailable("confirmed calendar snapshot unavailable") from exc
+
+
+# Compatibility import for earlier Task10 callers; qualification accepts only
+# the concrete class above, never a structural Protocol or arbitrary object.
+ConfirmedCalendarReader = VerifiedConfirmedCalendarReader
 
 
 def _authorizer(role: str):
@@ -229,13 +409,19 @@ class ShadowRegistry:
                 os.close(parent_fd)
             guard_fd, guarded_path, before = self._open_guard_descriptor()
             connection = None
+            bound = None
             try:
-                connection = self._open_writer(physical_path)
-                initialize_registry(connection)
+                connection, bound = self._open_bound_writer()
+                try:
+                    initialize_registry(connection)
+                except sqlite3.DatabaseError as exc:
+                    raise RegistryUnavailable("registry migration unavailable") from exc
             finally:
                 if connection is not None:
                     connection.close()
                 try:
+                    if bound is not None:
+                        self._close_bound_writer(bound)
                     self._verify_guard_descriptor(guard_fd, guarded_path, before)
                 finally:
                     os.close(guard_fd)
@@ -304,6 +490,102 @@ class ShadowRegistry:
         return getattr(self, "_memory_connection", None) or ShadowRegistryTerminalWriter.open(
             path or self.path
         )
+
+    def _open_bound_writer(self):
+        """Open SQLite through a hardlink bound to the verified basename inode."""
+        if self._memory:
+            return self._open_writer(), None
+        physical_path = self._trusted_physical_path(self.path)
+        self._validate_existing_ancestors(physical_path.parent)
+        parent_fd = os.open(
+            physical_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        config_fd = None
+        alias_fd = None
+        alias_name = f".{physical_path.name}.bound-{secrets.token_hex(12)}"
+        alias_path = physical_path.parent / alias_name
+        try:
+            config_fd = os.open(
+                physical_path.name,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            before = os.fstat(config_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o777 != 0o600:
+                raise RegistryUnavailable("registry permissions unavailable")
+            os.link(
+                physical_path.name,
+                alias_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            alias_fd = os.open(
+                alias_name,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            alias_info = os.fstat(alias_fd)
+            if (alias_info.st_dev, alias_info.st_ino) != (before.st_dev, before.st_ino):
+                raise RegistryUnavailable("registry basename identity unavailable")
+        except (OSError, ValueError) as exc:
+            if alias_fd is not None:
+                os.close(alias_fd)
+            if config_fd is not None:
+                os.close(config_fd)
+            try:
+                alias_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise RegistryUnavailable("registry basename unavailable") from exc
+        except RegistryUnavailable:
+            if alias_fd is not None:
+                os.close(alias_fd)
+            if config_fd is not None:
+                os.close(config_fd)
+            try:
+                alias_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(parent_fd)
+        try:
+            connection = ShadowRegistryTerminalWriter.open(alias_path)
+        except Exception:
+            if alias_fd is not None:
+                os.close(alias_fd)
+            if config_fd is not None:
+                os.close(config_fd)
+            try:
+                alias_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return connection, (config_fd, alias_fd, alias_path, before)
+
+    @staticmethod
+    def _close_bound_writer(bound) -> None:
+        config_fd, alias_fd, alias_path, before = bound
+        try:
+            current = os.fstat(config_fd)
+            if (current.st_dev, current.st_ino, current.st_mode) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+            ):
+                raise RegistryUnavailable("registry basename changed")
+            alias_info = os.fstat(alias_fd)
+            if (alias_info.st_dev, alias_info.st_ino) != (before.st_dev, before.st_ino):
+                raise RegistryUnavailable("registry alias changed")
+        finally:
+            os.close(alias_fd)
+            os.close(config_fd)
+            try:
+                alias_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _open_guard_descriptor(self) -> tuple[int, Path, tuple[int, int, int, int]]:
         physical_path = self._trusted_physical_path(self.path)
@@ -445,12 +727,13 @@ class ShadowRegistry:
         with self._lock(shared=False):
             guard_fd = None
             connection = None
+            bound = None
             try:
                 if self._memory:
                     connection = self._open_writer()
                 else:
                     guard_fd, physical_path, before = self._open_guard_descriptor()
-                    connection = self._open_writer(physical_path)
+                    connection, bound = self._open_bound_writer()
                 connection.execute("BEGIN IMMEDIATE")
                 result = callback(connection)
                 connection.commit()
@@ -471,10 +754,14 @@ class ShadowRegistry:
                 raise RegistryUnavailable("registry transaction unavailable") from exc
             finally:
                 if not self._memory:
-                    if connection is not None:
-                        connection.close()
-                    if guard_fd is not None:
-                        os.close(guard_fd)
+                    try:
+                        if connection is not None:
+                            connection.close()
+                        if bound is not None:
+                            self._close_bound_writer(bound)
+                    finally:
+                        if guard_fd is not None:
+                            os.close(guard_fd)
 
     @staticmethod
     def _record_values(record: ShadowProviderRecord) -> tuple[object, ...]:
@@ -1063,7 +1350,7 @@ class ShadowRegistry:
         provider_id: str,
         window_id: str,
         *,
-        calendar_reader: ConfirmedCalendarReader,
+        calendar_reader: VerifiedConfirmedCalendarReader,
         expected_provider_state_version: int,
         expected_window_state_version: int,
     ) -> QualificationWindow:
@@ -1071,6 +1358,8 @@ class ShadowRegistry:
             snapshot = calendar_reader.read(provider_id, window_id)
         except (OSError, ValueError, TypeError, RegistryUnavailable) as exc:
             raise RegistryUnavailable("confirmed calendar snapshot unavailable") from exc
+        if type(calendar_reader) is not VerifiedConfirmedCalendarReader:
+            raise RegistryUnavailable("confirmed calendar snapshot unavailable")
         if not isinstance(snapshot, ConfirmedCalendarSnapshot):
             raise RegistryUnavailable("confirmed calendar snapshot unavailable")
 
@@ -1090,7 +1379,11 @@ class ShadowRegistry:
                 or snapshot.calendar_generation != current.calendar_generation
                 or snapshot.calendar_sha256 != current.calendar_sha256
                 or snapshot.adapter_hash != provider.adapter_hash
+                or snapshot.endpoint_contract_hash != provider.endpoint_contract_hash
+                or snapshot.source_schema_hash != provider.source_schema_hash
+                or snapshot.normalizer_hash != provider.normalizer_hash
                 or snapshot.reconciliation_policy_hash != provider.reconciliation_policy_hash
+                or snapshot.universe_sha256 is None
                 or len(snapshot.sessions) < 20
             ):
                 raise RegistryUnavailable("confirmed calendar snapshot unavailable")
@@ -1109,7 +1402,7 @@ class ShadowRegistry:
                  AND j.window_id=s.window_id
                 WHERE s.provider_id=? AND s.window_id=? AND s.outcome='success'
                   AND s.version_vector_sha256=? AND j.version_vector_sha256=?
-                  AND j.universe_id=?
+                  AND j.universe_id=? AND s.universe_sha256=?
                 ORDER BY s.trade_date
                 """,
                 (
@@ -1118,6 +1411,7 @@ class ShadowRegistry:
                     snapshot.version_vector_sha256,
                     snapshot.version_vector_sha256,
                     snapshot.universe_id,
+                    snapshot.universe_sha256,
                 ),
             ).fetchall()
             observed_sessions = tuple(date.fromisoformat(row[0]) for row in rows)

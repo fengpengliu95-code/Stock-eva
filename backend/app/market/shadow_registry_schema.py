@@ -120,6 +120,16 @@ BEGIN
     AND c.window_id=NEW.window_id AND c.session_id=NEW.session_id
     AND c.candidate_sha256=NEW.candidate_sha256
  ) THEN RAISE(ABORT,'attestation_candidate_hash_mismatch') END;
+ SELECT CASE WHEN NOT EXISTS (
+   SELECT 1 FROM session_report s WHERE s.session_report_id=NEW.session_report_id
+    AND s.provider_id=NEW.provider_id AND s.job_id=NEW.job_id
+    AND s.window_id=NEW.window_id AND s.session_id=NEW.session_id
+    AND s.outcome='success' AND s.report_version>=2
+    AND s.terminal_attestation_id=NEW.attestation_id
+    AND s.evidence_id=NEW.evidence_id AND s.candidate_id=NEW.candidate_id
+    AND s.evidence_sha256=NEW.evidence_sha256
+    AND s.candidate_sha256=NEW.candidate_sha256
+ ) THEN RAISE(ABORT,'attestation_requires_terminal_success_session') END;
 END;
 CREATE TRIGGER session_report_hash_match BEFORE INSERT ON session_report
 WHEN NEW.outcome IN ('evidence_ready','success')
@@ -227,6 +237,63 @@ MIGRATION_CHECKSUMS = {
     migration_id: hashlib.sha256(sql.encode("utf-8")).hexdigest()
     for migration_id, sql in MIGRATION_SQL.items()
 }
+# ``0a4352f`` shipped the 0001 migration before the checksum column was
+# introduced.  Keep the reviewed digest as an input-compatibility value; new
+# databases always persist the current canonical digest.
+ACCEPTED_MIGRATION_CHECKSUMS = {
+    "r2f3-registry-0001": frozenset(
+        {
+            MIGRATION_CHECKSUMS["r2f3-registry-0001"],
+            "f55ac72643f67eb7d7c9df793ae1aaca2ca35e6457097bcd97c604a02a2e72d3",
+        }
+    ),
+    "r2f3-registry-0002": frozenset({MIGRATION_CHECKSUMS["r2f3-registry-0002"]}),
+}
+
+
+def _schema_fingerprint(connection: sqlite3.Connection) -> str:
+    """Hash the reviewed PRAGMA table/column/index/trigger shape."""
+    rows: list[object] = []
+    table_names = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY name"
+    ).fetchall()
+    for (table_name,) in table_names:
+        escaped = table_name.replace('"', '""')
+        rows.append(
+            (
+                "table",
+                table_name,
+                tuple(connection.execute(f'PRAGMA table_info("{escaped}")').fetchall()),
+            )
+        )
+        for index in connection.execute(f'PRAGMA index_list("{escaped}")').fetchall():
+            index_name = str(index[1]).replace('"', '""')
+            rows.append(
+                (
+                    "index",
+                    table_name,
+                    index,
+                    tuple(connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()),
+                )
+            )
+    rows.extend(
+        ("trigger", name, table_name, sql)
+        for name, table_name, sql in connection.execute(
+            "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name"
+        )
+    )
+    return hashlib.sha256(repr(rows).encode("utf-8")).hexdigest()
+
+
+_ACCEPTED_LEGACY_SCHEMA_FINGERPRINTS = frozenset(
+    {
+        # Current canonical 0001 with its checksum column removed.
+        "4d5817883d7a171327b66355447cff445b2bedc12a8df690fcde008da16577aa",
+        # The exact reviewed round-2 0001 schema (pre-deferred-FK spelling).
+        "132a7e6ac31fca439668f4a11928793eab34792ac5bc7983badaf34d0ed7c053",
+    }
+)
 
 
 def _execute_script_transactionally(connection: sqlite3.Connection, script: str) -> None:
@@ -334,6 +401,8 @@ def initialize_registry(connection: sqlite3.Connection) -> None:
                 row[1] for row in connection.execute("PRAGMA table_info(schema_migration)")
             }
             if "checksum" not in migration_columns:
+                if _schema_fingerprint(connection) not in _ACCEPTED_LEGACY_SCHEMA_FINGERPRINTS:
+                    raise sqlite3.DatabaseError("unreviewed legacy registry schema")
                 connection.execute("ALTER TABLE schema_migration ADD COLUMN checksum TEXT")
                 legacy_rows = connection.execute(
                     "SELECT migration_id,schema_version FROM schema_migration"
@@ -356,7 +425,7 @@ def initialize_registry(connection: sqlite3.Connection) -> None:
         if (
             not rows
             or rows[0][0] != MIGRATION_IDS[0]
-            or rows[0][2] != MIGRATION_CHECKSUMS[MIGRATION_IDS[0]]
+            or rows[0][2] not in ACCEPTED_MIGRATION_CHECKSUMS[MIGRATION_IDS[0]]
         ):
             raise sqlite3.DatabaseError("registry migration checksum mismatch")
         if len(rows) == 1:
@@ -367,10 +436,11 @@ def initialize_registry(connection: sqlite3.Connection) -> None:
                 "INSERT INTO schema_migration VALUES (?,?,datetime('now'),?)",
                 (MIGRATION_IDS[1], 2, MIGRATION_CHECKSUMS[MIGRATION_IDS[1]]),
             )
-        elif len(rows) != 2 or rows[-1] != (
-            MIGRATION_IDS[1],
-            2,
-            MIGRATION_CHECKSUMS[MIGRATION_IDS[1]],
+        elif (
+            len(rows) != 2
+            or rows[-1][0] != MIGRATION_IDS[1]
+            or rows[-1][1] != 2
+            or rows[-1][2] not in ACCEPTED_MIGRATION_CHECKSUMS[MIGRATION_IDS[1]]
         ):
             raise sqlite3.DatabaseError("registry migration state unavailable")
         connection.commit()
