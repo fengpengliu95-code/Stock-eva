@@ -539,6 +539,17 @@ Required behavior:
   matching factor manifest capture ID. `EvidenceManifest.object_count=len(objects)`; manifest
   `row_count` sums raw-page descriptors only; `attempt_count=sum(len(completion.attempts) for
   completion in request_completions)` and excludes audit/observation/page counts.
+- Serialize the complete ordered tuple of per-symbol `FactorResolutionBinding` values once as a
+  separate immutable `factor_resolution_snapshot` JSON object. The object is content addressed,
+  bounded by the evidence object limit, and described by local `capture_id`, object ID/path/SHA,
+  byte count, binding count, fixed schema/hash and `bindings_sha256`; it has no provider session,
+  request, endpoint, attempt or page identity. `EvidenceManifest` stores only the published
+  resolution descriptor plus `factor_resolution_sha256=bindings_sha256`, never the unbounded
+  binding tuple inline. The resolution descriptor is included exactly once in `objects`, so
+  `object_count` includes raw pages plus the optional factor-cache and factor-resolution
+  descriptors while `row_count` continues to sum raw pages only. Online normalization and replay
+  must open this sidecar by the same root dirfd, validate its complete ordered binding set and join
+  it bidirectionally to the factor snapshot before resolving any record.
 - While holding `RefreshRunLock`, generate one locally unique `capture_id` immediately before the
   exact snapshot read; it is not a provider/session/request ID and must not borrow the last provider
   identity. Serialize one immutable `factor_cache_snapshot` object from the in-memory

@@ -747,6 +747,7 @@ class RequestRole(StrEnum):
 class EvidenceObjectKind(StrEnum):
     RAW_ENDPOINT_PAGE = "raw_endpoint_page"
     FACTOR_CACHE_SNAPSHOT = "factor_cache_snapshot"
+    FACTOR_RESOLUTION_SNAPSHOT = "factor_resolution_snapshot"
 
 class ProviderId(StrEnum):
     BAOSTOCK = "baostock"
@@ -1155,6 +1156,24 @@ class PublishedFactorCacheSnapshot(BaseModel):
     manifest: FactorCacheSnapshotManifest
     reader_identity: SafeSha256
 
+class FactorResolutionSnapshotManifest(BaseModel):
+    """Immutable sidecar for the complete per-symbol factor-resolution bindings."""
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    capture_id: SafeIdentifier
+    object_id: SafeIdentifier
+    relative_path: SafeRelativePath
+    object_sha256: SafeSha256
+    byte_count: int = Field(ge=0, le=67_108_864)
+    binding_count: int = Field(ge=1, le=10_000_000)
+    schema_variant: Literal["factor-resolution.snapshot.v1"]
+    schema_hash: SafeSha256
+    bindings_sha256: SafeSha256
+
+class PublishedFactorResolutionSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    manifest: FactorResolutionSnapshotManifest
+    reader_identity: SafeSha256
+
 class ProviderRawBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     provider_id: ProviderId
@@ -1228,12 +1247,12 @@ class EvidenceManifest(BaseModel):
     request_plan_hash: SafeSha256
     request_completions: tuple["RequestCompletion", ...]
     completion_hash: SafeSha256
-    objects: tuple[EvidenceObjectDescriptor, ...]  # ordered raw pages plus at most one factor snapshot
+    objects: tuple[EvidenceObjectDescriptor, ...]  # raw pages plus local factor/resolution sidecars
     transport_lineage: tuple[TransportLineageRef, ...]
     transport_observations: TransportObservationAggregate
     endpoint_summaries: tuple[EndpointContractSummary, ...]
     factor_cache_snapshot: PublishedFactorCacheSnapshot | None
-    factor_resolution: tuple[FactorResolutionBinding, ...]
+    factor_resolution_snapshot: PublishedFactorResolutionSnapshot | None
     factor_resolution_sha256: SafeSha256
     request_count: int = Field(ge=1, le=4096)
     attempt_count: int = Field(ge=1, le=20_000)
