@@ -148,6 +148,8 @@ class TickFlowAdapter:
         symbols: tuple[str, ...] = (),
         session: AuthorizedCanarySession,
     ) -> TickFlowSourceBatch:
+        if type(session) is not AuthorizedCanarySession:
+            raise PermissionError("authorized canary session required")
         return session.execute(self, trade_date, symbols=symbols)
 
     def fetch(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TickFlowPlan:

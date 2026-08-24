@@ -193,7 +193,7 @@ class TushareAdapter:
     ) -> TushareSourceBatch:
         if not OFFICIAL_HTTPS_PROVEN:
             raise TushareExecutionBlocked("tushare official HTTPS is unproven")
-        if session is None:
+        if type(session) is not AuthorizedCanarySession:
             raise TushareExecutionBlocked("authorized canary session required")
         return session.execute(self, trade_date, symbols=symbols)
 

@@ -1,9 +1,12 @@
 """Offline RED/GREEN tests for successful-attempt-only shadow evidence."""
 
+import hashlib
+import json
 from datetime import date
 
 import pytest
 
+import backend.app.market.shadow_evidence as shadow_module
 from backend.app.market.shadow_evidence import (
     ShadowAttempt,
     ShadowAttemptReport,
@@ -50,8 +53,6 @@ def _plan_completion(request, attempt_id="attempt-2", evidence_id="ev-test"):
         evidence_id=evidence_id,
         request_plan_sha256=plan.request_plan_sha256,
         requests=(request_completion,),
-        aggregate_page_count=1,
-        aggregate_row_count=1,
     )
     return plan, completion
 
@@ -173,8 +174,6 @@ def test_completion_requires_explicit_identity_and_final_success():
             evidence_id="ev-bad",
             request_plan_sha256=plan.request_plan_sha256,
             requests=complete.requests,
-            aggregate_page_count=1,
-            aggregate_row_count=1,
         )
     with pytest.raises(ValueError):
         ShadowRequestCompletion(
@@ -272,6 +271,107 @@ def test_reader_rejects_hardlinks_extra_files_and_mutation(tmp_path):
     (final / "hardlink").hardlink_to(page)
     with pytest.raises(RuntimeError):
         ShadowEvidenceReader(tmp_path).read(bundle.evidence_id)
+
+
+def test_reader_uses_held_directory_descriptors_not_pathname_listing(tmp_path, monkeypatch):
+    request = _request()
+    plan, completion = _plan_completion(request, attempt_id="attempt-held", evidence_id="ev-held")
+    bundle = ShadowEvidenceStore(tmp_path).publish(
+        plan=plan,
+        completion=completion,
+        attempts=(
+            ShadowAttempt(
+                attempt_id="attempt-held",
+                ordinal=0,
+                outcome="success",
+                rows=({"x": 1},),
+                pages=completion.requests[0].pages,
+            ),
+        ),
+    )
+    original_lstat = shadow_module.os.lstat
+
+    def reject_path_lstat(value):
+        if not isinstance(value, int):
+            raise AssertionError("reader must not lstat configured pathnames")
+        return original_lstat(value)
+
+    monkeypatch.setattr(shadow_module.os, "lstat", reject_path_lstat)
+    assert ShadowEvidenceReader(tmp_path).read(bundle.evidence_id).evidence_id == bundle.evidence_id
+
+
+def test_completion_aggregate_fields_are_not_caller_controlled():
+    request = _request()
+    with pytest.raises(ValueError):
+        ShadowCompletion(
+            job_id="job-1",
+            provider_id="tickflow",
+            window_id="window-1",
+            session_id="session-1",
+            evidence_id="ev-aggregate",
+            request_plan_sha256=ShadowLogicalRequestPlan(requests=(request,)).request_plan_sha256,
+            requests=(
+                ShadowRequestCompletion(
+                    ordinal=0,
+                    request_id=request.request_id,
+                    endpoint=request.endpoint,
+                    final_attempt_id="attempt-1",
+                    pages=({"page_identity": "request-0:page-000001", "rows": [{"x": 1}]},),
+                ),
+            ),
+            aggregate_page_count=1,
+            aggregate_row_count=1,
+        )
+
+
+def test_recovery_does_not_delete_self_consistent_malformed_completion(tmp_path):
+    request = _request()
+    plan, completion = _plan_completion(
+        request, attempt_id="attempt-malformed", evidence_id="ev-malformed"
+    )
+    store = ShadowEvidenceStore(tmp_path)
+    with pytest.raises(RuntimeError):
+        store.publish(
+            plan=plan,
+            completion=completion,
+            attempts=(
+                ShadowAttempt(
+                    attempt_id="attempt-malformed",
+                    ordinal=0,
+                    outcome="success",
+                    rows=({"x": 1},),
+                    pages=completion.requests[0].pages,
+                ),
+            ),
+            simulate_crash=True,
+        )
+    staging = next((tmp_path / "staging").iterdir())
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["completion"]["requests"] = []
+    completion_sha = hashlib.sha256(
+        b"stock-eva/r2f3/completion/v1\n"
+        + (
+            json.dumps(manifest["completion"], sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+    ).hexdigest()
+    manifest["completion_sha256"] = completion_sha
+    owner_path = staging / "OWNER"
+    owner = json.loads(owner_path.read_text())
+    owner["completion_sha256"] = completion_sha
+    owner_path.write_text(json.dumps(owner, sort_keys=True, separators=(",", ":")) + "\n")
+    manifest_values = {
+        key: manifest[key] for key in manifest if key not in {"manifest_sha256", "rows"}
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        b"stock-eva/r2f3/shadow-evidence/v1\n"
+        + (json.dumps(manifest_values, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    (staging / "COMMIT").write_text(f"COMMIT\n{manifest['manifest_sha256']}\n")
+    result = store.recover_orphans()
+    assert result.removed == 0
+    assert staging.exists()
 
 
 def test_control_sink_is_registry_backed_and_exposes_no_terminal_candidate_api():

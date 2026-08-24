@@ -12,7 +12,7 @@ import os
 import re
 import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import sleep
 from typing import Any, Protocol
@@ -177,6 +177,7 @@ def build_canary_permit(
     adapter_hash: str,
     endpoint_contract_hash: str,
     source_schema_hash: str,
+    environ: Mapping[str, str] | None = None,
 ) -> _CanaryPermit:
     """Validate the Task10 descriptor before reading the closed credential env map."""
     from .shadow_contracts import STATIC_PROVIDER_CONTRACTS, exact_credential_env
@@ -185,7 +186,44 @@ def build_canary_permit(
         raise CanaryPermissionError("external authorization is invalid")
     if provider_id not in STATIC_PROVIDER_CONTRACTS:
         raise CanaryPermissionError("provider descriptor unavailable")
+    record, terms = _read_canary_descriptor(
+        provider_id,
+        registry,
+        adapter_hash=adapter_hash,
+        endpoint_contract_hash=endpoint_contract_hash,
+        source_schema_hash=source_schema_hash,
+    )
+    env_name = exact_credential_env(provider_id, requested=record.credential_env_name)
+    source_env = os.environ if environ is None else environ
+    token = source_env.get(env_name, "")
+    if not token:
+        raise CanaryPermissionError("provider credential unavailable")
+    return _CanaryPermit(
+        provider_id,
+        external_authorization_id,
+        token,
+        _seal=_PERMIT_SEAL,
+        _adapter_hash=adapter_hash,
+        _endpoint_contract_hash=endpoint_contract_hash,
+        _source_schema_hash=source_schema_hash,
+        _terms_review_id=terms.review_id,
+    )
+
+
+def _read_canary_descriptor(
+    provider_id: str,
+    registry: Any,
+    *,
+    adapter_hash: str,
+    endpoint_contract_hash: str,
+    source_schema_hash: str,
+):
+    from .registry import ShadowRegistry
+    from .shadow_contracts import STATIC_PROVIDER_CONTRACTS, exact_credential_env
+
     contract = STATIC_PROVIDER_CONTRACTS[provider_id]
+    if type(registry) is not ShadowRegistry:
+        raise CanaryPermissionError("concrete shadow registry required")
     record = registry.read_status(provider_id)
     if record.admission_state.value != "canary":
         raise CanaryPermissionError("provider is not admitted for canary")
@@ -224,20 +262,7 @@ def build_canary_permit(
         or (contract.requires_official_https_proof and not contract.official_https_proven)
     ):
         raise CanaryPermissionError("reviewed provider decisions unavailable")
-    env_name = exact_credential_env(provider_id, requested=record.credential_env_name)
-    token = os.environ.get(env_name, "")
-    if not token:
-        raise CanaryPermissionError("provider credential unavailable")
-    return _CanaryPermit(
-        provider_id,
-        external_authorization_id,
-        token,
-        _seal=_PERMIT_SEAL,
-        _adapter_hash=adapter_hash,
-        _endpoint_contract_hash=endpoint_contract_hash,
-        _source_schema_hash=source_schema_hash,
-        _terms_review_id=record.terms_review_id,
-    )
+    return record, terms
 
 
 @dataclass(frozen=True)
@@ -249,14 +274,48 @@ class HttpResult:
     request_count: int
 
 
-@dataclass(frozen=True)
+_SESSION_ISSUER = object()
+
+
+@dataclass(frozen=True, init=False)
 class AuthorizedCanarySession:
     """The sole network execution capability for a shadow provider."""
 
     provider_id: str
     registry_path: Path
     external_authorization_id: str
-    transport: HttpTransport
+    expected_state_version: int
+    expected_terms_evidence_hash: str
+    expected_terms_review_id: str
+    credential_env_name: str
+    _environ: Mapping[str, str] = field(repr=False)
+    _client_factory: Callable[[], HttpTransport] = field(repr=False)
+
+    def __init__(
+        self,
+        *,
+        _issuer: object | None = None,
+        provider_id: str,
+        registry_path: Path,
+        external_authorization_id: str,
+        expected_state_version: int,
+        expected_terms_evidence_hash: str,
+        expected_terms_review_id: str,
+        credential_env_name: str,
+        environ: Mapping[str, str],
+        client_factory: Callable[[], HttpTransport],
+    ) -> None:
+        if _issuer is not _SESSION_ISSUER:
+            raise CanaryPermissionError("authorized session factory required")
+        object.__setattr__(self, "provider_id", provider_id)
+        object.__setattr__(self, "registry_path", registry_path)
+        object.__setattr__(self, "external_authorization_id", external_authorization_id)
+        object.__setattr__(self, "expected_state_version", expected_state_version)
+        object.__setattr__(self, "expected_terms_evidence_hash", expected_terms_evidence_hash)
+        object.__setattr__(self, "expected_terms_review_id", expected_terms_review_id)
+        object.__setattr__(self, "credential_env_name", credential_env_name)
+        object.__setattr__(self, "_environ", environ)
+        object.__setattr__(self, "_client_factory", client_factory)
 
     def execute(self, adapter: Any, trade_date: Any, *, symbols: tuple[str, ...] = ()) -> Any:
         if getattr(adapter, "PROVIDER_ID", None) != self.provider_id:
@@ -271,6 +330,17 @@ class AuthorizedCanarySession:
         payloads: dict[str, Any] = {}
         for endpoint in adapter.ENDPOINTS:
             registry = ShadowRegistry(self.registry_path)
+            try:
+                current = registry.read_status(self.provider_id)
+            except Exception as exc:
+                raise CanaryPermissionError("provider descriptor unavailable") from exc
+            if (
+                current.state_version != self.expected_state_version
+                or current.terms_evidence_hash != self.expected_terms_evidence_hash
+                or current.terms_review_id != self.expected_terms_review_id
+                or current.credential_env_name != self.credential_env_name
+            ):
+                raise CanaryPermissionError("provider descriptor changed")
             permit = build_canary_permit(
                 self.provider_id,
                 registry,
@@ -278,9 +348,10 @@ class AuthorizedCanarySession:
                 adapter_hash=adapter.ADAPTER_HASH,
                 endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
                 source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
+                environ=self._environ,
             )
             if client is None:
-                client = BoundedHttpClient(self.transport)
+                client = BoundedHttpClient(self._client_factory())
             payloads[endpoint] = client.request_json(
                 endpoint,
                 params=adapter.request_params(endpoint, trade_date, symbols),
@@ -293,20 +364,54 @@ class AuthorizedCanarySession:
 
 def build_authorized_canary_session(
     provider_id: str,
-    registry_path: Path | str,
+    registry: Any,
     *,
     external_authorization_id: str,
-    transport: HttpTransport,
+    environ: Mapping[str, str],
+    client_factory: Callable[[], HttpTransport],
 ) -> AuthorizedCanarySession:
+    from .registry import ShadowRegistry
+    from .shadow_contracts import exact_credential_env
+
     if provider_id not in {"tickflow", "tushare"}:
         raise CanaryPermissionError("provider descriptor unavailable")
+    if provider_id == "tushare":
+        from .tushare import TushareExecutionBlocked
+
+        raise TushareExecutionBlocked("tushare official HTTPS is unproven")
     if not _valid_authorization_id(external_authorization_id):
         raise CanaryPermissionError("external authorization is invalid")
+    if not isinstance(environ, Mapping) or not callable(client_factory):
+        raise CanaryPermissionError("closed environment and client factory required")
+    if type(registry) is ShadowRegistry:
+        registry_obj = registry
+    elif isinstance(registry, (Path, str)):
+        registry_obj = ShadowRegistry(registry)
+    else:
+        raise CanaryPermissionError("concrete shadow registry required")
+    from .tickflow import TickFlowAdapter
+
+    adapter = TickFlowAdapter
+    record, terms = _read_canary_descriptor(
+        provider_id,
+        registry_obj,
+        adapter_hash=adapter.ADAPTER_HASH,
+        endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
+        source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
+    )
+    if record.credential_env_name != exact_credential_env(provider_id):
+        raise CanaryPermissionError("provider credential mapping unavailable")
     return AuthorizedCanarySession(
+        _issuer=_SESSION_ISSUER,
         provider_id=provider_id,
-        registry_path=Path(registry_path),
+        registry_path=Path(registry_obj.path),
         external_authorization_id=external_authorization_id,
-        transport=transport,
+        expected_state_version=record.state_version,
+        expected_terms_evidence_hash=record.terms_evidence_hash or "",
+        expected_terms_review_id=terms.review_id,
+        credential_env_name=record.credential_env_name,
+        environ=environ,
+        client_factory=client_factory,
     )
 
 
