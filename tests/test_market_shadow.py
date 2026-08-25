@@ -1,12 +1,19 @@
 """Task13 scheduler and automation boundary behavior."""
 
+import json
 from datetime import UTC, datetime
 
 import pytest
 
 from backend.app.market.providers.registry import ShadowRegistry
-from backend.app.market.shadow_jobs import CanonicalOutcomeScanner, ShadowHandoff, ShadowJobStore
-from backend.app.market.shadow_scheduler import ShadowScheduler
+from backend.app.market.shadow_jobs import (
+    CanonicalOutcomeScanner,
+    ShadowBundlePublisher,
+    ShadowHandoff,
+    ShadowJobStore,
+    ShadowOutcomeReporter,
+)
+from backend.app.market.shadow_scheduler import ShadowScheduler, build_shadow_scheduler
 from tests.test_market_provider_registry import _record, _sha, _terms
 
 
@@ -36,6 +43,51 @@ def test_shadow_handoff_drops_when_bounded_queue_is_full():
 def test_scheduler_is_independent_worker_surface():
     with pytest.raises(TypeError):
         ShadowScheduler(None)
+
+
+def test_scheduler_idle_publishes_run_level_outcome(tmp_path):
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    root = tmp_path / "shadow"
+    scheduler = ShadowScheduler(
+        ShadowJobStore(registry, root),
+        canonical_scanner=CanonicalOutcomeScanner(
+            tmp_path / "canonical",
+            shadow_start_date=datetime(2026, 1, 1).date(),
+            provider_id="tickflow",
+            window_id="tickflow-window-1",
+        ),
+        outcome_reporter=ShadowOutcomeReporter(ShadowBundlePublisher(root)),
+    )
+    assert scheduler.run_once().status == "idle"
+    report = root / "bundles" / "outcome-run-none-idle" / "report.json"
+    assert json.loads(report.read_text()) == {
+        "job_id": None,
+        "reason_code": None,
+        "report_version": 1,
+        "state_version": None,
+        "status": "idle",
+    }
+
+
+def test_production_shadow_factory_wires_scanner_publisher_writer_and_scheduler(tmp_path):
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    scheduler = build_shadow_scheduler(
+        registry=registry,
+        canonical_root=tmp_path / "canonical",
+        shadow_root=tmp_path / "shadow",
+        shadow_start_date=datetime(2026, 1, 1).date(),
+        provider_id="tickflow",
+        window_id="tickflow-window-1",
+    )
+    assert type(scheduler).__name__ == "ShadowScheduler"
+    assert type(scheduler.canonical_scanner).__name__ == "CanonicalOutcomeScanner"
+    assert type(scheduler.outcome_reporter).__name__ == "ShadowOutcomeReporter"
+    assert type(scheduler.terminal_writer).__name__ == "ShadowTerminalWriter"
+    assert not (tmp_path / "shadow").exists()
+    assert scheduler.run_once().status == "idle"
+    assert (tmp_path / "shadow" / "bundles" / "outcome-run-none-idle").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -81,6 +133,7 @@ def test_scheduler_releases_sqlite_lease_on_every_worker_exit(
             provider_id="tickflow",
             window_id=window.window_id,
         ),
+        outcome_reporter=ShadowOutcomeReporter(ShadowBundlePublisher(tmp_path / "shadow")),
     )
     result = scheduler.run_once(now=datetime(2026, 1, 2, tzinfo=UTC))
     assert result.status == (
@@ -88,6 +141,9 @@ def test_scheduler_releases_sqlite_lease_on_every_worker_exit(
     )
     assert store.get("job-1").run_status == expected_status
     assert store.get("job-1").lease_owner is None
+    outcome_reports = list((tmp_path / "shadow" / "bundles").glob("*/report.json"))
+    assert outcome_reports
+    assert any(json.loads(path.read_text())["job_id"] == "job-1" for path in outcome_reports)
 
 
 def test_scheduler_worker_exception_releases_sqlite_lease(tmp_path):
@@ -125,6 +181,7 @@ def test_scheduler_worker_exception_releases_sqlite_lease(tmp_path):
             provider_id="tickflow",
             window_id=window.window_id,
         ),
+        outcome_reporter=ShadowOutcomeReporter(ShadowBundlePublisher(tmp_path / "shadow")),
     ).run_once()
     assert result.status == "failed"
     assert store.get("job-error").run_status == "failed"

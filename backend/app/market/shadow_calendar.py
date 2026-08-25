@@ -22,6 +22,13 @@ class ShadowCalendarUnavailable(RuntimeError):
     """Calendar evidence is missing, unknown, malformed, or changed."""
 
 
+_TRUSTED_AUTHORITY_VERSION = "r2f3-calendar-authority-v1"
+_TRUSTED_SOURCES = (
+    ("SSE", "Shanghai Stock Exchange", "https://www.sse.com.cn/", None),
+    ("SZSE", "Shenzhen Stock Exchange", "https://www.szse.cn/", None),
+)
+
+
 class ConfirmedSessionSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -63,6 +70,16 @@ class ShadowCalendarConfig(BaseModel):
     sources: tuple[ShadowCalendarSource, ...] = Field(min_length=1)
     closed_dates: tuple[date, ...]
 
+    @model_validator(mode="after")
+    def validate_trusted_sources(self) -> ShadowCalendarConfig:
+        actual = tuple(
+            (item.exchange, item.title, item.url, item.notice_no)
+            for item in sorted(self.sources, key=lambda value: value.exchange)
+        )
+        if actual != _TRUSTED_SOURCES:
+            raise ValueError("calendar sources are not trusted")
+        return self
+
 
 def _canonical(value: Any) -> bytes:
     return (
@@ -91,10 +108,12 @@ class ConfirmedCalendarReader:
         self.window_id = window_id
         self.universe_id = universe_id
         self.universe_sha256 = universe_sha256
-        if not self.calendar_root.is_absolute() or not re.fullmatch(
-            r"[0-9a-f]{64}", universe_sha256
+        if (
+            not self.calendar_root.is_absolute()
+            or provider_id not in {"tickflow", "tushare"}
+            or not re.fullmatch(r"[0-9a-f]{64}", universe_sha256)
         ):
-            raise ValueError("shadow calendar descriptor is invalid")
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
         authority = self._read_file(self.calendar_root / "calendar-manifest.json")
         try:
             payload = json.loads(authority.decode("utf-8"))
@@ -102,15 +121,13 @@ class ConfirmedCalendarReader:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"generation", "official_metadata"}
-            or not isinstance(payload.get("generation"), str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", payload["generation"])
-            or not isinstance(payload.get("official_metadata"), str)
-            or not payload["official_metadata"].strip()
+            or set(payload) != {"payload_sha256"}
+            or not isinstance(payload.get("payload_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload["payload_sha256"])
         ):
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-        self.calendar_generation = payload["generation"]
-        self.official_metadata = payload["official_metadata"]
+        self.payload_sha256 = payload["payload_sha256"]
+        self.calendar_generation = f"{_TRUSTED_AUTHORITY_VERSION}-{self.payload_sha256[:16]}"
 
     def _read_file(self, path: Path) -> bytes:
         try:
@@ -142,6 +159,13 @@ class ConfirmedCalendarReader:
             candidates = sorted(self.calendar_root.glob("cn_a_share_*.json"))
         else:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        if not candidates:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        payload_bytes = b"".join(
+            path.name.encode("utf-8") + b"\0" + self._read_file(path) for path in candidates
+        )
+        if _sha(payload_bytes) != self.payload_sha256:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
         found: list[dict[str, Any]] = []
         for path in candidates:
             try:
@@ -149,16 +173,8 @@ class ConfirmedCalendarReader:
             except (UnicodeError, json.JSONDecodeError) as exc:
                 raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
             values = payload if isinstance(payload, list) else [payload]
-            # Reviewed dumps may carry one explicit authority envelope.  Preserve the
-            # envelope in the generation hash, while validating the same CalendarConfig
-            # objects as the canonical reader.
             if isinstance(payload, dict) and "configs" in payload:
-                envelope = payload
-                if envelope.get("generation") != self.calendar_generation:
-                    raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-                values = envelope["configs"]
-                if not isinstance(values, list):
-                    raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+                raise ShadowCalendarUnavailable("confirmed calendar unavailable")
             for item in values:
                 if not isinstance(item, dict) or item.get("year") not in years:
                     continue
@@ -192,7 +208,8 @@ class ConfirmedCalendarReader:
                 sessions.append(current)
             current += timedelta(days=1)
         calendar_payload = {
-            "metadata": self.official_metadata,
+            "authority_version": _TRUSTED_AUTHORITY_VERSION,
+            "payload_sha256": self.payload_sha256,
             "generation": self.calendar_generation,
             "configs": configs,
         }

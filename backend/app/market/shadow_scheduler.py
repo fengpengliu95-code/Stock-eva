@@ -14,9 +14,11 @@ from pydantic import BaseModel, ConfigDict
 
 from .shadow_jobs import (
     CanonicalOutcomeScanner,
+    ShadowBundlePublisher,
     ShadowJob,
     ShadowJobStore,
     ShadowJobUnavailable,
+    ShadowOutcomeReporter,
 )
 from .shadow_terminal import ShadowTerminalWriter
 
@@ -44,10 +46,13 @@ class ShadowScheduler:
         cancellation: Callable[[], bool] | None = None,
         handoff=None,
         canonical_scanner: CanonicalOutcomeScanner,
+        outcome_reporter: ShadowOutcomeReporter,
         terminal_writer: ShadowTerminalWriter | None = None,
     ) -> None:
         if type(canonical_scanner) is not CanonicalOutcomeScanner:
             raise TypeError("shadow scheduler requires CanonicalOutcomeScanner")
+        if type(outcome_reporter) is not ShadowOutcomeReporter:
+            raise TypeError("shadow scheduler requires ShadowOutcomeReporter")
         if terminal_writer is not None and type(terminal_writer) is not ShadowTerminalWriter:
             raise TypeError("shadow scheduler requires ShadowTerminalWriter")
         self.job_store = job_store
@@ -59,6 +64,7 @@ class ShadowScheduler:
         self.cancellation = cancellation or (lambda: False)
         self.handoff = handoff
         self.canonical_scanner = canonical_scanner
+        self.outcome_reporter = outcome_reporter
         self.terminal_writer = terminal_writer
 
     def run_once(self, *, now: datetime | None = None) -> ShadowSchedulerOutcome:
@@ -72,6 +78,7 @@ class ShadowScheduler:
         # A scanner/queue caller may pass the identity; default worker selection is bounded.
         job = self._next_job()
         if job is None:
+            self._report(status="idle")
             return ShadowSchedulerOutcome(
                 status="idle", elapsed_ms=int((time.monotonic() - started) * 1000)
             )
@@ -80,22 +87,37 @@ class ShadowScheduler:
                 job.job_id, owner=self.owner, now=now, lease_seconds=self.lease_seconds
             )
         except ShadowJobUnavailable:
+            self._report(status="busy", job_id=job.job_id, state_version=job.state_version)
             return ShadowSchedulerOutcome(
                 status="busy",
                 job_id=job.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.cancellation():
-            self.job_store.release_after_worker(leased, status="cancelled")
+            try:
+                self._report(
+                    status="cancelled",
+                    job_id=leased.job_id,
+                    state_version=leased.state_version,
+                )
+            finally:
+                self.job_store.release_after_worker(leased, status="cancelled")
             return ShadowSchedulerOutcome(
                 status="cancelled",
                 job_id=leased.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.worker is None:
-            self.job_store.release_after_worker(leased, status="pending")
+            try:
+                self._report(
+                    status="no_worker",
+                    job_id=leased.job_id,
+                    state_version=leased.state_version,
+                )
+            finally:
+                self.job_store.release_after_worker(leased, status="pending")
             return ShadowSchedulerOutcome(
-                status="leased",
+                status="no_worker",
                 job_id=leased.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
@@ -114,21 +136,54 @@ class ShadowScheduler:
             if time.monotonic() - started > self.deadline_seconds:
                 status = "budget_exhausted"
             if status in {"failed", "failure", "unavailable", "budget_exhausted"}:
+                self._report(
+                    status=(
+                        "unavailable"
+                        if status == "unavailable"
+                        else "budget_exhausted"
+                        if status == "budget_exhausted"
+                        else "failure"
+                    ),
+                    job_id=leased.job_id,
+                    state_version=leased.state_version,
+                )
                 self._persist_or_release(
                     leased,
                     result,
                     outcome="unavailable" if status == "unavailable" else "failure",
                 )
             elif status not in {"completed", "success"}:
+                self._report(
+                    status="pending",
+                    job_id=leased.job_id,
+                    state_version=leased.state_version,
+                    reason_code="unexpected_worker_status",
+                )
                 self.job_store.release_after_worker(leased, status="pending")
             elif status in {"completed", "success"}:
                 context = self._terminal_context(result)
                 if self.terminal_writer is None or context is None:
+                    reported = self._report(
+                        status="missing_context",
+                        job_id=leased.job_id,
+                        state_version=leased.state_version,
+                    )
                     self.job_store.release_after_worker(leased, status="failed")
                     status = "failed"
-                    failure_class = "terminal_context_unavailable"
+                    failure_class = (
+                        "terminal_context_unavailable" if reported else "outcome_report_unavailable"
+                    )
                 else:
-                    self.terminal_writer.write_success(self.job_store.registry, **context)
+                    if not self._report(
+                        status="success",
+                        job_id=leased.job_id,
+                        state_version=leased.state_version,
+                    ):
+                        self.job_store.release_after_worker(leased, status="failed")
+                        status = "failed"
+                        failure_class = "outcome_report_unavailable"
+                    else:
+                        self.terminal_writer.write_success(self.job_store.registry, **context)
             return ShadowSchedulerOutcome(
                 status=str(status),
                 job_id=leased.job_id,
@@ -136,7 +191,14 @@ class ShadowScheduler:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         except Exception:
-            self.job_store.release_after_worker(leased, status="failed")
+            try:
+                self._report(
+                    status="worker_exception",
+                    job_id=leased.job_id,
+                    state_version=leased.state_version,
+                )
+            finally:
+                self.job_store.release_after_worker(leased, status="failed")
             return ShadowSchedulerOutcome(
                 status="failed",
                 job_id=leased.job_id,
@@ -152,6 +214,25 @@ class ShadowScheduler:
             else getattr(result, "terminal_context", None)
         )
         return context if isinstance(context, dict) else None
+
+    def _report(
+        self,
+        *,
+        status: str,
+        job_id: str | None = None,
+        state_version: int | None = None,
+        reason_code: str | None = None,
+    ) -> bool:
+        try:
+            self.outcome_reporter.publish(
+                status=status,
+                job_id=job_id,
+                state_version=state_version,
+                reason_code=reason_code,
+            )
+        except Exception:
+            return False
+        return True
 
     def _persist_or_release(self, leased: ShadowJob, result: Any, *, outcome: str) -> None:
         context = (
@@ -187,4 +268,32 @@ class ShadowScheduler:
         return self.canonical_scanner.enqueue(self.job_store, limit=limit)
 
 
-__all__ = ["ShadowScheduler", "ShadowSchedulerOutcome"]
+def build_shadow_scheduler(
+    *,
+    registry,
+    canonical_root,
+    shadow_root,
+    shadow_start_date,
+    provider_id: str,
+    window_id: str,
+    worker: Callable[..., Any] | None = None,
+    owner: str | None = None,
+) -> ShadowScheduler:
+    """Construct the approved offline shadow call graph without starting work."""
+    publisher = ShadowBundlePublisher(shadow_root)
+    return ShadowScheduler(
+        ShadowJobStore(registry, shadow_root),
+        worker=worker,
+        owner=owner,
+        canonical_scanner=CanonicalOutcomeScanner(
+            canonical_root,
+            shadow_start_date=shadow_start_date,
+            provider_id=provider_id,
+            window_id=window_id,
+        ),
+        outcome_reporter=ShadowOutcomeReporter(publisher),
+        terminal_writer=ShadowTerminalWriter(publisher),
+    )
+
+
+__all__ = ["ShadowScheduler", "ShadowSchedulerOutcome", "build_shadow_scheduler"]

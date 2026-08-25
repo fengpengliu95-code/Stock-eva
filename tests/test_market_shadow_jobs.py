@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 from datetime import date
+from multiprocessing import get_context
 from types import SimpleNamespace
 
 import duckdb
@@ -37,6 +38,15 @@ from backend.app.market.shadow_terminal import (
     write_terminal_success,
 )
 from tests.test_market_provider_registry import _record, _sha, _terms
+
+
+def _publish_same_bundle_process(arguments):
+    root, identity, payload = arguments
+    try:
+        ShadowBundlePublisher(root).publish(identity, payload)
+        return "ok"
+    except Exception:
+        return "error"
 
 
 def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
@@ -108,10 +118,6 @@ def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
 def _calendar_root(tmp_path):
     root = tmp_path / "calendar"
     root.mkdir(exist_ok=True)
-    (root / "calendar-manifest.json").write_text(
-        json.dumps({"generation": "calendar-v1", "official_metadata": "official-calendar-config"}),
-        encoding="utf-8",
-    )
     (root / "cn_a_share_2026.json").write_text(
         json.dumps(
             {
@@ -119,12 +125,28 @@ def _calendar_root(tmp_path):
                 "status": "confirmed",
                 "published_on": "2026-01-01",
                 "sources": [
-                    {"exchange": "SSE", "title": "official", "url": "https://example.invalid"}
+                    {
+                        "exchange": "SSE",
+                        "title": "Shanghai Stock Exchange",
+                        "url": "https://www.sse.com.cn/",
+                    },
+                    {
+                        "exchange": "SZSE",
+                        "title": "Shenzhen Stock Exchange",
+                        "url": "https://www.szse.cn/",
+                    },
                 ],
                 "closed_dates": ["2026-01-01"],
             }
         ),
         encoding="utf-8",
+    )
+    config_path = root / "cn_a_share_2026.json"
+    payload_sha256 = hashlib.sha256(
+        config_path.name.encode() + b"\0" + config_path.read_bytes()
+    ).hexdigest()
+    (root / "calendar-manifest.json").write_text(
+        json.dumps({"payload_sha256": payload_sha256}), encoding="utf-8"
     )
     return root
 
@@ -133,7 +155,7 @@ def _calendar(tmp_path):
     return ConfirmedCalendarReader(
         _calendar_root(tmp_path).resolve(),
         provider_id="tickflow",
-        window_id="window-1",
+        window_id="tickflow-window-1",
         universe_id="universe-1",
         universe_sha256="a" * 64,
     )
@@ -170,6 +192,21 @@ def test_contract_policy_or_terms_change_resets_window(tmp_path):
     publisher.publish("policy-v1", {"policy_sha256": "a" * 64})
     with pytest.raises(ShadowJobUnavailable):
         publisher.publish("policy-v1", {"policy_sha256": "b" * 64})
+
+
+def test_eight_processes_same_bundle_identity_are_idempotent(tmp_path):
+    root = str(tmp_path / "shadow")
+    arguments = [(root, "same-identity", {"status": "failure", "report_version": 1})] * 8
+    context = get_context("spawn")
+    with context.Pool(8) as pool:
+        results = pool.map(_publish_same_bundle_process, arguments)
+    assert results == ["ok"] * 8
+    assert (
+        json.loads((tmp_path / "shadow" / "bundles" / "same-identity" / "report.json").read_text())[
+            "status"
+        ]
+        == "failure"
+    )
 
 
 def test_mismatch_quarantines_secondary_not_primary(tmp_path):
@@ -247,7 +284,7 @@ def test_confirmed_session_snapshot_freezes_calendar_generation_and_next_session
     snapshot = _calendar(tmp_path).read(
         date(2026, 1, 1), date(2026, 1, 5), captured_at="2026-01-06T00:00:00Z"
     )
-    assert snapshot.calendar_generation == "calendar-v1"
+    assert snapshot.calendar_generation.startswith("r2f3-calendar-authority-v1-")
     assert snapshot.confirmed_next_sessions == (date(2026, 1, 2), date(2026, 1, 5))
 
 
@@ -437,6 +474,30 @@ def test_duplicate_involved_year_calendar_config_is_unavailable(tmp_path):
         _calendar(tmp_path).read(date(2026, 1, 1), date(2026, 1, 5))
 
 
+def test_calendar_rejects_spoofed_authority_and_unknown_provider(tmp_path):
+    root = _calendar_root(tmp_path)
+    config_path = root / "cn_a_share_2026.json"
+    payload = json.loads(config_path.read_text())
+    payload["sources"][0]["title"] = "evil"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ShadowCalendarUnavailable):
+        ConfirmedCalendarReader(
+            root.resolve(),
+            provider_id="tickflow",
+            window_id="tickflow-window-1",
+            universe_id="universe-1",
+            universe_sha256="a" * 64,
+        ).read(date(2026, 1, 1), date(2026, 1, 5))
+    with pytest.raises(ShadowCalendarUnavailable):
+        ConfirmedCalendarReader(
+            root.resolve(),
+            provider_id="evil",
+            window_id="tickflow-window-1",
+            universe_id="universe-1",
+            universe_sha256="a" * 64,
+        )
+
+
 def test_scanner_ignores_arbitrary_shadow_bundle_json(tmp_path):
     root = tmp_path / "dataset"
     bundle = root / "bundles" / "arbitrary"
@@ -464,6 +525,24 @@ def test_scanner_rejects_uppercase_manifest_hash(tmp_path):
     )
 
 
+def test_scanner_rejects_nonhex_r2f2_lineage_sha_on_real_parquet(tmp_path):
+    root = tmp_path / "dataset"
+    _write_canonical_dataset(root)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][0]["evidence_sha256"] = "z" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert (
+        CanonicalOutcomeScanner(
+            root,
+            shadow_start_date=date(2026, 1, 1),
+            provider_id="tickflow",
+            window_id="w1",
+        ).scan()
+        == ()
+    )
+
+
 def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_path):
     from backend.app.market.shadow_terminal import TerminalGraphIdentity
 
@@ -475,7 +554,10 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
     registry.attach_terms_to_provider("tickflow", terms)
     state = registry.transition("tickflow", "canary", expected_state_version=1)
     registry.transition("tickflow", "shadow", expected_state_version=state.state_version)
-    window = registry.ensure_window("tickflow", _sha("vector"), "calendar-v1", _sha("calendar"))
+    snapshot = _calendar(tmp_path).read(date(2026, 1, 1), date(2026, 1, 5))
+    window = registry.ensure_window(
+        "tickflow", _sha("v"), snapshot.calendar_generation, snapshot.calendar_sha256
+    )
     job_id, session_id, evidence_id, candidate_id = "job-1", "session-1", "e-1", "c-1"
     request = ShadowLogicalRequest(
         job_id=job_id,
@@ -667,7 +749,6 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         ),
     )
     connection.commit()
-    snapshot = _calendar(tmp_path).read(date(2026, 1, 1), date(2026, 1, 5))
     identity = TerminalGraphIdentity(
         "tickflow",
         job_id,

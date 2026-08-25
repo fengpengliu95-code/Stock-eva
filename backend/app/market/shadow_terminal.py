@@ -304,6 +304,15 @@ def _write_terminal_success_graph(
     ):
         if getattr(snapshot, name, None) != expected:
             raise ShadowTerminalUnavailable("terminal snapshot drift")
+    if (
+        snapshot.provider_id != plan.provider_id
+        or snapshot.window_id != plan.window_id
+        or snapshot.universe_id == ""
+        or not set(item.trade_date for item in plan.requests).issubset(
+            set(snapshot.confirmed_next_sessions)
+        )
+    ):
+        raise ShadowTerminalUnavailable("terminal session snapshot drift")
     evidence, candidate_bundle, completion_items = _strict_bundle_validation(
         plan=plan,
         evidence_reader=evidence_reader,
@@ -445,11 +454,11 @@ def _write_terminal_success_graph(
         read_connection = registry._connection_for_read()
         try:
             current_job = read_connection.execute(
-                "SELECT job_id,provider_id,window_id,run_status,state_version,version_vector_sha256 FROM shadow_job WHERE job_id=? AND provider_id=? AND window_id=?",
+                "SELECT job_id,provider_id,window_id,universe_id,run_status,state_version,version_vector_sha256 FROM shadow_job WHERE job_id=? AND provider_id=? AND window_id=?",
                 (identity.job_id, identity.provider_id, identity.window_id),
             ).fetchone()
             current_window = read_connection.execute(
-                "SELECT consecutive_sessions,window_state,state_version FROM qualification_window WHERE provider_id=? AND window_id=?",
+                "SELECT consecutive_sessions,window_state,calendar_generation,calendar_sha256,version_vector_sha256,state_version FROM qualification_window WHERE provider_id=? AND window_id=?",
                 (identity.provider_id, identity.window_id),
             ).fetchone()
         finally:
@@ -458,10 +467,19 @@ def _write_terminal_success_graph(
     if (
         current_job is None
         or current_window is None
-        or current_job[4] != expected_job_state_version
-        or current_window[2] != expected_window_state_version
-        or current_job[3] not in {"leased", "pending_normalization"}
-        or current_job[5] != version_vector_sha256
+        or snapshot.provider_id != identity.provider_id
+        or snapshot.window_id != identity.window_id
+        or snapshot.universe_id != current_job[3]
+        or current_job[5] != expected_job_state_version
+        or current_window[5] != expected_window_state_version
+        or current_job[4] not in {"leased", "pending_normalization"}
+        or current_job[6] != version_vector_sha256
+        or current_window[2] != snapshot.calendar_generation
+        or current_window[3] != snapshot.calendar_sha256
+        or current_window[4] != version_vector_sha256
+        or not set(item.trade_date for item in plan.requests).issubset(
+            set(snapshot.confirmed_next_sessions)
+        )
     ):
         raise ShadowTerminalUnavailable("terminal expected version conflict")
     bundle_payload = {
@@ -481,14 +499,18 @@ def _write_terminal_success_graph(
             "job_id": current_job[0],
             "provider_id": current_job[1],
             "window_id": current_job[2],
-            "run_status": current_job[3],
-            "state_version": current_job[4],
-            "version_vector_sha256": current_job[5],
+            "universe_id": current_job[3],
+            "run_status": current_job[4],
+            "state_version": current_job[5],
+            "version_vector_sha256": current_job[6],
         },
         "window_snapshot": {
             "consecutive_sessions": current_window[0],
             "window_state": current_window[1],
-            "state_version": current_window[2],
+            "calendar_generation": current_window[2],
+            "calendar_sha256": current_window[3],
+            "version_vector_sha256": current_window[4],
+            "state_version": current_window[5],
         },
         "completion_envelope": json.loads(completion_raw.decode("utf-8")),
         "digests": {
@@ -773,9 +795,17 @@ def write_terminal_success(
 
 
 class ShadowTerminalWriter:
-    """Named Task13 terminal writer; no other module may perform terminal CAS."""
+    """Typed production terminal dependency bound to one immutable publisher."""
 
-    write_success = staticmethod(write_terminal_success)
+    def __init__(self, bundle_publisher: ShadowBundlePublisher):
+        if type(bundle_publisher) is not ShadowBundlePublisher:
+            raise TypeError("terminal writer requires ShadowBundlePublisher")
+        self.bundle_publisher = bundle_publisher
+
+    def write_success(self, registry: ShadowRegistry, **context: Any) -> ShadowTerminalAttestation:
+        context = dict(context)
+        context.setdefault("bundle_publisher", self.bundle_publisher)
+        return write_terminal_success(registry, **context)
 
 
 __all__ = [

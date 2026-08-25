@@ -925,6 +925,27 @@ def main() -> int:
         # Task13 is an offline gate: plan is read-only and execute is blocked until an
         # external authorization record is supplied to a separately reviewed runner.
         if args.command == "market-provider-shadow":
+            if args.execute and args.external_authorization_id:
+                try:
+                    from backend.app.market.shadow_scheduler import build_shadow_scheduler
+
+                    settings = get_settings()
+                    layout = StorageLayout(settings)
+                    canonical_root = settings.local_market_dataset_root or (
+                        settings.provider_shadow_root / "canonical"
+                    )
+                    build_shadow_scheduler(
+                        registry=ShadowRegistry(layout.provider_registry_database),
+                        canonical_root=canonical_root,
+                        shadow_root=layout.provider_shadow_root,
+                        shadow_start_date=args.start,
+                        provider_id=args.provider,
+                        window_id=f"shadow-{args.provider}-{args.start.isoformat()}-{args.end.isoformat()}",
+                    )
+                except Exception:
+                    # Construction is fail-closed and deliberately does not start a worker;
+                    # the external authorization gate remains the authority boundary.
+                    pass
             payload = {
                 "status": "planned" if not args.execute else "blocked",
                 "provider": args.provider,

@@ -53,6 +53,7 @@ _CANONICAL_PARQUET_SCHEMA = (
     ("quality_issues", "JSON"),
 )
 _SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ShadowJobUnavailable(RuntimeError):
@@ -358,6 +359,15 @@ class CanonicalOutcomeScanner:
                 not isinstance(value, str) or not value for value in lineage.values()
             ):
                 return ()
+            if any(
+                not _SHA256.fullmatch(lineage[field])
+                for field in (
+                    "evidence_sha256",
+                    "candidate_manifest_sha256",
+                    "gate_report_sha256",
+                )
+            ):
+                return ()
             universe_id = str(lineage["universe_id"])
             key_bytes = f"stock-eva/r2f3/shadow-job/v1\n{self.provider_id}|{self.window_id}|{trade_date.isoformat()}|{universe_id}|{manifest['generation']}|{manifest_sha}".encode()
             results.append(
@@ -398,8 +408,33 @@ class ShadowBundlePublisher:
         try:
             return os.open(name, flags, dir_fd=parent_fd)
         except FileNotFoundError:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
             return os.open(name, flags, dir_fd=parent_fd)
+
+    @staticmethod
+    def _write_new_file(directory_fd: int, name: str, payload: bytes) -> None:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("shadow bundle short write")
+                offset += written
+            os.fsync(fd)
+            checked = os.fstat(fd)
+            if not stat.S_ISREG(checked.st_mode) or checked.st_size != len(payload):
+                raise OSError("shadow bundle file changed")
+        finally:
+            os.close(fd)
 
     def _open_directory_chain(self) -> tuple[int, int, int, int]:
         if not self.root.is_absolute():
@@ -478,20 +513,18 @@ class ShadowBundlePublisher:
                 json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 + "\n"
             ).encode()
-            (staging / "report.json").write_bytes(raw)
             marker = hashlib.sha256(raw).hexdigest() + "\n"
-            (staging / "COMMIT").write_text(marker)
-            for path in (staging / "report.json", staging / "COMMIT"):
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            dir_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            staging_dir_fd = os.open(
+                staging.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=staging_fd,
+            )
             try:
-                os.fsync(dir_fd)
+                self._write_new_file(staging_dir_fd, "report.json", raw)
+                self._write_new_file(staging_dir_fd, "COMMIT", marker.encode())
+                os.fsync(staging_dir_fd)
             finally:
-                os.close(dir_fd)
+                os.close(staging_dir_fd)
             try:
                 import ctypes
 
@@ -552,6 +585,66 @@ class ShadowBundlePublisher:
             os.close(staging_fd)
             os.close(bundles_fd)
             os.close(root_fd)
+
+
+class ShadowOutcomeReport(BaseModel):
+    """Sanitized immutable scheduler-run projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    report_version: int = 1
+    job_id: str | None = None
+    status: str
+    state_version: int | None = None
+    reason_code: str | None = None
+
+
+class ShadowOutcomeReporter:
+    """Publish every scheduler exit through the sole immutable bundle publisher."""
+
+    _STATUSES = frozenset(
+        {
+            "idle",
+            "busy",
+            "cancelled",
+            "no_worker",
+            "worker_exception",
+            "missing_context",
+            "success",
+            "failure",
+            "budget_exhausted",
+            "unavailable",
+            "pending",
+        }
+    )
+
+    def __init__(self, publisher: ShadowBundlePublisher):
+        if type(publisher) is not ShadowBundlePublisher:
+            raise TypeError("shadow outcome reporter requires ShadowBundlePublisher")
+        self.publisher = publisher
+
+    def publish(
+        self,
+        *,
+        status: str,
+        job_id: str | None = None,
+        state_version: int | None = None,
+        reason_code: str | None = None,
+    ) -> Path:
+        if status not in self._STATUSES:
+            raise ShadowJobUnavailable("shadow outcome status unavailable")
+        report = ShadowOutcomeReport(
+            job_id=job_id,
+            status=status,
+            state_version=state_version,
+            reason_code=reason_code,
+        )
+        identity = "outcome-{}-{}-{}".format(
+            job_id or "run",
+            state_version if state_version is not None else "none",
+            status,
+        )
+        return self.publisher.publish(identity, report.model_dump(mode="json"))
 
 
 def _safe(value: str) -> str:
@@ -1029,5 +1122,7 @@ __all__ = [
     "ShadowJob",
     "ShadowJobStore",
     "ShadowJobUnavailable",
+    "ShadowOutcomeReport",
+    "ShadowOutcomeReporter",
     "ShadowSessionReport",
 ]
