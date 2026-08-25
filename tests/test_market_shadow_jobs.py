@@ -555,6 +555,33 @@ def test_publisher_verifies_each_held_bundle_file_before_success(
         ShadowBundlePublisher(tmp_path / "shadow").publish("file-check", {"value": 1})
 
 
+@pytest.mark.parametrize("target", ["OWNER", "report.json", "COMMIT"])
+def test_publisher_rejects_permission_change_before_final_verify(tmp_path, monkeypatch, target):
+    original_fsync = os.fsync
+    fsync_calls = 0
+    target_path = tmp_path / "shadow" / "bundles" / "permission-check" / target
+
+    def chmod_after_commit(fd):
+        nonlocal fsync_calls
+        original_fsync(fd)
+        fsync_calls += 1
+        if fsync_calls == 4:
+            os.chmod(target_path, 0o640)
+
+    monkeypatch.setattr(os, "fsync", chmod_after_commit)
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish("permission-check", {"value": 1})
+
+
+@pytest.mark.parametrize("target", ["OWNER", "report.json", "COMMIT"])
+def test_publisher_rejects_permission_change_on_idempotent_reopen(tmp_path, target):
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    publisher.publish("permission-reopen", {"value": 1})
+    os.chmod(tmp_path / "shadow" / "bundles" / "permission-reopen" / target, 0o640)
+    with pytest.raises(ShadowJobUnavailable):
+        publisher.publish("permission-reopen", {"value": 1})
+
+
 def _owner_bytes(identity, payload):
     raw = (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
@@ -579,8 +606,10 @@ def test_publisher_recovers_owner_and_report_crash_gaps(tmp_path, phase):
     directory = tmp_path / "shadow" / "bundles" / identity
     directory.mkdir(parents=True)
     (directory / "OWNER").write_bytes(owner_raw)
+    (directory / "OWNER").chmod(0o600)
     if phase == "report":
         (directory / "report.json").write_bytes(raw)
+        (directory / "report.json").chmod(0o600)
     result = ShadowBundlePublisher(tmp_path / "shadow").publish(identity, payload)
     assert result == directory
     assert (directory / "OWNER").read_bytes() == owner_raw

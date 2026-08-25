@@ -421,7 +421,7 @@ class ShadowBundlePublisher:
             return os.open(name, flags, dir_fd=parent_fd)
 
     @staticmethod
-    def _write_new_file(directory_fd: int, name: str, payload: bytes) -> None:
+    def _write_new_file(directory_fd: int, name: str, payload: bytes) -> os.stat_result:
         fd = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -439,6 +439,7 @@ class ShadowBundlePublisher:
             checked = os.fstat(fd)
             if not stat.S_ISREG(checked.st_mode) or checked.st_size != len(payload):
                 raise OSError("shadow bundle file changed")
+            return checked
         finally:
             os.close(fd)
 
@@ -464,11 +465,12 @@ class ShadowBundlePublisher:
             os.close(fd)
 
     @staticmethod
-    def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
         return (
             info.st_dev,
             info.st_ino,
-            stat.S_IFMT(info.st_mode),
+            info.st_mode,
+            info.st_size,
             info.st_mtime_ns,
             getattr(info, "st_ctime_ns", 0),
         )
@@ -547,7 +549,11 @@ class ShadowBundlePublisher:
             raise ShadowJobUnavailable("shadow bundle file conflict") from exc
         try:
             before = os.fstat(fd)
-            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > limit
+            ):
                 raise ShadowJobUnavailable("shadow bundle file conflict")
             raw = os.read(fd, min(limit, len(expected) + 1))
             after = os.fstat(fd)
@@ -561,6 +567,16 @@ class ShadowBundlePublisher:
             return cls._fingerprint(before), len(raw), hashlib.sha256(raw).hexdigest(), raw
         finally:
             os.close(fd)
+
+    @classmethod
+    def _record_written_file(cls, info: os.stat_result, payload: bytes):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size != len(payload)
+        ):
+            raise ShadowJobUnavailable("shadow bundle file conflict")
+        return cls._fingerprint(info), len(payload), hashlib.sha256(payload).hexdigest(), payload
 
     @classmethod
     def _verify_files(cls, directory_fd: int, records: dict[str, tuple]) -> None:
@@ -669,33 +685,42 @@ class ShadowBundlePublisher:
                             raise ShadowJobUnavailable("shadow bundle identity conflict")
                 except OSError as exc:
                     raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+                records = {
+                    "OWNER": self._capture_file(destination_fd, "OWNER", existing_owner),
+                }
                 if "report.json" not in entries:
-                    self._write_new_file(destination_fd, "report.json", raw)
+                    records["report.json"] = self._record_written_file(
+                        self._write_new_file(destination_fd, "report.json", raw), raw
+                    )
+                else:
+                    records["report.json"] = self._capture_file(destination_fd, "report.json", raw)
                 if "COMMIT" not in entries:
-                    self._write_new_file(destination_fd, "COMMIT", marker)
+                    records["COMMIT"] = self._record_written_file(
+                        self._write_new_file(destination_fd, "COMMIT", marker), marker
+                    )
                     os.fsync(destination_fd)
                     os.fsync(bundles_fd)
                     expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
-                records = {
-                    "OWNER": self._capture_file(destination_fd, "OWNER", existing_owner),
-                    "report.json": self._capture_file(destination_fd, "report.json", raw),
-                    "COMMIT": self._capture_file(destination_fd, "COMMIT", marker),
-                }
+                else:
+                    records["COMMIT"] = self._capture_file(destination_fd, "COMMIT", marker)
                 self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
                 self._verify_files(destination_fd, records)
                 return destination
-            self._write_new_file(destination_fd, "OWNER", owner_raw)
-            self._write_new_file(destination_fd, "report.json", raw)
+            records = {
+                "OWNER": self._record_written_file(
+                    self._write_new_file(destination_fd, "OWNER", owner_raw), owner_raw
+                ),
+                "report.json": self._record_written_file(
+                    self._write_new_file(destination_fd, "report.json", raw), raw
+                ),
+            }
             # COMMIT is created last; an incomplete directory is never attachable.
-            self._write_new_file(destination_fd, "COMMIT", marker)
+            records["COMMIT"] = self._record_written_file(
+                self._write_new_file(destination_fd, "COMMIT", marker), marker
+            )
             os.fsync(destination_fd)
             os.fsync(bundles_fd)
             expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
-            records = {
-                "OWNER": self._capture_file(destination_fd, "OWNER", owner_raw),
-                "report.json": self._capture_file(destination_fd, "report.json", raw),
-                "COMMIT": self._capture_file(destination_fd, "COMMIT", marker),
-            }
             self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
             self._verify_files(destination_fd, records)
             return destination
