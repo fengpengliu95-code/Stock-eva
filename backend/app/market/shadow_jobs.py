@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import sqlite3
+import stat
+from collections import deque
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +70,288 @@ class ShadowSessionReport(BaseModel):
     report_ref: str
     report_sha256: str
     report_version: int = 1
+
+
+class CanonicalManifestUnavailable(RuntimeError):
+    """Published canonical manifest did not satisfy the scanner contract."""
+
+
+class PublishedCanonicalManifestScanner:
+    """Descriptor-bound scanner for the canonical DatasetManifest only."""
+
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        shadow_start_date: date,
+        shadow_end_date: date | None = None,
+        provider_id: str,
+        window_id: str,
+    ) -> None:
+        self.root = Path(root)
+        self.shadow_start_date = shadow_start_date
+        self.shadow_end_date = shadow_end_date
+        self.provider_id = provider_id
+        self.window_id = window_id
+
+    @staticmethod
+    def _read(path: Path) -> tuple[bytes, tuple[int, int, int, int]]:
+        try:
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise CanonicalManifestUnavailable("canonical manifest unavailable")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                before = os.fstat(fd)
+                raw = os.read(fd, 1_048_577)
+                after = os.fstat(fd)
+            finally:
+                os.close(fd)
+            before_fp = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            after_fp = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            if len(raw) > 1_048_576 or before_fp != after_fp:
+                raise CanonicalManifestUnavailable("canonical manifest unavailable")
+            return raw, before_fp
+        except OSError as exc:
+            raise CanonicalManifestUnavailable("canonical manifest unavailable") from exc
+
+    def scan(self) -> tuple[dict[str, Any], ...]:
+        if self.provider_id not in {"tickflow", "tushare"}:
+            return ()
+        try:
+            sentinel_raw, _ = self._read(self.root / ".stock-eva-dataset.json")
+            manifest_path = self.root / "manifest.json"
+            manifest_raw, before = self._read(manifest_path)
+            _after_raw, after = self._read(manifest_path)
+        except CanonicalManifestUnavailable:
+            return ()
+        if before != after:
+            return ()
+        try:
+            sentinel = json.loads(sentinel_raw)
+            manifest = json.loads(manifest_raw)
+        except (UnicodeError, json.JSONDecodeError):
+            return ()
+        if not isinstance(sentinel, dict) or sentinel != {
+            "dataset": "stock-eva-market",
+            "schema_version": 2,
+        }:
+            return ()
+        if not isinstance(manifest, dict) or set(manifest) != {
+            "dataset",
+            "schema_version",
+            "generation",
+            "files",
+        }:
+            return ()
+        if (
+            manifest.get("dataset") != "stock-eva-market"
+            or manifest.get("schema_version") != 2
+            or not isinstance(manifest.get("generation"), str)
+            or not isinstance(manifest.get("files"), list)
+        ):
+            return ()
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        files = manifest["files"]
+        if not files:
+            return ()
+        results: list[dict[str, Any]] = []
+        for item in files:
+            if not isinstance(item, dict) or item.get("source", "baostock") != "baostock":
+                return ()
+            required = {"path", "sha256", "row_count", "trade_date", "source"}
+            if not required <= set(item):
+                return ()
+            try:
+                trade_date = date.fromisoformat(str(item["trade_date"]))
+            except ValueError:
+                return ()
+            if (
+                trade_date < self.shadow_start_date
+                or (self.shadow_end_date is not None and trade_date > self.shadow_end_date)
+                or not isinstance(item["path"], str)
+                or not isinstance(item["sha256"], str)
+                or len(item["sha256"]) != 64
+            ):
+                return ()
+            relative = Path(item["path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                return ()
+            try:
+                object_raw, _ = self._read(self.root / relative)
+            except CanonicalManifestUnavailable:
+                return ()
+            if hashlib.sha256(object_raw).hexdigest() != item["sha256"]:
+                return ()
+            lineage = {
+                key: item.get(key)
+                for key in (
+                    "provider_id",
+                    "universe_id",
+                    "evidence_id",
+                    "evidence_sha256",
+                    "candidate_id",
+                    "candidate_manifest_sha256",
+                    "gate_report_sha256",
+                    "adapter_version",
+                    "source_schema_version",
+                )
+            }
+            if lineage["provider_id"] != "baostock" or any(
+                not isinstance(value, str) or not value for value in lineage.values()
+            ):
+                return ()
+            universe_id = str(lineage["universe_id"])
+            key_bytes = f"stock-eva/r2f3/shadow-job/v1\n{self.provider_id}|{self.window_id}|{trade_date.isoformat()}|{universe_id}|{manifest['generation']}|{manifest_sha}".encode()
+            results.append(
+                {
+                    "job_id": hashlib.sha256(key_bytes).hexdigest()[:32],
+                    "provider_id": self.provider_id,
+                    "window_id": self.window_id,
+                    "trade_date": trade_date.isoformat(),
+                    "universe_id": universe_id,
+                    "canonical_manifest_generation": manifest["generation"],
+                    "canonical_manifest_sha256": manifest_sha,
+                    "version_vector_sha256": hashlib.sha256(
+                        json.dumps(lineage, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "files": (item,),
+                }
+            )
+        return tuple(results)
+
+
+class ShadowBundlePublisher:
+    """No-follow, locked, atomic report bundle publisher."""
+
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+        self.lock_path = self.root / "bundles.lock"
+
+    def publish(self, identity: str, payload: dict[str, Any]) -> Path:
+        if not self.root.is_absolute() or not identity or "/" in identity or "\\" in identity:
+            raise ShadowJobUnavailable("shadow bundle root unavailable")
+        current = Path(self.root.anchor)
+        for part in self.root.parts[1:]:
+            current /= part
+            try:
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    raise ShadowJobUnavailable("shadow bundle root unavailable")
+            except FileNotFoundError:
+                continue
+        self.root.mkdir(parents=True, exist_ok=True)
+        bundles = self.root / "bundles"
+        staging_root = self.root / "staging"
+        bundles.mkdir(exist_ok=True)
+        staging_root.mkdir(exist_ok=True)
+        lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        nonce = f"{identity}-{secrets.token_hex(8)}"
+        staging = staging_root / nonce
+        destination = bundles / identity
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if destination.exists():
+                try:
+                    if stat.S_ISLNK(os.lstat(destination).st_mode):
+                        raise ShadowJobUnavailable("shadow bundle identity conflict")
+                except FileNotFoundError:
+                    pass
+                marker = destination / "COMMIT"
+                raw = (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                )
+                expected = hashlib.sha256(raw.encode()).hexdigest() + "\n"
+                try:
+                    marker_fd = os.open(
+                        marker,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                    )
+                    try:
+                        marker_raw = os.read(marker_fd, 128).decode()
+                    finally:
+                        os.close(marker_fd)
+                except OSError as exc:
+                    raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+                if marker_raw != expected:
+                    raise ShadowJobUnavailable("shadow bundle identity conflict")
+                return destination
+            staging.mkdir()
+            raw = (
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode()
+            (staging / "report.json").write_bytes(raw)
+            marker = hashlib.sha256(raw).hexdigest() + "\n"
+            (staging / "COMMIT").write_text(marker)
+            for path in (staging / "report.json", staging / "COMMIT"):
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            dir_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            try:
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                renameatx_np = libc.renameatx_np
+                parent_fd = os.open(bundles, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                source_fd = os.open(staging_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    if (
+                        renameatx_np(
+                            source_fd,
+                            staging.name.encode(),
+                            parent_fd,
+                            destination.name.encode(),
+                            0x00000004,
+                        )
+                        != 0
+                    ):
+                        raise OSError(ctypes.get_errno(), "exclusive bundle rename failed")
+                finally:
+                    os.close(source_fd)
+                    os.close(parent_fd)
+            except AttributeError:
+                if destination.exists():
+                    raise ShadowJobUnavailable("shadow bundle identity conflict") from None
+                os.rename(staging, destination)
+            except OSError as exc:
+                if destination.exists() and not stat.S_ISLNK(os.lstat(destination).st_mode):
+                    marker = destination / "COMMIT"
+                    expected = hashlib.sha256(raw).hexdigest() + "\n"
+                    try:
+                        marker_fd = os.open(
+                            marker,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                        )
+                        try:
+                            marker_raw = os.read(marker_fd, 128).decode()
+                        finally:
+                            os.close(marker_fd)
+                    except OSError:
+                        marker_raw = ""
+                    if marker_raw == expected:
+                        return destination
+                raise ShadowJobUnavailable("shadow bundle publish unavailable") from exc
+            dir_fd = os.open(bundles, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return destination
+        finally:
+            if staging.exists():
+                for path in staging.iterdir():
+                    path.unlink()
+                staging.rmdir()
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def _safe(value: str) -> str:
@@ -226,6 +511,22 @@ class ShadowJobStore:
 
         return self.registry._with_transaction(update)
 
+    def release_after_worker(self, job: ShadowJob, *, status: str) -> ShadowJob | None:
+        """CAS-release a leased job on every worker exit; never leave a stale lease."""
+        if status not in {"pending", "failed", "cancelled", "unavailable"}:
+            raise ValueError("invalid shadow worker release status")
+
+        def update(connection):
+            cursor = connection.execute(
+                "UPDATE shadow_job SET run_status=?,lease_owner=NULL,lease_expires_at=NULL,state_version=state_version+1 WHERE job_id=? AND provider_id=? AND window_id=? AND run_status='leased' AND state_version=?",
+                (status, job.job_id, job.provider_id, job.window_id, job.state_version),
+            )
+            if cursor.rowcount != 1:
+                return self._row(connection, job.job_id)
+            return self._row(connection, job.job_id)
+
+        return self.registry._with_transaction(update)
+
     def persist_outcome(
         self,
         *,
@@ -240,6 +541,10 @@ class ShadowJobStore:
         expected_job_state_version: int | None = None,
         expected_window_state_version: int | None = None,
         failure_class: str | None = None,
+        snapshot: ConfirmedSessionSnapshot | None = None,
+        bundle_publisher: ShadowBundlePublisher | None = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
     ) -> tuple[ShadowAttemptReport, ...]:
         """Persist one complete sanitized failure graph and atomically reset the window.
 
@@ -249,6 +554,21 @@ class ShadowJobStore:
         """
         if outcome not in {"failure", "skip", "unavailable", "mismatch"}:
             raise ShadowJobUnavailable("shadow outcome requires terminal writer")
+        if type(snapshot) is not ConfirmedSessionSnapshot:
+            raise ShadowJobUnavailable("confirmed session snapshot is required")
+        if (
+            snapshot.provider_id != plan.provider_id
+            or snapshot.window_id != plan.window_id
+            or snapshot.universe_sha256 != universe_sha256
+            or snapshot.calendar_generation != calendar_generation
+            or snapshot.calendar_sha256 != calendar_sha256
+            or trade_date not in {item.isoformat() for item in snapshot.confirmed_next_sessions}
+        ):
+            raise ShadowJobUnavailable("confirmed session snapshot mismatch")
+        now = started_at or datetime.now(UTC)
+        finished = completed_at or now
+        if now.tzinfo is None or finished.tzinfo is None or finished < now:
+            raise ShadowJobUnavailable("shadow report timing unavailable")
         reports = tuple(
             ShadowAttemptReport(
                 report_id=f"report-{session_id}-{request.ordinal:06d}",
@@ -261,8 +581,8 @@ class ShadowJobStore:
                 request_id=request.request_id,
                 endpoint_class=request.endpoint_class,
                 outcome=outcome,
-                started_at="",
-                completed_at="",
+                started_at=now.astimezone(UTC).isoformat(),
+                completed_at=finished.astimezone(UTC).isoformat(),
                 failure_class=failure_class or outcome,
                 durable_report_ref=f"reports/{session_id}",
             )
@@ -276,6 +596,27 @@ class ShadowJobStore:
         )
         report_sha = hashlib.sha256(report_raw.encode()).hexdigest()
         terminal_status = "unavailable" if outcome == "unavailable" else "failed"
+        publisher = bundle_publisher or (
+            ShadowBundlePublisher(self.shadow_root) if self.shadow_root else None
+        )
+        if publisher is None:
+            raise ShadowJobUnavailable("shadow report bundle publisher unavailable")
+        bundle_path = publisher.publish(
+            report_id,
+            {
+                "report_version": 1,
+                "outcome": outcome,
+                "reports": [item.model_dump(mode="json") for item in reports],
+                "report_sha256": report_sha,
+            },
+        )
+        try:
+            bundle_raw = (bundle_path / "report.json").read_bytes()
+            marker = (bundle_path / "COMMIT").read_text()
+            if hashlib.sha256(bundle_raw).hexdigest() + "\n" != marker:
+                raise ShadowJobUnavailable("shadow report bundle hash mismatch")
+        except OSError as exc:
+            raise ShadowJobUnavailable("shadow report bundle unavailable") from exc
 
         def save(connection):
             job = self._row(connection, plan.job_id)
@@ -475,31 +816,52 @@ class ShadowJobStore:
 
 
 class ShadowHandoff:
-    """Post-lock, zero-wait handoff adapter used by automation."""
+    """Post-lock bounded in-memory handoff; offer never touches SQLite or callbacks."""
 
     def __init__(
-        self, job_store: ShadowJobStore, enqueue_outcome: Callable[[Any], Any] | None = None
+        self,
+        job_store: ShadowJobStore | None = None,
+        enqueue_outcome: Callable[[Any], Any] | None = None,
+        *,
+        maxsize: int = 64,
     ):
         self.job_store = job_store
         self.enqueue_outcome = enqueue_outcome
         self._offered: set[str] = set()
+        self._queue = deque(maxlen=max(1, maxsize))
 
     def offer(self, outcome: Any, *, wait_budget: float = 0, nonblocking: bool = True) -> bool:
+        if wait_budget != 0 or nonblocking is not True:
+            raise ValueError("shadow handoff must be nonblocking with zero wait")
         key = getattr(getattr(outcome, "result", None), "run_id", None) or getattr(
             getattr(outcome, "decision", None), "target_session", None
         )
         key = str(key or "none")
         if key in self._offered:
             return False
+        if len(self._queue) >= self._queue.maxlen:
+            return False
+        self._queue.append((key, outcome))
         self._offered.add(key)
-        if self.enqueue_outcome is not None:
-            self.enqueue_outcome(outcome)
         return True
+
+    def drain(self, *, limit: int = 64) -> int:
+        """Drain outside the canonical lock; callback failures leave scanner recovery."""
+        count = 0
+        while self._queue and count < max(0, limit):
+            _key, outcome = self._queue.popleft()
+            if self.enqueue_outcome is not None:
+                self.enqueue_outcome(outcome)
+            count += 1
+        return count
 
 
 __all__ = [
+    "CanonicalManifestUnavailable",
     "ConfirmedSessionSnapshot",
+    "PublishedCanonicalManifestScanner",
     "ShadowAttemptReport",
+    "ShadowBundlePublisher",
     "ShadowHandoff",
     "ShadowJob",
     "ShadowJobStore",

@@ -36,6 +36,7 @@ class ShadowScheduler:
         max_requests: int = 256,
         deadline_seconds: float = 30.0,
         cancellation: Callable[[], bool] | None = None,
+        handoff=None,
     ) -> None:
         self.job_store = job_store
         self.worker = worker
@@ -44,9 +45,15 @@ class ShadowScheduler:
         self.max_requests = max(1, max_requests)
         self.deadline_seconds = max(0.01, deadline_seconds)
         self.cancellation = cancellation or (lambda: False)
+        self.handoff = handoff
 
     def run_once(self, *, now: datetime | None = None) -> ShadowSchedulerOutcome:
         started = time.monotonic()
+        if self.handoff is not None:
+            try:
+                self.handoff.drain(limit=1)
+            except Exception:
+                pass
         self.job_store.reclaim_expired(now=now)
         # A scanner/queue caller may pass the identity; default worker selection is bounded.
         job = self._next_job()
@@ -65,12 +72,14 @@ class ShadowScheduler:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.cancellation():
+            self.job_store.release_after_worker(leased, status="cancelled")
             return ShadowSchedulerOutcome(
                 status="cancelled",
                 job_id=leased.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.worker is None:
+            self.job_store.release_after_worker(leased, status="pending")
             return ShadowSchedulerOutcome(
                 status="leased",
                 job_id=leased.job_id,
@@ -90,12 +99,23 @@ class ShadowScheduler:
             )
             if time.monotonic() - started > self.deadline_seconds:
                 status = "budget_exhausted"
+            if status in {"failed", "unavailable", "budget_exhausted"}:
+                self.job_store.release_after_worker(
+                    leased, status="unavailable" if status == "unavailable" else "failed"
+                )
+            elif status not in {"completed", "success"}:
+                self.job_store.release_after_worker(leased, status="pending")
+            elif status == "success":
+                # A legal terminal writer may already have CASed completed; this is a
+                # harmless expected-version no-op otherwise returning the job to scanner.
+                self.job_store.release_after_worker(leased, status="pending")
             return ShadowSchedulerOutcome(
                 status=str(status),
                 job_id=leased.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         except Exception:
+            self.job_store.release_after_worker(leased, status="failed")
             return ShadowSchedulerOutcome(
                 status="failed",
                 job_id=leased.job_id,

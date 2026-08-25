@@ -12,7 +12,7 @@ import os
 import stat
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,6 +34,25 @@ class ConfirmedSessionSnapshot(BaseModel):
     universe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     captured_at: str
     snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ShadowCalendarSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    exchange: Literal["SSE", "SZSE"]
+    title: str
+    url: str
+    notice_no: str | None = None
+
+
+class ShadowCalendarConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    year: int
+    status: str
+    published_on: date
+    sources: tuple[ShadowCalendarSource, ...]
+    closed_dates: tuple[date, ...]
 
 
 def _canonical(value: Any) -> bytes:
@@ -118,19 +137,13 @@ class ConfirmedCalendarReader:
             for item in values:
                 if not isinstance(item, dict) or item.get("year") not in years:
                     continue
-                if item.get("status") != "confirmed" or set(item) != {
-                    "year",
-                    "status",
-                    "published_on",
-                    "sources",
-                    "closed_dates",
-                }:
+                try:
+                    validated = ShadowCalendarConfig.model_validate(item)
+                except (TypeError, ValueError) as exc:
+                    raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
+                if validated.status != "confirmed":
                     raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-                if not isinstance(item["sources"], list) or not isinstance(
-                    item["closed_dates"], list
-                ):
-                    raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-                found.append(item)
+                found.append(validated.model_dump(mode="json"))
         if {int(item["year"]) for item in found} != years:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
         return tuple(sorted(found, key=lambda item: int(item["year"])))
@@ -175,3 +188,12 @@ class ConfirmedCalendarReader:
             **snapshot_payload,
             snapshot_sha256=_sha(_canonical(snapshot_payload)),
         )
+
+
+__all__ = [
+    "ConfirmedCalendarReader",
+    "ConfirmedSessionSnapshot",
+    "ShadowCalendarConfig",
+    "ShadowCalendarSource",
+    "ShadowCalendarUnavailable",
+]
