@@ -519,6 +519,42 @@ def test_publisher_verifies_held_destination_before_success(tmp_path, monkeypatc
     assert (hidden / "COMMIT").is_file()
 
 
+@pytest.mark.parametrize("target", ["OWNER", "report.json", "COMMIT"])
+@pytest.mark.parametrize("mutation", ["symlink", "replace", "same_inode"])
+def test_publisher_verifies_each_held_bundle_file_before_success(
+    tmp_path, monkeypatch, target, mutation
+):
+    original_fsync = os.fsync
+    fsync_calls = 0
+    bundle_root = tmp_path / "shadow" / "bundles"
+    target_path = bundle_root / "file-check" / target
+    hidden_path = bundle_root / "file-check" / f".{target}.hidden"
+
+    def mutate_after_commit(fd):
+        nonlocal fsync_calls
+        original_fsync(fd)
+        fsync_calls += 1
+        if fsync_calls == 4:
+            if mutation == "symlink":
+                os.rename(target_path, hidden_path)
+                os.symlink(hidden_path.name, target_path)
+            elif mutation == "replace":
+                replacement = b"replacement" if target != "COMMIT" else b"0" * 65
+                original_size = target_path.stat().st_size
+                os.rename(target_path, hidden_path)
+                target_path.write_bytes(replacement[:original_size].ljust(original_size, b"!"))
+            else:
+                replacement = b"X" * target_path.stat().st_size
+                with target_path.open("r+b") as stream:
+                    stream.write(replacement)
+                    stream.flush()
+                    original_fsync(stream.fileno())
+
+    monkeypatch.setattr(os, "fsync", mutate_after_commit)
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish("file-check", {"value": 1})
+
+
 def _owner_bytes(identity, payload):
     raw = (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"

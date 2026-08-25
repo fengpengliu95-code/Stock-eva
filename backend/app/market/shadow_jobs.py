@@ -533,6 +533,47 @@ class ShadowBundlePublisher:
         finally:
             os.close(current_fd)
 
+    @classmethod
+    def _capture_file(
+        cls, directory_fd: int, name: str, expected: bytes, *, limit: int = 16 * 1024 * 1024
+    ):
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise ShadowJobUnavailable("shadow bundle file conflict") from exc
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                raise ShadowJobUnavailable("shadow bundle file conflict")
+            raw = os.read(fd, min(limit, len(expected) + 1))
+            after = os.fstat(fd)
+            if (
+                raw != expected
+                or before.st_size != len(expected)
+                or len(raw) != len(expected)
+                or cls._fingerprint(before) != cls._fingerprint(after)
+            ):
+                raise ShadowJobUnavailable("shadow bundle file conflict")
+            return cls._fingerprint(before), len(raw), hashlib.sha256(raw).hexdigest(), raw
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _verify_files(cls, directory_fd: int, records: dict[str, tuple]) -> None:
+        try:
+            if set(os.listdir(directory_fd)) != set(records):
+                raise ShadowJobUnavailable("shadow bundle file conflict")
+        except OSError as exc:
+            raise ShadowJobUnavailable("shadow bundle file conflict") from exc
+        for name, (fingerprint, size, payload_sha256, expected) in records.items():
+            actual = cls._capture_file(directory_fd, name, expected)
+            if actual != (fingerprint, size, payload_sha256, expected):
+                raise ShadowJobUnavailable("shadow bundle file conflict")
+
     def _open_directory_chain(self) -> tuple[int, int, int, int]:
         if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
@@ -635,7 +676,13 @@ class ShadowBundlePublisher:
                     os.fsync(destination_fd)
                     os.fsync(bundles_fd)
                     expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
+                records = {
+                    "OWNER": self._capture_file(destination_fd, "OWNER", existing_owner),
+                    "report.json": self._capture_file(destination_fd, "report.json", raw),
+                    "COMMIT": self._capture_file(destination_fd, "COMMIT", marker),
+                }
                 self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
+                self._verify_files(destination_fd, records)
                 return destination
             self._write_new_file(destination_fd, "OWNER", owner_raw)
             self._write_new_file(destination_fd, "report.json", raw)
@@ -644,7 +691,13 @@ class ShadowBundlePublisher:
             os.fsync(destination_fd)
             os.fsync(bundles_fd)
             expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
+            records = {
+                "OWNER": self._capture_file(destination_fd, "OWNER", owner_raw),
+                "report.json": self._capture_file(destination_fd, "report.json", raw),
+                "COMMIT": self._capture_file(destination_fd, "COMMIT", marker),
+            }
             self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
+            self._verify_files(destination_fd, records)
             return destination
         finally:
             if destination_fd >= 0:
