@@ -201,6 +201,11 @@ class ShadowCandidateManifest(BaseModel):
     expected_symbol_count: int = Field(ge=0)
     bundle_commit_sha256: str
     status: Literal["accepted"] = "accepted"
+    reconciliation_id: str | None = None
+    reconciliation_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reconciliation_status: Literal["ready", "material_mismatch", "unavailable"] | None = None
+    reconciliation_compared_counts: dict[str, int] | None = None
+    reconciliation_mismatch_counts: dict[str, int] | None = None
     manifest_sha256: str = "0" * 64
 
     @model_validator(mode="after")
@@ -320,6 +325,7 @@ class ShadowCandidateStore:
         evidence_id: str,
         quality_report: ShadowQualityReport | None = None,
         candidate_id: str | None = None,
+        reconciliation_report: Any | None = None,
         registry: ShadowRegistry,
     ) -> ShadowCandidateManifest:
         if not self.root.is_absolute():
@@ -433,6 +439,25 @@ class ShadowCandidateStore:
         quality = expected_quality
         if quality.verdict != "pass":
             raise ShadowCandidateUnavailable("shadow quality gate failed")
+        reconciliation_values: dict[str, Any] = {}
+        if reconciliation_report is not None:
+            from .shadow_reconciliation import ShadowReconciliationReport
+
+            if (
+                type(reconciliation_report) is not ShadowReconciliationReport
+                or getattr(reconciliation_report, "status", None) != "ready"
+                or getattr(reconciliation_report, "trade_date", None) != candidate.trade_date
+                or getattr(reconciliation_report, "universe_id", None) != candidate.universe_id
+                or not getattr(reconciliation_report, "report_sha256", None)
+            ):
+                raise ShadowCandidateUnavailable("shadow reconciliation is not ready")
+            reconciliation_values = {
+                "reconciliation_id": reconciliation_report.reconciliation_id,
+                "reconciliation_sha256": reconciliation_report.report_sha256,
+                "reconciliation_status": reconciliation_report.status,
+                "reconciliation_compared_counts": dict(reconciliation_report.compared_counts),
+                "reconciliation_mismatch_counts": dict(reconciliation_report.mismatch_counts),
+            }
         normalized_bytes = _json(candidate.model_dump(mode="json"))
         quality_bytes = _json(quality.model_dump(mode="json"))
         bundle_rel = f"bundles/{cid}"
@@ -452,6 +477,7 @@ class ShadowCandidateStore:
             row_count=len(candidate.rows),
             expected_symbol_count=len(expected),
             bundle_commit_sha256="0" * 64,
+            **reconciliation_values,
         )
         commit_preimage = {
             "manifest": manifest.model_dump(mode="json"),
@@ -508,6 +534,122 @@ class ShadowCandidateStore:
         return manifest
 
     write = publish
+
+    def attach(
+        self,
+        *,
+        candidate_reader: ShadowCandidateReader,
+        candidate_id: str,
+        registry: ShadowRegistry,
+    ) -> ShadowCandidateManifest:
+        return ShadowCandidateAttachmentService().attach(
+            candidate_reader=candidate_reader,
+            candidate_id=candidate_id,
+            registry=registry,
+        )
+
+
+class ShadowCandidateAttachmentService:
+    """Attach one published candidate manifest through the registry CAS.
+
+    Bundle publication and this control-plane attachment are deliberately
+    separate.  The service never manufactures a candidate identity: it reads
+    the committed bundle and uses ``manifest_sha256`` as the frozen registry
+    candidate hash.
+    """
+
+    def attach(
+        self,
+        *,
+        candidate_reader: ShadowCandidateReader,
+        candidate_id: str,
+        registry: ShadowRegistry,
+    ) -> ShadowCandidateManifest:
+        if (
+            type(candidate_reader) is not ShadowCandidateReader
+            or type(registry) is not ShadowRegistry
+        ):
+            raise ShadowCandidateUnavailable("shadow candidate attachment unavailable")
+        try:
+            bundle = candidate_reader.read(candidate_id)
+        except Exception as exc:
+            raise ShadowCandidateUnavailable("shadow candidate bundle unavailable") from exc
+        manifest = bundle.manifest
+        candidate = bundle.candidate
+        if (
+            manifest.candidate_id != candidate_id
+            or manifest.reconciliation_status != "ready"
+            or not manifest.reconciliation_sha256
+            or manifest.manifest_sha256 == "0" * 64
+            or candidate.provider_id != manifest.provider_id
+            or candidate.trade_date != manifest.trade_date
+            or candidate.universe_id != manifest.universe_id
+        ):
+            raise ShadowCandidateUnavailable("shadow candidate reconciliation unavailable")
+
+        def save(connection):
+            job = connection.execute(
+                "SELECT job_id,provider_id,window_id,trade_date,universe_id,run_status "
+                "FROM shadow_job WHERE job_id=? AND provider_id=? AND window_id=?",
+                (candidate.job_id, manifest.provider_id, candidate.window_id),
+            ).fetchone()
+            evidence = connection.execute(
+                "SELECT evidence_id,job_id,provider_id,window_id,session_id,evidence_sha256,"
+                "attached_session_report_id FROM shadow_evidence_ref WHERE evidence_id=?",
+                (manifest.evidence_id,),
+            ).fetchone()
+            if job is None or evidence is None:
+                raise ShadowCandidateUnavailable("shadow candidate registry binding unavailable")
+            if (
+                job[0] != candidate.job_id
+                or job[1] != manifest.provider_id
+                or job[2] != candidate.window_id
+                or str(job[3])[:10] != manifest.trade_date.isoformat()
+                or job[4] != manifest.universe_id
+                or job[5] != "pending_normalization"
+                or evidence[1:5]
+                != (
+                    candidate.job_id,
+                    manifest.provider_id,
+                    candidate.window_id,
+                    candidate.session_id,
+                )
+                or evidence[5] != manifest.evidence_sha256
+                or evidence[6] is not None
+            ):
+                raise ShadowCandidateUnavailable("shadow candidate registry binding unavailable")
+            try:
+                connection.execute(
+                    "INSERT INTO shadow_candidate_ref "
+                    "(candidate_id,evidence_id,job_id,provider_id,window_id,session_id,"
+                    "candidate_ref,candidate_sha256,quality_report_ref,quality_report_sha256) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        manifest.candidate_id,
+                        manifest.evidence_id,
+                        candidate.job_id,
+                        manifest.provider_id,
+                        candidate.window_id,
+                        candidate.session_id,
+                        manifest.normalized_object_ref,
+                        manifest.manifest_sha256,
+                        manifest.quality_report_ref,
+                        manifest.quality_report_sha256,
+                    ),
+                )
+            except Exception as exc:
+                raise ShadowCandidateUnavailable("shadow candidate attachment conflict") from exc
+            return manifest
+
+        return registry._with_transaction(save)
+
+
+def attach_candidate(
+    *, candidate_reader: ShadowCandidateReader, candidate_id: str, registry: ShadowRegistry
+) -> ShadowCandidateManifest:
+    return ShadowCandidateAttachmentService().attach(
+        candidate_reader=candidate_reader, candidate_id=candidate_id, registry=registry
+    )
 
 
 class ShadowCandidateReader:

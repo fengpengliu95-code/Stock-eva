@@ -4,6 +4,7 @@ import pytest
 
 from backend.app.market.providers.registry import ShadowRegistry
 from backend.app.market.shadow_candidates import (
+    ShadowCandidateAttachmentService,
     ShadowCandidateReader,
     ShadowCandidateStore,
     ShadowCandidateUnavailable,
@@ -236,6 +237,25 @@ def test_candidate_store_and_reader_require_real_evidence_reader_and_registry(tm
         )
     with pytest.raises(ShadowCandidateUnavailable):
         ShadowCandidateReader(root, evidence_reader=object(), registry=object())
+
+
+def test_candidate_attachment_refuses_unreconciled_bundle_without_registry_write(tmp_path):
+    reader, registry = bindings(tmp_path)
+    manifest = ShadowCandidateStore(tmp_path / "shadow").publish(
+        candidate(), evidence_reader=reader, evidence_id="ev-1", registry=registry
+    )
+    candidate_reader = ShadowCandidateReader(
+        tmp_path / "shadow", evidence_reader=reader, registry=registry
+    )
+    with pytest.raises(ShadowCandidateUnavailable, match="reconciliation"):
+        ShadowCandidateAttachmentService().attach(
+            candidate_reader=candidate_reader,
+            candidate_id=manifest.candidate_id,
+            registry=registry,
+        )
+    assert registry._memory_connection.execute(
+        "SELECT count(*) FROM shadow_candidate_ref"
+    ).fetchone() == (0,)
 
 
 def test_candidate_store_rejects_caller_version_override(tmp_path):

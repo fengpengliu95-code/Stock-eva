@@ -28,4 +28,3 @@ authorized, same-contract 20-consecutive-confirmed-session report and review.
 - [ ] Calendar generation/closed dates/unknown-year behavior reviewed
 - [ ] R2-F2 golden fixture unchanged
 - [ ] Full offline gate and independent review complete
-

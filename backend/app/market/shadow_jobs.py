@@ -296,20 +296,28 @@ class CanonicalOutcomeScanner:
         if not files:
             return ()
         results: list[dict[str, Any]] = []
+        seen_trade_dates: set[date] = set()
         for item in files:
-            if not isinstance(item, dict) or item.get("source") != "baostock":
+            if not isinstance(item, dict):
+                return ()
+            try:
+                trade_date = date.fromisoformat(str(item["trade_date"]))
+            except (KeyError, TypeError, ValueError):
+                return ()
+            if trade_date < self.shadow_start_date or (
+                self.shadow_end_date is not None and trade_date > self.shadow_end_date
+            ):
+                continue
+            if trade_date in seen_trade_dates:
+                return ()
+            seen_trade_dates.add(trade_date)
+            if item.get("source") != "baostock":
                 return ()
             required = {"path", "sha256", "row_count", "trade_date", "source"}
             if not required <= set(item):
                 return ()
-            try:
-                trade_date = date.fromisoformat(str(item["trade_date"]))
-            except ValueError:
-                return ()
             if (
-                trade_date < self.shadow_start_date
-                or (self.shadow_end_date is not None and trade_date > self.shadow_end_date)
-                or not isinstance(item["path"], str)
+                not isinstance(item["path"], str)
                 or not isinstance(item["sha256"], str)
                 or len(item["sha256"]) != 64
                 or item["sha256"] != item["sha256"].lower()

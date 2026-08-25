@@ -169,12 +169,15 @@ class ShadowScheduler:
                     status = "failed"
                     failure_class = "terminal_context_unavailable"
                 else:
+                    # The immutable success report is emitted only after the
+                    # strict terminal writer has published and committed its
+                    # success graph.  A commit failure must yield failure only.
+                    self.terminal_writer.write_success(self.job_store.registry, **context)
                     self._report(
-                        status="success",
+                        status="completed",
                         job_id=leased.job_id,
                         state_version=leased.state_version,
                     )
-                    self.terminal_writer.write_success(self.job_store.registry, **context)
             return ShadowSchedulerOutcome(
                 status=str(status),
                 job_id=leased.job_id,

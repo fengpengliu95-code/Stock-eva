@@ -177,6 +177,13 @@ def _strict_bundle_validation(
         != str(descriptor.get("trade_date", manifest.trade_date))[:10]
         or manifest.universe_id != descriptor.get("universe_id", manifest.universe_id)
         or manifest.status != "accepted"
+        or not isinstance(manifest.manifest_sha256, str)
+        or len(manifest.manifest_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in manifest.manifest_sha256)
+        or manifest.reconciliation_status != "ready"
+        or not isinstance(manifest.reconciliation_sha256, str)
+        or len(manifest.reconciliation_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in manifest.reconciliation_sha256)
         or candidate.job_id != identity.job_id
         or candidate.window_id != identity.window_id
         or candidate.session_id != identity.session_id
@@ -342,9 +349,10 @@ def _write_terminal_success_graph(
         identity=identity,
     )
     evidence_sha = evidence.manifest_sha256
-    candidate_sha = candidate_bundle.manifest.candidate_sha256
-    if candidate_sha != candidate_bundle.manifest.candidate_sha256:
-        raise ShadowTerminalUnavailable("terminal candidate hash unavailable")
+    # The immutable Task 12 candidate identity is the manifest digest.  The
+    # frozen Task 10 registry column keeps its historical candidate_sha256
+    # name, but Task 12 does not expose a separate candidate_sha256 field.
+    candidate_sha = candidate_bundle.manifest.manifest_sha256
     from datetime import UTC, datetime
 
     started = (now or datetime.now(UTC)).isoformat()
@@ -502,6 +510,58 @@ def _write_terminal_success_graph(
         )
     ):
         raise ShadowTerminalUnavailable("terminal expected version conflict")
+    trade_dates = {item.trade_date for item in plan.requests}
+    if len(trade_dates) != 1:
+        raise ShadowTerminalUnavailable("terminal session date unavailable")
+    current_trade_date = next(iter(trade_dates))
+    confirmed = tuple(snapshot.confirmed_next_sessions)
+    continuity_ok = False
+    with registry._lock(shared=True):
+        continuity_connection = registry._connection_for_read()
+        try:
+            duplicate = continuity_connection.execute(
+                "SELECT 1 FROM session_report WHERE provider_id=? AND window_id=? AND trade_date=? LIMIT 1",
+                (identity.provider_id, identity.window_id, current_trade_date.isoformat()),
+            ).fetchone()
+            previous = continuity_connection.execute(
+                "SELECT trade_date FROM session_report WHERE provider_id=? AND window_id=? AND outcome='success' ORDER BY trade_date DESC LIMIT 1",
+                (identity.provider_id, identity.window_id),
+            ).fetchone()
+        finally:
+            if not registry._memory:
+                continuity_connection.close()
+    current_index = confirmed.index(current_trade_date) if current_trade_date in confirmed else -1
+    if duplicate is None and current_index >= 0:
+        if current_window[0] == 0:
+            # A reset retains prior reports for audit; the next confirmed
+            # session starts a fresh sequence even when an older success row
+            # remains in the append-only history.
+            continuity_ok = current_index == 0
+        else:
+            continuity_ok = (
+                current_index == current_window[0]
+                and previous is not None
+                and str(previous[0])[:10] == confirmed[current_index - 1].isoformat()
+            )
+    if not continuity_ok:
+
+        def reset_continuity(connection):
+            connection.execute(
+                "UPDATE qualification_window SET consecutive_sessions=0,window_state='reset',last_session_report_id=NULL,qualification_evidence_sha256=NULL,qualification_candidate_sha256=NULL,terminal_attestation_id=NULL,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
+                (identity.provider_id, identity.window_id, expected_window_state_version),
+            )
+            connection.execute(
+                "UPDATE shadow_job SET run_status='failed',lease_owner=NULL,lease_expires_at=NULL,state_version=state_version+1 WHERE job_id=? AND provider_id=? AND window_id=? AND state_version=?",
+                (
+                    identity.job_id,
+                    identity.provider_id,
+                    identity.window_id,
+                    expected_job_state_version,
+                ),
+            )
+
+        registry._with_transaction(reset_continuity)
+        raise ShadowTerminalUnavailable("terminal confirmed session continuity unavailable")
     bundle_payload = {
         "kind": "shadow-terminal-success",
         "report_version": 2,
@@ -737,7 +797,9 @@ def _write_terminal_success_graph(
             ),
         )
         new_count = window[0] + 1
-        window_state = "qualified" if new_count >= 20 else "observing"
+        # Reaching twenty is evidence for the explicit registry qualification
+        # validator, never an implicit promotion by the terminal writer.
+        window_state = "observing"
         if (
             connection.execute(
                 "UPDATE shadow_job SET run_status='completed',successful_evidence_sha256=?,successful_candidate_sha256=?,completion_sha256=?,terminal_attestation_id=?,lease_owner=NULL,lease_expires_at=NULL,state_version=state_version+1 WHERE job_id=? AND provider_id=? AND window_id=? AND state_version=? AND run_status IN ('leased','pending_normalization')",

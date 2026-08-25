@@ -713,7 +713,9 @@ def test_terminal_accepts_real_task11_descriptor_without_candidate_id(tmp_path):
             provider_id=plan.provider_id,
             trade_date=request.trade_date,
             universe_id="universe-real-descriptor",
-            candidate_sha256="f" * 64,
+            manifest_sha256="f" * 64,
+            reconciliation_status="ready",
+            reconciliation_sha256="d" * 64,
             status="accepted",
         ),
         candidate=SimpleNamespace(
@@ -844,6 +846,78 @@ def test_scanner_rejects_nonhex_r2f2_lineage_sha_on_real_parquet(tmp_path):
     )
 
 
+def test_scanner_skips_out_of_window_real_partitions_but_validates_inside(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}), encoding="utf-8"
+    )
+
+    def partition(day: str, lineage_seed: str) -> dict[str, object]:
+        month = day[5:7]
+        directory = root / "bars" / "source=baostock" / f"year={day[:4]}" / f"month={month}"
+        directory.mkdir(parents=True, exist_ok=True)
+        temp = directory / f"tmp-{day}.parquet"
+        connection = duckdb.connect(":memory:")
+        try:
+            connection.execute(
+                f"""COPY (SELECT DATE '{day}' AS trade_date, '000001'::VARCHAR AS symbol,
+                    'stock'::VARCHAR AS security_type, 'SSE'::VARCHAR AS exchange,
+                    'main'::VARCHAR AS board, 1.0::DOUBLE AS open, 1.1::DOUBLE AS high,
+                    0.9::DOUBLE AS low, 1.0::DOUBLE AS close, 1.0::DOUBLE AS preclose,
+                    100.0::DOUBLE AS volume, 100.0::DOUBLE AS amount, 0.1::DOUBLE AS turnover_rate,
+                    0.0::DOUBLE AS pct_change, 1.0::DOUBLE AS adjust_factor, 'none'::VARCHAR AS price_adjustment,
+                    true::BOOLEAN AS is_trading, false::BOOLEAN AS is_suspended, false::BOOLEAN AS is_st,
+                    'baostock'::VARCHAR AS source, '000001'::VARCHAR AS source_record_id,
+                    TIMESTAMPTZ '2026-01-02 08:00:00+00' AS ingested_at, 'valid'::VARCHAR AS quality_status,
+                    '[]'::JSON AS quality_issues) TO ? (FORMAT PARQUET)""",
+                [str(temp)],
+            )
+        finally:
+            connection.close()
+        raw = temp.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        final = directory / f"date={day}_{digest[:12]}.parquet"
+        temp.rename(final)
+        return {
+            "path": str(final.relative_to(root)),
+            "sha256": digest,
+            "row_count": 1,
+            "trade_date": day,
+            "source": "baostock",
+            "provider_id": "baostock",
+            "universe_id": "u1",
+            "evidence_id": f"e-{lineage_seed}",
+            "evidence_sha256": "a" * 64,
+            "candidate_id": f"c-{lineage_seed}",
+            "candidate_manifest_sha256": "b" * 64,
+            "gate_report_sha256": "c" * 64,
+            "adapter_version": "v1",
+            "source_schema_version": "v1",
+        }
+
+    files = [
+        partition("2025-12-31", "before"),
+        partition("2026-01-02", "inside"),
+        partition("2026-01-04", "after"),
+    ]
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {"dataset": "stock-eva-market", "schema_version": 2, "generation": "g1", "files": files}
+        ),
+        encoding="utf-8",
+    )
+    result = CanonicalOutcomeScanner(
+        root,
+        shadow_start_date=date(2026, 1, 1),
+        shadow_end_date=date(2026, 1, 3),
+        provider_id="tickflow",
+        window_id="w1",
+    ).scan()
+    assert len(result) == 1
+    assert result[0]["trade_date"] == "2026-01-02"
+
+
 def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_path):
     from backend.app.market.shadow_terminal import TerminalGraphIdentity
 
@@ -931,7 +1005,9 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         provider_id="tickflow",
         trade_date=date(2026, 1, 2),
         universe_id="universe-1",
-        candidate_sha256="f" * 64,
+        manifest_sha256="f" * 64,
+        reconciliation_status="ready",
+        reconciliation_sha256="d" * 64,
         status="accepted",
     )
     candidate_bundle = SimpleNamespace(

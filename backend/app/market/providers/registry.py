@@ -1306,6 +1306,33 @@ class ShadowRegistry:
                 raise RegistryUnavailable("provider is not shadow-qualified")
             if window.consecutive_sessions != 20:
                 raise RegistryUnavailable("qualification window unavailable")
+            proof_count = connection.execute(
+                """
+                SELECT count(*)
+                FROM qualification_session q
+                JOIN session_report s ON s.session_report_id=q.session_report_id
+                 AND s.provider_id=q.provider_id AND s.window_id=q.window_id
+                WHERE q.provider_id=? AND q.window_id=?
+                  AND q.calendar_generation=? AND q.calendar_sha256=?
+                  AND s.outcome='success'
+                  AND s.version_vector_sha256=?
+                """,
+                (
+                    provider_id,
+                    window_id,
+                    window.calendar_generation,
+                    window.calendar_sha256,
+                    window.version_vector_sha256,
+                ),
+            ).fetchone()[0]
+            if proof_count != 20:
+                raise RegistryUnavailable("qualification proof unavailable")
+            proof_pair = connection.execute(
+                "SELECT 1 FROM qualification_session WHERE provider_id=? AND window_id=? AND session_report_id=? AND terminal_attestation_id=?",
+                (provider_id, window_id, session_report_id, terminal_attestation_id),
+            ).fetchone()
+            if proof_pair is None:
+                raise RegistryUnavailable("qualification proof unavailable")
             attestation = connection.execute(
                 "SELECT 1 FROM shadow_terminal_attestation WHERE attestation_id=? AND provider_id=? AND job_id IS NOT NULL AND window_id=? AND evidence_sha256=? AND candidate_sha256=? AND session_report_id=?",
                 (
@@ -1530,7 +1557,7 @@ class ShadowRegistry:
             expected_sessions = snapshot.sessions[-20:]
             rows = connection.execute(
                 """
-                SELECT s.trade_date
+                SELECT s.session_report_id,s.trade_date,s.terminal_attestation_id
                 FROM session_report s
                 JOIN shadow_terminal_attestation t
                   ON t.session_report_id=s.session_report_id
@@ -1554,9 +1581,32 @@ class ShadowRegistry:
                     snapshot.universe_sha256,
                 ),
             ).fetchall()
-            observed_sessions = tuple(date.fromisoformat(row[0]) for row in rows)
-            if observed_sessions[-20:] != expected_sessions or len(observed_sessions) < 20:
+            observed_sessions = tuple(date.fromisoformat(row[1]) for row in rows)
+            if (
+                observed_sessions[-20:] != expected_sessions
+                or len(observed_sessions) < 20
+                or len(set(observed_sessions[-20:])) != 20
+            ):
                 raise RegistryUnavailable("terminal calendar sequence unavailable")
+            for report_id, trade_date, attestation_id in rows[-20:]:
+                connection.execute(
+                    "INSERT OR IGNORE INTO qualification_session (provider_id,window_id,trade_date,session_report_id,terminal_attestation_id,calendar_generation,calendar_sha256) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        provider_id,
+                        window_id,
+                        trade_date,
+                        report_id,
+                        attestation_id,
+                        snapshot.calendar_generation,
+                        snapshot.calendar_sha256,
+                    ),
+                )
+            proof_count = connection.execute(
+                "SELECT count(*) FROM qualification_session WHERE provider_id=? AND window_id=? AND calendar_generation=? AND calendar_sha256=?",
+                (provider_id, window_id, snapshot.calendar_generation, snapshot.calendar_sha256),
+            ).fetchone()[0]
+            if proof_count != 20:
+                raise RegistryUnavailable("qualification proof unavailable")
             cursor = connection.execute(
                 "UPDATE qualification_window SET consecutive_sessions=20,window_start=?,window_end=?,window_state='observing',state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
                 (

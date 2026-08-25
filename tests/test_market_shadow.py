@@ -15,6 +15,7 @@ from backend.app.market.shadow_jobs import (
     ShadowOutcomeReportUnavailable,
 )
 from backend.app.market.shadow_scheduler import ShadowScheduler, build_shadow_scheduler
+from backend.app.market.shadow_terminal import ShadowTerminalWriter
 from tests.test_market_provider_registry import _record, _sha, _terms
 
 
@@ -235,3 +236,57 @@ def test_scheduler_reporter_failure_preserves_sqlite_lease_for_reclaim(tmp_path)
     assert leased.run_status == "leased"
     assert leased.lease_owner == "report-failure-owner"
     assert leased.state_version == 1
+
+
+def test_scheduler_terminal_commit_failure_has_no_success_report(tmp_path, monkeypatch):
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    registry.attach_terms_to_provider("tickflow", terms)
+    state = registry.transition("tickflow", "canary", expected_state_version=1)
+    registry.transition("tickflow", "shadow", expected_state_version=state.state_version)
+    window = registry.ensure_window("tickflow", _sha("vector"), "calendar-v1", _sha("calendar"))
+    store = ShadowJobStore(registry, tmp_path / "shadow")
+    store.enqueue(
+        job_id="job-terminal-failure",
+        provider_id="tickflow",
+        window_id=window.window_id,
+        trade_date="2026-01-02",
+        universe_id="u1",
+        canonical_manifest_generation="g1",
+        canonical_manifest_sha256=_sha("manifest"),
+        version_vector_sha256=_sha("vector"),
+    )
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    monkeypatch.setattr(
+        ShadowTerminalWriter,
+        "write_success",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("terminal commit failed")),
+    )
+    scheduler = ShadowScheduler(
+        store,
+        worker=lambda *_args, **_kwargs: {
+            "status": "completed",
+            "terminal_context": {"real": True},
+        },
+        owner="terminal-failure-owner",
+        canonical_scanner=CanonicalOutcomeScanner(
+            tmp_path / "canonical",
+            shadow_start_date=datetime(2026, 1, 1).date(),
+            provider_id="tickflow",
+            window_id=window.window_id,
+        ),
+        outcome_reporter=ShadowOutcomeReporter(publisher),
+        terminal_writer=ShadowTerminalWriter(publisher),
+    )
+    result = scheduler.run_once()
+    assert result.status == "failed"
+    statuses = [
+        json.loads(path.read_text())["status"]
+        for path in (tmp_path / "shadow" / "bundles").glob("*/report.json")
+    ]
+    assert "success" not in statuses
+    assert "worker_exception" in statuses
+    assert store.get("job-terminal-failure").run_status == "failed"
