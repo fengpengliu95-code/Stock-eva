@@ -12,7 +12,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -22,6 +22,39 @@ class ShadowNormalizationError(ValueError):
 
 
 SHADOW_PROVIDERS = frozenset({"tickflow", "tushare"})
+
+
+class TushareUnitContract(BaseModel):
+    """Reviewed source contract; payload fields are never trusted to define it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    volume_unit: Literal["lots"]
+    amount_unit: Literal["thousand_cny"]
+    factor_semantics: Literal["multiplicative_back_adjust"]
+    factor_anchor: Literal["trade_date"]
+    factor_direction: Literal["back_adjust"]
+
+    @model_validator(mode="after")
+    def reviewed_values_only(self) -> TushareUnitContract:
+        if self.model_dump() != {
+            "volume_unit": "lots",
+            "amount_unit": "thousand_cny",
+            "factor_semantics": "multiplicative_back_adjust",
+            "factor_anchor": "trade_date",
+            "factor_direction": "back_adjust",
+        }:
+            raise ValueError("tushare source contract is not reviewed")
+        return self
+
+
+REVIEWED_TUSHARE_UNIT_CONTRACT = TushareUnitContract(
+    volume_unit="lots",
+    amount_unit="thousand_cny",
+    factor_semantics="multiplicative_back_adjust",
+    factor_anchor="trade_date",
+    factor_direction="back_adjust",
+)
 
 
 def _canonical(value: Any) -> bytes:
@@ -121,6 +154,10 @@ class ShadowNormalizedRow(BaseModel):
             raise ValueError("shadow OHLC is impossible")
         if self.factor is not None and (not math.isfinite(self.factor) or self.factor <= 0):
             raise ValueError("shadow factor is invalid")
+        if self.factor_previous is not None and (
+            not math.isfinite(self.factor_previous) or self.factor_previous <= 0
+        ):
+            raise ValueError("shadow previous factor is invalid")
         return self
 
 
@@ -144,6 +181,7 @@ class ShadowNormalizedCandidate(BaseModel):
     job_id: str = ""
     window_id: str = ""
     session_id: str = ""
+    version_vector_sha256: str = ""
     normalized_sha256: str = "0" * 64
 
     @model_validator(mode="after")
@@ -160,8 +198,16 @@ class ShadowNormalizedCandidate(BaseModel):
         if set(symbols) - set(self.expected_symbols):
             raise ValueError("shadow row is outside declared universe")
         legal_missing = set(self.suspended_symbols) | set(self.not_listed_symbols)
+        suspended = set(self.suspended_symbols)
+        not_listed = set(self.not_listed_symbols)
+        if suspended & not_listed or suspended & set(symbols) or not_listed & set(symbols):
+            raise ValueError("shadow status evidence contradicts daily rows")
+        if any(row.suspension and row.symbol not in suspended for row in self.rows):
+            raise ValueError("shadow row suspension lacks explicit suspension evidence")
         if not (set(self.expected_symbols) - set(symbols)).issubset(legal_missing):
             raise ValueError("shadow candidate coverage is incomplete")
+        if legal_missing != set(self.expected_symbols) - set(symbols):
+            raise ValueError("shadow status evidence must exactly explain missing symbols")
         if tuple(sorted(set(self.required_index_symbols))) != self.required_index_symbols:
             raise ValueError("shadow required indexes are not ordered")
         if self.required_index_symbols and set(self.required_index_symbols) != set(
@@ -176,6 +222,7 @@ class ShadowNormalizedCandidate(BaseModel):
                 "job_id": self.job_id,
                 "window_id": self.window_id,
                 "session_id": self.session_id,
+                "version_vector_sha256": self.version_vector_sha256,
                 "rows": [row.model_dump(mode="json") for row in self.rows],
             }
         )
@@ -218,7 +265,7 @@ def normalize_tushare(
     *,
     trade_date: date,
     universe_id: str,
-    provider_id: str = "tushare",
+    contract: TushareUnitContract | None = None,
     required_indexes: tuple[str, ...] = (),
 ) -> ShadowNormalizedCandidate:
     daily = _rows(payload, "daily")
@@ -226,19 +273,11 @@ def normalize_tushare(
     suspend = _rows(payload, "suspend_d")
     factors = _rows(payload, "adj_factor")
     indexes = _rows(payload, "index_daily") or _rows(payload, "indexes")
-    contract = _source_contract(payload, "daily")
-    if (
-        not isinstance(contract, Mapping)
-        or contract.get("vol") != "lots"
-        or contract.get("amount") != "thousand_cny"
-        or not contract.get("factor_semantics")
-        or not contract.get("factor_anchor")
-        or not contract.get("factor_direction")
-    ):
+    if type(contract) is not TushareUnitContract or contract != REVIEWED_TUSHARE_UNIT_CONTRACT:
         raise ShadowNormalizationError("tushare unit contract unavailable")
-    factor_semantics = str(contract["factor_semantics"])
-    factor_anchor = str(contract["factor_anchor"])
-    factor_direction = str(contract["factor_direction"])
+    factor_semantics = contract.factor_semantics
+    factor_anchor = contract.factor_anchor
+    factor_direction = contract.factor_direction
     expected = tuple(sorted({_row_symbol(item) for item in universe}))
     if not expected:
         raise ShadowNormalizationError("shadow universe unavailable")
@@ -284,7 +323,7 @@ def normalize_tushare(
             rows.append(
                 ShadowNormalizedRow(
                     symbol=symbol,
-                    provider_id=provider_id,
+                    provider_id="tushare",
                     trade_date=trade_date,
                     open=_finite(source.get("open"), positive=True),
                     high=_finite(source.get("high"), positive=True),
@@ -312,7 +351,7 @@ def normalize_tushare(
     ):
         raise ShadowNormalizationError("shadow factor evidence unavailable")
     return ShadowNormalizedCandidate(
-        provider_id=provider_id,
+        provider_id="tushare",
         trade_date=trade_date,
         universe_id=universe_id,
         rows=tuple(sorted(rows, key=lambda row: row.symbol)),
@@ -324,6 +363,12 @@ def normalize_tushare(
         factor_semantics=factor_semantics,
         factor_anchor=factor_anchor,
         factor_direction=factor_direction,
+        job_id=str(payload.get("job_id", "")) if isinstance(payload, Mapping) else "",
+        window_id=str(payload.get("window_id", "")) if isinstance(payload, Mapping) else "",
+        session_id=str(payload.get("session_id", "")) if isinstance(payload, Mapping) else "",
+        version_vector_sha256=(
+            str(payload.get("version_vector_sha256", "")) if isinstance(payload, Mapping) else ""
+        ),
         complete=True,
     )
 
@@ -333,7 +378,6 @@ def normalize_tickflow(
     *,
     trade_date: date,
     universe_id: str,
-    provider_id: str = "tickflow",
     required_indexes: tuple[str, ...] = (),
 ) -> ShadowNormalizedCandidate:
     daily = _rows(payload, "daily")
@@ -376,7 +420,7 @@ def normalize_tickflow(
             rows.append(
                 ShadowNormalizedRow(
                     symbol=symbol,
-                    provider_id=provider_id,
+                    provider_id="tickflow",
                     trade_date=trade_date,
                     open=_finite(source.get("open"), positive=True),
                     high=_finite(source.get("high"), positive=True),
@@ -431,7 +475,7 @@ def normalize_tickflow(
         "ready",
     }
     return ShadowNormalizedCandidate(
-        provider_id=provider_id,
+        provider_id="tickflow",
         trade_date=trade_date,
         universe_id=universe_id,
         rows=tuple(sorted(rows, key=lambda row: row.symbol)),
@@ -443,6 +487,12 @@ def normalize_tickflow(
         factor_semantics=factor_semantics,
         factor_anchor=factor_anchor,
         factor_direction=factor_direction,
+        job_id=str(payload.get("job_id", "")) if isinstance(payload, Mapping) else "",
+        window_id=str(payload.get("window_id", "")) if isinstance(payload, Mapping) else "",
+        session_id=str(payload.get("session_id", "")) if isinstance(payload, Mapping) else "",
+        version_vector_sha256=(
+            str(payload.get("version_vector_sha256", "")) if isinstance(payload, Mapping) else ""
+        ),
         complete=complete,
         quality_status="ready" if complete else "unavailable",
     )

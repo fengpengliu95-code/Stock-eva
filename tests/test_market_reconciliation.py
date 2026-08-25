@@ -2,13 +2,16 @@ from datetime import date
 
 import pytest
 
-from backend.app.market.shadow_normalize import normalize_tushare
+from backend.app.market.shadow_normalize import (
+    REVIEWED_TUSHARE_UNIT_CONTRACT,
+    normalize_tushare,
+)
 from backend.app.market.shadow_reconciliation import ReconciliationPolicy, reconcile
 
 TRADE_DATE = date(2026, 8, 20)
 
 
-def candidate(*, close=10.5, factor=1, previous_factor=1, universe="u", provider="tushare"):
+def candidate(*, close=10.5, factor=1, previous_factor=1, universe="u"):
     payload = {
         "daily": [
             {
@@ -46,7 +49,10 @@ def candidate(*, close=10.5, factor=1, previous_factor=1, universe="u", provider
         },
     }
     return normalize_tushare(
-        payload, trade_date=TRADE_DATE, universe_id=universe, provider_id=provider
+        payload,
+        trade_date=TRADE_DATE,
+        universe_id=universe,
+        contract=REVIEWED_TUSHARE_UNIT_CONTRACT,
     )
 
 
@@ -74,6 +80,35 @@ def test_factor_anchor_equivalence_uses_adjusted_returns_and_ignores_raw_scale()
     )
     assert report.status == "ready"
     assert report.mismatch_counts["adjusted_return"] == 0
+
+
+def test_factor_anchor_labels_may_differ_when_relative_returns_are_equivalent():
+    right_values = candidate().model_dump(mode="json")
+    right_values["factor_anchor"] = "calendar_anchor"
+    right_values["normalized_sha256"] = "0" * 64
+    right = candidate().__class__.model_validate(right_values)
+    assert reconcile(candidate(), right).status == "ready"
+
+
+def test_missing_adjacent_factor_is_unavailable_not_a_zero_return():
+    values = candidate().model_dump(mode="json")
+    values["rows"][0]["factor_previous"] = None
+    values["normalized_sha256"] = "0" * 64
+    incomplete = candidate().__class__.model_validate(values)
+    assert reconcile(candidate(), incomplete).status == "unavailable"
+
+
+def test_suspended_and_not_listed_sets_are_compared_as_material_status():
+    base = candidate().model_dump(mode="json")
+    base["expected_symbols"] = ["sz.000001", "sz.000002"]
+    base["suspended_symbols"] = ["sz.000002"]
+    base["normalized_sha256"] = "0" * 64
+    suspended = candidate().__class__.model_validate(base)
+    base["suspended_symbols"] = []
+    base["not_listed_symbols"] = ["sz.000002"]
+    base["normalized_sha256"] = "0" * 64
+    not_listed = candidate().__class__.model_validate(base)
+    assert reconcile(suspended, not_listed).status == "material_mismatch"
 
 
 def test_adjusted_return_over_five_basis_points_is_material():

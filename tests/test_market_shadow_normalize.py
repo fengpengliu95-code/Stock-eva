@@ -2,13 +2,23 @@ from datetime import date
 
 import pytest
 
+from backend.app.market.providers.tushare import TushareAdapter
 from backend.app.market.shadow_normalize import (
+    REVIEWED_TUSHARE_UNIT_CONTRACT,
     ShadowNormalizationError,
     normalize_tickflow,
-    normalize_tushare,
+)
+from backend.app.market.shadow_normalize import (
+    normalize_tushare as _normalize_tushare,
 )
 
 TRADE_DATE = date(2026, 8, 20)
+
+
+def normalize_tushare(payload, *, trade_date, universe_id, **kwargs):
+    """Existing fixture calls use the reviewed source-layer contract explicitly."""
+    kwargs.setdefault("contract", REVIEWED_TUSHARE_UNIT_CONTRACT)
+    return _normalize_tushare(payload, trade_date=trade_date, universe_id=universe_id, **kwargs)
 
 
 def tushare_payload(
@@ -96,7 +106,12 @@ def test_tushare_lots_and_thousand_cny_convert_once():
 )
 def test_tushare_requires_nonempty_exact_typed_source_units(payload):
     with pytest.raises(ShadowNormalizationError):
-        normalize_tushare(payload, trade_date=TRADE_DATE, universe_id="u")
+        _normalize_tushare(payload, trade_date=TRADE_DATE, universe_id="u", contract=None)
+
+
+def test_tushare_requires_explicit_reviewed_contract_not_payload_units():
+    with pytest.raises(ShadowNormalizationError):
+        _normalize_tushare(tushare_payload(), trade_date=TRADE_DATE, universe_id="u", contract=None)
 
 
 def test_tickflow_units_are_not_guessed():
@@ -161,6 +176,28 @@ def test_factor_row_trade_date_must_equal_requested_date_and_anchor_semantics_pr
         normalize_tushare(
             tushare_payload(factor_date="20260821"), trade_date=TRADE_DATE, universe_id="u"
         )
+
+
+def test_tushare_parse_does_not_invent_contract_when_payload_omits_it():
+    adapter = TushareAdapter()
+    payloads = {endpoint: {"data": {"fields": [], "items": []}} for endpoint in adapter.ENDPOINTS}
+    payloads["daily"] = {
+        "data": {
+            "fields": [
+                "ts_code",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "pre_close",
+                "vol",
+                "amount",
+            ],
+            "items": [["000001.SZ", "20260820", 10, 11, 9, 10.5, 10, 100, 20]],
+        }
+    }
+    assert adapter.parse(TRADE_DATE, payloads).units is None
     with pytest.raises(ShadowNormalizationError):
         normalize_tushare(
             tushare_payload(factor_semantics=""), trade_date=TRADE_DATE, universe_id="u"
@@ -179,4 +216,26 @@ def test_shadow_provider_identity_is_static_and_rows_cannot_mix():
     with pytest.raises(ValueError):
         result.__class__.model_validate(
             {**result.model_dump(mode="json"), "provider_id": "arbitrary"}
+        )
+
+
+def test_normalizers_do_not_allow_caller_provider_override():
+    with pytest.raises(TypeError):
+        normalize_tushare(
+            tushare_payload(),
+            trade_date=TRADE_DATE,
+            universe_id="u",
+            provider_id="baostock",
+        )
+    with pytest.raises(TypeError):
+        normalize_tickflow(
+            {
+                "daily": [],
+                "universe": [{"symbol": "sh.600000", "list_status": "L"}],
+                "indexes": [],
+                "units": {"volume": "shares", "amount": "CNY"},
+            },
+            trade_date=TRADE_DATE,
+            universe_id="u",
+            provider_id="tushare",
         )

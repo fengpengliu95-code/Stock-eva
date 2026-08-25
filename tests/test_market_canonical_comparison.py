@@ -2,7 +2,6 @@ import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import duckdb
 
@@ -18,8 +17,9 @@ from backend.app.market.canonical_comparison import (
     PublishedCanonicalComparison,
     UnavailableReason,
 )
+from backend.app.market.evidence import EvidenceStore
 from backend.app.market.models import DailyBar
-from backend.app.market.providers.base import ProviderId
+from tests.test_market_provider_contract import _provider_raw_batch
 
 
 def digest(value):
@@ -30,29 +30,19 @@ def digest(value):
     ).hexdigest()
 
 
-class EvidenceFixture:
-    def __init__(self, evidence_id, evidence_sha, trade_date, universe):
-        self.manifest = SimpleNamespace(
-            provider_id=ProviderId.BAOSTOCK,
-            evidence_id=evidence_id,
-            manifest_sha256=evidence_sha,
-            trade_date=trade_date,
-            universe_id=universe,
-        )
-
-    def read(self, _evidence_id):
-        return self
-
-
 def write_canonical_fixture(root: Path):
     dataset = root / "dataset"
     candidate_root = root / "candidate"
+    evidence_root = root / "evidence"
     dataset.mkdir()
     candidate_root.mkdir()
+    evidence_root.mkdir()
     trade_date = date(2026, 8, 20)
-    universe = "main-board-v1"
-    evidence_id = "ev-canonical-0001"
-    evidence_sha = "e" * 64
+    evidence_store = EvidenceStore(evidence_root)
+    evidence_manifest = evidence_store.publish(_provider_raw_batch())
+    evidence_id = evidence_manifest.evidence_id
+    evidence_sha = evidence_manifest.manifest_sha256
+    universe = evidence_manifest.universe_id
     symbol = "sh.600000"
     ingested = datetime(2026, 8, 20, 8, tzinfo=UTC)
     bar = DailyBar(
@@ -89,11 +79,11 @@ def write_canonical_fixture(root: Path):
         "provider_id": "baostock",
         "evidence_id": evidence_id,
         "evidence_sha256": evidence_sha,
-        "normalized_object_relative_path": "normalized.json",
+        "normalized_object_relative_path": "bundles/candidate-canonical-0001/normalized.json",
         "normalized_object_sha256": normalized_sha,
-        "gate_report_relative_path": "gate.json",
+        "gate_report_relative_path": "bundles/candidate-canonical-0001/gate.json",
         "gate_report_sha256": "0" * 64,
-        "factor_resolution_sha256": "f" * 64,
+        "factor_resolution_sha256": evidence_manifest.factor_resolution_sha256,
         "adapter_version": "r2f2.v1",
         "source_schema_version": "daily_astock.v1",
         "row_count": 1,
@@ -101,7 +91,12 @@ def write_canonical_fixture(root: Path):
         "status": "accepted",
     }
     outcomes = tuple(
-        GateOutcome(gate_name=name, gate_version="r2f2.v1", verdict="pass")
+        GateOutcome(
+            gate_name=name,
+            gate_version="r2f2.v1",
+            verdict="pass",
+            referenced_hashes=(evidence_sha,),
+        )
         for name in R2F2_GATE_ORDER
     )
     gate_values = {
@@ -132,14 +127,16 @@ def write_canonical_fixture(root: Path):
     }
     selection_values["selection_sha256"] = digest(selection_values)
     selection = SessionSelection.model_validate(selection_values)
-    (candidate_root / "normalized.json").write_bytes(normalized_raw)
-    (candidate_root / "gate.json").write_text(
+    bundle = candidate_root / "bundles" / candidate.candidate_id
+    bundle.mkdir(parents=True)
+    (bundle / "normalized.json").write_bytes(normalized_raw)
+    (bundle / "gate.json").write_text(
         json.dumps(gate.model_dump(mode="json"), sort_keys=True, separators=(",", ":")) + "\n"
     )
-    (candidate_root / "candidate.json").write_text(
+    (bundle / "candidate.json").write_text(
         json.dumps(candidate.model_dump(mode="json"), sort_keys=True, separators=(",", ":")) + "\n"
     )
-    (candidate_root / "selection.json").write_text(
+    (bundle / "selection.json").write_text(
         json.dumps(selection.model_dump(mode="json"), sort_keys=True, separators=(",", ":")) + "\n"
     )
     partition = dataset / "partitions" / "2026-08-20.parquet"
@@ -158,21 +155,39 @@ def write_canonical_fixture(root: Path):
         connection.close()
     partition_sha = hashlib.sha256(partition.read_bytes()).hexdigest()
     manifest = {
+        "dataset": "stock-eva-market",
+        "schema_version": 2,
         "generation": "g1",
-        "trade_date": "2026-08-20",
-        "trade_date_partition_relative_path": "partitions/2026-08-20.parquet",
-        "trade_date_partition_sha256": partition_sha,
-        "trade_date_row_count": 1,
+        "files": [
+            {
+                "path": "partitions/2026-08-20.parquet",
+                "sha256": partition_sha,
+                "row_count": 1,
+                "source": "baostock",
+                "trade_date": "2026-08-20",
+                "lineage": {
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_manifest_sha256": candidate.manifest_sha256,
+                    "evidence_id": evidence_id,
+                    "evidence_sha256": evidence_sha,
+                    "gate_report_sha256": gate.aggregate_sha256,
+                    "factor_resolution_sha256": candidate.factor_resolution_sha256,
+                    "normalized_object_sha256": candidate.normalized_object_sha256,
+                    "selection_id": selection.selection_id,
+                    "selection_sha256": selection.selection_sha256,
+                },
+            }
+        ],
     }
     (dataset / "manifest.json").write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
     )
-    return dataset, candidate_root, EvidenceFixture(evidence_id, evidence_sha, trade_date, universe)
+    return dataset, candidate_root, evidence_root
 
 
 def test_canonical_comparison_snapshot_binds_manifest_partition_and_r2f2_lineage(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
-    result = CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence).read()
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
     assert result.status == "ready"
     assert result.snapshot.trade_date_partition_sha256
     assert result.snapshot.r2f2_publication_lineage["provider_id"] == "baostock"
@@ -186,26 +201,24 @@ def test_canonical_comparison_bidirectional_hashes(
     tmp_path,
 ):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
-    snapshot = (
-        CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence).read().snapshot
-    )
+    snapshot = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read().snapshot
+    bundle = candidate / "bundles" / "candidate-canonical-0001"
     assert (
         snapshot.selection_sha256
-        == json.loads((candidate / "selection.json").read_text())["selection_sha256"]
+        == json.loads((bundle / "selection.json").read_text())["selection_sha256"]
     )
     assert (
-        snapshot.gate_sha256
-        == json.loads((candidate / "gate.json").read_text())["aggregate_sha256"]
+        snapshot.gate_sha256 == json.loads((bundle / "gate.json").read_text())["aggregate_sha256"]
     )
     assert (
         snapshot.normalized_sha256
-        == json.loads((candidate / "candidate.json").read_text())["normalized_object_sha256"]
+        == json.loads((bundle / "candidate.json").read_text())["normalized_object_sha256"]
     )
 
 
 def test_canonical_comparison_drift_returns_unavailable_and_zero_write(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
-    reader = CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence)
+    reader = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence)
     assert reader.read().status == "ready"
     before = (dataset / "manifest.json").read_bytes()
     (dataset / "manifest.json").write_text(before.decode().replace('"g1"', '"g2"'))
@@ -217,19 +230,20 @@ def test_canonical_comparison_drift_returns_unavailable_and_zero_write(tmp_path)
 
 def test_canonical_candidate_reader_rejects_root_bundle_and_fd_toctou(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
-    bundled = tmp_path / "bundles" / "candidate-canonical-0001"
+    bundled = tmp_path / "foreign-bundles" / "candidate-canonical-0001"
     bundled.parent.mkdir()
     bundled.mkdir()
+    existing = candidate / "bundles" / "candidate-canonical-0001"
     for name in ("candidate.json", "gate.json", "normalized.json", "selection.json"):
-        (bundled / name).write_bytes((candidate / name).read_bytes())
+        (bundled / name).write_bytes((existing / name).read_bytes())
     assert (
-        CanonicalCandidateReader(dataset, tmp_path, evidence_reader=evidence).read().status
+        CanonicalCandidateReader(dataset, tmp_path, evidence_root=evidence).read().status
         == "unavailable"
     )
-    (candidate / "normalized.json").unlink()
-    (candidate / "normalized.json").symlink_to(bundled / "normalized.json")
+    (existing / "normalized.json").unlink()
+    (existing / "normalized.json").symlink_to(bundled / "normalized.json")
     assert (
-        CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence).read().status
+        CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read().status
         == "unavailable"
     )
 
@@ -237,7 +251,7 @@ def test_canonical_candidate_reader_rejects_root_bundle_and_fd_toctou(tmp_path):
 def test_published_canonical_comparison_verify_before_after_and_close_capability(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
     capability = PublishedCanonicalComparison.open(
-        CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence)
+        CanonicalCandidateReader(dataset, candidate, evidence_root=evidence)
     )
     assert isinstance(capability, PublishedCanonicalComparison)
     assert capability.verify().status == "ready"
@@ -250,23 +264,22 @@ def test_published_canonical_comparison_verify_before_after_and_close_capability
 def test_canonical_comparison_rejects_mixed_generation_or_lineage(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
     manifest = json.loads((dataset / "manifest.json").read_text())
-    manifest["publication_lineage"] = {"provider_id": "tushare"}
+    manifest["files"][0]["lineage"]["evidence_sha256"] = "t" * 64
     (dataset / "manifest.json").write_text(json.dumps(manifest) + "\n")
-    result = CanonicalCandidateReader(dataset, candidate, evidence_reader=evidence).read()
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
     assert (
         result.status == "unavailable"
-        and result.unavailable_reason == UnavailableReason.CANONICAL_DESCRIPTOR_CHANGED
+        and result.unavailable_reason == UnavailableReason.SELECTION_BINDING_INVALID
     )
 
 
 def test_task12_candidate_attach_requires_evidence_ready_and_keeps_job_nonterminal(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
-    calls = []
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
+    assert result.status == "ready"
 
-    class EvidenceReader:
-        def read(self, evidence_id):
-            calls.append(evidence_id)
-            return evidence
 
-    result = CanonicalCandidateReader(dataset, candidate, evidence_reader=EvidenceReader()).read()
-    assert result.status == "ready" and calls == ["ev-canonical-0001"]
+def test_canonical_reader_uses_production_dataset_files_and_candidate_bundle_layout(tmp_path):
+    dataset, candidate_root, evidence = write_canonical_fixture(tmp_path)
+    result = CanonicalCandidateReader(dataset, candidate_root, evidence_root=evidence).read()
+    assert result.status == "ready"

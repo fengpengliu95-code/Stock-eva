@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .providers.registry import ShadowRegistry
 from .shadow_evidence import ShadowEvidenceReader
 from .shadow_normalize import ShadowNormalizedCandidate
 
@@ -212,7 +213,81 @@ class ShadowCandidateBundle(BaseModel):
 
 
 def _candidate_id(candidate: ShadowNormalizedCandidate, evidence_id: str) -> str:
-    return _sha({"normalized": candidate.normalized_sha256, "evidence": evidence_id})[:32]
+    return _sha(
+        {
+            "domain": "stock-eva/r2f3/shadow-candidate/v1",
+            "normalized_sha256": candidate.normalized_sha256,
+            "evidence_id": evidence_id,
+            "provider_id": candidate.provider_id,
+            "trade_date": candidate.trade_date.isoformat(),
+            "universe_id": candidate.universe_id,
+        }
+    )[:32]
+
+
+def _registry_binding(
+    registry: ShadowRegistry,
+    candidate: ShadowNormalizedCandidate,
+    evidence_id: str,
+    evidence_sha256: str,
+) -> dict[str, Any]:
+    if type(registry) is not ShadowRegistry:
+        raise ShadowCandidateUnavailable("shadow registry unavailable")
+    if not all((candidate.job_id, candidate.window_id, candidate.session_id)):
+        raise ShadowCandidateUnavailable("shadow candidate identity unavailable")
+    try:
+        with registry._lock(shared=True):
+            connection = registry._connection_for_read()
+            try:
+                job = connection.execute(
+                    "SELECT job_id,provider_id,window_id,trade_date,universe_id,"
+                    "canonical_manifest_generation,canonical_manifest_sha256,"
+                    "version_vector_sha256,run_status FROM shadow_job "
+                    "WHERE job_id=? AND provider_id=? AND window_id=?",
+                    (candidate.job_id, candidate.provider_id, candidate.window_id),
+                ).fetchone()
+                evidence = connection.execute(
+                    "SELECT evidence_id,job_id,provider_id,window_id,session_id,"
+                    "evidence_sha256,attached_session_report_id FROM shadow_evidence_ref "
+                    "WHERE evidence_id=? AND job_id=? AND provider_id=? AND window_id=? "
+                    "AND session_id=?",
+                    (
+                        evidence_id,
+                        candidate.job_id,
+                        candidate.provider_id,
+                        candidate.window_id,
+                        candidate.session_id,
+                    ),
+                ).fetchone()
+            finally:
+                if not registry._memory:
+                    connection.close()
+    except Exception as exc:
+        raise ShadowCandidateUnavailable("shadow registry unavailable") from exc
+    if job is None or evidence is None:
+        raise ShadowCandidateUnavailable("shadow registry binding unavailable")
+    if job[8] != "pending_normalization" or evidence[6] is not None:
+        raise ShadowCandidateUnavailable("shadow job is not evidence-ready")
+    if (
+        job[1] != candidate.provider_id
+        or job[2] != candidate.window_id
+        or str(job[3])[:10] != candidate.trade_date.isoformat()
+        or job[4] != candidate.universe_id
+        or candidate.version_vector_sha256 != job[7]
+        or evidence[5] != evidence_sha256
+    ):
+        raise ShadowCandidateUnavailable("shadow registry binding mismatch")
+    return {
+        "job_id": job[0],
+        "provider_id": job[1],
+        "window_id": job[2],
+        "trade_date": job[3],
+        "universe_id": job[4],
+        "version_vector_sha256": job[7],
+        "evidence_id": evidence[0],
+        "session_id": evidence[4],
+        "evidence_sha256": evidence[5],
+    }
 
 
 class ShadowCandidateStore:
@@ -234,17 +309,18 @@ class ShadowCandidateStore:
         candidate_id: str | None = None,
         adapter_version: str = "r2f3-v1",
         source_schema_version: str = "r2f3-v1",
-        registry: Any | None = None,
+        registry: ShadowRegistry,
     ) -> ShadowCandidateManifest:
         if not self.root.is_absolute():
             raise ShadowCandidateUnavailable("shadow candidate root unavailable")
         _assert_no_symlink_chain(self.root)
+        if (
+            type(evidence_reader) is not ShadowEvidenceReader
+            or type(registry) is not ShadowRegistry
+        ):
+            raise ShadowCandidateUnavailable("shadow evidence or registry unavailable")
         try:
-            if hasattr(evidence_reader, "read_descriptor"):
-                evidence, descriptor = evidence_reader.read_descriptor(evidence_id)
-            else:
-                evidence = evidence_reader.read(evidence_id)
-                descriptor = {}
+            evidence, descriptor = evidence_reader.read_descriptor(evidence_id)
         except Exception as exc:
             raise ShadowCandidateUnavailable("shadow evidence unavailable") from exc
         evidence_id_value = getattr(evidence, "evidence_id", None) or getattr(
@@ -259,6 +335,8 @@ class ShadowCandidateStore:
             or candidate.trade_date is None
         ):
             raise ShadowCandidateUnavailable("shadow evidence unavailable")
+        if not getattr(evidence, "evidence_ready", False):
+            raise ShadowCandidateUnavailable("shadow evidence is not ready")
         evidence_manifest = getattr(evidence, "manifest", None)
         evidence_provider = descriptor.get("provider_id") or getattr(
             evidence_manifest, "provider_id", ""
@@ -287,26 +365,19 @@ class ShadowCandidateStore:
             not same_date(item.get("trade_date", "")) for item in plan_requests
         ):
             raise ShadowCandidateUnavailable("shadow evidence request date mismatch")
-        if registry is not None:
-            try:
-                job = registry.get_job(candidate.job_id, candidate.provider_id, candidate.window_id)
-            except AttributeError:
-                job = registry.read_job(
-                    candidate.job_id, candidate.provider_id, candidate.window_id
-                )
-            if (
-                job is None
-                or str(job.get("run_status", job.get("state", ""))) != "pending_normalization"
-            ):
-                raise ShadowCandidateUnavailable("shadow job is not evidence-ready")
-            for field in ("trade_date", "universe_id", "provider_id"):
-                expected = getattr(candidate, field)
-                observed = job.get(field)
-                if observed is not None and str(observed)[:10] != str(expected)[:10]:
-                    raise ShadowCandidateUnavailable("shadow job binding mismatch")
-        cid = candidate_id or _candidate_id(candidate, evidence_id)
-        if candidate_id is not None and candidate_id != cid:
+        _registry_binding(registry, candidate, evidence_id, evidence_sha_value)
+        for field in ("job_id", "window_id", "session_id"):
+            if descriptor.get(field) != getattr(candidate, field):
+                raise ShadowCandidateUnavailable("shadow evidence identity mismatch")
+        if (
+            descriptor.get("version_vector_sha256", candidate.version_vector_sha256)
+            != candidate.version_vector_sha256
+        ):
+            raise ShadowCandidateUnavailable("shadow evidence version mismatch")
+        computed_candidate_id = _candidate_id(candidate, evidence_id)
+        if candidate_id is not None and candidate_id != computed_candidate_id:
             raise ShadowCandidateUnavailable("shadow candidate identity mismatch")
+        cid = computed_candidate_id
         expected = set(candidate.expected_symbols)
         observed = {row.symbol for row in candidate.rows}
         legal_missing = set(candidate.suspended_symbols) | set(candidate.not_listed_symbols)
@@ -405,12 +476,19 @@ class ShadowCandidateStore:
                 os.close(dir_fd)
             destination = bundles / cid
             if destination.exists():
-                existing = ShadowCandidateReader(self.root).read(cid)
+                existing = ShadowCandidateReader(
+                    self.root, evidence_reader=evidence_reader, registry=registry
+                ).read(cid)
                 if existing.manifest.manifest_sha256 != manifest.manifest_sha256:
                     raise ShadowCandidateUnavailable("shadow candidate identity collision")
                 return existing.manifest
             _rename_noclobber(staging, destination)
             _fsync_dir(bundles)
+            verified = ShadowCandidateReader(
+                self.root, evidence_reader=evidence_reader, registry=registry
+            ).read(cid)
+            if verified.manifest.manifest_sha256 != manifest.manifest_sha256:
+                raise ShadowCandidateUnavailable("shadow candidate readback mismatch")
         finally:
             if staging.exists():
                 for path in staging.iterdir():
@@ -426,10 +504,15 @@ class ShadowCandidateReader:
         self,
         root: Path | str,
         *,
-        evidence_reader: ShadowEvidenceReader | None = None,
-        registry: Any | None = None,
+        evidence_reader: ShadowEvidenceReader,
+        registry: ShadowRegistry,
     ):
         self.root = Path(root)
+        if (
+            type(evidence_reader) is not ShadowEvidenceReader
+            or type(registry) is not ShadowRegistry
+        ):
+            raise ShadowCandidateUnavailable("shadow evidence or registry unavailable")
         self.evidence_reader = evidence_reader
         self.registry = registry
 
@@ -454,12 +537,47 @@ class ShadowCandidateReader:
             manifest = ShadowCandidateManifest.model_validate(json.loads(manifest_raw))
             quality = ShadowQualityReport.model_validate(json.loads(quality_raw))
             candidate = ShadowNormalizedCandidate.model_validate(json.loads(normalized_raw))
+            expected_symbols = set(candidate.expected_symbols)
+            observed_symbols = {row.symbol for row in candidate.rows}
+            legal_missing = set(candidate.suspended_symbols) | set(candidate.not_listed_symbols)
+            failed_symbols = tuple(sorted(expected_symbols - observed_symbols - legal_missing))
+            derived_complete = (
+                candidate.complete
+                and observed_symbols | legal_missing == expected_symbols
+                and candidate.quality_status == "ready"
+                and bool(
+                    candidate.factor_semantics
+                    and candidate.factor_anchor
+                    and candidate.factor_direction
+                )
+                and all(
+                    row.factor is not None and row.factor_previous is not None
+                    for row in candidate.rows
+                )
+                and all(row.provider_id == candidate.provider_id for row in candidate.rows)
+            )
+            expected_verdict = "pass" if derived_complete and not failed_symbols else "fail"
             if (
                 manifest.candidate_id != candidate_id
+                or _candidate_id(candidate, manifest.evidence_id) != candidate_id
                 or manifest.normalized_object_sha256 != _sha(normalized_raw)
                 or manifest.quality_report_sha256 != _sha(quality_raw)
                 or manifest.evidence_id == ""
                 or quality.candidate_id != candidate_id
+                or manifest.row_count != len(candidate.rows)
+                or manifest.expected_symbol_count != len(candidate.expected_symbols)
+                or quality.expected_symbol_count != len(candidate.expected_symbols)
+                or quality.loaded_symbol_count != len(candidate.rows)
+                or quality.suspended_count
+                != sum(row.suspension for row in candidate.rows) + len(candidate.suspended_symbols)
+                or quality.failed_symbols != failed_symbols
+                or quality.ordered_gate_outcomes
+                != (
+                    ("coverage", "pass" if derived_complete and not failed_symbols else "fail"),
+                    ("self_quality", "pass" if candidate.quality_status == "ready" else "fail"),
+                )
+                or quality.input_evidence_sha256 != manifest.evidence_sha256
+                or quality.verdict != expected_verdict
                 or commit != f"COMMIT\n{manifest.bundle_commit_sha256}\n"
             ):
                 raise ShadowCandidateUnavailable("shadow candidate descriptor mismatch")
@@ -469,28 +587,35 @@ class ShadowCandidateReader:
                 or manifest.universe_id != candidate.universe_id
             ):
                 raise ShadowCandidateUnavailable("shadow candidate identity mismatch")
-            if self.evidence_reader is not None:
-                try:
-                    if hasattr(self.evidence_reader, "read_descriptor"):
-                        evidence, descriptor = self.evidence_reader.read_descriptor(
-                            manifest.evidence_id
-                        )
-                    else:
-                        evidence, descriptor = self.evidence_reader.read(manifest.evidence_id), {}
-                    evidence_sha_value = getattr(evidence, "manifest_sha256", None) or getattr(
-                        getattr(evidence, "manifest", None), "manifest_sha256", None
+            try:
+                evidence, descriptor = self.evidence_reader.read_descriptor(manifest.evidence_id)
+                evidence_sha_value = getattr(evidence, "manifest_sha256", None) or getattr(
+                    getattr(evidence, "manifest", None), "manifest_sha256", None
+                )
+                if (
+                    evidence_sha_value != manifest.evidence_sha256
+                    or not getattr(evidence, "evidence_ready", False)
+                    or descriptor.get("provider_id") != manifest.provider_id
+                    or (
+                        descriptor.get("trade_date") is not None
+                        and str(descriptor["trade_date"])[:10] != manifest.trade_date.isoformat()
                     )
-                    if evidence_sha_value != manifest.evidence_sha256:
-                        raise ShadowCandidateUnavailable("shadow evidence hash mismatch")
-                    if descriptor and (
-                        descriptor.get("provider_id") not in {None, manifest.provider_id}
-                        or descriptor.get("universe_id") not in {None, manifest.universe_id}
-                    ):
-                        raise ShadowCandidateUnavailable("shadow evidence binding mismatch")
-                except ShadowCandidateUnavailable:
-                    raise
-                except Exception as exc:
-                    raise ShadowCandidateUnavailable("shadow evidence unavailable") from exc
+                    or (
+                        descriptor.get("universe_id") is not None
+                        and descriptor["universe_id"] != manifest.universe_id
+                    )
+                    or descriptor.get("job_id") != candidate.job_id
+                    or descriptor.get("window_id") != candidate.window_id
+                    or descriptor.get("session_id") != candidate.session_id
+                ):
+                    raise ShadowCandidateUnavailable("shadow evidence binding mismatch")
+                _registry_binding(
+                    self.registry, candidate, manifest.evidence_id, manifest.evidence_sha256
+                )
+            except ShadowCandidateUnavailable:
+                raise
+            except Exception as exc:
+                raise ShadowCandidateUnavailable("shadow evidence unavailable") from exc
             return ShadowCandidateBundle(
                 manifest=manifest, quality_report=quality, candidate=candidate
             )

@@ -13,7 +13,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .candidates import CandidateGateReport, CandidateManifest, SessionSelection
+from backend.app.storage.models import DatasetManifest
+
+from .candidates import (
+    CandidateGateReport,
+    CandidateManifest,
+    SessionSelection,
+    _validate_factor_resolution,
+    validate_candidate_lineage,
+)
 from .evidence import EvidenceReader
 from .models import DailyBar
 
@@ -180,7 +188,6 @@ class CanonicalCandidateReader:
         *,
         trade_date: date | None = None,
         universe_id: str | None = None,
-        evidence_reader: Any | None = None,
     ):
         self.dataset_root = Path(dataset_root)
         self.candidate_root = Path(candidate_root) if candidate_root else self.dataset_root
@@ -188,8 +195,8 @@ class CanonicalCandidateReader:
         self.selection_root = Path(selection_root) if selection_root else self.candidate_root
         self.trade_date = trade_date
         self.universe_id = universe_id
-        self.evidence_reader = evidence_reader
         self._snapshot: CanonicalComparisonSnapshot | None = None
+        self._dataset_lineage: dict[str, Any] = {}
         self._paths: tuple[Path, ...] = ()
         self._fingerprints: tuple[_Fingerprint, ...] = ()
 
@@ -197,26 +204,52 @@ class CanonicalCandidateReader:
         return CanonicalComparisonResult(status="unavailable", unavailable_reason=reason)
 
     def _partition_descriptor(self, manifest: dict[str, Any], trade: date) -> tuple[str, str, int]:
-        relative = manifest.get("trade_date_partition_relative_path") or manifest.get(
-            "partition_relative_path"
-        )
-        if not relative and isinstance(manifest.get("partitions"), dict):
-            entry = manifest["partitions"].get(trade.isoformat())
-            if isinstance(entry, dict):
-                relative = entry.get("relative_path")
-        digest = manifest.get("trade_date_partition_sha256") or manifest.get("partition_sha256")
-        row_count = manifest.get("trade_date_row_count") or manifest.get("partition_row_count")
-        if (
-            not isinstance(relative, str)
-            or not relative
-            or not isinstance(digest, str)
-            or not isinstance(row_count, int)
-        ):
-            raise ValueError("canonical partition descriptor unavailable")
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts:
-            raise ValueError("canonical partition path unavailable")
-        return relative, digest, row_count
+        files = manifest.get("files")
+        if isinstance(files, list):
+            matches = [
+                item
+                for item in files
+                if isinstance(item, dict)
+                and item.get("source") == "baostock"
+                and str(item.get("trade_date", ""))[:10] == trade.isoformat()
+            ]
+            if len(matches) != 1:
+                raise ValueError("canonical partition lineage unavailable")
+            item = matches[0]
+            lineage = item.get("lineage")
+            if not isinstance(lineage, dict):
+                raise ValueError("canonical lineage unavailable")
+            required_lineage = (
+                "candidate_id",
+                "candidate_manifest_sha256",
+                "evidence_id",
+                "evidence_sha256",
+                "gate_report_sha256",
+                "factor_resolution_sha256",
+                "normalized_object_sha256",
+                "selection_id",
+                "selection_sha256",
+            )
+            if any(
+                not isinstance(lineage.get(key), str) or not lineage[key]
+                for key in required_lineage
+            ):
+                raise ValueError("canonical lineage unavailable")
+            self._dataset_lineage = lineage
+            relative = item.get("path") or item.get("relative_path")
+            digest = item.get("sha256")
+            row_count = item.get("row_count")
+            if (
+                not isinstance(relative, str)
+                or not isinstance(digest, str)
+                or not isinstance(row_count, int)
+            ):
+                raise ValueError("canonical partition descriptor unavailable")
+            path = Path(relative)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("canonical partition path unavailable")
+            return relative, digest, row_count
+        raise ValueError("canonical DatasetManifest.files descriptor unavailable")
 
     def _validate_partition(self, path: Path, trade: date, row_count: int) -> None:
         if path.suffix.lower() != ".parquet":
@@ -244,7 +277,7 @@ class CanonicalCandidateReader:
             raise ValueError("canonical partition semantics mismatch")
 
     def _read_evidence(self, evidence_id: str) -> Any:
-        return (self.evidence_reader or EvidenceReader(self.evidence_root)).read(evidence_id)
+        return EvidenceReader(self.evidence_root).read(evidence_id)
 
     def read(self) -> CanonicalComparisonResult:
         if self._snapshot is not None:
@@ -257,24 +290,40 @@ class CanonicalCandidateReader:
                 self.selection_root,
             ):
                 _assert_no_symlink_chain(root)
-            if self.selection_root == self.candidate_root:
-                _assert_exact_json_tree(
-                    self.candidate_root,
-                    {"candidate.json", "gate.json", "normalized.json", "selection.json"},
-                )
-            else:
-                _assert_exact_json_tree(
-                    self.candidate_root, {"candidate.json", "gate.json", "normalized.json"}
-                )
-                _assert_exact_json_tree(self.selection_root, {"selection.json"})
             manifest_raw, manifest_fp = _read_verified(self.dataset_root / "manifest.json")
             manifest = _json(manifest_raw)
             if not isinstance(manifest, dict) or not manifest.get("generation"):
                 return self._unavailable(UnavailableReason.CANONICAL_DESCRIPTOR_CHANGED)
-            candidate_path = self.candidate_root / "candidate.json"
-            gate_path = self.candidate_root / "gate.json"
-            normalized_path = self.candidate_root / "normalized.json"
-            selection_path = self.selection_root / "selection.json"
+            if isinstance(manifest.get("files"), list):
+                DatasetManifest.model_validate(manifest)
+                files = [item for item in manifest["files"] if isinstance(item, dict)]
+                if self.trade_date is None:
+                    dates = {
+                        str(item.get("trade_date", ""))[:10]
+                        for item in files
+                        if item.get("source") == "baostock"
+                    }
+                    if len(dates) != 1:
+                        raise ValueError("canonical trade date unavailable")
+                    requested_trade = date.fromisoformat(next(iter(dates)))
+                else:
+                    requested_trade = self.trade_date
+                relative, partition_sha, partition_count = self._partition_descriptor(
+                    manifest, requested_trade
+                )
+                lineage = self._dataset_lineage
+                candidate_id = lineage["candidate_id"]
+                bundle = self.candidate_root / "bundles" / candidate_id
+                _assert_no_symlink_chain(bundle)
+                _assert_exact_json_tree(
+                    bundle, {"candidate.json", "gate.json", "normalized.json", "selection.json"}
+                )
+                candidate_path = bundle / "candidate.json"
+                gate_path = bundle / "gate.json"
+                normalized_path = bundle / "normalized.json"
+                selection_path = bundle / "selection.json"
+            else:
+                raise ValueError("canonical DatasetManifest.files descriptor unavailable")
             candidate_raw, candidate_fp = _read_verified(candidate_path)
             gate_raw, gate_fp = _read_verified(gate_path)
             normalized_raw, normalized_fp = _read_verified(normalized_path)
@@ -282,6 +331,21 @@ class CanonicalCandidateReader:
             candidate = CandidateManifest.model_validate(_json(candidate_raw))
             gate = CandidateGateReport.model_validate(_json(gate_raw))
             selection = SessionSelection.model_validate(_json(selection_raw))
+            lineage = self._dataset_lineage
+            if lineage and any(
+                (
+                    lineage["candidate_id"] != candidate.candidate_id,
+                    lineage["candidate_manifest_sha256"] != candidate.manifest_sha256,
+                    lineage["evidence_id"] != candidate.evidence_id,
+                    lineage["evidence_sha256"] != candidate.evidence_sha256,
+                    lineage["gate_report_sha256"] != gate.aggregate_sha256,
+                    lineage["factor_resolution_sha256"] != candidate.factor_resolution_sha256,
+                    lineage["normalized_object_sha256"] != candidate.normalized_object_sha256,
+                    lineage["selection_id"] != selection.selection_id,
+                    lineage["selection_sha256"] != selection.selection_sha256,
+                )
+            ):
+                return self._unavailable(UnavailableReason.SELECTION_BINDING_INVALID)
             if (
                 candidate.provider_id.value != "baostock"
                 or candidate.status != "accepted"
@@ -301,8 +365,14 @@ class CanonicalCandidateReader:
                 gate.candidate_id != candidate.candidate_id
                 or gate.verdict != "pass"
                 or candidate.gate_report_sha256 != gate.aggregate_sha256
-                or candidate.normalized_object_relative_path != "normalized.json"
-                or candidate.gate_report_relative_path != "gate.json"
+                or candidate.normalized_object_relative_path
+                != (
+                    f"bundles/{candidate.candidate_id}/normalized.json"
+                    if lineage
+                    else "normalized.json"
+                )
+                or candidate.gate_report_relative_path
+                != (f"bundles/{candidate.candidate_id}/gate.json" if lineage else "gate.json")
             ):
                 return self._unavailable(UnavailableReason.CANDIDATE_DESCRIPTOR_CHANGED)
             if candidate.normalized_object_sha256 != normalized_fp.sha256:
@@ -348,6 +418,8 @@ class CanonicalCandidateReader:
             self._validate_partition(partition_path, candidate.trade_date, partition_count)
             evidence = self._read_evidence(candidate.evidence_id)
             evidence_manifest = evidence.manifest
+            validate_candidate_lineage(candidate, evidence, gate)
+            _validate_factor_resolution(evidence)
             if (
                 evidence_manifest.provider_id.value != "baostock"
                 or evidence_manifest.evidence_id != candidate.evidence_id
@@ -406,6 +478,11 @@ class CanonicalCandidateReader:
                 gate_path,
                 selection_path,
                 normalized_path,
+                self.evidence_root / "manifests" / f"{candidate.evidence_id}.json",
+                *(
+                    self.evidence_root / descriptor.relative_path
+                    for descriptor in evidence.descriptors
+                ),
             )
             self._fingerprints = tuple(_read_verified(path)[1] for path in self._paths)
             self._snapshot = snapshot

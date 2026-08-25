@@ -90,14 +90,29 @@ def _return(row: ShadowNormalizedRow) -> float:
     return (row.close * factor) / (row.preclose * previous_factor) - 1.0
 
 
+def _compatible_factor_contract(
+    left: ShadowNormalizedCandidate, right: ShadowNormalizedCandidate
+) -> bool:
+    def normalized(value: str) -> str:
+        return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+    return normalized(left.factor_direction) == normalized(right.factor_direction) and normalized(
+        left.factor_semantics
+    ) == normalized(right.factor_semantics)
+
+
 def reconcile(
     left: ShadowNormalizedCandidate,
     right: ShadowNormalizedCandidate,
     *,
     policy: ReconciliationPolicy | None = None,
 ) -> ShadowReconciliationReport:
-    if left.provider_id not in SHADOW_PROVIDERS or right.provider_id not in SHADOW_PROVIDERS:
+    allowed = SHADOW_PROVIDERS | {"baostock"}
+    if left.provider_id not in allowed or right.provider_id not in allowed:
         raise ValueError("shadow provider identity is not allowlisted")
+    if (left.provider_id == "baostock") == (right.provider_id == "baostock"):
+        if "baostock" in {left.provider_id, right.provider_id}:
+            raise ValueError("reconciliation requires one canonical and one shadow provider")
     policy = policy or ReconciliationPolicy()
     policy = ReconciliationPolicy.model_validate(policy.model_dump())
     left_id, right_id = _candidate_id(left), _candidate_id(right)
@@ -128,12 +143,15 @@ def reconcile(
         or not right.factor_anchor
         or not left.factor_direction
         or not right.factor_direction
-        or left.factor_anchor != right.factor_anchor
-        or left.factor_direction != right.factor_direction
+        or not _compatible_factor_contract(left, right)
     ):
         mismatch["identity"] = 1
     if left.expected_symbols != right.expected_symbols or left.index_symbols != right.index_symbols:
         mismatch["universe"] = 1
+    if left.suspended_symbols != right.suspended_symbols:
+        mismatch["suspension"] = 1
+    if left.not_listed_symbols != right.not_listed_symbols:
+        mismatch["not_listed"] = 1
     left_rows = {row.symbol: row for row in left.rows}
     right_rows = {row.symbol: row for row in right.rows}
     if set(left_rows) != set(right_rows):
@@ -181,6 +199,8 @@ def reconcile(
         "right_rows": len(right.rows),
     }
     active_count = max(len(set(left_rows) & set(right_rows)), 1)
+    if any(row.factor is None or row.factor_previous is None for row in (*left.rows, *right.rows)):
+        mismatch["identity"] = 1
     rate_limited = (
         mismatch["volume"] / active_count > 0.001 or mismatch["amount"] / active_count > 0.001
     )
@@ -190,6 +210,7 @@ def reconcile(
         else (
             "material_mismatch"
             if mismatch["suspension"]
+            or mismatch.get("not_listed", 0)
             or mismatch["ohlc"]
             or rate_limited
             or mismatch["adjusted_return"]
