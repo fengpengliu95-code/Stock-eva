@@ -18,10 +18,14 @@ from backend.app.market.providers.registry import ShadowRegistry
 from backend.app.market.shadow_calendar import ConfirmedCalendarReader, ShadowCalendarUnavailable
 from backend.app.market.shadow_candidates import ShadowCandidateReader
 from backend.app.market.shadow_evidence import (
+    ShadowAttempt,
+    ShadowCompletion,
     ShadowEvidenceBundle,
     ShadowEvidenceReader,
+    ShadowEvidenceStore,
     ShadowLogicalRequest,
     ShadowLogicalRequestPlan,
+    ShadowRequestCompletion,
 )
 from backend.app.market.shadow_jobs import (
     CanonicalOutcomeScanner,
@@ -32,6 +36,7 @@ from backend.app.market.shadow_jobs import (
 from backend.app.market.shadow_terminal import (
     ShadowTerminalUnavailable,
     ShadowTerminalWriter,
+    _strict_bundle_validation,
     attempt_ordinal_closure_digest,
     canonical_json,
     completion_digest,
@@ -493,12 +498,184 @@ def test_publisher_rejects_identity_replacement_symlink(tmp_path, monkeypatch):
     assert not (tmp_path / "shadow" / "bundles" / "race" / "COMMIT").exists()
 
 
+def test_publisher_verifies_held_destination_before_success(tmp_path, monkeypatch):
+    original_fsync = os.fsync
+    fsync_calls = 0
+    destination = tmp_path / "shadow" / "bundles" / "replace"
+    hidden = tmp_path / "shadow" / "bundles" / ".replace-hidden"
+
+    def replace_after_commit(fd):
+        nonlocal fsync_calls
+        original_fsync(fd)
+        fsync_calls += 1
+        if fsync_calls == 3:
+            os.rename(destination, hidden)
+            os.symlink(hidden.name, destination)
+
+    monkeypatch.setattr(os, "fsync", replace_after_commit)
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish("replace", {"value": 1})
+    assert destination.is_symlink()
+    assert (hidden / "COMMIT").is_file()
+
+
+def _owner_bytes(identity, payload):
+    raw = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    owner = {
+        "bundle_id": identity,
+        "payload_sha256": hashlib.sha256(raw).hexdigest(),
+        "publisher_id": "a" * 32,
+        "schema_version": 1,
+    }
+    owner_raw = (
+        json.dumps(owner, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    return raw, owner_raw
+
+
+@pytest.mark.parametrize("phase", ["owner", "report"])
+def test_publisher_recovers_owner_and_report_crash_gaps(tmp_path, phase):
+    identity = "recover-" + phase
+    payload = {"value": phase}
+    raw, owner_raw = _owner_bytes(identity, payload)
+    directory = tmp_path / "shadow" / "bundles" / identity
+    directory.mkdir(parents=True)
+    (directory / "OWNER").write_bytes(owner_raw)
+    if phase == "report":
+        (directory / "report.json").write_bytes(raw)
+    result = ShadowBundlePublisher(tmp_path / "shadow").publish(identity, payload)
+    assert result == directory
+    assert (directory / "OWNER").read_bytes() == owner_raw
+    assert (directory / "report.json").read_bytes() == raw
+    assert (directory / "COMMIT").read_text() == hashlib.sha256(raw).hexdigest() + "\n"
+
+
+def test_publisher_preserves_foreign_incomplete_bundle(tmp_path):
+    identity = "foreign-owner"
+    directory = tmp_path / "shadow" / "bundles" / identity
+    directory.mkdir(parents=True)
+    (directory / "OWNER").write_text(
+        json.dumps(
+            {
+                "bundle_id": identity,
+                "payload_sha256": "0" * 64,
+                "publisher_id": "b" * 32,
+                "schema_version": 1,
+            }
+        )
+    )
+    (directory / "foreign").write_text("evidence")
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish(identity, {"value": "new"})
+    assert (directory / "foreign").read_text() == "evidence"
+
+
 def test_public_terminal_success_requires_strict_cross_task_inputs(tmp_path):
     import backend.app.market.shadow_terminal as shadow_terminal
 
     assert "write_terminal_success" not in dir(shadow_terminal)
     assert "write_terminal_success" not in shadow_terminal.__all__
     assert "context" in inspect.signature(ShadowTerminalWriter.write_success).parameters
+
+
+def test_terminal_accepts_real_task11_descriptor_without_candidate_id(tmp_path):
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    request = ShadowLogicalRequest(
+        job_id="job-real-descriptor",
+        provider_id="tickflow",
+        window_id="window-real-descriptor",
+        ordinal=0,
+        request_id="request-0",
+        endpoint="daily",
+        endpoint_class="daily",
+        role="bars",
+        trade_date=date(2026, 1, 2),
+        symbol_or_index_shard="all",
+        schema_contract_hash="a" * 64,
+        unit_contract_hash="b" * 64,
+    )
+    plan = ShadowLogicalRequestPlan(requests=(request,))
+    completion = ShadowCompletion(
+        job_id=plan.job_id,
+        provider_id=plan.provider_id,
+        window_id=plan.window_id,
+        session_id="session-real-descriptor",
+        evidence_id="evidence-real-descriptor",
+        request_plan_sha256=plan.request_plan_sha256,
+        requests=(
+            ShadowRequestCompletion(
+                ordinal=0,
+                request_id=request.request_id,
+                endpoint=request.endpoint,
+                endpoint_class=request.endpoint_class,
+                final_attempt_id="attempt-real-descriptor",
+                pages=(
+                    {
+                        "page_identity": "request-0:page-000001",
+                        "rows": [{"row": 1}],
+                    },
+                ),
+            ),
+        ),
+    )
+    bundle = ShadowEvidenceStore(tmp_path / "evidence").publish(
+        plan=plan,
+        completion=completion,
+        attempts=(
+            ShadowAttempt(
+                attempt_id="attempt-real-descriptor",
+                ordinal=0,
+                outcome="success",
+                rows=({"row": 1},),
+                pages=completion.requests[0].pages,
+            ),
+        ),
+    )
+    evidence_reader = ShadowEvidenceReader(tmp_path / "evidence")
+    evidence, descriptor = evidence_reader.read_descriptor(bundle.evidence_id)
+    assert "candidate_id" not in descriptor
+    candidate_reader = ShadowCandidateReader(
+        tmp_path / "candidate", evidence_reader=evidence_reader, registry=registry
+    )
+    candidate_reader.read = lambda _candidate_id: SimpleNamespace(
+        manifest=SimpleNamespace(
+            evidence_sha256=bundle.manifest_sha256,
+            evidence_id=bundle.evidence_id,
+            candidate_id="candidate-real-descriptor",
+            provider_id=plan.provider_id,
+            trade_date=request.trade_date,
+            universe_id="universe-real-descriptor",
+            candidate_sha256="f" * 64,
+            status="accepted",
+        ),
+        candidate=SimpleNamespace(
+            job_id=plan.job_id,
+            window_id=plan.window_id,
+            session_id=completion.session_id,
+            quality_status="ready",
+        ),
+        quality_report=SimpleNamespace(verdict="pass"),
+    )
+    evidence, candidate_bundle, items = _strict_bundle_validation(
+        plan=plan,
+        evidence_reader=evidence_reader,
+        candidate_reader=candidate_reader,
+        evidence_id=bundle.evidence_id,
+        candidate_id="candidate-real-descriptor",
+        identity=SimpleNamespace(
+            provider_id=plan.provider_id,
+            job_id=plan.job_id,
+            window_id=plan.window_id,
+            session_id=completion.session_id,
+            evidence_id=bundle.evidence_id,
+            candidate_id="candidate-real-descriptor",
+        ),
+    )
+    assert evidence.evidence_ready and candidate_bundle.manifest.candidate_id
+    assert items[0]["ordinal"] == 0
 
 
 def test_calendar_hash_and_parse_use_one_held_read(tmp_path, monkeypatch):
@@ -636,12 +813,13 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         job_id=job_id, provider_id="tickflow", window_id=window.window_id, requests=(request,)
     )
     page = {
-        "ordinal": 0,
+        "ordinal": 1,
         "page_identity": "page-0",
         "object_ref": "pages/page-0.json",
         "content_sha256": "c" * 64,
         "row_count": 1,
     }
+    descriptor_page = {**page, "ordinal": 0}
     completion = {
         "job_id": job_id,
         "provider_id": "tickflow",
@@ -669,10 +847,9 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "window_id": window.window_id,
         "session_id": session_id,
         "evidence_id": evidence_id,
-        "candidate_id": candidate_id,
         "plan_sha256": plan.request_plan_sha256,
         "completion": completion,
-        "pages": [page],
+        "pages": [descriptor_page],
     }
     evidence = ShadowEvidenceBundle(
         evidence_id=evidence_id,
@@ -825,9 +1002,15 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "terminal-report-1",
     )
     writer = ShadowTerminalWriter(ShadowBundlePublisher(tmp_path / "shadow"))
-    evil_descriptor = dict(descriptor)
-    evil_descriptor["candidate_id"] = "evil-candidate"
-    evidence_reader.read_descriptor = lambda _evidence_id: (evidence, evil_descriptor)
+    evil_manifest_values = dict(manifest.__dict__)
+    evil_manifest_values["candidate_id"] = "evil-candidate"
+    evil_manifest = SimpleNamespace(**evil_manifest_values)
+    evil_candidate_bundle = SimpleNamespace(
+        manifest=evil_manifest,
+        candidate=candidate_bundle.candidate,
+        quality_report=candidate_bundle.quality_report,
+    )
+    candidate_reader.read = lambda _candidate_id: evil_candidate_bundle
     with pytest.raises(ShadowTerminalUnavailable):
         writer.write_success(
             registry,
@@ -846,7 +1029,7 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
     assert connection.execute(
         "SELECT run_status,state_version FROM shadow_job WHERE job_id=?", (job_id,)
     ).fetchone() == ("pending_normalization", 0)
-    evidence_reader.read_descriptor = lambda _evidence_id: (evidence, descriptor)
+    candidate_reader.read = lambda _candidate_id: candidate_bundle
     attestation = writer.write_success(
         registry,
         plan=plan,

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 from collections import deque
@@ -53,6 +54,7 @@ _CANONICAL_PARQUET_SCHEMA = (
 )
 _SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OWNER_SCHEMA_VERSION = 1
 
 
 class ShadowJobUnavailable(RuntimeError):
@@ -404,6 +406,7 @@ class ShadowBundlePublisher:
     def __init__(self, root: Path | str):
         self.root = Path(root)
         self.lock_path = self.root / "bundles.lock"
+        self.publisher_id = secrets.token_hex(16)
 
     @staticmethod
     def _open_child_directory(parent_fd: int, name: str) -> int:
@@ -460,6 +463,76 @@ class ShadowBundlePublisher:
         finally:
             os.close(fd)
 
+    @staticmethod
+    def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            stat.S_IFMT(info.st_mode),
+            info.st_mtime_ns,
+            getattr(info, "st_ctime_ns", 0),
+        )
+
+    @staticmethod
+    def _owner_payload(identity: str, payload_sha256: str, publisher_id: str) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "bundle_id": identity,
+                    "payload_sha256": payload_sha256,
+                    "publisher_id": publisher_id,
+                    "schema_version": _OWNER_SCHEMA_VERSION,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+
+    @classmethod
+    def _validate_owner(cls, raw: bytes, identity: str, payload_sha256: str) -> None:
+        try:
+            owner = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ShadowJobUnavailable("shadow bundle owner unavailable") from exc
+        if (
+            not isinstance(owner, dict)
+            or set(owner) != {"bundle_id", "payload_sha256", "publisher_id", "schema_version"}
+            or owner.get("schema_version") != _OWNER_SCHEMA_VERSION
+            or owner.get("bundle_id") != identity
+            or owner.get("payload_sha256") != payload_sha256
+            or not isinstance(owner.get("publisher_id"), str)
+            or not _SHA256.fullmatch(owner.get("payload_sha256", ""))
+            or not re.fullmatch(r"[0-9a-f]{32}", owner["publisher_id"])
+        ):
+            raise ShadowJobUnavailable("shadow bundle owner unavailable")
+        if raw != cls._owner_payload(identity, payload_sha256, owner["publisher_id"]):
+            raise ShadowJobUnavailable("shadow bundle owner unavailable")
+
+    @classmethod
+    def _verify_destination(
+        cls, bundles_fd: int, identity: str, destination_fd: int, expected_fingerprint
+    ) -> None:
+        try:
+            current_fd = os.open(
+                identity,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=bundles_fd,
+            )
+        except OSError as exc:
+            raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+        try:
+            current = os.fstat(current_fd)
+            held = os.fstat(destination_fd)
+            if (
+                cls._fingerprint(current) != expected_fingerprint
+                or cls._fingerprint(held) != expected_fingerprint
+            ):
+                raise ShadowJobUnavailable("shadow bundle identity conflict")
+        finally:
+            os.close(current_fd)
+
     def _open_directory_chain(self) -> tuple[int, int, int, int]:
         if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
@@ -508,7 +581,9 @@ class ShadowBundlePublisher:
         raw = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
-        marker = hashlib.sha256(raw).hexdigest().encode() + b"\n"
+        payload_sha256 = hashlib.sha256(raw).hexdigest()
+        marker = payload_sha256.encode() + b"\n"
+        owner_raw = self._owner_payload(identity, payload_sha256, self.publisher_id)
         destination_fd = -1
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -526,25 +601,50 @@ class ShadowBundlePublisher:
                 )
             except OSError as exc:
                 raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+            expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
             if not created:
                 try:
                     entries = set(os.listdir(destination_fd))
-                    existing_raw = self._read_existing_file(destination_fd, "report.json")
-                    existing_marker = self._read_existing_file(destination_fd, "COMMIT", limit=128)
                 except OSError as exc:
                     raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
-                if (
-                    entries != {"report.json", "COMMIT"}
-                    or existing_raw != raw
-                    or existing_marker != marker
+                if entries not in (
+                    {"OWNER"},
+                    {"OWNER", "report.json"},
+                    {"OWNER", "report.json", "COMMIT"},
                 ):
                     raise ShadowJobUnavailable("shadow bundle identity conflict")
+                try:
+                    existing_owner = self._read_existing_file(destination_fd, "OWNER")
+                    self._validate_owner(existing_owner, identity, payload_sha256)
+                    if "report.json" in entries:
+                        existing_raw = self._read_existing_file(destination_fd, "report.json")
+                        if existing_raw != raw:
+                            raise ShadowJobUnavailable("shadow bundle identity conflict")
+                    if "COMMIT" in entries:
+                        existing_marker = self._read_existing_file(
+                            destination_fd, "COMMIT", limit=128
+                        )
+                        if existing_marker != marker:
+                            raise ShadowJobUnavailable("shadow bundle identity conflict")
+                except OSError as exc:
+                    raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+                if "report.json" not in entries:
+                    self._write_new_file(destination_fd, "report.json", raw)
+                if "COMMIT" not in entries:
+                    self._write_new_file(destination_fd, "COMMIT", marker)
+                    os.fsync(destination_fd)
+                    os.fsync(bundles_fd)
+                    expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
+                self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
                 return destination
+            self._write_new_file(destination_fd, "OWNER", owner_raw)
             self._write_new_file(destination_fd, "report.json", raw)
             # COMMIT is created last; an incomplete directory is never attachable.
             self._write_new_file(destination_fd, "COMMIT", marker)
             os.fsync(destination_fd)
             os.fsync(bundles_fd)
+            expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
+            self._verify_destination(bundles_fd, identity, destination_fd, expected_fingerprint)
             return destination
         finally:
             if destination_fd >= 0:

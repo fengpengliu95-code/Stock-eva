@@ -164,7 +164,6 @@ def _strict_bundle_validation(
         "window_id": identity.window_id,
         "session_id": identity.session_id,
         "evidence_id": evidence_id,
-        "candidate_id": candidate_id,
     }
     if (
         not isinstance(descriptor, dict)
@@ -235,9 +234,9 @@ def _strict_bundle_validation(
             or item.get("endpoint_class") != request.endpoint_class
         ):
             raise ShadowTerminalUnavailable("terminal endpoint binding unavailable")
-        for page in item.get("page_refs", []):
+        for page_number, page in enumerate(item.get("page_refs", []), start=1):
             if (
-                page.get("ordinal") != item["ordinal"]
+                page.get("ordinal") != page_number
                 or not page.get("page_identity")
                 or not page.get("object_ref")
                 or len(page.get("content_sha256", "")) != 64
@@ -248,7 +247,7 @@ def _strict_bundle_validation(
                 raise ShadowTerminalUnavailable("terminal page binding unavailable")
             flattened_pages.append(
                 {
-                    key: page.get(key)
+                    key: item["ordinal"] if key == "ordinal" else page.get(key)
                     for key in (
                         "ordinal",
                         "page_identity",
