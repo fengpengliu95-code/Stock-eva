@@ -508,7 +508,7 @@ def test_publisher_verifies_held_destination_before_success(tmp_path, monkeypatc
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 3:
+        if fsync_calls == 4:
             os.rename(destination, hidden)
             os.symlink(hidden.name, destination)
 
@@ -534,7 +534,7 @@ def test_publisher_verifies_each_held_bundle_file_before_success(
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 4:
+        if fsync_calls == 5:
             if mutation == "symlink":
                 os.rename(target_path, hidden_path)
                 os.symlink(hidden_path.name, target_path)
@@ -565,7 +565,7 @@ def test_publisher_rejects_permission_change_before_final_verify(tmp_path, monke
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 4:
+        if fsync_calls == 5:
             os.chmod(target_path, 0o640)
 
     monkeypatch.setattr(os, "fsync", chmod_after_commit)
@@ -615,6 +615,33 @@ def test_publisher_recovers_owner_and_report_crash_gaps(tmp_path, phase):
     assert (directory / "OWNER").read_bytes() == owner_raw
     assert (directory / "report.json").read_bytes() == raw
     assert (directory / "COMMIT").read_text() == hashlib.sha256(raw).hexdigest() + "\n"
+
+
+def test_publisher_recovers_owned_empty_directory_after_mkdir_crash(tmp_path, monkeypatch):
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    original_write = ShadowBundlePublisher._write_new_file
+
+    def crash_before_owner(directory_fd, name, payload):
+        if name == "OWNER":
+            raise RuntimeError("crash after mkdir before owner")
+        return original_write(directory_fd, name, payload)
+
+    monkeypatch.setattr(ShadowBundlePublisher, "_write_new_file", crash_before_owner)
+    with pytest.raises(RuntimeError, match="crash after mkdir"):
+        publisher.publish("mkdir-crash", {"value": 1})
+    destination = tmp_path / "shadow" / "bundles" / "mkdir-crash"
+    assert destination.is_dir() and not tuple(destination.iterdir())
+    monkeypatch.setattr(ShadowBundlePublisher, "_write_new_file", original_write)
+    restarted = ShadowBundlePublisher(tmp_path / "shadow")
+    assert restarted.publish("mkdir-crash", {"value": 1}) == destination
+
+
+def test_publisher_rejects_foreign_empty_directory_without_ownership_token(tmp_path):
+    destination = tmp_path / "shadow" / "bundles" / "foreign-empty"
+    destination.mkdir(parents=True)
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish("foreign-empty", {"value": 1})
+    assert destination.is_dir() and not tuple(destination.iterdir())
 
 
 def test_publisher_preserves_foreign_incomplete_bundle(tmp_path):
@@ -716,6 +743,7 @@ def test_terminal_accepts_real_task11_descriptor_without_candidate_id(tmp_path):
             manifest_sha256="f" * 64,
             reconciliation_status="ready",
             reconciliation_sha256="d" * 64,
+            canonical_comparison_snapshot_sha256="a" * 64,
             status="accepted",
         ),
         candidate=SimpleNamespace(
@@ -1008,6 +1036,7 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         manifest_sha256="f" * 64,
         reconciliation_status="ready",
         reconciliation_sha256="d" * 64,
+        canonical_comparison_snapshot_sha256="a" * 64,
         status="accepted",
     )
     candidate_bundle = SimpleNamespace(

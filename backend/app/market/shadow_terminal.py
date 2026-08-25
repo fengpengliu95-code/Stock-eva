@@ -184,6 +184,7 @@ def _strict_bundle_validation(
         or not isinstance(manifest.reconciliation_sha256, str)
         or len(manifest.reconciliation_sha256) != 64
         or any(char not in "0123456789abcdef" for char in manifest.reconciliation_sha256)
+        or not manifest.canonical_comparison_snapshot_sha256
         or candidate.job_id != identity.job_id
         or candidate.window_id != identity.window_id
         or candidate.session_id != identity.session_id

@@ -452,6 +452,25 @@ class ShadowBundlePublisher:
             os.close(fd)
 
     @staticmethod
+    def _write_ownership_token(directory_fd: int, name: str, payload: bytes) -> None:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("shadow ownership short write")
+                offset += written
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
     def _read_existing_file(
         directory_fd: int, name: str, *, limit: int = 16 * 1024 * 1024
     ) -> bytes:
@@ -598,12 +617,12 @@ class ShadowBundlePublisher:
             if actual != (fingerprint, size, payload_sha256, expected):
                 raise ShadowJobUnavailable("shadow bundle file conflict")
 
-    def _open_directory_chain(self) -> tuple[int, int, int, int]:
+    def _open_directory_chain(self) -> tuple[int, int, int, int, int]:
         if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         current = os.open(os.sep, flags)
-        bundles_fd = staging_fd = lock_fd = -1
+        bundles_fd = staging_fd = owners_fd = lock_fd = -1
         try:
             for component in self.root.parts[1:]:
                 next_fd = self._open_child_directory(current, component)
@@ -611,15 +630,16 @@ class ShadowBundlePublisher:
                 current = next_fd
             bundles_fd = self._open_child_directory(current, "bundles")
             staging_fd = self._open_child_directory(current, "staging")
+            owners_fd = self._open_child_directory(current, "owners")
             lock_fd = os.open(
                 "bundles.lock",
                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
                 0o600,
                 dir_fd=current,
             )
-            return current, bundles_fd, staging_fd, lock_fd
+            return current, bundles_fd, staging_fd, owners_fd, lock_fd
         except Exception:
-            for descriptor in (lock_fd, staging_fd, bundles_fd):
+            for descriptor in (lock_fd, owners_fd, staging_fd, bundles_fd):
                 if descriptor >= 0:
                     os.close(descriptor)
             os.close(current)
@@ -640,7 +660,7 @@ class ShadowBundlePublisher:
                     raise ShadowJobUnavailable("shadow bundle root unavailable")
             except FileNotFoundError:
                 continue
-        root_fd, bundles_fd, staging_fd, lock_fd = self._open_directory_chain()
+        root_fd, bundles_fd, staging_fd, owners_fd, lock_fd = self._open_directory_chain()
         bundles = self.root / "bundles"
         destination = bundles / identity
         raw = (
@@ -652,6 +672,27 @@ class ShadowBundlePublisher:
         destination_fd = -1
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            owner_created = False
+            try:
+                owner_token = self._read_existing_file(owners_fd, identity, limit=4096)
+                self._validate_owner(owner_token, identity, payload_sha256)
+            except FileNotFoundError:
+                owner_token = owner_raw
+                try:
+                    self._write_ownership_token(owners_fd, identity, owner_token)
+                    owner_created = True
+                except FileExistsError:
+                    owner_token = self._read_existing_file(owners_fd, identity, limit=4096)
+                    self._validate_owner(owner_token, identity, payload_sha256)
+            except OSError as exc:
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable") from exc
+            try:
+                owner_value = json.loads(owner_token.decode("utf-8"))
+                owner_raw = self._owner_payload(
+                    identity, payload_sha256, owner_value["publisher_id"]
+                )
+            except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable") from exc
             created = False
             try:
                 os.mkdir(identity, 0o700, dir_fd=bundles_fd)
@@ -673,14 +714,26 @@ class ShadowBundlePublisher:
                 except OSError as exc:
                     raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
                 if entries not in (
+                    set(),
                     {"OWNER"},
                     {"OWNER", "report.json"},
                     {"OWNER", "report.json", "COMMIT"},
                 ):
                     raise ShadowJobUnavailable("shadow bundle identity conflict")
+                if not entries and owner_created:
+                    raise ShadowJobUnavailable("shadow bundle ownership unavailable")
                 try:
-                    existing_owner = self._read_existing_file(destination_fd, "OWNER")
+                    existing_owner = (
+                        owner_raw
+                        if not entries
+                        else self._read_existing_file(destination_fd, "OWNER")
+                    )
                     self._validate_owner(existing_owner, identity, payload_sha256)
+                    if owner_created and entries and existing_owner != owner_token:
+                        os.unlink(identity, dir_fd=owners_fd)
+                        self._write_ownership_token(owners_fd, identity, existing_owner)
+                        owner_token = existing_owner
+                        owner_raw = existing_owner
                     if "report.json" in entries:
                         existing_raw = self._read_existing_file(destination_fd, "report.json")
                         if existing_raw != raw:
@@ -694,17 +747,24 @@ class ShadowBundlePublisher:
                 except OSError as exc:
                     raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
                 records = {
-                    "OWNER": self._capture_file(destination_fd, "OWNER", existing_owner),
+                    "OWNER": (
+                        self._record_written_file(
+                            type(self)._write_new_file(destination_fd, "OWNER", existing_owner),
+                            existing_owner,
+                        )
+                        if not entries
+                        else self._capture_file(destination_fd, "OWNER", existing_owner)
+                    ),
                 }
                 if "report.json" not in entries:
                     records["report.json"] = self._record_written_file(
-                        self._write_new_file(destination_fd, "report.json", raw), raw
+                        type(self)._write_new_file(destination_fd, "report.json", raw), raw
                     )
                 else:
                     records["report.json"] = self._capture_file(destination_fd, "report.json", raw)
                 if "COMMIT" not in entries:
                     records["COMMIT"] = self._record_written_file(
-                        self._write_new_file(destination_fd, "COMMIT", marker), marker
+                        type(self)._write_new_file(destination_fd, "COMMIT", marker), marker
                     )
                     os.fsync(destination_fd)
                     os.fsync(bundles_fd)
@@ -716,15 +776,15 @@ class ShadowBundlePublisher:
                 return destination
             records = {
                 "OWNER": self._record_written_file(
-                    self._write_new_file(destination_fd, "OWNER", owner_raw), owner_raw
+                    type(self)._write_new_file(destination_fd, "OWNER", owner_raw), owner_raw
                 ),
                 "report.json": self._record_written_file(
-                    self._write_new_file(destination_fd, "report.json", raw), raw
+                    type(self)._write_new_file(destination_fd, "report.json", raw), raw
                 ),
             }
             # COMMIT is created last; an incomplete directory is never attachable.
             records["COMMIT"] = self._record_written_file(
-                self._write_new_file(destination_fd, "COMMIT", marker), marker
+                type(self)._write_new_file(destination_fd, "COMMIT", marker), marker
             )
             os.fsync(destination_fd)
             os.fsync(bundles_fd)
@@ -737,6 +797,7 @@ class ShadowBundlePublisher:
                 os.close(destination_fd)
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            os.close(owners_fd)
             os.close(staging_fd)
             os.close(bundles_fd)
             os.close(root_fd)

@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market.canonical_comparison import PublishedCanonicalComparison
+
 from .providers.registry import ShadowRegistry
 from .shadow_evidence import ShadowEvidenceReader
 from .shadow_normalize import ShadowNormalizedCandidate
@@ -206,6 +208,9 @@ class ShadowCandidateManifest(BaseModel):
     reconciliation_status: Literal["ready", "material_mismatch", "unavailable"] | None = None
     reconciliation_compared_counts: dict[str, int] | None = None
     reconciliation_mismatch_counts: dict[str, int] | None = None
+    canonical_comparison_snapshot_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     manifest_sha256: str = "0" * 64
 
     @model_validator(mode="after")
@@ -326,6 +331,7 @@ class ShadowCandidateStore:
         quality_report: ShadowQualityReport | None = None,
         candidate_id: str | None = None,
         reconciliation_report: Any | None = None,
+        canonical_comparison: Any | None = None,
         registry: ShadowRegistry,
     ) -> ShadowCandidateManifest:
         if not self.root.is_absolute():
@@ -445,18 +451,37 @@ class ShadowCandidateStore:
 
             if (
                 type(reconciliation_report) is not ShadowReconciliationReport
+                or type(canonical_comparison) is not PublishedCanonicalComparison
                 or getattr(reconciliation_report, "status", None) != "ready"
                 or getattr(reconciliation_report, "trade_date", None) != candidate.trade_date
                 or getattr(reconciliation_report, "universe_id", None) != candidate.universe_id
                 or not getattr(reconciliation_report, "report_sha256", None)
             ):
                 raise ShadowCandidateUnavailable("shadow reconciliation is not ready")
+            before = canonical_comparison.verify()
+            if before.status != "ready" or before.snapshot is None:
+                raise ShadowCandidateUnavailable("canonical comparison unavailable")
+            if (
+                before.snapshot.dataset_manifest_generation
+                != registry_binding["canonical_manifest_generation"]
+                or before.snapshot.dataset_manifest_sha256
+                != registry_binding["canonical_manifest_sha256"]
+            ):
+                raise ShadowCandidateUnavailable("canonical comparison lineage unavailable")
+            after = canonical_comparison.verify()
+            if (
+                after.status != "ready"
+                or after.snapshot is None
+                or after.snapshot.snapshot_sha256 != before.snapshot.snapshot_sha256
+            ):
+                raise ShadowCandidateUnavailable("canonical comparison changed")
             reconciliation_values = {
                 "reconciliation_id": reconciliation_report.reconciliation_id,
                 "reconciliation_sha256": reconciliation_report.report_sha256,
                 "reconciliation_status": reconciliation_report.status,
                 "reconciliation_compared_counts": dict(reconciliation_report.compared_counts),
                 "reconciliation_mismatch_counts": dict(reconciliation_report.mismatch_counts),
+                "canonical_comparison_snapshot_sha256": before.snapshot.snapshot_sha256,
             }
         normalized_bytes = _json(candidate.model_dump(mode="json"))
         quality_bytes = _json(quality.model_dump(mode="json"))
@@ -541,11 +566,13 @@ class ShadowCandidateStore:
         candidate_reader: ShadowCandidateReader,
         candidate_id: str,
         registry: ShadowRegistry,
+        canonical_comparison: Any | None = None,
     ) -> ShadowCandidateManifest:
         return ShadowCandidateAttachmentService().attach(
             candidate_reader=candidate_reader,
             candidate_id=candidate_id,
             registry=registry,
+            canonical_comparison=canonical_comparison,
         )
 
 
@@ -564,6 +591,7 @@ class ShadowCandidateAttachmentService:
         candidate_reader: ShadowCandidateReader,
         candidate_id: str,
         registry: ShadowRegistry,
+        canonical_comparison: Any | None = None,
     ) -> ShadowCandidateManifest:
         if (
             type(candidate_reader) is not ShadowCandidateReader
@@ -580,12 +608,28 @@ class ShadowCandidateAttachmentService:
             manifest.candidate_id != candidate_id
             or manifest.reconciliation_status != "ready"
             or not manifest.reconciliation_sha256
+            or not manifest.canonical_comparison_snapshot_sha256
             or manifest.manifest_sha256 == "0" * 64
             or candidate.provider_id != manifest.provider_id
             or candidate.trade_date != manifest.trade_date
             or candidate.universe_id != manifest.universe_id
         ):
             raise ShadowCandidateUnavailable("shadow candidate reconciliation unavailable")
+        if type(canonical_comparison) is not PublishedCanonicalComparison:
+            raise ShadowCandidateUnavailable("canonical comparison unavailable")
+        before = canonical_comparison.verify()
+        after = canonical_comparison.verify()
+        if (
+            before.status != "ready"
+            or before.snapshot is None
+            or after.status != "ready"
+            or after.snapshot is None
+            or before.snapshot.snapshot_sha256 != manifest.canonical_comparison_snapshot_sha256
+            or after.snapshot.snapshot_sha256 != before.snapshot.snapshot_sha256
+            or before.snapshot.dataset_manifest_generation != manifest.canonical_manifest_generation
+            or before.snapshot.dataset_manifest_sha256 != manifest.canonical_manifest_sha256
+        ):
+            raise ShadowCandidateUnavailable("canonical comparison changed")
 
         def save(connection):
             job = connection.execute(
