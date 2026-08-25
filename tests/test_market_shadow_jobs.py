@@ -644,6 +644,19 @@ def test_publisher_rejects_foreign_empty_directory_without_ownership_token(tmp_p
     assert destination.is_dir() and not tuple(destination.iterdir())
 
 
+def test_publisher_rejects_empty_replacement_of_owned_directory(tmp_path):
+    root = tmp_path / "shadow"
+    publisher = ShadowBundlePublisher(root)
+    destination = publisher.publish("owned-replacement", {"value": 1})
+    hidden = destination.with_name("owned-replacement-hidden")
+    destination.rename(hidden)
+    destination.mkdir()
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(root).publish("owned-replacement", {"value": 1})
+    assert destination.is_dir() and not tuple(destination.iterdir())
+    assert (hidden / "COMMIT").is_file()
+
+
 def test_publisher_preserves_foreign_incomplete_bundle(tmp_path):
     identity = "foreign-owner"
     directory = tmp_path / "shadow" / "bundles" / identity
