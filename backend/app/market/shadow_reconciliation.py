@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .shadow_normalize import ShadowNormalizedCandidate, ShadowNormalizedRow
+from .shadow_normalize import SHADOW_PROVIDERS, ShadowNormalizedCandidate, ShadowNormalizedRow
 
 
 def _canonical(value: Any) -> bytes:
@@ -31,6 +31,20 @@ class ReconciliationPolicy(BaseModel):
     amount_relative_error: float = 0.005
     adjusted_return_basis_points: float = 5.0
     sample_limit: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def frozen_r2f3_v1(self) -> ReconciliationPolicy:
+        expected = {
+            "version": "r2f3-v1",
+            "legal_tick": 0.01,
+            "volume_relative_error": 0.001,
+            "amount_relative_error": 0.005,
+            "adjusted_return_basis_points": 5.0,
+            "sample_limit": 20,
+        }
+        if self.model_dump() != expected:
+            raise ValueError("r2f3-v1 reconciliation policy is frozen")
+        return self
 
 
 class ShadowReconciliationReport(BaseModel):
@@ -71,7 +85,9 @@ def _relative_error(left: float, right: float) -> float:
 
 
 def _return(row: ShadowNormalizedRow) -> float:
-    return row.close / row.preclose - 1.0
+    factor = row.factor or 1.0
+    previous_factor = row.factor_previous or factor
+    return (row.close * factor) / (row.preclose * previous_factor) - 1.0
 
 
 def reconcile(
@@ -80,7 +96,10 @@ def reconcile(
     *,
     policy: ReconciliationPolicy | None = None,
 ) -> ShadowReconciliationReport:
+    if left.provider_id not in SHADOW_PROVIDERS or right.provider_id not in SHADOW_PROVIDERS:
+        raise ValueError("shadow provider identity is not allowlisted")
     policy = policy or ReconciliationPolicy()
+    policy = ReconciliationPolicy.model_validate(policy.model_dump())
     left_id, right_id = _candidate_id(left), _candidate_id(right)
     identity = {
         "trade_date": left.trade_date,
@@ -103,6 +122,14 @@ def reconcile(
         or left.universe_id != right.universe_id
         or not left.complete
         or not right.complete
+        or not left.factor_semantics
+        or not right.factor_semantics
+        or not left.factor_anchor
+        or not right.factor_anchor
+        or not left.factor_direction
+        or not right.factor_direction
+        or left.factor_anchor != right.factor_anchor
+        or left.factor_direction != right.factor_direction
     ):
         mismatch["identity"] = 1
     if left.expected_symbols != right.expected_symbols or left.index_symbols != right.index_symbols:
@@ -113,6 +140,14 @@ def reconcile(
         mismatch["coverage"] = abs(len(set(left_rows) ^ set(right_rows)))
     for symbol in sorted(set(left_rows) & set(right_rows)):
         lrow, rrow = left_rows[symbol], right_rows[symbol]
+        if (
+            lrow.factor is None
+            or lrow.factor_previous is None
+            or rrow.factor is None
+            or rrow.factor_previous is None
+        ):
+            mismatch["adjusted_return"] += 1
+            continue
         if lrow.suspension != rrow.suspension:
             mismatch["suspension"] += 1
         if any(
@@ -124,11 +159,7 @@ def reconcile(
             mismatch["volume"] += 1
         if _relative_error(lrow.amount, rrow.amount) > policy.amount_relative_error:
             mismatch["amount"] += 1
-        factor_scale = (rrow.factor or 1.0) / (lrow.factor or 1.0)
-        if (
-            abs((_return(lrow) * factor_scale) - _return(rrow)) * 10000
-            > policy.adjusted_return_basis_points
-        ):
+        if abs(_return(lrow) - _return(rrow)) * 10000 > policy.adjusted_return_basis_points:
             mismatch["adjusted_return"] += 1
         if any(
             mismatch[key] and len(samples) < policy.sample_limit

@@ -60,6 +60,7 @@ class TushareSourceBatch:
     index_daily: tuple[dict[str, Any], ...]
     stock_basic: tuple[dict[str, Any], ...]
     request_count: int
+    units: dict[str, str] | None = None
 
 
 def _rows(payload: Any) -> tuple[dict[str, Any], ...]:
@@ -182,6 +183,17 @@ class TushareAdapter:
             index_daily=_rows(payloads["index_daily"]),
             stock_basic=_rows(payloads["stock_basic"]),
             request_count=request_count,
+            units=(
+                dict(payloads["units"])
+                if isinstance(payloads.get("units"), dict)
+                else {
+                    "vol": "lots",
+                    "amount": "thousand_cny",
+                    "factor_semantics": "multiplicative_back_adjust",
+                    "factor_anchor": "trade_date",
+                    "factor_direction": "back_adjust",
+                }
+            ),
         )
 
     def execute(
