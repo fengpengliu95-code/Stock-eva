@@ -239,3 +239,112 @@ def test_normalizers_do_not_allow_caller_provider_override():
             universe_id="u",
             provider_id="tushare",
         )
+
+
+@pytest.mark.parametrize("provider", ["tushare", "tickflow"])
+def test_normalizers_reject_daily_rows_contradicting_explicit_status(provider):
+    if provider == "tushare":
+        payload = tushare_payload()
+        payload["suspend_d"] = [{"ts_code": "000001.SZ", "trade_date": "20260820"}]
+        with pytest.raises(ShadowNormalizationError):
+            normalize_tushare(payload, trade_date=TRADE_DATE, universe_id="u")
+        payload = tushare_payload()
+        payload["universe"] = [{"ts_code": "000001.SZ", "list_status": "D"}]
+        with pytest.raises(ShadowNormalizationError):
+            normalize_tushare(payload, trade_date=TRADE_DATE, universe_id="u")
+    else:
+        payload = {
+            "daily": [
+                {
+                    "symbol": "sh.600000",
+                    "date": "2026-08-20",
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "preclose": 1,
+                    "volume": 1,
+                    "amount": 1,
+                }
+            ],
+            "universe": [{"symbol": "sh.600000", "list_status": "L"}],
+            "indexes": [],
+            "units": {"volume": "shares", "amount": "CNY"},
+            "suspensions": [{"symbol": "sh.600000", "trade_date": "2026-08-20"}],
+        }
+        with pytest.raises(ShadowNormalizationError):
+            normalize_tickflow(payload, trade_date=TRADE_DATE, universe_id="u")
+
+
+def test_tickflow_factor_contract_is_typed_unavailable_not_caller_authorized():
+    payload = {
+        "daily": [
+            {
+                "symbol": "sh.600000",
+                "date": "2026-08-20",
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "preclose": 1,
+                "volume": 1,
+                "amount": 1,
+            }
+        ],
+        "universe": [{"symbol": "sh.600000", "list_status": "L"}],
+        "indexes": [],
+        "units": {
+            "volume": "shares",
+            "amount": "CNY",
+            "factor_semantics": "caller_claimed",
+            "factor_anchor": "trade_date",
+            "factor_direction": "back_adjust",
+        },
+    }
+    result = normalize_tickflow(payload, trade_date=TRADE_DATE, universe_id="u")
+    assert result.complete is False
+    assert result.quality_status == "unavailable"
+    assert result.unavailable_reason == "FACTOR_CONTRACT_UNPROVEN"
+    assert not result.factor_semantics and not result.factor_anchor and not result.factor_direction
+
+
+@pytest.mark.parametrize(
+    "factor",
+    [
+        {
+            "symbol": "sh.600000",
+            "trade_date": "2026-08-20",
+            "factor": 1,
+            "prev_factor": 1,
+        },
+        {
+            "symbol": "sh.600000",
+            "trade_date": "2026-08-21",
+            "anchor_date": "2026-08-21",
+            "factor": 1,
+            "prev_factor": 1,
+        },
+    ],
+)
+def test_tickflow_factor_rows_duplicate_or_anchor_date_are_rejected(factor):
+    payload = {
+        "daily": [
+            {
+                "symbol": "sh.600000",
+                "date": "2026-08-20",
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "preclose": 1,
+                "volume": 1,
+                "amount": 1,
+            }
+        ],
+        "universe": [{"symbol": "sh.600000", "list_status": "L"}],
+        "indexes": [],
+        "units": {"volume": "shares", "amount": "CNY"},
+        "factors": [factor, {**factor}],
+    }
+    with pytest.raises(ShadowNormalizationError):
+        normalize_tickflow(payload, trade_date=TRADE_DATE, universe_id="u")

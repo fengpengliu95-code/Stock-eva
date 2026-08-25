@@ -69,7 +69,12 @@ def test_reconciliation_requires_same_date_universe_and_complete_candidates():
     report = reconcile(candidate(), candidate(universe="other"))
     assert report.status == "unavailable"
     incomplete = candidate().__class__.model_validate(
-        {**candidate().model_dump(mode="json"), "complete": False, "normalized_sha256": "0" * 64}
+        {
+            **candidate().model_dump(mode="json"),
+            "complete": False,
+            "unavailable_reason": "INCOMPLETE",
+            "normalized_sha256": "0" * 64,
+        }
     )
     assert reconcile(candidate(), incomplete).status == "unavailable"
 

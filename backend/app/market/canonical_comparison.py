@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.storage.dataset import _R2F2_LINEAGE_FIELDS
 from backend.app.storage.models import DatasetManifest
 
 from .candidates import (
@@ -216,25 +217,30 @@ class CanonicalCandidateReader:
             if len(matches) != 1:
                 raise ValueError("canonical partition lineage unavailable")
             item = matches[0]
-            lineage = item.get("lineage")
-            if not isinstance(lineage, dict):
-                raise ValueError("canonical lineage unavailable")
-            required_lineage = (
-                "candidate_id",
-                "candidate_manifest_sha256",
-                "evidence_id",
-                "evidence_sha256",
-                "gate_report_sha256",
-                "factor_resolution_sha256",
-                "normalized_object_sha256",
-                "selection_id",
-                "selection_sha256",
-            )
-            if any(
-                not isinstance(lineage.get(key), str) or not lineage[key]
-                for key in required_lineage
+            if "lineage" in item or set(item).intersection(
+                {
+                    "factor_resolution_sha256",
+                    "normalized_object_sha256",
+                    "selection_id",
+                    "selection_sha256",
+                }
             ):
                 raise ValueError("canonical lineage unavailable")
+            if set(key for key in _R2F2_LINEAGE_FIELDS if key in item) != set(_R2F2_LINEAGE_FIELDS):
+                raise ValueError("canonical lineage unavailable")
+            lineage = {key: item[key] for key in _R2F2_LINEAGE_FIELDS}
+            if any(
+                value is None or not isinstance(value, str) or not value
+                for value in lineage.values()
+            ):
+                raise ValueError("canonical lineage unavailable")
+            if lineage["provider_id"] != "baostock":
+                raise ValueError("canonical lineage provider unavailable")
+            for key in ("evidence_sha256", "candidate_manifest_sha256", "gate_report_sha256"):
+                if len(lineage[key]) != 64 or any(
+                    char not in "0123456789abcdef" for char in lineage[key]
+                ):
+                    raise ValueError("canonical lineage hash unavailable")
             self._dataset_lineage = lineage
             relative = item.get("path") or item.get("relative_path")
             digest = item.get("sha256")
@@ -251,30 +257,119 @@ class CanonicalCandidateReader:
             return relative, digest, row_count
         raise ValueError("canonical DatasetManifest.files descriptor unavailable")
 
-    def _validate_partition(self, path: Path, trade: date, row_count: int) -> None:
+    def _validate_partition(
+        self, path: Path, trade: date, row_count: int, expected_sha256: str
+    ) -> _Fingerprint:
         if path.suffix.lower() != ".parquet":
             raise ValueError("canonical partition format unavailable")
         try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise ValueError("canonical partition unavailable") from exc
+        try:
+            before = os.fstat(fd)
+            configured = os.stat(path, follow_symlinks=False)
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_ctime_ns,
+            )
+            configured_identity = (
+                configured.st_dev,
+                configured.st_ino,
+                configured.st_mode,
+                configured.st_size,
+                configured.st_ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or identity != configured_identity
+            ):
+                raise ValueError("canonical partition identity unavailable")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+            if digest.hexdigest() != expected_sha256 or size != before.st_size:
+                raise ValueError("canonical partition hash mismatch")
+            os.lseek(fd, 0, os.SEEK_SET)
             import duckdb
 
             connection = duckdb.connect(":memory:")
             try:
+                parquet_ref = f"/dev/fd/{fd}"
+                schema = connection.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{parquet_ref}', hive_partitioning=false)"
+                ).fetchall()
+                columns = {str(row[0]): str(row[1]).upper() for row in schema}
+                required = {
+                    "trade_date",
+                    "symbol",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                }
+                if not required.issubset(columns):
+                    raise ValueError("canonical partition schema mismatch")
+                selected = "trade_date, symbol, open, high, low, close, volume, amount"
+                if "source" in columns:
+                    selected += ", source"
                 rows = connection.execute(
-                    "SELECT trade_date, symbol, open, high, low, close, volume, amount "
-                    "FROM read_parquet(?)",
-                    [str(path)],
+                    f"SELECT {selected} FROM read_parquet('{parquet_ref}', hive_partitioning=false)"
                 ).fetchall()
             finally:
                 connection.close()
+            after = os.fstat(fd)
+            configured_after = os.stat(path, follow_symlinks=False)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_ctime_ns,
+            ) != identity or (
+                configured_after.st_dev,
+                configured_after.st_ino,
+                configured_after.st_mode,
+                configured_after.st_size,
+                configured_after.st_ctime_ns,
+            ) != identity:
+                raise ValueError("canonical partition changed during read")
         except Exception as exc:
+            if isinstance(exc, ValueError):
+                raise
             raise ValueError("canonical partition unavailable") from exc
+        finally:
+            os.close(fd)
         if len(rows) != row_count or any(
             str(row[0])[:10] != trade.isoformat()
             or not str(row[1]).lower().startswith(("sh.", "sz."))
-            or any(value is None for value in row[2:])
+            or any(value is None for value in row[2:8])
+            or (len(row) == 9 and row[8] != "baostock")
             for row in rows
         ):
             raise ValueError("canonical partition semantics mismatch")
+        return _Fingerprint(
+            path=str(path),
+            sha256=expected_sha256,
+            size=before.st_size,
+            dev=before.st_dev,
+            inode=before.st_ino,
+            mode=before.st_mode,
+            ctime_ns=before.st_ctime_ns,
+            mtime_ns=before.st_mtime_ns,
+        )
 
     def _read_evidence(self, evidence_id: str) -> Any:
         return EvidenceReader(self.evidence_root).read(evidence_id)
@@ -339,10 +434,8 @@ class CanonicalCandidateReader:
                     lineage["evidence_id"] != candidate.evidence_id,
                     lineage["evidence_sha256"] != candidate.evidence_sha256,
                     lineage["gate_report_sha256"] != gate.aggregate_sha256,
-                    lineage["factor_resolution_sha256"] != candidate.factor_resolution_sha256,
-                    lineage["normalized_object_sha256"] != candidate.normalized_object_sha256,
-                    lineage["selection_id"] != selection.selection_id,
-                    lineage["selection_sha256"] != selection.selection_sha256,
+                    lineage["adapter_version"] != candidate.adapter_version,
+                    lineage["source_schema_version"] != candidate.source_schema_version,
                 )
             ):
                 return self._unavailable(UnavailableReason.SELECTION_BINDING_INVALID)
@@ -410,22 +503,28 @@ class CanonicalCandidateReader:
                 manifest, candidate.trade_date
             )
             partition_path = self.dataset_root / relative
-            _, partition_fp = _read_verified(partition_path)
-            if partition_fp.sha256 != partition_sha:
-                return self._unavailable(UnavailableReason.CANONICAL_DESCRIPTOR_CHANGED)
             if partition_count != candidate.row_count:
                 return self._unavailable(UnavailableReason.CANONICAL_DESCRIPTOR_CHANGED)
-            self._validate_partition(partition_path, candidate.trade_date, partition_count)
+            partition_fp = self._validate_partition(
+                partition_path, candidate.trade_date, partition_count, partition_sha
+            )
             evidence = self._read_evidence(candidate.evidence_id)
             evidence_manifest = evidence.manifest
             validate_candidate_lineage(candidate, evidence, gate)
             _validate_factor_resolution(evidence)
+            daily_schema_versions = {
+                request.schema_variant
+                for request in evidence_manifest.logical_request_plan.requests
+                if str(request.request_role.value) == "daily_stock"
+            }
             if (
                 evidence_manifest.provider_id.value != "baostock"
                 or evidence_manifest.evidence_id != candidate.evidence_id
                 or evidence_manifest.manifest_sha256 != candidate.evidence_sha256
                 or evidence_manifest.trade_date != candidate.trade_date
                 or evidence_manifest.universe_id != candidate.universe_id
+                or candidate.adapter_version != evidence_manifest.adapter_version
+                or candidate.source_schema_version not in daily_schema_versions
             ):
                 return self._unavailable(UnavailableReason.EVIDENCE_INCOMPLETE)
             lineage = {

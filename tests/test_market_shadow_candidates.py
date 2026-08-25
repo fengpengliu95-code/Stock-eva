@@ -162,7 +162,12 @@ def candidate(complete=True):
         contract=REVIEWED_TUSHARE_UNIT_CONTRACT,
     )
     return value.__class__.model_validate(
-        {**value.model_dump(mode="json"), "complete": complete, "normalized_sha256": "0" * 64}
+        {
+            **value.model_dump(mode="json"),
+            "complete": complete,
+            "unavailable_reason": None if complete else "FORGED_INCOMPLETE",
+            "normalized_sha256": "0" * 64,
+        }
     )
 
 

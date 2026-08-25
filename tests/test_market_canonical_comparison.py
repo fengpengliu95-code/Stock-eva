@@ -165,17 +165,15 @@ def write_canonical_fixture(root: Path):
                 "row_count": 1,
                 "source": "baostock",
                 "trade_date": "2026-08-20",
-                "lineage": {
-                    "candidate_id": candidate.candidate_id,
-                    "candidate_manifest_sha256": candidate.manifest_sha256,
-                    "evidence_id": evidence_id,
-                    "evidence_sha256": evidence_sha,
-                    "gate_report_sha256": gate.aggregate_sha256,
-                    "factor_resolution_sha256": candidate.factor_resolution_sha256,
-                    "normalized_object_sha256": candidate.normalized_object_sha256,
-                    "selection_id": selection.selection_id,
-                    "selection_sha256": selection.selection_sha256,
-                },
+                "provider_id": "baostock",
+                "universe_id": candidate.universe_id,
+                "evidence_id": evidence_id,
+                "evidence_sha256": evidence_sha,
+                "candidate_id": candidate.candidate_id,
+                "candidate_manifest_sha256": candidate.manifest_sha256,
+                "gate_report_sha256": gate.aggregate_sha256,
+                "adapter_version": candidate.adapter_version,
+                "source_schema_version": candidate.source_schema_version,
             }
         ],
     }
@@ -264,12 +262,12 @@ def test_published_canonical_comparison_verify_before_after_and_close_capability
 def test_canonical_comparison_rejects_mixed_generation_or_lineage(tmp_path):
     dataset, candidate, evidence = write_canonical_fixture(tmp_path)
     manifest = json.loads((dataset / "manifest.json").read_text())
-    manifest["files"][0]["lineage"]["evidence_sha256"] = "t" * 64
+    manifest["files"][0]["evidence_sha256"] = "t" * 64
     (dataset / "manifest.json").write_text(json.dumps(manifest) + "\n")
     result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
     assert (
         result.status == "unavailable"
-        and result.unavailable_reason == UnavailableReason.SELECTION_BINDING_INVALID
+        and result.unavailable_reason == UnavailableReason.CANONICAL_DESCRIPTOR_CHANGED
     )
 
 
@@ -283,3 +281,91 @@ def test_canonical_reader_uses_production_dataset_files_and_candidate_bundle_lay
     dataset, candidate_root, evidence = write_canonical_fixture(tmp_path)
     result = CanonicalCandidateReader(dataset, candidate_root, evidence_root=evidence).read()
     assert result.status == "ready"
+
+
+def _flatten_r2f2_manifest(dataset: Path, candidate_root: Path) -> None:
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    item = manifest["files"][0]
+    candidate = json.loads(
+        (candidate_root / "bundles" / item["candidate_id"] / "candidate.json").read_text()
+    )
+    item.pop("lineage", None)
+    item.update(
+        {
+            "provider_id": "baostock",
+            "universe_id": candidate["universe_id"],
+            "evidence_id": candidate["evidence_id"],
+            "evidence_sha256": candidate["evidence_sha256"],
+            "candidate_id": candidate["candidate_id"],
+            "candidate_manifest_sha256": candidate["manifest_sha256"],
+            "gate_report_sha256": candidate["gate_report_sha256"],
+            "adapter_version": candidate["adapter_version"],
+            "source_schema_version": candidate["source_schema_version"],
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def test_canonical_reader_accepts_real_flat_r2f2_lineage_fields(tmp_path):
+    dataset, candidate, evidence = write_canonical_fixture(tmp_path)
+    _flatten_r2f2_manifest(dataset, candidate)
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
+    assert result.status == "ready"
+    assert set(result.snapshot.r2f2_publication_lineage) == {
+        "provider_id",
+        "universe_id",
+        "evidence_id",
+        "evidence_sha256",
+        "candidate_id",
+        "candidate_manifest_sha256",
+        "gate_report_sha256",
+        "adapter_version",
+        "source_schema_version",
+    }
+
+
+def test_canonical_reader_uses_held_partition_fd_for_duckdb(monkeypatch, tmp_path):
+    dataset, candidate, evidence = write_canonical_fixture(tmp_path)
+    _flatten_r2f2_manifest(dataset, candidate)
+    import duckdb
+
+    real_connect = duckdb.connect
+    queries = []
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, query, parameters=None):
+            queries.append((query, parameters))
+            return (
+                self.connection.execute(query, parameters)
+                if parameters is not None
+                else self.connection.execute(query)
+            )
+
+        def close(self):
+            return self.connection.close()
+
+    monkeypatch.setattr(
+        duckdb,
+        "connect",
+        lambda *args, **kwargs: ConnectionProxy(real_connect(*args, **kwargs)),
+    )
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
+    assert result.status == "ready"
+    parquet_queries = [query for query, _ in queries if "/dev/fd/" in query]
+    assert parquet_queries
+    assert "hive_partitioning=false" in parquet_queries[-1]
+
+
+def test_canonical_reader_rejects_flat_lineage_version_or_readiness_drift(tmp_path):
+    dataset, candidate, evidence = write_canonical_fixture(tmp_path)
+    _flatten_r2f2_manifest(dataset, candidate)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][0]["source_schema_version"] = "unreviewed"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    result = CanonicalCandidateReader(dataset, candidate, evidence_root=evidence).read()
+    assert result.status == "unavailable"

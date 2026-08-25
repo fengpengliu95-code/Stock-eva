@@ -111,11 +111,14 @@ def _row_symbol(row: Mapping[str, Any]) -> str:
 
 def _date(value: Any, expected: date) -> date:
     raw = str(value or "")
-    parsed = (
-        date.fromisoformat(raw[:10])
-        if "-" in raw
-        else date.fromisoformat(f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}")
-    )
+    try:
+        parsed = (
+            date.fromisoformat(raw[:10])
+            if "-" in raw
+            else date.fromisoformat(f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}")
+        )
+    except ValueError:
+        raise ShadowNormalizationError("shadow date binding unavailable") from None
     if parsed != expected:
         raise ShadowNormalizationError("shadow date binding unavailable")
     return parsed
@@ -182,12 +185,17 @@ class ShadowNormalizedCandidate(BaseModel):
     window_id: str = ""
     session_id: str = ""
     version_vector_sha256: str = ""
+    unavailable_reason: str | None = None
     normalized_sha256: str = "0" * 64
 
     @model_validator(mode="after")
     def validate_candidate(self) -> ShadowNormalizedCandidate:
         if self.provider_id not in SHADOW_PROVIDERS:
             raise ValueError("shadow provider identity is not allowlisted")
+        if self.complete and self.unavailable_reason is not None:
+            raise ValueError("complete shadow candidate has unavailable reason")
+        if not self.complete and not self.unavailable_reason:
+            raise ValueError("incomplete shadow candidate lacks typed unavailable reason")
         if any(row.provider_id != self.provider_id for row in self.rows):
             raise ValueError("shadow candidate contains mixed providers")
         symbols = tuple(row.symbol for row in self.rows)
@@ -223,6 +231,7 @@ class ShadowNormalizedCandidate(BaseModel):
                 "window_id": self.window_id,
                 "session_id": self.session_id,
                 "version_vector_sha256": self.version_vector_sha256,
+                "unavailable_reason": self.unavailable_reason,
                 "rows": [row.model_dump(mode="json") for row in self.rows],
             }
         )
@@ -292,6 +301,10 @@ def normalize_tushare(
         if str(item.get("trade_date", item.get("suspend_date", ""))).replace("-", "")
         == trade_date.strftime("%Y%m%d")
     }
+    listed_missing = set(expected) - listed
+    daily_symbols = {_row_symbol(item) for item in daily}
+    if daily_symbols & (suspended | listed_missing):
+        raise ShadowNormalizationError("shadow status evidence contradicts daily rows")
     factor_by_symbol: dict[str, tuple[float, float | None]] = {}
     for item in factors:
         factor_date = item.get("trade_date") or item.get("date")
@@ -399,19 +412,33 @@ def normalize_tickflow(
     index_symbols = {_row_symbol(item) for item in indexes}
     if required_indexes and set(required_indexes) != index_symbols:
         raise ShadowNormalizationError("shadow required index coverage unavailable")
-    factor_semantics = str(units.get("factor_semantics", ""))
-    factor_anchor = str(units.get("factor_anchor", ""))
-    factor_direction = str(units.get("factor_direction", ""))
+    suspension_rows = _rows(payload, "suspensions") or _rows(payload, "suspend_d")
+    suspended = {
+        _row_symbol(item)
+        for item in suspension_rows
+        if str(item.get("trade_date", item.get("suspend_date", ""))).replace("-", "")
+        == trade_date.strftime("%Y%m%d")
+    }
+    listed = {
+        _row_symbol(item)
+        for item in universe
+        if str(item.get("list_status", "L")).upper() in {"L", "P", "G"}
+    }
+    daily_symbols = {_row_symbol(item) for item in daily}
+    if daily_symbols & (suspended | (set(expected) - listed)):
+        raise ShadowNormalizationError("shadow status evidence contradicts daily rows")
     factor_values: dict[str, tuple[float, float | None]] = {}
-    for item in factors:
-        _date(item.get("trade_date") or item.get("date"), trade_date)
-        if str(item.get("factor_semantics", factor_semantics)) != factor_semantics:
-            raise ShadowNormalizationError("shadow factor semantics unavailable")
-        previous = item.get("prev_factor", item.get("prev_adj_factor"))
-        factor_values[_row_symbol(item)] = (
-            _finite(item.get("factor", item.get("adj_factor")), positive=True),
-            None if previous is None else _finite(previous, positive=True),
-        )
+    if factors:
+        seen_factors: set[str] = set()
+        for item in factors:
+            factor_symbol = _row_symbol(item)
+            if factor_symbol in seen_factors:
+                raise ShadowNormalizationError("tickflow factor row duplicated")
+            seen_factors.add(factor_symbol)
+            _date(item.get("trade_date") or item.get("date"), trade_date)
+            if item.get("anchor_date") is not None:
+                _date(item["anchor_date"], trade_date)
+        raise ShadowNormalizationError("tickflow factor contract unproven")
     rows: list[ShadowNormalizedRow] = []
     for source in daily:
         symbol = _row_symbol(source)
@@ -437,43 +464,11 @@ def normalize_tickflow(
             )
         except ValueError as exc:
             raise ShadowNormalizationError("shadow OHLC self-quality gate failed") from exc
-    suspension_rows = _rows(payload, "suspensions") or _rows(payload, "suspend_d")
-    suspended = {
-        _row_symbol(item)
-        for item in suspension_rows
-        if str(item.get("trade_date", item.get("suspend_date", ""))).replace("-", "")
-        == trade_date.strftime("%Y%m%d")
-    }
-    listed = {
-        _row_symbol(item)
-        for item in universe
-        if str(item.get("list_status", "L")).upper() in {"L", "P", "G"}
-    }
     _ensure_complete(rows, expected, suspended, listed)
-    factor_status = (
-        str(payload.get("factor_status", "unavailable"))
-        if isinstance(payload, Mapping)
-        else "unavailable"
-    )
-    suspension_status = (
-        str(payload.get("suspension_status", "unavailable"))
-        if isinstance(payload, Mapping)
-        else "unavailable"
-    )
-    factor_semantics = str(units.get("factor_semantics", ""))
-    factor_anchor = str(units.get("factor_anchor", ""))
-    factor_direction = str(units.get("factor_direction", ""))
-    if (
-        not factor_semantics
-        or not factor_anchor
-        or not factor_direction
-        or any(row.factor is None or row.factor_previous is None for row in rows)
-    ):
-        factor_status = "unavailable"
-    complete = factor_status in {"available", "ready"} and suspension_status in {
-        "available",
-        "ready",
-    }
+    factor_semantics = ""
+    factor_anchor = ""
+    factor_direction = ""
+    complete = False
     return ShadowNormalizedCandidate(
         provider_id="tickflow",
         trade_date=trade_date,
@@ -495,6 +490,7 @@ def normalize_tickflow(
         ),
         complete=complete,
         quality_status="ready" if complete else "unavailable",
+        unavailable_reason="FACTOR_CONTRACT_UNPROVEN",
     )
 
 
