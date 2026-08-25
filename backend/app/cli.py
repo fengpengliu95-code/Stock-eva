@@ -451,6 +451,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--external-authorization-id",
         type=_external_authorization_id,
     )
+    shadow_run = subparsers.add_parser(
+        "market-provider-shadow",
+        help="plan or execute one isolated bounded provider shadow window",
+    )
+    shadow_run.add_argument("--provider", required=True, choices=("tickflow", "tushare"))
+    shadow_run.add_argument("--start", required=True, type=date.fromisoformat)
+    shadow_run.add_argument("--end", required=True, type=date.fromisoformat)
+    shadow_run.add_argument("--execute", action="store_true")
+    shadow_run.add_argument("--external-authorization-id", type=_external_authorization_id)
+    shadow_promote = subparsers.add_parser(
+        "market-provider-promote",
+        help="plan or explicitly review a shadow promotion (failover remains disabled)",
+    )
+    shadow_promote.add_argument("--provider", required=True, choices=("tickflow", "tushare"))
+    shadow_promote.add_argument("--window-id", required=True, type=_evidence_id)
+    shadow_promote.add_argument("--review-id", required=True, type=_external_authorization_id)
+    shadow_promote.add_argument("--execute", action="store_true")
     calendar_sync = subparsers.add_parser(
         "calendar-sync",
         help="plan or execute versioned BaoStock checks of the official calendar",
@@ -904,6 +921,34 @@ def main() -> int:
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
+    if args.command in {"market-provider-shadow", "market-provider-promote"}:
+        # Task13 is an offline gate: plan is read-only and execute is blocked until an
+        # external authorization record is supplied to a separately reviewed runner.
+        if args.command == "market-provider-shadow":
+            payload = {
+                "status": "planned" if not args.execute else "blocked",
+                "provider": args.provider,
+                "start": args.start.isoformat(),
+                "end": args.end.isoformat(),
+                "provider_requests": 0,
+                "writes": False,
+                "writes_canonical": False,
+                "failover_enabled": False,
+                "error_code": None if not args.execute else "external_authorization_required",
+            }
+        else:
+            payload = {
+                "status": "planned" if not args.execute else "blocked",
+                "provider": args.provider,
+                "window_id": args.window_id,
+                "review_id": args.review_id,
+                "provider_requests": 0,
+                "writes": False,
+                "failover_enabled": False,
+                "error_code": None if not args.execute else "external_authorization_required",
+            }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if not args.execute else 2
     if args.command == "market-provider-replay":
         try:
             payload = replay_cli_payload(

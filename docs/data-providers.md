@@ -44,3 +44,13 @@ identities and request bounds. Task11 evidence is isolated under the shadow root
 retains only final successful pages, and ends at `evidence_ready` /
 `pending_normalization`; it never writes canonical data, candidates, selections,
 Parquet or pointers. No real provider canary was run for this offline change.
+
+## Task13 shadow report contract
+
+The isolated outbox retains sanitized `ShadowAttemptReport` outcomes only:
+`evidence_ready`, `success`, `failure`, `skip`, `unavailable` or `mismatch`.
+Failure-class reports retain timing, coverage, retry/rate-limit counts and a
+content hash, while page/row/evidence/candidate fields are empty or null.
+`evidence_ready` is nonterminal; only a new terminal report version plus one
+immutable attestation and the expected job/window CAS updates can complete a
+session. Every report is append-only. Automatic failover remains disabled.

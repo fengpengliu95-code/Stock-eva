@@ -1,0 +1,123 @@
+"""Independent, bounded shadow worker; canonical refresh is never called here."""
+
+# ruff: noqa: E501
+
+from __future__ import annotations
+
+import time
+import uuid
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
+
+from .shadow_jobs import ShadowJob, ShadowJobStore, ShadowJobUnavailable
+
+
+class ShadowSchedulerOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: str
+    job_id: str | None = None
+    failure_class: str | None = None
+    request_count: int = 0
+    elapsed_ms: int = 0
+
+
+class ShadowScheduler:
+    def __init__(
+        self,
+        job_store: ShadowJobStore,
+        worker: Callable[..., Any] | None = None,
+        *,
+        owner: str | None = None,
+        lease_seconds: int = 300,
+        max_requests: int = 256,
+        deadline_seconds: float = 30.0,
+        cancellation: Callable[[], bool] | None = None,
+    ) -> None:
+        self.job_store = job_store
+        self.worker = worker
+        self.owner = owner or f"shadow-{uuid.uuid4().hex[:12]}"
+        self.lease_seconds = max(1, lease_seconds)
+        self.max_requests = max(1, max_requests)
+        self.deadline_seconds = max(0.01, deadline_seconds)
+        self.cancellation = cancellation or (lambda: False)
+
+    def run_once(self, *, now: datetime | None = None) -> ShadowSchedulerOutcome:
+        started = time.monotonic()
+        self.job_store.reclaim_expired(now=now)
+        # A scanner/queue caller may pass the identity; default worker selection is bounded.
+        job = self._next_job()
+        if job is None:
+            return ShadowSchedulerOutcome(
+                status="idle", elapsed_ms=int((time.monotonic() - started) * 1000)
+            )
+        try:
+            leased = self.job_store.lease(
+                job.job_id, owner=self.owner, now=now, lease_seconds=self.lease_seconds
+            )
+        except ShadowJobUnavailable:
+            return ShadowSchedulerOutcome(
+                status="busy",
+                job_id=job.job_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        if self.cancellation():
+            return ShadowSchedulerOutcome(
+                status="cancelled",
+                job_id=leased.job_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        if self.worker is None:
+            return ShadowSchedulerOutcome(
+                status="leased",
+                job_id=leased.job_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        try:
+            result = self.worker(
+                leased,
+                deadline=started + self.deadline_seconds,
+                max_requests=self.max_requests,
+                cancelled=self.cancellation,
+            )
+            status = (
+                getattr(result, "status", None)
+                or (result.get("status") if isinstance(result, dict) else None)
+                or "completed"
+            )
+            if time.monotonic() - started > self.deadline_seconds:
+                status = "budget_exhausted"
+            return ShadowSchedulerOutcome(
+                status=str(status),
+                job_id=leased.job_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        except Exception:
+            return ShadowSchedulerOutcome(
+                status="failed",
+                job_id=leased.job_id,
+                failure_class="worker_error",
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+
+    def _next_job(self) -> ShadowJob | None:
+        registry = self.job_store.registry
+        with registry._lock(shared=True):
+            connection = registry._connection_for_read()
+            try:
+                row = connection.execute(
+                    "SELECT job_id FROM shadow_job WHERE run_status='pending' ORDER BY trade_date,job_id LIMIT 1"
+                ).fetchone()
+                return self.job_store.get(row[0]) if row else None
+            finally:
+                if not registry._memory:
+                    connection.close()
+
+    def scan(self, *, limit: int = 64) -> int:
+        return self.job_store.scan_recovery(limit=limit)
+
+
+__all__ = ["ShadowScheduler", "ShadowSchedulerOutcome"]

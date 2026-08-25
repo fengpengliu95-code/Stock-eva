@@ -71,6 +71,15 @@ from backend.app.market.store import MarketStore
 
 logger = logging.getLogger("stock_eva.market.automation")
 
+
+def _safe_outcome_id(outcome: "AutomationOutcome") -> str:
+    """Return only a bounded public identifier for handoff diagnostics."""
+    result = getattr(outcome, "result", None)
+    value = getattr(result, "run_id", None) or getattr(outcome.decision, "target_session", None)
+    text = str(value or "unknown")
+    return text[:96] if all(char.isalnum() or char in "-_.:" for char in text) else "unknown"
+
+
 AUTOMATION_PROBE_STOCK_SYMBOL = "sh.600000"
 AUTOMATION_PROBE_INDEX_SYMBOL = "sh.000001"
 _TRANSPORT_ERROR_PRIORITY = {
@@ -1085,6 +1094,7 @@ class MarketAutomationService:
         required_symbols: Callable[[], set[str]],
         lock_path: Path | None = None,
         post_publish=None,
+        shadow_handoff=None,
         health_store=None,
         probe_runner: ProviderProbeRunner | None = None,
         continuity: ContinuityCoordinator | None = None,
@@ -1098,6 +1108,7 @@ class MarketAutomationService:
         self.required_symbols = required_symbols
         self.lock_path = lock_path
         self.post_publish = post_publish
+        self.shadow_handoff = shadow_handoff
         self.health_store = health_store or InMemoryProviderHealthStore()
         self.probe_runner = probe_runner
         self.continuity = continuity
@@ -1136,11 +1147,13 @@ class MarketAutomationService:
                 refresh_state=decision.refresh_state,
                 next_retry_at=decision.next_run_at,
             )
-            return AutomationOutcome(
+            outcome = AutomationOutcome(
                 decision=decision,
                 state=state,
                 continuity_result=repair_result,
             )
+            self._offer_shadow(outcome)
+            return outcome
         if decision.action != "run":
             state = current or SchedulerState(
                 target_session=decision.target_session,
@@ -1149,18 +1162,20 @@ class MarketAutomationService:
             )
             if decision.action == "wait" and current is None:
                 self.store.save_scheduler_state(state)
+            outcome = AutomationOutcome(decision=decision, state=state)
             if (
                 decision.refresh_state == "success"
                 and published is not None
                 and published.status == "ready"
             ):
                 self._run_post_publish(published)
-            return AutomationOutcome(decision=decision, state=state)
+            self._offer_shadow(outcome)
+            return outcome
 
         lease = RefreshRunLock(self.lock_path) if self.lock_path is not None else nullcontext()
         try:
             with lease:
-                return self._execute_due(decision, current, local)
+                outcome = self._execute_due(decision, current, local)
         except RefreshAlreadyRunning:
             target = decision.target_session
             next_retry = self.policy.next_retry_after(target, local) if target is not None else None
@@ -1182,6 +1197,12 @@ class MarketAutomationService:
                 next_retry_at=next_retry,
             )
             return AutomationOutcome(decision=decision, state=state)
+        # The canonical publication transaction and RefreshRunLock are both complete before
+        # after-close or shadow work is offered.  Neither callback can delay this result.
+        if outcome.result is not None and outcome.result.status == "ready":
+            self._run_post_publish(outcome.result)
+        self._offer_shadow(outcome)
+        return outcome
 
     def _plan_continuity(self, decision: ScheduleDecision, local: datetime):
         if not self.repair_enabled or self.continuity is None:
@@ -1353,7 +1374,6 @@ class MarketAutomationService:
                     "error_code": None,
                 }
             )
-            self._run_post_publish(result)
         else:
             state = self._failed_state(
                 running,
@@ -1365,6 +1385,20 @@ class MarketAutomationService:
             )
         self.store.save_scheduler_state(state)
         return AutomationOutcome(decision=decision, state=state, result=result)
+
+    def _offer_shadow(self, outcome: AutomationOutcome) -> None:
+        """Offer a durable shadow handoff after the canonical lock, with zero wait."""
+        if self.shadow_handoff is None:
+            return
+        try:
+            self.shadow_handoff.offer(outcome, wait_budget=0, nonblocking=True)
+        except RefreshAlreadyRunning:
+            # A contended canonical run is never retried or handed to the shadow lane.
+            return
+        except Exception:
+            _log_event(
+                logging.WARNING, "shadow_handoff_dropped", outcome_id=_safe_outcome_id(outcome)
+            )
 
     def _handle_open_circuit(
         self,
