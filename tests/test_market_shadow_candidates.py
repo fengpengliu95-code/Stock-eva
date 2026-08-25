@@ -7,6 +7,7 @@ from backend.app.market.shadow_candidates import (
     ShadowCandidateReader,
     ShadowCandidateStore,
     ShadowCandidateUnavailable,
+    ShadowQualityReport,
 )
 from backend.app.market.shadow_evidence import (
     ShadowAttempt,
@@ -86,7 +87,7 @@ def bindings(tmp_path, *, provider="tushare", universe="u"):
             "2026-08-20",
             universe,
             "g1",
-            "m" * 64,
+            "a" * 64,
             "v" * 64,
             "pending_normalization",
             1,
@@ -235,3 +236,42 @@ def test_candidate_store_and_reader_require_real_evidence_reader_and_registry(tm
         )
     with pytest.raises(ShadowCandidateUnavailable):
         ShadowCandidateReader(root, evidence_reader=object(), registry=object())
+
+
+def test_candidate_store_rejects_caller_version_override(tmp_path):
+    reader, registry = bindings(tmp_path)
+    with pytest.raises(TypeError):
+        ShadowCandidateStore(tmp_path / "shadow").publish(
+            candidate(),
+            evidence_reader=reader,
+            evidence_id="ev-1",
+            registry=registry,
+            adapter_version="caller-override",
+            source_schema_version="caller-override",
+        )
+
+
+def test_shadow_quality_report_freezes_gate_identity():
+    with pytest.raises(ValueError):
+        ShadowQualityReport(
+            quality_report_id="quality-candidate",
+            candidate_id="candidate",
+            trade_date=date(2026, 8, 20),
+            universe_id="u",
+            gate_version="caller-override",
+            ordered_gate_outcomes=(("coverage", "pass"), ("self_quality", "pass")),
+            expected_symbol_count=1,
+            loaded_symbol_count=1,
+            suspended_count=0,
+            verdict="pass",
+            input_evidence_sha256="e" * 64,
+        )
+
+
+def test_published_candidate_manifest_binds_registry_generation_and_hash(tmp_path):
+    reader, registry = bindings(tmp_path)
+    manifest = ShadowCandidateStore(tmp_path / "shadow").publish(
+        candidate(), evidence_reader=reader, evidence_id="ev-1", registry=registry
+    )
+    assert manifest.canonical_manifest_generation == "g1"
+    assert manifest.canonical_manifest_sha256 == "a" * 64

@@ -9,7 +9,7 @@ import secrets
 import stat
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -149,7 +149,7 @@ class ShadowQualityReport(BaseModel):
     candidate_id: str
     trade_date: date
     universe_id: str
-    gate_version: str = "r2f3-v1"
+    gate_version: Literal["r2f3-v1"] = "r2f3-v1"
     ordered_gate_outcomes: tuple[tuple[str, str], ...]
     expected_symbol_count: int = Field(ge=0)
     loaded_symbol_count: int = Field(ge=0)
@@ -161,6 +161,15 @@ class ShadowQualityReport(BaseModel):
 
     @model_validator(mode="after")
     def bind_report_hash(self) -> ShadowQualityReport:
+        if self.quality_report_id != f"quality-{self.candidate_id}":
+            raise ValueError("shadow quality report identity mismatch")
+        if tuple(name for name, _ in self.ordered_gate_outcomes) != (
+            "coverage",
+            "self_quality",
+        ):
+            raise ValueError("shadow quality gate order mismatch")
+        if any(verdict not in {"pass", "fail"} for _, verdict in self.ordered_gate_outcomes):
+            raise ValueError("shadow quality gate verdict unavailable")
         values = self.model_dump(mode="json")
         values.pop("report_sha256", None)
         expected = _sha(values)
@@ -184,12 +193,14 @@ class ShadowCandidateManifest(BaseModel):
     normalized_object_sha256: str
     quality_report_ref: str
     quality_report_sha256: str
-    source_schema_version: str = "r2f3-v1"
-    adapter_version: str = "r2f3-v1"
+    canonical_manifest_generation: str = Field(min_length=1)
+    canonical_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_schema_version: Literal["r2f3-v1"] = "r2f3-v1"
+    adapter_version: Literal["r2f3-v1"] = "r2f3-v1"
     row_count: int = Field(ge=0)
     expected_symbol_count: int = Field(ge=0)
     bundle_commit_sha256: str
-    status: str = "accepted"
+    status: Literal["accepted"] = "accepted"
     manifest_sha256: str = "0" * 64
 
     @model_validator(mode="after")
@@ -283,6 +294,8 @@ def _registry_binding(
         "window_id": job[2],
         "trade_date": job[3],
         "universe_id": job[4],
+        "canonical_manifest_generation": job[5],
+        "canonical_manifest_sha256": job[6],
         "version_vector_sha256": job[7],
         "evidence_id": evidence[0],
         "session_id": evidence[4],
@@ -307,8 +320,6 @@ class ShadowCandidateStore:
         evidence_id: str,
         quality_report: ShadowQualityReport | None = None,
         candidate_id: str | None = None,
-        adapter_version: str = "r2f3-v1",
-        source_schema_version: str = "r2f3-v1",
         registry: ShadowRegistry,
     ) -> ShadowCandidateManifest:
         if not self.root.is_absolute():
@@ -365,7 +376,7 @@ class ShadowCandidateStore:
             not same_date(item.get("trade_date", "")) for item in plan_requests
         ):
             raise ShadowCandidateUnavailable("shadow evidence request date mismatch")
-        _registry_binding(registry, candidate, evidence_id, evidence_sha_value)
+        registry_binding = _registry_binding(registry, candidate, evidence_id, evidence_sha_value)
         for field in ("job_id", "window_id", "session_id"):
             if descriptor.get(field) != getattr(candidate, field):
                 raise ShadowCandidateUnavailable("shadow evidence identity mismatch")
@@ -436,8 +447,8 @@ class ShadowCandidateStore:
             normalized_object_sha256=_sha(normalized_bytes),
             quality_report_ref=f"{bundle_rel}/quality.json",
             quality_report_sha256=_sha(quality_bytes),
-            source_schema_version=source_schema_version,
-            adapter_version=adapter_version,
+            canonical_manifest_generation=registry_binding["canonical_manifest_generation"],
+            canonical_manifest_sha256=registry_binding["canonical_manifest_sha256"],
             row_count=len(candidate.rows),
             expected_symbol_count=len(expected),
             bundle_commit_sha256="0" * 64,
@@ -609,9 +620,16 @@ class ShadowCandidateReader:
                     or descriptor.get("session_id") != candidate.session_id
                 ):
                     raise ShadowCandidateUnavailable("shadow evidence binding mismatch")
-                _registry_binding(
+                registry_binding = _registry_binding(
                     self.registry, candidate, manifest.evidence_id, manifest.evidence_sha256
                 )
+                if (
+                    manifest.canonical_manifest_generation
+                    != registry_binding["canonical_manifest_generation"]
+                    or manifest.canonical_manifest_sha256
+                    != registry_binding["canonical_manifest_sha256"]
+                ):
+                    raise ShadowCandidateUnavailable("shadow registry generation mismatch")
             except ShadowCandidateUnavailable:
                 raise
             except Exception as exc:
