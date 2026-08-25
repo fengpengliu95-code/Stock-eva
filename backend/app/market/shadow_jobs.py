@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import sqlite3
 import stat
 from collections import deque
@@ -58,6 +57,10 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 class ShadowJobUnavailable(RuntimeError):
     """The shadow outbox is unavailable; callers must preserve canonical outcome."""
+
+
+class ShadowOutcomeReportUnavailable(ShadowJobUnavailable):
+    """The immutable exit report could not be persisted; the lease must remain."""
 
 
 class ShadowJob(BaseModel):
@@ -436,6 +439,27 @@ class ShadowBundlePublisher:
         finally:
             os.close(fd)
 
+    @staticmethod
+    def _read_existing_file(
+        directory_fd: int, name: str, *, limit: int = 16 * 1024 * 1024
+    ) -> bytes:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                raise OSError("shadow bundle file unavailable")
+            raw = os.read(fd, limit + 1)
+            after = os.fstat(fd)
+            if len(raw) > limit or info.st_size != len(raw) or info.st_ino != after.st_ino:
+                raise OSError("shadow bundle file changed")
+            return raw
+        finally:
+            os.close(fd)
+
     def _open_directory_chain(self) -> tuple[int, int, int, int]:
         if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
@@ -464,7 +488,11 @@ class ShadowBundlePublisher:
             raise
 
     def publish(self, identity: str, payload: dict[str, Any]) -> Path:
-        if not self.root.is_absolute() or not identity or "/" in identity or "\\" in identity:
+        try:
+            _safe(identity)
+        except (TypeError, ValueError):
+            raise ShadowJobUnavailable("shadow bundle identity unavailable") from None
+        if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
         current = Path(self.root.anchor)
         for part in self.root.parts[1:]:
@@ -476,110 +504,51 @@ class ShadowBundlePublisher:
                 continue
         root_fd, bundles_fd, staging_fd, lock_fd = self._open_directory_chain()
         bundles = self.root / "bundles"
-        staging_root = self.root / "staging"
-        nonce = f"{identity}-{secrets.token_hex(8)}"
-        staging = staging_root / nonce
         destination = bundles / identity
+        raw = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        marker = hashlib.sha256(raw).hexdigest().encode() + b"\n"
+        destination_fd = -1
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            if destination.exists():
-                try:
-                    if stat.S_ISLNK(os.lstat(destination).st_mode):
-                        raise ShadowJobUnavailable("shadow bundle identity conflict")
-                except FileNotFoundError:
-                    pass
-                marker = destination / "COMMIT"
-                raw = (
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                    + "\n"
+            created = False
+            try:
+                os.mkdir(identity, 0o700, dir_fd=bundles_fd)
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                destination_fd = os.open(
+                    identity,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=bundles_fd,
                 )
-                expected = hashlib.sha256(raw.encode()).hexdigest() + "\n"
+            except OSError as exc:
+                raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
+            if not created:
                 try:
-                    marker_fd = os.open(
-                        marker,
-                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
-                    )
-                    try:
-                        marker_raw = os.read(marker_fd, 128).decode()
-                    finally:
-                        os.close(marker_fd)
+                    entries = set(os.listdir(destination_fd))
+                    existing_raw = self._read_existing_file(destination_fd, "report.json")
+                    existing_marker = self._read_existing_file(destination_fd, "COMMIT", limit=128)
                 except OSError as exc:
                     raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
-                if marker_raw != expected:
+                if (
+                    entries != {"report.json", "COMMIT"}
+                    or existing_raw != raw
+                    or existing_marker != marker
+                ):
                     raise ShadowJobUnavailable("shadow bundle identity conflict")
                 return destination
-            os.mkdir(staging.name, 0o700, dir_fd=staging_fd)
-            raw = (
-                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                + "\n"
-            ).encode()
-            marker = hashlib.sha256(raw).hexdigest() + "\n"
-            staging_dir_fd = os.open(
-                staging.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=staging_fd,
-            )
-            try:
-                self._write_new_file(staging_dir_fd, "report.json", raw)
-                self._write_new_file(staging_dir_fd, "COMMIT", marker.encode())
-                os.fsync(staging_dir_fd)
-            finally:
-                os.close(staging_dir_fd)
-            try:
-                import ctypes
-
-                libc = ctypes.CDLL(None, use_errno=True)
-                renameatx_np = libc.renameatx_np
-                parent_fd = os.dup(bundles_fd)
-                source_fd = os.dup(staging_fd)
-                try:
-                    if (
-                        renameatx_np(
-                            source_fd,
-                            staging.name.encode(),
-                            parent_fd,
-                            destination.name.encode(),
-                            0x00000004,
-                        )
-                        != 0
-                    ):
-                        raise OSError(ctypes.get_errno(), "exclusive bundle rename failed")
-                finally:
-                    os.close(source_fd)
-                    os.close(parent_fd)
-            except AttributeError:
-                if destination.exists():
-                    raise ShadowJobUnavailable("shadow bundle identity conflict") from None
-                os.rename(staging, destination)
-            except OSError as exc:
-                if destination.exists() and not stat.S_ISLNK(os.lstat(destination).st_mode):
-                    marker = destination / "COMMIT"
-                    expected = hashlib.sha256(raw).hexdigest() + "\n"
-                    try:
-                        marker_fd = os.open(
-                            marker,
-                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
-                        )
-                        try:
-                            marker_raw = os.read(marker_fd, 128).decode()
-                        finally:
-                            os.close(marker_fd)
-                    except OSError:
-                        marker_raw = ""
-                    if marker_raw == expected:
-                        return destination
-                raise ShadowJobUnavailable("shadow bundle publish unavailable") from exc
-            dir_fd = os.open(bundles, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            self._write_new_file(destination_fd, "report.json", raw)
+            # COMMIT is created last; an incomplete directory is never attachable.
+            self._write_new_file(destination_fd, "COMMIT", marker)
+            os.fsync(destination_fd)
+            os.fsync(bundles_fd)
             return destination
         finally:
-            if staging.exists():
-                for path in staging.iterdir():
-                    path.unlink()
-                staging.rmdir()
+            if destination_fd >= 0:
+                os.close(destination_fd)
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
             os.close(staging_fd)
@@ -644,7 +613,12 @@ class ShadowOutcomeReporter:
             state_version if state_version is not None else "none",
             status,
         )
-        return self.publisher.publish(identity, report.model_dump(mode="json"))
+        try:
+            return self.publisher.publish(identity, report.model_dump(mode="json"))
+        except ShadowOutcomeReportUnavailable:
+            raise
+        except Exception as exc:
+            raise ShadowOutcomeReportUnavailable("shadow outcome report unavailable") from exc
 
 
 def _safe(value: str) -> str:
@@ -1123,6 +1097,7 @@ __all__ = [
     "ShadowJobStore",
     "ShadowJobUnavailable",
     "ShadowOutcomeReport",
+    "ShadowOutcomeReportUnavailable",
     "ShadowOutcomeReporter",
     "ShadowSessionReport",
 ]

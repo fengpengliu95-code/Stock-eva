@@ -6,6 +6,7 @@
 import hashlib
 import inspect
 import json
+import os
 from datetime import date
 from multiprocessing import get_context
 from types import SimpleNamespace
@@ -30,12 +31,12 @@ from backend.app.market.shadow_jobs import (
 )
 from backend.app.market.shadow_terminal import (
     ShadowTerminalUnavailable,
+    ShadowTerminalWriter,
     attempt_ordinal_closure_digest,
     canonical_json,
     completion_digest,
     report_digest,
     request_plan_digest,
-    write_terminal_success,
 )
 from tests.test_market_provider_registry import _record, _sha, _terms
 
@@ -461,9 +462,67 @@ def test_attempt_and_session_report_update_delete_are_append_only_rejected(tmp_p
         publisher.publish("immutable", {"value": 2})
 
 
+def test_publisher_creates_final_identity_without_staging_name_rename(tmp_path, monkeypatch):
+    mkdir_names = []
+    original_mkdir = os.mkdir
+
+    def record_mkdir(name, mode=0o777, *, dir_fd=None):
+        mkdir_names.append(str(name))
+        return original_mkdir(name, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", record_mkdir)
+    ShadowBundlePublisher(tmp_path / "shadow").publish("direct", {"value": 1})
+    assert "direct" in mkdir_names
+    assert not any(name.startswith("direct-") for name in mkdir_names)
+
+
+def test_publisher_rejects_identity_replacement_symlink(tmp_path, monkeypatch):
+    original_mkdir = os.mkdir
+
+    def replace_after_create(name, mode=0o777, *, dir_fd=None):
+        result = original_mkdir(name, mode, dir_fd=dir_fd)
+        if name == "race" and dir_fd is not None:
+            os.rmdir(name, dir_fd=dir_fd)
+            os.symlink("target", name, dir_fd=dir_fd)
+        return result
+
+    monkeypatch.setattr(os, "mkdir", replace_after_create)
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(tmp_path / "shadow").publish("race", {"value": 1})
+    assert (tmp_path / "shadow" / "bundles" / "race").is_symlink()
+    assert not (tmp_path / "shadow" / "bundles" / "race" / "COMMIT").exists()
+
+
 def test_public_terminal_success_requires_strict_cross_task_inputs(tmp_path):
-    parameters = inspect.signature(write_terminal_success).parameters
-    assert {"plan", "evidence_reader", "candidate_reader", "snapshot"} <= set(parameters)
+    import backend.app.market.shadow_terminal as shadow_terminal
+
+    assert "write_terminal_success" not in dir(shadow_terminal)
+    assert "write_terminal_success" not in shadow_terminal.__all__
+    assert "context" in inspect.signature(ShadowTerminalWriter.write_success).parameters
+
+
+def test_calendar_hash_and_parse_use_one_held_read(tmp_path, monkeypatch):
+    reader = _calendar(tmp_path)
+    config_path = _calendar_root(tmp_path) / "cn_a_share_2026.json"
+    changed = json.loads(config_path.read_text())
+    changed["closed_dates"] = [f"2026-01-{day:02d}" for day in range(2, 20)]
+    changed_raw = json.dumps(changed, ensure_ascii=False).encode()
+    import backend.app.market.shadow_calendar as shadow_calendar
+
+    original_pread = shadow_calendar.os.pread
+    calls = 0
+
+    def race(fd, size, offset):
+        nonlocal calls
+        raw = original_pread(fd, size, offset)
+        calls += 1
+        if calls == 1:
+            config_path.write_bytes(changed_raw)
+        return raw
+
+    monkeypatch.setattr(shadow_calendar.os, "pread", race)
+    with pytest.raises(ShadowCalendarUnavailable):
+        reader.read(date(2026, 1, 1), date(2026, 1, 5))
 
 
 def test_duplicate_involved_year_calendar_config_is_unavailable(tmp_path):
@@ -584,6 +643,11 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "row_count": 1,
     }
     completion = {
+        "job_id": job_id,
+        "provider_id": "tickflow",
+        "window_id": window.window_id,
+        "session_id": session_id,
+        "evidence_id": evidence_id,
         "request_plan_sha256": plan.request_plan_sha256,
         "requests": [
             {
@@ -604,6 +668,8 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "job_id": job_id,
         "window_id": window.window_id,
         "session_id": session_id,
+        "evidence_id": evidence_id,
+        "candidate_id": candidate_id,
         "plan_sha256": plan.request_plan_sha256,
         "completion": completion,
         "pages": [page],
@@ -758,7 +824,30 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         candidate_id,
         "terminal-report-1",
     )
-    attestation = write_terminal_success(
+    writer = ShadowTerminalWriter(ShadowBundlePublisher(tmp_path / "shadow"))
+    evil_descriptor = dict(descriptor)
+    evil_descriptor["candidate_id"] = "evil-candidate"
+    evidence_reader.read_descriptor = lambda _evidence_id: (evidence, evil_descriptor)
+    with pytest.raises(ShadowTerminalUnavailable):
+        writer.write_success(
+            registry,
+            plan=plan,
+            evidence_reader=evidence_reader,
+            candidate_reader=candidate_reader,
+            identity=identity,
+            calendar_generation=snapshot.calendar_generation,
+            calendar_sha256=snapshot.calendar_sha256,
+            universe_sha256=snapshot.universe_sha256,
+            version_vector_sha256=_sha("v"),
+            expected_job_state_version=0,
+            expected_window_state_version=0,
+            snapshot=snapshot,
+        )
+    assert connection.execute(
+        "SELECT run_status,state_version FROM shadow_job WHERE job_id=?", (job_id,)
+    ).fetchone() == ("pending_normalization", 0)
+    evidence_reader.read_descriptor = lambda _evidence_id: (evidence, descriptor)
+    attestation = writer.write_success(
         registry,
         plan=plan,
         evidence_reader=evidence_reader,
@@ -771,7 +860,6 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         expected_job_state_version=0,
         expected_window_state_version=0,
         snapshot=snapshot,
-        bundle_publisher=ShadowBundlePublisher(tmp_path / "shadow"),
     )
     assert attestation.session_report_version == 2
     assert connection.execute(

@@ -19,6 +19,7 @@ from .shadow_jobs import (
     ShadowJobStore,
     ShadowJobUnavailable,
     ShadowOutcomeReporter,
+    ShadowOutcomeReportUnavailable,
 )
 from .shadow_terminal import ShadowTerminalWriter
 
@@ -94,28 +95,24 @@ class ShadowScheduler:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.cancellation():
-            try:
-                self._report(
-                    status="cancelled",
-                    job_id=leased.job_id,
-                    state_version=leased.state_version,
-                )
-            finally:
-                self.job_store.release_after_worker(leased, status="cancelled")
+            self._report(
+                status="cancelled",
+                job_id=leased.job_id,
+                state_version=leased.state_version,
+            )
+            self.job_store.release_after_worker(leased, status="cancelled")
             return ShadowSchedulerOutcome(
                 status="cancelled",
                 job_id=leased.job_id,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         if self.worker is None:
-            try:
-                self._report(
-                    status="no_worker",
-                    job_id=leased.job_id,
-                    state_version=leased.state_version,
-                )
-            finally:
-                self.job_store.release_after_worker(leased, status="pending")
+            self._report(
+                status="no_worker",
+                job_id=leased.job_id,
+                state_version=leased.state_version,
+            )
+            self.job_store.release_after_worker(leased, status="pending")
             return ShadowSchedulerOutcome(
                 status="no_worker",
                 job_id=leased.job_id,
@@ -163,42 +160,38 @@ class ShadowScheduler:
             elif status in {"completed", "success"}:
                 context = self._terminal_context(result)
                 if self.terminal_writer is None or context is None:
-                    reported = self._report(
+                    self._report(
                         status="missing_context",
                         job_id=leased.job_id,
                         state_version=leased.state_version,
                     )
                     self.job_store.release_after_worker(leased, status="failed")
                     status = "failed"
-                    failure_class = (
-                        "terminal_context_unavailable" if reported else "outcome_report_unavailable"
-                    )
+                    failure_class = "terminal_context_unavailable"
                 else:
-                    if not self._report(
+                    self._report(
                         status="success",
                         job_id=leased.job_id,
                         state_version=leased.state_version,
-                    ):
-                        self.job_store.release_after_worker(leased, status="failed")
-                        status = "failed"
-                        failure_class = "outcome_report_unavailable"
-                    else:
-                        self.terminal_writer.write_success(self.job_store.registry, **context)
+                    )
+                    self.terminal_writer.write_success(self.job_store.registry, **context)
             return ShadowSchedulerOutcome(
                 status=str(status),
                 job_id=leased.job_id,
                 failure_class=locals().get("failure_class"),
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
+        except ShadowOutcomeReportUnavailable:
+            # A missing immutable report is not a worker outcome.  Keep the lease
+            # and state version unchanged so expiry/reclaim can recover it.
+            raise
         except Exception:
-            try:
-                self._report(
-                    status="worker_exception",
-                    job_id=leased.job_id,
-                    state_version=leased.state_version,
-                )
-            finally:
-                self.job_store.release_after_worker(leased, status="failed")
+            self._report(
+                status="worker_exception",
+                job_id=leased.job_id,
+                state_version=leased.state_version,
+            )
+            self.job_store.release_after_worker(leased, status="failed")
             return ShadowSchedulerOutcome(
                 status="failed",
                 job_id=leased.job_id,
@@ -222,17 +215,13 @@ class ShadowScheduler:
         job_id: str | None = None,
         state_version: int | None = None,
         reason_code: str | None = None,
-    ) -> bool:
-        try:
-            self.outcome_reporter.publish(
-                status=status,
-                job_id=job_id,
-                state_version=state_version,
-                reason_code=reason_code,
-            )
-        except Exception:
-            return False
-        return True
+    ) -> None:
+        self.outcome_reporter.publish(
+            status=status,
+            job_id=job_id,
+            state_version=state_version,
+            reason_code=reason_code,
+        )
 
     def _persist_or_release(self, leased: ShadowJob, result: Any, *, outcome: str) -> None:
         context = (

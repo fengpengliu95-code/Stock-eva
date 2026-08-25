@@ -112,9 +112,27 @@ class ConfirmedCalendarReader:
             not self.calendar_root.is_absolute()
             or provider_id not in {"tickflow", "tushare"}
             or not re.fullmatch(r"[0-9a-f]{64}", universe_sha256)
+            or not self.calendar_root.is_dir()
         ):
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-        authority = self._read_file(self.calendar_root / "calendar-manifest.json")
+        try:
+            root_fd = self._open_root()
+        except OSError as exc:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
+        try:
+            authority_fd = os.open(
+                "calendar-manifest.json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=root_fd,
+            )
+            try:
+                authority = self._read_fd(authority_fd)
+            finally:
+                os.close(authority_fd)
+        except (OSError, ShadowCalendarUnavailable) as exc:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
+        finally:
+            os.close(root_fd)
         try:
             payload = json.loads(authority.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -129,47 +147,79 @@ class ConfirmedCalendarReader:
         self.payload_sha256 = payload["payload_sha256"]
         self.calendar_generation = f"{_TRUSTED_AUTHORITY_VERSION}-{self.payload_sha256[:16]}"
 
-    def _read_file(self, path: Path) -> bytes:
+    def _open_root(self) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        current = os.open(os.sep, flags)
         try:
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            for component in self.calendar_root.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=current)
+                os.close(current)
+                current = next_fd
+            return current
+        except Exception:
+            os.close(current)
+            raise
+
+    @staticmethod
+    def _read_fd(fd: int, *, limit: int = 1_048_576) -> bytes:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        raw = os.pread(fd, limit + 1, 0)
+        after = os.fstat(fd)
+
+        def fingerprint(info):
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                getattr(info, "st_ctime_ns", 0),
+            )
+
+        if (
+            len(raw) > limit
+            or len(raw) != before.st_size
+            or fingerprint(before) != fingerprint(after)
+        ):
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        return raw
+
+    def _read_relative(self, root_fd: int, name: str) -> bytes:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=root_fd,
+            )
             try:
-                before = os.fstat(fd)
-                raw = os.read(fd, 1_048_577)
-                after = os.fstat(fd)
+                return self._read_fd(fd)
             finally:
                 os.close(fd)
-            if len(raw) > 1_048_576 or (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-            return raw
-        except (OSError, ValueError) as exc:
+        except (OSError, ShadowCalendarUnavailable) as exc:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
 
     def _configs(self, years: set[int]) -> tuple[dict[str, Any], ...]:
-        if self.calendar_root.is_file():
-            candidates = [self.calendar_root]
-        elif self.calendar_root.is_dir():
-            candidates = sorted(self.calendar_root.glob("cn_a_share_*.json"))
-        else:
-            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        candidates = sorted(self.calendar_root.glob("cn_a_share_*.json"))
         if not candidates:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
-        payload_bytes = b"".join(
-            path.name.encode("utf-8") + b"\0" + self._read_file(path) for path in candidates
-        )
+        try:
+            root_fd = self._open_root()
+        except OSError as exc:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
+        raw_files: list[tuple[str, bytes]] = []
+        try:
+            for path in candidates:
+                raw_files.append((path.name, self._read_relative(root_fd, path.name)))
+        finally:
+            os.close(root_fd)
+        payload_bytes = b"".join(name.encode("utf-8") + b"\0" + raw for name, raw in raw_files)
         if _sha(payload_bytes) != self.payload_sha256:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
         found: list[dict[str, Any]] = []
-        for path in candidates:
+        for _name, raw in raw_files:
             try:
-                payload = json.loads(self._read_file(path).decode("utf-8"))
+                payload = json.loads(raw.decode("utf-8"))
             except (UnicodeError, json.JSONDecodeError) as exc:
                 raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
             values = payload if isinstance(payload, list) else [payload]

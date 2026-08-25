@@ -12,6 +12,7 @@ from backend.app.market.shadow_jobs import (
     ShadowHandoff,
     ShadowJobStore,
     ShadowOutcomeReporter,
+    ShadowOutcomeReportUnavailable,
 )
 from backend.app.market.shadow_scheduler import ShadowScheduler, build_shadow_scheduler
 from tests.test_market_provider_registry import _record, _sha, _terms
@@ -186,3 +187,51 @@ def test_scheduler_worker_exception_releases_sqlite_lease(tmp_path):
     assert result.status == "failed"
     assert store.get("job-error").run_status == "failed"
     assert store.get("job-error").lease_owner is None
+
+
+def test_scheduler_reporter_failure_preserves_sqlite_lease_for_reclaim(tmp_path):
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record())
+    terms = _terms()
+    registry.put_terms_evidence(terms)
+    registry.attach_terms_to_provider("tickflow", terms)
+    state = registry.transition("tickflow", "canary", expected_state_version=1)
+    registry.transition("tickflow", "shadow", expected_state_version=state.state_version)
+    window = registry.ensure_window("tickflow", _sha("vector"), "calendar-v1", _sha("calendar"))
+    store = ShadowJobStore(registry, tmp_path / "shadow")
+    store.enqueue(
+        job_id="job-report-failure",
+        provider_id="tickflow",
+        window_id=window.window_id,
+        trade_date="2026-01-02",
+        universe_id="u1",
+        canonical_manifest_generation="g1",
+        canonical_manifest_sha256=_sha("manifest"),
+        version_vector_sha256=_sha("vector"),
+    )
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    reporter = ShadowOutcomeReporter(publisher)
+
+    def fail_publish(*_args, **_kwargs):
+        raise OSError("injected report failure")
+
+    publisher.publish = fail_publish
+    scheduler = ShadowScheduler(
+        store,
+        worker=lambda *_args, **_kwargs: {"status": "failure"},
+        owner="report-failure-owner",
+        canonical_scanner=CanonicalOutcomeScanner(
+            tmp_path / "canonical",
+            shadow_start_date=datetime(2026, 1, 1).date(),
+            provider_id="tickflow",
+            window_id=window.window_id,
+        ),
+        outcome_reporter=reporter,
+    )
+    with pytest.raises(ShadowOutcomeReportUnavailable):
+        scheduler.run_once()
+    leased = store.get("job-report-failure")
+    assert leased.run_status == "leased"
+    assert leased.lease_owner == "report-failure-owner"
+    assert leased.state_version == 1

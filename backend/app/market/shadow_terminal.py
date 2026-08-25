@@ -158,8 +158,18 @@ def _strict_bundle_validation(
         raise ShadowTerminalUnavailable("terminal evidence or candidate unavailable") from exc
     manifest = candidate_bundle.manifest
     candidate = candidate_bundle.candidate
+    expected_descriptor = {
+        "provider_id": identity.provider_id,
+        "job_id": identity.job_id,
+        "window_id": identity.window_id,
+        "session_id": identity.session_id,
+        "evidence_id": evidence_id,
+        "candidate_id": candidate_id,
+    }
     if (
-        not getattr(evidence, "evidence_ready", False)
+        not isinstance(descriptor, dict)
+        or any(descriptor.get(key) != value for key, value in expected_descriptor.items())
+        or not getattr(evidence, "evidence_ready", False)
         or evidence.manifest_sha256 != manifest.evidence_sha256
         or manifest.evidence_id != evidence_id
         or manifest.candidate_id != candidate_id
@@ -183,7 +193,17 @@ def _strict_bundle_validation(
     if descriptor.get("plan_sha256") != plan.request_plan_sha256:
         raise ShadowTerminalUnavailable("terminal request plan hash unavailable")
     completion = descriptor.get("completion", {})
-    if completion.get("request_plan_sha256") != plan.request_plan_sha256:
+    expected_completion = {
+        "job_id": identity.job_id,
+        "provider_id": identity.provider_id,
+        "window_id": identity.window_id,
+        "session_id": identity.session_id,
+        "evidence_id": evidence_id,
+        "request_plan_sha256": plan.request_plan_sha256,
+    }
+    if not isinstance(completion, dict) or any(
+        completion.get(key) != value for key, value in expected_completion.items()
+    ):
         raise ShadowTerminalUnavailable("terminal completion hash unavailable")
     if evidence.completion_sha256 != completion_digest(completion)[1]:
         raise ShadowTerminalUnavailable("terminal completion digest unavailable")
@@ -217,7 +237,8 @@ def _strict_bundle_validation(
             raise ShadowTerminalUnavailable("terminal endpoint binding unavailable")
         for page in item.get("page_refs", []):
             if (
-                not page.get("page_identity")
+                page.get("ordinal") != item["ordinal"]
+                or not page.get("page_identity")
                 or not page.get("object_ref")
                 or len(page.get("content_sha256", "")) != 64
                 or any(char not in "0123456789abcdef" for char in page.get("content_sha256", ""))
@@ -758,7 +779,7 @@ def _write_terminal_success_graph(
     return registry._with_transaction(transaction)
 
 
-def write_terminal_success(
+def _write_terminal_success(
     registry: ShadowRegistry,
     *,
     plan: ShadowLogicalRequestPlan,
@@ -775,7 +796,7 @@ def write_terminal_success(
     bundle_publisher: ShadowBundlePublisher,
     now=None,
 ) -> ShadowTerminalAttestation:
-    """The sole public terminal writer for the complete Task13 graph."""
+    """Private graph implementation; production callers use ShadowTerminalWriter."""
     return _write_terminal_success_graph(
         registry,
         plan=plan,
@@ -805,7 +826,7 @@ class ShadowTerminalWriter:
     def write_success(self, registry: ShadowRegistry, **context: Any) -> ShadowTerminalAttestation:
         context = dict(context)
         context.setdefault("bundle_publisher", self.bundle_publisher)
-        return write_terminal_success(registry, **context)
+        return _write_terminal_success(registry, **context)
 
 
 __all__ = [
@@ -821,5 +842,4 @@ __all__ = [
     "report_digest",
     "request_plan_digest",
     "validate_terminal_digests",
-    "write_terminal_success",
 ]
