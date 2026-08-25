@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ShadowCalendarUnavailable(RuntimeError):
@@ -34,6 +34,14 @@ class ConfirmedSessionSnapshot(BaseModel):
     universe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     captured_at: str
     snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_snapshot_hash(self) -> ConfirmedSessionSnapshot:
+        values = self.model_dump(mode="json")
+        values.pop("snapshot_sha256")
+        if self.snapshot_sha256 != _sha(_canonical(values)):
+            raise ValueError("confirmed session snapshot hash mismatch")
+        return self
 
 
 class ShadowCalendarSource(BaseModel):
