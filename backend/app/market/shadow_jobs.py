@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -18,11 +19,40 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import duckdb
 from pydantic import BaseModel, ConfigDict, Field
 
 from .providers.registry import ShadowRegistry
 from .shadow_calendar import ConfirmedSessionSnapshot
 from .shadow_evidence import ShadowAttemptReport
+
+_CANONICAL_PARQUET_SCHEMA = (
+    ("trade_date", "DATE"),
+    ("symbol", "VARCHAR"),
+    ("security_type", "VARCHAR"),
+    ("exchange", "VARCHAR"),
+    ("board", "VARCHAR"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("preclose", "DOUBLE"),
+    ("volume", "DOUBLE"),
+    ("amount", "DOUBLE"),
+    ("turnover_rate", "DOUBLE"),
+    ("pct_change", "DOUBLE"),
+    ("adjust_factor", "DOUBLE"),
+    ("price_adjustment", "VARCHAR"),
+    ("is_trading", "BOOLEAN"),
+    ("is_suspended", "BOOLEAN"),
+    ("is_st", "BOOLEAN"),
+    ("source", "VARCHAR"),
+    ("source_record_id", "VARCHAR"),
+    ("ingested_at", "TIMESTAMP WITH TIME ZONE"),
+    ("quality_status", "VARCHAR"),
+    ("quality_issues", "JSON"),
+)
+_SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class ShadowJobUnavailable(RuntimeError):
@@ -76,7 +106,7 @@ class CanonicalManifestUnavailable(RuntimeError):
     """Published canonical manifest did not satisfy the scanner contract."""
 
 
-class PublishedCanonicalManifestScanner:
+class CanonicalOutcomeScanner:
     """Descriptor-bound scanner for the canonical DatasetManifest only."""
 
     def __init__(
@@ -94,26 +124,122 @@ class PublishedCanonicalManifestScanner:
         self.provider_id = provider_id
         self.window_id = window_id
 
-    @staticmethod
-    def _read(path: Path) -> tuple[bytes, tuple[int, int, int, int]]:
+    def _open_relative(self, relative: Path) -> int:
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise CanonicalManifestUnavailable("canonical object unavailable")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise CanonicalManifestUnavailable("canonical object unavailable")
+        root_fd = -1
         try:
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            root_fd = os.open(os.sep, os.O_RDONLY | directory | nofollow | os.O_CLOEXEC)
+            for component in self.root.parts[1:]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | os.O_CLOEXEC,
+                    dir_fd=root_fd,
+                )
+                os.close(root_fd)
+                root_fd = next_fd
+        except OSError as exc:
+            if root_fd >= 0:
+                os.close(root_fd)
+            raise CanonicalManifestUnavailable("canonical object unavailable") from exc
+        current_fd = root_fd
+        try:
+            for component in relative.parts[:-1]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | os.O_CLOEXEC,
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            return os.open(
+                relative.parts[-1],
+                os.O_RDONLY | nofollow | os.O_CLOEXEC,
+                dir_fd=current_fd,
+            )
+        except OSError as exc:
+            raise CanonicalManifestUnavailable("canonical object unavailable") from exc
+        finally:
+            if current_fd != root_fd:
+                os.close(current_fd)
+            else:
+                os.close(root_fd)
+
+    @staticmethod
+    def _read_fd(fd: int) -> tuple[bytes, tuple[int, int, int, int], str]:
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
                 raise CanonicalManifestUnavailable("canonical manifest unavailable")
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                before = os.fstat(fd)
-                raw = os.read(fd, 1_048_577)
-                after = os.fstat(fd)
-            finally:
-                os.close(fd)
+            raw = os.pread(fd, 1_048_577, 0)
+            after = os.fstat(fd)
             before_fp = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             after_fp = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             if len(raw) > 1_048_576 or before_fp != after_fp:
                 raise CanonicalManifestUnavailable("canonical manifest unavailable")
-            return raw, before_fp
+            return raw, before_fp, hashlib.sha256(raw).hexdigest()
         except OSError as exc:
             raise CanonicalManifestUnavailable("canonical manifest unavailable") from exc
+
+    def _read(self, relative: Path) -> tuple[bytes, tuple[int, int, int, int]]:
+        fd = self._open_relative(relative)
+        try:
+            raw, fingerprint, _ = self._read_fd(fd)
+            return raw, fingerprint
+        finally:
+            os.close(fd)
+
+    def _validate_object(self, relative: Path, item: dict[str, Any], trade_date: date) -> None:
+        fd = self._open_relative(relative)
+        try:
+            raw, _, digest = self._read_fd(fd)
+            if digest != item["sha256"]:
+                raise CanonicalManifestUnavailable("canonical object checksum mismatch")
+            query_fd = os.dup(fd)
+            try:
+                connection = duckdb.connect(":memory:")
+                try:
+                    descriptor = f"/dev/fd/{query_fd}"
+                    schema = tuple(
+                        (row[0], row[1])
+                        for row in connection.execute(
+                            "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false)",
+                            [descriptor],
+                        ).fetchall()
+                    )
+                    if schema != _CANONICAL_PARQUET_SCHEMA:
+                        raise CanonicalManifestUnavailable("canonical object schema mismatch")
+                    row_count = int(
+                        connection.execute(
+                            "SELECT count(*) FROM read_parquet(?, hive_partitioning=false)",
+                            [descriptor],
+                        ).fetchone()[0]
+                    )
+                    if row_count != item["row_count"] or row_count < 1:
+                        raise CanonicalManifestUnavailable("canonical object row count mismatch")
+                    invalid = int(
+                        connection.execute(
+                            """SELECT count(*) FROM read_parquet(?, hive_partitioning=false)
+                               WHERE source IS DISTINCT FROM ? OR trade_date IS DISTINCT FROM ?""",
+                            [descriptor, "baostock", trade_date],
+                        ).fetchone()[0]
+                    )
+                    if invalid:
+                        raise CanonicalManifestUnavailable("canonical object partition mismatch")
+                finally:
+                    connection.close()
+            except duckdb.Error as exc:
+                raise CanonicalManifestUnavailable("canonical object cannot be read") from exc
+            finally:
+                os.close(query_fd)
+            if len(raw) == 0:
+                raise CanonicalManifestUnavailable("canonical object is empty")
+        finally:
+            os.close(fd)
 
     def scan(self) -> tuple[dict[str, Any], ...]:
         if self.provider_id not in {"tickflow", "tushare"}:
@@ -127,10 +253,9 @@ class PublishedCanonicalManifestScanner:
         except OSError:
             return ()
         try:
-            sentinel_raw, _ = self._read(self.root / ".stock-eva-dataset.json")
-            manifest_path = self.root / "manifest.json"
-            manifest_raw, before = self._read(manifest_path)
-            _after_raw, after = self._read(manifest_path)
+            sentinel_raw, _ = self._read(Path(".stock-eva-dataset.json"))
+            manifest_raw, before = self._read(Path("manifest.json"))
+            _after_raw, after = self._read(Path("manifest.json"))
         except CanonicalManifestUnavailable:
             return ()
         if before != after:
@@ -156,6 +281,7 @@ class PublishedCanonicalManifestScanner:
             manifest.get("dataset") != "stock-eva-market"
             or manifest.get("schema_version") != 2
             or not isinstance(manifest.get("generation"), str)
+            or _SAFE_GENERATION.fullmatch(manifest.get("generation", "")) is None
             or not isinstance(manifest.get("files"), list)
         ):
             return ()
@@ -183,7 +309,7 @@ class PublishedCanonicalManifestScanner:
                 or item["sha256"] != item["sha256"].lower()
                 or any(char not in "0123456789abcdef" for char in item["sha256"])
                 or not isinstance(item["row_count"], int)
-                or item["row_count"] < 0
+                or item["row_count"] < 1
                 or Path(item["path"]).suffix.lower() != ".parquet"
                 or not isinstance(item.get("source_schema_version"), str)
                 or not item["source_schema_version"]
@@ -191,6 +317,16 @@ class PublishedCanonicalManifestScanner:
                 return ()
             relative = Path(item["path"])
             if relative.is_absolute() or ".." in relative.parts:
+                return ()
+            expected_path = (
+                Path("bars")
+                / "source=baostock"
+                / f"year={trade_date:%Y}"
+                / f"month={trade_date:%m}"
+            )
+            if relative.parent != expected_path or relative.name != (
+                f"date={trade_date.isoformat()}_{item['sha256'][:12]}.parquet"
+            ):
                 return ()
             try:
                 parent = self.root
@@ -201,10 +337,8 @@ class PublishedCanonicalManifestScanner:
             except OSError:
                 return ()
             try:
-                object_raw, _ = self._read(self.root / relative)
+                self._validate_object(relative, item, trade_date)
             except CanonicalManifestUnavailable:
-                return ()
-            if hashlib.sha256(object_raw).hexdigest() != item["sha256"]:
                 return ()
             lineage = {
                 key: item.get(key)
@@ -258,6 +392,42 @@ class ShadowBundlePublisher:
         self.root = Path(root)
         self.lock_path = self.root / "bundles.lock"
 
+    @staticmethod
+    def _open_child_directory(parent_fd: int, name: str) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            return os.open(name, flags, dir_fd=parent_fd)
+
+    def _open_directory_chain(self) -> tuple[int, int, int, int]:
+        if not self.root.is_absolute():
+            raise ShadowJobUnavailable("shadow bundle root unavailable")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        current = os.open(os.sep, flags)
+        bundles_fd = staging_fd = lock_fd = -1
+        try:
+            for component in self.root.parts[1:]:
+                next_fd = self._open_child_directory(current, component)
+                os.close(current)
+                current = next_fd
+            bundles_fd = self._open_child_directory(current, "bundles")
+            staging_fd = self._open_child_directory(current, "staging")
+            lock_fd = os.open(
+                "bundles.lock",
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=current,
+            )
+            return current, bundles_fd, staging_fd, lock_fd
+        except Exception:
+            for descriptor in (lock_fd, staging_fd, bundles_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+            os.close(current)
+            raise
+
     def publish(self, identity: str, payload: dict[str, Any]) -> Path:
         if not self.root.is_absolute() or not identity or "/" in identity or "\\" in identity:
             raise ShadowJobUnavailable("shadow bundle root unavailable")
@@ -269,12 +439,9 @@ class ShadowBundlePublisher:
                     raise ShadowJobUnavailable("shadow bundle root unavailable")
             except FileNotFoundError:
                 continue
-        self.root.mkdir(parents=True, exist_ok=True)
+        root_fd, bundles_fd, staging_fd, lock_fd = self._open_directory_chain()
         bundles = self.root / "bundles"
         staging_root = self.root / "staging"
-        bundles.mkdir(exist_ok=True)
-        staging_root.mkdir(exist_ok=True)
-        lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         nonce = f"{identity}-{secrets.token_hex(8)}"
         staging = staging_root / nonce
         destination = bundles / identity
@@ -306,7 +473,7 @@ class ShadowBundlePublisher:
                 if marker_raw != expected:
                     raise ShadowJobUnavailable("shadow bundle identity conflict")
                 return destination
-            staging.mkdir()
+            os.mkdir(staging.name, 0o700, dir_fd=staging_fd)
             raw = (
                 json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 + "\n"
@@ -330,8 +497,8 @@ class ShadowBundlePublisher:
 
                 libc = ctypes.CDLL(None, use_errno=True)
                 renameatx_np = libc.renameatx_np
-                parent_fd = os.open(bundles, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                source_fd = os.open(staging_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                parent_fd = os.dup(bundles_fd)
+                source_fd = os.dup(staging_fd)
                 try:
                     if (
                         renameatx_np(
@@ -382,6 +549,9 @@ class ShadowBundlePublisher:
                 staging.rmdir()
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            os.close(staging_fd)
+            os.close(bundles_fd)
+            os.close(root_fd)
 
 
 def _safe(value: str) -> str:
@@ -852,7 +1022,7 @@ class ShadowHandoff:
 __all__ = [
     "CanonicalManifestUnavailable",
     "ConfirmedSessionSnapshot",
-    "PublishedCanonicalManifestScanner",
+    "CanonicalOutcomeScanner",
     "ShadowAttemptReport",
     "ShadowBundlePublisher",
     "ShadowHandoff",

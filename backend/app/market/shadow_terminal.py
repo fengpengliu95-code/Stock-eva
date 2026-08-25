@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import unicodedata
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,7 @@ from .providers.registry import ShadowRegistry
 from .shadow_calendar import ConfirmedSessionSnapshot
 from .shadow_candidates import ShadowCandidateReader
 from .shadow_evidence import ShadowAttemptReport, ShadowEvidenceReader, ShadowLogicalRequestPlan
+from .shadow_jobs import ShadowBundlePublisher
 
 
 class ShadowTerminalUnavailable(RuntimeError):
@@ -272,159 +274,6 @@ def validate_terminal_digests(attestation: ShadowTerminalAttestation) -> None:
             raise ShadowTerminalUnavailable("terminal digest mismatch")
 
 
-def terminal_graph_validator(
-    connection, identity: TerminalGraphIdentity, attestation: ShadowTerminalAttestation
-) -> None:
-    """Validate immutable graph before writing any terminal row or CAS state."""
-    validate_terminal_digests(attestation)
-    if attestation.terminal_outcome != "success" or attestation.session_report_version < 2:
-        raise ShadowTerminalUnavailable("terminal outcome unavailable")
-    if (
-        attestation.provider_id,
-        attestation.job_id,
-        attestation.window_id,
-        attestation.session_id,
-        attestation.evidence_id,
-        attestation.candidate_id,
-        attestation.session_report_id,
-    ) != (
-        identity.provider_id,
-        identity.job_id,
-        identity.window_id,
-        identity.session_id,
-        identity.evidence_id,
-        identity.candidate_id,
-        identity.session_report_id,
-    ):
-        raise ShadowTerminalUnavailable("terminal identity mismatch")
-    report = connection.execute(
-        "SELECT outcome,report_version,evidence_id,candidate_id,terminal_attestation_id,evidence_sha256,candidate_sha256 FROM session_report WHERE session_report_id=? AND provider_id=? AND job_id=? AND window_id=? AND session_id=?",
-        (
-            identity.session_report_id,
-            identity.provider_id,
-            identity.job_id,
-            identity.window_id,
-            identity.session_id,
-        ),
-    ).fetchone()
-    if (
-        report is None
-        or report[0] != "success"
-        or report[1] < 2
-        or report[2:]
-        != (
-            identity.evidence_id,
-            identity.candidate_id,
-            attestation.attestation_id,
-            attestation.evidence_sha256,
-            attestation.candidate_sha256,
-        )
-    ):
-        raise ShadowTerminalUnavailable("terminal session report unavailable")
-    rows = connection.execute(
-        "SELECT logical_request_ordinal,outcome,terminal_marker,evidence_id,evidence_sha256,candidate_sha256,terminal_session_report_id FROM shadow_attempt_report WHERE provider_id=? AND job_id=? AND window_id=? AND session_id=? AND terminal_session_report_id=? ORDER BY logical_request_ordinal",
-        (
-            identity.provider_id,
-            identity.job_id,
-            identity.window_id,
-            identity.session_id,
-            identity.session_report_id,
-        ),
-    ).fetchall()
-    if not rows or any(
-        row[1] != "success"
-        or row[2] != 1
-        or row[3] != identity.evidence_id
-        or row[4] != attestation.evidence_sha256
-        or row[5] != attestation.candidate_sha256
-        or row[6] != identity.session_report_id
-        for row in rows
-    ):
-        raise ShadowTerminalUnavailable("terminal ordinal closure unavailable")
-
-
-def _write_terminal_attestation(
-    registry: ShadowRegistry,
-    *,
-    identity: TerminalGraphIdentity,
-    attestation: ShadowTerminalAttestation,
-    expected_job_state_version: int,
-    expected_window_state_version: int,
-    window_state: str = "observing",
-) -> ShadowTerminalAttestation:
-    """Insert one immutable attestation and CAS both state rows in one transaction."""
-    if type(registry) is not ShadowRegistry:
-        raise TypeError("terminal writer requires ShadowRegistry")
-    validate_terminal_digests(attestation)
-    if attestation.attestation_id == "":
-        raise ShadowTerminalUnavailable("terminal attestation identity unavailable")
-
-    def transaction(connection):
-        terminal_graph_validator(connection, identity, attestation)
-        connection.execute(
-            "INSERT INTO shadow_terminal_attestation (attestation_id,provider_id,job_id,window_id,session_id,evidence_id,candidate_id,session_report_id,session_report_version,request_plan_canonical_json,completion_canonical_json,attempt_ordinal_closure_canonical_json,report_digest_canonical_json,attempt_ordinal_closure_sha256,request_plan_sha256,completion_sha256,report_digest_sha256,evidence_sha256,candidate_sha256,terminal_outcome,immutable_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            tuple(
-                getattr(attestation, name)
-                for name in (
-                    "attestation_id",
-                    "provider_id",
-                    "job_id",
-                    "window_id",
-                    "session_id",
-                    "evidence_id",
-                    "candidate_id",
-                    "session_report_id",
-                    "session_report_version",
-                    "request_plan_canonical_json",
-                    "completion_canonical_json",
-                    "attempt_ordinal_closure_canonical_json",
-                    "report_digest_canonical_json",
-                    "attempt_ordinal_closure_sha256",
-                    "request_plan_sha256",
-                    "completion_sha256",
-                    "report_digest_sha256",
-                    "evidence_sha256",
-                    "candidate_sha256",
-                    "terminal_outcome",
-                    "immutable_version",
-                )
-            ),
-        )
-        job = connection.execute(
-            "UPDATE shadow_job SET run_status='completed',successful_evidence_sha256=?,successful_candidate_sha256=?,completion_sha256=?,terminal_attestation_id=?,state_version=state_version+1 WHERE job_id=? AND provider_id=? AND window_id=? AND run_status='pending_normalization' AND state_version=?",
-            (
-                attestation.evidence_sha256,
-                attestation.candidate_sha256,
-                attestation.completion_sha256,
-                attestation.attestation_id,
-                identity.job_id,
-                identity.provider_id,
-                identity.window_id,
-                expected_job_state_version,
-            ),
-        )
-        if job.rowcount != 1:
-            raise ShadowTerminalUnavailable("terminal job CAS conflict")
-        window = connection.execute(
-            "UPDATE qualification_window SET window_state=?,last_session_report_id=?,qualification_evidence_sha256=?,qualification_candidate_sha256=?,terminal_attestation_id=?,state_version=state_version+1 WHERE provider_id=? AND window_id=? AND state_version=?",
-            (
-                window_state,
-                identity.session_report_id,
-                attestation.evidence_sha256,
-                attestation.candidate_sha256,
-                attestation.attestation_id,
-                identity.provider_id,
-                identity.window_id,
-                expected_window_state_version,
-            ),
-        )
-        if window.rowcount != 1:
-            raise ShadowTerminalUnavailable("terminal window CAS conflict")
-        return attestation
-
-    return registry._with_transaction(transaction)
-
-
 def _write_terminal_success_graph(
     registry: ShadowRegistry,
     *,
@@ -439,10 +288,14 @@ def _write_terminal_success_graph(
     expected_job_state_version: int,
     expected_window_state_version: int,
     snapshot: ConfirmedSessionSnapshot,
+    bundle_publisher: ShadowBundlePublisher,
     now=None,
 ) -> ShadowTerminalAttestation:
     """Complete one Task13 graph using strict Task11/Task12 readers and one CAS transaction."""
-    if type(snapshot) is not ConfirmedSessionSnapshot:
+    if (
+        type(snapshot) is not ConfirmedSessionSnapshot
+        or type(bundle_publisher) is not ShadowBundlePublisher
+    ):
         raise ShadowTerminalUnavailable("terminal snapshot unavailable")
     for name, expected in (
         ("calendar_generation", calendar_generation),
@@ -498,7 +351,7 @@ def _write_terminal_success_graph(
                 evidence_sha256=evidence_sha,
                 candidate_sha256=candidate_sha,
                 terminal_session_report_id=report_id,
-                durable_report_ref=f"reports/{report_id}",
+                durable_report_ref=f"bundles/{report_id}",
             )
         )
     if not reports:
@@ -587,6 +440,96 @@ def _write_terminal_success_graph(
         evidence_sha256=evidence_sha,
         candidate_sha256=candidate_sha,
     )
+
+    with registry._lock(shared=True):
+        read_connection = registry._connection_for_read()
+        try:
+            current_job = read_connection.execute(
+                "SELECT job_id,provider_id,window_id,run_status,state_version,version_vector_sha256 FROM shadow_job WHERE job_id=? AND provider_id=? AND window_id=?",
+                (identity.job_id, identity.provider_id, identity.window_id),
+            ).fetchone()
+            current_window = read_connection.execute(
+                "SELECT consecutive_sessions,window_state,state_version FROM qualification_window WHERE provider_id=? AND window_id=?",
+                (identity.provider_id, identity.window_id),
+            ).fetchone()
+        finally:
+            if not registry._memory:
+                read_connection.close()
+    if (
+        current_job is None
+        or current_window is None
+        or current_job[4] != expected_job_state_version
+        or current_window[2] != expected_window_state_version
+        or current_job[3] not in {"leased", "pending_normalization"}
+        or current_job[5] != version_vector_sha256
+    ):
+        raise ShadowTerminalUnavailable("terminal expected version conflict")
+    bundle_payload = {
+        "kind": "shadow-terminal-success",
+        "report_version": 2,
+        "identity": {
+            "provider_id": identity.provider_id,
+            "job_id": identity.job_id,
+            "window_id": identity.window_id,
+            "session_id": identity.session_id,
+            "evidence_id": identity.evidence_id,
+            "candidate_id": identity.candidate_id,
+            "session_report_id": identity.session_report_id,
+        },
+        "snapshot": snapshot.model_dump(mode="json"),
+        "job_snapshot": {
+            "job_id": current_job[0],
+            "provider_id": current_job[1],
+            "window_id": current_job[2],
+            "run_status": current_job[3],
+            "state_version": current_job[4],
+            "version_vector_sha256": current_job[5],
+        },
+        "window_snapshot": {
+            "consecutive_sessions": current_window[0],
+            "window_state": current_window[1],
+            "state_version": current_window[2],
+        },
+        "completion_envelope": json.loads(completion_raw.decode("utf-8")),
+        "digests": {
+            "request_plan_sha256": plan_sha,
+            "completion_sha256": completion_sha,
+            "attempt_ordinal_closure_sha256": closure_sha,
+            "report_digest_sha256": report_sha,
+            "evidence_sha256": evidence_sha,
+            "candidate_sha256": candidate_sha,
+        },
+        "attestation": {
+            "attestation_id": attestation.attestation_id,
+            "request_plan_canonical_json": plan_raw.decode("utf-8"),
+            "completion_canonical_json": completion_raw.decode("utf-8"),
+            "attempt_ordinal_closure_canonical_json": closure_raw.decode("utf-8"),
+            "report_digest_canonical_json": report_raw.decode("utf-8"),
+        },
+        "reports": report_value["reports"],
+    }
+    try:
+        bundle_path = bundle_publisher.publish(report_id, bundle_payload)
+        report_fd = os.open(bundle_path / "report.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            bundle_raw = os.read(report_fd, 16 * 1024 * 1024 + 1)
+        finally:
+            os.close(report_fd)
+        marker_fd = os.open(bundle_path / "COMMIT", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            marker = os.read(marker_fd, 128).decode("ascii")
+        finally:
+            os.close(marker_fd)
+        if (
+            len(bundle_raw) > 16 * 1024 * 1024
+            or hashlib.sha256(bundle_raw).hexdigest() + "\n" != marker
+            or json.loads(bundle_raw.decode("utf-8")) != bundle_payload
+        ):
+            raise ShadowTerminalUnavailable("terminal report bundle changed")
+    except ShadowTerminalUnavailable:
+        raise
+    except Exception as exc:
+        raise ShadowTerminalUnavailable("terminal report bundle unavailable") from exc
 
     def transaction(connection):
         job = connection.execute(
@@ -700,7 +643,7 @@ def _write_terminal_success_graph(
                 version_vector_sha256,
                 evidence_sha,
                 candidate_sha,
-                f"reports/{report_id}",
+                f"bundles/{report_id}",
                 report_sha,
                 job[1] + 1,
             ),
@@ -807,6 +750,7 @@ def write_terminal_success(
     expected_job_state_version: int,
     expected_window_state_version: int,
     snapshot: ConfirmedSessionSnapshot,
+    bundle_publisher: ShadowBundlePublisher,
     now=None,
 ) -> ShadowTerminalAttestation:
     """The sole public terminal writer for the complete Task13 graph."""
@@ -823,14 +767,9 @@ def write_terminal_success(
         expected_job_state_version=expected_job_state_version,
         expected_window_state_version=expected_window_state_version,
         snapshot=snapshot,
+        bundle_publisher=bundle_publisher,
         now=now,
     )
-
-
-class ShadowTerminalValidator:
-    """Small object form for workers that inject a registry connection."""
-
-    validate = staticmethod(terminal_graph_validator)
 
 
 class ShadowTerminalWriter:
@@ -841,7 +780,6 @@ class ShadowTerminalWriter:
 
 __all__ = [
     "ShadowTerminalAttestation",
-    "ShadowTerminalValidator",
     "ShadowTerminalWriter",
     "ShadowTerminalUnavailable",
     "TerminalGraphIdentity",
@@ -852,7 +790,6 @@ __all__ = [
     "compute_terminal_digests",
     "report_digest",
     "request_plan_digest",
-    "terminal_graph_validator",
     "validate_terminal_digests",
     "write_terminal_success",
 ]

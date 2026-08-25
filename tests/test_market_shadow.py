@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from backend.app.market.providers.registry import ShadowRegistry
-from backend.app.market.shadow_jobs import ShadowHandoff, ShadowJobStore
+from backend.app.market.shadow_jobs import CanonicalOutcomeScanner, ShadowHandoff, ShadowJobStore
 from backend.app.market.shadow_scheduler import ShadowScheduler
 from tests.test_market_provider_registry import _record, _sha, _terms
 
@@ -34,17 +34,15 @@ def test_shadow_handoff_drops_when_bounded_queue_is_full():
 
 
 def test_scheduler_is_independent_worker_surface():
-    scheduler = ShadowScheduler.__new__(ShadowScheduler)
-    scheduler.canonical_scanner = None
-    scheduler.job_store = None
-    assert scheduler.scan(limit=1) == 0
+    with pytest.raises(TypeError):
+        ShadowScheduler(None)
 
 
 @pytest.mark.parametrize(
     ("worker_result", "expected_status"),
     [
-        ("completed", "pending"),
-        ("success", "pending"),
+        ("completed", "failed"),
+        ("success", "failed"),
         ("failure", "failed"),
         ("unavailable", "unavailable"),
     ],
@@ -77,9 +75,17 @@ def test_scheduler_releases_sqlite_lease_on_every_worker_exit(
         worker=lambda *_args, **_kwargs: {"status": worker_result},
         owner="worker-1",
         deadline_seconds=1,
+        canonical_scanner=CanonicalOutcomeScanner(
+            tmp_path / "canonical",
+            shadow_start_date=datetime(2026, 1, 1).date(),
+            provider_id="tickflow",
+            window_id=window.window_id,
+        ),
     )
     result = scheduler.run_once(now=datetime(2026, 1, 2, tzinfo=UTC))
-    assert result.status == worker_result
+    assert result.status == (
+        worker_result if worker_result in {"failure", "unavailable"} else expected_status
+    )
     assert store.get("job-1").run_status == expected_status
     assert store.get("job-1").lease_owner is None
 
@@ -109,7 +115,17 @@ def test_scheduler_worker_exception_releases_sqlite_lease(tmp_path):
     def crash(*_args, **_kwargs):
         raise RuntimeError("must be sanitized")
 
-    result = ShadowScheduler(store, worker=crash, owner="worker-error").run_once()
+    result = ShadowScheduler(
+        store,
+        worker=crash,
+        owner="worker-error",
+        canonical_scanner=CanonicalOutcomeScanner(
+            tmp_path / "canonical",
+            shadow_start_date=datetime(2026, 1, 1).date(),
+            provider_id="tickflow",
+            window_id=window.window_id,
+        ),
+    ).run_once()
     assert result.status == "failed"
     assert store.get("job-error").run_status == "failed"
     assert store.get("job-error").lease_owner is None

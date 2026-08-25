@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from datetime import date, timedelta
 from pathlib import Path
@@ -59,7 +60,7 @@ class ShadowCalendarConfig(BaseModel):
     year: int
     status: str
     published_on: date
-    sources: tuple[ShadowCalendarSource, ...]
+    sources: tuple[ShadowCalendarSource, ...] = Field(min_length=1)
     closed_dates: tuple[date, ...]
 
 
@@ -82,20 +83,34 @@ class ConfirmedCalendarReader:
         *,
         provider_id: str,
         window_id: str,
-        calendar_generation: str,
         universe_id: str,
         universe_sha256: str,
-        official_metadata: str = "official-calendar-config",
     ) -> None:
         self.calendar_root = Path(calendar_root)
         self.provider_id = provider_id
         self.window_id = window_id
-        self.calendar_generation = calendar_generation
         self.universe_id = universe_id
         self.universe_sha256 = universe_sha256
-        self.official_metadata = official_metadata
-        if not self.calendar_root.is_absolute() or len(universe_sha256) != 64:
+        if not self.calendar_root.is_absolute() or not re.fullmatch(
+            r"[0-9a-f]{64}", universe_sha256
+        ):
             raise ValueError("shadow calendar descriptor is invalid")
+        authority = self._read_file(self.calendar_root / "calendar-manifest.json")
+        try:
+            payload = json.loads(authority.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"generation", "official_metadata"}
+            or not isinstance(payload.get("generation"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", payload["generation"])
+            or not isinstance(payload.get("official_metadata"), str)
+            or not payload["official_metadata"].strip()
+        ):
+            raise ShadowCalendarUnavailable("confirmed calendar unavailable")
+        self.calendar_generation = payload["generation"]
+        self.official_metadata = payload["official_metadata"]
 
     def _read_file(self, path: Path) -> bytes:
         try:

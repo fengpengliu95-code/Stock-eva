@@ -9,6 +9,7 @@ import json
 from datetime import date
 from types import SimpleNamespace
 
+import duckdb
 import pytest
 
 from backend.app.market.providers.registry import ShadowRegistry
@@ -21,7 +22,7 @@ from backend.app.market.shadow_evidence import (
     ShadowLogicalRequestPlan,
 )
 from backend.app.market.shadow_jobs import (
-    PublishedCanonicalManifestScanner,
+    CanonicalOutcomeScanner,
     ShadowBundlePublisher,
     ShadowHandoff,
     ShadowJobUnavailable,
@@ -38,9 +39,79 @@ from backend.app.market.shadow_terminal import (
 from tests.test_market_provider_registry import _record, _sha, _terms
 
 
+def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".stock-eva-dataset.json").write_text(
+        json.dumps({"dataset": "stock-eva-market", "schema_version": 2}), encoding="utf-8"
+    )
+    object_path = root / "bars" / "source=baostock" / "year=2026" / "month=01"
+    object_path.mkdir(parents=True)
+    parquet = object_path / "date=2026-01-02.parquet"
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute(
+            """COPY (
+                SELECT DATE '2026-01-02' AS trade_date, '000001'::VARCHAR AS symbol,
+                       'stock'::VARCHAR AS security_type, 'SSE'::VARCHAR AS exchange,
+                       'main'::VARCHAR AS board, 1.0::DOUBLE AS open, 1.1::DOUBLE AS high,
+                       0.9::DOUBLE AS low, 1.0::DOUBLE AS close, 1.0::DOUBLE AS preclose,
+                       100.0::DOUBLE AS volume, 100.0::DOUBLE AS amount,
+                       0.1::DOUBLE AS turnover_rate, 0.0::DOUBLE AS pct_change,
+                       1.0::DOUBLE AS adjust_factor, 'none'::VARCHAR AS price_adjustment,
+                       true::BOOLEAN AS is_trading, false::BOOLEAN AS is_suspended,
+                       false::BOOLEAN AS is_st, 'baostock'::VARCHAR AS source,
+                       '000001.2026-01-02'::VARCHAR AS source_record_id,
+                       TIMESTAMPTZ '2026-01-02 08:00:00+00' AS ingested_at,
+                       'valid'::VARCHAR AS quality_status, '[]'::JSON AS quality_issues
+            ) TO ? (FORMAT PARQUET)""",
+            [str(parquet)],
+        )
+    finally:
+        connection.close()
+    raw = parquet.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    final_parquet = object_path / f"date=2026-01-02_{digest[:12]}.parquet"
+    parquet.rename(final_parquet)
+    parquet = final_parquet
+    lineage = {
+        "provider_id": "baostock",
+        "universe_id": "u1",
+        "evidence_id": "e1",
+        "evidence_sha256": "a" * 64,
+        "candidate_id": "c1",
+        "candidate_manifest_sha256": "b" * 64,
+        "gate_report_sha256": "c" * 64,
+        "adapter_version": "v1",
+        "source_schema_version": "v1",
+    }
+    item = {
+        "path": str(parquet.relative_to(root)),
+        "sha256": digest_override or digest,
+        "row_count": 1,
+        "trade_date": "2026-01-02",
+        "source": "baostock",
+        **lineage,
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "stock-eva-market",
+                "schema_version": 2,
+                "generation": generation,
+                "files": [item],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _calendar_root(tmp_path):
     root = tmp_path / "calendar"
     root.mkdir(exist_ok=True)
+    (root / "calendar-manifest.json").write_text(
+        json.dumps({"generation": "calendar-v1", "official_metadata": "official-calendar-config"}),
+        encoding="utf-8",
+    )
     (root / "cn_a_share_2026.json").write_text(
         json.dumps(
             {
@@ -63,7 +134,6 @@ def _calendar(tmp_path):
         _calendar_root(tmp_path).resolve(),
         provider_id="tickflow",
         window_id="window-1",
-        calendar_generation="calendar-v1",
         universe_id="universe-1",
         universe_sha256="a" * 64,
     )
@@ -103,7 +173,7 @@ def test_contract_policy_or_terms_change_resets_window(tmp_path):
 
 
 def test_mismatch_quarantines_secondary_not_primary(tmp_path):
-    scanner = PublishedCanonicalManifestScanner(
+    scanner = CanonicalOutcomeScanner(
         tmp_path, shadow_start_date=date(2026, 1, 1), provider_id="baostock", window_id="w1"
     )
     assert scanner.scan() == ()
@@ -159,44 +229,8 @@ def test_unexpected_handoff_exception_is_sanitized_and_never_changes_outcome(tmp
 
 def test_published_but_unenqueued_manifest_is_recovered_by_scanner(tmp_path):
     root = tmp_path / "dataset"
-    root.mkdir()
-    (root / ".stock-eva-dataset.json").write_text(
-        json.dumps({"dataset": "stock-eva-market", "schema_version": 2})
-    )
-    object_bytes = b"flat9 fixture"
-    (root / "bars.parquet").write_bytes(object_bytes)
-    lineage = {
-        "provider_id": "baostock",
-        "universe_id": "u1",
-        "evidence_id": "e1",
-        "evidence_sha256": "a" * 64,
-        "candidate_id": "c1",
-        "candidate_manifest_sha256": "b" * 64,
-        "gate_report_sha256": "c" * 64,
-        "adapter_version": "v1",
-        "source_schema_version": "v1",
-    }
-    import hashlib
-
-    item = {
-        "path": "bars.parquet",
-        "sha256": hashlib.sha256(object_bytes).hexdigest(),
-        "row_count": 1,
-        "trade_date": "2026-01-02",
-        "source": "baostock",
-        **lineage,
-    }
-    (root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset": "stock-eva-market",
-                "schema_version": 2,
-                "generation": "g1",
-                "files": [item],
-            }
-        )
-    )
-    found = PublishedCanonicalManifestScanner(
+    _write_canonical_dataset(root)
+    found = CanonicalOutcomeScanner(
         root, shadow_start_date=date(2026, 1, 1), provider_id="tickflow", window_id="w1"
     ).scan()
     assert len(found) == 1 and found[0]["provider_id"] == "tickflow"
@@ -290,7 +324,7 @@ def test_session_hash_mismatch_rejects_terminal_attestation(tmp_path):
 
 
 def test_terminal_validator_runs_before_both_cas_and_zero_writes_on_failure(tmp_path):
-    scanner = PublishedCanonicalManifestScanner(
+    scanner = CanonicalOutcomeScanner(
         tmp_path / "missing",
         shadow_start_date=date(2026, 1, 1),
         provider_id="tickflow",
@@ -395,35 +429,6 @@ def test_public_terminal_success_requires_strict_cross_task_inputs(tmp_path):
     assert {"plan", "evidence_reader", "candidate_reader", "snapshot"} <= set(parameters)
 
 
-def test_old_json_recovery_surface_does_not_attach_arbitrary_payload(tmp_path):
-    from backend.app.market.shadow_jobs import ShadowJobStore
-
-    root = tmp_path / "shadow"
-    root.mkdir()
-    bundle = root / "bundles" / "arbitrary"
-    bundle.mkdir(parents=True)
-    raw = b'{"job_id":"not-a-manifest"}\n'
-    (bundle / "payload.json").write_bytes(raw)
-    (bundle / "COMMIT").write_text(hashlib.sha256(raw).hexdigest() + "\n")
-    store = ShadowJobStore.__new__(ShadowJobStore)
-    store.shadow_root = root
-    with pytest.raises(AttributeError):
-        _ = store.scan_recovery
-    assert (
-        PublishedCanonicalManifestScanner(
-            root, shadow_start_date=date(2026, 1, 1), provider_id="tickflow", window_id="w1"
-        ).scan()
-        == ()
-    )
-
-
-def test_job_store_has_one_bundle_publisher_surface(tmp_path):
-    from backend.app.market.shadow_jobs import ShadowJobStore
-
-    with pytest.raises(AttributeError):
-        _ = ShadowJobStore.publish_bundle
-
-
 def test_duplicate_involved_year_calendar_config_is_unavailable(tmp_path):
     root = _calendar_root(tmp_path)
     duplicate = root / "cn_a_share_duplicate.json"
@@ -432,43 +437,27 @@ def test_duplicate_involved_year_calendar_config_is_unavailable(tmp_path):
         _calendar(tmp_path).read(date(2026, 1, 1), date(2026, 1, 5))
 
 
+def test_scanner_ignores_arbitrary_shadow_bundle_json(tmp_path):
+    root = tmp_path / "dataset"
+    bundle = root / "bundles" / "arbitrary"
+    bundle.mkdir(parents=True)
+    (bundle / "report.json").write_text(json.dumps({"job_id": "not-a-manifest"}))
+    assert (
+        CanonicalOutcomeScanner(
+            root,
+            shadow_start_date=date(2026, 1, 1),
+            provider_id="tickflow",
+            window_id="w1",
+        ).scan()
+        == ()
+    )
+
+
 def test_scanner_rejects_uppercase_manifest_hash(tmp_path):
     root = tmp_path / "dataset"
-    root.mkdir()
-    (root / ".stock-eva-dataset.json").write_text(
-        json.dumps({"dataset": "stock-eva-market", "schema_version": 2})
-    )
-    content = b"flat9"
-    (root / "bars.parquet").write_bytes(content)
-    digest = hashlib.sha256(content).hexdigest().upper()
-    item = {
-        "path": "bars.parquet",
-        "sha256": digest,
-        "row_count": 1,
-        "trade_date": "2026-01-02",
-        "source": "baostock",
-        "provider_id": "baostock",
-        "universe_id": "u1",
-        "evidence_id": "e1",
-        "evidence_sha256": "a" * 64,
-        "candidate_id": "c1",
-        "candidate_manifest_sha256": "b" * 64,
-        "gate_report_sha256": "c" * 64,
-        "adapter_version": "v1",
-        "source_schema_version": "v1",
-    }
-    (root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset": "stock-eva-market",
-                "schema_version": 2,
-                "generation": "g1",
-                "files": [item],
-            }
-        )
-    )
+    _write_canonical_dataset(root, digest_override="A" * 64)
     assert (
-        PublishedCanonicalManifestScanner(
+        CanonicalOutcomeScanner(
             root, shadow_start_date=date(2026, 1, 1), provider_id="tickflow", window_id="w1"
         ).scan()
         == ()
@@ -701,6 +690,7 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         expected_job_state_version=0,
         expected_window_state_version=0,
         snapshot=snapshot,
+        bundle_publisher=ShadowBundlePublisher(tmp_path / "shadow"),
     )
     assert attestation.session_report_version == 2
     assert connection.execute(
