@@ -119,6 +119,14 @@ class PublishedCanonicalManifestScanner:
         if self.provider_id not in {"tickflow", "tushare"}:
             return ()
         try:
+            current = Path(self.root.anchor)
+            for part in self.root.parts[1:]:
+                current /= part
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    return ()
+        except OSError:
+            return ()
+        try:
             sentinel_raw, _ = self._read(self.root / ".stock-eva-dataset.json")
             manifest_path = self.root / "manifest.json"
             manifest_raw, before = self._read(manifest_path)
@@ -157,7 +165,7 @@ class PublishedCanonicalManifestScanner:
             return ()
         results: list[dict[str, Any]] = []
         for item in files:
-            if not isinstance(item, dict) or item.get("source", "baostock") != "baostock":
+            if not isinstance(item, dict) or item.get("source") != "baostock":
                 return ()
             required = {"path", "sha256", "row_count", "trade_date", "source"}
             if not required <= set(item):
@@ -172,10 +180,25 @@ class PublishedCanonicalManifestScanner:
                 or not isinstance(item["path"], str)
                 or not isinstance(item["sha256"], str)
                 or len(item["sha256"]) != 64
+                or item["sha256"] != item["sha256"].lower()
+                or any(char not in "0123456789abcdef" for char in item["sha256"])
+                or not isinstance(item["row_count"], int)
+                or item["row_count"] < 0
+                or Path(item["path"]).suffix.lower() != ".parquet"
+                or not isinstance(item.get("source_schema_version"), str)
+                or not item["source_schema_version"]
             ):
                 return ()
             relative = Path(item["path"])
             if relative.is_absolute() or ".." in relative.parts:
+                return ()
+            try:
+                parent = self.root
+                for part in relative.parts[:-1]:
+                    parent /= part
+                    if stat.S_ISLNK(os.lstat(parent).st_mode):
+                        return ()
+            except OSError:
                 return ()
             try:
                 object_raw, _ = self._read(self.root / relative)
@@ -219,6 +242,13 @@ class PublishedCanonicalManifestScanner:
                 }
             )
         return tuple(results)
+
+    def enqueue(self, job_store, *, limit: int = 64) -> int:
+        """Scan the canonical descriptor, then enqueue only validated identities."""
+        if type(job_store) is not ShadowJobStore:
+            raise TypeError("canonical scanner requires ShadowJobStore")
+        descriptors = self.scan()[: max(0, limit)]
+        return job_store._enqueue_canonical_descriptors(descriptors)
 
 
 class ShadowBundlePublisher:
@@ -611,8 +641,22 @@ class ShadowJobStore:
             },
         )
         try:
-            bundle_raw = (bundle_path / "report.json").read_bytes()
-            marker = (bundle_path / "COMMIT").read_text()
+            report_fd = os.open(
+                bundle_path / "report.json",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+            )
+            try:
+                bundle_raw = os.read(report_fd, 1_048_577)
+            finally:
+                os.close(report_fd)
+            marker_fd = os.open(
+                bundle_path / "COMMIT",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+            )
+            try:
+                marker = os.read(marker_fd, 128).decode()
+            finally:
+                os.close(marker_fd)
             if hashlib.sha256(bundle_raw).hexdigest() + "\n" != marker:
                 raise ShadowJobUnavailable("shadow report bundle hash mismatch")
         except OSError as exc:
@@ -720,58 +764,7 @@ class ShadowJobStore:
 
     persist_failure = persist_outcome
 
-    def publish_bundle(self, identity: str, payload: dict[str, Any]) -> Path:
-        """Publish one content-addressed bundle before any registry CAS."""
-        if self.shadow_root is None or not self.shadow_root.is_absolute():
-            raise ShadowJobUnavailable("shadow root unavailable")
-        identity = _safe(identity)
-        bundles = self.shadow_root / "bundles"
-        staging = self.shadow_root / "staging" / f"{identity}-{secrets.token_hex(8)}"
-        bundles.mkdir(parents=True, exist_ok=True)
-        staging.mkdir(parents=True, exist_ok=False)
-        raw = (
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
-        (staging / "payload.json").write_bytes(raw)
-        (staging / "COMMIT").write_text(hashlib.sha256(raw).hexdigest() + "\n")
-        for path in (staging / "payload.json", staging / "COMMIT"):
-            with path.open("rb") as stream:
-                os.fsync(stream.fileno())
-        destination = bundles / identity
-        if destination.exists():
-            if (destination / "COMMIT").read_text() != (staging / "COMMIT").read_text():
-                raise ShadowJobUnavailable("shadow bundle identity conflict")
-            return destination
-        os.rename(staging, destination)
-        return destination
-
-    def scan_recovery(
-        self, *, limit: int = 64, attach: Callable[[dict[str, Any]], Any] | None = None
-    ) -> int:
-        if self.shadow_root is None:
-            return 0
-        bundles = self.shadow_root / "bundles"
-        if not bundles.is_dir():
-            return 0
-        count = 0
-        for directory in sorted(bundles.iterdir())[: max(0, limit)]:
-            payload = directory / "payload.json"
-            marker = directory / "COMMIT"
-            if not directory.is_dir() or not payload.is_file() or not marker.is_file():
-                continue
-            try:
-                raw = payload.read_bytes()
-                if hashlib.sha256(raw).hexdigest() + "\n" != marker.read_text():
-                    continue
-                item = json.loads(raw)
-                if attach is not None:
-                    attach(item)
-                count += 1
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                continue
-        return count
-
-    def recover_published_manifests(
+    def _enqueue_canonical_descriptors(
         self,
         manifests,
         *,

@@ -37,6 +37,7 @@ class ShadowScheduler:
         deadline_seconds: float = 30.0,
         cancellation: Callable[[], bool] | None = None,
         handoff=None,
+        canonical_scanner=None,
     ) -> None:
         self.job_store = job_store
         self.worker = worker
@@ -46,6 +47,7 @@ class ShadowScheduler:
         self.deadline_seconds = max(0.01, deadline_seconds)
         self.cancellation = cancellation or (lambda: False)
         self.handoff = handoff
+        self.canonical_scanner = canonical_scanner
 
     def run_once(self, *, now: datetime | None = None) -> ShadowSchedulerOutcome:
         started = time.monotonic()
@@ -99,13 +101,13 @@ class ShadowScheduler:
             )
             if time.monotonic() - started > self.deadline_seconds:
                 status = "budget_exhausted"
-            if status in {"failed", "unavailable", "budget_exhausted"}:
+            if status in {"failed", "failure", "unavailable", "budget_exhausted"}:
                 self.job_store.release_after_worker(
                     leased, status="unavailable" if status == "unavailable" else "failed"
                 )
             elif status not in {"completed", "success"}:
                 self.job_store.release_after_worker(leased, status="pending")
-            elif status == "success":
+            elif status in {"completed", "success"}:
                 # A legal terminal writer may already have CASed completed; this is a
                 # harmless expected-version no-op otherwise returning the job to scanner.
                 self.job_store.release_after_worker(leased, status="pending")
@@ -137,7 +139,9 @@ class ShadowScheduler:
                     connection.close()
 
     def scan(self, *, limit: int = 64) -> int:
-        return self.job_store.scan_recovery(limit=limit)
+        if self.canonical_scanner is None:
+            return 0
+        return self.canonical_scanner.enqueue(self.job_store, limit=limit)
 
 
 __all__ = ["ShadowScheduler", "ShadowSchedulerOutcome"]

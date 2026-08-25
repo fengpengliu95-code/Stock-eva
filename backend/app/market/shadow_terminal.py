@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .providers.registry import ShadowRegistry
+from .shadow_calendar import ConfirmedSessionSnapshot
 from .shadow_candidates import ShadowCandidateReader
 from .shadow_evidence import ShadowAttemptReport, ShadowEvidenceReader, ShadowLogicalRequestPlan
 
@@ -342,7 +343,7 @@ def terminal_graph_validator(
         raise ShadowTerminalUnavailable("terminal ordinal closure unavailable")
 
 
-def write_terminal_success(
+def _write_terminal_attestation(
     registry: ShadowRegistry,
     *,
     identity: TerminalGraphIdentity,
@@ -424,7 +425,7 @@ def write_terminal_success(
     return registry._with_transaction(transaction)
 
 
-def write_terminal_success_graph(
+def _write_terminal_success_graph(
     registry: ShadowRegistry,
     *,
     plan: ShadowLogicalRequestPlan,
@@ -437,18 +438,19 @@ def write_terminal_success_graph(
     version_vector_sha256: str,
     expected_job_state_version: int,
     expected_window_state_version: int,
-    snapshot=None,
+    snapshot: ConfirmedSessionSnapshot,
     now=None,
 ) -> ShadowTerminalAttestation:
     """Complete one Task13 graph using strict Task11/Task12 readers and one CAS transaction."""
-    if snapshot is not None:
-        for name, expected in (
-            ("calendar_generation", calendar_generation),
-            ("calendar_sha256", calendar_sha256),
-            ("universe_sha256", universe_sha256),
-        ):
-            if getattr(snapshot, name, None) != expected:
-                raise ShadowTerminalUnavailable("terminal snapshot drift")
+    if type(snapshot) is not ConfirmedSessionSnapshot:
+        raise ShadowTerminalUnavailable("terminal snapshot unavailable")
+    for name, expected in (
+        ("calendar_generation", calendar_generation),
+        ("calendar_sha256", calendar_sha256),
+        ("universe_sha256", universe_sha256),
+    ):
+        if getattr(snapshot, name, None) != expected:
+            raise ShadowTerminalUnavailable("terminal snapshot drift")
     evidence, candidate_bundle, completion_items = _strict_bundle_validation(
         plan=plan,
         evidence_reader=evidence_reader,
@@ -791,6 +793,40 @@ def write_terminal_success_graph(
     return registry._with_transaction(transaction)
 
 
+def write_terminal_success(
+    registry: ShadowRegistry,
+    *,
+    plan: ShadowLogicalRequestPlan,
+    evidence_reader: ShadowEvidenceReader,
+    candidate_reader: ShadowCandidateReader,
+    identity: TerminalGraphIdentity,
+    calendar_generation: str,
+    calendar_sha256: str,
+    universe_sha256: str,
+    version_vector_sha256: str,
+    expected_job_state_version: int,
+    expected_window_state_version: int,
+    snapshot: ConfirmedSessionSnapshot,
+    now=None,
+) -> ShadowTerminalAttestation:
+    """The sole public terminal writer for the complete Task13 graph."""
+    return _write_terminal_success_graph(
+        registry,
+        plan=plan,
+        evidence_reader=evidence_reader,
+        candidate_reader=candidate_reader,
+        identity=identity,
+        calendar_generation=calendar_generation,
+        calendar_sha256=calendar_sha256,
+        universe_sha256=universe_sha256,
+        version_vector_sha256=version_vector_sha256,
+        expected_job_state_version=expected_job_state_version,
+        expected_window_state_version=expected_window_state_version,
+        snapshot=snapshot,
+        now=now,
+    )
+
+
 class ShadowTerminalValidator:
     """Small object form for workers that inject a registry connection."""
 
@@ -819,5 +855,4 @@ __all__ = [
     "terminal_graph_validator",
     "validate_terminal_digests",
     "write_terminal_success",
-    "write_terminal_success_graph",
 ]

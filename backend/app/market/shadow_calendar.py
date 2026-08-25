@@ -131,6 +131,8 @@ class ConfirmedCalendarReader:
             # objects as the canonical reader.
             if isinstance(payload, dict) and "configs" in payload:
                 envelope = payload
+                if envelope.get("generation") != self.calendar_generation:
+                    raise ShadowCalendarUnavailable("confirmed calendar unavailable")
                 values = envelope["configs"]
                 if not isinstance(values, list):
                     raise ShadowCalendarUnavailable("confirmed calendar unavailable")
@@ -144,7 +146,7 @@ class ConfirmedCalendarReader:
                 if validated.status != "confirmed":
                     raise ShadowCalendarUnavailable("confirmed calendar unavailable")
                 found.append(validated.model_dump(mode="json"))
-        if {int(item["year"]) for item in found} != years:
+        if len(found) != len(years) or {int(item["year"]) for item in found} != years:
             raise ShadowCalendarUnavailable("confirmed calendar unavailable")
         return tuple(sorted(found, key=lambda item: int(item["year"])))
 
