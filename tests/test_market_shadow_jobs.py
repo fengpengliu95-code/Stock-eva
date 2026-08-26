@@ -508,7 +508,7 @@ def test_publisher_verifies_held_destination_before_success(tmp_path, monkeypatc
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 4:
+        if fsync_calls == 8:
             os.rename(destination, hidden)
             os.symlink(hidden.name, destination)
 
@@ -534,7 +534,7 @@ def test_publisher_verifies_each_held_bundle_file_before_success(
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 5:
+        if fsync_calls == 8:
             if mutation == "symlink":
                 os.rename(target_path, hidden_path)
                 os.symlink(hidden_path.name, target_path)
@@ -565,7 +565,7 @@ def test_publisher_rejects_permission_change_before_final_verify(tmp_path, monke
         nonlocal fsync_calls
         original_fsync(fd)
         fsync_calls += 1
-        if fsync_calls == 5:
+        if fsync_calls == 8:
             os.chmod(target_path, 0o640)
 
     monkeypatch.setattr(os, "fsync", chmod_after_commit)
@@ -602,14 +602,13 @@ def _owner_bytes(identity, payload):
 def test_publisher_recovers_owner_and_report_crash_gaps(tmp_path, phase):
     identity = "recover-" + phase
     payload = {"value": phase}
-    raw, owner_raw = _owner_bytes(identity, payload)
-    directory = tmp_path / "shadow" / "bundles" / identity
-    directory.mkdir(parents=True)
-    (directory / "OWNER").write_bytes(owner_raw)
-    (directory / "OWNER").chmod(0o600)
-    if phase == "report":
-        (directory / "report.json").write_bytes(raw)
-        (directory / "report.json").chmod(0o600)
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    directory = publisher.publish(identity, payload)
+    raw = (directory / "report.json").read_bytes()
+    owner_raw = (directory / "OWNER").read_bytes()
+    (directory / "COMMIT").unlink()
+    if phase == "owner":
+        (directory / "report.json").unlink()
     result = ShadowBundlePublisher(tmp_path / "shadow").publish(identity, payload)
     assert result == directory
     assert (directory / "OWNER").read_bytes() == owner_raw
@@ -655,6 +654,15 @@ def test_publisher_rejects_empty_replacement_of_owned_directory(tmp_path):
         ShadowBundlePublisher(root).publish("owned-replacement", {"value": 1})
     assert destination.is_dir() and not tuple(destination.iterdir())
     assert (hidden / "COMMIT").is_file()
+
+
+def test_publisher_rejects_existing_bundle_when_reservation_is_deleted(tmp_path):
+    root = tmp_path / "shadow"
+    destination = ShadowBundlePublisher(root).publish("reservation-deleted", {"value": 1})
+    (root / "owners" / "reservation-deleted").unlink()
+    with pytest.raises(ShadowJobUnavailable):
+        ShadowBundlePublisher(root).publish("reservation-deleted", {"value": 1})
+    assert (destination / "COMMIT").is_file()
 
 
 def test_publisher_preserves_foreign_incomplete_bundle(tmp_path):
@@ -1184,7 +1192,16 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         candidate_id,
         "terminal-report-1",
     )
-    writer = ShadowTerminalWriter(ShadowBundlePublisher(tmp_path / "shadow"))
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    published = []
+    original_publish = publisher.publish
+
+    def record_publish(identity, payload):
+        published.append((identity, payload["kind"], payload["outcome"]))
+        return original_publish(identity, payload)
+
+    publisher.publish = record_publish
+    writer = ShadowTerminalWriter(publisher)
     evil_manifest_values = dict(manifest.__dict__)
     evil_manifest_values["candidate_id"] = "evil-candidate"
     evil_manifest = SimpleNamespace(**evil_manifest_values)
@@ -1213,6 +1230,32 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "SELECT run_status,state_version FROM shadow_job WHERE job_id=?", (job_id,)
     ).fetchone() == ("pending_normalization", 0)
     candidate_reader.read = lambda _candidate_id: candidate_bundle
+    original_transaction = registry._with_transaction
+
+    def fail_transaction(_callback):
+        raise RuntimeError("injected CAS failure")
+
+    registry._with_transaction = fail_transaction
+    with pytest.raises(ShadowTerminalUnavailable):
+        writer.write_success(
+            registry,
+            plan=plan,
+            evidence_reader=evidence_reader,
+            candidate_reader=candidate_reader,
+            identity=identity,
+            calendar_generation=snapshot.calendar_generation,
+            calendar_sha256=snapshot.calendar_sha256,
+            universe_sha256=snapshot.universe_sha256,
+            version_vector_sha256=_sha("v"),
+            expected_job_state_version=0,
+            expected_window_state_version=0,
+            snapshot=snapshot,
+        )
+    assert published[-2:] == [
+        ("terminal-report-1-pending", "shadow-terminal-pending", "pending"),
+        ("terminal-report-1-failure", "shadow-terminal-failure", "failure"),
+    ]
+    registry._with_transaction = original_transaction
     attestation = writer.write_success(
         registry,
         plan=plan,
@@ -1238,3 +1281,7 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         "SELECT outcome FROM session_report WHERE session_report_id=?",
         (identity.session_report_id,),
     ).fetchone() == ("success",)
+    assert published[-2:] == [
+        ("terminal-report-1-pending", "shadow-terminal-pending", "pending"),
+        ("terminal-report-1", "shadow-terminal-success", "success"),
+    ]

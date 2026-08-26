@@ -356,8 +356,16 @@ def _write_terminal_success_graph(
     candidate_sha = candidate_bundle.manifest.manifest_sha256
     from datetime import UTC, datetime
 
-    started = (now or datetime.now(UTC)).isoformat()
+    if not plan.requests:
+        raise ShadowTerminalUnavailable("terminal report closure unavailable")
+    # A retry must address the same immutable pending identity.  When the
+    # caller does not provide a run timestamp, anchor it to the requested
+    # session date instead of introducing a fresh wall-clock payload.
+    started = (
+        now or datetime.combine(plan.requests[0].trade_date, datetime.min.time(), tzinfo=UTC)
+    ).isoformat()
     report_id = identity.session_report_id
+    pending_bundle_id = f"{report_id}-pending"
     reports = []
     for item in sorted(completion_items, key=lambda value: value["ordinal"]):
         request = plan.requests[item["ordinal"]]
@@ -389,7 +397,7 @@ def _write_terminal_success_graph(
                 evidence_sha256=evidence_sha,
                 candidate_sha256=candidate_sha,
                 terminal_session_report_id=report_id,
-                durable_report_ref=f"bundles/{report_id}",
+                durable_report_ref=f"bundles/{pending_bundle_id}",
             )
         )
     if not reports:
@@ -564,7 +572,10 @@ def _write_terminal_success_graph(
         registry._with_transaction(reset_continuity)
         raise ShadowTerminalUnavailable("terminal confirmed session continuity unavailable")
     bundle_payload = {
-        "kind": "shadow-terminal-success",
+        # The DB CAS is the success decision.  Until that commit is durable,
+        # this immutable bundle is deliberately non-success and quarantinable.
+        "kind": "shadow-terminal-pending",
+        "outcome": "pending",
         "report_version": 2,
         "identity": {
             "provider_id": identity.provider_id,
@@ -612,7 +623,7 @@ def _write_terminal_success_graph(
         "reports": report_value["reports"],
     }
     try:
-        bundle_path = bundle_publisher.publish(report_id, bundle_payload)
+        bundle_path = bundle_publisher.publish(pending_bundle_id, bundle_payload)
         report_fd = os.open(bundle_path / "report.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             bundle_raw = os.read(report_fd, 16 * 1024 * 1024 + 1)
@@ -838,7 +849,41 @@ def _write_terminal_success_graph(
             raise ShadowTerminalUnavailable("terminal window CAS conflict")
         return attestation
 
-    return registry._with_transaction(transaction)
+    try:
+        attested = registry._with_transaction(transaction)
+    except Exception as exc:
+        # A pending graph is retained for quarantine/audit.  A terminal
+        # failure report is best-effort; if its publisher is unavailable the
+        # original transaction failure remains the authoritative result.
+        try:
+            bundle_publisher.publish(
+                f"{report_id}-failure",
+                {
+                    "kind": "shadow-terminal-failure",
+                    "outcome": "failure",
+                    "report_version": 2,
+                    "reason_code": "terminal_commit_failed",
+                    "identity": bundle_payload["identity"],
+                },
+            )
+        except Exception:
+            pass
+        if isinstance(exc, ShadowTerminalUnavailable):
+            raise
+        raise ShadowTerminalUnavailable("terminal transaction unavailable") from exc
+
+    success_payload = dict(bundle_payload)
+    success_payload["kind"] = "shadow-terminal-success"
+    success_payload["outcome"] = "success"
+    success_payload["pending_bundle_id"] = pending_bundle_id
+    success_payload["attestation_ref"] = attested.attestation_id
+    try:
+        bundle_publisher.publish(report_id, success_payload)
+    except Exception as exc:
+        # The committed DB graph is recoverable from its pending bundle.  Do
+        # not manufacture a second success result when the marker is absent.
+        raise ShadowTerminalUnavailable("terminal success marker unavailable") from exc
+    return attested
 
 
 def _write_terminal_success(
@@ -889,6 +934,65 @@ class ShadowTerminalWriter:
         context = dict(context)
         context.setdefault("bundle_publisher", self.bundle_publisher)
         return _write_terminal_success(registry, **context)
+
+    def recover_success(self, registry: ShadowRegistry, *, report_id: str):
+        """Materialize a success marker after a committed DB transaction.
+
+        Recovery is descriptor-bound to the pending bundle and only permitted
+        when the immutable session row already says success.  A pending bundle
+        is never treated as a successful outcome by itself.
+        """
+        if type(registry) is not ShadowRegistry or not isinstance(report_id, str) or not report_id:
+            raise ShadowTerminalUnavailable("terminal recovery unavailable")
+        pending_id = f"{report_id}-pending"
+        try:
+            directory_fd = os.open(
+                self.bundle_publisher.root / "bundles" / pending_id,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            try:
+                report_fd = os.open(
+                    "report.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd
+                )
+                try:
+                    raw = os.read(report_fd, 16 * 1024 * 1024 + 1)
+                finally:
+                    os.close(report_fd)
+            finally:
+                os.close(directory_fd)
+            pending = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(pending, dict)
+                or pending.get("kind") != "shadow-terminal-pending"
+                or pending.get("outcome") != "pending"
+                or pending.get("identity", {}).get("session_report_id") != report_id
+            ):
+                raise ShadowTerminalUnavailable("terminal pending bundle unavailable")
+        except ShadowTerminalUnavailable:
+            raise
+        except Exception as exc:
+            raise ShadowTerminalUnavailable("terminal pending bundle unavailable") from exc
+        with registry._lock(shared=True):
+            connection = registry._connection_for_read()
+            try:
+                committed = connection.execute(
+                    "SELECT terminal_attestation_id FROM session_report WHERE session_report_id=? AND outcome='success'",
+                    (report_id,),
+                ).fetchone()
+            finally:
+                if not registry._memory:
+                    connection.close()
+        if committed is None or not committed[0]:
+            raise ShadowTerminalUnavailable("terminal success is not committed")
+        success = dict(pending)
+        success["kind"] = "shadow-terminal-success"
+        success["outcome"] = "success"
+        success["pending_bundle_id"] = pending_id
+        success["attestation_ref"] = committed[0]
+        try:
+            return self.bundle_publisher.publish(report_id, success)
+        except Exception as exc:
+            raise ShadowTerminalUnavailable("terminal success marker unavailable") from exc
 
 
 __all__ = [

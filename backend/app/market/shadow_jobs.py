@@ -453,22 +453,22 @@ class ShadowBundlePublisher:
 
     @staticmethod
     def _write_ownership_token(directory_fd: int, name: str, payload: bytes) -> None:
-        fd = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=directory_fd,
-        )
+        stage = f".{name}.{secrets.token_hex(12)}.stage"
+        ShadowBundlePublisher._write_new_file(directory_fd, stage, payload)
         try:
-            offset = 0
-            while offset < len(payload):
-                written = os.write(fd, payload[offset:])
-                if written <= 0:
-                    raise OSError("shadow ownership short write")
-                offset += written
-            os.fsync(fd)
+            os.link(
+                stage,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            os.fsync(directory_fd)
         finally:
-            os.close(fd)
+            try:
+                os.unlink(stage, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def _read_existing_file(
@@ -577,25 +577,66 @@ class ShadowBundlePublisher:
     ) -> bytes:
         owner = json.loads(owner_raw.decode("utf-8"))
         directory = cls._fingerprint(os.fstat(destination_fd))[:2]
-        bound = cls._owner_payload(
-            identity, owner["payload_sha256"], owner["publisher_id"], directory
+        bound = (
+            json.dumps(
+                {
+                    "bundle_id": identity,
+                    "directory": {"dev": directory[0], "ino": directory[1]},
+                    "payload_sha256": owner["payload_sha256"],
+                    "publisher_id": owner["publisher_id"],
+                    "schema_version": _OWNER_SCHEMA_VERSION,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
         )
-        fd = os.open(
-            identity,
-            os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=owners_fd,
-        )
+        binding_name = f"{identity}.binding"
         try:
-            offset = 0
-            while offset < len(bound):
-                written = os.write(fd, bound[offset:])
-                if written <= 0:
-                    raise OSError("shadow ownership short write")
-                offset += written
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            existing = cls._read_existing_file(owners_fd, binding_name, limit=4096)
+            if existing != bound:
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+            return bound
+        except FileNotFoundError:
+            cls._write_ownership_token(owners_fd, binding_name, bound)
         return bound
+
+    @classmethod
+    def _read_owner_binding(
+        cls, owners_fd: int, identity: str, payload_sha256: str, publisher_id: str
+    ) -> tuple[int, int] | None:
+        try:
+            raw = cls._read_existing_file(owners_fd, f"{identity}.binding", limit=4096)
+            value = json.loads(raw.decode("utf-8"))
+            directory = value.get("directory") if isinstance(value, dict) else None
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {"bundle_id", "directory", "payload_sha256", "publisher_id", "schema_version"}
+                or value.get("schema_version") != _OWNER_SCHEMA_VERSION
+                or value.get("bundle_id") != identity
+                or value.get("payload_sha256") != payload_sha256
+                or value.get("publisher_id") != publisher_id
+                or not isinstance(directory, dict)
+                or set(directory) != {"dev", "ino"}
+                or not all(
+                    isinstance(directory[key], int) and directory[key] > 0 for key in directory
+                )
+                or raw
+                != (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode()
+            ):
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+            return directory["dev"], directory["ino"]
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ShadowJobUnavailable("shadow bundle ownership unavailable") from exc
+        except (UnicodeError, json.JSONDecodeError, AttributeError) as exc:
+            raise ShadowJobUnavailable("shadow bundle ownership unavailable") from exc
 
     @classmethod
     def _verify_destination(
@@ -735,6 +776,22 @@ class ShadowBundlePublisher:
                 owner_token = self._read_existing_file(owners_fd, identity, limit=4096)
                 self._validate_owner(owner_token, identity, payload_sha256)
             except FileNotFoundError:
+                # The reservation is the proof that an already-created
+                # destination belongs to this publisher identity.  Never
+                # adopt an existing directory after that proof is removed.
+                try:
+                    existing_destination = os.open(
+                        identity,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=bundles_fd,
+                    )
+                except FileNotFoundError:
+                    existing_destination = -1
+                except OSError as exc:
+                    raise ShadowJobUnavailable("shadow bundle ownership unavailable") from exc
+                if existing_destination >= 0:
+                    os.close(existing_destination)
+                    raise ShadowJobUnavailable("shadow bundle ownership unavailable") from None
                 owner_token = owner_raw
                 try:
                     self._write_ownership_token(owners_fd, identity, owner_token)
@@ -767,10 +824,21 @@ class ShadowBundlePublisher:
                 raise ShadowJobUnavailable("shadow bundle identity conflict") from exc
             expected_fingerprint = self._fingerprint(os.fstat(destination_fd))
             owner_directory = self._owner_directory(owner_token)
+            owner_value = json.loads(owner_token.decode("utf-8"))
+            binding_directory = self._read_owner_binding(
+                owners_fd, identity, payload_sha256, owner_value["publisher_id"]
+            )
+            if (
+                owner_directory is not None
+                and binding_directory is not None
+                and owner_directory != binding_directory
+            ):
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+            owner_directory = binding_directory or owner_directory
             if owner_directory is not None and owner_directory != expected_fingerprint[:2]:
                 raise ShadowJobUnavailable("shadow bundle ownership unavailable")
             if created:
-                owner_token = self._bind_owner(owners_fd, identity, owner_token, destination_fd)
+                self._bind_owner(owners_fd, identity, owner_token, destination_fd)
             if not created:
                 try:
                     entries = set(os.listdir(destination_fd))
@@ -792,20 +860,11 @@ class ShadowBundlePublisher:
                         else self._read_existing_file(destination_fd, "OWNER")
                     )
                     self._validate_owner(existing_owner, identity, payload_sha256)
-                    owner_value = json.loads(owner_token.decode("utf-8"))
                     existing_value = json.loads(existing_owner.decode("utf-8"))
-                    if (
-                        owner_directory is not None
-                        and owner_value["publisher_id"] != existing_value["publisher_id"]
-                    ):
+                    if owner_value["publisher_id"] != existing_value["publisher_id"]:
                         raise ShadowJobUnavailable("shadow bundle ownership unavailable")
-                    if (
-                        owner_directory is None
-                        or owner_value["publisher_id"] != existing_value["publisher_id"]
-                    ):
-                        owner_token = self._bind_owner(
-                            owners_fd, identity, existing_owner, destination_fd
-                        )
+                    if owner_directory is None:
+                        self._bind_owner(owners_fd, identity, owner_token, destination_fd)
                     if "report.json" in entries:
                         existing_raw = self._read_existing_file(destination_fd, "report.json")
                         if existing_raw != raw:
