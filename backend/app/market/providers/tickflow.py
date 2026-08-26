@@ -29,6 +29,7 @@ TICKFLOW_TERMS_URL = "https://tickflow.org/legal/terms-of-service.md"
 _SAFE_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
 _MAIN_BOARD = ("sh.600", "sh.601", "sh.603", "sh.605", "sz.000", "sz.001", "sz.002", "sz.003")
 _PROVIDER_SYMBOL = re.compile(r"^\d{6}\.(?:SH|SZ)$")
+_INT64_MAX = 2**63 - 1
 
 
 def tickflow_to_canonical_symbol(value: str) -> str:
@@ -233,16 +234,15 @@ def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], .
                     or row[field] <= 0
                 ):
                     raise TickFlowDiscoveryError("numeric_value_invalid")
-            for field in ("volume", "amount"):
-                if (
-                    type(row[field]) not in (int, float)
-                    or not isfinite(float(row[field]))
-                    or row[field] < 0
-                ):
-                    raise TickFlowDiscoveryError("numeric_value_invalid")
+            volume = row["volume"]
+            if type(volume) is not int or not 0 <= volume <= _INT64_MAX:
+                raise TickFlowDiscoveryError("numeric_value_invalid")
+            amount = row["amount"]
+            if type(amount) not in (int, float) or not isfinite(float(amount)) or amount < 0:
+                raise TickFlowDiscoveryError("numeric_value_invalid")
             for field in _KLINE_OPTIONAL_COLUMNS & set(compact):
                 optional = compact[field][index]
-                if optional is not None and (
+                if (
                     type(optional) not in (int, float)
                     or not isfinite(float(optional))
                     or optional < 0
@@ -255,14 +255,14 @@ def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], .
 
 
 def _official_factor_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], ...]:
-    if not isinstance(data, dict) or not data:
+    if not isinstance(data, dict):
         raise TickFlowDiscoveryError("empty_endpoint")
     start_ms, end_ms = _trade_bounds(trade_date)
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     for provider_symbol, entries in data.items():
         canonical = tickflow_to_canonical_symbol(provider_symbol)
-        if not isinstance(entries, list) or not entries:
+        if not isinstance(entries, list):
             raise TickFlowDiscoveryError("empty_endpoint")
         for entry in entries:
             if not isinstance(entry, dict) or set(entry) != {"timestamp", "ex_factor"}:
@@ -305,6 +305,8 @@ def _official_universe(data: Any, *, expected_id: str) -> tuple[dict[str, Any], 
     ):
         raise TickFlowDiscoveryError("schema_drift")
     symbols = tuple(data["symbols"])
+    if expected_id == "CN_Index" and not symbols:
+        raise TickFlowDiscoveryError("empty_endpoint")
     if any(type(symbol) is not str for symbol in symbols):
         raise TickFlowDiscoveryError("symbol_schema")
     if data["symbol_count"] != len(symbols) or len(set(symbols)) != len(symbols):
@@ -409,7 +411,10 @@ class TickFlowAdapter:
             if symbols:
                 expected = {canonical_to_tickflow_symbol(symbol) for symbol in symbols}
                 daily_symbols = {row["provider_symbol"] for row in official_daily}
-                factor_symbols = {row["provider_symbol"] for row in official_factors}
+                # Coverage is defined by the provider map keys, not by emitted rows:
+                # an empty list is a valid no-event result for that symbol.
+                factor_data = _official_data(payloads["ex_factors"])
+                factor_symbols = set(factor_data)
                 equity_symbols = {row["provider_symbol"] for row in official_universe}
                 if (
                     daily_symbols != expected
@@ -425,6 +430,14 @@ class TickFlowAdapter:
                 indexes=official_indexes,
                 request_count=request_count,
                 units_status="unknown",
+                factor_status=(
+                    "no_event"
+                    if symbols
+                    and not official_factors
+                    and set(_official_data(payloads["ex_factors"]))
+                    == {canonical_to_tickflow_symbol(symbol) for symbol in symbols}
+                    else "unavailable"
+                ),
             )
         # Preserve the Task11 read-only parser shape for callers that only replayed the
         # historical three-endpoint fixture. The execute contract below is always four calls.
@@ -491,7 +504,9 @@ class TickFlowAdapter:
     ) -> TickFlowSourceBatch:
         if type(session) is not _AuthorizedCanarySession:
             raise PermissionError("authorized canary session required")
-        _validate_symbols(tuple(symbols), for_execute=bool(symbols))
+        if not symbols:
+            raise PermissionError("canary symbols are required")
+        _validate_symbols(tuple(symbols), for_execute=True)
         return session.execute(self, trade_date, symbols=symbols)
 
     def fetch(self, trade_date: date, *, symbols: tuple[str, ...] = ()) -> TickFlowPlan:

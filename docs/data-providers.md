@@ -35,6 +35,10 @@ TickFlow's offline plan requests `daily_batch`, `ex_factors`, `universe(CN_Equit
 factor/corporate-action units, suspension semantics and quota/retention remain explicit
 discovery gaps. Execute-mode failures retain only sanitized `failure_class`, safe endpoint
 identity and actual post-client `provider_requests`; pre-client blocks remain zero-request.
+The official factor map must contain exactly the requested provider-symbol keys; an empty
+per-symbol array is a valid `no_event` discovery result, while missing/extra keys fail closed.
+Compact kline optional arrays are non-null finite numbers, volume is non-negative int64, and
+all execute calls require 5–10 unique main-board symbols.
 Tushare's
 offline plan requests `daily`, `adj_factor`, `suspend_d`, `trade_cal` and
 `index_daily` for one exact trade date. Tushare `vol` remains source `lots` and

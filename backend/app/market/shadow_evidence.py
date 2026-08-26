@@ -26,6 +26,16 @@ class ShadowEvidenceUnavailable(RuntimeError):
     """Sanitized unavailable result for missing/corrupt/orphan shadow evidence."""
 
 
+class ShadowEvidencePublishError(ShadowEvidenceUnavailable):
+    """Fixed, non-sensitive failure contract for the Task14 four-request publisher."""
+
+    failure_class = "evidence_publish_error"
+    request_count = 4
+
+    def __init__(self) -> None:
+        super().__init__("shadow evidence publication failed")
+
+
 class ShadowEvidenceCleanupFailed(ShadowEvidenceUnavailable):
     """Owned orphan cleanup stopped with residual data still present."""
 
@@ -1974,7 +1984,7 @@ class ShadowEvidenceStore:
             # Staging is intentionally left as a bounded, owner-marked orphan for a scanner.
             raise
 
-    def publish_raw_responses(
+    def _publish_raw_responses(
         self,
         *,
         plan: ShadowLogicalRequestPlan,
@@ -2041,6 +2051,25 @@ class ShadowEvidenceStore:
             requests=tuple(completions),
         )
         return self.publish(plan=plan, completion=completion, attempts=tuple(attempts))
+
+    def publish_raw_responses(
+        self,
+        *,
+        plan: ShadowLogicalRequestPlan,
+        response_bytes_by_ordinal: dict[int, bytes],
+        rows_by_ordinal: dict[int, tuple[dict[str, Any], ...]] | None = None,
+        evidence_id: str = "task14-tickflow-canary",
+    ) -> ShadowEvidenceBundle:
+        """Publish Task14 raw responses with a fixed sanitized failure boundary."""
+        try:
+            return self._publish_raw_responses(
+                plan=plan,
+                response_bytes_by_ordinal=response_bytes_by_ordinal,
+                rows_by_ordinal=rows_by_ordinal,
+                evidence_id=evidence_id,
+            )
+        except Exception:
+            raise ShadowEvidencePublishError() from None
 
 
 class ShadowEvidenceReader:

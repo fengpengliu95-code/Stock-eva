@@ -9,7 +9,6 @@ import pytest
 
 from backend.app.market.providers.http import (
     BoundedHttpClient,
-    CanaryPermissionError,
     HttpPolicy,
     ProviderHttpError,
     _AuthorizedCanarySession,
@@ -156,7 +155,7 @@ def test_http_rejects_empty_content_even_when_json_method_claims_payload():
     assert captured.value.failure_class == "malformed_json"
 
 
-def test_authorized_session_revalidates_real_canary_registry_before_fake_transport(
+def test_authorized_session_rejects_empty_symbols_before_registry_or_fake_transport(
     tmp_path, monkeypatch
 ):
     def digest(value: str) -> str:
@@ -213,15 +212,9 @@ def test_authorized_session_revalidates_real_canary_registry_before_fake_transpo
         environ={"STOCK_EVA_TICKFLOW_TOKEN": "fake-token"},
         client_factory=lambda: transport,
     )
-    result = TickFlowAdapter().execute(date(2026, 8, 20), session=session)
-    assert result.request_count == 3
-    assert len(transport.calls) == 3
-    assert all(call[2]["headers"] == {"x-api-key": "fake-token"} for call in transport.calls)
-    monkeypatch.setenv("STOCK_EVA_TICKFLOW_TOKEN", "fake-token-2")
-    registry.transition("tickflow", "quarantined", expected_state_version=2)
-    with pytest.raises(CanaryPermissionError):
-        TickFlowAdapter().execute(date(2026, 8, 20), session=session)
-    assert len(transport.calls) == 3
+    with pytest.raises(PermissionError):
+        TickFlowAdapter().execute(date(2026, 8, 20), symbols=(), session=session)
+    assert transport.calls == []
 
 
 def test_private_session_object_is_not_execution_authority_or_duck_typed():

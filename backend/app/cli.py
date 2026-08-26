@@ -928,6 +928,7 @@ def main() -> int:
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
+        postclient_boundary = False
         try:
             from backend.app.market.providers.http import build_tickflow_client
 
@@ -939,6 +940,9 @@ def main() -> int:
                 registry=ShadowRegistry(layout.provider_registry_database),
                 client_factory=build_tickflow_client,
             )
+            # Only failures raised after entering the runner can carry a provider
+            # request count. Construction and all earlier gates are zero-request.
+            postclient_boundary = True
             result = runner.execute(
                 args.trade_date,
                 symbols=symbols,
@@ -965,17 +969,27 @@ def main() -> int:
             )
             return 0
         except Exception as exc:
-            provider_requests = getattr(exc, "request_count", 0)
+            from backend.app.market.providers.http import (
+                safe_public_endpoint,
+                safe_public_failure_class,
+            )
+
+            try:
+                provider_requests = getattr(exc, "request_count", 0) if postclient_boundary else 0
+            except Exception:
+                provider_requests = 0
             provider_requests = (
                 provider_requests
-                if type(provider_requests) is int and provider_requests >= 0
+                if type(provider_requests) is int and 0 <= provider_requests <= 4
                 else 0
             )
-            failure_class = getattr(exc, "failure_class", None)
-            if not isinstance(failure_class, str) or not failure_class:
+            try:
+                failure_class = safe_public_failure_class(getattr(exc, "failure_class", None))
+            except Exception:
                 failure_class = None
-            endpoint = getattr(exc, "endpoint", None)
-            if not isinstance(endpoint, str) or not endpoint:
+            try:
+                endpoint = safe_public_endpoint(getattr(exc, "endpoint", None))
+            except Exception:
                 endpoint = None
             payload = {
                 "status": "unavailable",

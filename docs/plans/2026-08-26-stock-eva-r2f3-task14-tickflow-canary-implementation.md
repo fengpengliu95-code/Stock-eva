@@ -10,6 +10,18 @@ changes. RED must show the old three-endpoint placeholder, retrying HTTP policy,
 execute gates. GREEN is the smallest implementation that makes those tests pass without changing
 Tasks10–13 lifecycle semantics.
 
+### Third-remediation hardening
+
+The compatibility parser remains read-only while execute is unambiguously Task14-only: it
+requires 5–10 unique main-board symbols and exactly four requests. Official factor coverage is
+checked from response map keys (empty per-symbol arrays mean `no_event`), CN_Index cannot be
+empty, and compact kline arrays use strict numeric types, including non-null optional values and
+non-negative int64 volume. Shared CLI sanitizers expose only fixed failure classes and pinned
+endpoint identities. Streaming responses and owned clients are idempotently closed, iterator
+timeouts retain the typed timeout class, and raw-evidence publication errors—including
+collisions—become fixed `evidence_publish_error` failures with four requests and no readable
+failed bundle.
+
 ## Implementation map
 
 1. `providers/tickflow.py`: pinned static contract, exact four logical requests, UTC bounds,

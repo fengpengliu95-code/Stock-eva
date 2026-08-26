@@ -76,6 +76,65 @@ class ProviderHttpError(RuntimeError):
         super().__init__(f"provider request failed: {failure_class}")
 
 
+# This is the only vocabulary allowed across the CLI/report boundary.  In particular,
+# values supplied by a forged exception or an upstream library are never serialized.
+SAFE_FAILURE_CLASSES = frozenset(
+    {
+        "request_budget_exhausted",
+        "transport_error",
+        "timeout",
+        "malformed_response",
+        "endpoint_url_unavailable",
+        "redirect_or_endpoint_mismatch",
+        "response_oversize",
+        "rate_limited",
+        "server_error",
+        "unauthorized",
+        "http_error",
+        "malformed_json",
+        "row_budget_exhausted",
+        "retry_budget_exhausted",
+        "evidence_publish_error",
+        # TickFlow's typed parser vocabulary.
+        "discovery_unavailable",
+        "symbol_schema",
+        "symbol_count_invalid",
+        "symbol_not_main_board",
+        "schema_drift",
+        "missing_endpoint",
+        "empty_endpoint",
+        "wrong_date",
+        "duplicate_row",
+        "column_length_mismatch",
+        "numeric_value_invalid",
+        "symbol_set_invalid",
+        "endpoint_unavailable",
+    }
+)
+SAFE_ENDPOINT_IDENTITIES = frozenset(
+    {
+        "daily_batch",
+        "ex_factors",
+        "universe",
+        "indexes",
+        "/v1/klines/batch",
+        "/v1/klines/ex-factors",
+        "/v1/universes/CN_Equity_A",
+        "/v1/universes/CN_Index",
+    }
+)
+
+
+def safe_public_failure_class(value: object) -> str | None:
+    return value if isinstance(value, str) and value in SAFE_FAILURE_CLASSES else None
+
+
+def safe_public_endpoint(value: object) -> str | None:
+    if not isinstance(value, str) or value not in SAFE_ENDPOINT_IDENTITIES:
+        return None
+    return value
+
+
 class _StreamingHttpxResponse:
     """Small response facade that keeps the body bounded while it is received."""
 
@@ -85,15 +144,38 @@ class _StreamingHttpxResponse:
         self.headers = response.headers
         self.url = response.url
         self.history = response.history
+        self._closed = False
 
     def iter_bytes(self):
         try:
             yield from self._response.iter_bytes()
         finally:
-            self._response.close()
+            self.close()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._response.close()
+
+
+class _CloseOnceResponse:
+    """Defensive facade for injected responses whose close is not itself idempotent."""
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._response, "close", None)
+        if callable(close):
+            close()
 
 
 class _TickFlowHttpxTransport:
@@ -404,14 +486,27 @@ class _AuthorizedCanarySession:
             from .tushare import TushareExecutionBlocked
 
             raise TushareExecutionBlocked("tushare official HTTPS is unproven")
+        # Task14 is always the fixed four-request canary.  The old three-endpoint
+        # replay shape remains parser-only and must never be reachable from execute.
+        if not 5 <= len(symbols) <= 10 or len(set(symbols)) != len(symbols):
+            raise CanaryPermissionError("canary symbols are required")
+        if any(
+            not isinstance(symbol, str)
+            or re.fullmatch(r"(?:sh|sz)\.\d{6}", symbol) is None
+            or not (
+                symbol.startswith(("sh.600", "sh.601", "sh.603", "sh.605"))
+                or symbol.startswith(("sz.000", "sz.001", "sz.002", "sz.003"))
+            )
+            for symbol in symbols
+        ):
+            raise CanaryPermissionError("canary symbols are invalid")
         from .registry import ShadowRegistry
 
         client: BoundedHttpClient | None = None
         payloads: dict[str, Any] = {}
-        # Task11's old fixture used three source-shaped endpoints. Keep that replay-only
-        # compatibility for an empty symbol tuple; an execute request with symbols is Task14's
+        # Task11's old fixture remains parser-only compatibility; execute is Task14's
         # fixed four-request contract.
-        endpoints = adapter.ENDPOINTS if symbols else adapter.ENDPOINTS[:3]
+        endpoints = adapter.ENDPOINTS
         for endpoint in endpoints:
             registry = ShadowRegistry(self.registry_path)
             try:
@@ -608,7 +703,9 @@ def _response_bytes(response: Any, *, max_bytes: int | None = None) -> bytes:
                 chunks.append(bytes(chunk))
         except ProviderHttpError:
             raise
-        except Exception:
+        except Exception as error:
+            if _is_timeout_error(error):
+                raise ProviderHttpError("timeout") from None
             raise ProviderHttpError("transport_error") from None
         return b"".join(chunks)
     content = getattr(response, "content", b"")
@@ -644,12 +741,14 @@ class BoundedHttpClient:
         self._sleeper = sleeper
         self._allowed_server = allowed_server
         self._owns_client = owns_client
+        self._client_closed = False
         self.request_count = 0
         self.raw_content_by_endpoint: dict[str, bytes] = {}
         self._last_result: HttpResult | None = None
 
     def close(self) -> None:
-        if self._owns_client:
+        if self._owns_client and not self._client_closed:
+            self._client_closed = True
             _close_response(self.client)
 
     @property
@@ -695,15 +794,17 @@ class BoundedHttpClient:
             attempts += 1
             self.request_count += 1
             try:
-                response = self.client.request(
-                    method,
-                    identity,
-                    params=dict(params or {}),
-                    json=dict(json_body or {}) if json_body is not None else None,
-                    headers=dict(headers or {}),  # headers are never persisted or echoed
-                    timeout=self.policy.timeout,
-                    follow_redirects=False,
-                    verify=True,
+                response = _CloseOnceResponse(
+                    self.client.request(
+                        method,
+                        identity,
+                        params=dict(params or {}),
+                        json=dict(json_body or {}) if json_body is not None else None,
+                        headers=dict(headers or {}),  # headers are never persisted or echoed
+                        timeout=self.policy.timeout,
+                        follow_redirects=False,
+                        verify=True,
+                    )
                 )
             except Exception as error:
                 if not _is_timeout_error(error):
@@ -726,6 +827,7 @@ class BoundedHttpClient:
             try:
                 status = int(getattr(response, "status_code", 0))
             except (TypeError, ValueError):
+                _close_response(response)
                 raise ProviderHttpError(
                     "malformed_response",
                     endpoint=identity,
