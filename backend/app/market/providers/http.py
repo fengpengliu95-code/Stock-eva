@@ -8,7 +8,6 @@ path network-free and makes all transport limits visible in one place.
 from __future__ import annotations
 
 import json
-import os
 import re
 import weakref
 from collections.abc import Callable, Mapping
@@ -16,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import sleep
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -74,6 +74,62 @@ class ProviderHttpError(RuntimeError):
         self.request_count = request_count
         # Keep the text deliberately small.  Callers can use the typed fields for audit.
         super().__init__(f"provider request failed: {failure_class}")
+
+
+class _StreamingHttpxResponse:
+    """Small response facade that keeps the body bounded while it is received."""
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self.status_code = response.status_code
+        self.headers = response.headers
+        self.url = response.url
+        self.history = response.history
+
+    def iter_bytes(self):
+        try:
+            yield from self._response.iter_bytes()
+        finally:
+            self._response.close()
+
+
+class _TickFlowHttpxTransport:
+    """Adapt httpx streaming responses to the injected transport protocol."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def request(self, method: str, endpoint: str, **kwargs: Any) -> _StreamingHttpxResponse:
+        # TLS verification, base URL and redirect policy are fixed on the client. BoundedHttpClient
+        # still passes these flags to make fake transports assert the same policy.
+        kwargs.pop("verify", None)
+        kwargs.pop("follow_redirects", None)
+        timeout = kwargs.pop("timeout", None)
+        if isinstance(timeout, Mapping):
+            import httpx
+
+            timeout = httpx.Timeout(
+                timeout.get("read", 30),
+                connect=timeout.get("connect", 5),
+                write=timeout.get("write", 5),
+                pool=timeout.get("pool", 5),
+            )
+        request = self._client.build_request(method, endpoint, timeout=timeout, **kwargs)
+        return _StreamingHttpxResponse(self._client.send(request, stream=True))
+
+
+def build_tickflow_client() -> HttpTransport:
+    """Build the sole deployable TickFlow client with an exact pinned origin."""
+    import httpx
+
+    return _TickFlowHttpxTransport(
+        httpx.Client(
+            base_url="https://api.tickflow.org",
+            verify=True,
+            follow_redirects=False,
+            timeout=httpx.Timeout(30, connect=5, write=5, pool=5),
+        )
+    )
 
 
 class CanaryPermissionError(PermissionError):
@@ -188,7 +244,7 @@ def build_canary_permit(
     adapter_hash: str,
     endpoint_contract_hash: str,
     source_schema_hash: str,
-    environ: Mapping[str, str] | None = None,
+    environ: Mapping[str, str],
 ) -> _CanaryPermit:
     """Validate the Task10 descriptor before reading the closed credential env map."""
     from .shadow_contracts import STATIC_PROVIDER_CONTRACTS, exact_credential_env
@@ -205,8 +261,9 @@ def build_canary_permit(
         source_schema_hash=source_schema_hash,
     )
     env_name = exact_credential_env(provider_id, requested=record.credential_env_name)
-    source_env = os.environ if environ is None else environ
-    token = source_env.get(env_name, "")
+    if not isinstance(environ, Mapping):
+        raise CanaryPermissionError("closed environment required")
+    token = environ.get(env_name, "")
     if not token:
         raise CanaryPermissionError("provider credential unavailable")
     return _CanaryPermit(
@@ -400,7 +457,10 @@ class _AuthorizedCanarySession:
             dict(client.raw_content_by_endpoint if client is not None else {}),
         )
         return adapter.parse(
-            trade_date, payloads, request_count=client.request_count if client else 0
+            trade_date,
+            payloads,
+            request_count=client.request_count if client else 0,
+            symbols=symbols,
         )
 
 
@@ -479,7 +539,24 @@ def _response_headers(response: Any) -> Mapping[str, Any]:
     return headers if isinstance(headers, Mapping) else {}
 
 
-def _response_bytes(response: Any) -> bytes:
+def _response_bytes(response: Any, *, max_bytes: int | None = None) -> bytes:
+    iterator = getattr(response, "iter_bytes", None)
+    if callable(iterator):
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in iterator():
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise ProviderHttpError("malformed_response")
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ProviderHttpError("response_oversize")
+                chunks.append(bytes(chunk))
+        except ProviderHttpError:
+            raise
+        except Exception:
+            raise ProviderHttpError("transport_error") from None
+        return b"".join(chunks)
     content = getattr(response, "content", b"")
     if isinstance(content, bytes):
         return content
@@ -587,20 +664,78 @@ class BoundedHttpClient:
                     ) from None
                 continue
 
-            status = int(getattr(response, "status_code", 0))
+            try:
+                status = int(getattr(response, "status_code", 0))
+            except (TypeError, ValueError):
+                raise ProviderHttpError(
+                    "malformed_response",
+                    endpoint=identity,
+                    attempts=attempts,
+                    request_count=self.request_count,
+                ) from None
             response_url = getattr(response, "url", None)
-            if getattr(response, "history", ()) or (
-                self._allowed_server
-                and response_url
-                and not str(response_url).startswith(self._allowed_server + "/")
-            ):
+            if self._allowed_server:
+                if not response_url:
+                    raise ProviderHttpError(
+                        "endpoint_url_unavailable",
+                        endpoint=identity,
+                        attempts=attempts,
+                        request_count=self.request_count,
+                    )
+                try:
+                    parsed_url = urlsplit(str(response_url))
+                    expected = urlsplit(self._allowed_server)
+                except ValueError:
+                    raise ProviderHttpError(
+                        "redirect_or_endpoint_mismatch",
+                        endpoint=identity,
+                        attempts=attempts,
+                        request_count=self.request_count,
+                    ) from None
+                try:
+                    response_port = parsed_url.port
+                except ValueError:
+                    raise ProviderHttpError(
+                        "redirect_or_endpoint_mismatch",
+                        endpoint=identity,
+                        attempts=attempts,
+                        request_count=self.request_count,
+                    ) from None
+                effective_response_port = response_port or (
+                    443 if parsed_url.scheme == "https" else 80
+                )
+                effective_expected_port = expected.port or (
+                    443 if expected.scheme == "https" else 80
+                )
+                if (
+                    parsed_url.scheme != expected.scheme
+                    or parsed_url.hostname != expected.hostname
+                    or effective_response_port != effective_expected_port
+                    or parsed_url.username is not None
+                    or parsed_url.password is not None
+                    or parsed_url.path != identity
+                    or parsed_url.fragment
+                ):
+                    raise ProviderHttpError(
+                        "redirect_or_endpoint_mismatch",
+                        endpoint=identity,
+                        attempts=attempts,
+                        request_count=self.request_count,
+                    )
+            if getattr(response, "history", ()):
                 raise ProviderHttpError(
                     "redirect_or_endpoint_mismatch",
                     endpoint=identity,
                     attempts=attempts,
                     request_count=self.request_count,
                 )
-            content = _response_bytes(response)
+            try:
+                content = _response_bytes(response, max_bytes=self.policy.max_response_bytes)
+            except ProviderHttpError as error:
+                error.endpoint = identity
+                error.attempts = attempts
+                error.request_count = self.request_count
+                raise
             if len(content) > self.policy.max_response_bytes:
                 raise ProviderHttpError(
                     "response_oversize",

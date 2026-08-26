@@ -15,7 +15,8 @@ shadow window.
 - fake-transport call order, parameter/header secrecy and no real socket;
 - immutable isolated raw evidence bytes and retained sanitized failure audit;
 - no canonical/candidate/pointer/shadow-job/failover/Tushare effect;
-- focused, related, full offline, LaunchAgent, validator, Ruff, compileall and diff checks;
+- focused, related, full offline, `tests/test_launchagent_assets.py`, the repository design
+  validator, Ruff, compileall and diff checks;
 - unchanged R2-F2 golden fixture bytes/hashes.
 
 ## Explicit remaining gate

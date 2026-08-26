@@ -43,7 +43,10 @@ class FakeClient:
 
     def request(self, method, endpoint, **kwargs):
         self.calls.append((method, endpoint, kwargs))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        response.url = f"https://api.tickflow.org{endpoint}"
+        response.history = ()
+        return response
 
 
 def test_tickflow_requests_unadjusted_daily_and_universe_without_inference():

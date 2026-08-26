@@ -53,6 +53,7 @@ from .http import (
     ProviderHttpError,
     build_authorized_canary_session,
     build_canary_permit,
+    build_tickflow_client,
 )
 from .tickflow import (
     TickFlowAdapter,
@@ -64,6 +65,8 @@ from .tickflow import (
     TickFlowProvider,
     TickFlowSchemaError,
     TickFlowSourceBatch,
+    canonical_to_tickflow_symbol,
+    tickflow_to_canonical_symbol,
 )
 from .tushare import (
     TushareAdapter,
@@ -82,6 +85,7 @@ __all__ = [
     "CanaryExecutor",
     "build_canary_permit",
     "build_authorized_canary_session",
+    "build_tickflow_client",
     "BoundedHTTPClient",
     "HttpPolicy",
     "HttpRequestPolicy",
@@ -94,6 +98,8 @@ __all__ = [
     "TickFlowPlan",
     "TickFlowProvider",
     "TickFlowSourceBatch",
+    "canonical_to_tickflow_symbol",
+    "tickflow_to_canonical_symbol",
     "TickFlowSchemaError",
     "TushareAdapter",
     "TushareExecutionBlocked",

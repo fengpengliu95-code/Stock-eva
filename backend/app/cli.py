@@ -872,8 +872,8 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
     if args.command == "market-provider-canary":
-        from backend.app.market.providers.tickflow import TickFlowAdapter
-        from backend.app.market.providers.tushare import TushareAdapter, TushareExecutionBlocked
+        from backend.app.market.providers.tickflow import TickFlowAdapter, TickFlowCanaryRunner
+        from backend.app.market.providers.tushare import TushareAdapter
 
         symbols = tuple(args.symbols)
         adapter = (
@@ -916,16 +916,54 @@ def main() -> int:
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 2
+        if args.provider == "tushare":
+            # Tushare's official transport is not proven HTTPS; keep it blocked before any
+            # registry, credential, client or filesystem operation.
+            payload = {
+                "status": "blocked",
+                "provider": args.provider,
+                "error_code": "provider_transport_unproven",
+                "provider_requests": 0,
+                "writes": False,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 1
         try:
-            # Task11's offline command never constructs a real network client.  The registry
-            # check is intentionally read-only and missing state fails closed.
+            from backend.app.market.providers.http import build_tickflow_client
+
             settings = get_settings()
-            record = ShadowRegistry(StorageLayout(settings).provider_registry_database).read_status(
-                args.provider
+            layout = StorageLayout(settings)
+            runner = TickFlowCanaryRunner(
+                settings=settings,
+                layout=layout,
+                registry=ShadowRegistry(layout.provider_registry_database),
+                client_factory=build_tickflow_client,
             )
-            if record.admission_state.value != "canary":
-                raise RegistryUnavailable("provider is not admitted for canary")
-            raise TushareExecutionBlocked("real shadow canary requires separate authorization gate")
+            result = runner.execute(
+                args.trade_date,
+                symbols=symbols,
+                external_authorization_id=args.external_authorization_id,
+                acknowledge_provider_requests=args.acknowledge_provider_requests,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "provider": result.provider,
+                        "trade_date": result.trade_date.isoformat(),
+                        "request_count": result.request_count,
+                        "endpoints": list(result.endpoints),
+                        "units_status": result.units_status,
+                        "provider_requests": result.request_count,
+                        "writes": result.writes_evidence,
+                        "writes_evidence": result.writes_evidence,
+                        "writes_canonical": result.writes_canonical,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
         except Exception:
             payload = {
                 "status": "unavailable",

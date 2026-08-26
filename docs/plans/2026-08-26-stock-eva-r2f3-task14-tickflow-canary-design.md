@@ -17,8 +17,12 @@ semantics are discovery gaps rather than evidence of suitability.
 The pinned official facts as of 2026-08-26 are OpenAPI
 `https://docs.tickflow.org/zh-Hans/api-reference/openapi.json`, server
 `https://api.tickflow.org`, `x-api-key`, GET `/v1/klines/batch` with `symbols`, `period=1d`,
-`start_time`, `end_time`, `adjust=none`; GET `/v1/klines/ex-factors` with `symbols`, `start`,
-`end`; and GET `/v1/universes/{id}` for `CN_Equity_A` and `CN_Index`. Terms state that keys may
+`start_time`, `end_time`, `adjust=none`; GET `/v1/klines/ex-factors` with `symbols`, `start_time`,
+`end_time`; and GET `/v1/universes/{id}` for `CN_Equity_A` and `CN_Index` with no query
+parameters. Provider symbols are `600000.SH`/`000001.SZ` and are explicitly mapped to canonical
+`sh.600000`/`sz.000001` only at the parser boundary. The response shapes are strict: batch `data`
+is a provider-symbol map of compact column arrays, factor `data` is a provider-symbol map of
+`[{timestamp, factor}]`, and universe/index `data` is `{symbols: [...]}`. Terms state that keys may
 not be shared, malicious large-scale scraping is forbidden, and lawful personal/commercial use
 is described subject to no unauthorized resale. Quota, retention, volume/amount units and
 suspension semantics remain unconfirmed. These pages are evidence references, not approval.
@@ -70,7 +74,7 @@ suspension semantics remain unconfirmed. These pages are evidence references, no
 
 ```text
 TickFlowCanaryRunner.execute(trade_date, symbols, *, external_authorization_id,
-                             acknowledge_provider_requests, transport) -> TickFlowCanaryReport
+                             acknowledge_provider_requests) -> TickFlowCanaryReport
 TickFlowCanaryReport.status = "discovered" | "blocked" | "error"
 TickFlowCanaryReport.outcome = "discovery" | "unavailable" | "failure"
 ```
@@ -106,6 +110,9 @@ Given five valid main-board symbols and fake responses, when execute is
 
 Given malformed, wrong-date, duplicate, partial or unitless payloads,
   when parsing, then a typed discovery failure is returned and no complete candidate is emitted.
+  Canonical symbols and provider symbols remain separate evidence fields; column lengths,
+  finite/nonnegative numeric values, duplicate timestamps, exact UTC-day bounds, required keys,
+  extra keys and empty/partial objects are all rejected.
 ### AC-5: Bounded transport (FR-5)
 
 Given timeout, redirect, 401/403/429/5xx or >8 MiB responses, when the

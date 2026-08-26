@@ -21,7 +21,8 @@ Tasks10–13 lifecycle semantics.
 4. `config.py`, `storage/layout.py`, `providers/registry.py`: exact Task14 gates and isolated
    root validation; no canonical path widening.
 5. `cli.py`: plan remains zero-write; execute requires authorization plus acknowledgement and
-   injected offline transport in tests; no real socket construction in this repository change.
+   uses only the fixed `https://api.tickflow.org` client factory after all gates. Tests inject
+   fake transport/client factories; no real socket is used by the offline verification.
 
 ## Explicit non-changes
 
@@ -31,6 +32,8 @@ candidate/selection, shadow scheduler, LaunchAgents, NAS, production DB, or depe
 ## Verification contract
 
 Run focused Task14/provider tests, related shadow/evidence/registry tests, full offline pytest,
-LaunchAgent assets, strict design validator, `ruff check`, `ruff format --check`, `compileall`
+`tests/test_launchagent_assets.py`, the repository's strict design validator at
+`/Users/finlay/.codex/skills/claude-skills--engineering/spec-driven-workflow/scripts/spec_validator.py`,
+`ruff check`, `ruff format --check`, `compileall`
 and `git diff --check`. Verify R2-F2 golden fixture bytes/hashes remain unchanged. No command may
 access network, credentials, NAS, production DB or LaunchAgent.

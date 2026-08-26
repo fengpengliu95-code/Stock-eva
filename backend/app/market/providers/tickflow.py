@@ -2,7 +2,8 @@
 
 The adapter is deliberately not a market-data provider: it never normalizes, publishes or
 qualifies data. Network execution is possible only through the separately gated private
-canary session in :mod:`http`; tests use :meth:`TickFlowCanaryRunner.offline` with a fake
+canary session in :mod:`http`; tests use the private
+:meth:`TickFlowCanaryRunner._offline_for_tests` helper with a fake
 transport.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from typing import Any, Literal
@@ -25,6 +27,19 @@ TICKFLOW_OPENAPI_URL = "https://docs.tickflow.org/zh-Hans/api-reference/openapi.
 TICKFLOW_TERMS_URL = "https://tickflow.org/legal/terms-of-service.md"
 _SAFE_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
 _MAIN_BOARD = ("sh.600", "sh.601", "sh.603", "sh.605", "sz.000", "sz.001", "sz.002", "sz.003")
+_PROVIDER_SYMBOL = re.compile(r"^\d{6}\.(?:SH|SZ)$")
+
+
+def tickflow_to_canonical_symbol(value: str) -> str:
+    if not isinstance(value, str) or _PROVIDER_SYMBOL.fullmatch(value) is None:
+        raise TickFlowDiscoveryError("symbol_schema")
+    return f"{value[-2:].lower()}.{value[:6]}"
+
+
+def canonical_to_tickflow_symbol(value: str) -> str:
+    if not isinstance(value, str) or _SAFE_SYMBOL.fullmatch(value) is None:
+        raise TickFlowDiscoveryError("symbol_schema")
+    return f"{value[3:]}.{value[:2].upper()}"
 
 
 def _hash(value: Any) -> str:
@@ -172,6 +187,102 @@ def _validate_rows(
                     raise TickFlowDiscoveryError("numeric_value_invalid") from None
 
 
+_KLINE_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "volume", "amount"})
+
+
+def _official_data(payload: Any) -> Any:
+    if not isinstance(payload, dict) or set(payload) != {"data"}:
+        raise TickFlowDiscoveryError("schema_drift")
+    return payload["data"]
+
+
+def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], ...]:
+    if not isinstance(data, dict) or not data:
+        raise TickFlowDiscoveryError("empty_endpoint")
+    start_ms, end_ms = _trade_bounds(trade_date)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for provider_symbol, compact in data.items():
+        canonical = tickflow_to_canonical_symbol(provider_symbol)
+        if not isinstance(compact, dict) or set(compact) != _KLINE_COLUMNS:
+            raise TickFlowDiscoveryError("schema_drift")
+        lengths = {len(value) for value in compact.values() if isinstance(value, list)}
+        if len(lengths) != 1 or any(not isinstance(value, list) for value in compact.values()):
+            raise TickFlowDiscoveryError("column_length_mismatch")
+        for index in range(next(iter(lengths))):
+            timestamp = compact["timestamp"][index]
+            if type(timestamp) is not int or not start_ms <= timestamp <= end_ms:
+                raise TickFlowDiscoveryError("wrong_date")
+            identity = (provider_symbol, timestamp)
+            if identity in seen:
+                raise TickFlowDiscoveryError("duplicate_row")
+            seen.add(identity)
+            row = {field: compact[field][index] for field in _KLINE_COLUMNS}
+            for field in ("open", "high", "low", "close"):
+                if (
+                    type(row[field]) not in (int, float)
+                    or not isfinite(float(row[field]))
+                    or row[field] <= 0
+                ):
+                    raise TickFlowDiscoveryError("numeric_value_invalid")
+            for field in ("volume", "amount"):
+                if (
+                    type(row[field]) not in (int, float)
+                    or not isfinite(float(row[field]))
+                    or row[field] < 0
+                ):
+                    raise TickFlowDiscoveryError("numeric_value_invalid")
+            rows.append({"provider_symbol": provider_symbol, "symbol": canonical, **row})
+    if not rows:
+        raise TickFlowDiscoveryError("empty_endpoint")
+    return tuple(rows)
+
+
+def _official_factor_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], ...]:
+    if not isinstance(data, dict) or not data:
+        raise TickFlowDiscoveryError("empty_endpoint")
+    start_ms, end_ms = _trade_bounds(trade_date)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for provider_symbol, entries in data.items():
+        canonical = tickflow_to_canonical_symbol(provider_symbol)
+        if not isinstance(entries, list) or not entries:
+            raise TickFlowDiscoveryError("empty_endpoint")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"timestamp", "factor"}:
+                raise TickFlowDiscoveryError("schema_drift")
+            timestamp = entry["timestamp"]
+            factor = entry["factor"]
+            if type(timestamp) is not int or not start_ms <= timestamp <= end_ms:
+                raise TickFlowDiscoveryError("wrong_date")
+            identity = (provider_symbol, timestamp)
+            if identity in seen:
+                raise TickFlowDiscoveryError("duplicate_row")
+            seen.add(identity)
+            if type(factor) not in (int, float) or not isfinite(float(factor)) or factor <= 0:
+                raise TickFlowDiscoveryError("numeric_value_invalid")
+            rows.append({"provider_symbol": provider_symbol, "symbol": canonical, **entry})
+    return tuple(rows)
+
+
+def _official_universe(data: Any) -> tuple[dict[str, Any], ...]:
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"symbols"}
+        or not isinstance(data["symbols"], list)
+    ):
+        raise TickFlowDiscoveryError("schema_drift")
+    symbols = tuple(data["symbols"])
+    if not symbols or len(set(symbols)) != len(symbols):
+        raise TickFlowDiscoveryError("symbol_set_invalid")
+    if any(_PROVIDER_SYMBOL.fullmatch(symbol) is None for symbol in symbols):
+        raise TickFlowDiscoveryError("symbol_schema")
+    return tuple(
+        {"provider_symbol": symbol, "symbol": tickflow_to_canonical_symbol(symbol)}
+        for symbol in symbols
+    )
+
+
 class TickFlowAdapter:
     PROVIDER_ID = "tickflow"
     ADAPTER_HASH = ADAPTER_HASH
@@ -219,7 +330,10 @@ class TickFlowAdapter:
         self, endpoint: str, trade_date: date, symbols: tuple[str, ...]
     ) -> dict[str, Any]:
         start_ms, end_ms = _trade_bounds(trade_date)
-        joined = ",".join(symbols)
+        try:
+            joined = ",".join(canonical_to_tickflow_symbol(symbol) for symbol in symbols)
+        except TickFlowDiscoveryError:
+            raise TickFlowDiscoveryError("symbol_schema") from None
         if endpoint == "daily_batch":
             return {
                 "symbols": joined,
@@ -229,14 +343,51 @@ class TickFlowAdapter:
                 "adjust": "none",
             }
         if endpoint == "ex_factors":
-            return {"symbols": joined, "start": start_ms, "end": end_ms}
+            return {"symbols": joined, "start_time": start_ms, "end_time": end_ms}
         if endpoint in {"universe", "indexes"}:
-            return {"start_time": start_ms, "end_time": end_ms}
+            return {}
         raise TickFlowDiscoveryError("endpoint_unavailable")
 
     def parse(
-        self, trade_date: date, payloads: dict[str, Any], *, request_count: int = 0
+        self,
+        trade_date: date,
+        payloads: dict[str, Any],
+        *,
+        request_count: int = 0,
+        symbols: tuple[str, ...] = (),
     ) -> TickFlowSourceBatch:
+        if set(self.ENDPOINTS).issubset(payloads) and all(
+            isinstance(payloads[item], dict) and isinstance(payloads[item].get("data"), dict)
+            for item in self.ENDPOINTS
+        ):
+            official_daily = _official_kline_rows(
+                _official_data(payloads["daily_batch"]), trade_date
+            )
+            official_factors = _official_factor_rows(
+                _official_data(payloads["ex_factors"]), trade_date
+            )
+            official_universe = _official_universe(_official_data(payloads["universe"]))
+            official_indexes = _official_universe(_official_data(payloads["indexes"]))
+            if symbols:
+                expected = {canonical_to_tickflow_symbol(symbol) for symbol in symbols}
+                daily_symbols = {row["provider_symbol"] for row in official_daily}
+                factor_symbols = {row["provider_symbol"] for row in official_factors}
+                equity_symbols = {row["provider_symbol"] for row in official_universe}
+                if (
+                    daily_symbols != expected
+                    or factor_symbols != expected
+                    or not expected <= equity_symbols
+                ):
+                    raise TickFlowDiscoveryError("symbol_set_invalid")
+            return TickFlowSourceBatch(
+                trade_date=trade_date,
+                daily=official_daily,
+                factors=official_factors,
+                universe=official_universe,
+                indexes=official_indexes,
+                request_count=request_count,
+                units_status="unknown",
+            )
         # Preserve the Task11 read-only parser shape for callers that only replayed the
         # historical three-endpoint fixture. The execute contract below is always four calls.
         if set(payloads) >= {"daily", "universe", "indexes"} and "daily_batch" not in payloads:
@@ -316,20 +467,23 @@ class TickFlowAdapter:
 
 
 class TickFlowCanaryRunner:
-    """Offline runner facade; no real client factory is accepted here."""
+    """Canary runner; production execution is separately gated and fixed-host only."""
 
     @classmethod
-    def offline(
+    def _offline_for_tests(
         cls,
         *,
         transport: Any,
         trade_date: date,
         symbols: tuple[str, ...],
-        token: str,
+        environ: Mapping[str, str],
         evidence_store: Any | None = None,
         evidence_id: str = "task14-tickflow-canary",
     ) -> TickFlowCanaryReport:
         _validate_symbols(tuple(symbols), for_execute=True)
+        token = environ.get("STOCK_EVA_TICKFLOW_TOKEN", "")
+        if not token:
+            raise PermissionError("provider credential unavailable")
         adapter = TickFlowAdapter(plan_only=False)
         from .http import BoundedHttpClient
 
@@ -344,6 +498,7 @@ class TickFlowCanaryRunner:
                 max_requests=4,
                 max_response_bytes=8 * 1024 * 1024,
             ),
+            allowed_server=TICKFLOW_SERVER,
         )
         payloads: dict[str, Any] = {}
         for endpoint in adapter.ENDPOINTS:
@@ -352,10 +507,14 @@ class TickFlowCanaryRunner:
                 params=adapter.request_params(endpoint, trade_date, tuple(symbols)),
                 headers={"x-api-key": token},
             )
-            # Reject shape drift at the first response; do not spend the remaining bounded
-            # request budget or retain a partial evidence set.
-            _rows(payloads[endpoint])
-        parsed = adapter.parse(trade_date, payloads, request_count=client.request_count)
+        # Parse only after all four complete responses. Partial responses can never be
+        # published, while call order and the four-request bound stay deterministic.
+        parsed = adapter.parse(
+            trade_date,
+            payloads,
+            request_count=client.request_count,
+            symbols=tuple(symbols),
+        )
         published_id = None
         if evidence_store is not None:
             raw_by_ordinal = {
@@ -409,7 +568,11 @@ class TickFlowCanaryRunner:
         The factory is deliberately mandatory and injected. Production code therefore cannot
         accidentally discover a URL or create a default network client in this runner.
         """
-        from .http import build_authorized_canary_session
+        from .http import (
+            _read_canary_descriptor,
+            _valid_authorization_id,
+            build_authorized_canary_session,
+        )
 
         if not (
             type(getattr(self.settings, "provider_shadow_enabled", False)) is bool
@@ -418,7 +581,11 @@ class TickFlowCanaryRunner:
             and self.settings.provider_shadow_execute_enabled is True
         ):
             raise PermissionError("provider shadow execution is disabled")
-        if not acknowledge_provider_requests or not external_authorization_id:
+        if (
+            type(acknowledge_provider_requests) is not bool
+            or not acknowledge_provider_requests
+            or not _valid_authorization_id(external_authorization_id)
+        ):
             raise PermissionError("provider request acknowledgement is required")
         canonical = tuple(
             root
@@ -433,6 +600,15 @@ class TickFlowCanaryRunner:
         if str(record.admission_state.value).lower() != "canary":
             raise PermissionError("provider is not admitted for canary")
         _validate_symbols(tuple(symbols), for_execute=True)
+        # Re-open and validate the immutable descriptor and reviewed TermsEvidence before the
+        # closed credential lookup. This ordering is intentional and tested with a getenv spy.
+        _read_canary_descriptor(
+            "tickflow",
+            self.registry,
+            adapter_hash=TickFlowAdapter.ADAPTER_HASH,
+            endpoint_contract_hash=TickFlowAdapter.ENDPOINT_CONTRACT_HASH,
+            source_schema_hash=TickFlowAdapter.SOURCE_SCHEMA_HASH,
+        )
         # The closed environment is intentionally read only after all filesystem, registry and
         # request gates. No alternate env name or token argument is accepted here.
         import os
