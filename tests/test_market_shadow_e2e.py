@@ -1,6 +1,7 @@
 """Production-store end-to-end coverage for the isolated shadow lane."""
 
 import json
+import os
 from datetime import date
 
 import pytest
@@ -521,22 +522,21 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
             f"terminal-{session_id}",
         )
         captured["identity"] = identity
-        return {
-            "status": "completed",
-            "terminal_context": {
-                "plan": plan,
-                "evidence_reader": evidence_reader,
-                "candidate_reader": candidate_reader,
-                "identity": identity,
-                "calendar_generation": snapshot.calendar_generation,
-                "calendar_sha256": snapshot.calendar_sha256,
-                "universe_sha256": "a" * 64,
-                "version_vector_sha256": leased.version_vector_sha256,
-                "expected_job_state_version": ready_job.state_version,
-                "expected_window_state_version": window.state_version,
-                "snapshot": snapshot,
-            },
+        terminal_context = {
+            "plan": plan,
+            "evidence_reader": evidence_reader,
+            "candidate_reader": candidate_reader,
+            "identity": identity,
+            "calendar_generation": snapshot.calendar_generation,
+            "calendar_sha256": snapshot.calendar_sha256,
+            "universe_sha256": "a" * 64,
+            "version_vector_sha256": leased.version_vector_sha256,
+            "expected_job_state_version": ready_job.state_version,
+            "expected_window_state_version": window.state_version,
+            "snapshot": snapshot,
         }
+        captured["context"] = terminal_context
+        return {"status": "completed", "terminal_context": terminal_context}
 
     assert scanner.enqueue(jobs) == 1
 
@@ -559,6 +559,16 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
         "SELECT COUNT(*) FROM session_report WHERE session_report_id=?",
         (captured["identity"].session_report_id,),
     ).fetchone()
+
+    def restore_file(path, payload):
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     for name in ("OWNER", "report.json", "COMMIT"):
         original = (pending_dir / name).read_bytes()
         (pending_dir / name).unlink()
@@ -568,7 +578,7 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
                     registry, report_id=captured["identity"].session_report_id
                 )
         finally:
-            (pending_dir / name).write_bytes(original)
+            restore_file(pending_dir / name, original)
 
         original = (pending_dir / name).read_bytes()
         (pending_dir / name).unlink()
@@ -580,7 +590,7 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
                 )
         finally:
             (pending_dir / name).unlink()
-            (pending_dir / name).write_bytes(original)
+            restore_file(pending_dir / name, original)
         assert (success_dir / "report.json").read_bytes() == success_before
         assert (
             registry._memory_connection.execute(
@@ -590,24 +600,62 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
             == db_before
         )
 
+    assert (
+        ShadowTerminalWriter(publisher)
+        .recover_success(registry, report_id=captured["identity"].session_report_id)
+        .is_dir()
+    )
+
     for name in ("OWNER", "report.json", "COMMIT"):
         original = (pending_dir / name).read_bytes()
         if name == "report.json":
-            changed = original.replace(b'"outcome":"pending"', b'"outcome":"tampered"', 1)
+            changed_payload = json.loads(original)
+            changed_payload["outcome"] = "tampered"
+            changed = (
+                json.dumps(changed_payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
         elif name == "OWNER":
-            changed = original.replace(b'"schema_version":1', b'"schema_version":2', 1)
+            changed_payload = json.loads(original)
+            changed_payload["publisher_id"] = "0" * 32
+            changed = (
+                json.dumps(changed_payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
         else:
             changed = b"0" + original[1:]
         with (pending_dir / name).open("wb") as handle:
             handle.write(changed)
             handle.flush()
         try:
-            with pytest.raises(ShadowTerminalUnavailable):
+            try:
                 ShadowTerminalWriter(publisher).recover_success(
                     registry, report_id=captured["identity"].session_report_id
                 )
+            except ShadowTerminalUnavailable:
+                pass
+            else:
+                pytest.fail(f"same-inode tamper was accepted for {name}")
         finally:
-            (pending_dir / name).write_bytes(original)
+            restore_file(pending_dir / name, original)
+
+    connection = registry._memory_connection
+    original_bundle_ref = connection.execute(
+        "SELECT bundle_ref FROM shadow_evidence_ref WHERE evidence_id=?",
+        (captured["identity"].evidence_id,),
+    ).fetchone()[0]
+    connection.execute(
+        "UPDATE shadow_evidence_ref SET bundle_ref=? WHERE evidence_id=?",
+        ("tampered/evidence", captured["identity"].evidence_id),
+    )
+    try:
+        with pytest.raises(ShadowTerminalUnavailable):
+            ShadowTerminalWriter(publisher).recover_success(
+                registry, report_id=captured["identity"].session_report_id
+            )
+    finally:
+        connection.execute(
+            "UPDATE shadow_evidence_ref SET bundle_ref=? WHERE evidence_id=?",
+            (original_bundle_ref, captured["identity"].evidence_id),
+        )
 
     pending_report = pending_dir / "report.json"
     original_report = pending_report.read_bytes()
@@ -626,7 +674,30 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
                     registry, report_id=captured["identity"].session_report_id
                 )
         finally:
-            pending_report.write_bytes(original_report)
+            restore_file(pending_report, original_report)
+    for section in ("evidence_ref", "candidate_ref"):
+        original_payload = json.loads(original_report)
+        for field, value in original_payload[section].items():
+            payload = json.loads(original_report)
+            if isinstance(value, dict):
+                changed = {**value, "tampered": 1}
+            elif isinstance(value, str):
+                changed = "tampered"
+            elif isinstance(value, int):
+                changed = value + 1
+            else:
+                changed = ["tampered"]
+            payload[section][field] = changed
+            pending_report.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            try:
+                with pytest.raises(ShadowTerminalUnavailable):
+                    ShadowTerminalWriter(publisher).recover_success(
+                        registry, report_id=captured["identity"].session_report_id
+                    )
+            finally:
+                restore_file(pending_report, original_report)
     payload = json.loads(original_report)
     payload["attestation"]["attestation_id"] = "evil-attestation"
     pending_report.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -636,8 +707,14 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
                 registry, report_id=captured["identity"].session_report_id
             )
     finally:
-        pending_report.write_bytes(original_report)
+        restore_file(pending_report, original_report)
     assert (success_dir / "report.json").read_bytes() == success_before
+    alternate = ShadowBundlePublisher(tmp_path / "alternate-shadow")
+    with pytest.raises(ShadowTerminalUnavailable):
+        ShadowTerminalWriter(publisher).write_success(
+            registry, **captured["context"], bundle_publisher=alternate
+        )
+    assert not alternate.root.exists()
 
 
 def test_production_scheduler_no_candidate_is_failure_without_success_marker(tmp_path):

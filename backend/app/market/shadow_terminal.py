@@ -487,6 +487,45 @@ def _write_terminal_success_graph(
         candidate_sha256=candidate_sha,
     )
 
+    evidence_ref_payload = {
+        "evidence_id": identity.evidence_id,
+        "job_id": identity.job_id,
+        "provider_id": identity.provider_id,
+        "window_id": identity.window_id,
+        "session_id": identity.session_id,
+        "completion_sha256": evidence.completion_sha256,
+        "evidence_sha256": evidence_sha,
+        "bundle_ref": f"evidence/{identity.evidence_id}",
+        "bundle_sha256": evidence_sha,
+        "attached_session_report_id": report_id,
+    }
+    candidate_manifest = candidate_bundle.manifest
+    candidate_manifest_payload = (
+        candidate_manifest.model_dump(mode="json")
+        if hasattr(candidate_manifest, "model_dump")
+        else None
+    )
+    candidate_ref_payload = {
+        "candidate_id": identity.candidate_id,
+        "evidence_id": identity.evidence_id,
+        "job_id": identity.job_id,
+        "provider_id": identity.provider_id,
+        "window_id": identity.window_id,
+        "session_id": identity.session_id,
+        "candidate_ref": candidate_manifest.normalized_object_ref,
+        "candidate_sha256": candidate_sha,
+        "quality_report_ref": candidate_manifest.quality_report_ref,
+        "quality_report_sha256": candidate_manifest.quality_report_sha256,
+        "canonical_manifest_generation": candidate_manifest.canonical_manifest_generation,
+        "canonical_manifest_sha256": candidate_manifest.canonical_manifest_sha256,
+        "reconciliation_id": candidate_manifest.reconciliation_id,
+        "reconciliation_sha256": candidate_manifest.reconciliation_sha256,
+        "reconciliation_status": candidate_manifest.reconciliation_status,
+        "reconciliation_compared_counts": candidate_manifest.reconciliation_compared_counts,
+        "reconciliation_mismatch_counts": candidate_manifest.reconciliation_mismatch_counts,
+        "canonical_comparison_snapshot_sha256": candidate_manifest.canonical_comparison_snapshot_sha256,
+    }
+
     with registry._lock(shared=True):
         read_connection = registry._connection_for_read()
         try:
@@ -625,6 +664,9 @@ def _write_terminal_success_graph(
             "attempt_ordinal_closure_canonical_json": closure_raw.decode("utf-8"),
             "report_digest_canonical_json": report_raw.decode("utf-8"),
         },
+        "evidence_ref": evidence_ref_payload,
+        "candidate_ref": candidate_ref_payload,
+        "candidate_manifest": candidate_manifest_payload,
         "reports": report_value["reports"],
     }
     try:
@@ -961,7 +1003,9 @@ class ShadowTerminalWriter:
 
     def write_success(self, registry: ShadowRegistry, **context: Any) -> ShadowTerminalAttestation:
         context = dict(context)
-        context.setdefault("bundle_publisher", self.bundle_publisher)
+        if "bundle_publisher" in context:
+            raise ShadowTerminalUnavailable("terminal publisher override unavailable")
+        context["bundle_publisher"] = self.bundle_publisher
         return _write_terminal_success(registry, **context)
 
     def recover_success(self, registry: ShadowRegistry, *, report_id: str):
@@ -1016,7 +1060,8 @@ class ShadowTerminalWriter:
                     ).fetchall()
                     job = connection.execute(
                         "SELECT job_id,provider_id,window_id,universe_id,state_version,"
-                        "version_vector_sha256,run_status FROM shadow_job WHERE job_id=?",
+                        "version_vector_sha256,run_status,canonical_manifest_generation,"
+                        "canonical_manifest_sha256 FROM shadow_job WHERE job_id=?",
                         (committed[1],),
                     ).fetchone()
                     window = connection.execute(
@@ -1026,13 +1071,16 @@ class ShadowTerminalWriter:
                         (committed[0], committed[2]),
                     ).fetchone()
                     evidence_ref = connection.execute(
-                        "SELECT evidence_id,evidence_sha256,attached_session_report_id FROM "
-                        "shadow_evidence_ref WHERE evidence_id=? AND attached_session_report_id=?",
+                        "SELECT evidence_id,job_id,provider_id,window_id,session_id,"
+                        "completion_sha256,evidence_sha256,bundle_ref,bundle_sha256,"
+                        "attached_session_report_id FROM shadow_evidence_ref "
+                        "WHERE evidence_id=? AND attached_session_report_id=?",
                         (committed[4], report_id),
                     ).fetchone()
                     candidate_ref = connection.execute(
                         "SELECT candidate_id,evidence_id,job_id,provider_id,window_id,session_id,"
-                        "candidate_sha256 FROM shadow_candidate_ref WHERE candidate_id=?",
+                        "candidate_ref,candidate_sha256,quality_report_ref,quality_report_sha256 "
+                        "FROM shadow_candidate_ref WHERE candidate_id=?",
                         (committed[5],),
                     ).fetchone()
             finally:
@@ -1052,6 +1100,9 @@ class ShadowTerminalWriter:
         window_payload = pending.get("window_snapshot")
         digests = pending.get("digests")
         attestation_payload = pending.get("attestation")
+        evidence_ref_payload = pending.get("evidence_ref")
+        candidate_ref_payload = pending.get("candidate_ref")
+        candidate_manifest_payload = pending.get("candidate_manifest")
         if not all(
             isinstance(value, dict)
             for value in (
@@ -1061,6 +1112,8 @@ class ShadowTerminalWriter:
                 window_payload,
                 digests,
                 attestation_payload,
+                evidence_ref_payload,
+                candidate_ref_payload,
             )
         ):
             raise ShadowTerminalUnavailable("terminal recovery graph unavailable")
@@ -1073,6 +1126,53 @@ class ShadowTerminalWriter:
             "candidate_id": committed[5],
             "session_report_id": report_id,
         }
+        candidate_manifest_ok = False
+        if isinstance(candidate_manifest_payload, dict):
+            manifest_for_hash = dict(candidate_manifest_payload)
+            manifest_sha = manifest_for_hash.pop("manifest_sha256", None)
+            manifest_raw = (
+                json.dumps(
+                    manifest_for_hash,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            candidate_manifest_ok = (
+                manifest_sha == committed[14]
+                and hashlib.sha256(manifest_raw).hexdigest() == committed[14]
+                and candidate_manifest_payload.get("candidate_id") == committed[5]
+                and candidate_manifest_payload.get("evidence_id") == committed[4]
+                and candidate_manifest_payload.get("provider_id") == committed[0]
+                and candidate_manifest_payload.get("job_id") is None
+            )
+        candidate_ref_metadata_ok = True
+        if isinstance(candidate_manifest_payload, dict):
+            candidate_ref_metadata_ok = all(
+                candidate_ref_payload.get(
+                    "candidate_ref" if field == "normalized_object_ref" else field
+                )
+                == candidate_manifest_payload.get(field)
+                for field in (
+                    "candidate_id",
+                    "evidence_id",
+                    "provider_id",
+                    "normalized_object_ref",
+                    "quality_report_ref",
+                    "quality_report_sha256",
+                    "canonical_manifest_generation",
+                    "canonical_manifest_sha256",
+                    "reconciliation_id",
+                    "reconciliation_sha256",
+                    "reconciliation_status",
+                    "reconciliation_compared_counts",
+                    "reconciliation_mismatch_counts",
+                    "canonical_comparison_snapshot_sha256",
+                )
+            )
+        else:
+            candidate_ref_metadata_ok = False
         if identity_payload != expected_identity:
             raise ShadowTerminalUnavailable("terminal recovery identity drift")
         if (
@@ -1087,6 +1187,8 @@ class ShadowTerminalWriter:
             or job_payload.get("window_id") != job[2]
             or job_payload.get("universe_id") != job[3]
             or job_payload.get("version_vector_sha256") != job[5]
+            or candidate_ref_payload.get("canonical_manifest_generation") != job[7]
+            or candidate_ref_payload.get("canonical_manifest_sha256") != job[8]
             or job_payload.get("state_version") != job[4] - 1
             or job_payload.get("run_status") != "pending_normalization"
             or window_payload.get("provider_id") != window[0]
@@ -1099,10 +1201,50 @@ class ShadowTerminalWriter:
             or window_payload.get("window_state") != "observing"
             or evidence_ref is None
             or candidate_ref is None
-            or candidate_ref[1] != committed[4]
-            or candidate_ref[2] != committed[1]
-            or candidate_ref[5] != committed[3]
-            or candidate_ref[6] != committed[14]
+            or not candidate_manifest_ok
+            or not candidate_ref_metadata_ok
+            or evidence_ref_payload
+            != {
+                "evidence_id": evidence_ref[0],
+                "job_id": evidence_ref[1],
+                "provider_id": evidence_ref[2],
+                "window_id": evidence_ref[3],
+                "session_id": evidence_ref[4],
+                "completion_sha256": evidence_ref[5],
+                "evidence_sha256": evidence_ref[6],
+                "bundle_ref": evidence_ref[7],
+                "bundle_sha256": evidence_ref[8],
+                "attached_session_report_id": evidence_ref[9],
+            }
+            or candidate_ref_payload
+            != {
+                "candidate_id": candidate_ref[0],
+                "evidence_id": candidate_ref[1],
+                "job_id": candidate_ref[2],
+                "provider_id": candidate_ref[3],
+                "window_id": candidate_ref[4],
+                "session_id": candidate_ref[5],
+                "candidate_ref": candidate_ref[6],
+                "candidate_sha256": candidate_ref[7],
+                "quality_report_ref": candidate_ref[8],
+                "quality_report_sha256": candidate_ref[9],
+                "canonical_manifest_generation": candidate_ref_payload.get(
+                    "canonical_manifest_generation"
+                ),
+                "canonical_manifest_sha256": candidate_ref_payload.get("canonical_manifest_sha256"),
+                "reconciliation_id": candidate_ref_payload.get("reconciliation_id"),
+                "reconciliation_sha256": candidate_ref_payload.get("reconciliation_sha256"),
+                "reconciliation_status": candidate_ref_payload.get("reconciliation_status"),
+                "reconciliation_compared_counts": candidate_ref_payload.get(
+                    "reconciliation_compared_counts"
+                ),
+                "reconciliation_mismatch_counts": candidate_ref_payload.get(
+                    "reconciliation_mismatch_counts"
+                ),
+                "canonical_comparison_snapshot_sha256": candidate_ref_payload.get(
+                    "canonical_comparison_snapshot_sha256"
+                ),
+            }
             or digests.get("evidence_sha256") != committed[13]
             or digests.get("candidate_sha256") != committed[14]
             or digests.get("request_plan_sha256") != attestation[14]

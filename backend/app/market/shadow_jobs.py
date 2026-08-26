@@ -785,7 +785,7 @@ class ShadowBundlePublisher:
         if not self.root.is_absolute():
             raise ShadowJobUnavailable("shadow bundle root unavailable")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        root_fd = bundles_fd = destination_fd = lock_fd = -1
+        root_fd = bundles_fd = owners_fd = destination_fd = lock_fd = -1
         current = os.open(os.sep, flags)
         try:
             for component in self.root.parts[1:]:
@@ -794,6 +794,7 @@ class ShadowBundlePublisher:
                 current = next_fd
             root_fd = current
             bundles_fd = os.open("bundles", flags, dir_fd=root_fd)
+            owners_fd = os.open("owners", flags, dir_fd=root_fd)
             lock_fd = os.open(
                 "bundles.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd
             )
@@ -803,6 +804,9 @@ class ShadowBundlePublisher:
             if set(os.listdir(destination_fd)) != {"OWNER", "report.json", "COMMIT"}:
                 raise ShadowJobUnavailable("shadow bundle unavailable")
             owner = self._read_existing_file(destination_fd, "OWNER", limit=4096)
+            reservation = self._read_existing_file(owners_fd, bundle_id, limit=4096)
+            if owner != reservation:
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable")
             report = self._read_existing_file(destination_fd, "report.json")
             marker = self._read_existing_file(destination_fd, "COMMIT", limit=128)
             self._validate_owner(owner, bundle_id, hashlib.sha256(report).hexdigest())
@@ -831,6 +835,8 @@ class ShadowBundlePublisher:
                 os.close(destination_fd)
             if bundles_fd >= 0:
                 os.close(bundles_fd)
+            if owners_fd >= 0:
+                os.close(owners_fd)
             if root_fd >= 0:
                 os.close(root_fd)
             elif current >= 0:

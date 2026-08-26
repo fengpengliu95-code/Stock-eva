@@ -15,7 +15,7 @@ from backend.app.market.shadow_jobs import (
     ShadowOutcomeReportUnavailable,
 )
 from backend.app.market.shadow_scheduler import ShadowScheduler, build_shadow_scheduler
-from backend.app.market.shadow_terminal import ShadowTerminalWriter
+from backend.app.market.shadow_terminal import ShadowTerminalUnavailable, ShadowTerminalWriter
 from tests.test_market_provider_registry import _record, _sha, _terms
 
 
@@ -77,6 +77,14 @@ def test_scheduler_completed_exit_report_is_persisted(tmp_path):
     report = reporter.publish(status="completed", job_id="job-1", state_version=2)
     assert report.is_dir()
     assert json.loads((report / "report.json").read_text())["status"] == "completed"
+
+
+def test_terminal_writer_rejects_publisher_override(tmp_path):
+    primary = ShadowBundlePublisher(tmp_path / "primary")
+    alternate = ShadowBundlePublisher(tmp_path / "alternate")
+    with pytest.raises(ShadowTerminalUnavailable):
+        ShadowTerminalWriter(primary).write_success(None, bundle_publisher=alternate)
+    assert not alternate.root.exists()
 
 
 def test_production_shadow_factory_wires_scanner_publisher_writer_and_scheduler(tmp_path):
