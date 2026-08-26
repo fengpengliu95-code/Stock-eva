@@ -10,8 +10,11 @@ shadow window.
 ## Required evidence
 
 - four exact logical requests and fixed hashes, with symbols/date/unit gates;
+- official `ex_factor` and universe-detail schema enforcement, plus optional kline field bounds;
 - default-off and pre-client authorization/root/registry gates;
 - one-attempt, four-request, timeout/size/TLS/redirect/status/schema fail-closed behavior;
+- post-client CLI failures retaining sanitized `failure_class`, safe endpoint and actual
+  `provider_requests`, while pre-client blocks remain zero-request;
 - fake-transport call order, parameter/header secrecy and no real socket;
 - immutable isolated raw evidence bytes and retained sanitized failure audit;
 - no canonical/candidate/pointer/shadow-job/failover/Tushare effect;

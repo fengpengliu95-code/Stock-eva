@@ -13,16 +13,21 @@ Tasks10–13 lifecycle semantics.
 ## Implementation map
 
 1. `providers/tickflow.py`: pinned static contract, exact four logical requests, UTC bounds,
-   strict source-shaped parser, representative symbol validation, and discovery-only report.
+   strict source-shaped parser, representative symbol validation, strict
+   `CN_Equity_A`/`CN_Index` universe detail checks, allowlisted optional kline fields, and
+   discovery-only report.
 2. `providers/http.py`: fixed one-attempt/no-retry Task14 policy, exact host/TLS/no-redirect
-   transport boundary, sanitized typed failures and allowlisted observations.
+   transport boundary, sanitized typed failures, response/client close ownership, and allowlisted
+   observations.
 3. `shadow_evidence.py`: reuse immutable bundle-first writer; raw bytes are retained only under
    the isolated shadow evidence root.
 4. `config.py`, `storage/layout.py`, `providers/registry.py`: exact Task14 gates and isolated
    root validation; no canonical path widening.
 5. `cli.py`: plan remains zero-write; execute requires authorization plus acknowledgement and
    uses only the fixed `https://api.tickflow.org` client factory after all gates. Tests inject
-   fake transport/client factories; no real socket is used by the offline verification.
+   fake transport/client factories; post-client failures still preserve sanitized
+   `failure_class`, safe endpoint identity and actual `provider_requests`. No real socket is
+   used by the offline verification.
 
 ## Explicit non-changes
 

@@ -22,9 +22,13 @@ The pinned official facts as of 2026-08-26 are OpenAPI
 parameters. Provider symbols are `600000.SH`/`000001.SZ` and are explicitly mapped to canonical
 `sh.600000`/`sz.000001` only at the parser boundary. The response shapes are strict: batch `data`
 is a provider-symbol map of compact column arrays, factor `data` is a provider-symbol map of
-`[{timestamp, factor}]`, and universe/index `data` is `{symbols: [...]}`. Terms state that keys may
-not be shared, malicious large-scale scraping is forbidden, and lawful personal/commercial use
-is described subject to no unauthorized resale. Quota, retention, volume/amount units and
+`[{timestamp, ex_factor}]`, and universe/index `data` is a strict detail object containing
+`id`, `name`, `region`, `category`, `symbol_count`, `symbols`, with optional `description`.
+Kline rows require the core columns `timestamp/open/high/low/close/volume/amount`; optional
+official fields `open_interest`, `prev_close` and `settlement_price` are accepted only when
+present as column-length-aligned nullable numeric arrays. Terms state that keys may not be
+shared, malicious large-scale scraping is forbidden, and lawful personal/commercial use is
+described subject to no unauthorized resale. Quota, retention, volume/amount units and
 suspension semantics remain unconfirmed. These pages are evidence references, not approval.
 
 ## Functional requirements
@@ -44,6 +48,8 @@ suspension semantics remain unconfirmed. These pages are evidence references, no
 - FR-4: Daily requests MUST use `adjust=none`; source rows MUST remain source-shaped. The
   parser MUST strictly reject malformed OpenAPI response shapes, unknown factor/universe/index
   schemas, wrong dates, duplicates, missing endpoint responses and unbounded/unknown units.
+  `CN_Equity_A`/`CN_Index` identities, `symbol_count`, provider-symbol sets, required fields,
+  extra keys, column lengths and optional kline numeric fields MUST all be fail-closed.
   Unknown units MUST produce a typed discovery report and MUST NOT be a complete candidate.
 - FR-5: Transport MUST allow at most four requests and one attempt each, use 5-second
   connect/write/pool bounds and 30-second read bound, cap every response at 8 MiB, disable
@@ -55,8 +61,10 @@ suspension semantics remain unconfirmed. These pages are evidence references, no
   failover or production mutation may occur.
 - FR-7: CLI plan remains zero-write/zero-network. Execute requires
   `--external-authorization-id` and an explicit acknowledgement flag. The CLI MUST report
-  blocked/unavailable without constructing a client when gates fail. Tushare remains pre-client
-  blocked. Tests use an injected fake transport only.
+  blocked/unavailable without constructing a client when gates fail; after a post-client
+  failure it MUST still report sanitized `failure_class`, safe endpoint identity and actual
+  `provider_requests`. Tushare remains pre-client blocked. Tests use an injected fake transport
+  only.
 
 ## Non-functional requirements
 
@@ -126,7 +134,9 @@ Given four valid fake raw responses, when evidence is enabled,
 ### AC-7: CLI boundary (FR-7)
 
 Given plan mode or missing acknowledgement/authorization, when the CLI
-  runs, then provider requests and writes are zero. Tushare is blocked before client creation.
+  runs, then provider requests and writes are zero. After a post-client transport/schema
+  failure, the CLI still reports sanitized `failure_class`, safe endpoint identity and actual
+  request count. Tushare is blocked before client creation.
 
 ## Edge Cases
 

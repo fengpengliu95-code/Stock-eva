@@ -92,6 +92,9 @@ class _StreamingHttpxResponse:
         finally:
             self._response.close()
 
+    def close(self) -> None:
+        self._response.close()
+
 
 class _TickFlowHttpxTransport:
     """Adapt httpx streaming responses to the injected transport protocol."""
@@ -116,6 +119,9 @@ class _TickFlowHttpxTransport:
             )
         request = self._client.build_request(method, endpoint, timeout=timeout, **kwargs)
         return _StreamingHttpxResponse(self._client.send(request, stream=True))
+
+    def close(self) -> None:
+        self._client.close()
 
 
 def build_tickflow_client() -> HttpTransport:
@@ -411,6 +417,8 @@ class _AuthorizedCanarySession:
             try:
                 current = registry.read_status(self.provider_id)
             except Exception as exc:
+                if client is not None:
+                    client.close()
                 raise CanaryPermissionError("provider descriptor unavailable") from exc
             if (
                 current.state_version != self.expected_state_version
@@ -418,18 +426,25 @@ class _AuthorizedCanarySession:
                 or current.terms_review_id != self.expected_terms_review_id
                 or current.credential_env_name != self.credential_env_name
             ):
+                if client is not None:
+                    client.close()
                 raise CanaryPermissionError("provider descriptor changed")
-            permit = build_canary_permit(
-                self.provider_id,
-                registry,
-                external_authorization_id=self.external_authorization_id,
-                adapter_hash=adapter.ADAPTER_HASH,
-                endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
-                source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
-                environ={
-                    self.credential_env_name: self._credential_reader(self.credential_env_name)
-                },
-            )
+            try:
+                permit = build_canary_permit(
+                    self.provider_id,
+                    registry,
+                    external_authorization_id=self.external_authorization_id,
+                    adapter_hash=adapter.ADAPTER_HASH,
+                    endpoint_contract_hash=adapter.ENDPOINT_CONTRACT_HASH,
+                    source_schema_hash=adapter.SOURCE_SCHEMA_HASH,
+                    environ={
+                        self.credential_env_name: self._credential_reader(self.credential_env_name)
+                    },
+                )
+            except Exception:
+                if client is not None:
+                    client.close()
+                raise
             if client is None:
                 client = BoundedHttpClient(
                     self._client_factory(),
@@ -443,25 +458,45 @@ class _AuthorizedCanarySession:
                         max_response_bytes=8 * 1024 * 1024,
                     ),
                     allowed_server="https://api.tickflow.org",
+                    owns_client=True,
                 )
-            payloads[endpoint] = client.request_json(
-                adapter.request_endpoint(endpoint)
-                if hasattr(adapter, "request_endpoint")
-                else endpoint,
-                params=adapter.request_params(endpoint, trade_date, symbols),
-                headers=permit.headers(),
-            )
+            try:
+                payloads[endpoint] = client.request_json(
+                    adapter.request_endpoint(endpoint)
+                    if hasattr(adapter, "request_endpoint")
+                    else endpoint,
+                    params=adapter.request_params(endpoint, trade_date, symbols),
+                    headers=permit.headers(),
+                )
+            except Exception:
+                client.close()
+                raise
         object.__setattr__(
             self,
             "last_raw_content_by_endpoint",
             dict(client.raw_content_by_endpoint if client is not None else {}),
         )
-        return adapter.parse(
-            trade_date,
-            payloads,
-            request_count=client.request_count if client else 0,
-            symbols=symbols,
-        )
+        try:
+            result = adapter.parse(
+                trade_date,
+                payloads,
+                request_count=client.request_count if client else 0,
+                symbols=symbols,
+            )
+        except Exception as exc:
+            if client is not None:
+                client.close()
+            if hasattr(exc, "request_count"):
+                exc.request_count = client.request_count if client else 0
+            else:
+                try:
+                    exc.request_count = client.request_count if client else 0
+                except Exception:
+                    pass
+            raise
+        if client is not None:
+            client.close()
+        return result
 
 
 def build_authorized_canary_session(
@@ -539,6 +574,25 @@ def _response_headers(response: Any) -> Mapping[str, Any]:
     return headers if isinstance(headers, Mapping) else {}
 
 
+def _close_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(error, httpx.TimeoutException)
+
+
 def _response_bytes(response: Any, *, max_bytes: int | None = None) -> bytes:
     iterator = getattr(response, "iter_bytes", None)
     if callable(iterator):
@@ -583,14 +637,20 @@ class BoundedHttpClient:
         policy: HttpPolicy | None = None,
         sleeper: Callable[[float], None] = sleep,
         allowed_server: str | None = None,
+        owns_client: bool = False,
     ) -> None:
         self.client = client
         self.policy = policy or HttpPolicy()
         self._sleeper = sleeper
         self._allowed_server = allowed_server
+        self._owns_client = owns_client
         self.request_count = 0
         self.raw_content_by_endpoint: dict[str, bytes] = {}
         self._last_result: HttpResult | None = None
+
+    def close(self) -> None:
+        if self._owns_client:
+            _close_response(self.client)
 
     @property
     def last_result(self) -> HttpResult | None:
@@ -645,7 +705,16 @@ class BoundedHttpClient:
                     follow_redirects=False,
                     verify=True,
                 )
-            except TimeoutError:
+            except Exception as error:
+                if not _is_timeout_error(error):
+                    if attempts >= self.policy.max_attempts:
+                        raise ProviderHttpError(
+                            "transport_error",
+                            endpoint=identity,
+                            attempts=attempts,
+                            request_count=self.request_count,
+                        ) from None
+                    continue
                 if attempts >= self.policy.max_attempts:
                     raise ProviderHttpError(
                         "timeout",
@@ -654,16 +723,6 @@ class BoundedHttpClient:
                         request_count=self.request_count,
                     ) from None
                 continue
-            except Exception:
-                if attempts >= self.policy.max_attempts:
-                    raise ProviderHttpError(
-                        "transport_error",
-                        endpoint=identity,
-                        attempts=attempts,
-                        request_count=self.request_count,
-                    ) from None
-                continue
-
             try:
                 status = int(getattr(response, "status_code", 0))
             except (TypeError, ValueError):
@@ -676,6 +735,7 @@ class BoundedHttpClient:
             response_url = getattr(response, "url", None)
             if self._allowed_server:
                 if not response_url:
+                    _close_response(response)
                     raise ProviderHttpError(
                         "endpoint_url_unavailable",
                         endpoint=identity,
@@ -686,6 +746,7 @@ class BoundedHttpClient:
                     parsed_url = urlsplit(str(response_url))
                     expected = urlsplit(self._allowed_server)
                 except ValueError:
+                    _close_response(response)
                     raise ProviderHttpError(
                         "redirect_or_endpoint_mismatch",
                         endpoint=identity,
@@ -695,6 +756,7 @@ class BoundedHttpClient:
                 try:
                     response_port = parsed_url.port
                 except ValueError:
+                    _close_response(response)
                     raise ProviderHttpError(
                         "redirect_or_endpoint_mismatch",
                         endpoint=identity,
@@ -716,6 +778,7 @@ class BoundedHttpClient:
                     or parsed_url.path != identity
                     or parsed_url.fragment
                 ):
+                    _close_response(response)
                     raise ProviderHttpError(
                         "redirect_or_endpoint_mismatch",
                         endpoint=identity,
@@ -723,6 +786,7 @@ class BoundedHttpClient:
                         request_count=self.request_count,
                     )
             if getattr(response, "history", ()):
+                _close_response(response)
                 raise ProviderHttpError(
                     "redirect_or_endpoint_mismatch",
                     endpoint=identity,
@@ -732,10 +796,12 @@ class BoundedHttpClient:
             try:
                 content = _response_bytes(response, max_bytes=self.policy.max_response_bytes)
             except ProviderHttpError as error:
+                _close_response(response)
                 error.endpoint = identity
                 error.attempts = attempts
                 error.request_count = self.request_count
                 raise
+            _close_response(response)
             if len(content) > self.policy.max_response_bytes:
                 raise ProviderHttpError(
                     "response_oversize",

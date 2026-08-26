@@ -6,7 +6,7 @@ qualification record. BaoStock remains the only canonical provider.
 
 | Provider | Official records | Disposition |
 | --- | --- | --- |
-| TickFlow | [OpenAPI](https://docs.tickflow.org/zh-Hans/api-reference/openapi.json), server `https://api.tickflow.org`, [terms](https://tickflow.org/legal/terms-of-service.md) | `discovered`; the pinned four-request contract is GET `/v1/klines/batch` (`symbols`, `period=1d`, `start_time`, `end_time`, `adjust=none`), GET `/v1/klines/ex-factors` (`symbols`, `start_time`, `end_time`), and GET `/v1/universes/CN_Equity_A` plus `/v1/universes/CN_Index` with no query parameters; `x-api-key` is the documented header. External codes use `600000.SH`/`000001.SZ`; canonical `sh.600000`/`sz.000001` is retained separately. Batch `data` is a symbol-to-compact-column-array map, factors are symbol-to-entry-array, and universe/index are `{symbols: [...]}`. Terms mention non-sharing, no malicious large-scale scraping and lawful personal/commercial use subject to no unauthorized resale; suspension semantics, units, quota and retention remain unverified. |
+| TickFlow | [OpenAPI](https://docs.tickflow.org/zh-Hans/api-reference/openapi.json), server `https://api.tickflow.org`, [terms](https://tickflow.org/legal/terms-of-service.md) | `discovered`; the pinned four-request contract is GET `/v1/klines/batch` (`symbols`, `period=1d`, `start_time`, `end_time`, `adjust=none`), GET `/v1/klines/ex-factors` (`symbols`, `start_time`, `end_time`), and GET `/v1/universes/CN_Equity_A` plus `/v1/universes/CN_Index` with no query parameters; `x-api-key` is the documented header. External codes use `600000.SH`/`000001.SZ`; canonical `sh.600000`/`sz.000001` is retained separately. Batch `data` is a provider-symbol to compact-column-array map, factors are provider-symbol to `[{timestamp, ex_factor}]`, and universe/index are strict detail objects with `id`, `name`, `region`, `category`, `symbol_count`, `symbols`, and optional `description`. Terms mention non-sharing, no malicious large-scale scraping and lawful personal/commercial use subject to no unauthorized resale; suspension semantics, units, quota and retention remain unverified. |
 | Tushare Pro | [HTTP](https://tushare.pro/document/1?doc_id=40), [daily](https://tushare.pro/document/1?doc_id=27), [adj_factor](https://tushare.pro/document/2?doc_id=28), [suspend_d](https://tushare.pro/document/2?doc_id=214), [trade_cal](https://tushare.pro/document/2?doc_id=26), [index_daily](https://tushare.pro/document/1?doc_id=95), [stock_basic](https://tushare.pro/document/1?doc_id=25), [points](https://tushare.pro/document/1?doc_id=108), [service terms](https://tushare.pro/document/1?doc_id=405), [user agreement](https://tushare.pro/document/1?doc_id=409) | `discovered`; official transport record documents HTTP only, so HTTPS token use is prohibited until separately proven. |
 
 The closed credential map is:
@@ -33,7 +33,9 @@ typed and sanitized; raw payloads, URLs, headers and credentials are not reports
 TickFlow's offline plan requests `daily_batch`, `ex_factors`, `universe(CN_Equity_A)` and
 `indexes(CN_Index)` in that order. Daily rows remain explicitly unadjusted, while
 factor/corporate-action units, suspension semantics and quota/retention remain explicit
-discovery gaps. Tushare's
+discovery gaps. Execute-mode failures retain only sanitized `failure_class`, safe endpoint
+identity and actual post-client `provider_requests`; pre-client blocks remain zero-request.
+Tushare's
 offline plan requests `daily`, `adj_factor`, `suspend_d`, `trade_cal` and
 `index_daily` for one exact trade date. Tushare `vol` remains source `lots` and
 `amount` remains source `thousand_cny`; conversion is not performed by the

@@ -100,7 +100,11 @@ class StorageLayout:
                 return Path("/private/var", *absolute.parts[2:])
             return absolute
 
-        canonical = tuple(canonical_roots) + (self.provider_evidence_root,)
+        canonical = tuple(canonical_roots) + (
+            self.provider_evidence_root,
+            self.settings.local_control_dir,
+            self.provider_registry_database.parent,
+        )
         root_resolved = physical(root)
         for candidate in canonical:
             candidate_resolved = physical(candidate)

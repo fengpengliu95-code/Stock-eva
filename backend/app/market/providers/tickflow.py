@@ -15,6 +15,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -187,7 +188,9 @@ def _validate_rows(
                     raise TickFlowDiscoveryError("numeric_value_invalid") from None
 
 
-_KLINE_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "volume", "amount"})
+_KLINE_CORE_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "volume", "amount"})
+_KLINE_OPTIONAL_COLUMNS = frozenset({"open_interest", "prev_close", "settlement_price"})
+_KLINE_COLUMNS = _KLINE_CORE_COLUMNS | _KLINE_OPTIONAL_COLUMNS
 
 
 def _official_data(payload: Any) -> Any:
@@ -204,7 +207,11 @@ def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], .
     seen: set[tuple[str, int]] = set()
     for provider_symbol, compact in data.items():
         canonical = tickflow_to_canonical_symbol(provider_symbol)
-        if not isinstance(compact, dict) or set(compact) != _KLINE_COLUMNS:
+        if (
+            not isinstance(compact, dict)
+            or not _KLINE_CORE_COLUMNS <= set(compact)
+            or set(compact) - _KLINE_COLUMNS
+        ):
             raise TickFlowDiscoveryError("schema_drift")
         lengths = {len(value) for value in compact.values() if isinstance(value, list)}
         if len(lengths) != 1 or any(not isinstance(value, list) for value in compact.values()):
@@ -217,7 +224,8 @@ def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], .
             if identity in seen:
                 raise TickFlowDiscoveryError("duplicate_row")
             seen.add(identity)
-            row = {field: compact[field][index] for field in _KLINE_COLUMNS}
+            row_fields = _KLINE_CORE_COLUMNS | (_KLINE_OPTIONAL_COLUMNS & set(compact))
+            row = {field: compact[field][index] for field in row_fields}
             for field in ("open", "high", "low", "close"):
                 if (
                     type(row[field]) not in (int, float)
@@ -230,6 +238,14 @@ def _official_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], .
                     type(row[field]) not in (int, float)
                     or not isfinite(float(row[field]))
                     or row[field] < 0
+                ):
+                    raise TickFlowDiscoveryError("numeric_value_invalid")
+            for field in _KLINE_OPTIONAL_COLUMNS & set(compact):
+                optional = compact[field][index]
+                if optional is not None and (
+                    type(optional) not in (int, float)
+                    or not isfinite(float(optional))
+                    or optional < 0
                 ):
                     raise TickFlowDiscoveryError("numeric_value_invalid")
             rows.append({"provider_symbol": provider_symbol, "symbol": canonical, **row})
@@ -249,10 +265,10 @@ def _official_factor_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], 
         if not isinstance(entries, list) or not entries:
             raise TickFlowDiscoveryError("empty_endpoint")
         for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"timestamp", "factor"}:
+            if not isinstance(entry, dict) or set(entry) != {"timestamp", "ex_factor"}:
                 raise TickFlowDiscoveryError("schema_drift")
             timestamp = entry["timestamp"]
-            factor = entry["factor"]
+            factor = entry["ex_factor"]
             if type(timestamp) is not int or not start_ms <= timestamp <= end_ms:
                 raise TickFlowDiscoveryError("wrong_date")
             identity = (provider_symbol, timestamp)
@@ -265,15 +281,33 @@ def _official_factor_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], 
     return tuple(rows)
 
 
-def _official_universe(data: Any) -> tuple[dict[str, Any], ...]:
+def _official_universe(data: Any, *, expected_id: str) -> tuple[dict[str, Any], ...]:
+    if not isinstance(data, dict):
+        raise TickFlowDiscoveryError("schema_drift")
+    required = {"id", "name", "region", "category", "symbol_count", "symbols"}
+    allowed = required | {"description"}
+    if set(data) - allowed or not required <= set(data):
+        raise TickFlowDiscoveryError("schema_drift")
     if (
-        not isinstance(data, dict)
-        or set(data) != {"symbols"}
+        data["id"] != expected_id
+        or any(
+            type(data[field]) is not str or not data[field]
+            for field in ("id", "name", "region", "category")
+        )
+        or type(data["symbol_count"]) is not int
+        or data["symbol_count"] < 0
         or not isinstance(data["symbols"], list)
+        or (
+            "description" in data
+            and data["description"] is not None
+            and type(data["description"]) is not str
+        )
     ):
         raise TickFlowDiscoveryError("schema_drift")
     symbols = tuple(data["symbols"])
-    if not symbols or len(set(symbols)) != len(symbols):
+    if any(type(symbol) is not str for symbol in symbols):
+        raise TickFlowDiscoveryError("symbol_schema")
+    if data["symbol_count"] != len(symbols) or len(set(symbols)) != len(symbols):
         raise TickFlowDiscoveryError("symbol_set_invalid")
     if any(_PROVIDER_SYMBOL.fullmatch(symbol) is None for symbol in symbols):
         raise TickFlowDiscoveryError("symbol_schema")
@@ -366,8 +400,12 @@ class TickFlowAdapter:
             official_factors = _official_factor_rows(
                 _official_data(payloads["ex_factors"]), trade_date
             )
-            official_universe = _official_universe(_official_data(payloads["universe"]))
-            official_indexes = _official_universe(_official_data(payloads["indexes"]))
+            official_universe = _official_universe(
+                _official_data(payloads["universe"]), expected_id="CN_Equity_A"
+            )
+            official_indexes = _official_universe(
+                _official_data(payloads["indexes"]), expected_id="CN_Index"
+            )
             if symbols:
                 expected = {canonical_to_tickflow_symbol(symbol) for symbol in symbols}
                 daily_symbols = {row["provider_symbol"] for row in official_daily}
@@ -587,11 +625,14 @@ class TickFlowCanaryRunner:
             or not _valid_authorization_id(external_authorization_id)
         ):
             raise PermissionError("provider request acknowledgement is required")
+        registry_path = getattr(self.registry, "path", None)
         canonical = tuple(
             root
             for root in (
                 getattr(self.settings, "local_market_dataset_root", None),
                 getattr(self.settings, "nas_market_dataset_root", None),
+                getattr(self.settings, "local_control_dir", None),
+                Path(registry_path).parent if registry_path is not None else None,
             )
             if root is not None
         )

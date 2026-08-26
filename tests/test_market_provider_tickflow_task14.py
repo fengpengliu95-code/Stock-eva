@@ -1,14 +1,22 @@
 """Task14 RED contract: all tests use an injected offline transport."""
 
 import base64
+import hashlib
 import json
 import os
+import sys
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
 
 from backend.app.market.providers.http import HttpPolicy, ProviderHttpError
+from backend.app.market.providers.registry import ShadowRegistry, exact_credential_env
+from backend.app.market.providers.shadow_contracts import (
+    AdmissionState,
+    ShadowProviderRecord,
+    TermsEvidence,
+)
 from backend.app.market.providers.tickflow import (
     TICKFLOW_SERVER,
     TickFlowAdapter,
@@ -27,6 +35,11 @@ class Response:
         self.headers = {}
         self.content = json.dumps(payload if payload is not None else {}).encode()
         self.url = url or f"{TICKFLOW_SERVER}/v1/ok"
+        self.history = ()
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
 
 
 class Transport:
@@ -40,6 +53,9 @@ class Transport:
         if response.url == f"{TICKFLOW_SERVER}/v1/ok":
             response.url = f"{TICKFLOW_SERVER}{endpoint}"
         return response
+
+    def close(self):
+        pass
 
 
 def _valid_payloads(trade_date=date(2026, 8, 20)):
@@ -63,13 +79,86 @@ def _valid_payloads(trade_date=date(2026, 8, 20)):
         }
         for symbol in provider_symbols
     }
-    factors = {symbol: [{"timestamp": start, "factor": 1.0}] for symbol in provider_symbols}
+    factors = {symbol: [{"timestamp": start, "ex_factor": 1.0}] for symbol in provider_symbols}
     return [
         Response(payload={"data": daily}),
         Response(payload={"data": factors}),
-        Response(payload={"data": {"symbols": list(provider_symbols)}}),
-        Response(payload={"data": {"symbols": ["000001.SZ"]}}),
+        Response(
+            payload={
+                "data": {
+                    "id": "CN_Equity_A",
+                    "name": "CN Equity",
+                    "region": "CN",
+                    "category": "equity",
+                    "symbol_count": len(provider_symbols),
+                    "symbols": list(provider_symbols),
+                    "description": None,
+                }
+            }
+        ),
+        Response(
+            payload={
+                "data": {
+                    "id": "CN_Index",
+                    "name": "CN Index",
+                    "region": "CN",
+                    "category": "index",
+                    "symbol_count": 1,
+                    "symbols": ["000001.SZ"],
+                    "description": None,
+                }
+            }
+        ),
     ]
+
+
+def _task14_registry(tmp_path):
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    registry = ShadowRegistry(tmp_path / "provider-registry.sqlite3")
+    registry.initialize()
+    registry.put_provider(
+        ShadowProviderRecord(
+            provider_id="tickflow",
+            admission_state=AdmissionState.DISCOVERED,
+            adapter_hash=TickFlowAdapter.ADAPTER_HASH,
+            endpoint_contract_hash=TickFlowAdapter.ENDPOINT_CONTRACT_HASH,
+            source_schema_hash=TickFlowAdapter.SOURCE_SCHEMA_HASH,
+            normalizer_hash=digest("normalizer"),
+            reconciliation_policy_hash=digest("policy"),
+            credential_env_name=exact_credential_env("tickflow"),
+            intended_use="internal research",
+            retention_decision="local bounded",
+            quota_contract="pending",
+            required_fields_json="[]",
+            unit_contract_json="{}",
+            state_version=0,
+            quarantine_reason=None,
+        )
+    )
+    terms = TermsEvidence.build(
+        terms_evidence_id="terms-tickflow",
+        provider_id="tickflow",
+        official_url_allowlist=(
+            "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json",
+            "https://tickflow.org/legal/terms-of-service.md",
+        ),
+        content_object_relpath="terms.txt",
+        content_bytes=b"reviewed terms",
+        contract_version="r2f3-terms-v1",
+        as_of_date="2026-08-26",
+        reviewer="reviewer-1",
+        review_id="review-1",
+        approved_intended_use="internal research",
+        approved_retention="local bounded",
+        approved_credential_mode="environment-only",
+        approved_quota_decision="pending-canary",
+    )
+    registry.put_terms_evidence(terms)
+    attached = registry.attach_terms_to_provider("tickflow", terms)
+    registry.transition("tickflow", "canary", expected_state_version=attached.state_version)
+    return registry
 
 
 def test_task14_contract_has_exact_four_requests_and_fixed_server():
@@ -118,6 +207,30 @@ def test_task14_http_policy_is_one_attempt_and_four_requests():
     assert policy.read_timeout_seconds == 30
 
 
+@pytest.mark.parametrize(
+    "symbols",
+    [
+        ("bad", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+        ("sh.600000", "sh.600001", "sh.600002", "sh.600003"),
+        ("sh.600000", "sh.600000", "sh.600002", "sh.600003", "sh.600004"),
+    ],
+)
+def test_task14_malformed_symbols_are_typed_and_sanitized(symbols):
+    with pytest.raises(TickFlowDiscoveryError) as exc:
+        TickFlowCanaryRunner._offline_for_tests(
+            transport=Transport(_valid_payloads()),
+            trade_date=date(2026, 8, 20),
+            symbols=symbols,
+            environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+        )
+    assert exc.value.failure_class in {
+        "symbol_schema",
+        "symbol_count_invalid",
+        "symbol_not_main_board",
+    }
+    assert "bad" not in str(exc.value)
+
+
 @pytest.mark.parametrize("status", [401, 403, 429, 500])
 def test_task14_status_failure_is_typed_and_no_retry(status):
     transport = Transport([Response(status_code=status)])
@@ -131,6 +244,34 @@ def test_task14_status_failure_is_typed_and_no_retry(status):
     assert exc.value.attempts == 1
     assert len(transport.calls) == 1
     assert "secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize("timeout_error", ["read", "connect"])
+def test_task14_httpx_timeout_exception_maps_to_timeout_attempt_one(timeout_error):
+    import httpx
+
+    class TimeoutTransport(Transport):
+        def __init__(self):
+            super().__init__([])
+
+        def request(self, method, endpoint, **kwargs):
+            self.calls.append((method, endpoint, kwargs))
+            if timeout_error == "read":
+                raise httpx.ReadTimeout("secret timeout", request=None)
+            raise httpx.ConnectTimeout("secret timeout", request=None)
+
+    transport = TimeoutTransport()
+    with pytest.raises(ProviderHttpError) as exc:
+        TickFlowCanaryRunner._offline_for_tests(
+            transport=transport,
+            trade_date=date(2026, 8, 20),
+            symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+            environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+        )
+    assert exc.value.failure_class == "timeout"
+    assert exc.value.attempts == 1
+    assert exc.value.request_count == 1
+    assert "secret timeout" not in str(exc.value)
 
 
 def test_task14_unknown_units_are_discovery_not_complete():
@@ -246,6 +387,60 @@ def test_task14_missing_terms_has_zero_credential_lookup_client_or_write(tmp_pat
     assert not (tmp_path / "isolated-shadow").exists()
 
 
+def test_task14_shadow_root_overlap_checks_control_and_registry_before_getenv(
+    tmp_path, monkeypatch
+):
+    registry = SimpleNamespace(
+        path=tmp_path / "control" / "provider-registry.sqlite3",
+        read_status=lambda _provider: pytest.fail(
+            "registry read must not occur after root overlap"
+        ),
+    )
+
+    class Settings:
+        provider_shadow_enabled = True
+        provider_shadow_execute_enabled = True
+        local_market_dataset_root = tmp_path / "canonical"
+        nas_market_dataset_root = tmp_path / "nas"
+        local_control_dir = tmp_path / "control"
+
+    class Layout:
+        provider_shadow_root = tmp_path / "shadow"
+
+        def validate_provider_shadow_root(self, *, canonical_roots):
+            assert canonical_roots == (
+                tmp_path / "canonical",
+                tmp_path / "nas",
+                tmp_path / "control",
+                tmp_path / "control",
+            )
+            raise PermissionError("shadow root overlaps canonical root")
+
+    class SpyEnvironment(dict):
+        lookups = 0
+
+        def get(self, key, default=None):
+            self.lookups += 1
+            return super().get(key, default)
+
+    spy_environment = SpyEnvironment(os.environ)
+    monkeypatch.setattr(os, "environ", spy_environment)
+    runner = TickFlowCanaryRunner(
+        settings=Settings(),
+        layout=Layout(),
+        registry=registry,
+        client_factory=lambda: pytest.fail("client constructed"),
+    )
+    with pytest.raises(PermissionError, match="shadow root overlaps canonical root"):
+        runner.execute(
+            date(2026, 8, 20),
+            symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+            external_authorization_id="auth-overlap",
+            acknowledge_provider_requests=True,
+        )
+    assert spy_environment.lookups == 0
+
+
 @pytest.mark.parametrize("payload", [{"data": {"items": []}}, {"data": ["not-a-row"]}])
 def test_task14_schema_drift_is_typed_and_stops_after_no_retry(payload):
     transport = Transport([Response(payload=payload), *_valid_payloads()[1:]])
@@ -260,14 +455,11 @@ def test_task14_schema_drift_is_typed_and_stops_after_no_retry(payload):
 
 
 def test_task14_redirect_and_oversize_are_fail_closed():
-    class Redirect(Response):
-        history = (object(),)
-
+    redirect_response = Response(payload={"data": [{"ok": True}]})
+    redirect_response.history = (object(),)
     with pytest.raises(ProviderHttpError) as redirect:
         TickFlowCanaryRunner._offline_for_tests(
-            transport=Transport(
-                [Redirect(payload={"data": [{"ok": True}]})] + _valid_payloads()[1:]
-            ),
+            transport=Transport([redirect_response] + _valid_payloads()[1:]),
             trade_date=date(2026, 8, 20),
             symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
             environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
@@ -336,6 +528,28 @@ def test_task14_streaming_response_is_bounded_before_content_access():
     assert exc.value.failure_class == "response_oversize"
 
 
+def test_task14_response_objects_close_on_success_and_failure():
+    success_payloads = _valid_payloads()
+    successful = success_payloads[0]
+    TickFlowCanaryRunner._offline_for_tests(
+        transport=Transport(success_payloads),
+        trade_date=date(2026, 8, 20),
+        symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+        environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+    )
+    assert successful.close_calls == 1
+
+    failing = Response(payload={"data": []}, url="http://api.tickflow.org/v1/klines/batch")
+    with pytest.raises(ProviderHttpError):
+        TickFlowCanaryRunner._offline_for_tests(
+            transport=Transport([failing] + _valid_payloads()[1:]),
+            trade_date=date(2026, 8, 20),
+            symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+            environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+        )
+    assert failing.close_calls == 1
+
+
 def test_task14_raw_response_bytes_are_in_immutable_isolated_evidence(tmp_path):
     transport = Transport(_valid_payloads())
     first_raw = transport.responses[0].content
@@ -355,6 +569,58 @@ def test_task14_raw_response_bytes_are_in_immutable_isolated_evidence(tmp_path):
     assert bundle.evidence_id == result.evidence_id
 
 
+def test_task14_authorized_session_closes_owned_client_on_success_and_failure(tmp_path):
+    registry = _task14_registry(tmp_path)
+
+    class ClosableTransport(Transport):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    success_transport = ClosableTransport(_valid_payloads())
+    session = __import__(
+        "backend.app.market.providers.http", fromlist=["build_authorized_canary_session"]
+    ).build_authorized_canary_session(
+        "tickflow",
+        registry,
+        external_authorization_id="auth-close-success",
+        environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+        client_factory=lambda: success_transport,
+    )
+    TickFlowAdapter().execute(
+        date(2026, 8, 20),
+        symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+        session=session,
+    )
+    assert success_transport.close_calls == 1
+
+    failing_payloads = _valid_payloads()
+    bad = json.loads(failing_payloads[1].content)
+    bad["data"]["600000.SH"][0]["factor"] = 1.0
+    failing_payloads[1] = Response(payload=bad)
+    failing_transport = ClosableTransport(failing_payloads)
+    failing_session = __import__(
+        "backend.app.market.providers.http", fromlist=["build_authorized_canary_session"]
+    ).build_authorized_canary_session(
+        "tickflow",
+        registry,
+        external_authorization_id="auth-close-failure",
+        environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
+        client_factory=lambda: failing_transport,
+    )
+    with pytest.raises(TickFlowDiscoveryError) as exc:
+        TickFlowAdapter().execute(
+            date(2026, 8, 20),
+            symbols=("sh.600000", "sh.600001", "sh.600002", "sh.600003", "sh.600004"),
+            session=failing_session,
+        )
+    assert exc.value.request_count == 4
+    assert failing_transport.close_calls == 1
+
+
 def official_payloads():
     start = 1787184000000
     compact = {
@@ -368,9 +634,29 @@ def official_payloads():
     }
     return {
         "daily_batch": {"data": {"600000.SH": compact}},
-        "ex_factors": {"data": {"600000.SH": [{"timestamp": start, "factor": 1.0}]}},
-        "universe": {"data": {"symbols": ["600000.SH"]}},
-        "indexes": {"data": {"symbols": ["000001.SZ"]}},
+        "ex_factors": {"data": {"600000.SH": [{"timestamp": start, "ex_factor": 1.0}]}},
+        "universe": {
+            "data": {
+                "id": "CN_Equity_A",
+                "name": "CN Equity",
+                "region": "CN",
+                "category": "equity",
+                "symbol_count": 1,
+                "symbols": ["600000.SH"],
+                "description": None,
+            }
+        },
+        "indexes": {
+            "data": {
+                "id": "CN_Index",
+                "name": "CN Index",
+                "region": "CN",
+                "category": "index",
+                "symbol_count": 1,
+                "symbols": ["000001.SZ"],
+                "description": None,
+            }
+        },
     }
 
 
@@ -429,3 +715,158 @@ def test_task14_missing_response_url_is_rejected_when_host_pinned():
             environ={"STOCK_EVA_TICKFLOW_TOKEN": "secret"},
         )
     assert exc.value.failure_class == "endpoint_url_unavailable"
+
+
+def test_task14_official_factor_entry_uses_ex_factor():
+    parsed = TickFlowAdapter().parse(date(2026, 8, 20), official_payloads(), request_count=4)
+    assert parsed.factors[0]["ex_factor"] == 1.0
+    assert "factor" not in parsed.factors[0]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p["ex_factors"]["data"]["600000.SH"][0].update({"factor": 1.0}),
+        lambda p: p["universe"]["data"].pop("id"),
+        lambda p: p["universe"]["data"].update({"description_extra": None}),
+        lambda p: p["universe"]["data"].update({"symbol_count": 2}),
+        lambda p: p["universe"]["data"].update({"symbols": [1]}),
+        lambda p: p["indexes"]["data"].update({"id": "CN_Equity_A"}),
+    ],
+)
+def test_task14_official_factor_and_universe_boundaries_are_rejected(mutate):
+    payloads = official_payloads()
+    mutate(payloads)
+    with pytest.raises(TickFlowDiscoveryError):
+        TickFlowAdapter().parse(date(2026, 8, 20), payloads, request_count=4)
+
+
+def test_task14_kline_allowlisted_optional_columns_are_preserved():
+    payloads = official_payloads()
+    compact = payloads["daily_batch"]["data"]["600000.SH"]
+    compact.update(
+        {
+            "open_interest": [0.0],
+            "prev_close": [9.5],
+            "settlement_price": [10.25],
+        }
+    )
+    parsed = TickFlowAdapter().parse(date(2026, 8, 20), payloads, request_count=4)
+    assert parsed.daily[0]["open_interest"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "optional_value",
+    [[0.0, 1.0], [float("nan")], [None, 1.0]],
+)
+def test_task14_kline_optional_columns_require_strict_values(optional_value):
+    payloads = official_payloads()
+    payloads["daily_batch"]["data"]["600000.SH"]["open_interest"] = optional_value
+    with pytest.raises(TickFlowDiscoveryError):
+        TickFlowAdapter().parse(date(2026, 8, 20), payloads, request_count=4)
+
+
+def test_task14_cli_preclient_failure_keeps_zero_provider_requests(tmp_path, monkeypatch, capsys):
+    import backend.app.cli as cli_module
+    import backend.app.market.providers.tickflow as tickflow_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            local_control_dir=tmp_path / "control",
+            provider_registry_database_name="provider-registry.sqlite3",
+            provider_shadow_root=tmp_path / "shadow",
+            provider_evidence_root=tmp_path / "evidence",
+        ),
+    )
+
+    def blocked_execute(self, *args, **kwargs):
+        raise PermissionError("provider shadow execution is disabled")
+
+    monkeypatch.setattr(tickflow_module.TickFlowCanaryRunner, "execute", blocked_execute)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-provider-canary",
+            "--provider",
+            "tickflow",
+            "--date",
+            "2026-08-20",
+            "--symbols",
+            "sh.600000",
+            "sh.600001",
+            "sh.600002",
+            "sh.600003",
+            "sh.600004",
+            "--execute",
+            "--external-authorization-id",
+            "auth-cli-preclient",
+            "--acknowledge-provider-requests",
+        ],
+    )
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["provider_requests"] == 0
+    assert payload["writes"] is False
+    assert payload["error_code"] == "canary_execution_blocked"
+
+
+def test_task14_cli_postclient_failure_reports_sanitized_failure_and_request_count(
+    tmp_path, monkeypatch, capsys
+):
+    import backend.app.cli as cli_module
+    import backend.app.market.providers.tickflow as tickflow_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            local_control_dir=tmp_path / "control",
+            provider_registry_database_name="provider-registry.sqlite3",
+            provider_shadow_root=tmp_path / "shadow",
+            provider_evidence_root=tmp_path / "evidence",
+        ),
+    )
+
+    def failing_execute(self, *args, **kwargs):
+        raise ProviderHttpError(
+            "timeout",
+            endpoint="/v1/klines/batch",
+            attempts=1,
+            request_count=1,
+        )
+
+    monkeypatch.setattr(tickflow_module.TickFlowCanaryRunner, "execute", failing_execute)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-provider-canary",
+            "--provider",
+            "tickflow",
+            "--date",
+            "2026-08-20",
+            "--symbols",
+            "sh.600000",
+            "sh.600001",
+            "sh.600002",
+            "sh.600003",
+            "sh.600004",
+            "--execute",
+            "--external-authorization-id",
+            "auth-cli-postclient",
+            "--acknowledge-provider-requests",
+        ],
+    )
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["provider_requests"] == 1
+    assert payload["failure_class"] == "timeout"
+    assert payload["endpoint"] == "/v1/klines/batch"
+    assert payload["writes"] is False

@@ -964,14 +964,30 @@ def main() -> int:
                 )
             )
             return 0
-        except Exception:
+        except Exception as exc:
+            provider_requests = getattr(exc, "request_count", 0)
+            provider_requests = (
+                provider_requests
+                if type(provider_requests) is int and provider_requests >= 0
+                else 0
+            )
+            failure_class = getattr(exc, "failure_class", None)
+            if not isinstance(failure_class, str) or not failure_class:
+                failure_class = None
+            endpoint = getattr(exc, "endpoint", None)
+            if not isinstance(endpoint, str) or not endpoint:
+                endpoint = None
             payload = {
                 "status": "unavailable",
                 "provider": args.provider,
                 "error_code": "canary_execution_blocked",
-                "provider_requests": 0,
+                "provider_requests": provider_requests,
                 "writes": False,
             }
+            if failure_class is not None:
+                payload["failure_class"] = failure_class
+            if endpoint is not None:
+                payload["endpoint"] = endpoint
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
     if args.command in {"market-provider-shadow", "market-provider-promote"}:
