@@ -607,6 +607,59 @@ def test_read_verified_returns_only_an_immutable_committed_bundle(tmp_path):
     assert publisher.read_verified("read-verified") == payload
 
 
+def test_read_verified_rejects_recreated_path_after_committed_bundle_rename(tmp_path):
+    root = tmp_path / "shadow"
+    publisher = ShadowBundlePublisher(root)
+    payload = {"kind": "terminal-pending", "outcome": "pending", "value": 1}
+    committed = publisher.publish("renamed-bundle", payload)
+    moved = tmp_path / "moved-bundle"
+    committed.rename(moved)
+    recreated = root / "bundles" / "renamed-bundle"
+    recreated.mkdir(mode=0o700)
+    for name in ("OWNER", "report.json", "COMMIT"):
+        target = recreated / name
+        target.write_bytes((moved / name).read_bytes())
+        os.chmod(target, 0o600)
+        with target.open("rb") as handle:
+            os.fsync(handle.fileno())
+    directory_fd = os.open(recreated, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    with pytest.raises(ShadowJobUnavailable):
+        publisher.read_verified("renamed-bundle")
+
+
+@pytest.mark.parametrize("tamper", ["missing", "symlink", "same-inode-rewrite"])
+def test_read_verified_rejects_binding_tampering(tmp_path, tamper):
+    root = tmp_path / "shadow"
+    publisher = ShadowBundlePublisher(root)
+    publisher.publish("binding-tamper", {"value": 1})
+    binding = root / "owners" / "binding-tamper.binding"
+    original = binding.read_bytes()
+    if tamper == "missing":
+        binding.unlink()
+    elif tamper == "symlink":
+        target = tmp_path / "binding-target"
+        target.write_bytes(original)
+        os.chmod(target, 0o600)
+        binding.unlink()
+        binding.symlink_to(target)
+    else:
+        value = json.loads(original.decode("utf-8"))
+        value["directory"]["ino"] += 1
+        rewritten = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        binding.write_bytes(rewritten)
+        os.chmod(binding, 0o600)
+        with binding.open("rb") as handle:
+            os.fsync(handle.fileno())
+    with pytest.raises(ShadowJobUnavailable):
+        publisher.read_verified("binding-tamper")
+
+
 @pytest.mark.parametrize("target", ["OWNER", "report.json", "COMMIT"])
 def test_read_verified_rejects_file_permission_or_replacement_tampering(tmp_path, target):
     root = tmp_path / "shadow"

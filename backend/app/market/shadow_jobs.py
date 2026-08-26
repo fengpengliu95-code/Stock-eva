@@ -810,6 +810,15 @@ class ShadowBundlePublisher:
             report = self._read_existing_file(destination_fd, "report.json")
             marker = self._read_existing_file(destination_fd, "COMMIT", limit=128)
             self._validate_owner(owner, bundle_id, hashlib.sha256(report).hexdigest())
+            owner_value = json.loads(owner.decode("utf-8"))
+            binding_directory = self._read_owner_binding(
+                owners_fd,
+                bundle_id,
+                hashlib.sha256(report).hexdigest(),
+                owner_value["publisher_id"],
+            )
+            if binding_directory is None or binding_directory != expected[:2]:
+                raise ShadowJobUnavailable("shadow bundle ownership unavailable")
             if marker != hashlib.sha256(report).hexdigest().encode() + b"\n":
                 raise ShadowJobUnavailable("shadow bundle unavailable")
             records = {
