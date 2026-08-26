@@ -1067,6 +1067,7 @@ class ShadowOutcomeReporter:
             "worker_exception",
             "missing_context",
             "success",
+            "completed",
             "failure",
             "budget_exhausted",
             "unavailable",

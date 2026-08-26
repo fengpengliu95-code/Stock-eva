@@ -72,6 +72,13 @@ def test_scheduler_idle_publishes_run_level_outcome(tmp_path):
     }
 
 
+def test_scheduler_completed_exit_report_is_persisted(tmp_path):
+    reporter = ShadowOutcomeReporter(ShadowBundlePublisher(tmp_path / "shadow"))
+    report = reporter.publish(status="completed", job_id="job-1", state_version=2)
+    assert report.is_dir()
+    assert json.loads((report / "report.json").read_text())["status"] == "completed"
+
+
 def test_production_shadow_factory_wires_scanner_publisher_writer_and_scheduler(tmp_path):
     registry = ShadowRegistry.in_memory()
     registry.initialize()

@@ -257,9 +257,15 @@ class CanonicalSessionCandidateReader:
             prefix = {"SSE": "sh", "SZSE": "sz"}.get(str(exchange).upper())
             if prefix is None:
                 raise ShadowCanonicalUnavailable("canonical exchange unavailable")
+            raw_symbol = str(symbol).lower()
+            canonical_symbol = (
+                raw_symbol
+                if raw_symbol.startswith(("sh.", "sz."))
+                else f"{prefix}.{raw_symbol.zfill(6)}"
+            )
             canonical_rows.append(
                 CanonicalSessionRow(
-                    symbol=f"{prefix}.{symbol.zfill(6)}",
+                    symbol=canonical_symbol,
                     trade_date=row_date,
                     open=open_,
                     high=high,

@@ -56,7 +56,21 @@ def _publish_same_bundle_process(arguments):
 
 
 def _write_canonical_dataset(
-    root, *, digest_override=None, generation="g1", trade_date=date(2026, 1, 2)
+    root,
+    *,
+    digest_override=None,
+    generation="g1",
+    trade_date=date(2026, 1, 2),
+    symbol="000001",
+    open_=1.0,
+    high=1.1,
+    low=0.9,
+    close=1.0,
+    preclose=1.0,
+    volume=100.0,
+    amount=100.0,
+    turnover_rate=0.1,
+    pct_change=0.0,
 ):
     root.mkdir(parents=True, exist_ok=True)
     (root / ".stock-eva-dataset.json").write_text(
@@ -71,16 +85,16 @@ def _write_canonical_dataset(
     try:
         connection.execute(
             f"""COPY (
-                SELECT DATE '{trade_date.isoformat()}' AS trade_date, '000001'::VARCHAR AS symbol,
+                SELECT DATE '{trade_date.isoformat()}' AS trade_date, '{symbol}'::VARCHAR AS symbol,
                        'stock'::VARCHAR AS security_type, 'SSE'::VARCHAR AS exchange,
-                       'main'::VARCHAR AS board, 1.0::DOUBLE AS open, 1.1::DOUBLE AS high,
-                       0.9::DOUBLE AS low, 1.0::DOUBLE AS close, 1.0::DOUBLE AS preclose,
-                       100.0::DOUBLE AS volume, 100.0::DOUBLE AS amount,
-                       0.1::DOUBLE AS turnover_rate, 0.0::DOUBLE AS pct_change,
+                       'main'::VARCHAR AS board, {open_}::DOUBLE AS open, {high}::DOUBLE AS high,
+                       {low}::DOUBLE AS low, {close}::DOUBLE AS close, {preclose}::DOUBLE AS preclose,
+                       {volume}::DOUBLE AS volume, {amount}::DOUBLE AS amount,
+                       {turnover_rate}::DOUBLE AS turnover_rate, {pct_change}::DOUBLE AS pct_change,
                        1.0::DOUBLE AS adjust_factor, 'none'::VARCHAR AS price_adjustment,
                        true::BOOLEAN AS is_trading, false::BOOLEAN AS is_suspended,
                        false::BOOLEAN AS is_st, 'baostock'::VARCHAR AS source,
-                       '000001.{trade_date.isoformat()}'::VARCHAR AS source_record_id,
+                       '{symbol}.{trade_date.isoformat()}'::VARCHAR AS source_record_id,
                        TIMESTAMPTZ '{trade_date.isoformat()} 08:00:00+00' AS ingested_at,
                        'valid'::VARCHAR AS quality_status, '[]'::JSON AS quality_issues
             ) TO ? (FORMAT PARQUET)""",
