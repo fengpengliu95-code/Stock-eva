@@ -55,19 +55,23 @@ def _publish_same_bundle_process(arguments):
         return "error"
 
 
-def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
+def _write_canonical_dataset(
+    root, *, digest_override=None, generation="g1", trade_date=date(2026, 1, 2)
+):
     root.mkdir(parents=True, exist_ok=True)
     (root / ".stock-eva-dataset.json").write_text(
         json.dumps({"dataset": "stock-eva-market", "schema_version": 2}), encoding="utf-8"
     )
-    object_path = root / "bars" / "source=baostock" / "year=2026" / "month=01"
+    object_path = (
+        root / "bars" / "source=baostock" / f"year={trade_date:%Y}" / f"month={trade_date:%m}"
+    )
     object_path.mkdir(parents=True)
-    parquet = object_path / "date=2026-01-02.parquet"
+    parquet = object_path / f"date={trade_date.isoformat()}.parquet"
     connection = duckdb.connect(":memory:")
     try:
         connection.execute(
-            """COPY (
-                SELECT DATE '2026-01-02' AS trade_date, '000001'::VARCHAR AS symbol,
+            f"""COPY (
+                SELECT DATE '{trade_date.isoformat()}' AS trade_date, '000001'::VARCHAR AS symbol,
                        'stock'::VARCHAR AS security_type, 'SSE'::VARCHAR AS exchange,
                        'main'::VARCHAR AS board, 1.0::DOUBLE AS open, 1.1::DOUBLE AS high,
                        0.9::DOUBLE AS low, 1.0::DOUBLE AS close, 1.0::DOUBLE AS preclose,
@@ -76,8 +80,8 @@ def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
                        1.0::DOUBLE AS adjust_factor, 'none'::VARCHAR AS price_adjustment,
                        true::BOOLEAN AS is_trading, false::BOOLEAN AS is_suspended,
                        false::BOOLEAN AS is_st, 'baostock'::VARCHAR AS source,
-                       '000001.2026-01-02'::VARCHAR AS source_record_id,
-                       TIMESTAMPTZ '2026-01-02 08:00:00+00' AS ingested_at,
+                       '000001.{trade_date.isoformat()}'::VARCHAR AS source_record_id,
+                       TIMESTAMPTZ '{trade_date.isoformat()} 08:00:00+00' AS ingested_at,
                        'valid'::VARCHAR AS quality_status, '[]'::JSON AS quality_issues
             ) TO ? (FORMAT PARQUET)""",
             [str(parquet)],
@@ -86,7 +90,7 @@ def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
         connection.close()
     raw = parquet.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    final_parquet = object_path / f"date=2026-01-02_{digest[:12]}.parquet"
+    final_parquet = object_path / f"date={trade_date.isoformat()}_{digest[:12]}.parquet"
     parquet.rename(final_parquet)
     parquet = final_parquet
     lineage = {
@@ -104,7 +108,7 @@ def _write_canonical_dataset(root, *, digest_override=None, generation="g1"):
         "path": str(parquet.relative_to(root)),
         "sha256": digest_override or digest,
         "row_count": 1,
-        "trade_date": "2026-01-02",
+        "trade_date": trade_date.isoformat(),
         "source": "baostock",
         **lineage,
     }
@@ -582,6 +586,24 @@ def test_publisher_rejects_permission_change_on_idempotent_reopen(tmp_path, targ
         publisher.publish("permission-reopen", {"value": 1})
 
 
+def test_read_verified_returns_only_an_immutable_committed_bundle(tmp_path):
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    payload = {"kind": "terminal-pending", "outcome": "pending", "value": 1}
+    publisher.publish("read-verified", payload)
+    assert publisher.read_verified("read-verified") == payload
+
+
+@pytest.mark.parametrize("target", ["OWNER", "report.json", "COMMIT"])
+def test_read_verified_rejects_file_permission_or_replacement_tampering(tmp_path, target):
+    root = tmp_path / "shadow"
+    publisher = ShadowBundlePublisher(root)
+    publisher.publish("read-tamper", {"value": 1})
+    path = root / "bundles" / "read-tamper" / target
+    os.chmod(path, 0o640)
+    with pytest.raises(ShadowJobUnavailable):
+        publisher.read_verified("read-tamper")
+
+
 def _owner_bytes(identity, payload):
     raw = (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
@@ -633,6 +655,25 @@ def test_publisher_recovers_owned_empty_directory_after_mkdir_crash(tmp_path, mo
     monkeypatch.setattr(ShadowBundlePublisher, "_write_new_file", original_write)
     restarted = ShadowBundlePublisher(tmp_path / "shadow")
     assert restarted.publish("mkdir-crash", {"value": 1}) == destination
+
+
+def test_publisher_binds_existing_empty_directory_after_bind_crash(tmp_path, monkeypatch):
+    publisher = ShadowBundlePublisher(tmp_path / "shadow")
+    original_bind = ShadowBundlePublisher._bind_owner
+
+    def crash_after_mkdir(*_args, **_kwargs):
+        raise RuntimeError("crash after mkdir before binding")
+
+    monkeypatch.setattr(ShadowBundlePublisher, "_bind_owner", crash_after_mkdir)
+    with pytest.raises(RuntimeError, match="before binding"):
+        publisher.publish("bind-crash", {"value": 1})
+    destination = tmp_path / "shadow" / "bundles" / "bind-crash"
+    assert destination.is_dir() and not tuple(destination.iterdir())
+    monkeypatch.setattr(ShadowBundlePublisher, "_bind_owner", original_bind)
+    assert (
+        ShadowBundlePublisher(tmp_path / "shadow").publish("bind-crash", {"value": 1})
+        == destination
+    )
 
 
 def test_publisher_rejects_foreign_empty_directory_without_ownership_token(tmp_path):
@@ -1121,7 +1162,7 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
             "tickflow",
             window.window_id,
             session_id,
-            "candidate",
+            "f" * 64,
             "f" * 64,
             "quality",
             _sha("quality"),
@@ -1285,3 +1326,4 @@ def test_public_terminal_success_writes_new_graph_and_preserves_evidence(tmp_pat
         ("terminal-report-1-pending", "shadow-terminal-pending", "pending"),
         ("terminal-report-1", "shadow-terminal-success", "success"),
     ]
+    assert writer.recover_success(registry, report_id=identity.session_report_id).is_dir()

@@ -1,0 +1,266 @@
+"""Production-store end-to-end coverage for the isolated shadow lane."""
+
+import json
+from datetime import date
+
+from backend.app.market.canonical_comparison import (
+    CanonicalCandidateReader,
+    PublishedCanonicalComparison,
+)
+from backend.app.market.providers.registry import ShadowRegistry
+from backend.app.market.shadow_calendar import ConfirmedCalendarReader
+from backend.app.market.shadow_candidates import ShadowCandidateReader, ShadowCandidateStore
+from backend.app.market.shadow_evidence import (
+    ShadowAttempt,
+    ShadowCompletion,
+    ShadowEvidenceControlSink,
+    ShadowEvidenceReader,
+    ShadowEvidenceStore,
+    ShadowLogicalRequest,
+    ShadowLogicalRequestPlan,
+    ShadowRequestCompletion,
+)
+from backend.app.market.shadow_jobs import ShadowBundlePublisher, ShadowJobStore
+from backend.app.market.shadow_normalize import REVIEWED_TUSHARE_UNIT_CONTRACT, normalize_tushare
+from backend.app.market.shadow_reconciliation import (
+    CanonicalSessionCandidateReader,
+    reconcile,
+)
+from backend.app.market.shadow_terminal import ShadowTerminalWriter, TerminalGraphIdentity
+from tests.test_market_canonical_comparison import write_canonical_fixture
+from tests.test_market_provider_registry import _record, _sha, _terms
+from tests.test_market_shadow_jobs import _calendar_root, _write_canonical_dataset
+
+
+def test_real_shadow_stores_reconcile_attach_and_terminal_success(tmp_path):
+    comparison_root = tmp_path / "comparison"
+    comparison_root.mkdir()
+    capability_dataset, canonical_candidate, canonical_evidence = write_canonical_fixture(
+        comparison_root
+    )
+    canonical_capability = PublishedCanonicalComparison.open(
+        CanonicalCandidateReader(
+            capability_dataset,
+            canonical_candidate,
+            evidence_root=canonical_evidence,
+        )
+    )
+    capability_snapshot = canonical_capability.verify().snapshot
+    assert capability_snapshot is not None
+    dataset = tmp_path / "canonical-scan"
+    _write_canonical_dataset(dataset, trade_date=date(2026, 8, 20))
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][0]["universe_id"] = "main-board-v1"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    canonical_side = CanonicalSessionCandidateReader(dataset, trade_date=date(2026, 8, 20)).read()
+
+    calendar_parent = tmp_path / "calendar-root"
+    calendar_parent.mkdir()
+    calendar_root = _calendar_root(calendar_parent)
+    calendar = ConfirmedCalendarReader(
+        calendar_root.resolve(),
+        provider_id="tushare",
+        window_id="tushare-window-1",
+        universe_id="main-board-v1",
+        universe_sha256="a" * 64,
+    )
+    snapshot = calendar.read(date(2026, 8, 20), date(2026, 8, 21))
+    version_vector = _sha("e2e-version")
+
+    registry = ShadowRegistry.in_memory()
+    registry.initialize()
+    registry.put_provider(_record("tushare"))
+    terms = _terms("tushare")
+    registry.put_terms_evidence(terms)
+    registry.attach_terms_to_provider("tushare", terms)
+    state = registry.transition("tushare", "canary", expected_state_version=1)
+    registry.transition("tushare", "shadow", expected_state_version=state.state_version)
+    window = registry.ensure_window(
+        "tushare", version_vector, snapshot.calendar_generation, snapshot.calendar_sha256
+    )
+
+    job_id = "job-e2e"
+    session_id = "session-e2e"
+    request = ShadowLogicalRequest(
+        job_id=job_id,
+        provider_id="tushare",
+        window_id=window.window_id,
+        ordinal=0,
+        request_id="request-e2e",
+        endpoint="daily",
+        endpoint_class="daily",
+        role="bars",
+        trade_date=date(2026, 8, 20),
+        symbol_or_index_shard="all",
+        schema_contract_hash=_sha("schema"),
+        unit_contract_hash=_sha("units"),
+    )
+    plan = ShadowLogicalRequestPlan(
+        job_id=job_id, provider_id="tushare", window_id=window.window_id, requests=(request,)
+    )
+    job = ShadowJobStore(registry).enqueue(
+        job_id=job_id,
+        provider_id="tushare",
+        window_id=window.window_id,
+        trade_date="2026-08-20",
+        universe_id="main-board-v1",
+        canonical_manifest_generation=capability_snapshot.dataset_manifest_generation,
+        canonical_manifest_sha256=capability_snapshot.dataset_manifest_sha256,
+        version_vector_sha256=version_vector,
+    )
+    ShadowJobStore(registry).lease(job.job_id, owner="e2e-worker")
+
+    page = {
+        "page_identity": "request-e2e:page-000001",
+        "rows": [{"ts_code": "600000.SH", "trade_date": "20260820"}],
+    }
+    completion = ShadowCompletion(
+        job_id=job_id,
+        provider_id="tushare",
+        window_id=window.window_id,
+        session_id=session_id,
+        evidence_id="evidence-e2e",
+        request_plan_sha256=plan.request_plan_sha256,
+        requests=(
+            ShadowRequestCompletion(
+                ordinal=0,
+                request_id=request.request_id,
+                endpoint="daily",
+                endpoint_class="daily",
+                final_attempt_id="attempt-e2e",
+                pages=(page,),
+            ),
+        ),
+    )
+    attempt = ShadowAttempt(
+        attempt_id="attempt-e2e",
+        job_id=job_id,
+        provider_id="tushare",
+        ordinal=0,
+        outcome="success",
+        rows=tuple(page["rows"]),
+        pages=(page,),
+        started_at="2026-08-20T08:00:00Z",
+        completed_at="2026-08-20T08:00:01Z",
+    )
+    evidence_store = ShadowEvidenceStore(tmp_path / "shadow-evidence")
+    evidence_store.publish(plan=plan, completion=completion, attempts=(attempt,))
+    evidence_reader = ShadowEvidenceReader(tmp_path / "shadow-evidence")
+    evidence = evidence_reader.read("evidence-e2e")
+    evidence_result = ShadowEvidenceControlSink(registry).persist_evidence_ready(
+        evidence=evidence,
+        reader=evidence_reader,
+        plan=plan,
+        completion=completion,
+        attempts=(attempt,),
+        session_id=session_id,
+        trade_date=date(2026, 8, 20),
+        calendar_generation=snapshot.calendar_generation,
+        calendar_sha256=snapshot.calendar_sha256,
+        universe_sha256="a" * 64,
+        version_vector_sha256=version_vector,
+    )
+    assert evidence_result.outcome == "evidence_ready"
+    evidence_ready_job = ShadowJobStore(registry).get(job_id)
+    assert evidence_ready_job is not None
+
+    secondary = normalize_tushare(
+        {
+            "daily": [
+                {
+                    "ts_code": "000001.SH",
+                    "trade_date": "20260820",
+                    "open": 1,
+                    "high": 1.1,
+                    "low": 0.9,
+                    "close": 1,
+                    "pre_close": 1,
+                    "vol": 1,
+                    "amount": 0.1,
+                }
+            ],
+            "universe": [{"ts_code": "000001.SH", "list_status": "L"}],
+            "indexes": [],
+            "adj_factor": [
+                {
+                    "ts_code": "000001.SH",
+                    "trade_date": "20260820",
+                    "anchor_date": "2026-08-20",
+                    "adj_factor": 1,
+                    "prev_adj_factor": 1,
+                    "factor_semantics": "multiplicative_back_adjust",
+                }
+            ],
+            "suspend_d": [],
+            "stock_basic": [{"ts_code": "000001.SH", "list_status": "L"}],
+            "units": {
+                "vol": "lots",
+                "amount": "thousand_cny",
+                "factor_semantics": "multiplicative_back_adjust",
+                "factor_anchor": "trade_date",
+                "factor_direction": "back_adjust",
+            },
+            "job_id": job_id,
+            "window_id": window.window_id,
+            "session_id": session_id,
+            "version_vector_sha256": version_vector,
+        },
+        trade_date=date(2026, 8, 20),
+        universe_id="main-board-v1",
+        contract=REVIEWED_TUSHARE_UNIT_CONTRACT,
+    )
+    mismatch_secondary = secondary.model_copy(
+        update={
+            "rows": (secondary.rows[0].model_copy(update={"close": 2}),),
+            "normalized_sha256": "0" * 64,
+        }
+    )
+    assert reconcile(canonical_side, mismatch_secondary).status == "material_mismatch"
+    reconciliation = reconcile(canonical_side, secondary)
+    assert reconciliation.status == "ready", reconciliation.model_dump()
+    candidate_store = ShadowCandidateStore(tmp_path / "shadow-candidate")
+    manifest = candidate_store.publish(
+        secondary,
+        evidence_reader=evidence_reader,
+        evidence_id=evidence.evidence_id,
+        reconciliation_report=reconciliation,
+        canonical_comparison=canonical_capability,
+        registry=registry,
+    )
+    candidate_reader = ShadowCandidateReader(
+        tmp_path / "shadow-candidate", evidence_reader=evidence_reader, registry=registry
+    )
+    attached = candidate_store.attach(
+        candidate_reader=candidate_reader,
+        candidate_id=manifest.candidate_id,
+        canonical_comparison=canonical_capability,
+        registry=registry,
+    )
+    assert attached.manifest_sha256 == manifest.manifest_sha256
+
+    terminal = ShadowTerminalWriter(ShadowBundlePublisher(tmp_path / "terminal-bundles"))
+    identity = TerminalGraphIdentity(
+        "tushare",
+        job_id,
+        window.window_id,
+        session_id,
+        evidence.evidence_id,
+        manifest.candidate_id,
+        "terminal-e2e",
+    )
+    attestation = terminal.write_success(
+        registry,
+        plan=plan,
+        evidence_reader=evidence_reader,
+        candidate_reader=candidate_reader,
+        identity=identity,
+        calendar_generation=snapshot.calendar_generation,
+        calendar_sha256=snapshot.calendar_sha256,
+        universe_sha256="a" * 64,
+        version_vector_sha256=version_vector,
+        expected_job_state_version=evidence_ready_job.state_version,
+        expected_window_state_version=window.state_version,
+        snapshot=snapshot,
+    )
+    assert attestation.terminal_outcome == "success"

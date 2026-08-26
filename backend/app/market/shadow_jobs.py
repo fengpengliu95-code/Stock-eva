@@ -481,26 +481,49 @@ class ShadowBundlePublisher:
         )
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+                or info.st_size > limit
+            ):
                 raise OSError("shadow bundle file unavailable")
-            raw = os.read(fd, limit + 1)
+            raw_parts: list[bytes] = []
+            size = 0
+            while size <= limit:
+                chunk = os.read(fd, min(1024 * 1024, limit + 1 - size))
+                if not chunk:
+                    break
+                raw_parts.append(chunk)
+                size += len(chunk)
+            raw = b"".join(raw_parts)
             after = os.fstat(fd)
-            if len(raw) > limit or info.st_size != len(raw) or info.st_ino != after.st_ino:
+            if (
+                len(raw) > limit
+                or info.st_size != len(raw)
+                or ShadowBundlePublisher._fingerprint(info)
+                != ShadowBundlePublisher._fingerprint(after)
+            ):
                 raise OSError("shadow bundle file changed")
             return raw
         finally:
             os.close(fd)
 
     @staticmethod
-    def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
         return (
             info.st_dev,
             info.st_ino,
             info.st_mode,
+            info.st_nlink,
             info.st_size,
             info.st_mtime_ns,
             getattr(info, "st_ctime_ns", 0),
         )
+
+    @staticmethod
+    def _directory_fingerprint(info: os.stat_result) -> tuple[int, int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
 
     @staticmethod
     def _owner_payload(
@@ -678,10 +701,19 @@ class ShadowBundlePublisher:
             if (
                 not stat.S_ISREG(before.st_mode)
                 or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
                 or before.st_size > limit
             ):
                 raise ShadowJobUnavailable("shadow bundle file conflict")
-            raw = os.read(fd, min(limit, len(expected) + 1))
+            raw_parts: list[bytes] = []
+            size = 0
+            while size <= len(expected):
+                chunk = os.read(fd, min(1024 * 1024, len(expected) + 1 - size))
+                if not chunk:
+                    break
+                raw_parts.append(chunk)
+                size += len(chunk)
+            raw = b"".join(raw_parts)
             after = os.fstat(fd)
             if (
                 raw != expected
@@ -743,6 +775,66 @@ class ShadowBundlePublisher:
                     os.close(descriptor)
             os.close(current)
             raise
+
+    def read_verified(self, bundle_id: str) -> dict[str, Any]:
+        """Read one committed bundle through held no-follow descriptors."""
+        try:
+            _safe(bundle_id)
+        except (TypeError, ValueError):
+            raise ShadowJobUnavailable("shadow bundle identity unavailable") from None
+        if not self.root.is_absolute():
+            raise ShadowJobUnavailable("shadow bundle root unavailable")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        root_fd = bundles_fd = destination_fd = lock_fd = -1
+        current = os.open(os.sep, flags)
+        try:
+            for component in self.root.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=current)
+                os.close(current)
+                current = next_fd
+            root_fd = current
+            bundles_fd = os.open("bundles", flags, dir_fd=root_fd)
+            lock_fd = os.open(
+                "bundles.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd
+            )
+            destination_fd = os.open(bundle_id, flags, dir_fd=bundles_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            expected = self._fingerprint(os.fstat(destination_fd))
+            if set(os.listdir(destination_fd)) != {"OWNER", "report.json", "COMMIT"}:
+                raise ShadowJobUnavailable("shadow bundle unavailable")
+            owner = self._read_existing_file(destination_fd, "OWNER", limit=4096)
+            report = self._read_existing_file(destination_fd, "report.json")
+            marker = self._read_existing_file(destination_fd, "COMMIT", limit=128)
+            self._validate_owner(owner, bundle_id, hashlib.sha256(report).hexdigest())
+            if marker != hashlib.sha256(report).hexdigest().encode() + b"\n":
+                raise ShadowJobUnavailable("shadow bundle unavailable")
+            records = {
+                "OWNER": self._capture_file(destination_fd, "OWNER", owner),
+                "report.json": self._capture_file(destination_fd, "report.json", report),
+                "COMMIT": self._capture_file(destination_fd, "COMMIT", marker),
+            }
+            self._verify_destination(bundles_fd, bundle_id, destination_fd, expected)
+            self._verify_files(destination_fd, records)
+            payload = json.loads(report.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ShadowJobUnavailable("shadow bundle unavailable")
+            return payload
+        except ShadowJobUnavailable:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ShadowJobUnavailable("shadow bundle unavailable") from exc
+        finally:
+            if lock_fd >= 0:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            if bundles_fd >= 0:
+                os.close(bundles_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+            elif current >= 0:
+                os.close(current)
 
     def publish(self, identity: str, payload: dict[str, Any]) -> Path:
         try:
@@ -851,7 +943,26 @@ class ShadowBundlePublisher:
                     {"OWNER", "report.json", "COMMIT"},
                 ):
                     raise ShadowJobUnavailable("shadow bundle identity conflict")
-                if not entries and (owner_created or owner_directory is None):
+                if not entries and owner_created:
+                    raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+                if not entries and owner_directory is None:
+                    before_directory = os.fstat(destination_fd)
+                    if (
+                        not stat.S_ISDIR(before_directory.st_mode)
+                        or stat.S_IMODE(before_directory.st_mode) != 0o700
+                        or before_directory.st_nlink < 2
+                    ):
+                        raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+                    after_directory = os.fstat(destination_fd)
+                    if self._directory_fingerprint(before_directory) != self._directory_fingerprint(
+                        after_directory
+                    ):
+                        raise ShadowJobUnavailable("shadow bundle ownership unavailable")
+                    self._bind_owner(owners_fd, identity, owner_token, destination_fd)
+                    owner_directory = expected_fingerprint[:2]
+                elif entries and owner_directory is None:
+                    # An unbound non-empty directory is not a recoverable mkdir
+                    # gap: without the inode binding it may be foreign evidence.
                     raise ShadowJobUnavailable("shadow bundle ownership unavailable")
                 try:
                     existing_owner = (
@@ -863,8 +974,6 @@ class ShadowBundlePublisher:
                     existing_value = json.loads(existing_owner.decode("utf-8"))
                     if owner_value["publisher_id"] != existing_value["publisher_id"]:
                         raise ShadowJobUnavailable("shadow bundle ownership unavailable")
-                    if owner_directory is None:
-                        self._bind_owner(owners_fd, identity, owner_token, destination_fd)
                     if "report.json" in entries:
                         existing_raw = self._read_existing_file(destination_fd, "report.json")
                         if existing_raw != raw:

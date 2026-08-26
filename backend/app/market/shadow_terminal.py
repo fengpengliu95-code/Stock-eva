@@ -529,7 +529,8 @@ def _write_terminal_success_graph(
         continuity_connection = registry._connection_for_read()
         try:
             duplicate = continuity_connection.execute(
-                "SELECT 1 FROM session_report WHERE provider_id=? AND window_id=? AND trade_date=? LIMIT 1",
+                "SELECT 1 FROM session_report WHERE provider_id=? AND window_id=? AND trade_date=? "
+                "AND outcome IN ('success','failure','skip','unavailable','mismatch') LIMIT 1",
                 (identity.provider_id, identity.window_id, current_trade_date.isoformat()),
             ).fetchone()
             previous = continuity_connection.execute(
@@ -571,6 +572,8 @@ def _write_terminal_success_graph(
 
         registry._with_transaction(reset_continuity)
         raise ShadowTerminalUnavailable("terminal confirmed session continuity unavailable")
+    snapshot_payload = snapshot.model_dump(mode="json")
+    snapshot_payload["version_vector_sha256"] = version_vector_sha256
     bundle_payload = {
         # The DB CAS is the success decision.  Until that commit is durable,
         # this immutable bundle is deliberately non-success and quarantinable.
@@ -586,7 +589,7 @@ def _write_terminal_success_graph(
             "candidate_id": identity.candidate_id,
             "session_report_id": identity.session_report_id,
         },
-        "snapshot": snapshot.model_dump(mode="json"),
+        "snapshot": snapshot_payload,
         "job_snapshot": {
             "job_id": current_job[0],
             "provider_id": current_job[1],
@@ -597,6 +600,8 @@ def _write_terminal_success_graph(
             "version_vector_sha256": current_job[6],
         },
         "window_snapshot": {
+            "provider_id": identity.provider_id,
+            "window_id": identity.window_id,
             "consecutive_sessions": current_window[0],
             "window_state": current_window[1],
             "calendar_generation": current_window[2],
@@ -757,7 +762,7 @@ def _write_terminal_success_graph(
                 version_vector_sha256,
                 evidence_sha,
                 candidate_sha,
-                f"bundles/{report_id}",
+                f"bundles/{pending_bundle_id}",
                 report_sha,
                 job[1] + 1,
             ),
@@ -877,6 +882,30 @@ def _write_terminal_success_graph(
     success_payload["outcome"] = "success"
     success_payload["pending_bundle_id"] = pending_bundle_id
     success_payload["attestation_ref"] = attested.attestation_id
+    with registry._lock(shared=True):
+        post_connection = registry._connection_for_read()
+        try:
+            post_job = post_connection.execute(
+                "SELECT state_version,run_status FROM shadow_job WHERE job_id=?",
+                (identity.job_id,),
+            ).fetchone()
+            post_window = post_connection.execute(
+                "SELECT consecutive_sessions,state_version,window_state FROM qualification_window "
+                "WHERE provider_id=? AND window_id=?",
+                (identity.provider_id, identity.window_id),
+            ).fetchone()
+        finally:
+            if not registry._memory:
+                post_connection.close()
+    if post_job is None or post_window is None:
+        raise ShadowTerminalUnavailable("terminal committed graph unavailable")
+    success_payload["job_snapshot"] = dict(bundle_payload["job_snapshot"])
+    success_payload["job_snapshot"]["state_version"] = post_job[0]
+    success_payload["job_snapshot"]["run_status"] = post_job[1]
+    success_payload["window_snapshot"] = dict(bundle_payload["window_snapshot"])
+    success_payload["window_snapshot"]["state_version"] = post_window[1]
+    success_payload["window_snapshot"]["consecutive_sessions"] = post_window[0]
+    success_payload["window_snapshot"]["window_state"] = post_window[2]
     try:
         bundle_publisher.publish(report_id, success_payload)
     except Exception as exc:
@@ -946,21 +975,7 @@ class ShadowTerminalWriter:
             raise ShadowTerminalUnavailable("terminal recovery unavailable")
         pending_id = f"{report_id}-pending"
         try:
-            directory_fd = os.open(
-                self.bundle_publisher.root / "bundles" / pending_id,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-            try:
-                report_fd = os.open(
-                    "report.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd
-                )
-                try:
-                    raw = os.read(report_fd, 16 * 1024 * 1024 + 1)
-                finally:
-                    os.close(report_fd)
-            finally:
-                os.close(directory_fd)
-            pending = json.loads(raw.decode("utf-8"))
+            pending = self.bundle_publisher.read_verified(pending_id)
             if (
                 not isinstance(pending, dict)
                 or pending.get("kind") != "shadow-terminal-pending"
@@ -976,19 +991,191 @@ class ShadowTerminalWriter:
             connection = registry._connection_for_read()
             try:
                 committed = connection.execute(
-                    "SELECT terminal_attestation_id FROM session_report WHERE session_report_id=? AND outcome='success'",
+                    "SELECT provider_id,job_id,window_id,session_id,evidence_id,candidate_id,"
+                    "terminal_attestation_id,report_version,trade_date,calendar_generation,"
+                    "calendar_sha256,universe_sha256,version_vector_sha256,evidence_sha256,"
+                    "candidate_sha256,report_ref,report_sha256,state_version FROM session_report "
+                    "WHERE session_report_id=? AND outcome='success'",
                     (report_id,),
                 ).fetchone()
+                if committed is not None:
+                    attestation = connection.execute(
+                        "SELECT attestation_id,provider_id,job_id,window_id,session_id,evidence_id,"
+                        "candidate_id,session_report_id,session_report_version,request_plan_canonical_json,"
+                        "completion_canonical_json,attempt_ordinal_closure_canonical_json,"
+                        "report_digest_canonical_json,attempt_ordinal_closure_sha256,request_plan_sha256,"
+                        "completion_sha256,report_digest_sha256,evidence_sha256,candidate_sha256,"
+                        "terminal_outcome FROM shadow_terminal_attestation WHERE attestation_id=?",
+                        (committed[6],),
+                    ).fetchone()
+                    attempts = connection.execute(
+                        "SELECT attempt_id,report_id,logical_request_ordinal,outcome,report_sha256 "
+                        "FROM shadow_attempt_report WHERE terminal_session_report_id=? "
+                        "ORDER BY logical_request_ordinal",
+                        (report_id,),
+                    ).fetchall()
+                    job = connection.execute(
+                        "SELECT job_id,provider_id,window_id,universe_id,state_version,"
+                        "version_vector_sha256,run_status FROM shadow_job WHERE job_id=?",
+                        (committed[1],),
+                    ).fetchone()
+                    window = connection.execute(
+                        "SELECT provider_id,window_id,consecutive_sessions,calendar_generation,"
+                        "calendar_sha256,version_vector_sha256,state_version FROM qualification_window "
+                        "WHERE provider_id=? AND window_id=?",
+                        (committed[0], committed[2]),
+                    ).fetchone()
+                    evidence_ref = connection.execute(
+                        "SELECT evidence_id,evidence_sha256,attached_session_report_id FROM "
+                        "shadow_evidence_ref WHERE evidence_id=? AND attached_session_report_id=?",
+                        (committed[4], report_id),
+                    ).fetchone()
+                    candidate_ref = connection.execute(
+                        "SELECT candidate_id,evidence_id,job_id,provider_id,window_id,session_id,"
+                        "candidate_sha256 FROM shadow_candidate_ref WHERE candidate_id=?",
+                        (committed[5],),
+                    ).fetchone()
             finally:
                 if not registry._memory:
                     connection.close()
-        if committed is None or not committed[0]:
+        if (
+            committed is None
+            or not committed[6]
+            or attestation is None
+            or job is None
+            or window is None
+        ):
             raise ShadowTerminalUnavailable("terminal success is not committed")
+        identity_payload = pending.get("identity")
+        snapshot_payload = pending.get("snapshot")
+        job_payload = pending.get("job_snapshot")
+        window_payload = pending.get("window_snapshot")
+        digests = pending.get("digests")
+        attestation_payload = pending.get("attestation")
+        if not all(
+            isinstance(value, dict)
+            for value in (
+                identity_payload,
+                snapshot_payload,
+                job_payload,
+                window_payload,
+                digests,
+                attestation_payload,
+            )
+        ):
+            raise ShadowTerminalUnavailable("terminal recovery graph unavailable")
+        expected_identity = {
+            "provider_id": committed[0],
+            "job_id": committed[1],
+            "window_id": committed[2],
+            "session_id": committed[3],
+            "evidence_id": committed[4],
+            "candidate_id": committed[5],
+            "session_report_id": report_id,
+        }
+        if identity_payload != expected_identity:
+            raise ShadowTerminalUnavailable("terminal recovery identity drift")
+        if (
+            snapshot_payload.get("provider_id") != committed[0]
+            or snapshot_payload.get("window_id") != committed[2]
+            or snapshot_payload.get("calendar_generation") != committed[9]
+            or snapshot_payload.get("calendar_sha256") != committed[10]
+            or snapshot_payload.get("universe_sha256") != committed[11]
+            or snapshot_payload.get("version_vector_sha256") != committed[12]
+            or job_payload.get("job_id") != job[0]
+            or job_payload.get("provider_id") != job[1]
+            or job_payload.get("window_id") != job[2]
+            or job_payload.get("universe_id") != job[3]
+            or job_payload.get("version_vector_sha256") != job[5]
+            or job_payload.get("state_version") != job[4] - 1
+            or job_payload.get("run_status") != "pending_normalization"
+            or window_payload.get("provider_id") != window[0]
+            or window_payload.get("window_id") != window[1]
+            or window_payload.get("calendar_generation") != window[3]
+            or window_payload.get("calendar_sha256") != window[4]
+            or window_payload.get("version_vector_sha256") != window[5]
+            or window_payload.get("state_version") != window[6] - 1
+            or window_payload.get("consecutive_sessions") != window[2] - 1
+            or window_payload.get("window_state") != "observing"
+            or evidence_ref is None
+            or candidate_ref is None
+            or candidate_ref[1] != committed[4]
+            or candidate_ref[2] != committed[1]
+            or candidate_ref[5] != committed[3]
+            or candidate_ref[6] != committed[14]
+            or digests.get("evidence_sha256") != committed[13]
+            or digests.get("candidate_sha256") != committed[14]
+            or digests.get("request_plan_sha256") != attestation[14]
+            or digests.get("completion_sha256") != attestation[15]
+            or digests.get("attempt_ordinal_closure_sha256") != attestation[13]
+            or digests.get("report_digest_sha256") != attestation[16]
+            or attestation_payload.get("attestation_id") != committed[6]
+            or committed[15] != f"bundles/{pending_id}"
+            or tuple(attestation[1:8])
+            != (
+                committed[0],
+                committed[1],
+                committed[2],
+                committed[3],
+                committed[4],
+                committed[5],
+                report_id,
+            )
+            or attestation[8] != pending.get("report_version")
+            or committed[16] != attestation[16]
+            or attestation[19] != "success"
+        ):
+            raise ShadowTerminalUnavailable("terminal recovery graph drift")
+        if len(attempts) != len(pending.get("reports", ())):
+            raise ShadowTerminalUnavailable("terminal recovery attempts drift")
+        for row, item in zip(attempts, pending["reports"], strict=True):
+            if (
+                not isinstance(item, dict)
+                or item.get("attempt_id") != row[0]
+                or item.get("report_id") != row[1]
+                or item.get("ordinal") != row[2]
+                or item.get("outcome") != row[3]
+                or item.get("report_sha256") != row[4]
+            ):
+                raise ShadowTerminalUnavailable("terminal recovery attempts drift")
+        expected_attestation = {
+            "attestation_id": attestation[0],
+            "request_plan_canonical_json": attestation[9].decode()
+            if isinstance(attestation[9], bytes)
+            else attestation[9],
+            "completion_canonical_json": attestation[10].decode()
+            if isinstance(attestation[10], bytes)
+            else attestation[10],
+            "attempt_ordinal_closure_canonical_json": attestation[11].decode()
+            if isinstance(attestation[11], bytes)
+            else attestation[11],
+            "report_digest_canonical_json": attestation[12].decode()
+            if isinstance(attestation[12], bytes)
+            else attestation[12],
+        }
+        try:
+            committed_completion = json.loads(
+                attestation[10].decode() if isinstance(attestation[10], bytes) else attestation[10]
+            )
+        except (TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ShadowTerminalUnavailable("terminal recovery attestation drift") from exc
+        if (
+            attestation_payload != expected_attestation
+            or pending.get("completion_envelope") != committed_completion
+        ):
+            raise ShadowTerminalUnavailable("terminal recovery attestation drift")
         success = dict(pending)
         success["kind"] = "shadow-terminal-success"
         success["outcome"] = "success"
         success["pending_bundle_id"] = pending_id
-        success["attestation_ref"] = committed[0]
+        success["attestation_ref"] = committed[6]
+        success["job_snapshot"] = dict(job_payload)
+        success["job_snapshot"]["state_version"] = job[4]
+        success["job_snapshot"]["run_status"] = job[6]
+        success["window_snapshot"] = dict(window_payload)
+        success["window_snapshot"]["state_version"] = window[6]
+        success["window_snapshot"]["consecutive_sessions"] = window[2]
+        success["window_snapshot"]["window_state"] = "qualified" if window[2] >= 20 else "observing"
         try:
             return self.bundle_publisher.publish(report_id, success)
         except Exception as exc:
