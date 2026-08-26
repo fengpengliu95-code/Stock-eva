@@ -1,6 +1,6 @@
 # Release 2 / R2-F3 Task14 acceptance
 
-## Current decision: RUNNER CODE GO / REAL CANARY AUTHORIZED-PENDING-EXECUTION
+## Current decision: RUNNER CODE GO / REAL CANARY BLOCKED-CREDENTIAL
 
 Task14 defines a bounded TickFlow discovery canary. Exact code HEAD
 `81c68471f998952faa62662b17a7ab42d354614e` passed independent review with H/M/L all zero. This
@@ -33,8 +33,31 @@ The user authorized one minimal real TickFlow discovery canary on 2026-08-26. Th
 is limited to five representative symbols, one confirmed trade date, four requests,
 `max_attempts=1`, the pinned HTTPS origin, and isolated raw evidence only. It does not authorize
 Tushare, purchases, NAS or canonical writes, a 20-session shadow window, publication, or
-failover. Runtime settings, isolated-root, registry `CANARY`, reviewed TermsEvidence, and exact
-environment credential gates must still pass before the authorization can be consumed.
+failover.
+
+The controlled preflight on 2026-08-26/27 completed every pre-client gate except the credential:
+
+- the private isolated root is
+  `/Users/finlay/Library/Application Support/Stock EVA/r2f3-task14-canary-20260826`;
+- control, evidence, and shadow roots are distinct, private, non-symlink directories;
+- the registry is at admission state `CANARY`, state version 2;
+- the immutable TermsEvidence manifest is
+  `50ab53ae7f5d0e4a9f4372b901cb710a8e83fec1fd637c81fb1fd897624c4707` and its content object is
+  `cfe37a166d6c5d71fcc9bfdc2ddd32524a945eacc44929417bf9b31c9c3f6817`;
+- the captured official OpenAPI and terms objects have SHA-256
+  `de80d0dc60df8a3d0bff491b9b29e6d615bc5e367b651005bdb773fb4e8d74e1` and
+  `61c93be79963763027d615cbe3e67a4dde0d3b4ce251186977828b8fcae8f977` respectively;
+- the plan reports exactly four requests and zero writes; the isolated shadow root contains zero
+  files;
+- the pre-execution canonical manifest snapshot is
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7` (64,351 bytes);
+- `STOCK_EVA_TICKFLOW_TOKEN` is absent from both the executing process environment and the current
+  user launchd environment.
+
+Consequently no provider endpoint was called, no authorization was consumed, and no raw provider
+evidence or canonical data was written. Execution remains fail-closed until the fixed environment
+credential is installed locally; the credential must never be pasted into this document, a CLI
+argument, chat, logs, or source control.
 
 ## Independent code evidence
 
