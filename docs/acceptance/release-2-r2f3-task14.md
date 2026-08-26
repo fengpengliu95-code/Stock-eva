@@ -59,6 +59,17 @@ evidence or canonical data was written. Execution remains fail-closed until the 
 credential is installed locally; the credential must never be pasted into this document, a CLI
 argument, chat, logs, or source control.
 
+## Downstream qualification decision
+
+An independent read-only review of the current official TickFlow OpenAPI, API overview, FAQ, SDK
+guidance and service terms found no provider-authored proof for shares/CNY units, factor
+direction/anchor, suspension versus missing-row semantics, numerical account quota, or the complete
+raw-response retention contract. Therefore a successful Task14 canary would remain discovery-only:
+it cannot authorize a complete one-day shadow candidate, a `CANARY -> SHADOW` transition, or the
+20-session qualification window. The provider ledger records the required closure evidence and
+fail-closed rules. No gate may be replaced by inference from examples, market convention, zero
+activity, missing rows, SDK retry defaults, or a marketing availability statement.
+
 ## Independent code evidence
 
 - independent fourth review at the exact HEAD: H=0, M=0, L=0;
