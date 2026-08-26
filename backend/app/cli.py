@@ -451,6 +451,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--external-authorization-id",
         type=_external_authorization_id,
     )
+    shadow_canary.add_argument(
+        "--acknowledge-provider-requests",
+        action="store_true",
+        help="acknowledge the four bounded TickFlow discovery requests",
+    )
     shadow_run = subparsers.add_parser(
         "market-provider-shadow",
         help="plan or execute one isolated bounded provider shadow window",
@@ -896,6 +901,16 @@ def main() -> int:
                 "status": "error",
                 "provider": args.provider,
                 "error_code": "external_authorization_required",
+                "provider_requests": 0,
+                "writes": False,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 2
+        if not args.acknowledge_provider_requests:
+            payload = {
+                "status": "error",
+                "provider": args.provider,
+                "error_code": "provider_requests_acknowledgement_required",
                 "provider_requests": 0,
                 "writes": False,
             }

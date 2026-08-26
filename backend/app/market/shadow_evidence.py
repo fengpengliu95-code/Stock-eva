@@ -7,6 +7,7 @@ been fsynced and the staging directory has been atomically renamed into ``bundle
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -1972,6 +1973,74 @@ class ShadowEvidenceStore:
         except Exception:
             # Staging is intentionally left as a bounded, owner-marked orphan for a scanner.
             raise
+
+    def publish_raw_responses(
+        self,
+        *,
+        plan: ShadowLogicalRequestPlan,
+        response_bytes_by_ordinal: dict[int, bytes],
+        rows_by_ordinal: dict[int, tuple[dict[str, Any], ...]] | None = None,
+        evidence_id: str = "task14-tickflow-canary",
+    ) -> ShadowEvidenceBundle:
+        """Publish four bounded raw responses through the normal immutable bundle protocol.
+
+        The exact bytes are base64-encoded inside each immutable page so a reader can recover
+        them without introducing a second, less-auditable storage format. They are metadata for
+        discovery only and are never consumed by a candidate or canonical writer.
+        """
+        if set(response_bytes_by_ordinal) != set(plan.exact_ordinal_set or ()):
+            raise ShadowEvidenceUnavailable("shadow raw response set is incomplete")
+        rows_by_ordinal = rows_by_ordinal or {}
+        attempts: list[ShadowAttempt] = []
+        completions: list[ShadowRequestCompletion] = []
+        for request in plan.requests:
+            raw = bytes(response_bytes_by_ordinal[request.ordinal])
+            if len(raw) > self.max_object_bytes:
+                raise ShadowEvidenceUnavailable("shadow object exceeds bound")
+            rows = tuple(rows_by_ordinal.get(request.ordinal, ()))
+            if not rows:
+                rows = ({"raw_response_b64": base64.b64encode(raw).decode("ascii")},)
+            page_id = f"{request.request_id}:page-000001"
+            page = {
+                "page_identity": page_id,
+                "rows": list(rows),
+                "raw_response_b64": base64.b64encode(raw).decode("ascii"),
+            }
+            attempt_id = f"{request.request_id}-attempt-1"
+            attempts.append(
+                ShadowAttempt(
+                    attempt_id=attempt_id,
+                    job_id=plan.job_id,
+                    provider_id=plan.provider_id,
+                    trade_date=request.trade_date,
+                    ordinal=request.ordinal,
+                    attempt_number=1,
+                    outcome="success",
+                    rows=rows,
+                    pages=(page,),
+                    request_count=1,
+                )
+            )
+            completions.append(
+                ShadowRequestCompletion(
+                    ordinal=request.ordinal,
+                    request_id=request.request_id,
+                    endpoint=request.endpoint,
+                    endpoint_class=request.endpoint_class,
+                    final_attempt_id=attempt_id,
+                    pages=(page,),
+                )
+            )
+        completion = ShadowCompletion(
+            session_id="task14-canary-session",
+            job_id=plan.job_id,
+            provider_id=plan.provider_id,
+            window_id=plan.window_id,
+            evidence_id=evidence_id,
+            request_plan_sha256=plan.request_plan_sha256,
+            requests=tuple(completions),
+        )
+        return self.publish(plan=plan, completion=completion, attempts=tuple(attempts))
 
 
 class ShadowEvidenceReader:

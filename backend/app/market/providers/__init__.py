@@ -56,6 +56,10 @@ from .http import (
 )
 from .tickflow import (
     TickFlowAdapter,
+    TickFlowCanaryReport,
+    TickFlowCanaryRunner,
+    TickFlowContract,
+    TickFlowDiscoveryError,
     TickFlowPlan,
     TickFlowProvider,
     TickFlowSchemaError,
@@ -83,6 +87,10 @@ __all__ = [
     "HttpRequestPolicy",
     "ProviderHttpError",
     "TickFlowAdapter",
+    "TickFlowCanaryReport",
+    "TickFlowCanaryRunner",
+    "TickFlowContract",
+    "TickFlowDiscoveryError",
     "TickFlowPlan",
     "TickFlowProvider",
     "TickFlowSourceBatch",

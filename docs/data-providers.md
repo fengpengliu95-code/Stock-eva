@@ -1,12 +1,12 @@
 # Data provider ledger
 
-This is a discovery ledger for the R2-F3 shadow lane (as of 2026-08-24). It is not
+This is a discovery ledger for the R2-F3 shadow lane (as of 2026-08-26). It is not
 runtime verification, provider endorsement, permission to request data, or a
 qualification record. BaoStock remains the only canonical provider.
 
 | Provider | Official records | Disposition |
 | --- | --- | --- |
-| TickFlow | [docs](https://docs.tickflow.org/zh-Hans), [quickstart](https://docs.tickflow.org/zh-Hans/quickstart), [homepage](https://tickflow.org/), [terms](https://tickflow.org/legal/terms/) | `discovered`; daily/universe pages do not prove terms, suspension, units, factors, quota, or retention. |
+| TickFlow | [OpenAPI](https://docs.tickflow.org/zh-Hans/api-reference/openapi.json), server `https://api.tickflow.org`, [terms](https://tickflow.org/legal/terms-of-service.md) | `discovered`; pinned hypotheses are GET `/v1/klines/batch` (`symbols`, `period=1d`, `start_time`, `end_time`, `adjust=none`), GET `/v1/klines/ex-factors` (`symbols`, `start`, `end`), and GET `/v1/universes/{id}` for `CN_Equity_A`/`CN_Index`; `x-api-key` is the documented header. Terms mention non-sharing, no malicious large-scale scraping and lawful personal/commercial use subject to no unauthorized resale; suspension semantics, units, quota and retention remain unverified. |
 | Tushare Pro | [HTTP](https://tushare.pro/document/1?doc_id=40), [daily](https://tushare.pro/document/1?doc_id=27), [adj_factor](https://tushare.pro/document/2?doc_id=28), [suspend_d](https://tushare.pro/document/2?doc_id=214), [trade_cal](https://tushare.pro/document/2?doc_id=26), [index_daily](https://tushare.pro/document/1?doc_id=95), [stock_basic](https://tushare.pro/document/1?doc_id=25), [points](https://tushare.pro/document/1?doc_id=108), [service terms](https://tushare.pro/document/1?doc_id=405), [user agreement](https://tushare.pro/document/1?doc_id=409) | `discovered`; official transport record documents HTTP only, so HTTPS token use is prohibited until separately proven. |
 
 The closed credential map is:
@@ -25,14 +25,15 @@ canonical publication.
 
 ## Task11 shadow adapter contract
 
-Task11 adds source-shaped, injected adapters only. The bounded HTTP policy uses
-connect/read/write/pool timeouts, at most five attempts, bounded `Retry-After`,
-bounded response bytes/rows, and a hard request counter. Transport failures are
+Task11 adds source-shaped, injected adapters only. Task14's bounded TickFlow policy uses
+5-second connect/write/pool and 30-second read timeouts, exactly one attempt, four total
+requests, no retry/sleep, exact HTTPS host/TLS and no redirects, plus bounded response bytes/rows. Transport failures are
 typed and sanitized; raw payloads, URLs, headers and credentials are not reports.
 
-TickFlow's offline plan requests `daily`, `universe` and `indexes`. Daily rows
-remain explicitly unadjusted, while factor/corporate-action evidence is an
-explicit `unavailable` gap until the official contract proves it. Tushare's
+TickFlow's offline plan requests `daily_batch`, `ex_factors`, `universe(CN_Equity_A)` and
+`indexes(CN_Index)` in that order. Daily rows remain explicitly unadjusted, while
+factor/corporate-action units, suspension semantics and quota/retention remain explicit
+discovery gaps. Tushare's
 offline plan requests `daily`, `adj_factor`, `suspend_d`, `trade_cal` and
 `index_daily` for one exact trade date. Tushare `vol` remains source `lots` and
 `amount` remains source `thousand_cny`; conversion is not performed by the

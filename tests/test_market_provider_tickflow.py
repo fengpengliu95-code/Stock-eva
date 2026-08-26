@@ -183,7 +183,10 @@ def test_authorized_session_revalidates_real_canary_registry_before_fake_transpo
     terms = TermsEvidence.build(
         terms_evidence_id="terms-tickflow",
         provider_id="tickflow",
-        official_url_allowlist=("https://example.invalid/terms",),
+        official_url_allowlist=(
+            "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json",
+            "https://tickflow.org/legal/terms-of-service.md",
+        ),
         content_object_relpath="terms.txt",
         content_bytes=b"reviewed terms",
         contract_version="r2f3-terms-v1",
@@ -210,9 +213,7 @@ def test_authorized_session_revalidates_real_canary_registry_before_fake_transpo
     result = TickFlowAdapter().execute(date(2026, 8, 20), session=session)
     assert result.request_count == 3
     assert len(transport.calls) == 3
-    assert all(
-        call[2]["headers"] == {"Authorization": "Bearer fake-token"} for call in transport.calls
-    )
+    assert all(call[2]["headers"] == {"x-api-key": "fake-token"} for call in transport.calls)
     monkeypatch.setenv("STOCK_EVA_TICKFLOW_TOKEN", "fake-token-2")
     registry.transition("tickflow", "quarantined", expected_state_version=2)
     with pytest.raises(CanaryPermissionError):

@@ -1,0 +1,25 @@
+# Release 2 / R2-F3 Task14 acceptance
+
+## Current decision: RUNNER CODE NO-GO / SHADOW WINDOW PENDING
+
+Task14 defines an offline-only bounded TickFlow discovery canary. This record does not claim a
+real provider call, provider approval, qualification, a 20-session window, or production
+readiness. Independent review must change the code decision before any separately authorized
+shadow window.
+
+## Required evidence
+
+- four exact logical requests and fixed hashes, with symbols/date/unit gates;
+- default-off and pre-client authorization/root/registry gates;
+- one-attempt, four-request, timeout/size/TLS/redirect/status/schema fail-closed behavior;
+- fake-transport call order, parameter/header secrecy and no real socket;
+- immutable isolated raw evidence bytes and retained sanitized failure audit;
+- no canonical/candidate/pointer/shadow-job/failover/Tushare effect;
+- focused, related, full offline, LaunchAgent, validator, Ruff, compileall and diff checks;
+- unchanged R2-F2 golden fixture bytes/hashes.
+
+## Explicit remaining gate
+
+No external authorization is present in this task. Therefore no real request is made and the
+acceptance remains **RUNNER CODE NO-GO / SHADOW WINDOW PENDING** until an independent reviewer
+approves the implementation and a separate user-authorized window is executed.

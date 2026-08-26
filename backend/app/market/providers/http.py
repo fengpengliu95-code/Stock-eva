@@ -129,8 +129,13 @@ class _CanaryPermit:
 
     def headers(self) -> dict[str, str]:
         token = self._token
-        self._token = None
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        if not token:
+            return {}
+        # TickFlow's pinned contract uses x-api-key; Tushare retains its legacy bearer
+        # contract.  The token is consumed exactly once and never persisted.
+        if self._provider_id == "tickflow":
+            return {"x-api-key": token}
+        return {"Authorization": f"Bearer {token}"}
 
     def __repr__(self) -> str:
         return "<private-canary-permit>"
@@ -266,6 +271,13 @@ def _read_canary_descriptor(
         or terms.approved_retention != record.retention_decision
         or not terms.approved_quota_decision
         or (contract.requires_official_https_proof and not contract.official_https_proven)
+        or (
+            provider_id == "tickflow"
+            and not {
+                "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json",
+                "https://tickflow.org/legal/terms-of-service.md",
+            }.issubset(terms.official_url_allowlist)
+        )
     ):
         raise CanaryPermissionError("reviewed provider decisions unavailable")
     return record, terms
@@ -333,7 +345,11 @@ class _AuthorizedCanarySession:
 
         client: BoundedHttpClient | None = None
         payloads: dict[str, Any] = {}
-        for endpoint in adapter.ENDPOINTS:
+        # Task11's old fixture used three source-shaped endpoints. Keep that replay-only
+        # compatibility for an empty symbol tuple; an execute request with symbols is Task14's
+        # fixed four-request contract.
+        endpoints = adapter.ENDPOINTS if symbols else adapter.ENDPOINTS[:3]
+        for endpoint in endpoints:
             registry = ShadowRegistry(self.registry_path)
             try:
                 current = registry.read_status(self.provider_id)
@@ -358,12 +374,31 @@ class _AuthorizedCanarySession:
                 },
             )
             if client is None:
-                client = BoundedHttpClient(self._client_factory())
+                client = BoundedHttpClient(
+                    self._client_factory(),
+                    policy=HttpPolicy(
+                        connect_timeout_seconds=5,
+                        read_timeout_seconds=30,
+                        write_timeout_seconds=5,
+                        pool_timeout_seconds=5,
+                        max_attempts=1,
+                        max_requests=4,
+                        max_response_bytes=8 * 1024 * 1024,
+                    ),
+                    allowed_server="https://api.tickflow.org",
+                )
             payloads[endpoint] = client.request_json(
-                endpoint,
+                adapter.request_endpoint(endpoint)
+                if hasattr(adapter, "request_endpoint")
+                else endpoint,
                 params=adapter.request_params(endpoint, trade_date, symbols),
                 headers=permit.headers(),
             )
+        object.__setattr__(
+            self,
+            "last_raw_content_by_endpoint",
+            dict(client.raw_content_by_endpoint if client is not None else {}),
+        )
         return adapter.parse(
             trade_date, payloads, request_count=client.request_count if client else 0
         )
@@ -422,8 +457,10 @@ def build_authorized_canary_session(
 
 
 def _safe_identity(value: str) -> str:
-    # Endpoints in this lane are static contract names.  Never echo a URL/query/header.
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
+    # Only static endpoint names and pinned API paths are accepted.  Never echo a URL/query/header.
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:[A-Za-z0-9_.-]{1,64}|/v1/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)", value
+    ):
         return "provider-endpoint"
     return value
 
@@ -468,11 +505,14 @@ class BoundedHttpClient:
         *,
         policy: HttpPolicy | None = None,
         sleeper: Callable[[float], None] = sleep,
+        allowed_server: str | None = None,
     ) -> None:
         self.client = client
         self.policy = policy or HttpPolicy()
         self._sleeper = sleeper
+        self._allowed_server = allowed_server
         self.request_count = 0
+        self.raw_content_by_endpoint: dict[str, bytes] = {}
         self._last_result: HttpResult | None = None
 
     @property
@@ -525,6 +565,8 @@ class BoundedHttpClient:
                     json=dict(json_body or {}) if json_body is not None else None,
                     headers=dict(headers or {}),  # headers are never persisted or echoed
                     timeout=self.policy.timeout,
+                    follow_redirects=False,
+                    verify=True,
                 )
             except TimeoutError:
                 if attempts >= self.policy.max_attempts:
@@ -546,6 +588,18 @@ class BoundedHttpClient:
                 continue
 
             status = int(getattr(response, "status_code", 0))
+            response_url = getattr(response, "url", None)
+            if getattr(response, "history", ()) or (
+                self._allowed_server
+                and response_url
+                and not str(response_url).startswith(self._allowed_server + "/")
+            ):
+                raise ProviderHttpError(
+                    "redirect_or_endpoint_mismatch",
+                    endpoint=identity,
+                    attempts=attempts,
+                    request_count=self.request_count,
+                )
             content = _response_bytes(response)
             if len(content) > self.policy.max_response_bytes:
                 raise ProviderHttpError(
@@ -614,6 +668,7 @@ class BoundedHttpClient:
                     request_count=self.request_count,
                 )
             result = HttpResult(identity, status, payload, attempts, self.request_count)
+            self.raw_content_by_endpoint[identity] = bytes(content)
             self._last_result = result
             return result
         raise ProviderHttpError("retry_budget_exhausted", endpoint=identity, attempts=attempts)
