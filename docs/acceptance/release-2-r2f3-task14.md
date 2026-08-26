@@ -1,11 +1,11 @@
 # Release 2 / R2-F3 Task14 acceptance
 
-## Current decision: RUNNER CODE NO-GO / SHADOW WINDOW PENDING
+## Current decision: RUNNER CODE GO / REAL CANARY AUTHORIZED-PENDING-EXECUTION
 
-Task14 defines an offline-only bounded TickFlow discovery canary. This record does not claim a
-real provider call, provider approval, qualification, a 20-session window, or production
-readiness. Independent review must change the code decision before any separately authorized
-shadow window.
+Task14 defines a bounded TickFlow discovery canary. Exact code HEAD
+`81c68471f998952faa62662b17a7ab42d354614e` passed independent review with H/M/L all zero. This
+record does not claim that a real provider call has occurred, that TickFlow is qualified, that a
+20-session window has completed, or that production failover is ready.
 
 ## Required evidence
 
@@ -29,6 +29,19 @@ shadow window.
 
 ## Explicit remaining gate
 
-No external authorization is present in this task. Therefore no real request is made and the
-acceptance remains **RUNNER CODE NO-GO / SHADOW WINDOW PENDING** until an independent reviewer
-approves the implementation and a separate user-authorized window is executed.
+The user authorized one minimal real TickFlow discovery canary on 2026-08-26. The authorization
+is limited to five representative symbols, one confirmed trade date, four requests,
+`max_attempts=1`, the pinned HTTPS origin, and isolated raw evidence only. It does not authorize
+Tushare, purchases, NAS or canonical writes, a 20-session shadow window, publication, or
+failover. Runtime settings, isolated-root, registry `CANARY`, reviewed TermsEvidence, and exact
+environment credential gates must still pass before the authorization can be consumed.
+
+## Independent code evidence
+
+- independent fourth review at the exact HEAD: H=0, M=0, L=0;
+- main-auditor full offline pytest: 1994 collected, 100% passed, exit 0;
+- focused Task14 suite: 71 passed; LaunchAgent assets: 26 passed;
+- strict design validator: 100/100 with zero errors or warnings;
+- changed-file Ruff check and format, compileall, range `git diff --check`: passed;
+- R2-F2 golden files unchanged; no real network, credential, NAS, production, canonical, or
+  LaunchAgent action occurred during development or review.

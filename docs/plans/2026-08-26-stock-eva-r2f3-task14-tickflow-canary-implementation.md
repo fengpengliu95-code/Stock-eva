@@ -1,6 +1,7 @@
 # Stock EVA R2-F3 Task14 TickFlow Canary Implementation
 
-**Status:** `RUNNER CODE NO-GO` pending independent review; implementation is offline-only.
+**Status:** `RUNNER CODE GO / REAL CANARY AUTHORIZED-PENDING-EXECUTION` at
+`81c68471f998952faa62662b17a7ab42d354614e`; no real request has occurred yet.
 **Specification:** [Task14 design](2026-08-26-stock-eva-r2f3-task14-tickflow-canary-design.md)
 
 ## RED then GREEN record

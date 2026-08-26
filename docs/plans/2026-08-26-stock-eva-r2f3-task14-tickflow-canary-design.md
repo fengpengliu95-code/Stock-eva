@@ -2,8 +2,8 @@
 
 **Author:** Codex delivery team
 **Date:** 2026-08-26 (Asia/Shanghai)
-**Status:** **DRAFT / RUNNER CODE NO-GO** — this is the contract for independent review; no
-provider request is authorized or performed by this change.
+**Status:** **APPROVED / RUNNER CODE GO / REAL CANARY AUTHORIZED-PENDING-EXECUTION** — no provider
+request was performed by the code change or its offline review.
 **Scope:** Task14 only: a default-off, explicitly authorized, bounded TickFlow discovery canary
 that writes isolated raw evidence. Tasks10–13 remain independent and unchanged.
 
@@ -26,7 +26,7 @@ is a provider-symbol map of compact column arrays, factor `data` is a provider-s
 `id`, `name`, `region`, `category`, `symbol_count`, `symbols`, with optional `description`.
 Kline rows require the core columns `timestamp/open/high/low/close/volume/amount`; optional
 official fields `open_interest`, `prev_close` and `settlement_price` are accepted only when
-present as column-length-aligned nullable numeric arrays. Terms state that keys may not be
+present as column-length-aligned, non-null numeric arrays. Terms state that keys may not be
 shared, malicious large-scale scraping is forbidden, and lawful personal/commercial use is
 described subject to no unauthorized resale. Quota, retention, volume/amount units and
 suspension semantics remain unconfirmed. These pages are evidence references, not approval.
