@@ -444,6 +444,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="plan an isolated TickFlow or Tushare shadow canary",
     )
     shadow_canary.add_argument("--provider", required=True, choices=("tickflow", "tushare"))
+    shadow_canary.add_argument(
+        "--capability",
+        choices=("free-daily", "authenticated"),
+        help="TickFlow capability; omitted defaults to credentialless free-daily",
+    )
     shadow_canary.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
     shadow_canary.add_argument("--symbols", nargs="*", type=_shadow_provider_symbol, default=())
     shadow_canary.add_argument("--execute", action="store_true")
@@ -872,16 +877,40 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
     if args.command == "market-provider-canary":
-        from backend.app.market.providers.tickflow import TickFlowAdapter, TickFlowCanaryRunner
+        from backend.app.market.providers.tickflow import (
+            TickFlowAdapter,
+            TickFlowCanaryRunner,
+            TickFlowFreeAdapter,
+            TickFlowFreeCanaryRunner,
+        )
         from backend.app.market.providers.tushare import TushareAdapter
 
         symbols = tuple(args.symbols)
-        adapter = (
-            TickFlowAdapter(plan_only=True)
-            if args.provider == "tickflow"
-            else TushareAdapter(plan_only=True)
-        )
+        tickflow_mode = None
+        if args.provider == "tickflow":
+            tickflow_mode = (
+                "AUTHENTICATED_DISCOVERY"
+                if args.capability == "authenticated"
+                else "FREE_DAILY_DISCOVERY"
+            )
+        if args.provider == "tickflow" and tickflow_mode == "FREE_DAILY_DISCOVERY":
+            adapter = TickFlowFreeAdapter()
+        elif args.provider == "tickflow":
+            adapter = TickFlowAdapter(plan_only=True)
+        else:
+            adapter = TushareAdapter(plan_only=True)
         if not args.execute:
+            if tickflow_mode == "FREE_DAILY_DISCOVERY" and symbols:
+                payload = {
+                    "status": "error",
+                    "provider": args.provider,
+                    "provider_mode": tickflow_mode,
+                    "error_code": "fixed_free_sample_required",
+                    "provider_requests": 0,
+                    "writes": False,
+                }
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                return 2
             plan = adapter.plan(args.trade_date, symbols=symbols)
             payload = {
                 "status": "planned",
@@ -894,6 +923,11 @@ def main() -> int:
                 "writes_evidence": False,
                 "writes_canonical": False,
             }
+            if tickflow_mode is not None:
+                payload["provider_mode"] = tickflow_mode
+            fixed_symbols = getattr(plan, "fixed_symbols", None)
+            if fixed_symbols is not None:
+                payload["fixed_symbols"] = list(fixed_symbols)
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 0
         if not args.external_authorization_id:
@@ -930,44 +964,79 @@ def main() -> int:
             return 1
         postclient_boundary = False
         try:
-            from backend.app.market.providers.http import build_tickflow_client
+            from backend.app.market.providers.http import (
+                build_tickflow_client,
+                build_tickflow_free_client,
+            )
 
             settings = get_settings()
             layout = StorageLayout(settings)
-            runner = TickFlowCanaryRunner(
-                settings=settings,
-                layout=layout,
-                registry=ShadowRegistry(layout.provider_registry_database),
-                client_factory=build_tickflow_client,
-            )
+            if tickflow_mode == "FREE_DAILY_DISCOVERY":
+                runner = TickFlowFreeCanaryRunner(
+                    settings=settings,
+                    layout=layout,
+                    registry=ShadowRegistry(layout.provider_registry_database),
+                    client_factory=build_tickflow_free_client,
+                )
+            else:
+                runner = TickFlowCanaryRunner(
+                    settings=settings,
+                    layout=layout,
+                    registry=ShadowRegistry(layout.provider_registry_database),
+                    client_factory=build_tickflow_client,
+                )
             # Only failures raised after entering the runner can carry a provider
             # request count. Construction and all earlier gates are zero-request.
             postclient_boundary = True
-            result = runner.execute(
-                args.trade_date,
-                symbols=symbols,
-                external_authorization_id=args.external_authorization_id,
-                acknowledge_provider_requests=args.acknowledge_provider_requests,
-            )
+            if tickflow_mode == "FREE_DAILY_DISCOVERY":
+                if symbols:
+                    raise PermissionError("fixed Free sample is required")
+                result = runner.execute(
+                    args.trade_date,
+                    external_authorization_id=args.external_authorization_id,
+                    acknowledge_provider_requests=args.acknowledge_provider_requests,
+                )
+            else:
+                result = runner.execute(
+                    args.trade_date,
+                    symbols=symbols,
+                    external_authorization_id=args.external_authorization_id,
+                    acknowledge_provider_requests=args.acknowledge_provider_requests,
+                )
+            writes = getattr(result, "writes", result.writes_evidence)
+            payload = {
+                "status": result.status,
+                "provider": result.provider,
+                "trade_date": result.trade_date.isoformat(),
+                "request_count": result.request_count,
+                "endpoints": list(result.endpoints),
+                "provider_requests": result.request_count,
+                "writes": writes,
+                "writes_evidence": result.writes_evidence,
+                "writes_canonical": result.writes_canonical,
+            }
+            if tickflow_mode is not None:
+                payload["provider_mode"] = tickflow_mode
+            if hasattr(result, "units_status"):
+                payload["units_status"] = result.units_status
+            if hasattr(result, "capabilities"):
+                payload["capabilities"] = result.capabilities.model_dump(mode="json")
+                payload["daily_bar_qualified"] = result.daily_bar_qualified
+                payload["adjustment_factor_qualified"] = result.adjustment_factor_qualified
+                payload["starts_shadow"] = result.starts_shadow
+                payload["fixed_symbols"] = list(result.fixed_symbols)
+            if getattr(result, "failure_class", None) is not None:
+                payload["failure_class"] = result.failure_class
+            if getattr(result, "endpoint", None) is not None:
+                payload["endpoint"] = result.endpoint
             print(
                 json.dumps(
-                    {
-                        "status": result.status,
-                        "provider": result.provider,
-                        "trade_date": result.trade_date.isoformat(),
-                        "request_count": result.request_count,
-                        "endpoints": list(result.endpoints),
-                        "units_status": result.units_status,
-                        "provider_requests": result.request_count,
-                        "writes": result.writes_evidence,
-                        "writes_evidence": result.writes_evidence,
-                        "writes_canonical": result.writes_canonical,
-                    },
+                    payload,
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
-            return 0
+            return 0 if result.status == "discovered" else 1
         except Exception as exc:
             from backend.app.market.providers.http import (
                 safe_public_endpoint,

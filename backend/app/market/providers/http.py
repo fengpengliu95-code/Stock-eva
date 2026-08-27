@@ -109,6 +109,10 @@ SAFE_FAILURE_CLASSES = frozenset(
         "numeric_value_invalid",
         "symbol_set_invalid",
         "endpoint_unavailable",
+        "fixed_sample_required",
+        "sdk_version_mismatch",
+        "sdk_contract_invalid",
+        "sdk_initialization_failed",
     }
 )
 SAFE_ENDPOINT_IDENTITIES = frozenset(
@@ -121,6 +125,12 @@ SAFE_ENDPOINT_IDENTITIES = frozenset(
         "/v1/klines/ex-factors",
         "/v1/universes/CN_Equity_A",
         "/v1/universes/CN_Index",
+        "connectivity",
+        "instrument_metadata",
+        "universe_metadata",
+        "historical_daily_1d",
+        "/v1/exchanges",
+        "/v1/instruments",
     }
 )
 
@@ -213,6 +223,20 @@ def build_tickflow_client() -> HttpTransport:
     return _TickFlowHttpxTransport(
         httpx.Client(
             base_url="https://api.tickflow.org",
+            verify=True,
+            follow_redirects=False,
+            timeout=httpx.Timeout(30, connect=5, write=5, pool=5),
+        )
+    )
+
+
+def build_tickflow_free_client() -> HttpTransport:
+    """Build the credentialless TickFlow Free client with the exact Free origin."""
+    import httpx
+
+    return _TickFlowHttpxTransport(
+        httpx.Client(
+            base_url="https://free-api.tickflow.org",
             verify=True,
             follow_redirects=False,
             timeout=httpx.Timeout(30, connect=5, write=5, pool=5),

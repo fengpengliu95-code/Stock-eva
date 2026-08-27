@@ -737,6 +737,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pytz" },
     { name = "ta-lib" },
+    { name = "tickflow" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -762,6 +763,7 @@ requires-dist = [
     { name = "pytz", specifier = ">=2025.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8,<1" },
     { name = "ta-lib", specifier = "==0.7.0" },
+    { name = "tickflow", specifier = "==0.1.24" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<1" },
 ]
 provides-extras = ["dev", "supplemental"]
@@ -794,6 +796,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/58/8c37dea7bbf769b20d58e7ace7e5edfe65b849442b00ffcdd56be88697c6/tabulate-0.10.0.tar.gz", hash = "sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d", size = 91754, upload-time = "2026-03-04T18:55:34.402Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3", size = 39814, upload-time = "2026-03-04T18:55:31.284Z" },
+]
+
+[[package]]
+name = "tickflow"
+version = "0.1.24"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/aa/56/d911f7d03363a06f69838878df4f92dd01235c899431197f94fb4c0e36ad/tickflow-0.1.24.tar.gz", hash = "sha256:13f6464a9dd1bdf98a312bc8c313fcc24ad0ad83c16d4f83b76bee83df6e11df", size = 36867, upload-time = "2026-06-20T02:39:35.891Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/9d/6c03706054f3bcca8a7113a60258e1a52a762077a555d52a5a84e4f6895f/tickflow-0.1.24-py3-none-any.whl", hash = "sha256:e898867b0e3e668618135c78e3a367542f81b7a289567335d298c707452e5f42", size = 43031, upload-time = "2026-06-20T02:39:34.307Z" },
 ]
 
 [[package]]
