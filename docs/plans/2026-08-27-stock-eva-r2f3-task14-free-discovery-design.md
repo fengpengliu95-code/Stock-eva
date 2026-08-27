@@ -260,8 +260,8 @@ interface TickFlowCapabilityRecord {
 }
 
 interface TickFlowFreeCanaryReport {
-  status: "discovered" | "blocked" | "error";
-  outcome: "discovery" | "unavailable" | "failure";
+  status: "discovered" | "unavailable";
+  outcome: "discovery" | "unavailable";
   provider: "tickflow";
   providerMode: "FREE_DAILY_DISCOVERY";
   tradeDate: string;
