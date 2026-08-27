@@ -84,7 +84,8 @@ r2f3-tickflow-free-daily-v2-ea6cfd3c52fc38f82cf17951a85f02bc605177aaead4753f3e11
 
 The existing V1 registry attachment is therefore stale for V2. A read-only gate replay proved it
 fails before SDK or HTTP client construction with zero provider requests and writes. No V2
-TermsEvidence may be attached until independent review returns GO.
+TermsEvidence may be attached until independent review returns GO. That review gate is now
+complete; descriptor attachment remains separately authorization-gated.
 
 The retained isolated root is
 `/Users/finlay/Library/Application Support/Stock EVA/r2f3-task14-canary-20260826`. The historical
@@ -102,6 +103,10 @@ canary did not mutate or publish against it.
 - Independent read-only re-review of the exact remediation commit: H=0, M=0, decision `GO`.
 - V2 RED reproduced the unsupported universe regex and missing endpoint attribution; six new
   focused regressions are GREEN.
+- V2 code `0da87a708176f3f92cbcc79244db2061ac76aef5` plus report-enum documentation
+  correction `d32b63c45cd5fa67cc50515a5c5e316061d72b11` received final independent
+  read-only review `GO`, H=0 and M=0. The review made zero network/provider requests and confirmed
+  the worktree was clean.
 - V2 focused Free suite: 29 passed; related provider/registry/shadow/golden/LaunchAgent suite:
   418 passed.
 - V2 full offline suite: 2,023 passed.
@@ -142,17 +147,17 @@ unknown; `CN_Equity_A` containing a non-SH/SZ member is only the leading hypothe
 
 ## Next controlled-operation gate
 
-The first authorization is consumed. A future V2 request would require, in order:
+The first authorization is consumed. The exact V2 implementation has completed independent review
+with H=0, M=0 and `GO`. A future V2 controlled operation now requires, in order:
 
-1. independent GO on the exact V2 implementation commit;
-2. a new explicit user authorization;
-3. attach the exact V2 TermsEvidence descriptor with zero provider requests;
-4. run one zero-write Free discovery canary for `2026-08-10`;
-5. permit only the four requests and fixed five-symbol sample listed above, with
+1. a new explicit user authorization;
+2. attach the exact V2 TermsEvidence descriptor with zero provider requests;
+3. run one zero-write Free discovery canary for `2026-08-10`;
+4. permit only the four requests and fixed five-symbol sample listed above, with
    `max_attempts=1`;
-6. keep the canary at zero DB/Parquet/evidence/manifest/pointer writes;
-7. do not call realtime, minute, factor or authenticated endpoints;
-8. do not start shadow or trigger another request after success or failure.
+5. keep the canary at zero DB/Parquet/evidence/manifest/pointer writes;
+6. do not call realtime, minute, factor or authenticated endpoints;
+7. do not start shadow or trigger another request after success or failure.
 
 No item above is currently authorized. Any future execution must stop after one sanitized report;
 contract mismatch, transport failure, incomplete response or schema failure remains fail-closed.

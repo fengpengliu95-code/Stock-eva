@@ -117,8 +117,14 @@ V2 RED/GREEN requirements are:
 5. bump the Free adapter/source/descriptor and TermsEvidence contract version so V1 review fails
    before any future client construction.
 
-The first authorization is consumed. No V2 real request is permitted until the full offline gate
-and a new independent review return GO, followed by a new explicit single-use authorization.
+V2 code commit `0da87a708176f3f92cbcc79244db2061ac76aef5`, followed by the report-enum
+documentation correction `d32b63c45cd5fa67cc50515a5c5e316061d72b11`, passed final independent
+read-only review with H=0, M=0 and decision `GO`. The reviewer confirmed the Free report model,
+CLI and design all use only `discovered | unavailable` status and `discovery | unavailable`
+outcome. The worktree was clean and the review made no network or provider request.
+
+The first authorization is consumed. The offline gate is complete, but no V2 descriptor attachment
+or real request is permitted without a new explicit single-use authorization.
 
 ## Explicit non-changes
 
