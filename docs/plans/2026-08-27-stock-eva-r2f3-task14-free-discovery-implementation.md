@@ -1,6 +1,6 @@
 # Stock EVA R2-F3 Task14 Free Discovery Implementation Plan
 
-**Status:** `CANARY #1 FAIL-CLOSED / V2 OFFLINE REMEDIATION IN VERIFICATION / NEW CANARY NOT AUTHORIZED`
+**Status:** `TASK14 FREE DISCOVERY GO / DAILY BAR SHADOW QUALIFICATION NOT STARTED`
 **Specification:** [Task14 Free discovery design](2026-08-27-stock-eva-r2f3-task14-free-discovery-design.md)
 
 ## Delivery boundary
@@ -123,8 +123,30 @@ read-only review with H=0, M=0 and decision `GO`. The reviewer confirmed the Fre
 CLI and design all use only `discovered | unavailable` status and `discovery | unavailable`
 outcome. The worktree was clean and the review made no network or provider request.
 
-The first authorization is consumed. The offline gate is complete, but no V2 descriptor attachment
-or real request is permitted without a new explicit single-use authorization.
+## V2 controlled discovery result
+
+The authorized V2 preflight attached contract
+`r2f3-tickflow-free-daily-v2-ea6cfd3c52fc38f82cf17951a85f02bc605177aaead4753f3e11896b56daabd4`
+to the isolated registry with zero provider requests. Its immutable content and manifest SHA-256
+values are `a2590e4abf0af82422fe858cbfc998a95c7b785fe650443a398ba33109713973`
+and `136913495cb71906060191e9a403c61aff126955d44810caa2ab39f69d5e00d9`.
+
+The one authorized `2026-08-10` canary then completed the fixed four-request graph with exit code
+0 and `status=discovered`. Connectivity, instrument metadata, universe metadata and historical
+Daily `1d` were discovered. The runner retained adjustment factor as `UNQUALIFIED`; units,
+suspension semantics, rate-limit/quota and raw-retention contract remained `UNKNOWN`; realtime and
+minute capabilities remained `FORBIDDEN`. Both qualification flags stayed false and shadow did not
+start.
+
+Pre/post fingerprints proved the canary was zero-write: registry SHA-256 remained
+`8c8b244b64a20cb5a007e14112c4e804f1e0eece5ca5b38a4c0b5b2f039728ad`, canonical manifest
+SHA-256 remained `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`,
+and evidence/shadow files plus jobs/windows/reports/references all remained zero. No retry,
+authenticated/realtime/minute/factor call or automatic follow-up occurred.
+
+Task14 is therefore complete for Free capability discovery. Daily Bar Shadow qualification is the
+next subversion and remains separate from adjustment-factor qualification; it cannot silently
+reuse this zero-write canary as a qualified shadow session.
 
 ## Explicit non-changes
 

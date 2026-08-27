@@ -2,7 +2,7 @@
 
 ## Current decision
 
-`CANARY #1 FAIL-CLOSED / V2 OFFLINE CODE AWAITING INDEPENDENT REVIEW / NEW CANARY NOT AUTHORIZED / SHADOW NOT STARTED`
+`FREE DISCOVERY GO / DAILY BAR SHADOW QUALIFICATION NOT STARTED / ADJUSTMENT FACTOR UNQUALIFIED`
 
 The V1 reviewed implementation commit is
 `099cb1ca46931459c6ce6177a164aedb47843ad5`. It replaces the earlier
@@ -12,11 +12,14 @@ mode. Only the explicitly selected legacy `AUTHENTICATED_DISCOVERY` capability m
 that credential.
 
 The first authorized Free canary completed its four requests and then failed closed with
-`failure_class=symbol_schema`. It did not discover or qualify any capability. V2 removes an
-unsupported full-universe SH/SZ-only assumption and adds fixed endpoint attribution; V2 is not
-eligible for another real request until its exact commit passes independent review. This record
-does not claim that TickFlow Free is currently usable, that Daily Bar or adjustment factors are
-qualified, that a shadow session has started, or that failover is ready.
+`failure_class=symbol_schema`. V2 removed the unsupported full-universe SH/SZ-only assumption and
+added fixed endpoint attribution. After the exact V2 implementation passed independent review, a
+second authorized canary completed all four requests and reported the four bounded Free
+capabilities as `DISCOVERED`.
+
+This is a successful connectivity/schema discovery result only. It does not qualify Daily Bar or
+adjustment factors, start a shadow session, prove full-universe coverage, establish units or
+suspension semantics, authorize publication, or make failover ready.
 
 ## Frozen Free canary contract
 
@@ -82,10 +85,17 @@ descriptor and now requires:
 r2f3-tickflow-free-daily-v2-ea6cfd3c52fc38f82cf17951a85f02bc605177aaead4753f3e11896b56daabd4
 ```
 
-The existing V1 registry attachment is therefore stale for V2. A read-only gate replay proved it
-fails before SDK or HTTP client construction with zero provider requests and writes. No V2
-TermsEvidence may be attached until independent review returns GO. That review gate is now
-complete; descriptor attachment remains separately authorization-gated.
+The V1 attachment was stale for V2, and a read-only gate replay proved it failed before SDK or HTTP
+client construction with zero provider requests and writes. After independent V2 review returned
+GO, the authorized control-state preflight attached:
+
+- TermsEvidence ID `tickflow-free-v2-terms-20260827-01`;
+- review ID `r2f3-tickflow-free-v2-review-20260827-01`;
+- content SHA-256 `a2590e4abf0af82422fe858cbfc998a95c7b785fe650443a398ba33109713973`;
+- manifest SHA-256 `136913495cb71906060191e9a403c61aff126955d44810caa2ab39f69d5e00d9`.
+
+The preflight made zero provider requests, retained state `CANARY`, and advanced only the isolated
+provider record from state version 3 to 4.
 
 The retained isolated root is
 `/Users/finlay/Library/Application Support/Stock EVA/r2f3-task14-canary-20260826`. The historical
@@ -141,23 +151,44 @@ canonical dataset was mutated by development or verification.
   `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`;
 - evidence files, shadow files, jobs, qualification windows and session reports all remained zero.
 
-The zero-write contract is GO. Free capability discovery and shadow qualification remain NO-GO.
-Because no payload was retained, the exact offending live symbol and failing parser endpoint are
-unknown; `CN_Equity_A` containing a non-SH/SZ member is only the leading hypothesis, not a fact.
+At the end of canary #1, the zero-write contract was GO while Free capability discovery and shadow
+qualification remained NO-GO. Because no payload was retained, the exact offending live symbol and
+failing parser endpoint remain unknown; `CN_Equity_A` containing a non-SH/SZ member was only the
+leading hypothesis, not a fact.
 
-## Next controlled-operation gate
+## Controlled canary #2 evidence
 
-The first authorization is consumed. The exact V2 implementation has completed independent review
-with H=0, M=0 and `GO`. A future V2 controlled operation now requires, in order:
+- authorization ID: `r2f3-tickflow-free-canary-v2-20260827-01`;
+- V2 descriptor preflight: zero provider requests, isolated control-state write only;
+- trade date `2026-08-10`, fixed five symbols, four ordered Free requests and `max_attempts=1`;
+- result: `status=discovered`, process exit code 0 and `provider_requests=4`;
+- `connectivity`, `instrument_metadata`, `universe_metadata` and `historical_daily_1d`:
+  `DISCOVERED`;
+- realtime quote and minute K-line: `FORBIDDEN`;
+- adjustment factor: `UNQUALIFIED`; units, suspension semantics, rate-limit/quota and raw-retention
+  contract: `UNKNOWN`;
+- `daily_bar_qualified=false`, `adjustment_factor_qualified=false`, `starts_shadow=false`;
+- `writes=false`, `writes_evidence=false`, `writes_canonical=false`;
+- registry SHA-256 immediately before and after the canary:
+  `8c8b244b64a20cb5a007e14112c4e804f1e0eece5ca5b38a4c0b5b2f039728ad`;
+- canonical manifest SHA-256 immediately before and after:
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`;
+- evidence and shadow files: zero; shadow jobs, qualification windows, attempt/session reports and
+  evidence references: zero.
 
-1. a new explicit user authorization;
-2. attach the exact V2 TermsEvidence descriptor with zero provider requests;
-3. run one zero-write Free discovery canary for `2026-08-10`;
-4. permit only the four requests and fixed five-symbol sample listed above, with
-   `max_attempts=1`;
-5. keep the canary at zero DB/Parquet/evidence/manifest/pointer writes;
-6. do not call realtime, minute, factor or authenticated endpoints;
-7. do not start shadow or trigger another request after success or failure.
+The canary ran from an empty parent environment containing only the allowlisted non-credential
+settings. It did not retry, call authenticated/realtime/minute/factor endpoints, persist a payload,
+or trigger a follow-up request.
 
-No item above is currently authorized. Any future execution must stop after one sanitized report;
-contract mismatch, transport failure, incomplete response or schema failure remains fail-closed.
+## Task14 delivery decision and next version boundary
+
+Task14 Free discovery is `GO`: the credentialless endpoint surface is reachable and its bounded
+sample schemas pass the strict V2 parser. Task14 intentionally stops here.
+
+The next subversion is Daily Bar Shadow qualification. It must use a whole-session Daily Bar
+candidate with no symbol-level mixing, retain successful RAW evidence through the existing
+R2-F2/R2-F3 immutable lane, reconcile against canonical BaoStock without publishing or changing the
+canonical provider, and build 20 consecutive confirmed-session evidence. Adjustment-factor
+qualification remains a separate workstream, and automatic failover stays disabled. The standing
+R2-F development/validation authorization removes the need for repeated read/write approvals; the
+project still pauses at this version boundary for the required human delivery confirmation.
