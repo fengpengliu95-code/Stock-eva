@@ -1,6 +1,6 @@
 # Stock EVA R2-F3 Task14 Free Discovery Implementation Plan
 
-**Status:** `OFFLINE IMPLEMENTATION APPROVED / REAL FREE CANARY NOT AUTHORIZED`
+**Status:** `OFFLINE RUNNER CODE GO AT 099cb1c / REAL FREE CANARY NOT AUTHORIZED`
 **Specification:** [Task14 Free discovery design](2026-08-27-stock-eva-r2f3-task14-free-discovery-design.md)
 
 ## Delivery boundary
@@ -75,6 +75,20 @@ Run, in order:
 
 Only an offline review `GO` permits requesting a new, single-use Free discovery authorization.
 That later canary remains `max_attempts=1`, zero-write, and cannot start shadow automatically.
+
+## Completed offline gate
+
+Implementation commit `af652e0` was independently rejected for two Medium contract defects: it
+used authenticated registry hashes as proof of the Free graph, and its CLI Free path constructed
+general settings that could enumerate credential names. Remediation commit `099cb1c` added the
+separately hashed Free descriptor, a closed eight-name non-credential settings projection, an
+isolated SDK child and an HTTP client with environment proxy lookup disabled.
+
+The exact remediation commit passed independent read-only re-review with H=0 and M=0. The focused
+Free suite passed 104 tests, the full offline suite passed 2,017 tests, and the strict design
+validator scored 100/100 with zero warnings. No real provider request occurred. The next permitted
+step is to request authorization for the isolated Free descriptor preflight and one zero-write
+Free discovery canary; this approval does not authorize shadow qualification.
 
 ## Explicit non-changes
 
