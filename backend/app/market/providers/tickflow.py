@@ -173,8 +173,21 @@ class TickFlowFreeDiscoveryError(TickFlowDiscoveryError):
         "sdk_initialization_failed": "pinned SDK Free initialization is unavailable",
     }
 
-    def __init__(self, failure_class: str = "discovery_unavailable") -> None:
+    def __init__(
+        self, failure_class: str = "discovery_unavailable", *, endpoint: str | None = None
+    ) -> None:
         self.failure_class = failure_class
+        self.endpoint = (
+            endpoint
+            if endpoint
+            in {
+                "connectivity",
+                "instrument_metadata",
+                "universe_metadata",
+                "historical_daily_1d",
+            }
+            else None
+        )
         ValueError.__init__(self, self._MESSAGES.get(failure_class, "Free discovery unavailable"))
 
 
@@ -228,9 +241,20 @@ class TickFlowFreeContract(_FreeImmutable):
         )
 
 
-FREE_ADAPTER_HASH = _hash("tickflow-free-adapter-task14-v1")
+_FREE_ENDPOINT_IDENTITY_BY_PATH = dict(
+    zip(TickFlowFreeContract().endpoint_paths, TickFlowFreeContract().endpoints, strict=True)
+)
+
+
+def _free_endpoint_identity(value: str | None) -> str | None:
+    if value in TickFlowFreeContract().endpoints:
+        return value
+    return _FREE_ENDPOINT_IDENTITY_BY_PATH.get(value)
+
+
+FREE_ADAPTER_HASH = _hash("tickflow-free-adapter-task14-v2")
 FREE_ENDPOINT_CONTRACT_HASH = TickFlowFreeContract().request_hash
-FREE_SOURCE_SCHEMA_HASH = _hash("tickflow-free-source-shape-0.1.24-2026-08-27")
+FREE_SOURCE_SCHEMA_HASH = _hash("tickflow-free-source-shape-0.1.24-2026-08-27-v2")
 FREE_UNIT_CONTRACT_HASH = _hash("tickflow-free-units-unknown-unqualified")
 FREE_DESCRIPTOR_HASH = _hash(
     {
@@ -242,7 +266,7 @@ FREE_DESCRIPTOR_HASH = _hash(
         "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
     }
 )
-TICKFLOW_FREE_TERMS_CONTRACT_VERSION = f"r2f3-tickflow-free-daily-v1-{FREE_DESCRIPTOR_HASH}"
+TICKFLOW_FREE_TERMS_CONTRACT_VERSION = f"r2f3-tickflow-free-daily-v2-{FREE_DESCRIPTOR_HASH}"
 
 
 class TickFlowFreePlan(_FreeImmutable):
@@ -345,7 +369,7 @@ class TickFlowFreeCanaryReport(_FreeImmutable):
     @field_validator("endpoint")
     @classmethod
     def validate_endpoint(cls, value: str | None) -> str | None:
-        if value is not None and value not in TickFlowFreeContract().endpoint_paths:
+        if value is not None and value not in TickFlowFreeContract().endpoints:
             raise ValueError("Free endpoint is not allowlisted")
         return value
 
@@ -749,10 +773,12 @@ def _official_free_instruments(data: Any) -> tuple[dict[str, Any], ...]:
         if not isinstance(row, dict) or set(row) - allowed or not required <= set(row):
             raise TickFlowFreeDiscoveryError("schema_drift")
         symbol = row["symbol"]
+        if type(symbol) is not str or not symbol or len(symbol) > 128 or not symbol.isprintable():
+            raise TickFlowFreeDiscoveryError("symbol_schema")
+        if symbol not in TICKFLOW_FREE_PROVIDER_SYMBOLS:
+            raise TickFlowFreeDiscoveryError("symbol_set_invalid")
         if (
-            type(symbol) is not str
-            or _PROVIDER_SYMBOL.fullmatch(symbol) is None
-            or row["code"] != symbol[:6]
+            row["code"] != symbol[:6]
             or row["exchange"] != symbol[-2:]
             or row["region"] != "CN"
             or symbol in seen
@@ -774,6 +800,52 @@ def _official_free_instruments(data: Any) -> tuple[dict[str, Any], ...]:
     if seen != set(TICKFLOW_FREE_PROVIDER_SYMBOLS):
         raise TickFlowFreeDiscoveryError("symbol_set_invalid")
     return tuple(rows)
+
+
+def _official_free_universe(data: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(data, dict):
+        raise TickFlowFreeDiscoveryError("schema_drift")
+    required = {"id", "name", "region", "category", "symbol_count", "symbols"}
+    allowed = required | {"description"}
+    if set(data) - allowed or not required <= set(data):
+        raise TickFlowFreeDiscoveryError("schema_drift")
+    if (
+        data["id"] != "CN_Equity_A"
+        or any(
+            type(data[field]) is not str or not data[field]
+            for field in ("id", "name", "region", "category")
+        )
+        or type(data["symbol_count"]) is not int
+        or data["symbol_count"] < 0
+        or not isinstance(data["symbols"], list)
+        or (
+            "description" in data
+            and data["description"] is not None
+            and type(data["description"]) is not str
+        )
+    ):
+        raise TickFlowFreeDiscoveryError("schema_drift")
+    symbols = tuple(data["symbols"])
+    if any(
+        type(symbol) is not str
+        or not symbol
+        or len(symbol) > 128
+        or symbol.strip() != symbol
+        or not symbol.isprintable()
+        for symbol in symbols
+    ):
+        raise TickFlowFreeDiscoveryError("symbol_schema")
+    if data["symbol_count"] != len(symbols) or len(set(symbols)) != len(symbols):
+        raise TickFlowFreeDiscoveryError("symbol_set_invalid")
+    if not set(TICKFLOW_FREE_PROVIDER_SYMBOLS) <= set(symbols):
+        raise TickFlowFreeDiscoveryError("symbol_set_invalid")
+    return tuple({"provider_symbol": symbol} for symbol in symbols)
+
+
+def _official_free_kline_rows(data: Any, trade_date: date) -> tuple[dict[str, Any], ...]:
+    if not isinstance(data, dict) or set(data) != set(TICKFLOW_FREE_PROVIDER_SYMBOLS):
+        raise TickFlowFreeDiscoveryError("symbol_set_invalid")
+    return _official_kline_rows(data, trade_date)
 
 
 def _validate_free_daily_rows(rows: tuple[dict[str, Any], ...]) -> None:
@@ -858,16 +930,35 @@ class TickFlowFreeAdapter:
     def parse(self, trade_date: date, payloads: dict[str, Any]) -> TickFlowFreeSourceBatch:
         if set(payloads) != set(self.ENDPOINTS):
             raise TickFlowFreeDiscoveryError("missing_endpoint")
-        exchanges = _official_free_exchanges(_official_data(payloads["connectivity"]))
-        instruments = _official_free_instruments(_official_data(payloads["instrument_metadata"]))
-        universe = _official_universe(
-            _official_data(payloads["universe_metadata"]), expected_id="CN_Equity_A"
+
+        def parse_endpoint(endpoint: str, parser: Any) -> Any:
+            try:
+                return parser()
+            except TickFlowDiscoveryError as exc:
+                raise TickFlowFreeDiscoveryError(
+                    exc.failure_class,
+                    endpoint=endpoint,
+                ) from None
+
+        exchanges = parse_endpoint(
+            "connectivity",
+            lambda: _official_free_exchanges(_official_data(payloads["connectivity"])),
         )
-        universe_symbols = {row["provider_symbol"] for row in universe}
-        if not set(TICKFLOW_FREE_PROVIDER_SYMBOLS) <= universe_symbols:
-            raise TickFlowFreeDiscoveryError("symbol_set_invalid")
-        daily = _official_kline_rows(_official_data(payloads["historical_daily_1d"]), trade_date)
-        _validate_free_daily_rows(daily)
+        instruments = parse_endpoint(
+            "instrument_metadata",
+            lambda: _official_free_instruments(_official_data(payloads["instrument_metadata"])),
+        )
+        universe = parse_endpoint(
+            "universe_metadata",
+            lambda: _official_free_universe(_official_data(payloads["universe_metadata"])),
+        )
+        daily = parse_endpoint(
+            "historical_daily_1d",
+            lambda: _official_free_kline_rows(
+                _official_data(payloads["historical_daily_1d"]), trade_date
+            ),
+        )
+        parse_endpoint("historical_daily_1d", lambda: _validate_free_daily_rows(daily))
         return TickFlowFreeSourceBatch(
             trade_date=trade_date,
             exchanges=exchanges,
@@ -1013,7 +1104,7 @@ class TickFlowFreeCanaryRunner:
             )
         except (ProviderHttpError, TickFlowDiscoveryError) as exc:
             failure_class = safe_public_failure_class(getattr(exc, "failure_class", None))
-            endpoint = safe_public_endpoint(getattr(exc, "endpoint", None))
+            endpoint = _free_endpoint_identity(safe_public_endpoint(getattr(exc, "endpoint", None)))
             return cls._failure_report(
                 trade_date,
                 request_count=client.request_count if client is not None else 0,

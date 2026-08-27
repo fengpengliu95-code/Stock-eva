@@ -2,8 +2,8 @@
 
 **Author:** Codex delivery team  
 **Date:** 2026-08-27 (Asia/Shanghai)  
-**Status:** **APPROVED FOR OFFLINE IMPLEMENTATION / REAL FREE CANARY NOT AUTHORIZED**  
-**Reviewer:** User directive dated 2026-08-27; independent code review remains required  
+**Status:** **CANARY #1 FAIL-CLOSED / V2 OFFLINE REMEDIATION IN VERIFICATION / NEW CANARY NOT AUTHORIZED**
+**Reviewer:** User directive and controlled-operation authorization dated 2026-08-27; V2 independent code review remains required
 **Supersedes:** The authenticated execution/default-mode portions of
 `2026-08-26-stock-eva-r2f3-task14-tickflow-canary-design.md`; the prior authenticated capability
 remains available only when explicitly requested.
@@ -28,6 +28,15 @@ Free Daily discovery is intentionally narrower than provider qualification. It c
 fixed A-share historical `1d` response and public metadata are reachable and structurally valid.
 It cannot prove adjustment-factor semantics, suspension semantics, volume/amount units,
 rate-limit/quota, raw-retention rights, complete-session coverage or long-term availability.
+
+The first authorized Free canary completed all four requests for `2026-08-10` and then failed
+closed with sanitized `failure_class=symbol_schema`. It wrote no evidence, canonical data or
+control state. Offline triage proved that V1 applied the fixed SH/SZ sample regex to every member
+of the full `CN_Equity_A` universe even though the retained OpenAPI specifies only opaque strings;
+the report also could not identify whether universe or Daily parsing failed. V2 removes that
+unsupported full-universe assumption while keeping the instrument and Daily response sets exactly
+equal to the requested five symbols, and binds every sanitized parse failure to one fixed logical
+endpoint identity. The exact live offending value was not retained and is not inferred.
 
 ## Functional Requirements
 
@@ -60,10 +69,12 @@ rate-limit/quota, raw-retention rights, complete-session coverage or long-term a
   widen this plan.
 - FR-5: The Free parser MUST require a non-empty exchange list containing `SH` and `SZ`, exactly
   one instrument record for each fixed sample symbol, an exact `CN_Equity_A` universe detail with
-  internally consistent symbol count and membership of all five fixed samples, and exactly one
-  valid unadjusted daily row per fixed symbol for the requested date. Wrong dates, duplicates,
-  unknown fields, partial compact arrays, non-finite or impossible OHLC values, negative activity
-  and missing endpoints MUST fail closed.
+  internally consistent symbol count, unique bounded printable opaque strings and membership of
+  all five fixed samples, and exactly one valid unadjusted daily row per fixed symbol for the
+  requested date. Non-sample universe members MUST NOT be translated to canonical symbols or used
+  to infer exchange semantics. Instrument and Daily response sets MUST remain exactly equal to the
+  requested five symbols. Wrong dates, duplicates, unknown fields, partial compact arrays,
+  non-finite or impossible OHLC values, negative activity and missing endpoints MUST fail closed.
 - FR-6: Free transport MUST use exact TLS origin `https://free-api.tickflow.org`, no redirects,
   5-second connect/write/pool bounds, a 30-second read bound, at most 8 MiB per response, at most
   four requests and `max_attempts=1`. Timeout, connection, 4xx, 429, 5xx, redirect, host mismatch,
@@ -78,6 +89,10 @@ rate-limit/quota, raw-retention rights, complete-session coverage or long-term a
   `FORBIDDEN`; adjustment factor is `UNQUALIFIED`; suspension semantics, units,
   rate-limit/quota and raw-retention contract are `UNKNOWN`. These states MUST NOT be inferred from
   example values or successful connectivity.
+- FR-8a: Every sanitized transport or parser failure MUST expose at most one fixed logical endpoint
+  identity from `connectivity / instrument_metadata / universe_metadata / historical_daily_1d`.
+  URL paths MUST be normalized to that vocabulary. The report MUST NOT contain an offending symbol,
+  URL, payload or provider exception text.
 - FR-9: Free success MUST remain `outcome=discovery`, `complete_candidate=false`,
   `writes=false` and `starts_shadow=false`. It MUST NOT call normalization, reconciliation,
   provider transition, Task13 scheduler, qualification or failover code.
@@ -141,11 +156,14 @@ exactly four calls occur in the specified order with exact methods, paths and pa
 attempt each, no sleep and no auth header. Any fifth, minute, quote, factor, dynamic-symbol or
 different-origin request is impossible.
 
-### AC-5: Strict Free parser (FR-5, FR-8)
+### AC-5: Strict Free parser (FR-5, FR-8, FR-8a)
 
 Given a missing SH/SZ exchange, wrong instrument, inconsistent universe, missing fixed symbol,
 wrong daily date, duplicate row, partial array, unexpected field or invalid number, when parsing,
 then a typed sanitized discovery failure is returned and every capability remains non-qualified.
+Given additional bounded printable members in `CN_Equity_A`, the parser treats them only as opaque
+metadata and still requires exact fixed-five instrument and Daily coverage. Instrument, universe
+and Daily failures identify only their fixed logical endpoint and never expose the offending value.
 
 ### AC-6: Zero-write success and failure (FR-7, FR-9, NFR-4)
 
@@ -187,8 +205,9 @@ valid fakes, execute returns one sanitized JSON object without SDK notice or pay
   override the Free contract -> ignored or rejected before network; never serialized.
 - EC-3: Free endpoint responds with auth challenge, redirect, 429 or capability-not-available ->
   fail closed once; do not fall back to authenticated origin and do not read a token.
-- EC-4: Instrument/universe daily metadata is empty, duplicated, cross-market or omits any fixed
-  sample symbol -> structural failure; do not substitute another symbol.
+- EC-4: Instrument/Daily metadata is empty, duplicated, widened or omits any fixed sample symbol ->
+  structural failure; do not substitute another symbol. Additional safe universe members remain
+  opaque metadata and neither qualify nor widen the fixed Daily sample.
 - EC-5: Daily data contains more than the requested exact-date row, adjusted/unknown fields, empty
   arrays, mismatched array lengths or values outside the UTC day -> structural failure.
 - EC-6: SDK initialization prints, opens a cache, exposes a non-empty key, uses an unexpected
@@ -254,6 +273,8 @@ interface TickFlowFreeCanaryReport {
     "000002.SZ"
   ];
   requestCount: number;
+  failureClass?: string;
+  endpoint?: "connectivity" | "instrument_metadata" | "universe_metadata" | "historical_daily_1d";
   capabilities: TickFlowCapabilityRecord;
   completeCandidate: false;
   dailyBarQualified: false;
@@ -288,14 +309,15 @@ market-provider-canary --provider tickflow --capability free-daily \
 | Free report | `request_count` | integer | 0-4 actual requests |
 | Free report | qualification flags | literal false | cannot be changed by discovery |
 | Free report | write flags | literal false | success and failure |
-| Free report | failure metadata | optional allowlisted token | no provider text, URL or payload |
+| Free report | failure metadata | optional allowlisted token and logical endpoint identity | no provider text, URL or payload |
 
 N/A - This Task14 revision adds no database table, migration, persisted evidence model or pointer.
 
 ## Out of Scope
 
-- OS-1: No real Free or authenticated provider request is authorized by implementation work. A
-  separate one-time Free discovery authorization is required after offline GREEN and review.
+- OS-1: The first real Free authorization was consumed by the fail-closed V1 canary. No additional
+  Free or authenticated provider request is authorized by V2 implementation work. A new one-time
+  Free discovery authorization is required only after V2 offline GREEN and independent review.
 - OS-2: No real-time quote, minute K-line, WebSocket, depth, financial, factor or authenticated
   endpoint call is part of Free discovery.
 - OS-3: No unit conversion, suspension inference, factor normalization, full-universe daily fetch,

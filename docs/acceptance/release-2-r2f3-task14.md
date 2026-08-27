@@ -2,19 +2,21 @@
 
 ## Current decision
 
-`OFFLINE RUNNER CODE GO / REAL FREE CANARY AUTHORIZATION REQUIRED / SHADOW NOT STARTED`
+`CANARY #1 FAIL-CLOSED / V2 OFFLINE CODE AWAITING INDEPENDENT REVIEW / NEW CANARY NOT AUTHORIZED / SHADOW NOT STARTED`
 
-The exact reviewed implementation commit is
+The V1 reviewed implementation commit is
 `099cb1ca46931459c6ce6177a164aedb47843ad5`. It replaces the earlier
 credential-gated TickFlow discovery default with a separate
 `FREE_DAILY_DISCOVERY` capability. Missing `STOCK_EVA_TICKFLOW_TOKEN` is not an error in this
 mode. Only the explicitly selected legacy `AUTHENTICATED_DISCOVERY` capability may read or require
 that credential.
 
-No real TickFlow request was made while implementing or reviewing this change. This record does
-not claim that TickFlow Free is currently reachable, that any live capability has been discovered,
-that Daily Bar is qualified, that adjustment factors are qualified, that a shadow session has
-started, or that failover is ready.
+The first authorized Free canary completed its four requests and then failed closed with
+`failure_class=symbol_schema`. It did not discover or qualify any capability. V2 removes an
+unsupported full-universe SH/SZ-only assumption and adds fixed endpoint attribution; V2 is not
+eligible for another real request until its exact commit passes independent review. This record
+does not claim that TickFlow Free is currently usable, that Daily Bar or adjustment factors are
+qualified, that a shadow session has started, or that failover is ready.
 
 ## Frozen Free canary contract
 
@@ -66,25 +68,29 @@ window, publish a candidate or enable failover.
 
 ## Descriptor and control-state gate
 
-The existing isolated registry contains the earlier authenticated-capability review and cannot be
-reused as proof of the Free request graph. Before the real canary, a separately reviewed
-TermsEvidence record must be attached to the TickFlow provider record with the exact contract
-version:
+The V1 Free TermsEvidence was attached under the user-authorized preflight with contract version:
 
 ```text
 r2f3-tickflow-free-daily-v1-f9d924340b978d6c8362fed3eeb08438ea53be4a25460071d105f0e4f9a7169f
 ```
 
-This is a bounded control-state preflight write to the isolated provider registry and performs zero
-provider requests. It is not part of the canary. The canary itself remains strictly zero-write. If
-the descriptor is absent, stale or mismatched, execution fails before constructing the SDK or HTTP
-client and the authorization is not consumed on a provider request.
+The preflight performed zero provider requests and advanced only the isolated provider record from
+state version 2 to 3 while retaining `CANARY`. V2 deliberately changes the adapter/source
+descriptor and now requires:
+
+```text
+r2f3-tickflow-free-daily-v2-ea6cfd3c52fc38f82cf17951a85f02bc605177aaead4753f3e11896b56daabd4
+```
+
+The existing V1 registry attachment is therefore stale for V2. A read-only gate replay proved it
+fails before SDK or HTTP client construction with zero provider requests and writes. No V2
+TermsEvidence may be attached until independent review returns GO.
 
 The retained isolated root is
-`/Users/finlay/Library/Application Support/Stock EVA/r2f3-task14-canary-20260826`. The proposed
-historical date is fixed to `2026-08-10`, which the current canonical manifest independently records
-as a BaoStock trading partition with 3,195 rows. The manifest was read only to select the date; the
-canary is not allowed to mutate or publish against it.
+`/Users/finlay/Library/Application Support/Stock EVA/r2f3-task14-canary-20260826`. The historical
+date was fixed to `2026-08-10`, which the current canonical manifest independently records as a
+BaoStock trading partition with 3,195 rows. The manifest was read only to select the date; the
+canary did not mutate or publish against it.
 
 ## Offline verification evidence
 
@@ -94,8 +100,11 @@ canary is not allowed to mutate or publish against it.
   descriptor, closed eight-name runtime settings projection, isolated SDK child and
   `trust_env=false` HTTP client.
 - Independent read-only re-review of the exact remediation commit: H=0, M=0, decision `GO`.
-- Focused Free suite: 104 passed.
-- Full offline suite: 2,017 passed.
+- V2 RED reproduced the unsupported universe regex and missing endpoint attribution; six new
+  focused regressions are GREEN.
+- V2 focused Free suite: 29 passed; related provider/registry/shadow/golden/LaunchAgent suite:
+  418 passed.
+- V2 full offline suite: 2,023 passed.
 - Strict design validator: 100/100, zero warnings.
 - Changed-file Ruff check and format check, compileall, `uv lock --check` and
   `git diff --check`: passed.
@@ -105,22 +114,45 @@ canary is not allowed to mutate or publish against it.
 - Full-repository Ruff still reports only pre-existing findings in the unmodified
   `replace_markdown_kline.py` and `scripts/markdown_to_pdf.py`; these are outside Task14.
 
-All tests and reviews were offline. No token, provider request, production DB, Parquet, manifest,
-pointer, NAS, LaunchAgent or canonical dataset was read or mutated by this implementation window.
+All V2 tests were offline. No token, production DB, Parquet, manifest, pointer, NAS, LaunchAgent or
+canonical dataset was mutated by development or verification.
 
-## Requested controlled operation
+## Controlled canary #1 evidence
 
-A new authorization is required because the prior authenticated-discovery authorization does not
-cover this breaking Free capability contract. The requested operation is:
+- authorization ID: `r2f3-tickflow-free-canary-20260827-01`;
+- descriptor content SHA-256:
+  `faf0a52e5cb491aab2e96e4edee3ad1703ef5af482d94e6818c4eae6b905b7d4`;
+- descriptor manifest SHA-256:
+  `4ab599966228fb25f7357487c9b9aa8e42020c396911b160173a4fc2c01b2e95`;
+- trade date `2026-08-10`, four requests, fixed five symbols and `max_attempts=1`;
+- result: `unavailable / symbol_schema`, `provider_requests=4`;
+- all four discoverable capabilities remained `UNKNOWN`; quote/minute remained `FORBIDDEN` and
+  adjustment factor remained `UNQUALIFIED`;
+- `daily_bar_qualified=false`, `adjustment_factor_qualified=false`, `starts_shadow=false`;
+- `writes=false`, `writes_evidence=false`, `writes_canonical=false`;
+- post-canary registry SHA-256 remained
+  `d3fb9907d3095c5fe7c7a788ea0d4a8d920dba852a26ce7b42ba7fa80d98f01e`;
+- canonical manifest SHA-256 remained
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`;
+- evidence files, shadow files, jobs, qualification windows and session reports all remained zero.
 
-1. attach the exact reviewed Free TermsEvidence descriptor to the existing isolated Task14
-   provider registry, with zero provider requests;
-2. run one Free discovery canary for the fixed confirmed A-share trade date `2026-08-10`;
-3. permit only the four requests and fixed five-symbol sample listed above, with
+The zero-write contract is GO. Free capability discovery and shadow qualification remain NO-GO.
+Because no payload was retained, the exact offending live symbol and failing parser endpoint are
+unknown; `CN_Equity_A` containing a non-SH/SZ member is only the leading hypothesis, not a fact.
+
+## Next controlled-operation gate
+
+The first authorization is consumed. A future V2 request would require, in order:
+
+1. independent GO on the exact V2 implementation commit;
+2. a new explicit user authorization;
+3. attach the exact V2 TermsEvidence descriptor with zero provider requests;
+4. run one zero-write Free discovery canary for `2026-08-10`;
+5. permit only the four requests and fixed five-symbol sample listed above, with
    `max_attempts=1`;
-4. keep the canary at zero DB/Parquet/evidence/manifest/pointer writes;
-5. do not call realtime, minute, factor or authenticated endpoints;
-6. do not start shadow or trigger another request after success or failure.
+6. keep the canary at zero DB/Parquet/evidence/manifest/pointer writes;
+7. do not call realtime, minute, factor or authenticated endpoints;
+8. do not start shadow or trigger another request after success or failure.
 
-Live execution must stop after emitting the sanitized report. Any contract mismatch, transport
-failure, incomplete response or schema failure remains fail-closed.
+No item above is currently authorized. Any future execution must stop after one sanitized report;
+contract mismatch, transport failure, incomplete response or schema failure remains fail-closed.

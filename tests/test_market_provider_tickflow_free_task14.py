@@ -29,6 +29,7 @@ from backend.app.market.providers.tickflow import (
     TickFlowFreeAdapter,
     TickFlowFreeCanaryReport,
     TickFlowFreeCanaryRunner,
+    TickFlowFreeCapabilities,
     TickFlowFreeDiscoveryError,
     initialize_tickflow_free_sdk,
 )
@@ -490,6 +491,113 @@ def test_free_parser_fails_closed_for_partial_or_impossible_data(mutation):
     assert report.failure_class in {"symbol_set_invalid", "numeric_value_invalid"}
     assert report.capabilities.historical_daily_1d == TickFlowCapabilityState.UNKNOWN
     assert report.writes is False
+
+
+def test_free_universe_treats_non_sample_provider_symbols_as_opaque_metadata():
+    responses = _valid_payloads()
+    payload = json.loads(responses[2].content)
+    payload["data"]["symbols"].append("830001.BJ")
+    payload["data"]["symbol_count"] += 1
+    responses[2] = Response(payload, endpoint="/v1/universes/CN_Equity_A")
+
+    report = _run(Transport(responses))
+
+    assert report.status == "discovered"
+    assert report.request_count == 4
+    assert report.capabilities.universe_metadata == TickFlowCapabilityState.DISCOVERED
+    assert report.daily_bar_qualified is False
+    assert report.adjustment_factor_qualified is False
+    assert report.writes is False
+    assert report.starts_shadow is False
+
+
+def test_free_instrument_symbol_failure_has_fixed_endpoint_without_payload():
+    responses = _valid_payloads()
+    payload = json.loads(responses[1].content)
+    payload["data"][0]["symbol"] = {"private": "LEAK-ME"}
+    responses[1] = Response(payload, endpoint="/v1/instruments")
+
+    report = _run(Transport(responses))
+
+    assert report.status == "unavailable"
+    assert report.failure_class == "symbol_schema"
+    assert report.endpoint == "instrument_metadata"
+    assert report.request_count == 4
+    assert "LEAK-ME" not in report.model_dump_json()
+
+
+def test_free_instrument_uses_exact_requested_set_not_exchange_format_guess():
+    responses = _valid_payloads()
+    payload = json.loads(responses[1].content)
+    payload["data"][0].update(
+        {
+            "symbol": "AAPL.US",
+            "code": "AAPL",
+            "exchange": "US",
+            "region": "US",
+        }
+    )
+    responses[1] = Response(payload, endpoint="/v1/instruments")
+
+    report = _run(Transport(responses))
+
+    assert report.status == "unavailable"
+    assert report.failure_class == "symbol_set_invalid"
+    assert report.endpoint == "instrument_metadata"
+    assert report.request_count == 4
+    assert "AAPL.US" not in report.model_dump_json()
+
+
+def test_free_universe_symbol_failure_has_fixed_endpoint_without_payload():
+    responses = _valid_payloads()
+    payload = json.loads(responses[2].content)
+    payload["data"]["symbols"][0] = {"private": "LEAK-ME"}
+    responses[2] = Response(payload, endpoint="/v1/universes/CN_Equity_A")
+
+    report = _run(Transport(responses))
+
+    assert report.status == "unavailable"
+    assert report.failure_class == "symbol_schema"
+    assert report.endpoint == "universe_metadata"
+    assert report.request_count == 4
+    assert "LEAK-ME" not in report.model_dump_json()
+
+
+def test_free_daily_symbol_set_failure_has_fixed_endpoint_and_stays_unqualified():
+    responses = _valid_payloads()
+    payload = json.loads(responses[3].content)
+    payload["data"]["LEAK-ME"] = payload["data"][TICKFLOW_FREE_PROVIDER_SYMBOLS[0]]
+    responses[3] = Response(payload, endpoint="/v1/klines/batch")
+
+    report = _run(Transport(responses))
+
+    assert report.status == "unavailable"
+    assert report.failure_class == "symbol_set_invalid"
+    assert report.endpoint == "historical_daily_1d"
+    assert report.request_count == 4
+    assert report.capabilities == TickFlowFreeCapabilities()
+    assert report.daily_bar_qualified is False
+    assert report.adjustment_factor_qualified is False
+    assert report.writes is False
+    assert report.starts_shadow is False
+    assert "LEAK-ME" not in report.model_dump_json()
+
+
+def test_free_transport_failure_normalizes_path_to_fixed_endpoint_identity():
+    responses = _valid_payloads()
+    responses[1] = Response(
+        {"private": "LEAK-ME"},
+        endpoint="/v1/instruments",
+        status_code=429,
+    )
+
+    report = _run(Transport(responses))
+
+    assert report.status == "unavailable"
+    assert report.failure_class == "rate_limited"
+    assert report.endpoint == "instrument_metadata"
+    assert report.request_count == 2
+    assert "LEAK-ME" not in report.model_dump_json()
 
 
 def test_cli_tickflow_plan_defaults_to_free_without_caller_symbols(monkeypatch, capsys):

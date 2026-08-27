@@ -1,6 +1,6 @@
 # Stock EVA R2-F3 Task14 Free Discovery Implementation Plan
 
-**Status:** `OFFLINE RUNNER CODE GO AT 099cb1c / REAL FREE CANARY NOT AUTHORIZED`
+**Status:** `CANARY #1 FAIL-CLOSED / V2 OFFLINE REMEDIATION IN VERIFICATION / NEW CANARY NOT AUTHORIZED`
 **Specification:** [Task14 Free discovery design](2026-08-27-stock-eva-r2f3-task14-free-discovery-design.md)
 
 ## Delivery boundary
@@ -89,6 +89,36 @@ Free suite passed 104 tests, the full offline suite passed 2,017 tests, and the 
 validator scored 100/100 with zero warnings. No real provider request occurred. The next permitted
 step is to request authorization for the isolated Free descriptor preflight and one zero-write
 Free discovery canary; this approval does not authorize shadow qualification.
+
+## Canary #1 result and V2 remediation
+
+The user authorized one Free descriptor preflight plus one zero-write Free canary. The descriptor
+was attached to the isolated registry with zero provider requests. The `2026-08-10` canary then
+completed all four requests and returned `unavailable / symbol_schema`; all four discoverable
+capabilities remained `UNKNOWN`, both qualification flags remained false and shadow did not start.
+Pre/post hashes proved that the registry after preflight, TermsEvidence objects and canonical
+manifest were unchanged by the canary; evidence and shadow roots remained empty.
+
+Offline triage found two Medium V1 contract defects:
+
+1. the full `CN_Equity_A` member list was forced through the fixed-sample SH/SZ regex although the
+   retained OpenAPI defines universe members only as strings;
+2. parser failures did not carry a fixed endpoint identity, so the zero-write report could not
+   distinguish universe from Daily schema failure.
+
+V2 RED/GREEN requirements are:
+
+1. accept additional bounded printable universe members only as opaque metadata while requiring
+   the fixed five symbols to be present;
+2. retain exact fixed-five instrument and Daily response sets, with all existing date/numeric
+   gates unchanged;
+3. normalize transport and parser errors to one of the four fixed logical endpoint identities;
+4. retain no offending symbol, URL, raw payload or provider exception;
+5. bump the Free adapter/source/descriptor and TermsEvidence contract version so V1 review fails
+   before any future client construction.
+
+The first authorization is consumed. No V2 real request is permitted until the full offline gate
+and a new independent review return GO, followed by a new explicit single-use authorization.
 
 ## Explicit non-changes
 
