@@ -239,6 +239,7 @@ def build_tickflow_free_client() -> HttpTransport:
             base_url="https://free-api.tickflow.org",
             verify=True,
             follow_redirects=False,
+            trust_env=False,
             timeout=httpx.Timeout(30, connect=5, write=5, pool=5),
         )
     )

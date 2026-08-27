@@ -17,7 +17,7 @@ from backend.app.classification.failures import (
 from backend.app.classification.provider import BaoStockClassificationProvider
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
-from backend.app.config import get_settings
+from backend.app.config import get_settings, get_tickflow_free_runtime_settings
 from backend.app.market.automation import (
     AutomationOutcome,
     BaoStockProbeRunner,
@@ -969,7 +969,11 @@ def main() -> int:
                 build_tickflow_free_client,
             )
 
-            settings = get_settings()
+            settings = (
+                get_tickflow_free_runtime_settings()
+                if tickflow_mode == "FREE_DAILY_DISCOVERY"
+                else get_settings()
+            )
             layout = StorageLayout(settings)
             if tickflow_mode == "FREE_DAILY_DISCOVERY":
                 runner = TickFlowFreeCanaryRunner(

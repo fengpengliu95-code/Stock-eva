@@ -43,7 +43,13 @@ rate-limit/quota, raw-retention rights, complete-session coverage or long-term a
   from `tickflow==0.1.24` with exact base URL `https://free-api.tickflow.org`, `max_retries=0`, fixed
   timeouts and a no-write cache path. It MUST reject a non-Free base URL or a non-empty SDK API key,
   suppress the SDK's human notice from CLI output, close the SDK client exactly once and perform no
-  provider request through the SDK client.
+  provider request through the SDK client. The production probe MUST run in an isolated child with
+  a closed credential-free environment; the actual Free HTTP transport MUST use `trust_env=false`.
+- FR-3a: Free execution MUST read a separately reviewed, persisted Free-capability descriptor.
+  Its TermsEvidence `contract_version` MUST bind the Free adapter, endpoint, source-schema, unit,
+  SDK-version and pinned-wheel hashes. The authenticated provider record hashes MUST NOT be used
+  as proof of the Free request graph. A missing or mismatched Free review MUST fail before SDK or
+  HTTP client construction with zero requests and writes.
 - FR-4: A Free plan MUST contain exactly four logical requests, once each and in this order:
   `connectivity` (`GET /v1/exchanges`), `instrument_metadata`
   (`POST /v1/instruments` for the exact fixed sample `600000.SH`, `600519.SH`, `601318.SH`,
@@ -93,6 +99,8 @@ rate-limit/quota, raw-retention rights, complete-session coverage or long-term a
   tests. A version change requires a new contract hash and review.
 - NFR-3: Free-mode public output MUST be valid single-object JSON and contain no SDK notice, URL
   query, raw response, header, token, arbitrary exception text or provider payload.
+- NFR-3a: Free CLI settings MUST use a closed allowlist of non-credential environment names and
+  MUST NOT instantiate a general settings source that enumerates the process environment or `.env`.
 - NFR-4: Existing BaoStock canonical, R2-F2 golden fixtures, Tasks10-13 lifecycle, Tushare block,
   authenticated capability and automatic-failover default-off guarantees MUST remain unchanged.
 - NFR-5: Every response and every owned SDK/HTTP client MUST close exactly once on success,
@@ -118,6 +126,13 @@ Given a fake official SDK factory and captured stdout/stderr, when the productio
 exercised offline, then it invokes `TickFlow.free()` with the exact Free origin,
 `max_retries=0`, fixed timeout and no-write cache, validates empty API key and exact base URL,
 emits no notice and closes once without an SDK network call.
+
+### AC-3a: Free descriptor and settings are capability-bound (FR-3a, NFR-3a)
+
+Given an authenticated-only registry descriptor, stale Free contract version, environment
+enumeration spy or either credential name, when Free execute is selected, then it fails before
+client construction or proves that only the closed non-credential settings allowlist was read.
+Only TermsEvidence bound to the exact Free descriptor hash permits the four requests.
 
 ### AC-4: Exact Free request graph (FR-4, FR-6)
 
@@ -268,6 +283,7 @@ market-provider-canary --provider tickflow --capability free-daily \
 | Free plan | `trade_date` | date | explicit confirmed historical date |
 | Free plan | `fixed_symbols` | literal tuple | exactly `600000.SH`, `600519.SH`, `601318.SH`, `000001.SZ`, `000002.SZ` |
 | Free plan | `requests` | tuple | four fixed ordered logical requests |
+| Free descriptor | `contract_version` | literal | embeds exact Free descriptor SHA-256 |
 | Capability record | each capability | enum | fixed state vocabulary; no free text |
 | Free report | `request_count` | integer | 0-4 actual requests |
 | Free report | qualification flags | literal false | cannot be changed by discovery |

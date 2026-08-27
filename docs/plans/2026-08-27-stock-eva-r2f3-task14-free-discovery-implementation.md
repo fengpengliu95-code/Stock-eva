@@ -10,10 +10,17 @@ reads a credential, never enters the authenticated service, never persists evide
 state, and never starts shadow qualification. `AUTHENTICATED_DISCOVERY` remains an explicit,
 separate legacy route and is the only route that may require `STOCK_EVA_TICKFLOW_TOKEN`.
 
+Free execute uses a closed runtime-settings projection that reads only eight named,
+non-credential process variables; it does not construct general `BaseSettings`, enumerate the
+environment or read `.env`. The existing provider record remains the authenticated descriptor.
+A separately reviewed TermsEvidence `contract_version` embeds the exact Free capability descriptor
+SHA-256 and is required before either the SDK or HTTP client is constructed.
+
 The official pinned SDK is used only to initialize and validate the official `TickFlow.free()`
 configuration without an SDK network call. All four Free HTTP requests use the existing bounded,
 streaming transport because the SDK does not expose the receive-level byte and request bounds
-required by the approved canary contract.
+required by the approved canary contract. The production SDK probe runs in an isolated child with
+a closed environment, and the bounded HTTPX client disables environment proxy lookup.
 
 ## RED sequence
 
@@ -30,6 +37,8 @@ current code lacks the following contracts:
    Bar and adjustment-factor qualification remain false and shadow never starts.
 5. CLI defaults TickFlow to `free-daily`; only explicit `authenticated` may reach the existing
    credential-gated runner.
+6. An authenticated-only/stale registry review blocks Free before client creation, while a Free
+   descriptor does not replace or masquerade as the authenticated request graph.
 
 The expected RED command is:
 

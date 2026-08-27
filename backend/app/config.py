@@ -1,8 +1,10 @@
+import os
+from collections.abc import Mapping
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -216,3 +218,100 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class TickFlowFreeRuntimeSettings(BaseModel):
+    """Allowlisted settings projection that never enumerates the process environment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider_shadow_enabled: bool = False
+    provider_shadow_execute_enabled: bool = False
+    provider_shadow_root: Path = Path.cwd() / "var/provider-shadow"
+    provider_evidence_root: Path = Path("var/evidence")
+    local_control_dir: Path = Path("var/control")
+    provider_registry_database_name: str = "provider_registry.sqlite3"
+    local_market_dataset_root: Path | None = None
+    nas_market_dataset_root: Path | None = None
+
+    @field_validator("provider_shadow_root")
+    @classmethod
+    def validate_shadow_root(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("provider shadow root must be absolute")
+        return value
+
+    @field_validator("provider_registry_database_name")
+    @classmethod
+    def validate_registry_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("provider registry database name is invalid")
+        return value
+
+
+def _closed_bool(environ: Mapping[str, str], name: str, *, default: bool) -> bool:
+    value = environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("Free canary boolean setting is invalid")
+
+
+def _closed_path(environ: Mapping[str, str], name: str, *, default: Path | None) -> Path | None:
+    value = environ.get(name)
+    if value is None:
+        return default
+    if not value.strip():
+        raise ValueError("Free canary path setting is invalid")
+    return Path(value)
+
+
+def get_tickflow_free_runtime_settings(
+    *, environ: Mapping[str, str] | None = None
+) -> TickFlowFreeRuntimeSettings:
+    """Read only the eight non-credential names required by Free discovery.
+
+    Do not replace this projection with ``Settings()``: BaseSettings enumerates the complete
+    environment, which would cross the Free-mode credential-read boundary.
+    """
+
+    source = os.environ if environ is None else environ
+    return TickFlowFreeRuntimeSettings(
+        provider_shadow_enabled=_closed_bool(
+            source, "STOCK_EVA_PROVIDER_SHADOW_ENABLED", default=False
+        ),
+        provider_shadow_execute_enabled=_closed_bool(
+            source, "STOCK_EVA_PROVIDER_SHADOW_EXECUTE_ENABLED", default=False
+        ),
+        provider_shadow_root=_closed_path(
+            source,
+            "STOCK_EVA_PROVIDER_SHADOW_ROOT",
+            default=Path.cwd() / "var/provider-shadow",
+        ),
+        provider_evidence_root=_closed_path(
+            source, "STOCK_EVA_PROVIDER_EVIDENCE_ROOT", default=Path("var/evidence")
+        ),
+        local_control_dir=_closed_path(
+            source, "STOCK_EVA_LOCAL_CONTROL_DIR", default=Path("var/control")
+        ),
+        provider_registry_database_name=source.get(
+            "STOCK_EVA_PROVIDER_REGISTRY_DATABASE_NAME", "provider_registry.sqlite3"
+        ),
+        local_market_dataset_root=_closed_path(
+            source, "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT", default=None
+        ),
+        nas_market_dataset_root=_closed_path(
+            source, "STOCK_EVA_NAS_MARKET_DATASET_ROOT", default=None
+        ),
+    )

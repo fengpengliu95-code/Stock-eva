@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.app.market.providers.http import build_tickflow_free_client
 from backend.app.market.providers.registry import ShadowRegistry, exact_credential_env
 from backend.app.market.providers.shadow_contracts import (
     AdmissionState,
@@ -20,7 +21,9 @@ from backend.app.market.providers.shadow_contracts import (
 )
 from backend.app.market.providers.tickflow import (
     TICKFLOW_FREE_PROVIDER_SYMBOLS,
+    TICKFLOW_FREE_REVIEW_URLS,
     TICKFLOW_FREE_SERVER,
+    TICKFLOW_FREE_TERMS_CONTRACT_VERSION,
     TickFlowAdapter,
     TickFlowCapabilityState,
     TickFlowFreeAdapter,
@@ -153,7 +156,9 @@ def _run(transport: Transport):
     )
 
 
-def _task14_registry(tmp_path: Path) -> ShadowRegistry:
+def _task14_registry(
+    tmp_path: Path, *, contract_version: str = TICKFLOW_FREE_TERMS_CONTRACT_VERSION
+) -> ShadowRegistry:
     def digest(value: str) -> str:
         return hashlib.sha256(value.encode()).hexdigest()
 
@@ -181,13 +186,10 @@ def _task14_registry(tmp_path: Path) -> ShadowRegistry:
     terms = TermsEvidence.build(
         terms_evidence_id="terms-tickflow-free",
         provider_id="tickflow",
-        official_url_allowlist=(
-            "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json",
-            "https://tickflow.org/legal/terms-of-service.md",
-        ),
+        official_url_allowlist=(*TICKFLOW_FREE_REVIEW_URLS,),
         content_object_relpath="terms.txt",
         content_bytes=b"reviewed terms",
-        contract_version="r2f3-terms-v1",
+        contract_version=contract_version,
         as_of_date="2026-08-27",
         reviewer="reviewer-1",
         review_id="review-1",
@@ -244,6 +246,46 @@ def test_official_free_sdk_is_pinned_credentialless_silent_and_closed(capsys, tm
     assert FakeSdk.instances[0].close_calls == 1
     assert not (tmp_path / "must-remain-absent").exists()
     assert capsys.readouterr().out == ""
+
+
+def test_production_sdk_probe_uses_isolated_closed_environment(monkeypatch):
+    import subprocess
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="FREE_SDK_OK\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    probe = initialize_tickflow_free_sdk(sdk_version="0.1.24")
+
+    assert probe.provider_requests == 0
+    argv, kwargs = calls[0]
+    assert argv[1:3] == ["-I", "-B"]
+    assert kwargs["env"] == {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+    assert "STOCK_EVA_TICKFLOW_TOKEN" not in kwargs["env"]
+    assert "TICKFLOW_API_KEY" not in kwargs["env"]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def test_free_http_factory_disables_environment_proxy_lookup(monkeypatch):
+    import httpx
+
+    calls = []
+
+    class Client:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: calls.append(kwargs) or Client())
+    client = build_tickflow_free_client()
+    client.close()
+
+    assert calls[0]["base_url"] == TICKFLOW_FREE_SERVER
+    assert calls[0]["follow_redirects"] is False
+    assert calls[0]["verify"] is True
+    assert calls[0]["trust_env"] is False
 
 
 def test_free_canary_makes_exact_requests_without_credentials(monkeypatch):
@@ -359,6 +401,40 @@ def test_production_free_runner_reads_registry_without_token_or_any_write(tmp_pa
     assert registry.read_status("tickflow").admission_state == AdmissionState.CANARY
 
 
+def test_production_free_runner_requires_separately_reviewed_free_descriptor(tmp_path):
+    registry = _task14_registry(tmp_path, contract_version="r2f3-authenticated-only")
+    shadow_root = tmp_path / "shadow"
+    shadow_root.mkdir()
+    client_calls = []
+    settings = SimpleNamespace(
+        provider_shadow_enabled=True,
+        provider_shadow_execute_enabled=True,
+        local_market_dataset_root=tmp_path / "canonical",
+        nas_market_dataset_root=None,
+        local_control_dir=tmp_path / "control",
+    )
+
+    class Layout:
+        provider_shadow_root = shadow_root
+
+        def validate_provider_shadow_root(self, *, canonical_roots):
+            assert shadow_root not in canonical_roots
+
+    runner = TickFlowFreeCanaryRunner(
+        settings=settings,
+        layout=Layout(),
+        registry=registry,
+        client_factory=lambda: client_calls.append("called"),
+    )
+    with pytest.raises(PermissionError, match="Free provider review unavailable"):
+        runner.execute(
+            TRADE_DATE,
+            external_authorization_id="free-canary-once",
+            acknowledge_provider_requests=True,
+        )
+    assert client_calls == []
+
+
 @pytest.mark.parametrize("failure_ordinal", range(4))
 def test_each_free_endpoint_failure_is_one_attempt_zero_write_and_unqualified(failure_ordinal):
     responses = _valid_payloads()
@@ -438,7 +514,22 @@ def test_cli_tickflow_execute_defaults_only_to_free_runner(tmp_path, monkeypatch
     from backend.app import cli
     from backend.app.market.providers import tickflow as tickflow_module
 
-    monkeypatch.setattr(cli, "get_settings", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("general Settings must not be constructed")),
+    )
+
+    class ClosedEnvironment(dict):
+        def items(self):
+            raise AssertionError("Free mode must not enumerate the environment")
+
+        def get(self, key, default=None):
+            if key in {"STOCK_EVA_TICKFLOW_TOKEN", "TICKFLOW_API_KEY"}:
+                raise AssertionError("Free mode must not read a credential")
+            return super().get(key, default)
+
+    monkeypatch.setattr(os, "environ", ClosedEnvironment(dict(os.environ)))
     monkeypatch.setattr(
         cli,
         "StorageLayout",

@@ -31,6 +31,15 @@ TICKFLOW_FREE_SERVER = "https://free-api.tickflow.org"
 TICKFLOW_OPENAPI_URL = "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json"
 TICKFLOW_TERMS_URL = "https://tickflow.org/legal/terms-of-service.md"
 TICKFLOW_FREE_SDK_VERSION = "0.1.24"
+TICKFLOW_FREE_SDK_WHEEL_SHA256 = "e898867b0e3e668618135c78e3a367542f81b7a289567335d298c707452e5f42"
+TICKFLOW_FREE_REVIEW_URLS = frozenset(
+    {
+        "https://docs.tickflow.org/zh-Hans/api-reference/openapi.json",
+        "https://docs.tickflow.org/zh-Hans/sdk/python-quickstart",
+        "https://free-api.tickflow.org",
+        "https://tickflow.org/legal/terms-of-service.md",
+    }
+)
 TICKFLOW_FREE_PROVIDER_SYMBOLS = (
     "600000.SH",
     "600519.SH",
@@ -223,6 +232,17 @@ FREE_ADAPTER_HASH = _hash("tickflow-free-adapter-task14-v1")
 FREE_ENDPOINT_CONTRACT_HASH = TickFlowFreeContract().request_hash
 FREE_SOURCE_SCHEMA_HASH = _hash("tickflow-free-source-shape-0.1.24-2026-08-27")
 FREE_UNIT_CONTRACT_HASH = _hash("tickflow-free-units-unknown-unqualified")
+FREE_DESCRIPTOR_HASH = _hash(
+    {
+        "adapter_hash": FREE_ADAPTER_HASH,
+        "endpoint_contract_hash": FREE_ENDPOINT_CONTRACT_HASH,
+        "source_schema_hash": FREE_SOURCE_SCHEMA_HASH,
+        "unit_contract_hash": FREE_UNIT_CONTRACT_HASH,
+        "sdk_version": TICKFLOW_FREE_SDK_VERSION,
+        "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
+    }
+)
+TICKFLOW_FREE_TERMS_CONTRACT_VERSION = f"r2f3-tickflow-free-daily-v1-{FREE_DESCRIPTOR_HASH}"
 
 
 class TickFlowFreePlan(_FreeImmutable):
@@ -369,10 +389,7 @@ def initialize_tickflow_free_sdk(
     if sdk_version != TICKFLOW_FREE_SDK_VERSION:
         raise TickFlowFreeDiscoveryError("sdk_version_mismatch")
     if sdk_class is None:
-        try:
-            from tickflow import TickFlow as sdk_class
-        except Exception:
-            raise TickFlowFreeDiscoveryError("sdk_initialization_failed") from None
+        return _initialize_tickflow_free_sdk_subprocess(cache_dir=cache_dir)
 
     class _CredentiallessTickFlow(sdk_class):
         def __init__(self, api_key: str | None = None, **kwargs: Any) -> None:
@@ -405,6 +422,60 @@ def initialize_tickflow_free_sdk(
                     close()
                 except Exception:
                     raise TickFlowFreeDiscoveryError("sdk_contract_invalid") from None
+
+
+def _initialize_tickflow_free_sdk_subprocess(*, cache_dir: Path) -> TickFlowFreeSdkProbe:
+    """Run the official factory in an isolated process with a closed environment."""
+
+    import subprocess
+    import sys
+
+    script = r"""
+import contextlib
+import io
+import sys
+
+from tickflow import TickFlow
+
+client = None
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        client = TickFlow.free(
+            base_url=sys.argv[1], timeout=30.0, max_retries=0, cache_dir=sys.argv[2]
+        )
+    if client.api_key not in (None, "") or client.base_url != sys.argv[1]:
+        raise RuntimeError("free contract mismatch")
+    if getattr(client._client, "max_retries", None) != 0:
+        raise RuntimeError("retry contract mismatch")
+finally:
+    if client is not None:
+        client.close()
+print("FREE_SDK_OK")
+"""
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                script,
+                TICKFLOW_FREE_SERVER,
+                str(cache_dir),
+            ],
+            cwd="/",
+            env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        raise TickFlowFreeDiscoveryError("sdk_initialization_failed") from None
+    if completed.returncode != 0 or completed.stdout != "FREE_SDK_OK\n":
+        raise TickFlowFreeDiscoveryError("sdk_contract_invalid")
+    return TickFlowFreeSdkProbe()
 
 
 class TickFlowPlan(BaseModel):
@@ -806,6 +877,50 @@ class TickFlowFreeAdapter:
         )
 
 
+def _read_tickflow_free_descriptor(registry: Any):
+    """Read the persisted Free-capability review without using auth graph hashes."""
+
+    from .http import CanaryPermissionError
+    from .registry import ShadowRegistry
+
+    if type(registry) is not ShadowRegistry:
+        raise CanaryPermissionError("concrete shadow registry required")
+    record = registry.read_status("tickflow")
+    if (
+        record.admission_state.value != "canary"
+        or record.credential_env_name != "STOCK_EVA_TICKFLOW_TOKEN"
+        or not record.terms_evidence_hash
+        or not record.terms_review_id
+    ):
+        raise CanaryPermissionError("Free provider descriptor unavailable")
+    with registry._lock(shared=True):
+        connection = registry._connection_for_read()
+        try:
+            row = connection.execute(
+                "SELECT terms_evidence_id FROM terms_evidence WHERE provider_id=? "
+                "AND manifest_sha256=? AND review_id=?",
+                ("tickflow", record.terms_evidence_hash, record.terms_review_id),
+            ).fetchone()
+        finally:
+            if not getattr(registry, "_memory", False):
+                connection.close()
+    if row is None:
+        raise CanaryPermissionError("Free provider review unavailable")
+    terms = registry.read_terms_evidence(row[0])
+    if (
+        terms.manifest_sha256 != record.terms_evidence_hash
+        or terms.review_id != record.terms_review_id
+        or terms.contract_version != TICKFLOW_FREE_TERMS_CONTRACT_VERSION
+        or not TICKFLOW_FREE_REVIEW_URLS.issubset(terms.official_url_allowlist)
+        or terms.approved_credential_mode != "environment-only"
+        or terms.approved_intended_use != record.intended_use
+        or terms.approved_retention != record.retention_decision
+        or not terms.approved_quota_decision
+    ):
+        raise CanaryPermissionError("Free provider review unavailable")
+    return record, terms
+
+
 class TickFlowFreeCanaryRunner:
     """Read-only Free discovery runner; it has no persistence dependency."""
 
@@ -940,7 +1055,7 @@ class TickFlowFreeCanaryRunner:
         external_authorization_id: str,
         acknowledge_provider_requests: bool,
     ) -> TickFlowFreeCanaryReport:
-        from .http import _read_canary_descriptor, _valid_authorization_id
+        from .http import _valid_authorization_id
 
         if not (
             type(getattr(self.settings, "provider_shadow_enabled", False)) is bool
@@ -967,18 +1082,10 @@ class TickFlowFreeCanaryRunner:
             if root is not None
         )
         self.layout.validate_provider_shadow_root(canonical_roots=canonical)
-        record = self.registry.read_status("tickflow")
-        if str(record.admission_state.value).lower() != "canary":
-            raise PermissionError("provider is not admitted for canary")
-        # Terms/admission is read-only.  The existing authenticated descriptor remains the
-        # provider-level reviewed record; the Free request graph is separately frozen above.
-        _read_canary_descriptor(
-            "tickflow",
-            self.registry,
-            adapter_hash=TickFlowAdapter.ADAPTER_HASH,
-            endpoint_contract_hash=TickFlowAdapter.ENDPOINT_CONTRACT_HASH,
-            source_schema_hash=TickFlowAdapter.SOURCE_SCHEMA_HASH,
-        )
+        # The provider record remains compatible with the explicit authenticated capability,
+        # while the attached TermsEvidence contract_version binds this separate Free graph to
+        # its adapter/schema/SDK descriptor hash.
+        _read_tickflow_free_descriptor(self.registry)
         return self._run_free(
             transport_factory=self.client_factory,
             trade_date=trade_date,
