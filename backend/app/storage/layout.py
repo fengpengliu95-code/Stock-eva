@@ -58,6 +58,42 @@ class StorageLayout:
         )
 
     @property
+    def daily_bar_shadow_database(self) -> Path:
+        return self.settings.local_control_dir / self.settings.daily_bar_shadow_database_name
+
+    @property
+    def daily_bar_shadow_lock(self) -> Path:
+        return self.daily_bar_shadow_database.with_name(
+            self.daily_bar_shadow_database.name + ".lock"
+        )
+
+    @property
+    def daily_bar_shadow_evidence_root(self) -> Path:
+        return self.provider_shadow_root / "daily-evidence"
+
+    @property
+    def daily_bar_shadow_candidate_root(self) -> Path:
+        return self.provider_shadow_root / "daily-candidates"
+
+    def validate_daily_bar_shadow_layout(
+        self, *, canonical_roots: tuple[Path, ...] = ()
+    ) -> tuple[Path, Path, Path]:
+        """Validate Daily sidecar paths without creating or resolving user links."""
+        self.validate_provider_shadow_root(canonical_roots=canonical_roots)
+        database = self.daily_bar_shadow_database
+        evidence = self.daily_bar_shadow_evidence_root
+        candidates = self.daily_bar_shadow_candidate_root
+        if (
+            not database.parent.is_absolute()
+            or not evidence.is_absolute()
+            or not candidates.is_absolute()
+            or database in {self.provider_registry_database, self.provider_health_database}
+            or evidence == candidates
+        ):
+            raise ValueError("Daily Bar shadow layout is not isolated")
+        return database, evidence, candidates
+
+    @property
     def provider_shadow_root(self) -> Path:
         return self.settings.provider_shadow_root
 

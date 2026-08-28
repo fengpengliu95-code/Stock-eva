@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
     provider_health_database_name: str = "provider_health.sqlite3"
     provider_registry_database_name: str = "provider_registry.sqlite3"
+    daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
@@ -111,7 +112,7 @@ class Settings(BaseSettings):
             raise ValueError("provider evidence contract version is unsupported")
         return value
 
-    @field_validator("provider_registry_database_name")
+    @field_validator("provider_registry_database_name", "daily_bar_shadow_database_name")
     @classmethod
     def validate_provider_registry_database_name(cls, value: str) -> str:
         candidate = Path(value)
@@ -121,7 +122,7 @@ class Settings(BaseSettings):
             or candidate.name != value
             or not value.endswith(".sqlite3")
         ):
-            raise ValueError("provider registry database name must be a local .sqlite3 basename")
+            raise ValueError("provider sidecar database name must be a local .sqlite3 basename")
         return value
 
     @field_validator("provider_shadow_max_object_bytes")
@@ -212,6 +213,16 @@ class Settings(BaseSettings):
     def private_database_names_are_distinct(self) -> "Settings":
         if self.user_database_name.casefold() == self.portfolio_database_name.casefold():
             raise ValueError("user and portfolio database names must be distinct")
+        control_databases = (
+            self.factor_cache_database_name,
+            self.calendar_sync_database_name,
+            self.regime_snapshot_database_name,
+            self.provider_health_database_name,
+            self.provider_registry_database_name,
+            self.daily_bar_shadow_database_name,
+        )
+        if len({name.casefold() for name in control_databases}) != len(control_databases):
+            raise ValueError("local control database names must be distinct")
         return self
 
 
@@ -231,6 +242,7 @@ class TickFlowFreeRuntimeSettings(BaseModel):
     provider_evidence_root: Path = Path("var/evidence")
     local_control_dir: Path = Path("var/control")
     provider_registry_database_name: str = "provider_registry.sqlite3"
+    daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
     local_market_dataset_root: Path | None = None
     nas_market_dataset_root: Path | None = None
 
@@ -241,7 +253,7 @@ class TickFlowFreeRuntimeSettings(BaseModel):
             raise ValueError("provider shadow root must be absolute")
         return value
 
-    @field_validator("provider_registry_database_name")
+    @field_validator("provider_registry_database_name", "daily_bar_shadow_database_name")
     @classmethod
     def validate_registry_name(cls, value: str) -> str:
         candidate = Path(value)
@@ -254,6 +266,15 @@ class TickFlowFreeRuntimeSettings(BaseModel):
         ):
             raise ValueError("provider registry database name is invalid")
         return value
+
+    @model_validator(mode="after")
+    def daily_database_is_isolated(self) -> "TickFlowFreeRuntimeSettings":
+        if (
+            self.provider_registry_database_name.casefold()
+            == self.daily_bar_shadow_database_name.casefold()
+        ):
+            raise ValueError("Free provider sidecar database names must be distinct")
+        return self
 
 
 def _closed_bool(environ: Mapping[str, str], name: str, *, default: bool) -> bool:
@@ -280,7 +301,7 @@ def _closed_path(environ: Mapping[str, str], name: str, *, default: Path | None)
 def get_tickflow_free_runtime_settings(
     *, environ: Mapping[str, str] | None = None
 ) -> TickFlowFreeRuntimeSettings:
-    """Read only the eight non-credential names required by Free discovery.
+    """Read only the allowlisted non-credential names required by Free discovery.
 
     Do not replace this projection with ``Settings()``: BaseSettings enumerates the complete
     environment, which would cross the Free-mode credential-read boundary.
@@ -307,6 +328,9 @@ def get_tickflow_free_runtime_settings(
         ),
         provider_registry_database_name=source.get(
             "STOCK_EVA_PROVIDER_REGISTRY_DATABASE_NAME", "provider_registry.sqlite3"
+        ),
+        daily_bar_shadow_database_name=source.get(
+            "STOCK_EVA_DAILY_BAR_SHADOW_DATABASE_NAME", "daily_bar_shadow.sqlite3"
         ),
         local_market_dataset_root=_closed_path(
             source, "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT", default=None
