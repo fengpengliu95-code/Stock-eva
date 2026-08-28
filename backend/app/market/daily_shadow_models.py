@@ -11,7 +11,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
 
 DAILY_SHADOW_PROFILE = "TICKFLOW_FREE_DAILY_BAR_OHLC_V1"
 _CANONICAL_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
@@ -213,24 +213,32 @@ class DailyShadowSourceRow(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
     trade_date: date
-    timestamp: int = Field(ge=0)
+    timestamp: StrictInt = Field(ge=0)
     provider_symbol: str = Field(pattern=r"^\d{6}\.(?:SH|SZ)$")
     symbol: str = Field(pattern=r"^(?:sh|sz)\.\d{6}$")
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: int = Field(ge=0)
-    amount: Decimal = Field(ge=0)
+    open: StrictInt | StrictFloat
+    high: StrictInt | StrictFloat
+    low: StrictInt | StrictFloat
+    close: StrictInt | StrictFloat
+    volume: StrictInt = Field(ge=0)
+    amount: StrictInt | StrictFloat
 
     @model_validator(mode="after")
     def validate_source_row(self) -> DailyShadowSourceRow:
         if canonical_to_tickflow_daily_symbol(self.symbol) != self.provider_symbol:
             raise ValueError("Daily shadow source symbol mapping mismatch")
-        prices = (self.open, self.high, self.low, self.close)
+        prices = tuple(
+            Decimal(str(value)) for value in (self.open, self.high, self.low, self.close)
+        )
+        amount = Decimal(str(self.amount))
         if any(not value.is_finite() or value <= 0 for value in prices):
             raise ValueError("Daily shadow source price is invalid")
-        if self.high < max(prices) or self.low > min(prices) or not self.amount.is_finite():
+        if (
+            prices[1] < max(prices)
+            or prices[2] > min(prices)
+            or not amount.is_finite()
+            or amount < 0
+        ):
             raise ValueError("Daily shadow source row is invalid")
         return self
 

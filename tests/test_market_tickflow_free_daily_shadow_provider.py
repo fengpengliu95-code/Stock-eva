@@ -287,7 +287,7 @@ def test_volume_and_amount_are_opaque_and_semantic_states_remain_unqualified():
     )
     assert result.status == "ready"
     assert result.rows[0].volume == 1000
-    assert result.rows[0].amount == Decimal("10200.0")
+    assert result.rows[0].amount == 10200.0
     assert result.units_state == "UNKNOWN"
     assert result.suspension_semantics_state == "UNKNOWN"
     assert result.factor_evidence_state == "UNQUALIFIED"

@@ -130,7 +130,7 @@ def _parse_shard(
         volume = compact["volume"][0]
         if type(volume) is not int or not 0 <= volume <= 2**63 - 1:
             raise TickFlowFreeDailyShadowError("numeric_value_invalid")
-        amount = _decimal(compact["amount"][0], positive=False)
+        _decimal(compact["amount"][0], positive=False)
         for field in _OPTIONAL_COLUMNS & set(compact):
             _decimal(compact[field][0], positive=False)
         try:
@@ -139,12 +139,12 @@ def _parse_shard(
                 timestamp=timestamp,
                 provider_symbol=provider,
                 symbol=canonical,
-                open=open_value,
-                high=high,
-                low=low,
-                close=close,
+                open=compact["open"][0],
+                high=compact["high"][0],
+                low=compact["low"][0],
+                close=compact["close"][0],
                 volume=volume,
-                amount=amount,
+                amount=compact["amount"][0],
             )
         except Exception as exc:
             raise TickFlowFreeDailyShadowError("numeric_value_invalid") from exc
