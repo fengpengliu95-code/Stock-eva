@@ -1,0 +1,14 @@
+{
+  "dataset": "stock-eva-market",
+  "files": [
+    {
+      "path": "bars/source=baostock/year=2026/month=08/date=2026-08-10_REPLACED.parquet",
+      "row_count": 4,
+      "sha256": "REPLACED",
+      "source": "baostock",
+      "trade_date": "2026-08-10"
+    }
+  ],
+  "generation": "generation-r2f3-daily-shadow-legacy",
+  "schema_version": 2
+}
