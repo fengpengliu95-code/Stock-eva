@@ -1,11 +1,28 @@
 # Stock EVA R2-F3 TickFlow Free Daily Bar Shadow Qualification Implementation Plan
 
-**Status:** `SPEC READY / IMPLEMENTATION NOT STARTED / DAILY BAR SHADOW NO-GO`  
-**Design:** [Daily Bar Shadow Qualification Design](2026-08-28-stock-eva-r2f3-daily-bar-shadow-qualification-design.md)  
-**Starting commit:** `d70fb02140e09ff3758ef224ad27abcf3e1e2e78`  
+**Status:** `OFFLINE CODE GATE PASS / INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+
+**Design:** [Daily Bar Shadow Qualification Design](2026-08-28-stock-eva-r2f3-daily-bar-shadow-qualification-design.md)
+
+**Starting commit:** `d70fb02140e09ff3758ef224ad27abcf3e1e2e78`
+
+**Implemented code through:** `3b0c5fb92f658762568241bd4409bd9cf4a48b1a`
 **Execution discipline:** one task at a time, witnessed RED before production edits, smallest
 GREEN, focused verification, then commit. No real provider request before all offline tasks and an
 independent exact-commit review pass.
+
+## Task 7 offline evidence
+
+- R2-F3 focused: 104/104 passed.
+- R2-F2/Task14/prior-shadow compatibility: 357/357 passed.
+- Full repository: 2,127/2,127 passed; LaunchAgent assets: 26/26 passed.
+- Full Ruff, format, compileall and diff checks passed; strict design validator: 100/100.
+- All eight frozen R2-F2 fixture hashes matched before/after.
+- Published canonical manifest remains
+  `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`; all 271 referenced
+  partitions match their descriptor SHA-256 values.
+- No real provider request was made. The exact-commit independent review and real shadow window
+  remain pending; see `docs/acceptance/release-2-r2f3-daily-bar-shadow.md`.
 
 ## Delivery result vocabulary
 
