@@ -280,6 +280,8 @@ def test_exact_terminal_retry_is_idempotent(tmp_path):
     first = registry.commit_success(success, lease=lease)
     second = registry.commit_success(success, lease=lease)
     assert first == second
+    assert _lease(registry, window, DATES[0], 0).outcome == "ALREADY_TERMINAL"
+    assert registry.read().window.state == "OBSERVING"
     assert registry.read().session_report_count == 1
 
 

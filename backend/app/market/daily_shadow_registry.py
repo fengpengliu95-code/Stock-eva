@@ -1511,6 +1511,41 @@ class DailyShadowRegistry:
             window = connection.execute(
                 "SELECT * FROM daily_shadow_window WHERE epoch_id=?", (epoch_id,)
             ).fetchone()
+            existing = connection.execute(
+                "SELECT * FROM daily_shadow_job WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if existing is not None:
+                same = (
+                    existing["epoch_id"] == epoch_id
+                    and existing["session_id"] == session_id
+                    and existing["trade_date"] == trade_date.isoformat()
+                    and existing["request_plan_sha256"] == request_plan_sha256
+                    and existing["canonical_snapshot_sha256"] == canonical_snapshot_sha256
+                )
+                if not same:
+                    state_version = 0
+                    if window is not None and window["window_state"] != "RESET":
+                        self._reset_window(
+                            connection, epoch_id=epoch_id, reason="DUPLICATE_CONFLICT"
+                        )
+                        state_version = window["state_version"] + 1
+                    return DailySessionLease(
+                        outcome="RESET",
+                        epoch_id=epoch_id,
+                        job_id=job_id,
+                        session_id=session_id,
+                        trade_date=trade_date,
+                        state_version=state_version,
+                    )
+                if existing["run_status"] != "LEASED":
+                    return DailySessionLease(
+                        outcome="ALREADY_TERMINAL",
+                        epoch_id=epoch_id,
+                        job_id=job_id,
+                        session_id=session_id,
+                        trade_date=trade_date,
+                        state_version=existing["state_version"],
+                    )
             if window is None or window["window_state"] != "OBSERVING":
                 return DailySessionLease(
                     outcome="RESET",
@@ -1530,37 +1565,8 @@ class DailyShadowRegistry:
                     trade_date=trade_date,
                     state_version=window["state_version"] + 1,
                 )
-            existing = connection.execute(
-                "SELECT * FROM daily_shadow_job WHERE job_id=?", (job_id,)
-            ).fetchone()
             expires = observed_at + timedelta(seconds=_JOB_LEASE_SECONDS)
             if existing is not None:
-                same = (
-                    existing["epoch_id"] == epoch_id
-                    and existing["session_id"] == session_id
-                    and existing["trade_date"] == trade_date.isoformat()
-                    and existing["request_plan_sha256"] == request_plan_sha256
-                    and existing["canonical_snapshot_sha256"] == canonical_snapshot_sha256
-                )
-                if not same:
-                    self._reset_window(connection, epoch_id=epoch_id, reason="DUPLICATE_CONFLICT")
-                    return DailySessionLease(
-                        outcome="RESET",
-                        epoch_id=epoch_id,
-                        job_id=job_id,
-                        session_id=session_id,
-                        trade_date=trade_date,
-                        state_version=window["state_version"] + 1,
-                    )
-                if existing["run_status"] != "LEASED":
-                    return DailySessionLease(
-                        outcome="ALREADY_TERMINAL",
-                        epoch_id=epoch_id,
-                        job_id=job_id,
-                        session_id=session_id,
-                        trade_date=trade_date,
-                        state_version=existing["state_version"],
-                    )
                 if datetime.fromisoformat(existing["lease_expires_at"]) > observed_at:
                     return DailySessionLease(
                         outcome="BUSY",
@@ -1570,11 +1576,13 @@ class DailyShadowRegistry:
                         trade_date=trade_date,
                         state_version=existing["state_version"],
                     )
-                connection.execute(
+                changed = connection.execute(
                     "UPDATE daily_shadow_job SET lease_owner=?,lease_expires_at=?,"
                     "state_version=state_version+1 WHERE job_id=? AND state_version=?",
                     (owner, expires.isoformat(), job_id, existing["state_version"]),
                 )
+                if changed.rowcount != 1:
+                    raise DailyShadowRegistryUnavailable("daily shadow job changed")
                 state_version = existing["state_version"] + 1
             else:
                 connection.execute(
