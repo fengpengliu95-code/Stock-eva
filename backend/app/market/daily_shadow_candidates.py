@@ -99,6 +99,30 @@ DAILY_BAR_RECONCILIATION_POLICY = DailyBarReconciliationPolicy()
 _CANDIDATE_POLICY_HASH = DAILY_BAR_RECONCILIATION_POLICY.policy_sha256
 
 
+def daily_version_vector_sha256(
+    snapshot: DailyCanonicalSnapshot, terms_evidence_sha256: str
+) -> str:
+    if type(snapshot) is not DailyCanonicalSnapshot or (
+        not isinstance(terms_evidence_sha256, str)
+        or _SHA256.fullmatch(terms_evidence_sha256) is None
+    ):
+        raise DailyCandidateUnavailable("Daily version vector unavailable")
+    return domain_sha256(
+        "stock-eva/r2f3/free-daily-version-vector/v1",
+        {
+            "profile": DAILY_SHADOW_PROFILE,
+            "adapter": DAILY_SHADOW_ADAPTER_HASH,
+            "endpoint": DAILY_SHADOW_ENDPOINT_CONTRACT_HASH,
+            "source_schema": DAILY_SHADOW_SOURCE_SCHEMA_HASH,
+            "mapping": DAILY_SHADOW_MAPPING_HASH,
+            "unit_state": DAILY_SHADOW_UNIT_STATE_HASH,
+            "reconciliation": _CANDIDATE_POLICY_HASH,
+            "terms": terms_evidence_sha256,
+            "canonical_mapping": snapshot.symbol_mapping_sha256,
+        },
+    )
+
+
 class DailyEvidenceInputs(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -711,17 +735,6 @@ def build_daily_candidate(
         }
         for row in rows
     )
-    version_vector = {
-        "profile": DAILY_SHADOW_PROFILE,
-        "adapter": DAILY_SHADOW_ADAPTER_HASH,
-        "endpoint": DAILY_SHADOW_ENDPOINT_CONTRACT_HASH,
-        "source_schema": DAILY_SHADOW_SOURCE_SCHEMA_HASH,
-        "mapping": DAILY_SHADOW_MAPPING_HASH,
-        "unit_state": DAILY_SHADOW_UNIT_STATE_HASH,
-        "reconciliation": _CANDIDATE_POLICY_HASH,
-        "terms": terms_evidence_sha256,
-        "canonical_mapping": snapshot.symbol_mapping_sha256,
-    }
     candidate = DailyBarShadowCandidate(
         candidate_id=candidate_id,
         trade_date=plan.trade_date.isoformat(),
@@ -743,9 +756,7 @@ def build_daily_candidate(
         unit_state_sha256=DAILY_SHADOW_UNIT_STATE_HASH,
         reconciliation_policy_sha256=_CANDIDATE_POLICY_HASH,
         terms_evidence_sha256=terms_evidence_sha256,
-        version_vector_sha256=domain_sha256(
-            "stock-eva/r2f3/free-daily-version-vector/v1", version_vector
-        ),
+        version_vector_sha256=daily_version_vector_sha256(snapshot, terms_evidence_sha256),
         expected_symbol_count=len(snapshot.rows),
         observed_symbol_count=len(rows),
         source_rows_sha256=domain_sha256("stock-eva/r2f3/free-daily-source-rows/v1", source_values),
