@@ -84,6 +84,9 @@ EC-4-EC-9.
 
 **Modify:**
 
+- `backend/app/market/providers/http.py` to retain only the received-byte count on success and
+  failure; no failed payload bytes become evidence or public output.
+
 - `backend/app/config.py` only if the closed Free runtime projection needs the exact sidecar DB
   basename; do not add credential lookup or general environment enumeration.
 

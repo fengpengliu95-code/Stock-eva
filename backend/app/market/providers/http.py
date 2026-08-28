@@ -66,12 +66,16 @@ class ProviderHttpError(RuntimeError):
         status_code: int | None = None,
         attempts: int = 0,
         request_count: int = 0,
+        response_bytes: int = 0,
     ) -> None:
         self.failure_class = failure_class
         self.endpoint = _safe_identity(endpoint)
         self.status_code = status_code
         self.attempts = attempts
         self.request_count = request_count
+        self.response_bytes = (
+            response_bytes if type(response_bytes) is int and response_bytes >= 0 else 0
+        )
         # Keep the text deliberately small.  Callers can use the typed fields for audit.
         super().__init__(f"provider request failed: {failure_class}")
 
@@ -724,14 +728,16 @@ def _response_bytes(response: Any, *, max_bytes: int | None = None) -> bytes:
                     raise ProviderHttpError("malformed_response")
                 total += len(chunk)
                 if max_bytes is not None and total > max_bytes:
-                    raise ProviderHttpError("response_oversize")
+                    raise ProviderHttpError("response_oversize", response_bytes=total)
                 chunks.append(bytes(chunk))
-        except ProviderHttpError:
+        except ProviderHttpError as error:
+            if error.response_bytes == 0:
+                error.response_bytes = total
             raise
         except Exception as error:
             if _is_timeout_error(error):
-                raise ProviderHttpError("timeout") from None
-            raise ProviderHttpError("transport_error") from None
+                raise ProviderHttpError("timeout", response_bytes=total) from None
+            raise ProviderHttpError("transport_error", response_bytes=total) from None
         return b"".join(chunks)
     content = getattr(response, "content", b"")
     if isinstance(content, bytes):
@@ -770,6 +776,7 @@ class BoundedHttpClient:
         self.request_count = 0
         self.raw_content_by_endpoint: dict[str, bytes] = {}
         self._last_result: HttpResult | None = None
+        self.last_response_bytes = 0
 
     def close(self) -> None:
         if self._owns_client and not self._client_closed:
@@ -809,6 +816,7 @@ class BoundedHttpClient:
         identity = _safe_identity(endpoint)
         attempts = 0
         while attempts < self.policy.max_attempts:
+            self.last_response_bytes = 0
             if self.request_count >= self.policy.max_requests:
                 raise ProviderHttpError(
                     "request_budget_exhausted",
@@ -927,8 +935,10 @@ class BoundedHttpClient:
                 error.endpoint = identity
                 error.attempts = attempts
                 error.request_count = self.request_count
+                self.last_response_bytes = error.response_bytes
                 raise
             _close_response(response)
+            self.last_response_bytes = len(content)
             if len(content) > self.policy.max_response_bytes:
                 raise ProviderHttpError(
                     "response_oversize",
@@ -936,6 +946,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 )
             if status == 429 or status >= 500:
                 if attempts < self.policy.max_attempts:
@@ -952,6 +963,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 ) from None
             if status in (401, 403):
                 raise ProviderHttpError(
@@ -960,6 +972,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 )
             if not 200 <= status < 300:
                 raise ProviderHttpError(
@@ -968,6 +981,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 )
             if not content:
                 raise ProviderHttpError(
@@ -976,6 +990,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 )
             try:
                 payload = json.loads(content.decode("utf-8"))
@@ -986,6 +1001,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 ) from None
             if _row_count(payload) > self.policy.max_rows:
                 raise ProviderHttpError(
@@ -994,6 +1010,7 @@ class BoundedHttpClient:
                     status_code=status,
                     attempts=attempts,
                     request_count=self.request_count,
+                    response_bytes=len(content),
                 )
             result = HttpResult(identity, status, payload, attempts, self.request_count)
             self.raw_content_by_endpoint[identity] = bytes(content)
