@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     provider_health_database_name: str = "provider_health.sqlite3"
     provider_registry_database_name: str = "provider_registry.sqlite3"
     daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
+    daily_bar_shadow_calendar_root: Path | None = None
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
@@ -153,6 +154,13 @@ class Settings(BaseSettings):
             raise ValueError("provider shadow root must be absolute")
         return value
 
+    @field_validator("daily_bar_shadow_calendar_root")
+    @classmethod
+    def validate_daily_bar_shadow_calendar_root(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("Daily Bar shadow calendar root must be absolute")
+        return value
+
     @field_validator("provider_tickflow_token_env_name")
     @classmethod
     def validate_tickflow_token_env_name(cls, value: str) -> str:
@@ -243,6 +251,7 @@ class TickFlowFreeRuntimeSettings(BaseModel):
     local_control_dir: Path = Path("var/control")
     provider_registry_database_name: str = "provider_registry.sqlite3"
     daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
+    daily_bar_shadow_calendar_root: Path | None = None
     local_market_dataset_root: Path | None = None
     nas_market_dataset_root: Path | None = None
 
@@ -251,6 +260,13 @@ class TickFlowFreeRuntimeSettings(BaseModel):
     def validate_shadow_root(cls, value: Path) -> Path:
         if not value.is_absolute():
             raise ValueError("provider shadow root must be absolute")
+        return value
+
+    @field_validator("daily_bar_shadow_calendar_root")
+    @classmethod
+    def validate_daily_calendar_root(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("Free Daily calendar root must be absolute")
         return value
 
     @field_validator("provider_registry_database_name", "daily_bar_shadow_database_name")
@@ -331,6 +347,9 @@ def get_tickflow_free_runtime_settings(
         ),
         daily_bar_shadow_database_name=source.get(
             "STOCK_EVA_DAILY_BAR_SHADOW_DATABASE_NAME", "daily_bar_shadow.sqlite3"
+        ),
+        daily_bar_shadow_calendar_root=_closed_path(
+            source, "STOCK_EVA_DAILY_BAR_SHADOW_CALENDAR_ROOT", default=None
         ),
         local_market_dataset_root=_closed_path(
             source, "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT", default=None

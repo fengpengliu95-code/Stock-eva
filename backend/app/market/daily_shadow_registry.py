@@ -323,10 +323,57 @@ class DailyShadowStatus(_Frozen):
     window: DailyWindowSnapshot | None = None
     epoch_count: int = Field(ge=0)
     session_report_count: int = Field(ge=0)
+    descriptor_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    terms_evidence_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    version_vector_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    calendar_generation: str | None = None
+    calendar_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    expected_dates: tuple[date, ...] = ()
+    last_outcome: (
+        Literal[
+            "SUCCESS",
+            "FAILURE",
+            "MISMATCH",
+            "UNAVAILABLE",
+            "SKIPPED_CIRCUIT_OPEN",
+        ]
+        | None
+    ) = None
+    circuit_state: Literal["CLOSED", "OPEN", "HALF_OPEN"] | None = None
     observation_mode: Literal["HISTORICAL_SHADOW"] = "HISTORICAL_SHADOW"
     publication_enabled: Literal[False] = False
     failover_enabled: Literal[False] = False
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_status(self) -> DailyShadowStatus:
+        ready_identity = (
+            self.descriptor_sha256,
+            self.terms_evidence_sha256,
+            self.circuit_state,
+        )
+        window_identity = (
+            self.version_vector_sha256,
+            self.calendar_generation,
+            self.calendar_sha256,
+        )
+        if self.status == "READY":
+            if any(value is None for value in ready_identity) or self.reason is not None:
+                raise ValueError("Daily shadow ready status is incomplete")
+            if self.window is None:
+                if any(value is not None for value in window_identity) or self.expected_dates:
+                    raise ValueError("Daily shadow pending status is inconsistent")
+            elif any(value is None for value in window_identity) or len(self.expected_dates) != 20:
+                raise ValueError("Daily shadow window status is incomplete")
+        elif (
+            self.window is not None
+            or any(value is not None for value in ready_identity + window_identity)
+            or self.expected_dates
+            or self.last_outcome is not None
+            or self.reason is None
+        ):
+            raise ValueError("Daily shadow unavailable status is inconsistent")
+        return self
 
 
 class DailyCircuitAction(StrEnum):
@@ -1030,6 +1077,57 @@ class DailyShadowRegistryReader:
                 report_count = memory.execute(
                     "SELECT count(*) FROM daily_shadow_session_report"
                 ).fetchone()[0]
+                if window_row is None:
+                    contracts = memory.execute(
+                        "SELECT descriptor_sha256,terms_evidence_sha256 "
+                        "FROM daily_shadow_contract WHERE provider='tickflow' AND profile=?",
+                        (DAILY_SHADOW_PROFILE,),
+                    ).fetchall()
+                    if len(contracts) != 1:
+                        raise DailyShadowRegistryUnavailable(
+                            "daily shadow contract selection unavailable"
+                        )
+                    contract_row = contracts[0]
+                    version_vector_sha256 = None
+                    calendar_generation = None
+                    calendar_sha256 = None
+                    expected_dates = ()
+                    last_outcome = None
+                else:
+                    epoch = memory.execute(
+                        "SELECT version_vector_sha256,terms_evidence_sha256,"
+                        "calendar_generation,calendar_sha256,expected_dates_json "
+                        "FROM daily_shadow_epoch WHERE epoch_id=?",
+                        (window_row["epoch_id"],),
+                    ).fetchone()
+                    contract_row = memory.execute(
+                        "SELECT descriptor_sha256,terms_evidence_sha256 "
+                        "FROM daily_shadow_contract WHERE provider='tickflow' AND profile=? "
+                        "AND terms_evidence_sha256=?",
+                        (DAILY_SHADOW_PROFILE, epoch["terms_evidence_sha256"]),
+                    ).fetchone()
+                    if contract_row is None:
+                        raise DailyShadowRegistryUnavailable(
+                            "daily shadow contract selection unavailable"
+                        )
+                    version_vector_sha256 = epoch["version_vector_sha256"]
+                    calendar_generation = epoch["calendar_generation"]
+                    calendar_sha256 = epoch["calendar_sha256"]
+                    expected_dates = tuple(
+                        date.fromisoformat(item)
+                        for item in json.loads(bytes(epoch["expected_dates_json"]).decode())
+                    )
+                    report = memory.execute(
+                        "SELECT outcome FROM daily_shadow_session_report WHERE epoch_id=? "
+                        "ORDER BY rowid DESC LIMIT 1",
+                        (window_row["epoch_id"],),
+                    ).fetchone()
+                    last_outcome = report["outcome"] if report is not None else None
+                circuit = memory.execute(
+                    "SELECT state FROM daily_shadow_circuit WHERE endpoint='historical_daily_1d'"
+                ).fetchone()
+                if circuit is None:
+                    raise DailyShadowRegistryUnavailable("daily shadow circuit unavailable")
             finally:
                 memory.close()
             return DailyShadowStatus(
@@ -1037,6 +1135,14 @@ class DailyShadowRegistryReader:
                 window=_window_from_row(window_row) if window_row is not None else None,
                 epoch_count=epoch_count,
                 session_report_count=report_count,
+                descriptor_sha256=contract_row["descriptor_sha256"],
+                terms_evidence_sha256=contract_row["terms_evidence_sha256"],
+                version_vector_sha256=version_vector_sha256,
+                calendar_generation=calendar_generation,
+                calendar_sha256=calendar_sha256,
+                expected_dates=expected_dates,
+                last_outcome=last_outcome,
+                circuit_state=circuit["state"],
             )
         except (DailyShadowRegistryUnavailable, DailyShadowSchemaError):
             raise

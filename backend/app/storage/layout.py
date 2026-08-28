@@ -83,11 +83,14 @@ class StorageLayout:
         database = self.daily_bar_shadow_database
         evidence = self.daily_bar_shadow_evidence_root
         candidates = self.daily_bar_shadow_candidate_root
+        health_database = self.settings.local_control_dir / getattr(
+            self.settings, "provider_health_database_name", "provider_health.sqlite3"
+        )
         if (
             not database.parent.is_absolute()
             or not evidence.is_absolute()
             or not candidates.is_absolute()
-            or database in {self.provider_registry_database, self.provider_health_database}
+            or database in {self.provider_registry_database, health_database}
             or evidence == candidates
         ):
             raise ValueError("Daily Bar shadow layout is not isolated")

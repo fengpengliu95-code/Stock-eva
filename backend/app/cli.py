@@ -3,7 +3,7 @@ import json
 import re
 import signal
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import perf_counter
 from zoneinfo import ZoneInfo
@@ -439,6 +439,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=tuple(item.value for item in ShadowProviderId),
     )
+    daily_shadow = subparsers.add_parser(
+        "market-provider-daily-shadow",
+        help="plan or execute one credentialless TickFlow Free Daily shadow session",
+    )
+    daily_shadow.add_argument("--provider", required=True, choices=("tickflow",))
+    daily_shadow.add_argument("--date", required=True, type=date.fromisoformat, dest="trade_date")
+    daily_shadow.add_argument("--execute", action="store_true")
+    daily_shadow.add_argument("--external-authorization-id", type=_external_authorization_id)
+    daily_shadow.add_argument(
+        "--acknowledge-provider-requests",
+        action="store_true",
+        help="acknowledge one bounded whole-session Free Daily provider invocation",
+    )
     shadow_canary = subparsers.add_parser(
         "market-provider-canary",
         help="plan an isolated TickFlow or Tushare shadow canary",
@@ -795,6 +808,235 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _daily_shadow_error(
+    *,
+    trade_date: date,
+    error_code: str,
+    return_code: int = 1,
+) -> int:
+    print(
+        json.dumps(
+            {
+                "status": "unavailable" if return_code == 1 else "error",
+                "provider": "tickflow",
+                "profile": "TICKFLOW_FREE_DAILY_BAR_OHLC_V1",
+                "trade_date": trade_date.isoformat(),
+                "error_code": error_code,
+                "provider_requests": 0,
+                "writes": False,
+                "canonical_writes": False,
+                "publication_enabled": False,
+                "failover_enabled": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return return_code
+
+
+def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
+    if args.execute and not args.external_authorization_id:
+        return _daily_shadow_error(
+            trade_date=args.trade_date,
+            error_code="external_authorization_required",
+            return_code=2,
+        )
+    if args.execute and not args.acknowledge_provider_requests:
+        return _daily_shadow_error(
+            trade_date=args.trade_date,
+            error_code="provider_requests_acknowledgement_required",
+            return_code=2,
+        )
+    try:
+        from backend.app.market.daily_shadow_canonical import (
+            DailyCanonicalReader,
+            PublishedDailyCanonicalProjection,
+        )
+        from backend.app.market.daily_shadow_registry import (
+            DailyShadowRegistry,
+            DailyShadowRegistryReader,
+        )
+        from backend.app.market.providers.tickflow_daily_shadow import (
+            TickFlowFreeDailyShadowAdapter,
+        )
+
+        settings = get_tickflow_free_runtime_settings()
+        if args.execute and (
+            not settings.provider_shadow_enabled or not settings.provider_shadow_execute_enabled
+        ):
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="daily_shadow_execution_disabled",
+                return_code=2,
+            )
+        canonical_root = settings.local_market_dataset_root or settings.nas_market_dataset_root
+        if canonical_root is None:
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="canonical_unavailable",
+            )
+        layout = StorageLayout(settings)
+        layout.validate_daily_bar_shadow_layout(
+            canonical_roots=tuple(
+                root
+                for root in (
+                    canonical_root,
+                    settings.daily_bar_shadow_calendar_root if args.execute else None,
+                )
+                if root is not None
+            )
+        )
+        control = DailyShadowRegistryReader(layout.daily_bar_shadow_database).read()
+        if (
+            control.status != "READY"
+            or control.descriptor_sha256 is None
+            or control.terms_evidence_sha256 is None
+        ):
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="control_state_unavailable",
+            )
+        opened = PublishedDailyCanonicalProjection.open(
+            DailyCanonicalReader(canonical_root, trade_date=args.trade_date)
+        )
+        if type(opened) is not PublishedDailyCanonicalProjection:
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="canonical_unavailable",
+            )
+        try:
+            canonical_snapshot = opened.snapshot
+            plan = TickFlowFreeDailyShadowAdapter().plan(canonical_snapshot)
+        finally:
+            opened.close()
+        base = {
+            "provider": "tickflow",
+            "profile": plan.profile,
+            "trade_date": args.trade_date.isoformat(),
+            "request_count": plan.request_count,
+            "expected_symbols": plan.symbol_count,
+            "request_plan_sha256": plan.request_plan_sha256,
+            "canonical_snapshot_sha256": plan.canonical_snapshot_sha256,
+            "canonical_universe_sha256": plan.canonical_universe_sha256,
+            "symbol_mapping_sha256": plan.symbol_mapping_sha256,
+            "descriptor_sha256": control.descriptor_sha256,
+            "terms_evidence_sha256": control.terms_evidence_sha256,
+            "publication_enabled": False,
+            "failover_enabled": False,
+        }
+        if not args.execute:
+            print(
+                json.dumps(
+                    {
+                        "status": "planned",
+                        **base,
+                        "provider_requests": 0,
+                        "writes": False,
+                        "canonical_writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        calendar_root = settings.daily_bar_shadow_calendar_root
+        if calendar_root is None:
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="calendar_unavailable",
+            )
+        from backend.app.market.daily_shadow_candidates import DailyCandidateStore
+        from backend.app.market.daily_shadow_worker import DailyShadowWorker
+        from backend.app.market.providers.http import build_tickflow_free_client
+        from backend.app.market.providers.tickflow_daily_shadow import (
+            TickFlowFreeDailyShadowFetcher,
+        )
+        from backend.app.market.shadow_calendar import ConfirmedCalendarReader
+        from backend.app.market.shadow_evidence import (
+            ShadowEvidenceReader,
+            ShadowEvidenceStore,
+        )
+
+        calendar_start = (
+            control.expected_dates[0]
+            if control.window is not None
+            and control.window.state != "RESET"
+            and control.expected_dates
+            else args.trade_date
+        )
+        calendar_reader = ConfirmedCalendarReader(
+            calendar_root,
+            provider_id="tickflow",
+            window_id=f"daily-window-{calendar_start.isoformat()}",
+            universe_id="daily-canonical-active-universe",
+            universe_sha256=canonical_snapshot.canonical_universe_sha256,
+        )
+        confirmed = None
+        for span in range(19, 65):
+            candidate = calendar_reader.read(
+                calendar_start,
+                calendar_start + timedelta(days=span),
+                captured_at=f"reviewed-{control.descriptor_sha256}",
+                snapshot_id=f"daily-calendar-{calendar_start.isoformat()}",
+            )
+            if len(candidate.confirmed_next_sessions) == 20:
+                confirmed = candidate
+                break
+            if len(candidate.confirmed_next_sessions) > 20:
+                break
+        if (
+            confirmed is None
+            or confirmed.confirmed_next_sessions[0] != calendar_start
+            or args.trade_date not in confirmed.confirmed_next_sessions
+        ):
+            return _daily_shadow_error(
+                trade_date=args.trade_date,
+                error_code="calendar_unavailable",
+            )
+
+        def canonical_factory(trade_date):
+            return PublishedDailyCanonicalProjection.open(
+                DailyCanonicalReader(canonical_root, trade_date=trade_date)
+            )
+
+        worker = DailyShadowWorker(
+            registry=DailyShadowRegistry(layout.daily_bar_shadow_database),
+            canonical_factory=canonical_factory,
+            confirmed_calendar=confirmed,
+            fetcher=lambda request_plan: TickFlowFreeDailyShadowFetcher.execute(
+                transport_factory=build_tickflow_free_client,
+                plan=request_plan,
+            ),
+            evidence_store=ShadowEvidenceStore(layout.daily_bar_shadow_evidence_root),
+            evidence_reader=ShadowEvidenceReader(layout.daily_bar_shadow_evidence_root),
+            candidate_store=DailyCandidateStore(layout.daily_bar_shadow_candidate_root),
+            terms_evidence_sha256=control.terms_evidence_sha256,
+            owner=args.external_authorization_id,
+        )
+        result = worker.run_one(args.trade_date)
+        payload = {
+            "status": "completed" if result.outcome == "SUCCESS" else "unavailable",
+            **base,
+            **result.model_dump(mode="json"),
+            "writes": result.outcome
+            not in {
+                "SKIPPED_CIRCUIT_OPEN",
+                "SKIPPED_HALF_OPEN",
+                "BUSY",
+                "ALREADY_TERMINAL",
+                "RESET",
+            },
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if result.outcome in {"SUCCESS", "ALREADY_TERMINAL"} else 1
+    except Exception:
+        return _daily_shadow_error(
+            trade_date=args.trade_date,
+            error_code="daily_shadow_unavailable",
+        )
+
+
 def main() -> int:
     try:
         args = build_parser().parse_args()
@@ -813,6 +1055,8 @@ def main() -> int:
         return 2
     if args.command == "market-continuity":
         return _market_continuity_command(args)
+    if args.command == "market-provider-daily-shadow":
+        return _market_provider_daily_shadow_command(args)
     if args.command == "market-provider-status":
         settings = get_settings()
         provider = args.provider

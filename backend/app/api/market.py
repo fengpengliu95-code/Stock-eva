@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.api.storage import get_storage_readiness
 from backend.app.config import Settings, get_settings
@@ -20,6 +20,8 @@ from backend.app.market.continuity import (
     ContinuityStatusSummary,
     build_continuity_status_summary,
 )
+from backend.app.market.daily_shadow_models import DAILY_SHADOW_PROFILE
+from backend.app.market.daily_shadow_registry import DailyShadowRegistryReader
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
@@ -64,6 +66,64 @@ class ShadowProviderStatusResponse(BaseModel):
     state: AdmissionState | None = None
     unavailable_reason: UnavailableReason | None = None
     report_id: str | None = None
+
+
+class DailyBarShadowStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["ready", "unavailable"]
+    provider: Literal["tickflow"] = "tickflow"
+    profile: Literal["TICKFLOW_FREE_DAILY_BAR_OHLC_V1"] = DAILY_SHADOW_PROFILE
+    state: Literal["PENDING", "OBSERVING", "SHADOW_QUALIFIED", "RESET", "UNAVAILABLE"]
+    epoch_id: str | None = None
+    consecutive_sessions: int = 0
+    required_sessions: Literal[20] = 20
+    first_trade_date: date | None = None
+    last_trade_date: date | None = None
+    last_outcome: (
+        Literal[
+            "SUCCESS",
+            "FAILURE",
+            "MISMATCH",
+            "UNAVAILABLE",
+            "SKIPPED_CIRCUIT_OPEN",
+        ]
+        | None
+    ) = None
+    observation_mode: Literal["HISTORICAL_SHADOW"] = "HISTORICAL_SHADOW"
+    descriptor_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    version_vector_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    circuit_state: Literal["CLOSED", "OPEN", "HALF_OPEN"] | None = None
+    units_state: Literal["UNKNOWN"] = "UNKNOWN"
+    suspension_semantics_state: Literal["UNKNOWN"] = "UNKNOWN"
+    factor_evidence_state: Literal["UNQUALIFIED"] = "UNQUALIFIED"
+    daily_bar_qualified: bool = False
+    adjustment_factor_qualified: Literal[False] = False
+    publication_eligible: Literal[False] = False
+    failover_enabled: Literal[False] = False
+    unavailable_reason: Literal["CONTROL_STATE_UNAVAILABLE"] | None = None
+
+    @model_validator(mode="after")
+    def validate_daily_status(self) -> "DailyBarShadowStatusResponse":
+        qualified = self.state == "SHADOW_QUALIFIED"
+        if self.daily_bar_qualified != qualified:
+            raise ValueError("Daily Bar qualification state is inconsistent")
+        if self.status == "unavailable":
+            if (
+                self.state != "UNAVAILABLE"
+                or self.unavailable_reason is None
+                or self.descriptor_sha256 is not None
+                or self.version_vector_sha256 is not None
+            ):
+                raise ValueError("Daily Bar unavailable state is inconsistent")
+        elif (
+            self.state == "UNAVAILABLE"
+            or self.unavailable_reason is not None
+            or self.descriptor_sha256 is None
+            or self.circuit_state is None
+        ):
+            raise ValueError("Daily Bar ready state is incomplete")
+        return self
 
 
 @router.get("/provider-status", response_model=ShadowProviderStatusResponse)
@@ -111,6 +171,57 @@ def market_provider_status(
         )
     return ShadowProviderStatusResponse(
         status="ready", provider=record.provider_id, state=record.admission_state
+    )
+
+
+@router.get(
+    "/provider-daily-bar-shadow",
+    response_model=DailyBarShadowStatusResponse,
+)
+def market_provider_daily_bar_shadow(
+    settings: Annotated[Settings, Depends(get_settings)],
+    provider: Literal["tickflow"] = "tickflow",
+) -> DailyBarShadowStatusResponse:
+    """Read the isolated Daily capability sidecar without creating or migrating it."""
+    layout = StorageLayout(settings)
+    try:
+        layout.validate_daily_bar_shadow_layout(
+            canonical_roots=tuple(
+                root
+                for root in (
+                    settings.local_market_dataset_root,
+                    settings.nas_market_dataset_root,
+                    settings.daily_bar_shadow_calendar_root,
+                )
+                if root is not None
+            )
+        )
+        status = DailyShadowRegistryReader(layout.daily_bar_shadow_database).read()
+    except Exception:
+        status = None
+    if status is None or status.status != "READY":
+        return DailyBarShadowStatusResponse(
+            status="unavailable",
+            provider=provider,
+            state="UNAVAILABLE",
+            unavailable_reason="CONTROL_STATE_UNAVAILABLE",
+        )
+    window = status.window
+    state = window.state if window is not None else "PENDING"
+    qualified = state == "SHADOW_QUALIFIED"
+    return DailyBarShadowStatusResponse(
+        status="ready",
+        provider=provider,
+        state=state,
+        epoch_id=window.epoch_id if window is not None else None,
+        consecutive_sessions=window.consecutive_sessions if window is not None else 0,
+        first_trade_date=window.first_trade_date if window is not None else None,
+        last_trade_date=window.last_trade_date if window is not None else None,
+        last_outcome=status.last_outcome,
+        descriptor_sha256=status.descriptor_sha256,
+        version_vector_sha256=status.version_vector_sha256,
+        circuit_state=status.circuit_state,
+        daily_bar_qualified=qualified,
     )
 
 
