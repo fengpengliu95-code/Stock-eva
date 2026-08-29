@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-28; amended 2026-08-29 (Asia/Shanghai)
 
-**Status:** **RATE-LIMIT CIRCUIT REMEDIATION IMPLEMENTED / RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO**
+**Status:** **20/20 SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO**
 
 **Scope:** The capability-scoped `TICKFLOW_FREE_DAILY_BAR_OHLC_V1` shadow lane and its
 20-consecutive-confirmed-session qualification window.
@@ -463,6 +463,23 @@ when successful, circuit state and literal false canonical/publication/failover 
 The sidecar schema owns only these capability records and references. It has no foreign key or
 write authority to the canonical dataset, R2-F2 candidate/selection tables or provider admission
 table.
+
+## Qualification execution record
+
+Exact clean remediation commit `ff4b6cd2579726e284ab2db6ddd56b66283d5441` received the same
+reviewer’s H=0/M=0/L=0 code-gate decision before the third runtime was initialized. The fresh
+descriptor/Terms-bound runtime completed the 20 confirmed Shanghai sessions from 2026-07-14
+through 2026-08-10 with one explicit bounded invocation per date and at least 60 seconds between
+continuation starts.
+
+The terminal sidecar state is `READY / SHADOW_QUALIFIED / CLOSED`: 20 success reports, 640
+attempt-one requests, 63,800/63,800 symbols, 255,200/255,200 OHLC cells within the frozen 0.01
+tolerance, zero request failures and zero rate limits. The v1 timezone-mismatch epoch and v2
+rate-limited epoch remain immutable and separate. Canonical, provider admission, publication and
+failover state remain unchanged. The sanitized per-date identity record is
+[R2-F3 Daily Shadow qualification report](../acceptance/release-2-r2f3-daily-shadow-qualification-report.md).
+This empirical result does not change any `UNKNOWN`, `UNQUALIFIED`, disabled or forbidden semantic
+boundary in this design.
 
 ## Out of Scope
 

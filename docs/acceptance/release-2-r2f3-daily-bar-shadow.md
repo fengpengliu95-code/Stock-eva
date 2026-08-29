@@ -2,7 +2,7 @@
 
 ## Current decision
 
-`ACCELERATED WINDOW RATE-LIMITED / IMMEDIATE-CIRCUIT REMEDIATION PENDING RE-REVIEW / DAILY BAR SHADOW NO-GO`
+`20/20 SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO`
 
 The same independent reviewer returned H=0/M=0/L=0 for exact clean code commit
 `a6716367a99fb7f35c4aff7f0e59753b9d38783b`. The first isolated runtime then exposed and preserved
@@ -21,6 +21,11 @@ after the first 429. New offline RED/GREEN changes only that policy: a proven 42
 with a truthful failure count of one, ordinary failures retain threshold three, and cooldown still
 permits only a fixed-five HALF_OPEN probe. The circuit policy/descriptor/Terms identity rotates;
 timeouts, retries, reconciliation tolerance, canonical data, publication and failover do not.
+
+The same reviewer subsequently returned H=0/M=0/L=0 on exact clean remediation commit
+`ff4b6cd2579726e284ab2db6ddd56b66283d5441`. A third fresh runtime then completed the exact
+20-session Shanghai calendar window with no reset. The sidecar is now `SHADOW_QUALIFIED`; this
+record remains NO-GO only until the final independent evidence review described below.
 
 ## Delivered capability
 
@@ -188,6 +193,32 @@ The rotated circuit policy hash is
 base is `00d86cb0720f3381c1b41c8bc28f951e6e9feab6e94a829e66e3ba45d538e10f`. Existing failed
 sidecars cannot satisfy this new Terms contract and remain preserved as immutable diagnostics.
 
+## Third controlled runtime and completed qualification window
+
+The third isolated runtime is
+`~/Library/Application Support/Stock EVA/r2f3-daily-shadow-20260829-rate-limit-v3`. It binds the
+reviewed clean commit `ff4b6cd2579726e284ab2db6ddd56b66283d5441`, rotated descriptor
+`0f0ab141f9b7fbd831a6081d8c731c4765db57ebda3a929ebdaaa1f9468c1911` and TermsEvidence
+`667916470cdceb743637e8e090513b8603ad8690464e4c537a85dddfe816728c`. Its initial 2026-07-14
+plan was zero-request/zero-write, and the first real session completed 32/32 attempt-one shards,
+3,190/3,190 symbols and 12,760/12,760 reconciled OHLC cells.
+
+The remaining 19 dates were each admitted by a fresh zero-write plan and one explicit CLI
+invocation. Every continuation full-session start was at least 60 seconds after the prior start;
+the minimum observed interval was 60.001 seconds. All 20 dates from 2026-07-14 through 2026-08-10
+completed without reset: 640/640 requests succeeded, 63,800/63,800 expected session symbols were
+observed, and 255,200/255,200 price cells were within tolerance with maximum delta zero. Strict
+readback re-opened all evidence/candidate bundles and reports `READY / SHADOW_QUALIFIED / CLOSED`.
+
+The authoritative sanitized report is
+`~/Library/Application Support/Stock EVA/r2f3-daily-shadow-20260829-rate-limit-v3/audit/final-qualification-report.json`,
+57,211 bytes with SHA-256
+`9bade0b8c669cf068a4e94b8cd45cd1e1851367680142995a605535343ead3f7`. The tracked hash-only
+projection is [R2-F3 Daily Shadow qualification report](release-2-r2f3-daily-shadow-qualification-report.md).
+Neither report contains provider payload rows. The old v1 mismatch and v2 rate-limited runtimes,
+all 271 canonical partitions and the Task14 control tree remained unchanged; production provider
+control targets remain absent.
+
 ## Frozen compatibility fingerprints
 
 All eight R2-F2 frozen objects matched before and after the gate:
@@ -252,14 +283,14 @@ observation is relabeled to a new date, and no provider row is silently mixed at
 
 ## Remaining gates
 
-- [ ] Same-reviewer exact-commit independent read-only re-review returns H=0/M=0 for the
+- [x] Same-reviewer exact-commit independent read-only re-review returned H=0/M=0 for the
   immediate-rate-limit circuit remediation and rotated contract hashes.
-- [ ] New capability-specific reviewed TermsEvidence is installed in a third fresh isolated
+- [x] New capability-specific reviewed TermsEvidence is installed in a third fresh isolated
   runtime for the rotated descriptor; both failed epochs and TermsEvidence objects remain preserved
   and are not reused.
-- [ ] One bounded real historical Daily session completes and is read back without canonical or
+- [x] One bounded real historical Daily session completed and was read back without canonical or
   provider-registry mutation.
-- [ ] Twenty same-vector consecutive confirmed sessions complete with zero reset in the qualifying
+- [x] Twenty same-vector consecutive confirmed sessions completed with zero reset in the qualifying
   epoch.
 - [ ] The immutable 20-session qualification report passes a final independent review.
 - [ ] Only then may the decision become `DAILY BAR SHADOW GO`; R2-F3 still does not imply full

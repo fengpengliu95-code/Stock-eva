@@ -1,14 +1,14 @@
 # Stock EVA R2-F3 TickFlow Free Daily Bar Shadow Qualification Implementation Plan
 
-**Status:** `ACCELERATED WINDOW RATE-LIMITED / IMMEDIATE-CIRCUIT FIX GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+**Status:** `20/20 SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO`
 
 **Design:** [Daily Bar Shadow Qualification Design](2026-08-28-stock-eva-r2f3-daily-bar-shadow-qualification-design.md)
 
 **Starting commit:** `d70fb02140e09ff3758ef224ad27abcf3e1e2e78`
 
-**Implemented code through:** Asia/Shanghai base
-`1a6b2968243d616ee684b83ea376aa32b393df84`; immediate-rate-limit circuit remediation pending
-exact-commit review.
+**Implemented code through:** exact clean immediate-rate-limit remediation
+`ff4b6cd2579726e284ab2db6ddd56b66283d5441`, independently reviewed H=0/M=0/L=0 before the
+qualifying runtime.
 
 **Execution discipline:** one task at a time, witnessed RED before production edits, smallest
 GREEN, focused verification, then commit. No real provider request before all offline tasks and an
@@ -533,6 +533,23 @@ After session 20:
    evidence and all 20 session graphs.
 5. Fix any High/Medium issue or declare `DAILY BAR SHADOW GO`. Only then pause for the user's human
    version confirmation.
+
+### Task 9 execution record
+
+Tasks 8 and 9 completed in the fresh isolated runtime
+`~/Library/Application Support/Stock EVA/r2f3-daily-shadow-20260829-rate-limit-v3`. The first plan
+was zero-request/zero-write; all 20 explicit sessions then completed in calendar order from
+2026-07-14 through 2026-08-10. The continuation runner enforced at least 60 seconds between full
+session starts and stopped-on-failure semantics; no retry, automatic follow-up, circuit skip or
+HALF_OPEN probe occurred.
+
+Terminal evidence is 20/20 success reports, 640/640 one-attempt requests, 63,800/63,800 symbols
+and 255,200/255,200 reconciled price cells with maximum delta zero. Strict readback verifies the
+complete external bundle graph and reports `SHADOW_QUALIFIED / CLOSED`; publication and failover
+remain false. The authoritative local sanitized report has SHA-256
+`9bade0b8c669cf068a4e94b8cd45cd1e1851367680142995a605535343ead3f7`; its tracked projection is
+[R2-F3 Daily Shadow qualification report](../acceptance/release-2-r2f3-daily-shadow-qualification-report.md).
+Only the final independent read-only audit remains before the narrow `DAILY BAR SHADOW GO` gate.
 
 ## Explicit non-changes and rollback
 
