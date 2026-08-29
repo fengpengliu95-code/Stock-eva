@@ -34,6 +34,7 @@ from backend.app.market.daily_shadow_schema import (
     MIGRATION_ID,
     SCHEMA_VERSION,
     canonical_json_bytes,
+    configure_daily_connection,
     validate_daily_shadow_schema,
 )
 from backend.app.market.providers.shadow_contracts import TermsEvidence
@@ -284,6 +285,33 @@ def test_raw_sql_cannot_bypass_terminal_graph_validator(tmp_path):
             "attempt_closure_json,attempt_closure_sha256,report_graph_json,report_graph_sha256,"
             "lower(hex(randomblob(32))),1 FROM daily_shadow_terminal_attestation LIMIT 1"
         )
+    connection.close()
+
+
+def test_raw_sql_terminal_trigger_rejects_job_symbol_set_hash_mismatch(tmp_path):
+    registry, _terms_value, window = _registry(tmp_path)
+    lease = _lease(registry, window, DATES[0], 0)
+    registry.commit_success(_success(window.epoch_id, DATES[0], 0), lease=lease)
+
+    connection = sqlite3.connect(registry.path)
+    connection.row_factory = sqlite3.Row
+    configure_daily_connection(connection)
+    row = connection.execute("SELECT * FROM daily_shadow_terminal_attestation").fetchone()
+    values = tuple(row)
+    connection.execute("DROP TRIGGER daily_attestation_immutable_delete")
+    connection.execute("DELETE FROM daily_shadow_terminal_attestation")
+    connection.execute(
+        "UPDATE daily_shadow_job SET canonical_symbol_set_sha256=? WHERE job_id=?",
+        ("f" * 64, row["job_id"]),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="daily_terminal_graph_unclosed"):
+        connection.execute(
+            "INSERT INTO daily_shadow_terminal_attestation VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            values,
+        )
+    connection.rollback()
     connection.close()
 
 

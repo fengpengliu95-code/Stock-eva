@@ -14,9 +14,9 @@ independent exact-commit review pass.
 
 ## Task 7 offline evidence
 
-- R2-F3 focused after review remediation: 111/111 passed.
+- R2-F3 focused after review remediation: 112/112 passed.
 - R2-F2/Task14/prior-shadow compatibility: 357/357 passed.
-- Full repository: 2,134/2,134 passed; LaunchAgent assets: 26/26 passed.
+- Full repository: 2,135/2,135 passed; LaunchAgent assets: 26/26 passed.
 - Full Ruff, format, compileall and diff checks passed; strict design validator: 100/100.
 - All eight frozen R2-F2 fixture hashes matched before/after.
 - Published canonical manifest remains
@@ -45,6 +45,11 @@ new reviewed symbol-set binding component changes the descriptor and Terms contr
 canonical universe-policy hash now embeds the exact legal suspended `partial` issue allowlist.
 Targeted RED/GREEN covers the descriptor/schema chain, policy allowlist, terminal mismatch and
 candidate binding. A same-reviewer exact-commit re-review remains required.
+
+The next exact-commit pass reduced the review to H=0/M=1/L=0: the SQL terminal trigger had not
+joined the leased job when checking the per-session symbol-set hash. A direct raw-SQL RED reproduced
+the bypass; GREEN joins the exact epoch/job/session identity and requires the job, candidate,
+session and new attestation hashes to be identical. Same-reviewer confirmation remains required.
 
 The actual latest 20 local canonical dates now read 20/20 ready. No Provider request or canonical
 write was made during that read-only proof. Same-reviewer exact-commit re-review remains required.

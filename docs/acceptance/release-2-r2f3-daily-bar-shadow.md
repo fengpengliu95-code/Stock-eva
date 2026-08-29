@@ -92,6 +92,12 @@ that per-session closure contract; the stable universe-policy hash now explicitl
 reviewed suspended `partial` issue allowlist. Targeted RED/GREEN also proves a conflicting terminal
 symbol-set hash cannot attach or advance the window. No provider request was made.
 
+The next exact-commit pass found one final Medium SQL-boundary gap: the terminal insert trigger
+joined the session and candidate hashes but not the leased job hash. A raw-SQL RED proved that a
+job-only hash mutation passed that trigger; GREEN adds the exact job identity join and
+`job.canonical_symbol_set_sha256 = NEW.canonical_symbol_set_sha256`. The focused trigger/registry
+set passes, and the same reviewer must confirm the new exact commit before any real request.
+
 ## Offline gate evidence
 
 All commands ran in the isolated R2-F3 worktree and used local fakes/fixtures. Provider I/O was not
@@ -99,9 +105,9 @@ invoked.
 
 | Gate | Result |
 | --- | --- |
-| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `111/111`, exit 0 |
+| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `112/112`, exit 0 |
 | R2-F2, Task14 and prior shadow compatibility | `357/357`, exit 0 |
-| Full repository | `2,134/2,134`, exit 0 |
+| Full repository | `2,135/2,135`, exit 0 |
 | LaunchAgent assets | `26/26`, exit 0 |
 | `ruff check backend tests` | all checks passed |
 | `ruff format --check backend tests` | 195 files already formatted |

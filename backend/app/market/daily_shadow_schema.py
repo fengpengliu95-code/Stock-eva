@@ -169,12 +169,14 @@ BEGIN
   SELECT 1 FROM daily_shadow_session_report s
   JOIN daily_shadow_evidence_ref e ON e.evidence_id=s.evidence_id AND e.epoch_id=s.epoch_id AND e.job_id=s.job_id AND e.session_id=s.session_id
   JOIN daily_shadow_candidate_ref c ON c.candidate_id=s.candidate_id AND c.epoch_id=s.epoch_id AND c.job_id=s.job_id AND c.session_id=s.session_id
+  JOIN daily_shadow_job j ON j.job_id=s.job_id AND j.epoch_id=s.epoch_id AND j.session_id=s.session_id
   WHERE s.session_report_id=NEW.session_report_id AND s.epoch_id=NEW.epoch_id AND s.job_id=NEW.job_id AND s.session_id=NEW.session_id
    AND s.outcome='SUCCESS' AND s.terminal_attestation_id=NEW.attestation_id
    AND e.evidence_id=NEW.evidence_id AND e.evidence_sha256=s.evidence_sha256
    AND c.candidate_id=NEW.candidate_id AND c.candidate_sha256=s.candidate_sha256
    AND s.canonical_symbol_set_sha256=NEW.canonical_symbol_set_sha256
    AND c.canonical_symbol_set_sha256=NEW.canonical_symbol_set_sha256
+   AND j.canonical_symbol_set_sha256=NEW.canonical_symbol_set_sha256
  ) THEN RAISE(ABORT,'daily_terminal_graph_unclosed') END;
 END;
 """
