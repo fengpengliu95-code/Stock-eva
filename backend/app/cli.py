@@ -887,7 +887,11 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
                 if root is not None
             )
         )
-        control = DailyShadowRegistryReader(layout.daily_bar_shadow_database).read()
+        control = DailyShadowRegistryReader(
+            layout.daily_bar_shadow_database,
+            evidence_root=layout.daily_bar_shadow_evidence_root,
+            candidate_root=layout.daily_bar_shadow_candidate_root,
+        ).read()
         if (
             control.status != "READY"
             or control.descriptor_sha256 is None
@@ -947,7 +951,13 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
                 error_code="calendar_unavailable",
             )
         from backend.app.market.daily_shadow_candidates import DailyCandidateStore
-        from backend.app.market.daily_shadow_worker import DailyShadowWorker
+        from backend.app.market.daily_shadow_models import (
+            DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
+        )
+        from backend.app.market.daily_shadow_worker import (
+            DailyHalfOpenProbeResult,
+            DailyShadowWorker,
+        )
         from backend.app.market.providers.http import build_tickflow_free_client
         from backend.app.market.providers.tickflow_daily_shadow import (
             TickFlowFreeDailyShadowFetcher,
@@ -969,8 +979,8 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
             calendar_root,
             provider_id="tickflow",
             window_id=f"daily-window-{calendar_start.isoformat()}",
-            universe_id="daily-canonical-active-universe",
-            universe_sha256=canonical_snapshot.canonical_universe_sha256,
+            universe_id="daily-canonical-universe-policy-v1",
+            universe_sha256=DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
         )
         confirmed = None
         for span in range(19, 65):
@@ -1000,6 +1010,48 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
                 DailyCanonicalReader(canonical_root, trade_date=trade_date)
             )
 
+        def fixed_five_probe(probe_date):
+            probe_canonical = None
+            try:
+                opened_probe = canonical_factory(probe_date)
+                if type(opened_probe) is not PublishedDailyCanonicalProjection:
+                    return DailyHalfOpenProbeResult(
+                        outcome="FAILURE",
+                        provider_requests=0,
+                        observed_symbols=0,
+                        failure_class="canonical_unavailable",
+                    )
+                probe_canonical = opened_probe
+                probe_plan = TickFlowFreeDailyShadowAdapter().fixed_five_probe_plan(
+                    probe_canonical.snapshot
+                )
+                probe_fetch = TickFlowFreeDailyShadowFetcher.execute(
+                    transport_factory=build_tickflow_free_client,
+                    plan=probe_plan,
+                )
+                if probe_fetch.status != "ready" or len(probe_fetch.rows) != 5:
+                    return DailyHalfOpenProbeResult(
+                        outcome="FAILURE",
+                        provider_requests=probe_fetch.request_count,
+                        observed_symbols=0,
+                        failure_class=probe_fetch.failure_class or "provider_failure",
+                    )
+                return DailyHalfOpenProbeResult(
+                    outcome="SUCCESS",
+                    provider_requests=probe_fetch.request_count,
+                    observed_symbols=5,
+                )
+            except Exception:
+                return DailyHalfOpenProbeResult(
+                    outcome="FAILURE",
+                    provider_requests=0,
+                    observed_symbols=0,
+                    failure_class="probe_unavailable",
+                )
+            finally:
+                if probe_canonical is not None:
+                    probe_canonical.close()
+
         worker = DailyShadowWorker(
             registry=DailyShadowRegistry(layout.daily_bar_shadow_database),
             canonical_factory=canonical_factory,
@@ -1013,6 +1065,7 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
             candidate_store=DailyCandidateStore(layout.daily_bar_shadow_candidate_root),
             terms_evidence_sha256=control.terms_evidence_sha256,
             owner=args.external_authorization_id,
+            probe_runner=fixed_five_probe,
         )
         result = worker.run_one(args.trade_date)
         payload = {
@@ -1029,7 +1082,9 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
             },
         }
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return 0 if result.outcome in {"SUCCESS", "ALREADY_TERMINAL"} else 1
+        return (
+            0 if result.outcome in {"SUCCESS", "ALREADY_TERMINAL", "HALF_OPEN_PROBE_SUCCESS"} else 1
+        )
     except Exception:
         return _daily_shadow_error(
             trade_date=args.trade_date,

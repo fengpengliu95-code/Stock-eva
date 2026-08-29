@@ -41,7 +41,7 @@ CREATE TABLE daily_shadow_epoch (
  epoch_id TEXT PRIMARY KEY, epoch_ordinal INTEGER NOT NULL UNIQUE CHECK(epoch_ordinal>=1),
  prior_epoch_id TEXT, epoch_state TEXT NOT NULL CHECK(epoch_state IN ('ACTIVE','RESET','SHADOW_QUALIFIED')),
  reset_reason TEXT, calendar_generation TEXT NOT NULL, calendar_sha256 TEXT NOT NULL CHECK(length(calendar_sha256)=64),
- universe_sha256 TEXT NOT NULL CHECK(length(universe_sha256)=64), version_vector_sha256 TEXT NOT NULL CHECK(length(version_vector_sha256)=64),
+ universe_policy_sha256 TEXT NOT NULL CHECK(length(universe_policy_sha256)=64), version_vector_sha256 TEXT NOT NULL CHECK(length(version_vector_sha256)=64),
  terms_evidence_sha256 TEXT NOT NULL, expected_dates_json BLOB NOT NULL CHECK(length(expected_dates_json)<=1048576),
  expected_dates_sha256 TEXT NOT NULL CHECK(length(expected_dates_sha256)=64), created_at TEXT NOT NULL,
  CHECK((epoch_state='RESET' AND reset_reason IS NOT NULL) OR (epoch_state<>'RESET' AND reset_reason IS NULL)),

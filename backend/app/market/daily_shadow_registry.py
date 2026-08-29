@@ -18,10 +18,16 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .daily_shadow_candidates import DAILY_BAR_RECONCILIATION_POLICY
-from .daily_shadow_models import DAILY_SHADOW_PROFILE, canonical_json_bytes, domain_sha256
+from .daily_shadow_models import (
+    DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
+    DAILY_SHADOW_PROFILE,
+    canonical_json_bytes,
+    domain_sha256,
+    validate_daily_failure_class,
+)
 from .daily_shadow_schema import (
     MAX_CANONICAL_BYTES,
     DailyShadowSchemaError,
@@ -106,6 +112,7 @@ DAILY_SHADOW_DESCRIPTOR_BASE_HASH = _contract_component_hash(
         "sdk_version": TICKFLOW_FREE_SDK_VERSION,
         "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
         "mapping": DAILY_SHADOW_MAPPING_HASH,
+        "universe_policy": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
         "candidate": DAILY_SHADOW_CANDIDATE_CONTRACT_HASH,
         "reconciliation": DAILY_BAR_RECONCILIATION_POLICY.policy_sha256,
         "retention": DAILY_SHADOW_RETENTION_HASH,
@@ -144,6 +151,7 @@ class DailyShadowContract(_Frozen):
     sdk_version: Literal["0.1.24"] = TICKFLOW_FREE_SDK_VERSION
     sdk_wheel_sha256: str = TICKFLOW_FREE_SDK_WHEEL_SHA256
     mapping_contract_sha256: str = DAILY_SHADOW_MAPPING_HASH
+    universe_policy_sha256: str = DAILY_CANONICAL_UNIVERSE_POLICY_SHA256
     candidate_contract_sha256: str = DAILY_SHADOW_CANDIDATE_CONTRACT_HASH
     reconciliation_policy_sha256: str = DAILY_BAR_RECONCILIATION_POLICY.policy_sha256
     unit_state_sha256: str = DAILY_SHADOW_UNIT_STATE_HASH
@@ -170,6 +178,7 @@ class DailyShadowContract(_Frozen):
             "source_schema_sha256": DAILY_SHADOW_SOURCE_SCHEMA_HASH,
             "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
             "mapping_contract_sha256": DAILY_SHADOW_MAPPING_HASH,
+            "universe_policy_sha256": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
             "candidate_contract_sha256": DAILY_SHADOW_CANDIDATE_CONTRACT_HASH,
             "reconciliation_policy_sha256": DAILY_BAR_RECONCILIATION_POLICY.policy_sha256,
             "unit_state_sha256": DAILY_SHADOW_UNIT_STATE_HASH,
@@ -193,7 +202,7 @@ class DailyShadowContract(_Frozen):
 class DailyWindowBinding(_Frozen):
     calendar_generation: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     calendar_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    universe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     version_vector_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     terms_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_dates: tuple[date, ...] = Field(min_length=20, max_length=20)
@@ -225,6 +234,11 @@ class DailyAttemptAudit(_Frozen):
     observed_rows: int = Field(ge=0, le=100)
     failure_class: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
     audit_sha256: str = Field(default="0" * 64, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str | None) -> str | None:
+        return validate_daily_failure_class(value)
 
     @model_validator(mode="after")
     def validate_audit(self) -> DailyAttemptAudit:
@@ -288,6 +302,11 @@ class DailySessionFailure(_Frozen):
     outcome: Literal["FAILURE", "MISMATCH", "UNAVAILABLE", "SKIPPED_CIRCUIT_OPEN"]
     failure_class: str = Field(pattern=r"^[a-z0-9_]{1,64}$")
     attempts: tuple[DailyAttemptAudit, ...] = Field(default=(), max_length=40)
+
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str) -> str:
+        return validate_daily_failure_class(value)  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def validate_failure(self) -> DailySessionFailure:
@@ -895,6 +914,10 @@ def _validate_control_graph(connection: sqlite3.Connection) -> None:
     ).fetchall()
     prior_circuit_state = "CLOSED"
     for row in circuit_events:
+        try:
+            validate_daily_failure_class(row["failure_class"])
+        except ValueError as exc:
+            raise DailyShadowRegistryUnavailable("daily circuit graph unavailable") from exc
         values = {
             "event_id": row["event_id"],
             "endpoint": row["endpoint"],
@@ -1003,9 +1026,50 @@ def _validate_control_graph(connection: sqlite3.Connection) -> None:
 
 
 class DailyShadowRegistryReader:
-    def __init__(self, path: Path | str):
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        evidence_root: Path | str | None = None,
+        candidate_root: Path | str | None = None,
+        verify_external: bool = True,
+    ):
         self.path = _physical(Path(path))
         self.lock_path = self.path.with_name(self.path.name + ".lock")
+        self.evidence_root = _physical(Path(evidence_root)) if evidence_root is not None else None
+        self.candidate_root = (
+            _physical(Path(candidate_root)) if candidate_root is not None else None
+        )
+        self.verify_external = verify_external
+
+    def _validate_external_bundles(self, refs: tuple[dict[str, Any], ...]) -> None:
+        if not refs or not self.verify_external:
+            return
+        if self.evidence_root is None or self.candidate_root is None:
+            raise DailyShadowRegistryUnavailable("daily shadow bundle roots unavailable")
+        from .daily_shadow_candidates import DailyCandidateReader
+        from .shadow_evidence import ShadowEvidenceReader
+
+        evidence_reader = ShadowEvidenceReader(self.evidence_root)
+        candidate_reader = DailyCandidateReader(self.candidate_root)
+        for ref in refs:
+            evidence, _descriptor = evidence_reader.read_descriptor(ref["evidence_id"])
+            candidate = candidate_reader.read(ref["candidate_id"])
+            if (
+                ref["evidence_bundle_ref"] != f"bundles/{ref['evidence_id']}"
+                or ref["candidate_bundle_ref"] != f"daily-candidates/{ref['candidate_id']}"
+                or evidence.completion_sha256 != ref["completion_sha256"]
+                or evidence.manifest_sha256 != ref["evidence_sha256"]
+                or evidence.manifest_sha256 != ref["evidence_bundle_sha256"]
+                or candidate.candidate.candidate_sha256 != ref["candidate_sha256"]
+                or candidate.bundle_sha256 != ref["candidate_bundle_sha256"]
+                or candidate.quality.report_sha256 != ref["quality_report_sha256"]
+                or candidate.reconciliation.report_sha256 != ref["reconciliation_report_sha256"]
+                or candidate.candidate.evidence_id != evidence.evidence_id
+                or candidate.candidate.evidence_sha256 != evidence.manifest_sha256
+                or candidate.candidate.completion_sha256 != evidence.completion_sha256
+            ):
+                raise DailyShadowRegistryUnavailable("daily shadow bundle graph unavailable")
 
     def _read_or_raise(self) -> DailyShadowStatus:
         parent_fd = _validate_parent(self.path.parent)
@@ -1093,6 +1157,7 @@ class DailyShadowRegistryReader:
                     calendar_sha256 = None
                     expected_dates = ()
                     last_outcome = None
+                    external_refs: tuple[dict[str, Any], ...] = ()
                 else:
                     epoch = memory.execute(
                         "SELECT version_vector_sha256,terms_evidence_sha256,"
@@ -1123,6 +1188,26 @@ class DailyShadowRegistryReader:
                         (window_row["epoch_id"],),
                     ).fetchone()
                     last_outcome = report["outcome"] if report is not None else None
+                    rows = memory.execute(
+                        "SELECT e.evidence_id,e.completion_sha256,e.evidence_sha256,"
+                        "e.bundle_ref AS evidence_bundle_ref,"
+                        "e.bundle_sha256 AS evidence_bundle_sha256,"
+                        "c.candidate_id,c.candidate_sha256,"
+                        "c.bundle_ref AS candidate_bundle_ref,"
+                        "c.bundle_sha256 AS candidate_bundle_sha256,"
+                        "c.quality_report_sha256,c.reconciliation_report_sha256 "
+                        "FROM daily_shadow_session_report r "
+                        "JOIN daily_shadow_evidence_ref e ON e.evidence_id=r.evidence_id "
+                        "JOIN daily_shadow_candidate_ref c ON c.candidate_id=r.candidate_id "
+                        "WHERE r.epoch_id=? AND r.outcome='SUCCESS' "
+                        "ORDER BY r.trade_date LIMIT 21",
+                        (window_row["epoch_id"],),
+                    ).fetchall()
+                    if len(rows) > _REQUIRED_SESSIONS:
+                        raise DailyShadowRegistryUnavailable(
+                            "daily shadow bundle graph unavailable"
+                        )
+                    external_refs = tuple(dict(row) for row in rows)
                 circuit = memory.execute(
                     "SELECT state FROM daily_shadow_circuit WHERE endpoint='historical_daily_1d'"
                 ).fetchone()
@@ -1130,6 +1215,7 @@ class DailyShadowRegistryReader:
                     raise DailyShadowRegistryUnavailable("daily shadow circuit unavailable")
             finally:
                 memory.close()
+            self._validate_external_bundles(external_refs)
             return DailyShadowStatus(
                 status="READY",
                 window=_window_from_row(window_row) if window_row is not None else None,
@@ -1427,7 +1513,7 @@ class DailyShadowRegistry:
                     ) from exc
 
     def read(self) -> DailyShadowStatus:
-        result = DailyShadowRegistryReader(self.path).read()
+        result = DailyShadowRegistryReader(self.path, verify_external=False).read()
         if result.status != "READY":
             raise DailyShadowRegistryUnavailable("daily shadow schema unavailable")
         return result
@@ -1437,7 +1523,7 @@ class DailyShadowRegistry:
         return (
             row["calendar_generation"],
             row["calendar_sha256"],
-            row["universe_sha256"],
+            row["universe_policy_sha256"],
             row["version_vector_sha256"],
             row["terms_evidence_sha256"],
             row["expected_dates_sha256"],
@@ -1452,7 +1538,7 @@ class DailyShadowRegistry:
         return (
             binding.calendar_generation,
             binding.calendar_sha256,
-            binding.universe_sha256,
+            binding.universe_policy_sha256,
             binding.version_vector_sha256,
             binding.terms_evidence_sha256,
             dates_sha,
@@ -1513,7 +1599,7 @@ class DailyShadowRegistry:
                     None,
                     binding.calendar_generation,
                     binding.calendar_sha256,
-                    binding.universe_sha256,
+                    binding.universe_policy_sha256,
                     binding.version_vector_sha256,
                     binding.terms_evidence_sha256,
                     dates_json,
@@ -2202,6 +2288,10 @@ class DailyShadowRegistry:
         _safe_id(event_id)
         if re.fullmatch(r"[a-z0-9_]{1,64}", failure_class) is None:
             raise DailyShadowRegistryUnavailable("daily circuit failure unavailable")
+        try:
+            validate_daily_failure_class(failure_class)
+        except ValueError as exc:
+            raise DailyShadowRegistryUnavailable("daily circuit failure unavailable") from exc
         observed_at = now or self._clock()
         if observed_at.utcoffset() is None:
             raise DailyShadowRegistryUnavailable("daily circuit time unavailable")

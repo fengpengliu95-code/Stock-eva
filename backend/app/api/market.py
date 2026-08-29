@@ -196,7 +196,11 @@ def market_provider_daily_bar_shadow(
                 if root is not None
             )
         )
-        status = DailyShadowRegistryReader(layout.daily_bar_shadow_database).read()
+        status = DailyShadowRegistryReader(
+            layout.daily_bar_shadow_database,
+            evidence_root=layout.daily_bar_shadow_evidence_root,
+            candidate_root=layout.daily_bar_shadow_candidate_root,
+        ).read()
     except Exception:
         status = None
     if status is None or status.status != "READY":

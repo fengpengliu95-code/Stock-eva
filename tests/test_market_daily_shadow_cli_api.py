@@ -30,7 +30,7 @@ from backend.app.market.daily_shadow_registry import (
     DailyShadowRegistry,
 )
 from backend.app.market.providers.shadow_contracts import TermsEvidence
-from tests.test_market_daily_shadow_canonical import TRADE_DATE, _write_dataset
+from tests.test_market_daily_shadow_canonical import TRADE_DATE, _row, _write_dataset
 from tests.test_market_shadow_jobs import _calendar_root
 
 
@@ -81,20 +81,16 @@ def _fetch(plan) -> DailyShadowFetchResult:
     timestamp = int(
         datetime.combine(plan.trade_date, datetime.min.time(), tzinfo=UTC).timestamp() * 1000
     )
-    prices = {
-        "sh.600000": (10.0, 10.4, 9.9, 10.2),
-        "sz.000001": (10.0, 10.4, 9.9, 10.2),
-    }
     rows = tuple(
         DailyShadowSourceRow(
             trade_date=plan.trade_date,
             timestamp=timestamp,
             provider_symbol=canonical_to_tickflow_daily_symbol(symbol),
             symbol=symbol,
-            open=prices[symbol][0],
-            high=prices[symbol][1],
-            low=prices[symbol][2],
-            close=prices[symbol][3],
+            open=10.0,
+            high=10.4,
+            low=9.9,
+            close=10.2,
             volume=1000,
             amount=10000.0,
         )
@@ -411,6 +407,7 @@ def test_daily_cli_fake_execute_writes_only_daily_shadow_lane(tmp_path, monkeypa
             "partition_sha256": domain_sha256(
                 "stock-eva/test/daily-cli-partition/v1", next_date.isoformat()
             ),
+            "canonical_universe_sha256": "0" * 64,
             "ohlc_sha256": domain_sha256(
                 "stock-eva/test/daily-cli-ohlc/v1",
                 tuple(row.model_dump(mode="json") for row in next_rows),
@@ -454,6 +451,94 @@ def test_daily_cli_fake_execute_writes_only_daily_shadow_lane(tmp_path, monkeypa
     assert second["consecutive_sessions"] == 2
     assert registry.read().epoch_count == 1
     assert registry.read().window.consecutive_sessions == 2
+
+    candidate_commit = (
+        settings.provider_shadow_root
+        / "daily-candidates"
+        / "daily-candidates"
+        / second["candidate_id"]
+        / "COMMIT"
+    )
+    hidden_candidate_commit = candidate_commit.with_name("COMMIT.hidden")
+    candidate_commit.rename(hidden_candidate_commit)
+    try:
+        unavailable = market_api.market_provider_daily_bar_shadow(
+            settings=api_settings, provider="tickflow"
+        )
+        assert unavailable.status == "unavailable"
+        assert unavailable.unavailable_reason == "CONTROL_STATE_UNAVAILABLE"
+    finally:
+        hidden_candidate_commit.rename(candidate_commit)
+
+    evidence_commit = (
+        settings.provider_shadow_root
+        / "daily-evidence"
+        / "bundles"
+        / second["evidence_id"]
+        / "COMMIT"
+    )
+    hidden_evidence_commit = evidence_commit.with_name("COMMIT.hidden")
+    evidence_commit.rename(hidden_evidence_commit)
+    try:
+        unavailable = market_api.market_provider_daily_bar_shadow(
+            settings=api_settings, provider="tickflow"
+        )
+        assert unavailable.status == "unavailable"
+        assert unavailable.unavailable_reason == "CONTROL_STATE_UNAVAILABLE"
+    finally:
+        hidden_evidence_commit.rename(evidence_commit)
+
+
+def test_daily_cli_half_open_runs_one_fixed_five_probe_and_ends_slot(tmp_path, monkeypatch, capsys):
+    dataset = tmp_path / "dataset"
+    symbols = ("sh.600000", "sh.600001", "sh.600002", "sz.000001", "sz.000002")
+    _write_dataset(dataset, rows=tuple(_row(symbol) for symbol in symbols))
+    settings, registry = _runtime(tmp_path, dataset)
+    past = datetime.now(UTC) - timedelta(seconds=1000)
+    for ordinal in range(3):
+        registry.record_endpoint_failure(
+            f"probe-precondition-{ordinal}", failure_class="timeout", now=past
+        )
+    provider_calls = 0
+
+    def execute_probe(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        assert kwargs["plan"].symbol_count == 5
+        assert kwargs["plan"].request_count == 1
+        return _fetch(kwargs["plan"])
+
+    monkeypatch.setattr(cli, "get_tickflow_free_runtime_settings", lambda: settings)
+    monkeypatch.setattr(
+        "backend.app.market.providers.tickflow_daily_shadow.TickFlowFreeDailyShadowFetcher.execute",
+        execute_probe,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "market-provider-daily-shadow",
+            "--provider",
+            "tickflow",
+            "--date",
+            TRADE_DATE.isoformat(),
+            "--execute",
+            "--external-authorization-id",
+            "approved-daily-half-open-probe",
+            "--acknowledge-provider-requests",
+        ],
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "HALF_OPEN_PROBE_SUCCESS"
+    assert payload["provider_requests"] == 1
+    assert payload["expected_symbols"] == payload["observed_symbols"] == 5
+    assert payload["circuit_state"] == "CLOSED"
+    assert provider_calls == 1
+    assert not (settings.provider_shadow_root / "daily-evidence").exists()
+    assert not (settings.provider_shadow_root / "daily-candidates").exists()
 
 
 def test_daily_api_missing_and_ready_sidecar_are_read_only(tmp_path):

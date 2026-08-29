@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .daily_shadow_candidates import (
     DailyCandidateMismatch,
@@ -18,10 +18,12 @@ from .daily_shadow_candidates import (
 )
 from .daily_shadow_canonical import PublishedDailyCanonicalProjection
 from .daily_shadow_models import (
+    DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
     DailyCanonicalReadResult,
     DailyShadowFetchResult,
     DailyShadowPlan,
     domain_sha256,
+    validate_daily_failure_class,
 )
 from .daily_shadow_registry import (
     DailyAttemptAudit,
@@ -50,10 +52,15 @@ class DailyHalfOpenProbeResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     outcome: Literal["SUCCESS", "FAILURE"]
-    provider_requests: Literal[1] = 1
+    provider_requests: int = Field(default=1, ge=0, le=1)
     expected_symbols: Literal[5] = 5
     observed_symbols: int = Field(ge=0, le=5)
     failure_class: str | None = Field(default=None, pattern=_FAILURE_CLASS)
+
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str | None) -> str | None:
+        return validate_daily_failure_class(value)
 
     @model_validator(mode="after")
     def validate_probe(self) -> DailyHalfOpenProbeResult:
@@ -97,6 +104,11 @@ class DailyShadowWorkerResult(BaseModel):
     canonical_writes: Literal[False] = False
     publication_enabled: Literal[False] = False
     failover_enabled: Literal[False] = False
+
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str | None) -> str | None:
+        return validate_daily_failure_class(value)
 
     @model_validator(mode="after")
     def validate_result(self) -> DailyShadowWorkerResult:
@@ -276,6 +288,7 @@ class DailyShadowWorker:
                 if self.probe_runner is not None
                 else DailyHalfOpenProbeResult(
                     outcome="FAILURE",
+                    provider_requests=0,
                     observed_symbols=0,
                     failure_class="probe_unavailable",
                 )
@@ -284,6 +297,7 @@ class DailyShadowWorker:
         except Exception:
             probe = DailyHalfOpenProbeResult(
                 outcome="FAILURE",
+                provider_requests=0,
                 observed_symbols=0,
                 failure_class="probe_unavailable",
             )
@@ -370,7 +384,7 @@ class DailyShadowWorker:
                 or dates != tuple(sorted(set(dates)))
                 or trade_date not in dates
                 or snapshot.trade_date != trade_date
-                or self.confirmed_calendar.universe_sha256 != snapshot.canonical_universe_sha256
+                or self.confirmed_calendar.universe_sha256 != DAILY_CANONICAL_UNIVERSE_POLICY_SHA256
             ):
                 return self._result(
                     outcome="UNAVAILABLE",
@@ -379,12 +393,12 @@ class DailyShadowWorker:
                     failure_class="calendar_unavailable",
                     circuit_state=decision.state,
                 )
-            version_vector = daily_version_vector_sha256(snapshot, self.terms_evidence_sha256)
+            version_vector = daily_version_vector_sha256(self.terms_evidence_sha256)
             window = self.registry.ensure_window(
                 DailyWindowBinding(
                     calendar_generation=self.confirmed_calendar.calendar_generation,
                     calendar_sha256=self.confirmed_calendar.calendar_sha256,
-                    universe_sha256=self.confirmed_calendar.universe_sha256,
+                    universe_policy_sha256=self.confirmed_calendar.universe_sha256,
                     version_vector_sha256=version_vector,
                     terms_evidence_sha256=self.terms_evidence_sha256,
                     expected_dates=dates,

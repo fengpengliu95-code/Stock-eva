@@ -24,6 +24,7 @@ from .daily_shadow_models import (
     DailyCanonicalSnapshot,
     DailyCanonicalUnavailableReason,
     canonical_to_tickflow_daily_symbol,
+    daily_canonical_universe_sha256,
     domain_sha256,
 )
 
@@ -207,6 +208,37 @@ def _validate_descriptor(
     return path, lineage_state, lineage
 
 
+def _validate_manifest_entries(root: Path, entries: list[Any]) -> None:
+    seen_dates: set[date] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise _ReadFailure(DailyCanonicalUnavailableReason.CANONICAL_DESCRIPTOR_INVALID)
+        try:
+            entry_date = date.fromisoformat(entry.get("trade_date", ""))
+        except (TypeError, ValueError) as exc:
+            raise _ReadFailure(
+                DailyCanonicalUnavailableReason.CANONICAL_DESCRIPTOR_INVALID
+            ) from exc
+        if entry_date in seen_dates:
+            raise _ReadFailure(DailyCanonicalUnavailableReason.CANONICAL_DESCRIPTOR_INVALID)
+        seen_dates.add(entry_date)
+        _validate_descriptor(root, entry, entry_date)
+
+
+def _quality_issues(value: Any) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except json.JSONDecodeError as exc:
+        raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID) from exc
+    if (
+        not isinstance(parsed, list)
+        or any(not isinstance(item, str) or not item for item in parsed)
+        or len(parsed) != len(set(parsed))
+    ):
+        raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)
+    return tuple(parsed)
+
+
 def _partition_rows(
     path: Path, *, expected_sha256: str, expected_rows: int
 ) -> tuple[list[tuple[Any, ...]], _Fingerprint]:
@@ -338,7 +370,7 @@ def _project_rows(
             _source_record_id,
             _ingested_at,
             quality_status,
-            _quality_issues,
+            quality_issues,
         ) = values
         if (
             str(row_date)[:10] != trade_date.isoformat()
@@ -351,17 +383,25 @@ def _project_rows(
             or type(is_trading) is not bool
             or type(is_suspended) is not bool
             or source != "baostock"
-            or quality_status != "ready"
         ):
             raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)
         seen.add(symbol)
+        issues = _quality_issues(quality_issues)
         if security_type == "index":
+            if quality_status != "ready" or issues:
+                raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)
             excluded.append((symbol, "security_type_index"))
             continue
         if (is_trading, is_suspended) == (False, True):
+            legal_suspended_quality = (quality_status == "ready" and not issues) or (
+                quality_status == "partial"
+                and set(issues) == {"suspended_placeholder", "missing_adjust_factor"}
+            )
+            if not legal_suspended_quality:
+                raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)
             excluded.append((symbol, "canonical_nontrading"))
             continue
-        if (is_trading, is_suspended) != (True, False):
+        if (is_trading, is_suspended) != (True, False) or quality_status != "ready" or issues:
             raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)
         try:
             eligible.append(
@@ -421,6 +461,7 @@ class DailyCanonicalReader:
                 or not isinstance(manifest.get("files"), list)
             ):
                 raise _ReadFailure(DailyCanonicalUnavailableReason.CANONICAL_DESCRIPTOR_INVALID)
+            _validate_manifest_entries(self.root, manifest["files"])
             matches = [
                 item
                 for item in manifest["files"]
@@ -454,6 +495,18 @@ class DailyCanonicalReader:
                 }
                 for row in projected
             )
+            exclusion_sha256 = domain_sha256(
+                "stock-eva/r2f3/daily-canonical-exclusions/v1", excluded
+            )
+            universe_sha256 = daily_canonical_universe_sha256(
+                symbols=symbols,
+                exclusion_sha256=exclusion_sha256,
+                manifest_generation=manifest["generation"],
+                manifest_sha256=manifest_fp.sha256,
+                partition_relative_path=descriptor["path"],
+                partition_sha256=partition_fp.sha256,
+                partition_row_count=descriptor["row_count"],
+            )
             snapshot = DailyCanonicalSnapshot(
                 trade_date=self.trade_date,
                 lineage_state=lineage_state,
@@ -465,12 +518,8 @@ class DailyCanonicalReader:
                 partition_row_count=descriptor["row_count"],
                 eligible_symbol_count=len(projected),
                 excluded_symbol_count=len(excluded),
-                canonical_universe_sha256=domain_sha256(
-                    "stock-eva/r2f3/daily-canonical-universe/v1", symbols
-                ),
-                canonical_exclusion_sha256=domain_sha256(
-                    "stock-eva/r2f3/daily-canonical-exclusions/v1", excluded
-                ),
+                canonical_universe_sha256=universe_sha256,
+                canonical_exclusion_sha256=exclusion_sha256,
                 symbol_mapping_sha256=domain_sha256(
                     "stock-eva/r2f3/daily-symbol-mapping/v1", mapping
                 ),

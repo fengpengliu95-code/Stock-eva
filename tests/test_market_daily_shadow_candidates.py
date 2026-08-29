@@ -74,9 +74,7 @@ def _snapshot() -> DailyCanonicalSnapshot:
         partition_row_count=4,
         eligible_symbol_count=2,
         excluded_symbol_count=2,
-        canonical_universe_sha256=domain_sha256(
-            "stock-eva/r2f3/daily-canonical-universe/v1", symbols
-        ),
+        canonical_universe_sha256="0" * 64,
         canonical_exclusion_sha256="4" * 64,
         symbol_mapping_sha256=domain_sha256("stock-eva/r2f3/daily-symbol-mapping/v1", mapping),
         ohlc_sha256="6" * 64,

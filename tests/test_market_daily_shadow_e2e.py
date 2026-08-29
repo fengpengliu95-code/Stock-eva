@@ -33,6 +33,15 @@ from backend.app.market.shadow_evidence import ShadowEvidenceReader, ShadowEvide
 START = date(2026, 7, 14)
 NOW = datetime(2026, 8, 28, tzinfo=UTC)
 SYMBOLS = ("sh.600000", "sz.000001")
+EXTRA_SYMBOL = "sh.600001"
+UNIVERSE_POLICY_SHA256 = domain_sha256(
+    "stock-eva/r2f3/daily-canonical-universe-policy/v1",
+    {
+        "eligible": "active-ready-sh-sz-stock-positive-legal-ohlc",
+        "excluded": "index-or-suspended-nontrading-hashed",
+        "mapping": "sh-sz-six-digit-reversible-v1",
+    },
+)
 
 
 class _Reader:
@@ -51,7 +60,12 @@ def _tree(root: Path) -> dict[str, str]:
     }
 
 
-def _snapshot(trade_date: date) -> DailyCanonicalSnapshot:
+def _snapshot(trade_date: date, *, symbols: tuple[str, ...] = SYMBOLS) -> DailyCanonicalSnapshot:
+    price_rows = {
+        "sh.600000": (10.0, 10.4, 9.9, 10.2),
+        "sz.000001": (11.0, 11.4, 10.9, 11.2),
+        EXTRA_SYMBOL: (12.0, 12.4, 11.9, 12.2),
+    }
     rows = tuple(
         CanonicalDailyOhlcRow(
             trade_date=trade_date,
@@ -61,12 +75,10 @@ def _snapshot(trade_date: date) -> DailyCanonicalSnapshot:
             low=Decimal(str(low)),
             close=Decimal(str(close)),
         )
-        for symbol, open_value, high, low, close in (
-            ("sh.600000", 10.0, 10.4, 9.9, 10.2),
-            ("sz.000001", 11.0, 11.4, 10.9, 11.2),
-        )
+        for symbol in symbols
+        for open_value, high, low, close in (price_rows[symbol],)
     )
-    mapping = tuple((symbol, canonical_to_tickflow_daily_symbol(symbol)) for symbol in SYMBOLS)
+    mapping = tuple((symbol, canonical_to_tickflow_daily_symbol(symbol)) for symbol in symbols)
     return DailyCanonicalSnapshot(
         trade_date=trade_date,
         lineage_state=DailyCanonicalLineageState.LEGACY_UNAVAILABLE,
@@ -74,12 +86,10 @@ def _snapshot(trade_date: date) -> DailyCanonicalSnapshot:
         manifest_sha256=domain_sha256("stock-eva/test/r2f3/manifest/v1", trade_date.isoformat()),
         partition_relative_path=(f"bars/source=baostock/date={trade_date.isoformat()}.parquet"),
         partition_sha256=domain_sha256("stock-eva/test/r2f3/partition/v1", trade_date.isoformat()),
-        partition_row_count=2,
-        eligible_symbol_count=2,
+        partition_row_count=len(symbols),
+        eligible_symbol_count=len(symbols),
         excluded_symbol_count=0,
-        canonical_universe_sha256=domain_sha256(
-            "stock-eva/r2f3/daily-canonical-universe/v1", SYMBOLS
-        ),
+        canonical_universe_sha256="0" * 64,
         canonical_exclusion_sha256=domain_sha256("stock-eva/test/r2f3/exclusions/v1", ()),
         symbol_mapping_sha256=domain_sha256("stock-eva/r2f3/daily-symbol-mapping/v1", mapping),
         ohlc_sha256=domain_sha256(
@@ -100,7 +110,7 @@ def _calendar(snapshots: dict[date, DailyCanonicalSnapshot]) -> ConfirmedSession
         "calendar_sha256": "5" * 64,
         "confirmed_next_sessions": [item.isoformat() for item in dates],
         "universe_id": "daily-canonical-active-universe",
-        "universe_sha256": snapshots[dates[0]].canonical_universe_sha256,
+        "universe_sha256": UNIVERSE_POLICY_SHA256,
         "captured_at": NOW.isoformat(),
     }
     payload = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -132,10 +142,11 @@ def _fetch(plan, *, mismatch: bool = False) -> DailyShadowFetchResult:
     timestamp = int(
         datetime.combine(plan.trade_date, datetime.min.time(), tzinfo=UTC).timestamp() * 1000
     )
-    prices = (
-        ("sh.600000", 10.0, 10.4, 9.9, 10.22 if mismatch else 10.2),
-        ("sz.000001", 11.0, 11.4, 10.9, 11.2),
-    )
+    prices = {
+        "sh.600000": (10.0, 10.4, 9.9, 10.22 if mismatch else 10.2),
+        "sz.000001": (11.0, 11.4, 10.9, 11.2),
+        EXTRA_SYMBOL: (12.0, 12.4, 11.9, 12.2),
+    }
     rows = tuple(
         DailyShadowSourceRow(
             trade_date=plan.trade_date,
@@ -149,7 +160,9 @@ def _fetch(plan, *, mismatch: bool = False) -> DailyShadowFetchResult:
             volume=1000,
             amount=10000.0,
         )
-        for symbol, open_value, high, low, close in prices
+        for shard in plan.shards
+        for symbol in shard.canonical_symbols
+        for open_value, high, low, close in (prices[symbol],)
     )
     return DailyShadowFetchResult(
         status="ready",
@@ -163,8 +176,8 @@ def _fetch(plan, *, mismatch: bool = False) -> DailyShadowFetchResult:
                 outcome="SUCCESS",
                 elapsed_ms=1,
                 response_bytes=100,
-                expected_rows=2,
-                observed_rows=2,
+                expected_rows=len(plan.shards[0].canonical_symbols),
+                observed_rows=len(plan.shards[0].canonical_symbols),
             ),
         ),
     )
@@ -180,7 +193,13 @@ def test_one_reset_then_clean_twenty_session_epoch_is_only_qualified_epoch(tmp_p
     canonical_before = _tree(canonical_root)
 
     dates = tuple(START + timedelta(days=ordinal) for ordinal in range(20))
-    snapshots = {trade_date: _snapshot(trade_date) for trade_date in dates}
+    snapshots = {
+        trade_date: _snapshot(
+            trade_date,
+            symbols=SYMBOLS if ordinal % 3 else tuple(sorted((*SYMBOLS, EXTRA_SYMBOL))),
+        )
+        for ordinal, trade_date in enumerate(dates)
+    }
     terms = _terms()
     control = tmp_path / "control"
     control.mkdir(mode=0o700)

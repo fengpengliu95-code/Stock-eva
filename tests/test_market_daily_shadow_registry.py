@@ -65,7 +65,7 @@ def _binding(terms=None, **updates):
     values = {
         "calendar_generation": "calendar-20260828",
         "calendar_sha256": "1" * 64,
-        "universe_sha256": "2" * 64,
+        "universe_policy_sha256": "2" * 64,
         "version_vector_sha256": "3" * 64,
         "terms_evidence_sha256": terms.manifest_sha256,
         "expected_dates": DATES,
@@ -370,6 +370,19 @@ def test_non_success_resets_epoch_and_retains_prior_reports(tmp_path, outcome):
     assert registry.read().session_report_count == 2
 
 
+def test_failure_classes_are_allowlisted_at_sidecar_boundaries():
+    with pytest.raises(ValueError, match="failure class"):
+        DailySessionFailure(
+            epoch_id="daily-epoch-0001-test",
+            job_id="daily-job-test",
+            session_id="daily-session-test",
+            session_report_id="daily-report-test",
+            trade_date=DATES[0],
+            outcome="UNAVAILABLE",
+            failure_class="arbitrary_provider_text",
+        )
+
+
 def test_gap_duplicate_and_binding_change_reset_without_deleting_history(tmp_path):
     registry, terms, window = _registry(tmp_path)
     lease = _lease(registry, window, DATES[0], 0)
@@ -399,7 +412,7 @@ def test_gap_duplicate_and_binding_change_reset_without_deleting_history(tmp_pat
     [
         ("calendar_generation", "calendar-20260829"),
         ("calendar_sha256", "e" * 64),
-        ("universe_sha256", "f" * 64),
+        ("universe_policy_sha256", "f" * 64),
         ("version_vector_sha256", "d" * 64),
     ],
 )

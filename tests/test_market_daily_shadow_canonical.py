@@ -52,6 +52,7 @@ def _row(
     is_trading: bool = True,
     is_suspended: bool = False,
     quality_status: str = "ready",
+    quality_issues: str = "[]",
     close: float = 10.2,
 ) -> tuple[object, ...]:
     exchange = exchange or symbol[:2]
@@ -79,7 +80,7 @@ def _row(
         f"baostock:{symbol}:{TRADE_DATE.isoformat()}",
         datetime(2026, 8, 10, 10, tzinfo=UTC),
         quality_status,
-        "[]",
+        quality_issues,
     )
 
 
@@ -169,6 +170,51 @@ def test_legacy_manifest_projects_exact_active_stock_universe_without_writes(tmp
     assert _tree(root) == before
 
 
+def test_suspended_partial_placeholder_is_excluded_and_universe_binds_full_identity(tmp_path):
+    rows = (
+        _row("sh.600000"),
+        _row(
+            "sz.000001",
+            is_trading=False,
+            is_suspended=True,
+            quality_status="partial",
+            quality_issues='["suspended_placeholder","missing_adjust_factor"]',
+        ),
+    )
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    third = tmp_path / "third"
+    _write_dataset(first, rows=rows)
+    _write_dataset(
+        second,
+        rows=(rows[0], _row("sz.000002", is_trading=False, is_suspended=True)),
+    )
+    _write_dataset(
+        third,
+        rows=rows,
+        manifest_updates={"generation": "generation-r2f3-daily-shadow-republished"},
+    )
+
+    first_result = DailyCanonicalReader(first, trade_date=TRADE_DATE).read()
+    second_result = DailyCanonicalReader(second, trade_date=TRADE_DATE).read()
+    third_result = DailyCanonicalReader(third, trade_date=TRADE_DATE).read()
+
+    assert first_result.status == "ready"
+    assert first_result.snapshot is not None
+    assert first_result.snapshot.eligible_symbol_count == 1
+    assert first_result.snapshot.excluded_symbol_count == 1
+    assert second_result.snapshot is not None
+    assert third_result.snapshot is not None
+    assert (
+        first_result.snapshot.canonical_universe_sha256
+        != second_result.snapshot.canonical_universe_sha256
+    )
+    assert (
+        first_result.snapshot.canonical_universe_sha256
+        != third_result.snapshot.canonical_universe_sha256
+    )
+
+
 def test_complete_r2f2_lineage_is_accepted_but_partial_lineage_fails_closed(tmp_path):
     lineage = {
         "provider_id": "baostock",
@@ -222,6 +268,26 @@ def test_descriptor_schema_hash_count_source_and_date_fail_closed(
     assert result.status == "unavailable"
     assert result.snapshot is None
     assert _tree(root) == before
+
+
+def test_every_manifest_entry_must_have_exact_schema_and_unique_trade_date(tmp_path):
+    malformed = tmp_path / "malformed"
+    _partition, manifest = _write_dataset(malformed)
+    manifest["files"].append({"source": "baostock", "trade_date": "2026-08-09"})
+    (malformed / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    assert DailyCanonicalReader(malformed, trade_date=TRADE_DATE).read().status == "unavailable"
+
+    duplicate = tmp_path / "duplicate"
+    _partition, manifest = _write_dataset(duplicate)
+    manifest["files"].append(dict(manifest["files"][0]))
+    (duplicate / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    assert DailyCanonicalReader(duplicate, trade_date=TRADE_DATE).read().status == "unavailable"
 
 
 @pytest.mark.parametrize(
@@ -283,7 +349,7 @@ def test_snapshot_hashes_are_deterministic_for_input_row_order(tmp_path):
     left = DailyCanonicalReader(first, trade_date=TRADE_DATE).read().snapshot
     right = DailyCanonicalReader(second, trade_date=TRADE_DATE).read().snapshot
     assert left is not None and right is not None
-    assert left.canonical_universe_sha256 == right.canonical_universe_sha256
+    assert left.canonical_universe_sha256 != right.canonical_universe_sha256
     assert left.canonical_exclusion_sha256 == right.canonical_exclusion_sha256
     assert left.symbol_mapping_sha256 == right.symbol_mapping_sha256
     assert left.ohlc_sha256 == right.ohlc_sha256

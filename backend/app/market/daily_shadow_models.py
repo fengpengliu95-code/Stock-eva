@@ -11,10 +11,59 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 DAILY_SHADOW_PROFILE = "TICKFLOW_FREE_DAILY_BAR_OHLC_V1"
 _CANONICAL_SYMBOL = re.compile(r"^(?:sh|sz)\.\d{6}$")
+DAILY_SHADOW_FAILURE_CLASSES = frozenset(
+    {
+        "calendar_unavailable",
+        "candidate_unavailable",
+        "canonical_unavailable",
+        "column_length_mismatch",
+        "endpoint_url_unavailable",
+        "http_error",
+        "malformed_json",
+        "malformed_response",
+        "numeric_value_invalid",
+        "probe_failure",
+        "probe_unavailable",
+        "provider_failure",
+        "provider_unavailable",
+        "rate_limited",
+        "reconciliation_mismatch",
+        "recv_timeout",
+        "redirect_or_endpoint_mismatch",
+        "request_budget_exhausted",
+        "response_contract_invalid",
+        "response_oversize",
+        "row_budget_exhausted",
+        "schema_drift",
+        "sdk_initialization_failed",
+        "server_error",
+        "symbol_set_invalid",
+        "terminal_unavailable",
+        "timeout",
+        "transport_error",
+        "unauthorized",
+        "worker_unavailable",
+        "wrong_date",
+    }
+)
+
+
+def validate_daily_failure_class(value: str | None) -> str | None:
+    if value is not None and value not in DAILY_SHADOW_FAILURE_CLASSES:
+        raise ValueError("Daily shadow failure class is not allowlisted")
+    return value
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -30,6 +79,41 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def domain_sha256(domain: str, value: Any) -> str:
     return hashlib.sha256(domain.encode("ascii") + b"\n" + canonical_json_bytes(value)).hexdigest()
+
+
+DAILY_CANONICAL_UNIVERSE_POLICY = {
+    "eligible": "active-ready-sh-sz-stock-positive-legal-ohlc",
+    "excluded": "index-or-suspended-nontrading-hashed",
+    "mapping": "sh-sz-six-digit-reversible-v1",
+}
+DAILY_CANONICAL_UNIVERSE_POLICY_SHA256 = domain_sha256(
+    "stock-eva/r2f3/daily-canonical-universe-policy/v1",
+    DAILY_CANONICAL_UNIVERSE_POLICY,
+)
+
+
+def daily_canonical_universe_sha256(
+    *,
+    symbols: tuple[str, ...],
+    exclusion_sha256: str,
+    manifest_generation: str,
+    manifest_sha256: str,
+    partition_relative_path: str,
+    partition_sha256: str,
+    partition_row_count: int,
+) -> str:
+    return domain_sha256(
+        "stock-eva/r2f3/daily-canonical-universe/v2",
+        {
+            "active_symbols": symbols,
+            "exclusion_sha256": exclusion_sha256,
+            "manifest_generation": manifest_generation,
+            "manifest_sha256": manifest_sha256,
+            "partition_relative_path": partition_relative_path,
+            "partition_sha256": partition_sha256,
+            "partition_row_count": partition_row_count,
+        },
+    )
 
 
 def canonical_to_tickflow_daily_symbol(value: str) -> str:
@@ -105,6 +189,19 @@ class DailyCanonicalSnapshot(BaseModel):
                 raise ValueError("legacy canonical descriptor cannot claim R2-F2 lineage")
         elif not self.r2f2_lineage:
             raise ValueError("R2-F2 canonical descriptor requires lineage")
+        expected_universe = daily_canonical_universe_sha256(
+            symbols=symbols,
+            exclusion_sha256=self.canonical_exclusion_sha256,
+            manifest_generation=self.manifest_generation,
+            manifest_sha256=self.manifest_sha256,
+            partition_relative_path=self.partition_relative_path,
+            partition_sha256=self.partition_sha256,
+            partition_row_count=self.partition_row_count,
+        )
+        if self.canonical_universe_sha256 == "0" * 64:
+            object.__setattr__(self, "canonical_universe_sha256", expected_universe)
+        elif self.canonical_universe_sha256 != expected_universe:
+            raise ValueError("canonical Daily universe identity mismatch")
         values = self.model_dump(mode="json")
         values.pop("snapshot_sha256", None)
         expected = domain_sha256("stock-eva/r2f3/daily-canonical-snapshot/v1", values)
@@ -168,6 +265,7 @@ class DailyShadowPlan(BaseModel):
     trade_date: date
     canonical_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonical_universe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_symbol_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonical_exclusion_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     symbol_mapping_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     period: Literal["1d"] = "1d"
@@ -183,10 +281,10 @@ class DailyShadowPlan(BaseModel):
         provider = tuple(symbol for shard in self.shards for symbol in shard.provider_symbols)
         if canonical != tuple(sorted(canonical)) or len(set(canonical)) != len(canonical):
             raise ValueError("Daily shadow plan symbol set is invalid")
-        if self.canonical_universe_sha256 != domain_sha256(
+        if self.canonical_symbol_set_sha256 != domain_sha256(
             "stock-eva/r2f3/daily-canonical-universe/v1", canonical
         ):
-            raise ValueError("Daily shadow universe hash mismatch")
+            raise ValueError("Daily shadow symbol set hash mismatch")
         if self.symbol_mapping_sha256 != domain_sha256(
             "stock-eva/r2f3/daily-symbol-mapping/v1", tuple(zip(canonical, provider, strict=True))
         ):
@@ -256,6 +354,11 @@ class DailyShadowFetchObservation(BaseModel):
     observed_rows: int = Field(ge=0, le=100)
     failure_class: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
 
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str | None) -> str | None:
+        return validate_daily_failure_class(value)
+
     @model_validator(mode="after")
     def validate_observation(self) -> DailyShadowFetchObservation:
         if self.outcome == "SUCCESS" and (
@@ -284,6 +387,11 @@ class DailyShadowFetchResult(BaseModel):
     suspension_semantics_state: Literal["UNKNOWN"] = "UNKNOWN"
     factor_evidence_state: Literal["UNQUALIFIED"] = "UNQUALIFIED"
     adjustment_request_state: Literal["NONE_REQUESTED"] = "NONE_REQUESTED"
+
+    @field_validator("failure_class")
+    @classmethod
+    def allowlisted_failure_class(cls, value: str | None) -> str | None:
+        return validate_daily_failure_class(value)
 
     @model_validator(mode="after")
     def validate_fetch_result(self) -> DailyShadowFetchResult:

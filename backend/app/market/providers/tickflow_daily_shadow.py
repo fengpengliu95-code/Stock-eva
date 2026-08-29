@@ -18,6 +18,7 @@ from backend.app.market.daily_shadow_models import (
     DailyShadowShard,
     DailyShadowSourceRow,
     canonical_to_tickflow_daily_symbol,
+    daily_canonical_universe_sha256,
     domain_sha256,
 )
 
@@ -172,7 +173,15 @@ class TickFlowFreeDailyShadowAdapter:
         if (
             snapshot.eligible_symbol_count != len(symbols)
             or snapshot.canonical_universe_sha256
-            != domain_sha256("stock-eva/r2f3/daily-canonical-universe/v1", symbols)
+            != daily_canonical_universe_sha256(
+                symbols=symbols,
+                exclusion_sha256=snapshot.canonical_exclusion_sha256,
+                manifest_generation=snapshot.manifest_generation,
+                manifest_sha256=snapshot.manifest_sha256,
+                partition_relative_path=snapshot.partition_relative_path,
+                partition_sha256=snapshot.partition_sha256,
+                partition_row_count=snapshot.partition_row_count,
+            )
             or snapshot.symbol_mapping_sha256 != mapping_hash
         ):
             raise ValueError("Daily shadow canonical snapshot binding is invalid")
@@ -199,9 +208,43 @@ class TickFlowFreeDailyShadowAdapter:
             trade_date=snapshot.trade_date,
             canonical_snapshot_sha256=snapshot.snapshot_sha256,
             canonical_universe_sha256=snapshot.canonical_universe_sha256,
+            canonical_symbol_set_sha256=domain_sha256(
+                "stock-eva/r2f3/daily-canonical-universe/v1", symbols
+            ),
             canonical_exclusion_sha256=snapshot.canonical_exclusion_sha256,
             symbol_mapping_sha256=mapping_hash,
             shards=tuple(shards),
+        )
+
+    def fixed_five_probe_plan(self, snapshot: DailyCanonicalSnapshot) -> DailyShadowPlan:
+        full = self.plan(snapshot)
+        canonical = tuple(symbol for shard in full.shards for symbol in shard.canonical_symbols)[:5]
+        if len(canonical) != 5:
+            raise ValueError("Daily shadow fixed-five probe universe unavailable")
+        provider = tuple(canonical_to_tickflow_daily_symbol(symbol) for symbol in canonical)
+        mapping_sha256 = domain_sha256(
+            "stock-eva/r2f3/daily-symbol-mapping/v1",
+            tuple(zip(canonical, provider, strict=True)),
+        )
+        shard = DailyShadowShard(
+            ordinal=0,
+            request_id=(
+                f"tickflow-free-daily-probe-{snapshot.trade_date.isoformat()}-"
+                f"{domain_sha256('stock-eva/r2f3/daily-probe/v1', provider)[:16]}"
+            ),
+            canonical_symbols=canonical,
+            provider_symbols=provider,
+        )
+        return DailyShadowPlan(
+            trade_date=snapshot.trade_date,
+            canonical_snapshot_sha256=snapshot.snapshot_sha256,
+            canonical_universe_sha256=snapshot.canonical_universe_sha256,
+            canonical_symbol_set_sha256=domain_sha256(
+                "stock-eva/r2f3/daily-canonical-universe/v1", canonical
+            ),
+            canonical_exclusion_sha256=snapshot.canonical_exclusion_sha256,
+            symbol_mapping_sha256=mapping_sha256,
+            shards=(shard,),
         )
 
     @staticmethod

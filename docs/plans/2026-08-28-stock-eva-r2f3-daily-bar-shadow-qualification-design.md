@@ -1,14 +1,19 @@
 # Stock EVA R2-F3 TickFlow Free Daily Bar Shadow Qualification Design
 
-**Author:** Codex delivery team  
-**Date:** 2026-08-28 (Asia/Shanghai)  
-**Status:** **SPEC READY / IMPLEMENTATION NOT STARTED / DAILY BAR SHADOW NO-GO**  
+**Author:** Codex delivery team
+
+**Date:** 2026-08-28; amended 2026-08-29 (Asia/Shanghai)
+
+**Status:** **REVIEW REMEDIATION IMPLEMENTED / RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO**
+
 **Scope:** The capability-scoped `TICKFLOW_FREE_DAILY_BAR_OHLC_V1` shadow lane and its
-20-consecutive-confirmed-session qualification window.  
+20-consecutive-confirmed-session qualification window.
+
 **Authority:** The user's standing R2-F development and validation authorization permits the
 required local reads/writes and bounded real-provider validation. It does not weaken the version
 delivery gate, provider terms gate, fail-closed behavior, canonical isolation, or automatic
-failover default-off rule.  
+failover default-off rule.
+
 **Predecessor:** Task14 Free discovery at commit
 `619d1f3dd30823506607fadeccbbec6c29cebbae` is GO. Its fixed-five, zero-write discovery result is
 not a shadow session and cannot be counted in this window.
@@ -32,6 +37,13 @@ does not contain R2-F2 candidate lineage fields. The Tasks10-13 canonical reader
 partition because it requires the newer lineage graph. A Daily-only reader must therefore support
 the reviewed legacy descriptor without inventing missing lineage, while remaining descriptor-
 bound and read-only.
+
+The first Task 7 independent review additionally proved two real-data constraints that the initial
+specification had modeled incorrectly. Canonical suspended placeholders legitimately carry
+`quality_status=partial`, and the exact active symbol set changes normally from session to session.
+The amended contract therefore hashes every session's full canonical identity separately while the
+20-session version vector binds the stable eligibility/mapping policy. Daily listing/suspension
+changes cannot be mistaken for a contract change or make the qualification window unreachable.
 
 ### Decision
 
@@ -97,17 +109,22 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   OHLC ordering. Index rows are excluded explicitly. Unknown security types, exchanges, quality
   states, duplicate symbols or invalid rows invalidate the entire projection.
 - FR-7: Suspended/non-trading canonical stock rows MAY be excluded only into a separately hashed
-  `canonical_exclusion_sha256`; they cannot be used to infer TickFlow suspension/no-row semantics.
+  `canonical_exclusion_sha256`; a canonical `partial` row is legal here only for the exact reviewed
+  suspended-placeholder quality-issue set. These rows cannot be used to infer TickFlow
+  suspension/no-row semantics.
   The exact sorted active symbol set, exact excluded symbol set, manifest identity and partition
   identity MUST produce a deterministic `canonical_universe_sha256`.
 - FR-8: The only symbol mapping is the total reversible function
   `sh.600000 -> 600000.SH` and `sz.000001 -> 000001.SZ`. Every input and returned key MUST validate;
   duplicates, aliases, extra keys, missing keys, BJ/HK/US or any non-reviewed exchange fail closed.
-  The sorted pair list MUST produce a `symbol_mapping_sha256` included in the version vector.
+  The sorted pair list MUST produce a per-session `symbol_mapping_sha256` bound to the request plan
+  and candidate. The stable mapping-contract hash and canonical universe-policy hash, not the
+  naturally changing daily pair list, MUST be included in the window version vector.
 - FR-9: The request plan MUST sort canonical symbols, partition them deterministically into
   consecutive shards of at most 100 symbols, and create exactly one `historical_daily_1d` logical
-  request per shard. Shard order, membership, date, `period=1d`, exact UTC-day bounds,
-  `adjust=none`, schema hash and unit-state hash MUST be immutable and hash-bound.
+  request per shard. The plan MUST bind both the complete per-session canonical-universe identity
+  and a separate exact active-symbol-set hash. Shard order, membership, date, `period=1d`, exact
+  UTC-day bounds, `adjust=none`, schema hash and unit-state hash MUST be immutable and hash-bound.
 - FR-10: Each execution MUST process exactly one trade-date session. It MUST perform at most 40
   provider requests, one attempt per shard, sequentially, with no SDK batch concurrency, hidden
   retry, sleep, pagination fallback, authenticated endpoint, realtime quote, minute K-line,
@@ -135,16 +152,17 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   elapsed/count/byte metrics and an allowlisted failure class; it MUST not contain payload, URL,
   header, token, provider text or offending symbol.
 - FR-17: A new capability-specific review descriptor and TermsEvidence MUST bind the exact Free
-  adapter, endpoint/source schema, SDK/wheel, symbol mapping, candidate, reconciliation policy,
-  retention decision and request-budget hashes. Task14 V1/V2 discovery descriptors cannot
+  adapter, endpoint/source schema, SDK/wheel, symbol mapping, canonical universe policy, candidate,
+  reconciliation policy, retention decision and request-budget hashes. Task14 V1/V2 discovery descriptors cannot
   authorize this wider whole-session plan.
 - FR-18: The user-selected retention policy is final-success source evidence only. The capability
   record MUST still report provider raw-retention semantics as `UNKNOWN`; this state cannot be
   converted into a general redistribution or long-term retention claim.
 - FR-19: `DailyBarShadowCandidate` MUST bind provider/profile, trade date, evidence/completion and
-  request-plan hashes, canonical snapshot/manifest/partition/universe/exclusion hashes, mapping,
-  adapter/schema/policy/terms hashes, exact expected/observed counts, source-row aggregate hash,
-  normalized OHLC aggregate hash and all semantic-state literals.
+  request-plan hashes, canonical snapshot/manifest/partition/universe/exclusion hashes, exact
+  per-session mapping, stable universe-policy and adapter/schema/policy/terms hashes, exact
+  expected/observed counts, source-row aggregate hash, normalized OHLC aggregate hash and all
+  semantic-state literals.
 - FR-20: Daily candidate self-quality MUST require exact expected/observed symbol equality,
   exact-one-row coverage, date match, finite positive prices, legal OHLC ordering, no duplicate,
   no extra symbol and unchanged canonical snapshot before and after evidence collection. A failed
@@ -168,16 +186,22 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   append-only attempt/session/attestation rows and immutable exact-hash foreign-key closure.
 - FR-26: The read path MUST take a shared lock, copy bounded descriptor-validated bytes into
   memory and open SQLite query-only. Missing DB/table, lock contention, corrupt schema, unknown
-  migration or unreadable bundle MUST return `UNAVAILABLE` with zero writes or initialization.
+  migration or any unreadable evidence/candidate bundle referenced by the current epoch MUST return
+  `UNAVAILABLE` with zero writes or initialization. External verification is bounded to the current
+  epoch's at most 20 successful session graphs.
 - FR-27: One qualification window MUST contain exactly 20 distinct consecutive dates from one
-  immutable `ConfirmedSessionSnapshot` and the exact same version vector. Processing may be
+  immutable `ConfirmedSessionSnapshot` and the exact same stable contract/policy version vector.
+  Each date retains its own exact canonical universe, exclusion and mapping hashes; normal
+  session-to-session active-set changes do not change the version vector. Processing may be
   historical, but each session MUST use real provider requests after its canonical partition was
   published. The report MUST label this `observation_mode=HISTORICAL_SHADOW`; it is not R2-F5 live
   production soak evidence.
 - FR-28: Any missing confirmed date, out-of-order date, duplicate success, failure, mismatch,
   unavailable result, calendar change, contract/hash change, canonical universe-policy change or
   terms change MUST end the current epoch as `RESET`. A later attempt starts a new immutable epoch;
-  prior reports remain queryable and cannot be overwritten.
+  prior reports remain queryable and cannot be overwritten. A legitimate change in the exact
+  active/excluded symbol set or immutable partition identity between two different dates MUST NOT
+  reset the window; those identities remain session-local and fully hash-bound.
 - FR-29: After the twentieth valid session, only the capability window may become
   `SHADOW_QUALIFIED`. TickFlow provider admission MUST remain no higher than its prior state,
   `daily_bar_qualified=true`, `adjustment_factor_qualified=false`,
@@ -189,6 +213,8 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   automatically run the next date. An endpoint circuit opens after the frozen failure threshold;
   OPEN slots record `SKIPPED_CIRCUIT_OPEN`. After cooldown, one fixed-five zero-write HALF_OPEN
   probe may close the circuit, but success MUST NOT automatically launch a whole-session request.
+  The production execute path MUST wire this probe to the same credentialless, pinned, bounded
+  one-attempt Daily transport; canonical/evidence/candidate artifacts remain unwritten by the probe.
 - FR-32: The read-only CLI/API status MUST expose profile, window epoch/state, count/required,
   first/last date, last outcome, version-vector hash, observation mode, semantic states and
   eligibility flags. It MUST not expose raw rows, URLs, request parameters, symbols or arbitrary
@@ -288,7 +314,8 @@ unavailable through CLI/API with no file/table/migration creation.
 
 Given sessions 1-10 pass and session 11 fails, gaps, duplicates or changes any version/calendar/
 universe-policy hash, when the terminal transaction runs, then the prior epoch becomes reset and
-the consecutive count returns to zero. All 11 immutable reports remain queryable.
+the consecutive count returns to zero. Normal session-local active-set changes do not reset it. All
+11 immutable reports remain queryable.
 
 ### AC-11: Twentieth session qualifies only Daily Bar (FR-27-FR-29, NFR-10)
 
@@ -315,8 +342,9 @@ Tasks10-13 registry/terminal outputs are unchanged and no symbol-level mixing pa
   only exact legacy or exact complete lineage is accepted.
 - EC-2: The trade-date partition contains two indexes plus stocks -> exclude only exact index rows;
   unknown or duplicate security types reject the projection.
-- EC-3: A canonical stock is marked suspended/non-trading -> hash into exclusions and make no
-  TickFlow request for it; do not infer provider suspension semantics.
+- EC-3: A canonical stock is marked suspended/non-trading, including the exact reviewed `partial`
+  suspended-placeholder form -> hash into exclusions and make no TickFlow request for it; do not
+  infer provider suspension semantics.
 - EC-4: Eligible symbol count is zero or above 4,000 -> unavailable before client construction.
 - EC-5: Provider response echoes a lowercase, aliased or unexpected symbol -> fail closed; do not
   normalize a response key that differs from the exact requested provider symbol.
@@ -402,14 +430,14 @@ when successful, circuit state and literal false canonical/publication/failover 
 | Entity | Required fields and invariants |
 | --- | --- |
 | `DailyCanonicalSnapshot` | date, lineage state, manifest generation/SHA/fingerprint, partition path/SHA/row count/fingerprint, active/excluded counts and hashes, exact active OHLC aggregate hash; frozen and re-verifiable |
-| `DailyShadowContract` | provider/profile, Free origin, adapter/endpoint/schema/SDK/wheel/mapping/candidate/policy/terms hashes, shard/request/byte/time bounds, semantic states; exact reviewed descriptor |
-| `DailyShadowPlan` | job/window/epoch/date, canonical snapshot SHA, universe/mapping hashes, sorted <=100-symbol shards, exact ordinal set, request-plan SHA |
+| `DailyShadowContract` | provider/profile, Free origin, adapter/endpoint/schema/SDK/wheel/mapping/universe-policy/candidate/reconciliation/terms hashes, shard/request/byte/time bounds, semantic states; exact reviewed descriptor |
+| `DailyShadowPlan` | job/window/epoch/date, canonical snapshot/full-universe/active-symbol-set/mapping hashes, sorted <=100-symbol shards, exact ordinal set, request-plan SHA |
 | `ShadowEvidenceManifest` | reused unchanged; capability identity is bound by Daily window/job/request fields; final-success pages only |
-| `DailyBarShadowCandidate` | identities/hashes listed by FR-19, exact counts, semantic states, `quality_verdict=PASS`; no factor/adjusted-return fields |
+| `DailyBarShadowCandidate` | identities/hashes listed by FR-19, per-session universe/mapping plus stable universe-policy hash, exact counts, semantic states, `quality_verdict=PASS`; no factor/adjusted-return fields |
 | `DailyBarReconciliationReport` | exact set/counts, four price-cell comparison counts, max absolute deltas, tolerance `0.01`, verdict and report SHA; no activity/factor metrics |
 | `DailyShadowAttemptAudit` | fixed endpoint/shard ordinal, attempt, request/byte/time counters, allowlisted outcome/failure; zero payload/URL/provider text |
 | `DailyShadowSessionReport` | immutable epoch/job/date/version/calendar/universe/evidence/candidate/reconciliation hashes and terminal outcome |
-| `DailyShadowWindow` | provider/profile/epoch, state, exact version/calendar hashes, first/last/next dates, consecutive/required counts, last report, CAS version |
+| `DailyShadowWindow` | provider/profile/epoch, state, exact stable version/calendar/universe-policy hashes, first/last/next dates, consecutive/required counts, last report, CAS version |
 | `DailyShadowCircuit` | endpoint, CLOSED/OPEN/HALF_OPEN, failure count, cooldown/probe lease, CAS version |
 
 The sidecar schema owns only these capability records and references. It has no foreign key or

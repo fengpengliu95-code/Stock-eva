@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .daily_shadow_canonical import PublishedDailyCanonicalProjection
 from .daily_shadow_models import (
+    DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
     DAILY_SHADOW_PROFILE,
     DailyCanonicalSnapshot,
     DailyShadowFetchResult,
@@ -99,10 +100,8 @@ DAILY_BAR_RECONCILIATION_POLICY = DailyBarReconciliationPolicy()
 _CANDIDATE_POLICY_HASH = DAILY_BAR_RECONCILIATION_POLICY.policy_sha256
 
 
-def daily_version_vector_sha256(
-    snapshot: DailyCanonicalSnapshot, terms_evidence_sha256: str
-) -> str:
-    if type(snapshot) is not DailyCanonicalSnapshot or (
+def daily_version_vector_sha256(terms_evidence_sha256: str) -> str:
+    if (
         not isinstance(terms_evidence_sha256, str)
         or _SHA256.fullmatch(terms_evidence_sha256) is None
     ):
@@ -118,7 +117,7 @@ def daily_version_vector_sha256(
             "unit_state": DAILY_SHADOW_UNIT_STATE_HASH,
             "reconciliation": _CANDIDATE_POLICY_HASH,
             "terms": terms_evidence_sha256,
-            "canonical_mapping": snapshot.symbol_mapping_sha256,
+            "universe_policy": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
         },
     )
 
@@ -242,6 +241,7 @@ class DailyBarShadowCandidate(BaseModel):
     endpoint_contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     mapping_contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     unit_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     reconciliation_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     terms_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -269,6 +269,7 @@ class DailyBarShadowCandidate(BaseModel):
             or self.endpoint_contract_sha256 != DAILY_SHADOW_ENDPOINT_CONTRACT_HASH
             or self.source_schema_sha256 != DAILY_SHADOW_SOURCE_SCHEMA_HASH
             or self.mapping_contract_sha256 != DAILY_SHADOW_MAPPING_HASH
+            or self.universe_policy_sha256 != DAILY_CANONICAL_UNIVERSE_POLICY_SHA256
             or self.unit_state_sha256 != DAILY_SHADOW_UNIT_STATE_HASH
             or self.reconciliation_policy_sha256 != _CANDIDATE_POLICY_HASH
         ):
@@ -753,10 +754,11 @@ def build_daily_candidate(
         endpoint_contract_sha256=DAILY_SHADOW_ENDPOINT_CONTRACT_HASH,
         source_schema_sha256=DAILY_SHADOW_SOURCE_SCHEMA_HASH,
         mapping_contract_sha256=DAILY_SHADOW_MAPPING_HASH,
+        universe_policy_sha256=DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
         unit_state_sha256=DAILY_SHADOW_UNIT_STATE_HASH,
         reconciliation_policy_sha256=_CANDIDATE_POLICY_HASH,
         terms_evidence_sha256=terms_evidence_sha256,
-        version_vector_sha256=daily_version_vector_sha256(snapshot, terms_evidence_sha256),
+        version_vector_sha256=daily_version_vector_sha256(terms_evidence_sha256),
         expected_symbol_count=len(snapshot.rows),
         observed_symbol_count=len(rows),
         source_rows_sha256=domain_sha256("stock-eva/r2f3/free-daily-source-rows/v1", source_values),

@@ -10,6 +10,7 @@ import pytest
 from backend.app.market.daily_shadow_candidates import DailyCandidateStore
 from backend.app.market.daily_shadow_canonical import PublishedDailyCanonicalProjection
 from backend.app.market.daily_shadow_models import (
+    DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
     CanonicalDailyOhlcRow,
     DailyCanonicalLineageState,
     DailyCanonicalReadResult,
@@ -74,9 +75,7 @@ def _snapshot() -> DailyCanonicalSnapshot:
         partition_row_count=2,
         eligible_symbol_count=2,
         excluded_symbol_count=0,
-        canonical_universe_sha256=domain_sha256(
-            "stock-eva/r2f3/daily-canonical-universe/v1", symbols
-        ),
+        canonical_universe_sha256="0" * 64,
         canonical_exclusion_sha256="3" * 64,
         symbol_mapping_sha256=domain_sha256("stock-eva/r2f3/daily-symbol-mapping/v1", mapping),
         ohlc_sha256="4" * 64,
@@ -114,7 +113,7 @@ def _calendar(snapshot: DailyCanonicalSnapshot) -> ConfirmedSessionSnapshot:
         "calendar_sha256": "5" * 64,
         "confirmed_next_sessions": [item.isoformat() for item in dates],
         "universe_id": "daily-canonical-active-universe",
-        "universe_sha256": snapshot.canonical_universe_sha256,
+        "universe_sha256": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
         "captured_at": NOW.isoformat(),
     }
     return ConfirmedSessionSnapshot(
