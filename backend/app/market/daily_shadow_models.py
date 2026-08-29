@@ -81,9 +81,14 @@ def domain_sha256(domain: str, value: Any) -> str:
     return hashlib.sha256(domain.encode("ascii") + b"\n" + canonical_json_bytes(value)).hexdigest()
 
 
+DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES = (
+    "missing_adjust_factor",
+    "suspended_placeholder",
+)
 DAILY_CANONICAL_UNIVERSE_POLICY = {
     "eligible": "active-ready-sh-sz-stock-positive-legal-ohlc",
     "excluded": "index-or-suspended-nontrading-hashed",
+    "suspended_partial_quality_issues": DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES,
     "mapping": "sh-sz-six-digit-reversible-v1",
 }
 DAILY_CANONICAL_UNIVERSE_POLICY_SHA256 = domain_sha256(

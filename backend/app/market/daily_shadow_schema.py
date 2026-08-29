@@ -61,6 +61,7 @@ CREATE TABLE daily_shadow_window (
 CREATE TABLE daily_shadow_job (
  job_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL, session_id TEXT NOT NULL UNIQUE, trade_date TEXT NOT NULL,
  request_plan_sha256 TEXT NOT NULL CHECK(length(request_plan_sha256)=64), canonical_snapshot_sha256 TEXT NOT NULL CHECK(length(canonical_snapshot_sha256)=64),
+ canonical_symbol_set_sha256 TEXT NOT NULL CHECK(length(canonical_symbol_set_sha256)=64),
  run_status TEXT NOT NULL CHECK(run_status IN ('LEASED','COMPLETED','FAILURE','MISMATCH','UNAVAILABLE','SKIPPED')),
  lease_owner TEXT, lease_expires_at TEXT, terminal_attestation_id TEXT, state_version INTEGER NOT NULL CHECK(state_version>=0),
  UNIQUE(epoch_id,trade_date), UNIQUE(job_id,epoch_id,session_id),
@@ -90,7 +91,7 @@ CREATE TABLE daily_shadow_evidence_ref (
 );
 CREATE TABLE daily_shadow_candidate_ref (
  candidate_id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL UNIQUE, epoch_id TEXT NOT NULL, job_id TEXT NOT NULL, session_id TEXT NOT NULL,
- candidate_sha256 TEXT NOT NULL CHECK(length(candidate_sha256)=64), bundle_ref TEXT NOT NULL,
+ candidate_sha256 TEXT NOT NULL CHECK(length(candidate_sha256)=64), canonical_symbol_set_sha256 TEXT NOT NULL CHECK(length(canonical_symbol_set_sha256)=64), bundle_ref TEXT NOT NULL,
  bundle_sha256 TEXT NOT NULL CHECK(length(bundle_sha256)=64), quality_report_sha256 TEXT NOT NULL CHECK(length(quality_report_sha256)=64),
  reconciliation_report_sha256 TEXT NOT NULL CHECK(length(reconciliation_report_sha256)=64),
  UNIQUE(candidate_id,epoch_id,job_id,session_id), UNIQUE(candidate_id,epoch_id,job_id,session_id,candidate_sha256),
@@ -100,7 +101,7 @@ CREATE TABLE daily_shadow_candidate_ref (
 CREATE TABLE daily_shadow_session_report (
  session_report_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL, job_id TEXT NOT NULL, session_id TEXT NOT NULL, trade_date TEXT NOT NULL,
  outcome TEXT NOT NULL CHECK(outcome IN ('SUCCESS','FAILURE','MISMATCH','UNAVAILABLE','SKIPPED_CIRCUIT_OPEN')),
- canonical_snapshot_sha256 TEXT NOT NULL CHECK(length(canonical_snapshot_sha256)=64), request_plan_sha256 TEXT NOT NULL CHECK(length(request_plan_sha256)=64),
+ canonical_snapshot_sha256 TEXT NOT NULL CHECK(length(canonical_snapshot_sha256)=64), canonical_symbol_set_sha256 TEXT NOT NULL CHECK(length(canonical_symbol_set_sha256)=64), request_plan_sha256 TEXT NOT NULL CHECK(length(request_plan_sha256)=64),
  completion_sha256 TEXT, evidence_id TEXT, evidence_sha256 TEXT, candidate_id TEXT, candidate_sha256 TEXT,
  reconciliation_report_sha256 TEXT, terminal_attestation_id TEXT, failure_class TEXT,
  report_json BLOB NOT NULL CHECK(length(report_json)<=1048576), report_sha256 TEXT NOT NULL CHECK(length(report_sha256)=64), created_at TEXT NOT NULL,
@@ -115,6 +116,7 @@ CREATE TABLE daily_shadow_session_report (
 CREATE TABLE daily_shadow_terminal_attestation (
  attestation_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL, job_id TEXT NOT NULL, session_id TEXT NOT NULL,
  session_report_id TEXT NOT NULL UNIQUE, evidence_id TEXT NOT NULL UNIQUE, candidate_id TEXT NOT NULL UNIQUE,
+ canonical_symbol_set_sha256 TEXT NOT NULL CHECK(length(canonical_symbol_set_sha256)=64),
  request_plan_json BLOB NOT NULL CHECK(length(request_plan_json)<=1048576), request_plan_sha256 TEXT NOT NULL CHECK(length(request_plan_sha256)=64),
  completion_json BLOB NOT NULL CHECK(length(completion_json)<=1048576), completion_sha256 TEXT NOT NULL CHECK(length(completion_sha256)=64),
  attempt_closure_json BLOB NOT NULL CHECK(length(attempt_closure_json)<=1048576), attempt_closure_sha256 TEXT NOT NULL CHECK(length(attempt_closure_sha256)=64),
@@ -171,6 +173,8 @@ BEGIN
    AND s.outcome='SUCCESS' AND s.terminal_attestation_id=NEW.attestation_id
    AND e.evidence_id=NEW.evidence_id AND e.evidence_sha256=s.evidence_sha256
    AND c.candidate_id=NEW.candidate_id AND c.candidate_sha256=s.candidate_sha256
+   AND s.canonical_symbol_set_sha256=NEW.canonical_symbol_set_sha256
+   AND c.canonical_symbol_set_sha256=NEW.canonical_symbol_set_sha256
  ) THEN RAISE(ABORT,'daily_terminal_graph_unclosed') END;
 END;
 """

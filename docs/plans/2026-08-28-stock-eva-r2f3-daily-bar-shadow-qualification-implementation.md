@@ -14,9 +14,9 @@ independent exact-commit review pass.
 
 ## Task 7 offline evidence
 
-- R2-F3 focused after review remediation: 108/108 passed.
+- R2-F3 focused after review remediation: 111/111 passed.
 - R2-F2/Task14/prior-shadow compatibility: 357/357 passed.
-- Full repository: 2,131/2,131 passed; LaunchAgent assets: 26/26 passed.
+- Full repository: 2,134/2,134 passed; LaunchAgent assets: 26/26 passed.
 - Full Ruff, format, compileall and diff checks passed; strict design validator: 100/100.
 - All eight frozen R2-F2 fixture hashes matched before/after.
 - Published canonical manifest remains
@@ -27,7 +27,7 @@ independent exact-commit review pass.
 
 ### Task 7 review-remediation delta
 
-The first exact-commit review returned H=3/M=2/L=2. All findings are implemented in
+The first exact-commit review returned H=3/M=2/L=2. Its findings were implemented in
 `2c306271b9affe17d94914c9d314ffc32903732c`:
 
 - accept only the exact legal suspended-placeholder `partial` form and bind exclusions plus
@@ -37,6 +37,14 @@ The first exact-commit review returned H=3/M=2/L=2. All findings are implemented
 - revalidate current-epoch evidence and candidate bundles on CLI/API status reads;
 - wire the production fixed-five HALF_OPEN probe and end its slot after resolution;
 - validate every manifest descriptor and enforce an explicit failure-class allowlist.
+
+The same reviewer then returned H=0/M=2/L=0 on `29e9906dc8334f8dd60e77de240f96575dd10ddb`.
+The remaining identity findings are now remediated offline: the exact per-session active-symbol-set
+hash is carried by the candidate and by the sidecar job/candidate/session/terminal graph, while a
+new reviewed symbol-set binding component changes the descriptor and Terms contract version. The
+canonical universe-policy hash now embeds the exact legal suspended `partial` issue allowlist.
+Targeted RED/GREEN covers the descriptor/schema chain, policy allowlist, terminal mismatch and
+candidate binding. A same-reviewer exact-commit re-review remains required.
 
 The actual latest 20 local canonical dates now read 20/20 ready. No Provider request or canonical
 write was made during that read-only proof. Same-reviewer exact-commit re-review remains required.

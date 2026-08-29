@@ -235,6 +235,7 @@ class DailyBarShadowCandidate(BaseModel):
     canonical_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonical_partition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonical_universe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_symbol_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonical_exclusion_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     symbol_mapping_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -748,6 +749,7 @@ def build_daily_candidate(
         canonical_manifest_sha256=snapshot.manifest_sha256,
         canonical_partition_sha256=snapshot.partition_sha256,
         canonical_universe_sha256=snapshot.canonical_universe_sha256,
+        canonical_symbol_set_sha256=plan.canonical_symbol_set_sha256,
         canonical_exclusion_sha256=snapshot.canonical_exclusion_sha256,
         symbol_mapping_sha256=snapshot.symbol_mapping_sha256,
         adapter_sha256=DAILY_SHADOW_ADAPTER_HASH,

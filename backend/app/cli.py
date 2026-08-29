@@ -923,6 +923,7 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
             "request_plan_sha256": plan.request_plan_sha256,
             "canonical_snapshot_sha256": plan.canonical_snapshot_sha256,
             "canonical_universe_sha256": plan.canonical_universe_sha256,
+            "canonical_symbol_set_sha256": plan.canonical_symbol_set_sha256,
             "symbol_mapping_sha256": plan.symbol_mapping_sha256,
             "descriptor_sha256": control.descriptor_sha256,
             "terms_evidence_sha256": control.terms_evidence_sha256,

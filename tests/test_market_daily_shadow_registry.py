@@ -9,8 +9,14 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from backend.app.config import Settings, TickFlowFreeRuntimeSettings
-from backend.app.market.daily_shadow_models import domain_sha256
+from backend.app.market.daily_shadow_models import (
+    DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES,
+    DAILY_CANONICAL_UNIVERSE_POLICY,
+    domain_sha256,
+)
 from backend.app.market.daily_shadow_registry import (
+    DAILY_SHADOW_DESCRIPTOR_BASE_HASH,
+    DAILY_SHADOW_SYMBOL_SET_BINDING_HASH,
     DAILY_SHADOW_TERMS_CONTRACT_VERSION,
     DailyAttemptAudit,
     DailyCircuitAction,
@@ -97,6 +103,7 @@ def _success(epoch_id: str, trade_date: date, ordinal: int):
         attestation_id=f"daily-attestation-{suffix}",
         trade_date=trade_date,
         canonical_snapshot_sha256=(f"{ordinal % 10}" * 64),
+        canonical_symbol_set_sha256="e" * 64,
         request_plan_sha256="4" * 64,
         completion_sha256="5" * 64,
         evidence_id=f"daily-evidence-{suffix}",
@@ -131,8 +138,43 @@ def _lease(registry, window, trade_date, ordinal):
         trade_date=trade_date,
         request_plan_sha256="4" * 64,
         canonical_snapshot_sha256=f"{ordinal % 10}" * 64,
+        canonical_symbol_set_sha256="e" * 64,
         owner="pytest",
         now=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+
+
+def test_descriptor_terms_and_schema_bind_per_session_canonical_symbol_set(tmp_path):
+    registry, terms, _window = _registry(tmp_path)
+    contract = _contract(terms)
+    assert contract.symbol_set_binding_sha256 == DAILY_SHADOW_SYMBOL_SET_BINDING_HASH
+    assert DAILY_SHADOW_SYMBOL_SET_BINDING_HASH in contract.model_dump_json()
+    assert DAILY_SHADOW_TERMS_CONTRACT_VERSION.endswith(DAILY_SHADOW_DESCRIPTOR_BASE_HASH)
+
+    connection = sqlite3.connect(registry.path)
+    try:
+        for table in (
+            "daily_shadow_job",
+            "daily_shadow_candidate_ref",
+            "daily_shadow_session_report",
+            "daily_shadow_terminal_attestation",
+        ):
+            columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            assert "canonical_symbol_set_sha256" in columns
+    finally:
+        connection.close()
+
+
+def test_universe_policy_hashes_exact_suspended_partial_issue_allowlist():
+    assert DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES == (
+        "missing_adjust_factor",
+        "suspended_placeholder",
+    )
+    assert DAILY_CANONICAL_UNIVERSE_POLICY["suspended_partial_quality_issues"] == (
+        "missing_adjust_factor",
+        "suspended_placeholder",
     )
 
 
@@ -237,6 +279,7 @@ def test_raw_sql_cannot_bypass_terminal_graph_validator(tmp_path):
         connection.execute(
             "INSERT INTO daily_shadow_terminal_attestation SELECT "
             "'forged',epoch_id,job_id,session_id,session_report_id,evidence_id,candidate_id,"
+            "canonical_symbol_set_sha256,"
             "request_plan_json,request_plan_sha256,completion_json,completion_sha256,"
             "attempt_closure_json,attempt_closure_sha256,report_graph_json,report_graph_sha256,"
             "lower(hex(randomblob(32))),1 FROM daily_shadow_terminal_attestation LIMIT 1"
@@ -285,6 +328,19 @@ def test_exact_terminal_retry_is_idempotent(tmp_path):
     assert registry.read().session_report_count == 1
 
 
+def test_terminal_success_rejects_symbol_set_hash_that_differs_from_leased_job(tmp_path):
+    registry, _terms_value, window = _registry(tmp_path)
+    lease = _lease(registry, window, DATES[0], 0)
+    conflicting = _success(window.epoch_id, DATES[0], 0).model_copy(
+        update={"canonical_symbol_set_sha256": "f" * 64}
+    )
+
+    with pytest.raises(DailyShadowRegistryUnavailable, match="identity"):
+        registry.commit_success(conflicting, lease=lease)
+
+    assert registry.read().session_report_count == 0
+
+
 def test_expired_session_lease_cannot_terminalize_and_may_be_reclaimed(tmp_path):
     now = [datetime(2026, 8, 28, tzinfo=UTC)]
     registry, _terms_value, window = _registry(tmp_path, clock=lambda: now[0])
@@ -301,6 +357,7 @@ def test_expired_session_lease_cannot_terminalize_and_may_be_reclaimed(tmp_path)
         trade_date=DATES[0],
         request_plan_sha256="4" * 64,
         canonical_snapshot_sha256="0" * 64,
+        canonical_symbol_set_sha256="e" * 64,
         owner="reclaimer",
         now=now[0],
     )
@@ -395,6 +452,7 @@ def test_gap_duplicate_and_binding_change_reset_without_deleting_history(tmp_pat
         trade_date=DATES[2],
         request_plan_sha256="4" * 64,
         canonical_snapshot_sha256="f" * 64,
+        canonical_symbol_set_sha256="e" * 64,
         owner="pytest",
         now=datetime(2026, 8, 28, tzinfo=UTC),
     )

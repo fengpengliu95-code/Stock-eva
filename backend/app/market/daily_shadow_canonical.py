@@ -18,6 +18,7 @@ import duckdb
 from backend.app.storage.dataset import _R2F2_LINEAGE_FIELDS
 
 from .daily_shadow_models import (
+    DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES,
     CanonicalDailyOhlcRow,
     DailyCanonicalLineageState,
     DailyCanonicalReadResult,
@@ -395,7 +396,7 @@ def _project_rows(
         if (is_trading, is_suspended) == (False, True):
             legal_suspended_quality = (quality_status == "ready" and not issues) or (
                 quality_status == "partial"
-                and set(issues) == {"suspended_placeholder", "missing_adjust_factor"}
+                and tuple(sorted(issues)) == DAILY_CANONICAL_SUSPENDED_PARTIAL_ISSUES
             )
             if not legal_suspended_quality:
                 raise _ReadFailure(DailyCanonicalUnavailableReason.PARTITION_SEMANTICS_INVALID)

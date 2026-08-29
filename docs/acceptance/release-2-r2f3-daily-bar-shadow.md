@@ -84,6 +84,14 @@ A read-only projection of the actual latest 20 local canonical dates (`2026-07-1
 `2026-08-10`) now returns ready for 20/20 dates, with 3,188-3,193 eligible active stocks per date.
 This check made no canonical write and did not contact TickFlow.
 
+The same reviewer then returned H=0/M=2/L=0 on exact clean commit
+`29e9906dc8334f8dd60e77de240f96575dd10ddb`. Both Medium identity gaps are remediated pending an
+exact-commit re-review: `canonical_symbol_set_sha256` now closes candidate -> sidecar job ->
+candidate ref -> session report -> terminal attestation, and the descriptor/Terms version binds
+that per-session closure contract; the stable universe-policy hash now explicitly includes the
+reviewed suspended `partial` issue allowlist. Targeted RED/GREEN also proves a conflicting terminal
+symbol-set hash cannot attach or advance the window. No provider request was made.
+
 ## Offline gate evidence
 
 All commands ran in the isolated R2-F3 worktree and used local fakes/fixtures. Provider I/O was not
@@ -91,9 +99,9 @@ invoked.
 
 | Gate | Result |
 | --- | --- |
-| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `108/108`, exit 0 |
+| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `111/111`, exit 0 |
 | R2-F2, Task14 and prior shadow compatibility | `357/357`, exit 0 |
-| Full repository | `2,131/2,131`, exit 0 |
+| Full repository | `2,134/2,134`, exit 0 |
 | LaunchAgent assets | `26/26`, exit 0 |
 | `ruff check backend tests` | all checks passed |
 | `ruff format --check backend tests` | 195 files already formatted |

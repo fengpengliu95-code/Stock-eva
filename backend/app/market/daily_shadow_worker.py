@@ -414,6 +414,7 @@ class DailyShadowWorker:
                 trade_date=trade_date,
                 request_plan_sha256=plan.request_plan_sha256,
                 canonical_snapshot_sha256=snapshot.snapshot_sha256,
+                canonical_symbol_set_sha256=plan.canonical_symbol_set_sha256,
                 owner=self.owner,
                 now=self.clock(),
             )
@@ -531,6 +532,8 @@ class DailyShadowWorker:
                     or final_canonical.snapshot is None
                     or final_canonical.snapshot.snapshot_sha256 != snapshot.snapshot_sha256
                     or published.candidate.version_vector_sha256 != version_vector
+                    or published.candidate.canonical_symbol_set_sha256
+                    != plan.canonical_symbol_set_sha256
                 ):
                     raise DailyCandidateUnavailable("Daily canonical snapshot changed")
             except DailyCandidateMismatch:
@@ -580,6 +583,9 @@ class DailyShadowWorker:
                         attestation_id=identities["attestation_id"],
                         trade_date=trade_date,
                         canonical_snapshot_sha256=snapshot.snapshot_sha256,
+                        canonical_symbol_set_sha256=(
+                            published.candidate.canonical_symbol_set_sha256
+                        ),
                         request_plan_sha256=plan.request_plan_sha256,
                         completion_sha256=evidence.completion_sha256,
                         evidence_id=evidence.evidence_id,

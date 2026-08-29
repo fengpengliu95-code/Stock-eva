@@ -251,6 +251,7 @@ def test_candidate_binds_exact_evidence_canonical_hashes_and_semantic_states(tmp
     assert candidate.observed_symbol_count == 2
     assert candidate.evidence_sha256 == bundle.manifest_sha256
     assert candidate.canonical_snapshot_sha256 == snapshot.snapshot_sha256
+    assert candidate.canonical_symbol_set_sha256 == plan.canonical_symbol_set_sha256
     assert candidate.units_state == "UNKNOWN"
     assert candidate.suspension_semantics_state == "UNKNOWN"
     assert candidate.factor_evidence_state == "UNQUALIFIED"

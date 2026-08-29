@@ -10,6 +10,7 @@ from pathlib import Path
 from backend.app.market.daily_shadow_candidates import DailyCandidateStore
 from backend.app.market.daily_shadow_canonical import PublishedDailyCanonicalProjection
 from backend.app.market.daily_shadow_models import (
+    DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
     CanonicalDailyOhlcRow,
     DailyCanonicalLineageState,
     DailyCanonicalReadResult,
@@ -34,14 +35,7 @@ START = date(2026, 7, 14)
 NOW = datetime(2026, 8, 28, tzinfo=UTC)
 SYMBOLS = ("sh.600000", "sz.000001")
 EXTRA_SYMBOL = "sh.600001"
-UNIVERSE_POLICY_SHA256 = domain_sha256(
-    "stock-eva/r2f3/daily-canonical-universe-policy/v1",
-    {
-        "eligible": "active-ready-sh-sz-stock-positive-legal-ohlc",
-        "excluded": "index-or-suspended-nontrading-hashed",
-        "mapping": "sh-sz-six-digit-reversible-v1",
-    },
-)
+UNIVERSE_POLICY_SHA256 = DAILY_CANONICAL_UNIVERSE_POLICY_SHA256
 
 
 class _Reader:

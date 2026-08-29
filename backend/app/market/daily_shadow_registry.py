@@ -100,6 +100,20 @@ DAILY_SHADOW_JOB_LEASE_POLICY_HASH = _contract_component_hash(
 DAILY_SHADOW_CANDIDATE_CONTRACT_HASH = _contract_component_hash(
     "candidate", "final-success-source-evidence-daily-ohlc-only"
 )
+DAILY_SHADOW_SYMBOL_SET_BINDING_HASH = _contract_component_hash(
+    "symbol-set-binding",
+    {
+        "identity": "per-session-canonical-active-symbol-set-sha256",
+        "domain": "stock-eva/r2f3/daily-canonical-universe/v1",
+        "closed_by": (
+            "request_plan",
+            "candidate",
+            "sidecar_job",
+            "session_report",
+            "terminal_attestation",
+        ),
+    },
+)
 DAILY_SHADOW_RETENTION_HASH = _contract_component_hash("retention", _RETENTION)
 DAILY_SHADOW_DESCRIPTOR_BASE_HASH = _contract_component_hash(
     "descriptor",
@@ -113,6 +127,7 @@ DAILY_SHADOW_DESCRIPTOR_BASE_HASH = _contract_component_hash(
         "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
         "mapping": DAILY_SHADOW_MAPPING_HASH,
         "universe_policy": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
+        "symbol_set_binding": DAILY_SHADOW_SYMBOL_SET_BINDING_HASH,
         "candidate": DAILY_SHADOW_CANDIDATE_CONTRACT_HASH,
         "reconciliation": DAILY_BAR_RECONCILIATION_POLICY.policy_sha256,
         "retention": DAILY_SHADOW_RETENTION_HASH,
@@ -152,6 +167,7 @@ class DailyShadowContract(_Frozen):
     sdk_wheel_sha256: str = TICKFLOW_FREE_SDK_WHEEL_SHA256
     mapping_contract_sha256: str = DAILY_SHADOW_MAPPING_HASH
     universe_policy_sha256: str = DAILY_CANONICAL_UNIVERSE_POLICY_SHA256
+    symbol_set_binding_sha256: str = DAILY_SHADOW_SYMBOL_SET_BINDING_HASH
     candidate_contract_sha256: str = DAILY_SHADOW_CANDIDATE_CONTRACT_HASH
     reconciliation_policy_sha256: str = DAILY_BAR_RECONCILIATION_POLICY.policy_sha256
     unit_state_sha256: str = DAILY_SHADOW_UNIT_STATE_HASH
@@ -179,6 +195,7 @@ class DailyShadowContract(_Frozen):
             "sdk_wheel_sha256": TICKFLOW_FREE_SDK_WHEEL_SHA256,
             "mapping_contract_sha256": DAILY_SHADOW_MAPPING_HASH,
             "universe_policy_sha256": DAILY_CANONICAL_UNIVERSE_POLICY_SHA256,
+            "symbol_set_binding_sha256": DAILY_SHADOW_SYMBOL_SET_BINDING_HASH,
             "candidate_contract_sha256": DAILY_SHADOW_CANDIDATE_CONTRACT_HASH,
             "reconciliation_policy_sha256": DAILY_BAR_RECONCILIATION_POLICY.policy_sha256,
             "unit_state_sha256": DAILY_SHADOW_UNIT_STATE_HASH,
@@ -265,6 +282,7 @@ class DailySessionSuccess(_Frozen):
     attestation_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     trade_date: date
     canonical_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_symbol_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     request_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     completion_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     evidence_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -608,6 +626,7 @@ def _validate_session_report(row: sqlite3.Row) -> None:
             "session_id": row["session_id"],
             "trade_date": row["trade_date"],
             "canonical_snapshot_sha256": row["canonical_snapshot_sha256"],
+            "canonical_symbol_set_sha256": row["canonical_symbol_set_sha256"],
             "request_plan_sha256": row["request_plan_sha256"],
             "completion_sha256": row["completion_sha256"],
             "terminal_attestation_id": row["terminal_attestation_id"],
@@ -620,6 +639,7 @@ def _validate_session_report(row: sqlite3.Row) -> None:
             "job_id": row["job_id"],
             "session_id": row["session_id"],
             "trade_date": row["trade_date"],
+            "canonical_symbol_set_sha256": row["canonical_symbol_set_sha256"],
             "outcome": row["outcome"],
             "failure_class": row["failure_class"],
         }
@@ -678,6 +698,15 @@ def _validate_terminal_attestation(connection: sqlite3.Connection, row: sqlite3.
         or evidence["evidence_id"] != candidate["evidence_id"]
         or report["trade_date"] != job["trade_date"]
         or report["canonical_snapshot_sha256"] != job["canonical_snapshot_sha256"]
+        or len(
+            {
+                row["canonical_symbol_set_sha256"],
+                report["canonical_symbol_set_sha256"],
+                job["canonical_symbol_set_sha256"],
+                candidate["canonical_symbol_set_sha256"],
+            }
+        )
+        != 1
         or report["request_plan_sha256"] != job["request_plan_sha256"]
         or report["completion_sha256"] != evidence["completion_sha256"]
         or report["evidence_sha256"] != evidence["evidence_sha256"]
@@ -690,6 +719,7 @@ def _validate_terminal_attestation(connection: sqlite3.Connection, row: sqlite3.
             "job_id": job["job_id"],
             "trade_date": job["trade_date"],
             "request_plan_sha256": job["request_plan_sha256"],
+            "canonical_symbol_set_sha256": job["canonical_symbol_set_sha256"],
         }
     )
     completion_json = schema_json_bytes(
@@ -708,6 +738,7 @@ def _validate_terminal_attestation(connection: sqlite3.Connection, row: sqlite3.
             "evidence_sha256": report["evidence_sha256"],
             "candidate_id": report["candidate_id"],
             "candidate_sha256": report["candidate_sha256"],
+            "canonical_symbol_set_sha256": report["canonical_symbol_set_sha256"],
             "reconciliation_report_sha256": report["reconciliation_report_sha256"],
         }
     )
@@ -861,6 +892,7 @@ def _validate_control_graph(connection: sqlite3.Connection) -> None:
             or (report["epoch_id"], report["session_id"], report["trade_date"])
             != (job["epoch_id"], job["session_id"], job["trade_date"])
             or report["canonical_snapshot_sha256"] != job["canonical_snapshot_sha256"]
+            or report["canonical_symbol_set_sha256"] != job["canonical_symbol_set_sha256"]
             or report["request_plan_sha256"] != job["request_plan_sha256"]
             or job["run_status"] != terminal_status[report["outcome"]]
             or tuple(item["ordinal"] for item in job_attempts) != tuple(range(len(job_attempts)))
@@ -1062,6 +1094,8 @@ class DailyShadowRegistryReader:
                 or evidence.manifest_sha256 != ref["evidence_sha256"]
                 or evidence.manifest_sha256 != ref["evidence_bundle_sha256"]
                 or candidate.candidate.candidate_sha256 != ref["candidate_sha256"]
+                or candidate.candidate.canonical_symbol_set_sha256
+                != ref["canonical_symbol_set_sha256"]
                 or candidate.bundle_sha256 != ref["candidate_bundle_sha256"]
                 or candidate.quality.report_sha256 != ref["quality_report_sha256"]
                 or candidate.reconciliation.report_sha256 != ref["reconciliation_report_sha256"]
@@ -1193,6 +1227,7 @@ class DailyShadowRegistryReader:
                         "e.bundle_ref AS evidence_bundle_ref,"
                         "e.bundle_sha256 AS evidence_bundle_sha256,"
                         "c.candidate_id,c.candidate_sha256,"
+                        "c.canonical_symbol_set_sha256,"
                         "c.bundle_ref AS candidate_bundle_ref,"
                         "c.bundle_sha256 AS candidate_bundle_sha256,"
                         "c.quality_report_sha256,c.reconciliation_report_sha256 "
@@ -1688,6 +1723,7 @@ class DailyShadowRegistry:
         trade_date: date,
         request_plan_sha256: str,
         canonical_snapshot_sha256: str,
+        canonical_symbol_set_sha256: str,
         owner: str,
         now: datetime | None = None,
     ) -> DailySessionLease:
@@ -1695,6 +1731,7 @@ class DailyShadowRegistry:
             _safe_id(value)
         _safe_sha(request_plan_sha256)
         _safe_sha(canonical_snapshot_sha256)
+        _safe_sha(canonical_symbol_set_sha256)
         observed_at = now or self._clock()
         if observed_at.utcoffset() is None:
             raise DailyShadowRegistryUnavailable("daily shadow lease time unavailable")
@@ -1713,6 +1750,7 @@ class DailyShadowRegistry:
                     and existing["trade_date"] == trade_date.isoformat()
                     and existing["request_plan_sha256"] == request_plan_sha256
                     and existing["canonical_snapshot_sha256"] == canonical_snapshot_sha256
+                    and existing["canonical_symbol_set_sha256"] == canonical_symbol_set_sha256
                 )
                 if not same:
                     state_version = 0
@@ -1778,7 +1816,7 @@ class DailyShadowRegistry:
                 state_version = existing["state_version"] + 1
             else:
                 connection.execute(
-                    "INSERT INTO daily_shadow_job VALUES (?,?,?,?,?,?,'LEASED',?,?,NULL,0)",
+                    "INSERT INTO daily_shadow_job VALUES (?,?,?,?,?,?,?,'LEASED',?,?,NULL,0)",
                     (
                         job_id,
                         epoch_id,
@@ -1786,6 +1824,7 @@ class DailyShadowRegistry:
                         trade_date.isoformat(),
                         request_plan_sha256,
                         canonical_snapshot_sha256,
+                        canonical_symbol_set_sha256,
                         owner,
                         expires.isoformat(),
                     ),
@@ -1913,6 +1952,8 @@ class DailyShadowRegistry:
                     and existing["session_id"] == success.session_id
                     and existing["trade_date"] == success.trade_date.isoformat()
                     and existing["canonical_snapshot_sha256"] == success.canonical_snapshot_sha256
+                    and existing["canonical_symbol_set_sha256"]
+                    == success.canonical_symbol_set_sha256
                     and existing["request_plan_sha256"] == success.request_plan_sha256
                     and existing["completion_sha256"] == success.completion_sha256
                     and existing["evidence_id"] == success.evidence_id
@@ -1928,6 +1969,8 @@ class DailyShadowRegistry:
                     and candidate is not None
                     and candidate["bundle_ref"] == success.candidate_bundle_ref
                     and candidate["bundle_sha256"] == success.candidate_bundle_sha256
+                    and candidate["canonical_symbol_set_sha256"]
+                    == success.canonical_symbol_set_sha256
                     and candidate["quality_report_sha256"] == success.quality_report_sha256
                     and tuple(row["audit_sha256"] for row in audits)
                     == tuple(item.audit_sha256 for item in success.attempts)
@@ -1959,6 +2002,7 @@ class DailyShadowRegistry:
                 or window["next_trade_date"] != success.trade_date.isoformat()
                 or job["request_plan_sha256"] != success.request_plan_sha256
                 or job["canonical_snapshot_sha256"] != success.canonical_snapshot_sha256
+                or job["canonical_symbol_set_sha256"] != success.canonical_symbol_set_sha256
             ):
                 raise DailyShadowRegistryUnavailable("daily terminal graph identity mismatch")
             self._insert_audits(
@@ -1984,7 +2028,7 @@ class DailyShadowRegistry:
             if simulate_crash_at == "after_evidence":
                 raise RuntimeError("daily shadow simulated crash")
             connection.execute(
-                "INSERT INTO daily_shadow_candidate_ref VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO daily_shadow_candidate_ref VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     success.candidate_id,
                     success.evidence_id,
@@ -1992,6 +2036,7 @@ class DailyShadowRegistry:
                     success.job_id,
                     success.session_id,
                     success.candidate_sha256,
+                    success.canonical_symbol_set_sha256,
                     success.candidate_bundle_ref,
                     success.candidate_bundle_sha256,
                     success.quality_report_sha256,
@@ -2005,6 +2050,7 @@ class DailyShadowRegistry:
                     "job_id": success.job_id,
                     "trade_date": success.trade_date.isoformat(),
                     "request_plan_sha256": success.request_plan_sha256,
+                    "canonical_symbol_set_sha256": success.canonical_symbol_set_sha256,
                 }
             )
             completion_json = schema_json_bytes(
@@ -2025,6 +2071,7 @@ class DailyShadowRegistry:
                 "evidence_sha256": success.evidence_sha256,
                 "candidate_id": success.candidate_id,
                 "candidate_sha256": success.candidate_sha256,
+                "canonical_symbol_set_sha256": success.canonical_symbol_set_sha256,
                 "reconciliation_report_sha256": success.reconciliation_report_sha256,
             }
             report_graph_json = schema_json_bytes(report_graph_values)
@@ -2044,6 +2091,7 @@ class DailyShadowRegistry:
                 "session_id": success.session_id,
                 "trade_date": success.trade_date.isoformat(),
                 "canonical_snapshot_sha256": success.canonical_snapshot_sha256,
+                "canonical_symbol_set_sha256": success.canonical_symbol_set_sha256,
                 "request_plan_sha256": success.request_plan_sha256,
                 "completion_sha256": success.completion_sha256,
                 "terminal_attestation_id": success.attestation_id,
@@ -2053,7 +2101,7 @@ class DailyShadowRegistry:
             report_sha = sha256_bytes(report_json)
             connection.execute(
                 "INSERT INTO daily_shadow_session_report VALUES "
-                "(?,?,?,?,?,'SUCCESS',?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
+                "(?,?,?,?,?,'SUCCESS',?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
                 (
                     success.session_report_id,
                     success.epoch_id,
@@ -2061,6 +2109,7 @@ class DailyShadowRegistry:
                     success.session_id,
                     success.trade_date.isoformat(),
                     success.canonical_snapshot_sha256,
+                    success.canonical_symbol_set_sha256,
                     success.request_plan_sha256,
                     success.completion_sha256,
                     success.evidence_id,
@@ -2081,7 +2130,7 @@ class DailyShadowRegistry:
             )
             connection.execute(
                 "INSERT INTO daily_shadow_terminal_attestation VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                 (
                     success.attestation_id,
                     success.epoch_id,
@@ -2090,6 +2139,7 @@ class DailyShadowRegistry:
                     success.session_report_id,
                     success.evidence_id,
                     success.candidate_id,
+                    success.canonical_symbol_set_sha256,
                     request_plan_json,
                     graph_hashes[0],
                     completion_json,
@@ -2193,13 +2243,14 @@ class DailyShadowRegistry:
                 "job_id": failure.job_id,
                 "session_id": failure.session_id,
                 "trade_date": failure.trade_date.isoformat(),
+                "canonical_symbol_set_sha256": job["canonical_symbol_set_sha256"],
                 "outcome": failure.outcome,
                 "failure_class": failure.failure_class,
             }
             report_json = schema_json_bytes(report_values)
             connection.execute(
                 "INSERT INTO daily_shadow_session_report VALUES "
-                "(?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?,?,?)",
+                "(?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?,?,?)",
                 (
                     failure.session_report_id,
                     failure.epoch_id,
@@ -2208,6 +2259,7 @@ class DailyShadowRegistry:
                     failure.trade_date.isoformat(),
                     failure.outcome,
                     job["canonical_snapshot_sha256"],
+                    job["canonical_symbol_set_sha256"],
                     job["request_plan_sha256"],
                     failure.failure_class,
                     report_json,

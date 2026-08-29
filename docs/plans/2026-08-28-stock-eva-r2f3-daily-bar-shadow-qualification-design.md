@@ -44,6 +44,9 @@ specification had modeled incorrectly. Canonical suspended placeholders legitima
 The amended contract therefore hashes every session's full canonical identity separately while the
 20-session version vector binds the stable eligibility/mapping policy. Daily listing/suspension
 changes cannot be mistaken for a contract change or make the qualification window unreachable.
+The stable policy hash explicitly includes the only reviewed legal suspended `partial` issue set,
+`missing_adjust_factor` plus `suspended_placeholder`; changing that allowlist changes the policy,
+descriptor/Terms contract version and version vector.
 
 ### Decision
 
@@ -153,16 +156,17 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   header, token, provider text or offending symbol.
 - FR-17: A new capability-specific review descriptor and TermsEvidence MUST bind the exact Free
   adapter, endpoint/source schema, SDK/wheel, symbol mapping, canonical universe policy, candidate,
-  reconciliation policy, retention decision and request-budget hashes. Task14 V1/V2 discovery descriptors cannot
-  authorize this wider whole-session plan.
+  per-session active-symbol-set binding contract, reconciliation policy, retention decision and
+  request-budget hashes. Task14 V1/V2 discovery descriptors cannot authorize this wider whole-
+  session plan.
 - FR-18: The user-selected retention policy is final-success source evidence only. The capability
   record MUST still report provider raw-retention semantics as `UNKNOWN`; this state cannot be
   converted into a general redistribution or long-term retention claim.
 - FR-19: `DailyBarShadowCandidate` MUST bind provider/profile, trade date, evidence/completion and
   request-plan hashes, canonical snapshot/manifest/partition/universe/exclusion hashes, exact
-  per-session mapping, stable universe-policy and adapter/schema/policy/terms hashes, exact
-  expected/observed counts, source-row aggregate hash, normalized OHLC aggregate hash and all
-  semantic-state literals.
+  per-session active-symbol-set and mapping hashes, stable universe-policy and
+  adapter/schema/policy/terms hashes, exact expected/observed counts, source-row aggregate hash,
+  normalized OHLC aggregate hash and all semantic-state literals.
 - FR-20: Daily candidate self-quality MUST require exact expected/observed symbol equality,
   exact-one-row coverage, date match, finite positive prices, legal OHLC ordering, no duplicate,
   no extra symbol and unchanged canonical snapshot before and after evidence collection. A failed
@@ -183,7 +187,9 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   never be written.
 - FR-25: The sidecar DB MUST use frozen versioned DDL, `journal_mode=DELETE`,
   `synchronous=FULL`, `foreign_keys=ON`, a private lock, compare-and-swap state versions,
-  append-only attempt/session/attestation rows and immutable exact-hash foreign-key closure.
+  append-only attempt/session/attestation rows and immutable exact-hash foreign-key closure. Every
+  successful job, candidate reference, session report and terminal attestation MUST carry the same
+  per-session `canonical_symbol_set_sha256`; mismatch is unavailable and cannot advance the window.
 - FR-26: The read path MUST take a shared lock, copy bounded descriptor-validated bytes into
   memory and open SQLite query-only. Missing DB/table, lock contention, corrupt schema, unknown
   migration or any unreadable evidence/candidate bundle referenced by the current epoch MUST return
@@ -430,13 +436,13 @@ when successful, circuit state and literal false canonical/publication/failover 
 | Entity | Required fields and invariants |
 | --- | --- |
 | `DailyCanonicalSnapshot` | date, lineage state, manifest generation/SHA/fingerprint, partition path/SHA/row count/fingerprint, active/excluded counts and hashes, exact active OHLC aggregate hash; frozen and re-verifiable |
-| `DailyShadowContract` | provider/profile, Free origin, adapter/endpoint/schema/SDK/wheel/mapping/universe-policy/candidate/reconciliation/terms hashes, shard/request/byte/time bounds, semantic states; exact reviewed descriptor |
+| `DailyShadowContract` | provider/profile, Free origin, adapter/endpoint/schema/SDK/wheel/mapping/universe-policy/per-session-symbol-set-binding/candidate/reconciliation/terms hashes, shard/request/byte/time bounds, semantic states; exact reviewed descriptor |
 | `DailyShadowPlan` | job/window/epoch/date, canonical snapshot/full-universe/active-symbol-set/mapping hashes, sorted <=100-symbol shards, exact ordinal set, request-plan SHA |
 | `ShadowEvidenceManifest` | reused unchanged; capability identity is bound by Daily window/job/request fields; final-success pages only |
 | `DailyBarShadowCandidate` | identities/hashes listed by FR-19, per-session universe/mapping plus stable universe-policy hash, exact counts, semantic states, `quality_verdict=PASS`; no factor/adjusted-return fields |
 | `DailyBarReconciliationReport` | exact set/counts, four price-cell comparison counts, max absolute deltas, tolerance `0.01`, verdict and report SHA; no activity/factor metrics |
 | `DailyShadowAttemptAudit` | fixed endpoint/shard ordinal, attempt, request/byte/time counters, allowlisted outcome/failure; zero payload/URL/provider text |
-| `DailyShadowSessionReport` | immutable epoch/job/date/version/calendar/universe/evidence/candidate/reconciliation hashes and terminal outcome |
+| `DailyShadowSessionReport` | immutable epoch/job/date/version/calendar/universe/active-symbol-set/evidence/candidate/reconciliation hashes and terminal outcome |
 | `DailyShadowWindow` | provider/profile/epoch, state, exact stable version/calendar/universe-policy hashes, first/last/next dates, consecutive/required counts, last report, CAS version |
 | `DailyShadowCircuit` | endpoint, CLOSED/OPEN/HALF_OPEN, failure count, cooldown/probe lease, CAS version |
 
