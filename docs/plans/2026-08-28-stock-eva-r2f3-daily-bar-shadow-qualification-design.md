@@ -127,7 +127,10 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   consecutive shards of at most 100 symbols, and create exactly one `historical_daily_1d` logical
   request per shard. The plan MUST bind both the complete per-session canonical-universe identity
   and a separate exact active-symbol-set hash. Shard order, membership, date, `period=1d`, exact
-  UTC-day bounds, `adjust=none`, schema hash and unit-state hash MUST be immutable and hash-bound.
+  Asia/Shanghai trade-date bounds expressed as UTC epoch milliseconds, `adjust=none`, schema hash
+  and unit-state hash MUST be immutable and hash-bound. A response timestamp is valid only when its
+  Asia/Shanghai calendar date equals the requested trade date; a UTC natural-day match is
+  insufficient.
 - FR-10: Each execution MUST process exactly one trade-date session. It MUST perform at most 40
   provider requests, one attempt per shard, sequentially, with no SDK batch concurrency, hidden
   retry, sleep, pagination fallback, authenticated endpoint, realtime quote, minute K-line,
@@ -354,8 +357,9 @@ Tasks10-13 registry/terminal outputs are unchanged and no symbol-level mixing pa
 - EC-4: Eligible symbol count is zero or above 4,000 -> unavailable before client construction.
 - EC-5: Provider response echoes a lowercase, aliased or unexpected symbol -> fail closed; do not
   normalize a response key that differs from the exact requested provider symbol.
-- EC-6: One shard returns two timestamps, zero rows or one wrong UTC-day timestamp -> whole session
-  invalid; never choose a convenient row.
+- EC-6: One shard returns two timestamps, zero rows or one timestamp outside the requested
+  Asia/Shanghai trade date -> whole session invalid; never choose a convenient row or accept the
+  next local session merely because its timestamp remains inside the requested UTC natural day.
 - EC-7: HTTP client or SDK initializer closes incorrectly -> execution unavailable and no evidence.
 - EC-8: A 429 or transport failure opens the capability endpoint circuit at its frozen threshold;
   later scheduled slots skip until cooldown without repeatedly requesting the whole universe.

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -205,6 +206,31 @@ def test_wrong_timestamp_cannot_become_daily_evidence():
     snapshot = _snapshot()
     plan, fetch = _fetch(snapshot)
     wrong_row = fetch.rows[0].model_copy(update={"timestamp": 0})
+    wrong_fetch = fetch.model_copy(update={"rows": (wrong_row, fetch.rows[1])})
+
+    with pytest.raises(DailyCandidateUnavailable, match="final success"):
+        build_daily_evidence_inputs(
+            plan,
+            wrong_fetch,
+            job_id="daily-job-20260810",
+            window_id="tickflow-free-daily-window-v1",
+            session_id="daily-session-20260810",
+            evidence_id="daily-evidence-20260810",
+        )
+
+
+def test_next_shanghai_trade_date_timestamp_cannot_become_daily_evidence():
+    snapshot = _snapshot()
+    plan, fetch = _fetch(snapshot)
+    timestamp = int(
+        datetime.combine(
+            TRADE_DATE + timedelta(days=1),
+            time.min,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        ).timestamp()
+        * 1000
+    )
+    wrong_row = fetch.rows[0].model_copy(update={"timestamp": timestamp})
     wrong_fetch = fetch.model_copy(update={"rows": (wrong_row, fetch.rows[1])})
 
     with pytest.raises(DailyCandidateUnavailable, match="final success"):

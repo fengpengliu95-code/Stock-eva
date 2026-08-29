@@ -621,7 +621,8 @@ def test_production_scheduler_run_once_uses_one_canonical_root_end_to_end(tmp_pa
                 json.dumps(changed_payload, sort_keys=True, separators=(",", ":")) + "\n"
             ).encode()
         else:
-            changed = b"0" + original[1:]
+            changed = (b"1" if original[:1] != b"1" else b"0") + original[1:]
+        assert changed != original
         with (pending_dir / name).open("wb") as handle:
             handle.write(changed)
             handle.flush()

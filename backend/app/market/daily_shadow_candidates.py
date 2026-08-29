@@ -7,10 +7,11 @@ import os
 import re
 import secrets
 import stat
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -53,6 +54,7 @@ from .shadow_evidence import (
 
 _PRICE_TOLERANCE = Decimal("0.01")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class DailyCandidateUnavailable(RuntimeError):
@@ -326,7 +328,7 @@ def _daily_shard_identity(shard: Any) -> str:
 
 
 def _timestamp_matches_trade_date(timestamp: int, trade_date: date) -> bool:
-    start = datetime.combine(trade_date, time.min, tzinfo=UTC)
+    start = datetime.combine(trade_date, time.min, tzinfo=_SHANGHAI)
     end = start + timedelta(days=1)
     return int(start.timestamp() * 1000) <= timestamp < int(end.timestamp() * 1000)
 

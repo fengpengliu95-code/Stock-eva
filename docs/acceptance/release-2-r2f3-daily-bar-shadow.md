@@ -2,20 +2,24 @@
 
 ## Current decision
 
-`OFFLINE REMEDIATION GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+`FIRST REAL SESSION FAILED CLOSED / DATE-SEMANTICS REMEDIATION PENDING RE-REVIEW / DAILY BAR SHADOW NO-GO`
 
-The implementation through code commit
-`2c306271b9affe17d94914c9d314ffc32903732c` passes the prescribed offline gate.
-The first independent review of `303f40ad6178d6f48ee5b37676c3ce4644d0971f` returned
-`NO-GO` with H=3, M=2 and L=2. All seven findings have been remediated with witnessed RED/GREEN
-evidence, but the same reviewer has not yet reviewed the new exact commit containing this record.
-This document therefore does not claim code GO, a real
-provider session, a 20-session qualification window, provider admission, publication eligibility,
-automatic failover, adjustment-factor qualification, known units or known suspension semantics.
+The same independent reviewer returned H=0/M=0/L=0 for exact clean code commit
+`a6716367a99fb7f35c4aff7f0e59753b9d38783b`. A capability-specific TermsEvidence/calendar was then
+installed in a new isolated runtime, its default plan proved zero-request/zero-write, and one
+explicit 2026-07-14 Free Daily session made 32 sequential one-attempt requests. The provider
+returned the exact 3,190-symbol set, but the session failed closed as `MISMATCH`, attached no
+candidate, advanced no qualification count and reset the epoch.
 
-No real TickFlow or other provider request was made by Tasks 1-7. The next operational gate remains
-closed until one independent reviewer returns H=0/M=0 for the exact clean commit containing this
-record.
+Read-only triage proved this was a local date-semantics defect rather than transient provider
+availability: the adapter requested and validated a UTC natural day, while the returned timestamp
+`2026-07-14T16:00:00Z` is `2026-07-15 00:00` in Asia/Shanghai. All 12,760 returned OHLC cells match
+the canonical 2026-07-15 values exactly; only 605/12,760 were within tolerance against the requested
+2026-07-14 partition. The remediation changes both request bounds and two independent response/
+evidence gates to Asia/Shanghai trade-date semantics and rotates the adapter, endpoint,
+source-schema, descriptor and TermsEvidence hashes. It does not change timeout, retry, tolerance,
+canonical data, publication or failover. The repaired exact commit requires the same independent
+reviewer before any second real session.
 
 ## Delivered capability
 
@@ -54,6 +58,8 @@ ee2bc32 add bounded credentialless Free Daily adapter
 421c42b assemble one-session worker and offline E2E
 3b0c5fb expose zero-write plan, controlled execute and read-only status
 2c30627 remediate exact-commit review and real-canonical blockers
+0746623 close the per-session canonical symbol-set identity chain
+a671636 bind the leased job hash in the terminal SQL trigger
 ```
 
 The initial REDs were witnessed before each production slice. They included missing Daily modules,
@@ -96,7 +102,43 @@ The next exact-commit pass found one final Medium SQL-boundary gap: the terminal
 joined the session and candidate hashes but not the leased job hash. A raw-SQL RED proved that a
 job-only hash mutation passed that trigger; GREEN adds the exact job identity join and
 `job.canonical_symbol_set_sha256 = NEW.canonical_symbol_set_sha256`. The focused trigger/registry
-set passes, and the same reviewer must confirm the new exact commit before any real request.
+set passed, and the same reviewer returned H=0/M=0/L=0 on exact clean commit
+`a6716367a99fb7f35c4aff7f0e59753b9d38783b` before any real request.
+
+## First controlled real session and remediation
+
+The isolated runtime is
+`~/Library/Application Support/Stock EVA/r2f3-daily-shadow-20260829`; it does not overlap the
+canonical dataset, production control databases or the Task14 discovery runtime. The initial plan
+reported 3,190 expected symbols, 32 shards, `provider_requests=0`, `writes=false`; the sidecar DB,
+lock and empty shadow tree were byte-identical before/after plan.
+
+The one authorized execution then reported:
+
+```text
+trade_date=2026-07-14
+provider_requests=32
+expected_symbols=3190
+observed_symbols=3190
+outcome=MISMATCH
+failure_class=reconciliation_mismatch
+candidate_id=null
+consecutive_sessions=0
+window_state=RESET
+circuit_state=CLOSED
+```
+
+The 32 final successful source pages remain immutable evidence under the user-selected
+final-success-only policy; there are no failed-attempt payloads and no candidate bundle. Strict
+readback reports one RESET epoch and one MISMATCH session. The canonical manifest, the referenced
+2026-07-14 partition and the existing Task14 provider registry remained byte-identical. No retry or
+next-date invocation occurred.
+
+Offline RED reproduced the flaw at all three boundaries: request start was eight hours late, local
+midnight for the requested date was rejected, and local midnight for the next date was accepted by
+both provider parsing and evidence assembly. The four targeted tests failed 4/4 before production
+changes and pass 4/4 after the minimal timezone fix; the provider/candidate focused files pass
+35/35. Full gates and same-reviewer re-review remain pending for the repaired commit.
 
 ## Offline gate evidence
 
@@ -105,9 +147,9 @@ invoked.
 
 | Gate | Result |
 | --- | --- |
-| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `112/112`, exit 0 |
+| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `116/116`, exit 0 |
 | R2-F2, Task14 and prior shadow compatibility | `357/357`, exit 0 |
-| Full repository | `2,135/2,135`, exit 0 |
+| Full repository | `2,139/2,139`, exit 0 |
 | LaunchAgent assets | `26/26`, exit 0 |
 | `ruff check backend tests` | all checks passed |
 | `ruff format --check backend tests` | 195 files already formatted |
@@ -182,9 +224,10 @@ observation is relabeled to a new date, and no provider row is silently mixed at
 
 ## Remaining gates
 
-- [ ] Same-reviewer exact-commit independent read-only re-review returns H=0/M=0.
-- [ ] Capability-specific reviewed TermsEvidence and calendar root are installed in an isolated
-  local runtime.
+- [ ] Same-reviewer exact-commit independent read-only re-review returns H=0/M=0 for the
+  Asia/Shanghai remediation and rotated contract hashes.
+- [ ] New capability-specific reviewed TermsEvidence is installed in a fresh isolated runtime for
+  the rotated descriptor; the failed epoch's old TermsEvidence/sidecar is not reused.
 - [ ] One bounded real historical Daily session completes and is read back without canonical or
   provider-registry mutation.
 - [ ] Twenty same-vector consecutive confirmed sessions complete with zero reset in the qualifying

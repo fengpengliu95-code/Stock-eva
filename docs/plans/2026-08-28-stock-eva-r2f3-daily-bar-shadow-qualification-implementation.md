@@ -1,6 +1,6 @@
 # Stock EVA R2-F3 TickFlow Free Daily Bar Shadow Qualification Implementation Plan
 
-**Status:** `OFFLINE REMEDIATION GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+**Status:** `FIRST REAL SESSION FAILED CLOSED / ASIA-SHANGHAI FIX GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
 
 **Design:** [Daily Bar Shadow Qualification Design](2026-08-28-stock-eva-r2f3-daily-bar-shadow-qualification-design.md)
 
@@ -53,6 +53,30 @@ session and new attestation hashes to be identical. Same-reviewer confirmation r
 
 The actual latest 20 local canonical dates now read 20/20 ready. No Provider request or canonical
 write was made during that read-only proof. Same-reviewer exact-commit re-review remains required.
+
+## Task 8 first controlled session and date-semantics remediation
+
+After the same reviewer returned H=0/M=0/L=0 for exact clean commit
+`a6716367a99fb7f35c4aff7f0e59753b9d38783b`, one fresh isolated capability runtime was initialized.
+Its plan for 2026-07-14 was zero-request/zero-write and bound 3,190 active symbols into 32 shards.
+The single authorized execution made those 32 one-attempt sequential Free requests, returned exact
+symbol coverage, then failed closed as `MISMATCH`; no candidate/window increment or automatic next
+date occurred.
+
+Read-only evidence proved the returned timestamp was `2026-07-14T16:00:00Z`, which is
+`2026-07-15 00:00` in Asia/Shanghai. All returned OHLC cells exactly match the next canonical
+session, so the cause is the adapter's UTC-natural-day request/validation contract, not a transient
+provider outage. Four focused regressions witnessed RED before the production change: wrong request
+bounds, rejected requested-date local midnight, accepted next-date local midnight and evidence
+assembly accepting that next-date timestamp. GREEN changes only the request/date gates to exact
+Asia/Shanghai semantics and rotates the adapter/endpoint/source-schema/descriptor/Terms hashes.
+
+Post-fix offline evidence is focused 116/116, compatibility 357/357, full repository 2,139/2,139,
+LaunchAgent 26/26, Ruff/format/compile/diff clean and strict design validator 100/100. One existing
+compatibility test also had a deterministic-test defect: it tried to tamper a random COMMIT hash by
+writing `0` over its first byte, which was a no-op when that hash already began with `0`. The test
+now always flips to a different byte and asserts the bytes changed; production recovery code was
+not modified.
 
 ## Delivery result vocabulary
 
@@ -140,7 +164,10 @@ EC-4-EC-9.
 **RED first:**
 
 1. Assert 3,193 canonical symbols become exactly 32 sorted shards, each <=100, with deterministic
-   request/plan hashes, exact UTC day, `period=1d`, `adjust=none` and at most 40 requests.
+   request/plan hashes, exact Asia/Shanghai trade-date bounds expressed as UTC epoch milliseconds,
+   `period=1d`, `adjust=none` and at most 40 requests. Assert the parser and evidence assembler both
+   reject the next Asia/Shanghai session even when that timestamp still lies inside the requested
+   UTC natural day.
 2. Assert fixed-five Task14 plans cannot validate as full-session plans and no caller can inject a
    symbol, origin, endpoint, period, adjustment mode or shard size.
 3. Use injected fake HTTP/SDK factories to prove exact Free origin, no auth/credential read,

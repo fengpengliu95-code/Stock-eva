@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,6 +22,7 @@ from backend.app.market.providers.tickflow_daily_shadow import (
 )
 
 TRADE_DATE = date(2026, 8, 10)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _snapshot(count: int = 201) -> DailyCanonicalSnapshot:
@@ -182,6 +184,49 @@ def test_success_is_sequential_one_attempt_credentialless_and_exact_shards():
     assert all(item.attempt == 1 for item in result.observations)
     assert all(item.response_bytes > 0 for item in result.observations)
     assert all(response.close_count == 1 for response in responses)
+
+
+def test_request_bounds_cover_exact_shanghai_trade_date():
+    plan = TickFlowFreeDailyShadowAdapter().plan(_snapshot(1))
+    params = TickFlowFreeDailyShadowAdapter.request_params(plan, plan.shards[0])
+    expected_start = datetime.combine(TRADE_DATE, time.min, tzinfo=SHANGHAI)
+    expected_end = expected_start + timedelta(days=1) - timedelta(milliseconds=1)
+
+    assert params["start_time"] == int(expected_start.timestamp() * 1000)
+    assert params["end_time"] == int(expected_end.timestamp() * 1000)
+
+
+def test_parser_accepts_shanghai_trade_date_midnight():
+    plan = TickFlowFreeDailyShadowAdapter().plan(_snapshot(1))
+    timestamp = int(datetime.combine(TRADE_DATE, time.min, tzinfo=SHANGHAI).timestamp() * 1000)
+    payload = _provider_payload(plan.shards[0].provider_symbols, timestamp=timestamp)
+
+    result = TickFlowFreeDailyShadowFetcher._offline_for_tests(
+        transport=_Transport([_Response(payload)]),
+        plan=plan,
+        sdk_initializer=lambda: None,
+    )
+
+    assert result.status == "ready"
+
+
+def test_parser_rejects_next_shanghai_trade_date_midnight():
+    plan = TickFlowFreeDailyShadowAdapter().plan(_snapshot(1))
+    timestamp = int(
+        datetime.combine(TRADE_DATE + timedelta(days=1), time.min, tzinfo=SHANGHAI).timestamp()
+        * 1000
+    )
+    payload = _provider_payload(plan.shards[0].provider_symbols, timestamp=timestamp)
+
+    result = TickFlowFreeDailyShadowFetcher._offline_for_tests(
+        transport=_Transport([_Response(payload)]),
+        plan=plan,
+        sdk_initializer=lambda: None,
+    )
+
+    assert result.status == "unavailable"
+    assert result.failure_class == "wrong_date"
+    assert result.rows == ()
 
 
 @pytest.mark.parametrize(

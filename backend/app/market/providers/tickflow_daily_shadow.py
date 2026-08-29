@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from time import monotonic as _monotonic
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.app.market.daily_shadow_models import (
     DailyCanonicalSnapshot,
@@ -28,6 +29,7 @@ from .tickflow import TICKFLOW_FREE_SERVER, initialize_tickflow_free_sdk
 TICKFLOW_FREE_DAILY_ENDPOINT = "/v1/klines/batch"
 _MAX_SHARD_SYMBOLS = 100
 _MAX_REQUESTS = 40
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CORE_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "volume", "amount"})
 _OPTIONAL_COLUMNS = frozenset({"open_interest", "prev_close", "settlement_price"})
 _ALLOWED_FAILURES = frozenset(
@@ -59,12 +61,14 @@ def _contract_hash(label: str) -> str:
     return hashlib.sha256(f"stock-eva/r2f3/free-daily-shadow/v1\n{label}".encode()).hexdigest()
 
 
-DAILY_SHADOW_ADAPTER_HASH = _contract_hash("adapter-sequential-one-attempt")
+DAILY_SHADOW_ADAPTER_HASH = _contract_hash(
+    "adapter-sequential-one-attempt-asia-shanghai-trade-date"
+)
 DAILY_SHADOW_ENDPOINT_CONTRACT_HASH = _contract_hash(
-    "GET:/v1/klines/batch:period=1d:adjust=none:max-shard=100"
+    "GET:/v1/klines/batch:period=1d:adjust=none:trade-date=Asia/Shanghai:max-shard=100"
 )
 DAILY_SHADOW_SOURCE_SCHEMA_HASH = _contract_hash(
-    "compact-kline:timestamp,open,high,low,close,volume,amount:optional-reviewed"
+    "compact-kline:timestamp=Asia/Shanghai-trade-date,open,high,low,close,volume,amount:optional-reviewed"
 )
 DAILY_SHADOW_UNIT_STATE_HASH = _contract_hash("volume=UNKNOWN:amount=UNKNOWN")
 DAILY_SHADOW_MAPPING_HASH = _contract_hash("sh.sz-six-digit-reversible-v1")
@@ -79,7 +83,7 @@ class TickFlowFreeDailyShadowError(ValueError):
 
 
 def _trade_bounds(trade_date: date) -> tuple[int, int]:
-    start = datetime.combine(trade_date, time.min, tzinfo=UTC)
+    start = datetime.combine(trade_date, time.min, tzinfo=_SHANGHAI)
     end = start + timedelta(days=1) - timedelta(milliseconds=1)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
