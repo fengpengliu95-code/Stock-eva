@@ -2,11 +2,14 @@
 
 ## Current decision
 
-`OFFLINE CODE GATE PASS / INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+`OFFLINE REMEDIATION GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
 
 The implementation through code commit
-`3b0c5fb92f658762568241bd4409bd9cf4a48b1a` passes the prescribed offline gate.
-This document is the pre-review Task 7 record: it does not claim independent review, a real
+`2c306271b9affe17d94914c9d314ffc32903732c` passes the prescribed offline gate.
+The first independent review of `303f40ad6178d6f48ee5b37676c3ce4644d0971f` returned
+`NO-GO` with H=3, M=2 and L=2. All seven findings have been remediated with witnessed RED/GREEN
+evidence, but the same reviewer has not yet reviewed the new exact commit containing this record.
+This document therefore does not claim code GO, a real
 provider session, a 20-session qualification window, provider admission, publication eligibility,
 automatic failover, adjustment-factor qualification, known units or known suspension semantics.
 
@@ -19,7 +22,7 @@ record.
 The new sidecar is limited to `TICKFLOW_FREE_DAILY_BAR_OHLC_V1`:
 
 - a descriptor-bound, no-follow, read-only canonical projection over published BaoStock Daily
-  partitions;
+  partitions, including the exact reviewed suspended-placeholder exclusion form;
 - one deterministic whole-session TickFlow Free plan, sorted into at most 40 sequential shards of
   at most 100 symbols, `period=1d`, `adjust=none`, one attempt and no hidden retry;
 - final-success-only immutable source evidence and a separate Daily OHLC candidate;
@@ -36,7 +39,9 @@ The new sidecar is limited to `TICKFLOW_FREE_DAILY_BAR_OHLC_V1`:
 
 The second and later explicit invocations reuse the exact original 20-date calendar binding. A
 failure/reset starts no implicit replacement window. A HALF_OPEN probe ends its scheduler slot even
-when successful. Provider admission remains untouched and symbol-level mixing is absent.
+when successful. The window binds a stable universe-policy/version vector while every date keeps
+its own complete canonical universe/exclusion/mapping/manifest/partition identity. Provider
+admission remains untouched and symbol-level mixing is absent.
 
 ## Exact implementation history
 
@@ -48,12 +53,36 @@ ee2bc32 add bounded credentialless Free Daily adapter
 6a0dcb2 make terminal leases idempotent
 421c42b assemble one-session worker and offline E2E
 3b0c5fb expose zero-write plan, controlled execute and read-only status
+2c30627 remediate exact-commit review and real-canonical blockers
 ```
 
 The initial REDs were witnessed before each production slice. They included missing Daily modules,
 missing worker/CLI/API surfaces and explicit failure/circuit/crash expectations. The Task 5 RED
 also exposed that an unexpected fetcher exception did not advance the endpoint circuit; GREEN now
 normalizes it to `provider_unavailable` and opens the circuit at the frozen third failure.
+
+## First independent review and remediation
+
+The first reviewer correctly rejected the code gate. The findings and closed evidence are:
+
+| Finding | Remediation evidence |
+| --- | --- |
+| H1: legal suspended `partial` placeholders invalidated most canonical dates | RED reproduced `PARTITION_SEMANTICS_INVALID`; the reader now accepts only the exact reviewed suspended-placeholder issue set and hashes it into exclusions |
+| H2: daily active mapping in the version vector made a 20-date window unreachable | read-only live analysis found 15 distinct mapping hashes in the latest 20 dates; the version vector now binds stable universe/mapping policy while each session retains its exact mapping |
+| H3: universe hash omitted exclusion/manifest/partition identity | canonical universe v2 binds active symbols, exclusion SHA, manifest generation/SHA and partition path/SHA/count; model and adapter revalidate it |
+| M1: status did not verify referenced immutable bundles | API/CLI readers now re-open and verify every current-epoch evidence/candidate graph, bounded to 20; missing either `COMMIT` is `UNAVAILABLE` with zero writes |
+| M2: production CLI omitted the HALF_OPEN probe runner | the execute path now wires one credentialless bounded fixed-five request, resolves the circuit and ends the slot without evidence/candidate publication |
+| L1: unrelated malformed manifest entries could be ignored | every manifest entry now has exact descriptor validation and trade dates are unique |
+| L2: sidecar failure classes were regex-only | fetch, worker, audit, session and circuit boundaries now enforce one explicit failure-class allowlist |
+
+The first targeted RED run failed the suspended-placeholder, manifest and changing-universe E2E
+cases 3/3. The second targeted RED run failed external bundle verification, production HALF_OPEN
+recovery and failure-class allowlisting 3/3. Their post-fix target set passed 23/23; the full R2-F3
+focused set then passed 108/108.
+
+A read-only projection of the actual latest 20 local canonical dates (`2026-07-14` through
+`2026-08-10`) now returns ready for 20/20 dates, with 3,188-3,193 eligible active stocks per date.
+This check made no canonical write and did not contact TickFlow.
 
 ## Offline gate evidence
 
@@ -62,9 +91,9 @@ invoked.
 
 | Gate | Result |
 | --- | --- |
-| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `104/104`, exit 0 |
+| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `108/108`, exit 0 |
 | R2-F2, Task14 and prior shadow compatibility | `357/357`, exit 0 |
-| Full repository | `2,127/2,127`, exit 0 |
+| Full repository | `2,131/2,131`, exit 0 |
 | LaunchAgent assets | `26/26`, exit 0 |
 | `ruff check backend tests` | all checks passed |
 | `ruff format --check backend tests` | 195 files already formatted |
@@ -104,10 +133,13 @@ Offline tests prove the following boundaries:
 
 - missing/corrupt/locked sidecar, unsafe layout, missing calendar, missing acknowledgement,
   disabled execute and unavailable canonical all stop before a provider call;
+- missing or corrupt evidence/candidate bundles referenced by the current epoch make read-only
+  status unavailable without initialization or repair;
 - timeouts, rate limits, HTTP/schema/date/symbol/coverage failures discard all source rows and stop
   later shards;
 - provider exceptions, three endpoint failures, OPEN skip, competing HALF_OPEN workers, probe
-  success and probe failure are sanitized and bounded;
+  success and probe failure are sanitized and bounded; the production CLI probe performs one
+  fixed-five request and cannot continue into a full session in that slot;
 - duplicate completed dates and concurrent lease losers make zero provider calls;
 - canonical changes before evidence and after candidate publication never increment the window;
 - evidence/candidate publication crashes may leave only immutable orphan objects; four DB attach
@@ -136,7 +168,7 @@ observation is relabeled to a new date, and no provider row is silently mixed at
 
 ## Remaining gates
 
-- [ ] Exact-commit independent read-only review returns H=0/M=0.
+- [ ] Same-reviewer exact-commit independent read-only re-review returns H=0/M=0.
 - [ ] Capability-specific reviewed TermsEvidence and calendar root are installed in an isolated
   local runtime.
 - [ ] One bounded real historical Daily session completes and is read back without canonical or
