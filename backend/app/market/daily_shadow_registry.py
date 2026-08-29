@@ -61,6 +61,7 @@ _SHA = re.compile(r"^[0-9a-f]{64}$")
 _MAX_DATABASE_BYTES = 32 * 1024 * 1024
 _REQUIRED_SESSIONS = 20
 _FAILURE_THRESHOLD = 3
+_IMMEDIATE_OPEN_FAILURES = frozenset({"rate_limited"})
 _COOLDOWN_SECONDS = 900
 _PROBE_LEASE_SECONDS = 120
 _JOB_LEASE_SECONDS = 1800
@@ -89,6 +90,7 @@ DAILY_SHADOW_CIRCUIT_POLICY_HASH = _contract_component_hash(
     "circuit-policy",
     {
         "failure_threshold": _FAILURE_THRESHOLD,
+        "immediate_open_failures": tuple(sorted(_IMMEDIATE_OPEN_FAILURES)),
         "cooldown_seconds": _COOLDOWN_SECONDS,
         "probe_lease_seconds": _PROBE_LEASE_SECONDS,
         "half_open_probe": "fixed-five-zero-write-one-attempt",
@@ -1011,12 +1013,23 @@ def _validate_control_graph(connection: sqlite3.Connection) -> None:
                 raise ValueError("naive circuit time")
     except Exception as exc:
         raise DailyShadowRegistryUnavailable("daily circuit graph unavailable") from exc
+    last_closed_event = max(
+        (index for index, event in enumerate(circuit_events) if event["state_after"] == "CLOSED"),
+        default=-1,
+    )
+    immediate_open_chain = any(
+        event["event_type"] == "FAILURE"
+        and event["failure_class"] in _IMMEDIATE_OPEN_FAILURES
+        and event["state_after"] == "OPEN"
+        for event in circuit_events[last_closed_event + 1 :]
+    )
     if (
         snapshot.state != prior_circuit_state
         or (snapshot.state == "CLOSED" and snapshot.consecutive_failures >= _FAILURE_THRESHOLD)
         or (
             snapshot.state in {"OPEN", "HALF_OPEN"}
             and snapshot.consecutive_failures < _FAILURE_THRESHOLD
+            and not immediate_open_chain
         )
         or snapshot.state_version < len(circuit_events)
     ):
@@ -2359,7 +2372,11 @@ class DailyShadowRegistry:
                 return self._circuit_from_row(row)
             before = row["state"]
             count = row["consecutive_failures"] + 1
-            if before == "HALF_OPEN" or count >= _FAILURE_THRESHOLD:
+            if (
+                before == "HALF_OPEN"
+                or failure_class in _IMMEDIATE_OPEN_FAILURES
+                or count >= _FAILURE_THRESHOLD
+            ):
                 state = "OPEN"
                 opened = observed_at.isoformat()
                 cooldown = (observed_at + timedelta(seconds=_COOLDOWN_SECONDS)).isoformat()

@@ -571,6 +571,27 @@ def test_circuit_open_skip_half_open_probe_and_safe_recovery(tmp_path):
     )
 
 
+def test_first_rate_limit_opens_circuit_and_only_half_open_probe_can_recover(tmp_path):
+    registry, _terms_value, _window = _registry(tmp_path)
+    now = datetime(2026, 8, 28, tzinfo=UTC)
+
+    opened = registry.record_endpoint_failure(
+        "rate-limit-first", failure_class="rate_limited", now=now
+    )
+
+    assert opened.state == "OPEN"
+    assert opened.consecutive_failures == 1
+    assert registry.read().circuit_state == "OPEN"
+    assert registry.circuit_action(owner="next-full-slot", now=now).action == (
+        DailyCircuitAction.SKIPPED_CIRCUIT_OPEN
+    )
+    probe = registry.circuit_action(owner="rate-limit-probe", now=now + timedelta(seconds=901))
+    assert probe.action == DailyCircuitAction.RUN_FIXED_FIVE_HALF_OPEN_PROBE
+    assert probe.max_attempts == 1
+    assert probe.zero_write is True
+    assert probe.ends_slot is True
+
+
 def test_closed_endpoint_success_resets_consecutive_failure_count(tmp_path):
     registry, _terms_value, _window = _registry(tmp_path)
     now = datetime(2026, 8, 28, tzinfo=UTC)

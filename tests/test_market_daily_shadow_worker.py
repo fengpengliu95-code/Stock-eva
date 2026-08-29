@@ -381,6 +381,36 @@ def test_half_open_is_fixed_five_probe_only_and_does_not_start_full_session(tmp_
     assert not candidate_root.exists()
 
 
+def test_first_rate_limited_session_opens_and_next_slot_skips_full_provider(tmp_path):
+    now = [NOW]
+    provider_calls = 0
+
+    def rate_limited_fetcher(plan):
+        nonlocal provider_calls
+        provider_calls += 1
+        return _unavailable_fetch(plan, failure_class="rate_limited")
+
+    worker, registry, _snapshot_value, evidence_root, candidate_root, _control = _worker(
+        tmp_path,
+        fetcher=rate_limited_fetcher,
+        clock=lambda: now[0],
+    )
+
+    failed = worker.run_one(TRADE_DATE)
+    skipped = worker.run_one(TRADE_DATE)
+
+    assert failed.outcome == "FAILURE"
+    assert failed.failure_class == "rate_limited"
+    assert failed.circuit_state == "OPEN"
+    assert skipped.outcome == "SKIPPED_CIRCUIT_OPEN"
+    assert skipped.provider_requests == 0
+    assert skipped.circuit_state == "OPEN"
+    assert provider_calls == 1
+    assert registry.read().circuit_state == "OPEN"
+    assert not evidence_root.exists()
+    assert not candidate_root.exists()
+
+
 def test_competing_half_open_worker_skips_and_failed_probe_reopens(tmp_path):
     now = [NOW]
     full_provider_calls = 0

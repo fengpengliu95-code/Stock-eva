@@ -2,24 +2,25 @@
 
 ## Current decision
 
-`FIRST REAL SESSION FAILED CLOSED / DATE-SEMANTICS REMEDIATION PENDING RE-REVIEW / DAILY BAR SHADOW NO-GO`
+`ACCELERATED WINDOW RATE-LIMITED / IMMEDIATE-CIRCUIT REMEDIATION PENDING RE-REVIEW / DAILY BAR SHADOW NO-GO`
 
 The same independent reviewer returned H=0/M=0/L=0 for exact clean code commit
-`a6716367a99fb7f35c4aff7f0e59753b9d38783b`. A capability-specific TermsEvidence/calendar was then
-installed in a new isolated runtime, its default plan proved zero-request/zero-write, and one
-explicit 2026-07-14 Free Daily session made 32 sequential one-attempt requests. The provider
-returned the exact 3,190-symbol set, but the session failed closed as `MISMATCH`, attached no
-candidate, advanced no qualification count and reset the epoch.
+`a6716367a99fb7f35c4aff7f0e59753b9d38783b`. The first isolated runtime then exposed and preserved
+an Asia/Shanghai date-semantics mismatch. After offline RED/GREEN remediation, full gates and a
+second same-reviewer H=0/M=0/L=0 result, a new rotated runtime completed 2026-07-14 through
+2026-07-16 as exact whole-session SUCCESS results. All returned OHLC cells matched canonical and
+the circuit remained CLOSED through those sessions.
 
-Read-only triage proved this was a local date-semantics defect rather than transient provider
-availability: the adapter requested and validated a UTC natural day, while the returned timestamp
-`2026-07-14T16:00:00Z` is `2026-07-15 00:00` in Asia/Shanghai. All 12,760 returned OHLC cells match
-the canonical 2026-07-15 values exactly; only 605/12,760 were within tolerance against the requested
-2026-07-14 partition. The remediation changes both request bounds and two independent response/
-evidence gates to Asia/Shanghai trade-date semantics and rotates the adapter, endpoint,
-source-schema, descriptor and TermsEvidence hashes. It does not change timeout, retry, tolerance,
-canonical data, publication or failover. The repaired exact commit requires the same independent
-reviewer before any second real session.
+During accelerated continuation, 2026-07-17 returned a proven HTTP 429 at shard ordinal 28 after
+ordinals 0-27 succeeded. The session failed closed: no evidence/candidate was attached, the epoch
+reset, canonical and provider-admission bytes remained unchanged, and no retry/follow-up occurred.
+The observation establishes 124 successful requests before this run's first 429, but does not prove
+an upstream threshold or time window; the official Free quota remains `UNKNOWN`. Local triage found
+that `rate_limited` used the generic three-failure circuit threshold, leaving the circuit CLOSED
+after the first 429. New offline RED/GREEN changes only that policy: a proven 429 opens immediately
+with a truthful failure count of one, ordinary failures retain threshold three, and cooldown still
+permits only a fixed-five HALF_OPEN probe. The circuit policy/descriptor/Terms identity rotates;
+timeouts, retries, reconciliation tolerance, canonical data, publication and failover do not.
 
 ## Delivered capability
 
@@ -138,7 +139,27 @@ Offline RED reproduced the flaw at all three boundaries: request start was eight
 midnight for the requested date was rejected, and local midnight for the next date was accepted by
 both provider parsing and evidence assembly. The four targeted tests failed 4/4 before production
 changes and pass 4/4 after the minimal timezone fix; the provider/candidate focused files pass
-35/35. Full gates and same-reviewer re-review remain pending for the repaired commit.
+35/35. That remediation later passed the full gates and same-reviewer re-review described below.
+
+## Second controlled runtime and rate-limit triage
+
+The Asia/Shanghai remediation was committed as
+`1a6b2968243d616ee684b83ea376aa32b393df84`, passed 116 focused, 357 compatibility and 2,139 full
+tests, and received same-reviewer H=0/M=0/L=0. A fresh runtime at
+`~/Library/Application Support/Stock EVA/r2f3-daily-shadow-20260829-shanghai-v2` bound new
+TermsEvidence and descriptor hashes. Its 2026-07-14 zero-write plan reported 3,190 symbols and 32
+shards with an unchanged sidecar/lock/shadow tree. The real session then returned 3,190/3,190 rows,
+12,760/12,760 reconciled price cells, `SUCCESS`, count 1 and circuit CLOSED. The next two explicit
+dates also completed with exact quality/reconciliation PASS, raising the epoch to 3/20.
+
+The accelerated fourth date, 2026-07-17, performed 29 one-attempt requests: 28 successful
+100-symbol shards followed by one 178-byte 429 response. The terminal report is `FAILURE /
+rate_limited`, candidate/evidence IDs are null, the epoch is RESET and all prior successful bundles
+remain immutable. No threshold or window is inferred from this observation. Offline tests now prove
+the first 429 opens the endpoint immediately, the next full slot is skipped with zero provider
+requests, and only the existing post-cooldown fixed-five HALF_OPEN probe can recover. A separate
+caller-owned historical runner limit of one full-session start per 60 seconds prevents this
+qualification harness from generating the same accelerated burst; it is not provider semantics.
 
 ## Offline gate evidence
 
@@ -147,9 +168,9 @@ invoked.
 
 | Gate | Result |
 | --- | --- |
-| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `116/116`, exit 0 |
+| R2-F3 focused canonical/provider/candidate/registry/worker/E2E/CLI/API | `118/118`, exit 0 |
 | R2-F2, Task14 and prior shadow compatibility | `357/357`, exit 0 |
-| Full repository | `2,139/2,139`, exit 0 |
+| Full repository | `2,141/2,141`, exit 0 |
 | LaunchAgent assets | `26/26`, exit 0 |
 | `ruff check backend tests` | all checks passed |
 | `ruff format --check backend tests` | 195 files already formatted |
@@ -160,6 +181,12 @@ invoked.
 Two non-blocking test-environment warnings remain visible: Starlette deprecates the current
 `httpx` TestClient integration, and pytest occasionally cannot clean an old macOS-protected
 migration garbage directory. Neither warning changed a test result or a tracked/runtime object.
+
+The two immediate-rate-limit REDs failed 2/2 against the prior contract and pass 2/2 after GREEN.
+The rotated circuit policy hash is
+`b3d4cdfa56b5db6bbc719514b35da4d430af75edf3de2c56c41fb393e8708495`; the resulting descriptor
+base is `00d86cb0720f3381c1b41c8bc28f951e6e9feab6e94a829e66e3ba45d538e10f`. Existing failed
+sidecars cannot satisfy this new Terms contract and remain preserved as immutable diagnostics.
 
 ## Frozen compatibility fingerprints
 
@@ -193,9 +220,10 @@ Offline tests prove the following boundaries:
   status unavailable without initialization or repair;
 - timeouts, rate limits, HTTP/schema/date/symbol/coverage failures discard all source rows and stop
   later shards;
-- provider exceptions, three endpoint failures, OPEN skip, competing HALF_OPEN workers, probe
-  success and probe failure are sanitized and bounded; the production CLI probe performs one
-  fixed-five request and cannot continue into a full session in that slot;
+- provider exceptions, three ordinary endpoint failures, first-429 immediate OPEN, OPEN skip,
+  competing HALF_OPEN workers, probe success and probe failure are sanitized and bounded; the
+  production CLI probe performs one fixed-five request and cannot continue into a full session in
+  that slot;
 - duplicate completed dates and concurrent lease losers make zero provider calls;
 - canonical changes before evidence and after candidate publication never increment the window;
 - evidence/candidate publication crashes may leave only immutable orphan objects; four DB attach
@@ -225,9 +253,10 @@ observation is relabeled to a new date, and no provider row is silently mixed at
 ## Remaining gates
 
 - [ ] Same-reviewer exact-commit independent read-only re-review returns H=0/M=0 for the
-  Asia/Shanghai remediation and rotated contract hashes.
-- [ ] New capability-specific reviewed TermsEvidence is installed in a fresh isolated runtime for
-  the rotated descriptor; the failed epoch's old TermsEvidence/sidecar is not reused.
+  immediate-rate-limit circuit remediation and rotated contract hashes.
+- [ ] New capability-specific reviewed TermsEvidence is installed in a third fresh isolated
+  runtime for the rotated descriptor; both failed epochs and TermsEvidence objects remain preserved
+  and are not reused.
 - [ ] One bounded real historical Daily session completes and is read back without canonical or
   provider-registry mutation.
 - [ ] Twenty same-vector consecutive confirmed sessions complete with zero reset in the qualifying

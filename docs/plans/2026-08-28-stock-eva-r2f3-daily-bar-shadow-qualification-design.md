@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-28; amended 2026-08-29 (Asia/Shanghai)
 
-**Status:** **REVIEW REMEDIATION IMPLEMENTED / RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO**
+**Status:** **RATE-LIMIT CIRCUIT REMEDIATION IMPLEMENTED / RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO**
 
 **Scope:** The capability-scoped `TICKFLOW_FREE_DAILY_BAR_OHLC_V1` shadow lane and its
 20-consecutive-confirmed-session qualification window.
@@ -219,11 +219,15 @@ factors, corporate actions, indexes, publication eligibility or operational prod
   explicit trade date, a safe external authorization identifier, provider-request acknowledgement,
   an initialized sidecar contract, the exact reviewed descriptor and a canonical ready snapshot.
 - FR-31: A scheduler invocation MUST lease and execute at most one session. It MUST not
-  automatically run the next date. An endpoint circuit opens after the frozen failure threshold;
-  OPEN slots record `SKIPPED_CIRCUIT_OPEN`. After cooldown, one fixed-five zero-write HALF_OPEN
-  probe may close the circuit, but success MUST NOT automatically launch a whole-session request.
-  The production execute path MUST wire this probe to the same credentialless, pinned, bounded
-  one-attempt Daily transport; canonical/evidence/candidate artifacts remain unwritten by the probe.
+  automatically run the next date. A proven `rate_limited` response MUST open the endpoint circuit
+  immediately; other allowlisted endpoint failures open it only after the frozen ordinary failure
+  threshold. OPEN slots record `SKIPPED_CIRCUIT_OPEN`. After cooldown, one fixed-five zero-write
+  HALF_OPEN probe may close the circuit, but success MUST NOT automatically launch a whole-session
+  request. The production execute path MUST wire this probe to the same credentialless, pinned,
+  bounded one-attempt Daily transport; canonical/evidence/candidate artifacts remain unwritten by
+  the probe. An accelerated historical qualification runner MUST additionally impose its own
+  conservative admission budget of at most one full session start per 60 seconds; that local
+  safety budget MUST NOT be reported as an inferred provider quota or recovery window.
 - FR-32: The read-only CLI/API status MUST expose profile, window epoch/state, count/required,
   first/last date, last outcome, version-vector hash, observation mode, semantic states and
   eligibility flags. It MUST not expose raw rows, URLs, request parameters, symbols or arbitrary
@@ -244,7 +248,9 @@ factors, corporate actions, indexes, publication eligibility or operational prod
 - NFR-3 (determinism): All identities and hashes derive from versioned semantic inputs, sorted
   symbol/shard order and canonical JSON, never process timing or dictionary iteration order.
 - NFR-4 (bounds): One session has <=40 sequential requests, <=100 symbols/request, <=8 MiB/response,
-  <=4000 rows/evidence, one attempt/request and bounded metadata/file/DB sizes.
+  <=4000 rows/evidence, one attempt/request and bounded metadata/file/DB sizes. Accelerated
+  historical qualification admits at most one full session start per 60 seconds and stops on the
+  first non-success without retry.
 - NFR-5 (security): No secret is read in Free mode. Logs, exceptions, reports and API/CLI output
   exclude raw payload, symbols, URL, headers, cookies, environment dumps and provider exception text.
 - NFR-6 (atomicity): Staging cannot be read as evidence/candidate. Only an exclusive directory
@@ -338,6 +344,8 @@ false and the output is labeled historical shadow rather than live soak.
 Given plan mode, missing acknowledgement/review, OPEN circuit or HALF_OPEN probe, when the command
 runs, then plan/rejection/open skip/probe are bounded and no whole-session work follows a probe.
 One execute or scheduler slot can attempt only one date and exposes only sanitized counts/states.
+The first proven 429 opens the circuit with a truthful failure count of one; ordinary failures still
+require the frozen threshold. Accelerated historical sessions start at least 60 seconds apart.
 
 ### AC-13: Existing contracts remain byte-compatible (FR-33, FR-34, NFR-8)
 
@@ -361,8 +369,9 @@ Tasks10-13 registry/terminal outputs are unchanged and no symbol-level mixing pa
   Asia/Shanghai trade date -> whole session invalid; never choose a convenient row or accept the
   next local session merely because its timestamp remains inside the requested UTC natural day.
 - EC-7: HTTP client or SDK initializer closes incorrectly -> execution unavailable and no evidence.
-- EC-8: A 429 or transport failure opens the capability endpoint circuit at its frozen threshold;
-  later scheduled slots skip until cooldown without repeatedly requesting the whole universe.
+- EC-8: A 429 opens the capability endpoint circuit immediately; a transport failure opens it only
+  at the frozen ordinary threshold. Later scheduled slots skip until cooldown without repeatedly
+  requesting the whole universe. Provider quota and recovery-window semantics remain `UNKNOWN`.
 - EC-9: HALF_OPEN fixed-five probe succeeds -> circuit closes, but the current slot ends; the next
   separately authorized slot may attempt a full session.
 - EC-10: Evidence publishes but candidate validation fails -> immutable evidence may remain for
@@ -373,8 +382,9 @@ Tasks10-13 registry/terminal outputs are unchanged and no symbol-level mixing pa
   returns the existing sanitized result without provider I/O.
 - EC-13: Calendar changes or the next expected date is unavailable -> reset/unavailable; weekdays
   are never guessed.
-- EC-14: Twenty valid historical dates are fetched in one day -> may qualify historical Daily OHLC
-  parity only; it does not satisfy R2-F5 elapsed production soak.
+- EC-14: Twenty valid historical dates are fetched in one day under the caller-owned one-session-
+  per-60-seconds admission budget -> may qualify historical Daily OHLC parity only; it does not
+  satisfy R2-F5 elapsed production soak or prove a provider quota.
 - EC-15: Daily qualifies while factor/units/suspension remain unresolved -> status shows the mixed
   capability states explicitly and all publication/failover gates remain closed.
 - EC-16: Provider or canonical failure occurs -> no old provider observation may be relabeled as a

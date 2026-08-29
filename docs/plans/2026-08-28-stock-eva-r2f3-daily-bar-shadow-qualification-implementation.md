@@ -1,12 +1,14 @@
 # Stock EVA R2-F3 TickFlow Free Daily Bar Shadow Qualification Implementation Plan
 
-**Status:** `FIRST REAL SESSION FAILED CLOSED / ASIA-SHANGHAI FIX GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+**Status:** `ACCELERATED WINDOW RATE-LIMITED / IMMEDIATE-CIRCUIT FIX GATE PASS / INDEPENDENT RE-REVIEW PENDING / DAILY BAR SHADOW NO-GO`
 
 **Design:** [Daily Bar Shadow Qualification Design](2026-08-28-stock-eva-r2f3-daily-bar-shadow-qualification-design.md)
 
 **Starting commit:** `d70fb02140e09ff3758ef224ad27abcf3e1e2e78`
 
-**Implemented code through:** `2c306271b9affe17d94914c9d314ffc32903732c`
+**Implemented code through:** Asia/Shanghai base
+`1a6b2968243d616ee684b83ea376aa32b393df84`; immediate-rate-limit circuit remediation pending
+exact-commit review.
 
 **Execution discipline:** one task at a time, witnessed RED before production edits, smallest
 GREEN, focused verification, then commit. No real provider request before all offline tasks and an
@@ -77,6 +79,30 @@ compatibility test also had a deterministic-test defect: it tried to tamper a ra
 writing `0` over its first byte, which was a no-op when that hash already began with `0`. The test
 now always flips to a different byte and asserts the bytes changed; production recovery code was
 not modified.
+
+## Task 9 accelerated-window rate-limit triage and remediation
+
+The second fresh runtime completed exact whole-session SUCCESS for 2026-07-14 through 2026-07-16.
+The accelerated 2026-07-17 invocation then stopped at a proven HTTP 429 on ordinal 28 after 28
+successful shards. It retained no candidate/evidence for the failed session, reset the epoch,
+changed no canonical/provider-admission bytes and performed no retry. The 124 successful requests
+observed before that 429 do not prove an upstream threshold or time window; Free quota remains
+`UNKNOWN`.
+
+Local triage found a circuit defect: `rate_limited` incremented the same generic three-failure
+counter as transport errors and therefore left the circuit CLOSED after the first 429. Two offline
+tests witnessed RED 2/2. GREEN opens immediately for the allowlisted `rate_limited` class while
+keeping the truthful consecutive count at one, preserves threshold three for every ordinary
+failure, skips the next full slot, and retains the existing 900-second/fixed-five HALF_OPEN recovery
+path. The rotated circuit policy hash is
+`b3d4cdfa56b5db6bbc719514b35da4d430af75edf3de2c56c41fb393e8708495` and descriptor base is
+`00d86cb0720f3381c1b41c8bc28f951e6e9feab6e94a829e66e3ba45d538e10f`.
+
+The post-fix gate is focused 118/118, compatibility 357/357, full repository 2,141/2,141,
+LaunchAgent 26/26, Ruff/format/compile/diff clean and strict design validator 100/100. Accelerated
+historical continuation is now additionally bounded by an execution-runner safety policy of at
+most one full-session start per 60 seconds. That local policy is not represented as provider quota
+semantics and does not add a timeout, retry, tolerance waiver or authenticated capability.
 
 ## Delivery result vocabulary
 
@@ -488,6 +514,11 @@ The first real session does not automatically start the remaining window.
 Process one next confirmed historical session per bounded invocation in exact calendar order. Each
 invocation repeats plan identity, canonical pre/post fingerprints and sidecar readback. Stop on
 any failure/mismatch/unavailable/circuit-open state, diagnose it and preserve the reset epoch.
+For accelerated historical execution, admit at most one full-session start per 60 seconds. This is
+a caller-owned conservative safety budget, not a claim about the provider's undocumented quota or
+recovery window. A proven 429 opens the endpoint circuit immediately; do not run another full
+session until the rotated circuit contract passes offline review and any OPEN state has completed
+its fixed-five HALF_OPEN recovery path.
 
 After session 20:
 
