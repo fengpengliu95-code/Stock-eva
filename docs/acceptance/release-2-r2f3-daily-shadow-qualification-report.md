@@ -1,6 +1,6 @@
 # R2-F3 TickFlow Free Daily Bar Shadow qualification report
 
-Status: `SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING`
+Status: `DAILY BAR SHADOW GO / SHADOW_QUALIFIED / NARROW CAPABILITY ONLY`
 
 This is a sanitized, hash-only review projection of the immutable local sidecar and bundle graph. It contains no provider payload rows, token, request URL, query string or sensitive exception text. The authoritative local report is:
 
@@ -79,4 +79,7 @@ Across all three preserved runtimes there were 797 attempts: 796 successful tran
 
 `SHADOW_QUALIFIED` applies only to credentialless TickFlow Free, historical unadjusted-requested A-share Daily OHLC, as a whole-session shadow candidate. It does not qualify adjustment factors, units, suspension semantics, raw-retention semantics, realtime quote, minute K-line, publication or automatic failover. Those states remain `UNQUALIFIED`, `UNKNOWN`, forbidden or disabled exactly as specified.
 
-The remaining release gate is the same reviewer’s independent read-only audit of the exact clean commit and the authoritative local evidence graph.
+The same reviewer’s independent read-only audit returned `DAILY BAR SHADOW GO`, H=0/M=0/L=1 on
+the exact clean evidence commit. The one documentation-only Low was the older acceptance page's
+ambiguous canonical aggregate label; it is resolved there by recording the final report's exact
+algorithm and `fc51fd6f90175d460406f77273a5c6b9053147d884f9e33b0fb0ccf5c63a9d96` value.

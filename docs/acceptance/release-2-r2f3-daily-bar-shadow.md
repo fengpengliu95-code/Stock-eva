@@ -2,7 +2,7 @@
 
 ## Current decision
 
-`20/20 SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO`
+`DAILY BAR SHADOW GO / 20/20 SHADOW_QUALIFIED / NARROW CAPABILITY ONLY`
 
 The same independent reviewer returned H=0/M=0/L=0 for exact clean code commit
 `a6716367a99fb7f35c4aff7f0e59753b9d38783b`. The first isolated runtime then exposed and preserved
@@ -25,7 +25,7 @@ timeouts, retries, reconciliation tolerance, canonical data, publication and fai
 The same reviewer subsequently returned H=0/M=0/L=0 on exact clean remediation commit
 `ff4b6cd2579726e284ab2db6ddd56b66283d5441`. A third fresh runtime then completed the exact
 20-session Shanghai calendar window with no reset. The sidecar is now `SHADOW_QUALIFIED`; this
-record remains NO-GO only until the final independent evidence review described below.
+record reached GO only after the final independent evidence review described below.
 
 ## Delivered capability
 
@@ -219,6 +219,22 @@ Neither report contains provider payload rows. The old v1 mismatch and v2 rate-l
 all 271 canonical partitions and the Task14 control tree remained unchanged; production provider
 control targets remain absent.
 
+## Final independent review
+
+The same reviewer independently audited exact clean commit
+`1d34ccfd8b136c636fd4c07ac2dd4ef0f0c289be` and the authoritative local evidence graph without
+network or provider access. The result was `DAILY BAR SHADOW GO`, H=0/M=0/L=1. The only Low was an
+older acceptance paragraph whose canonical aggregate label did not state its algorithm and showed
+a different historical aggregate. The paragraph below now names the exact final-report algorithm
+and value; the reviewer independently recomputed it after verifying all 271/271 Parquet hashes.
+
+The review also independently confirmed SQLite integrity and foreign keys, 20 reports/jobs/
+candidates/evidence/attestations, 640 attempt-one successes, 20 evidence and candidate bundles,
+640 page objects, exact symbol and OHLC-cell coverage, the three isolated epoch outcomes, absent
+production control targets, and all disabled/unqualified semantic boundaries. The immutable local
+report intentionally preserves its pre-review `GO_PENDING_INDEPENDENT_FINAL_REVIEW` snapshot; this
+section is the subsequent decision record and does not rewrite that reviewed artifact.
+
 ## Frozen compatibility fingerprints
 
 All eight R2-F2 frozen objects matched before and after the gate:
@@ -237,9 +253,10 @@ sha256sums.txt           3f3f412cef86b4e6a41e2e1296a7be1a03a8d8cc2992a79a45333d0
 The local published canonical dataset was read back without writes. Its manifest SHA-256 remains
 the previously recorded Task14 pre-gate value
 `052799bddd785c8a4204e0bc3352b16edaa636934d819a156f247bb8393873a7`.
-All 271 referenced Parquet objects match their immutable descriptor SHA-256 values; their ordered
-date/path/content identity aggregate is
-`3b8f962e80e82714e42820c37f32a65c68c87d98d8e96a5b0ff97743e61cb9fd`.
+All 271 referenced Parquet objects match their immutable descriptor SHA-256 values. The final
+report's exact aggregate is SHA-256 over canonical JSON for the ordered array of
+`path/sha256/row_count`, followed by LF:
+`fc51fd6f90175d460406f77273a5c6b9053147d884f9e33b0fb0ccf5c63a9d96`.
 
 ## Fail-closed and crash evidence
 
@@ -292,6 +309,7 @@ observation is relabeled to a new date, and no provider row is silently mixed at
   provider-registry mutation.
 - [x] Twenty same-vector consecutive confirmed sessions completed with zero reset in the qualifying
   epoch.
-- [ ] The immutable 20-session qualification report passes a final independent review.
-- [ ] Only then may the decision become `DAILY BAR SHADOW GO`; R2-F3 still does not imply full
+- [x] The immutable 20-session qualification report passed a final independent review with
+  H=0/M=0 and one resolved documentation-only Low.
+- [x] The decision is `DAILY BAR SHADOW GO`; R2-F3 still does not imply full
   provider/factor/failover readiness beyond its stated scope.

@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-28; amended 2026-08-29 (Asia/Shanghai)
 
-**Status:** **20/20 SHADOW_QUALIFIED / FINAL INDEPENDENT REVIEW PENDING / DAILY BAR SHADOW NO-GO**
+**Status:** **DAILY BAR SHADOW GO / 20/20 SHADOW_QUALIFIED / NARROW CAPABILITY ONLY**
 
 **Scope:** The capability-scoped `TICKFLOW_FREE_DAILY_BAR_OHLC_V1` shadow lane and its
 20-consecutive-confirmed-session qualification window.
@@ -480,6 +480,10 @@ failover state remain unchanged. The sanitized per-date identity record is
 [R2-F3 Daily Shadow qualification report](../acceptance/release-2-r2f3-daily-shadow-qualification-report.md).
 This empirical result does not change any `UNKNOWN`, `UNQUALIFIED`, disabled or forbidden semantic
 boundary in this design.
+
+The final independent read-only audit of the exact clean evidence commit returned H=0/M=0 and
+`DAILY BAR SHADOW GO`. This decision remains limited to the capability in this design and does not
+authorize any item in Out of Scope.
 
 ## Out of Scope
 
