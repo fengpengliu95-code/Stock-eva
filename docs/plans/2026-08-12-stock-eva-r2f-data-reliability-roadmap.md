@@ -304,13 +304,26 @@ status never exposes provider response bodies or arbitrary exception strings.
   supersede only the assumption that Daily Bar shadow qualification is canonical failover
   authority. R2-F4.0 must keep the secondary blocked and changes no canonical publication path.
 
+**R2-F4.0 delivery status:** **DELIVERED — `R2-F4.0 SELECTION CONTRACT GO / SECONDARY
+BLOCKED / R2-F4 NO-GO`** at reviewed implementation baseline
+`bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1`.
+This is an offline, read-only capability admission shield. It records TickFlow's
+`DAILY_BAR_SHADOW_QUALIFIED` projection while keeping adjustment factors `UNQUALIFIED`,
+activity units/suspension/exact-session universe/promoted calendar/raw retention `UNKNOWN`,
+`canonical_session_failover_state=UNQUALIFIED`, `effective_auto_failover_enabled=false`,
+and publication/failover disabled. No provider, canonical dataset, pointer, automation or
+production control state is changed. The next blocking subversion is R2-F4.1 promoted runtime
+calendar generations; it must be separately implemented and reviewed before any legacy
+failover task is rewritten.
+
 | Version | Objective | Main deliverables | Exit gate | Planning size |
 |---|---|---|---|---|
 | R2-F0 | Close the active incident without weakening quality | Suspended/factor contract fix, typed failures, 2026-08-11 regression, supervised republish | Incident fixture GREEN; invalid active rows still fail; exact missing session publishes; old pointer preserved on negative tests | 2-3 engineering days |
 | R2-F1 | Ensure every confirmed missing session remains repairable | Continuity inventory, persistent repair queue, Freshness/Repair lanes, status/CLI | Restart-safe queue repairs injected gaps; latest session is never starved; no future/unknown calendar writes | 4-6 engineering days |
 | R2-F2 | Make provider evidence and canonical selection auditable | Provider protocol, BaoStock compatibility adapter, immutable evidence, replay, candidate/selection manifests, source-model migration | BaoStock can be replayed offline to byte/semantic-equivalent candidate; old readers remain compatible; no secret/path leakage | 6-8 engineering days |
 | R2-F3 | Qualify a real secondary source without production risk | TickFlow and credentialed Tushare evaluation, adapters for approved candidates, reconciliation, shadow scheduler, qualification report | At least one legally/operationally approved provider completes 20 consecutive full-universe shadow sessions within tolerances; canonical source remains unchanged | 5-8 engineering days plus 20 trading sessions |
-| R2-F4 | Enable controlled whole-session failover and close operating gaps | Selection policy and kill switch, automatic next-year calendar workflow, universe/classification maintenance, replication outbox, restore drill, operator runbook | Forced primary failure publishes one qualified secondary session with zero mixed-source rows; calendar/universe/restore/NAS-degraded drills pass | 7-10 engineering days |
+| R2-F4.0 | Deliver the capability-gated selection shield | Read-only capability matrix, deterministic preflight, default-off configuration, API/CLI status, compatibility evidence | Daily-only qualification remains failover-ineligible; no canonical mutation; frozen R2-F2/R2-F3 state remains byte-identical | **Delivered** |
+| R2-F4 | Enable controlled whole-session failover and close operating gaps | Selection policy and kill switch, automatic next-year calendar workflow, universe/classification maintenance, replication outbox, restore drill, operator runbook | Forced primary failure publishes one qualified secondary session with zero mixed-source rows; calendar/universe/restore/NAS-degraded drills pass | Blocked by R2-F4.1+ |
 | R2-F5 | Prove long-term operation under real schedules and failures | Automated acceptance matrix, production soak dashboard, chaos drills, final evidence and Release 2 re-entry decision | All SLOs below pass over 20 consecutive trading sessions; no unresolved P0/P1 data-reliability defect | Minimum 20 trading sessions |
 
 Planning size is an engineering estimate, not a delivery date. Provider procurement, terms review,

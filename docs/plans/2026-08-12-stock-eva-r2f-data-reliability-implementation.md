@@ -1103,6 +1103,23 @@ R2-F4.0 adds only a read-only selection shield and cannot select or publish a se
 Task 14 rewrite remains blocked until a separate canonical-capability qualification proves every
 required semantic and exact-session contract.
 
+### R2-F4.0 delivered — capability-gated selection shield
+
+The R2-F4.0 slice is delivered at reviewed implementation baseline
+`bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1` with the decision
+`R2-F4.0 SELECTION CONTRACT GO / SECONDARY BLOCKED / R2-F4 NO-GO`. Its isolated domain,
+allowlisted configuration and read-only API/CLI status make the R2-F3 Daily qualification
+explicitly non-canonical: Daily Bar is `QUALIFIED` only; adjustment factor is `UNQUALIFIED`;
+activity units, suspension semantics, exact-session universe, promoted calendar and raw
+retention remain `UNKNOWN`; full-session and canonical failover states remain `UNQUALIFIED`.
+The effective automatic-failover flag, publication and failover are false. The implementation
+does not call a provider, read credentials, initialize or write a sidecar, mutate canonical
+data, move a pointer, or add an automation branch.
+
+The next blocking subversion is **R2-F4.1 promoted runtime calendar generations and next-year
+fail-closed maintenance**. It must be implemented and independently reviewed before the parked
+legacy Task 14 may be rewritten. R2-F4.1 does not grant canonical secondary authority by itself.
+
 ### PARKED LEGACY Task 14 — DO NOT EXECUTE
 
 The former executable Task 14 sketch was removed from the current plan because its prerequisite —
@@ -1798,6 +1815,8 @@ installed runtime or observation window.
   code gate is GO at 336107be1149d829c0ea841dd2466982bff7d689.
 - [ ] R2-F2 replays immutable raw evidence and preserves all legacy canonical objects/readers.
 - [ ] R2-F3 qualifies at least one secondary over 20 consecutive trading sessions.
+- [x] R2-F4.0 delivers a default-off, read-only capability shield and keeps Daily-only
+  qualification failover-ineligible; see `docs/acceptance/release-2-r2f4-0.md`.
 - [ ] R2-F4 demonstrates default-off, whole-session failover with zero mixed-source rows.
 - [ ] Calendar covers the next required year and unknown/conflict remains fail-closed.
 - [ ] Exact-session universe counts reconcile and unknown state is zero for publication.
