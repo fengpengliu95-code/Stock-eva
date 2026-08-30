@@ -143,8 +143,10 @@ or modifying any sidecar.
 
 - FR-14: Hash binding
 
-Capability and readiness snapshots use domain-separated canonical JSON SHA-256. Equivalent input
-is byte/digest deterministic; changed state or lineage changes the digest.
+The policy, capability, readiness and preflight identities MUST use the exact canonical encoding,
+domain strings, field sets and digest-field exclusions frozen under **Canonical bytes and policy
+identity** below. Equivalent input is byte/digest deterministic; changed state or lineage changes
+the digest, and a supplied digest that does not match the recomputed preimage is rejected.
 
 - FR-15: No authority widening
 
@@ -172,25 +174,90 @@ secondary branch to automation, or modify canonical publication.
 
 ## Data models
 
+### Canonical bytes and policy identity
+
+Every hash in this slice uses these exact functions:
+
+```python
+canonical_json_bytes(value) = (
+    json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    + "\n"
+).encode("utf-8")
+
+domain_sha256(domain, value) = sha256(
+    domain.encode("ascii") + b"\n" + canonical_json_bytes(value)
+).hexdigest()
+```
+
+Model preimages use `model_dump(mode="json", by_alias=False, exclude_none=False)` and include every
+declared field, including nulls, empty tuples, zeroes and false values. Only the model's own digest
+field is removed where stated below; no default, alias or nested field may be omitted.
+
+The policy payload is the following fixed object; these values are implementation constants and
+are never accepted from a caller:
+
+```json
+{
+  "canonical_capability_profile": "CANONICAL_SESSION_FAILOVER_V1",
+  "effective_auto_failover_enabled": false,
+  "eligible_secondary": null,
+  "policy_version": "r2f4.0-selection-shield-v1",
+  "primary_provider": "baostock",
+  "schema_version": 1,
+  "selection_execution": "NOT_IMPLEMENTED"
+}
+```
+
+`policy_sha256` is exactly
+`domain_sha256("stock-eva/r2f4.0/selection-shield-policy/v1", policy_payload)`.
+
 ### Capability snapshot v1
 
 | Field | Type | Constraints |
 |---|---|---|
+| `schema_version` | literal | `1` |
+| `capability_profile` | literal | `DAILY_BAR_SHADOW_V1` |
 | `provider` | literal | `tickflow` |
 | `source_profile` | literal | `TICKFLOW_FREE_DAILY_BAR_OHLC_V1` |
 | `source_status` | enum | `READY` or `UNAVAILABLE` |
-| capability state fields | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
-| source descriptor/vector | SHA-256 or null | Present only for verified ready source state |
-| component identity hashes | SHA-256 or null | Adapter, policy, terms, calendar, universe policy and qualification evidence |
-| qualification sessions | integer | `0..20` |
-| canonical failover state | literal | `UNQUALIFIED` in schema v1 |
+| `source_lifecycle_state` | enum or null | `PENDING`, `OBSERVING`, `RESET`, `SHADOW_QUALIFIED`, or null only when unavailable |
+| `daily_bar_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `activity_units_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `adjustment_factor_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `suspension_semantics_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `exact_session_universe_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `promoted_calendar_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `raw_retention_contract_state` | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
+| `full_session_qualification_state` | literal | `UNQUALIFIED` |
+| `source_descriptor_sha256` | SHA-256 or null | Strict Daily descriptor identity |
+| `source_version_vector_sha256` | SHA-256 or null | Strict Daily version-vector identity |
+| `source_adapter_sha256` | SHA-256 or null | Reviewed adapter identity |
+| `source_policy_sha256` | SHA-256 or null | Daily qualification-policy identity |
+| `source_terms_evidence_sha256` | SHA-256 or null | Terms evidence identity |
+| `source_calendar_generation` | safe ID or null | Daily source calendar generation |
+| `source_calendar_sha256` | SHA-256 or null | Daily source calendar identity |
+| `source_universe_policy_sha256` | SHA-256 or null | Daily universe-policy identity |
+| `source_exact_universe_sha256` | SHA-256 or null | Always null in this profile |
+| `source_qualification_evidence_sha256` | SHA-256 or null | Always null in this profile |
+| `source_qualification_candidate_sha256` | SHA-256 or null | Always null in this profile |
+| `source_qualification_sessions` | integer | `0..20` |
+| `canonical_session_failover_state` | literal | `UNQUALIFIED` |
 | `snapshot_sha256` | SHA-256 | Domain-separated canonical projection |
 
 ```text
 SecondaryCapabilitySnapshotV1
+  schema_version = 1
+  capability_profile = DAILY_BAR_SHADOW_V1
   provider = tickflow
   source_profile = TICKFLOW_FREE_DAILY_BAR_OHLC_V1
   source_status = READY | UNAVAILABLE
+  source_lifecycle_state = PENDING | OBSERVING | RESET | SHADOW_QUALIFIED | null
   daily_bar_state = QUALIFIED | UNQUALIFIED | UNKNOWN
   activity_units_state = QUALIFIED | UNQUALIFIED | UNKNOWN
   adjustment_factor_state = QUALIFIED | UNQUALIFIED | UNKNOWN
@@ -215,6 +282,10 @@ SecondaryCapabilitySnapshotV1
   snapshot_sha256 = sha256(canonical domain-separated projection)
 ```
 
+The capability preimage is the complete model dump with only `snapshot_sha256` removed.
+`snapshot_sha256` is exactly
+`domain_sha256("stock-eva/r2f4.0/capability-snapshot/v1", capability_preimage)`.
+
 `canonical_session_failover_state` is intentionally a literal `UNQUALIFIED` in v1. A future
 canonical-capability qualification must introduce a new schema/profile and direct evidence rather
 than mutating the meaning of v1.
@@ -238,20 +309,28 @@ Cross-field validation is fail closed:
 
 | Field | Type | Constraints |
 |---|---|---|
+| `schema_version` | literal | `1` |
 | `status` | enum | `ready` or `unavailable` |
 | `policy_version` | literal | `r2f4.0-selection-shield-v1` |
-| configured flag | boolean | Observed configuration only |
-| effective flag | literal | Always false in R2-F4.0 |
-| provider priority | ordered tuple | BaoStock first, known, unique |
-| eligible secondary | null | No secondary admission in schema v1 |
-| blocked reasons | ordered tuple | Closed vocabulary |
-| request/write counters | literals | Zero and false |
+| `policy_sha256` | SHA-256 | Exact fixed policy identity above |
+| `primary_provider` | literal | `baostock` |
+| `configured_auto_failover_enabled` | boolean | Observed configuration only |
+| `effective_auto_failover_enabled` | literal | `false` |
+| `provider_priority` | ordered tuple | BaoStock first, known, unique |
+| `eligible_secondary` | null | No secondary admission in schema v1 |
+| `secondary` | model or null | Complete capability snapshot including its digest |
+| `blocked_reasons` | ordered tuple | Closed vocabulary |
+| `provider_requests` | literal | `0` |
+| `secondary_requests` | literal | `0` |
+| `canonical_writes` | literal | `false` |
 | `readiness_sha256` | SHA-256 | Domain-separated canonical projection |
 
 ```text
 FailoverReadinessV1
+  schema_version = 1
   status = ready | unavailable
   policy_version = r2f4.0-selection-shield-v1
+  policy_sha256 = fixed policy digest
   primary_provider = baostock
   configured_auto_failover_enabled = bool
   effective_auto_failover_enabled = false
@@ -260,23 +339,31 @@ FailoverReadinessV1
   secondary = SecondaryCapabilitySnapshotV1 | null
   blocked_reasons = ordered closed vocabulary
   provider_requests = 0
+  secondary_requests = 0
   canonical_writes = false
   readiness_sha256 = sha256(canonical domain-separated projection)
 ```
+
+The readiness preimage is the complete model dump with only `readiness_sha256` removed. A non-null
+`secondary` is its complete nested model dump including `snapshot_sha256`. `readiness_sha256` is
+exactly `domain_sha256("stock-eva/r2f4.0/failover-readiness/v1", readiness_preimage)`.
 
 ### Preflight decision
 
 | Field | Type | Constraints |
 |---|---|---|
 | `schema_version` | literal | `1` |
-| policy version/hash | literal/SHA-256 | Exact R2-F4.0 shield identity |
+| `policy_version` | literal | `r2f4.0-selection-shield-v1` |
+| `policy_sha256` | SHA-256 | Exact fixed policy identity above |
 | `primary_state` | enum | `READY` or `UNAVAILABLE` |
 | `readiness_sha256` | SHA-256 | Exact validated readiness input |
 | `action` | enum | `PRIMARY_ALLOWED` or `SECONDARY_BLOCKED` |
 | `selected_provider` | literal or null | `baostock` only for primary-ready |
 | `pointer_action` | enum | `PRIMARY_PUBLICATION_MAY_PROCEED` or `PRESERVE_POINTER` |
 | `reason` | enum | `PRIMARY_READY` or `SECONDARY_NOT_CANONICALLY_QUALIFIED` |
-| request/write fields | literals | Zero and false |
+| `provider_requests` | literal | `0` |
+| `secondary_requests` | literal | `0` |
+| `canonical_writes` | literal | `false` |
 | `decision_sha256` | SHA-256 | Domain-separated canonical projection without the digest field |
 
 ```text
@@ -286,8 +373,8 @@ primary UNAVAILABLE -> SECONDARY_BLOCKED / null / PRESERVE_POINTER /
 ```
 
 The decision is advisory and confers no `PublishedSelection` or canonical write capability. Its
-canonical preimage is every field above except `decision_sha256`, encoded with the same sorted,
-compact, UTF-8 canonical JSON plus the domain `stock-eva/r2f4.0/preflight-decision/v1`.
+preimage is the complete model dump with only `decision_sha256` removed. `decision_sha256` is
+exactly `domain_sha256("stock-eva/r2f4.0/preflight-decision/v1", decision_preimage)`.
 
 ## API contracts
 
@@ -430,6 +517,12 @@ operator drill or automatic/manual failover.
 - OS-6: Production operations
 
 Production installation, LaunchAgent changes, NAS access or production control writes.
+
+- OS-7: Production readback
+
+Application Support runtime state, production canonical data, production provider-control state and
+`/Volumes/Stock` are not read, fingerprinted or enumerated by R2-F4.0 development or acceptance.
+All runtime-shaped evidence is built from tracked fixtures or synthetic private temporary roots.
 
 ## Linear follow-on
 

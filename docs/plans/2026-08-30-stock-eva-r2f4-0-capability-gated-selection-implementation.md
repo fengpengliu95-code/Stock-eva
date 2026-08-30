@@ -55,7 +55,11 @@ Add tests proving:
 13. every source component hash/generation field is either correctly bound or fail-closed null;
 14. every readiness state maps to the exact frozen reason tuple and order;
 15. a priority whose first secondary has no capability source returns control unavailable and does
-    not skip to a later provider.
+    not skip to a later provider;
+16. policy, capability, readiness and decision use exact byte vectors for the frozen domain,
+    canonical JSON and preimage contracts, including a non-ASCII value;
+17. changing any included field or adding/removing a null, false, zero or empty-tuple field changes
+    the digest, while a supplied digest mismatch fails validation.
 
 ### Step 1.2: Run RED
 
@@ -117,6 +121,9 @@ Add tests proving:
 - missing, corrupt/short, symlinked, wrong-owner, wrong-mode, journaled, locked and external-bundle-
   mismatched state is bounded unavailable;
 - invalid provider priority is rejected before an injected reader sentinel can be called;
+- provider/network constructors are hard sentinels and are never invoked;
+- Application Support runtime paths and `/Volumes/Stock` are hard path-open sentinels and are never
+  read, fingerprinted or enumerated;
 - ready and unavailable GET/CLI calls preserve complete tree fingerprints, DB hashes and mtimes;
 - configured true plus TickFlow priority still reports effective false and no eligible secondary;
 - serialized output contains no credential, path, URL, payload, SQL or arbitrary exception text.
@@ -202,19 +209,23 @@ uv run --offline python \
 git diff --check
 ```
 
-### Step 3.3: Prove protected state did not change
+### Step 3.3: Prove protected state did not change using offline fixtures
 
 Verify and record:
 
-- every R2-F2 golden file and `sha256sums.txt` hash;
-- the R2-F3 final qualification report SHA-256;
-- strict R2-F3 Daily status remains `READY / SHADOW_QUALIFIED / 20/20 / CLOSED`, with publication
-  and failover false;
-- production canonical manifest SHA-256 and every declared Parquet object hash;
-- no production provider-control or canonical file was created/modified by R2-F4.0 tests/status;
+- every tracked R2-F2 golden file matches tracked `sha256sums.txt`;
+- the tracked R2-F3 fixture and frozen constants remain byte-identical to the starting commit;
+- a synthetic private temporary-root Daily sidecar proves strict
+  `READY / SHADOW_QUALIFIED / 20/20 / CLOSED`, with publication and failover false;
+- a synthetic canonical fixture tree is byte-identical before and after API/CLI reads;
+- provider/network constructors, Application Support runtime paths and `/Volumes/Stock` are hard
+  sentinels whose invocation fails the test;
 - changed-file diff does not include `providers/base.py`, `models.py`, `candidates.py`,
   `automation.py`, `store.py`, `storage/dataset.py`, generic provider registry, R2-F3 Daily
   sidecar/schema/evidence/candidate/worker/provider modules or any canonical data object.
+
+Do not read or fingerprint real R2-F3 runtime state, production canonical data, production provider
+control state or NAS. Prior R2-F3 acceptance is historical context, not fresh R2-F4.0 evidence.
 
 ### Step 3.4: Independent final review
 
