@@ -148,6 +148,35 @@ def test_failover_readiness_api_does_not_mask_projection_errors(tmp_path, monkey
     assert "projection" not in response.text
 
 
+def test_failover_readiness_api_does_not_mask_projection_value_errors(
+    tmp_path, monkeypatch
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type("Reader", (), {"read": lambda self: object()})(),
+    )
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_api,
+        "build_capability_snapshot",
+        lambda _status: (_ for _ in ()).throw(ValueError("projection")),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings, raise_app_exceptions=False)
+    assert response.status_code == 500
+    assert "projection" not in response.text
+
+
 def test_failover_readiness_does_not_mask_policy_errors(tmp_path, monkeypatch) -> None:
     settings = Settings(
         _env_file=None,
@@ -180,6 +209,34 @@ def test_failover_readiness_does_not_mask_policy_errors(tmp_path, monkeypatch) -
     assert "policy" not in response.text
 
 
+def test_failover_readiness_api_does_not_mask_policy_value_errors(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type("Reader", (), {"read": lambda self: object()})(),
+    )
+    monkeypatch.setattr(market_api, "build_capability_snapshot", lambda _status: object())
+    monkeypatch.setattr(
+        market_api,
+        "build_readiness",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("policy")),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings, raise_app_exceptions=False)
+    assert response.status_code == 500
+    assert "policy" not in response.text
+
+
 def test_failover_readiness_api_invalid_environment_is_sanitized_422(monkeypatch) -> None:
     from backend.app.config import get_settings
 
@@ -201,6 +258,25 @@ def test_failover_readiness_api_invalid_environment_is_sanitized_422(monkeypatch
     assert response.json() == {"detail": {"code": "invalid_failover_configuration"}}
     assert "tickflow" not in response.text
     assert "STOCK_EVA" not in response.text
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        Settings.model_construct(market_provider_priority=("tickflow", "baostock")),
+        Settings.model_construct(market_provider_priority=None),
+        Settings.model_construct(market_auto_failover_enabled="yes"),
+    ],
+)
+def test_failover_readiness_api_bypassed_invalid_settings_are_sanitized_422(settings) -> None:
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "invalid_failover_configuration"}}
+
+
+def test_failover_readiness_openapi_declares_sanitized_422_response() -> None:
+    response = app.openapi()["paths"]["/api/v1/market/failover-readiness"]["get"]["responses"]
+    assert "422" in response
 
 
 def test_failover_readiness_primary_only_does_not_construct_reader(tmp_path, monkeypatch) -> None:

@@ -55,6 +55,10 @@ from backend.app.storage.preflight import StoragePreflight, configured_market_da
 router = APIRouter(prefix="/market", tags=["market"])
 
 
+class InvalidFailoverConfiguration(ValueError):
+    """Raised only when the allowlisted readiness configuration is invalid."""
+
+
 class UnavailableReason(StrEnum):
     REGISTRY_MISSING = "registry_missing"
     REGISTRY_SCHEMA_INVALID = "registry_schema_invalid"
@@ -243,14 +247,14 @@ def read_market_failover_readiness(
     settings: Settings | MarketFailoverRuntimeSettings,
 ) -> FailoverReadinessV1:
     """Read the advisory failover shield without provider or canonical access."""
-    priority = tuple(settings.market_provider_priority)
     # Validate the complete allowlisted configuration before touching any sidecar path.
     try:
+        priority = tuple(settings.market_provider_priority)
         _validate_priority(priority)
         if type(settings.market_auto_failover_enabled) is not bool:
             raise TypeError("invalid failover boolean")
     except (TypeError, ValueError) as exc:
-        raise ValueError("invalid failover configuration") from exc
+        raise InvalidFailoverConfiguration("invalid failover configuration") from exc
 
     kwargs = {
         "configured_auto_failover_enabled": settings.market_auto_failover_enabled,
@@ -297,11 +301,21 @@ def get_market_failover_api_settings() -> Settings:
         ) from exc
 
 
-@router.get("/failover-readiness", response_model=FailoverReadinessV1)
+@router.get(
+    "/failover-readiness",
+    response_model=FailoverReadinessV1,
+    responses={422: {"description": "invalid failover configuration"}},
+)
 def market_failover_readiness(
     settings: Annotated[Settings, Depends(get_market_failover_api_settings)],
 ) -> FailoverReadinessV1:
-    return read_market_failover_readiness(settings)
+    try:
+        return read_market_failover_readiness(settings)
+    except InvalidFailoverConfiguration as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_failover_configuration"},
+        ) from exc
 
 
 def get_calendar_sync_store(
