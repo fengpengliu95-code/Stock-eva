@@ -9,6 +9,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _validate_provider_priority(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = tuple(value.split(","))
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("invalid market provider priority")
+    priority = tuple(value)
+    known = {"baostock", "tickflow", "tushare"}
+    if any(
+        not isinstance(item, str) or not item or item.strip() != item or item not in known
+        for item in priority
+    ):
+        raise ValueError("invalid market provider priority")
+    if not priority or priority[0] != "baostock" or len(set(priority)) != len(priority):
+        raise ValueError("invalid market provider priority")
+    return priority
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -91,23 +111,7 @@ class Settings(BaseSettings):
     @field_validator("market_provider_priority", mode="before")
     @classmethod
     def validate_market_provider_priority(cls, value: object) -> tuple[str, ...]:
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                value = tuple(value.split(","))
-        if not isinstance(value, (tuple, list)):
-            raise ValueError("invalid market provider priority")
-        priority = tuple(value)
-        known = {"baostock", "tickflow", "tushare"}
-        if any(
-            not isinstance(item, str) or not item or item.strip() != item or item not in known
-            for item in priority
-        ):
-            raise ValueError("invalid market provider priority")
-        if not priority or priority[0] != "baostock" or len(set(priority)) != len(priority):
-            raise ValueError("invalid market provider priority")
-        return priority
+        return _validate_provider_priority(value)
 
     @field_validator("provider_evidence_max_object_bytes")
     @classmethod
@@ -263,26 +267,122 @@ def get_settings() -> Settings:
     return Settings()
 
 
+class MarketFailoverRuntimeSettings(BaseModel):
+    """Credential-free, allowlisted settings used by the readiness CLI."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market_auto_failover_enabled: bool = False
+    market_provider_priority: tuple[str, ...] = ("baostock",)
+    provider_shadow_root: Path = Path.cwd() / "var/provider-shadow"
+    provider_evidence_root: Path = Path.cwd() / "var/evidence"
+    local_control_dir: Path = Path.cwd() / "var/control"
+    provider_registry_database_name: str = "provider_registry.sqlite3"
+    daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
+    provider_health_database_name: str = "provider_health.sqlite3"
+    local_market_dataset_root: Path | None = None
+    nas_market_dataset_root: Path | None = None
+    daily_bar_shadow_calendar_root: Path | None = None
+
+    @field_validator("market_provider_priority", mode="before")
+    @classmethod
+    def validate_priority(cls, value: object) -> tuple[str, ...]:
+        return _validate_provider_priority(value)
+
+    @field_validator(
+        "provider_shadow_root",
+        "provider_evidence_root",
+        "local_control_dir",
+        "local_market_dataset_root",
+        "nas_market_dataset_root",
+        "daily_bar_shadow_calendar_root",
+    )
+    @classmethod
+    def validate_runtime_paths(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("market failover runtime path must be absolute")
+        return value
+
+    @field_validator(
+        "provider_registry_database_name",
+        "daily_bar_shadow_database_name",
+        "provider_health_database_name",
+    )
+    @classmethod
+    def validate_sidecar_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("market failover sidecar name is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def sidecar_names_are_distinct(self) -> "MarketFailoverRuntimeSettings":
+        names = (
+            self.provider_registry_database_name,
+            self.daily_bar_shadow_database_name,
+            self.provider_health_database_name,
+        )
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("market failover sidecar names must be distinct")
+        return self
+
+
 def get_market_failover_runtime_settings(
     environ: Mapping[str, str] | None = None,
-) -> Settings:
-    """Build the failover CLI settings from its two non-credential allowlisted values.
+) -> MarketFailoverRuntimeSettings:
+    """Read only the failover CLI's explicit non-credential allowlist.
 
-    ``model_validate`` is intentional here: unlike ``Settings()``, it does not enumerate
-    process environment variables.  Runtime paths therefore remain the safe local defaults
-    unless a caller injects a fully constructed Settings object for an isolated test root.
+    No BaseSettings construction occurs here: only the named Mapping ``get`` calls below are
+    allowed, and no token or provider credential can influence the projection.
     """
 
     source = os.environ if environ is None else environ
-    return Settings.model_validate(
-        {
-            "market_auto_failover_enabled": source.get(
-                "STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED", False
-            ),
-            "market_provider_priority": source.get(
-                "STOCK_EVA_MARKET_PROVIDER_PRIORITY", ("baostock",)
-            ),
-        }
+    return MarketFailoverRuntimeSettings(
+        market_auto_failover_enabled=_closed_bool(
+            source, "STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED", default=False
+        ),
+        market_provider_priority=_validate_provider_priority(
+            source.get("STOCK_EVA_MARKET_PROVIDER_PRIORITY", ("baostock",))
+        ),
+        provider_shadow_root=_closed_path(
+            source,
+            "STOCK_EVA_PROVIDER_SHADOW_ROOT",
+            default=Path.cwd() / "var/provider-shadow",
+        ),
+        provider_evidence_root=_closed_path(
+            source,
+            "STOCK_EVA_PROVIDER_EVIDENCE_ROOT",
+            default=Path.cwd() / "var/evidence",
+        ),
+        local_control_dir=_closed_path(
+            source,
+            "STOCK_EVA_LOCAL_CONTROL_DIR",
+            default=Path.cwd() / "var/control",
+        ),
+        provider_registry_database_name=source.get(
+            "STOCK_EVA_PROVIDER_REGISTRY_DATABASE_NAME", "provider_registry.sqlite3"
+        ),
+        daily_bar_shadow_database_name=source.get(
+            "STOCK_EVA_DAILY_BAR_SHADOW_DATABASE_NAME", "daily_bar_shadow.sqlite3"
+        ),
+        provider_health_database_name=source.get(
+            "STOCK_EVA_PROVIDER_HEALTH_DATABASE_NAME", "provider_health.sqlite3"
+        ),
+        local_market_dataset_root=_closed_path(
+            source, "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT", default=None
+        ),
+        nas_market_dataset_root=_closed_path(
+            source, "STOCK_EVA_NAS_MARKET_DATASET_ROOT", default=None
+        ),
+        daily_bar_shadow_calendar_root=_closed_path(
+            source, "STOCK_EVA_DAILY_BAR_SHADOW_CALENDAR_ROOT", default=None
+        ),
     )
 
 

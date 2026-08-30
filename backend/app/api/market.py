@@ -4,10 +4,11 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_settings import SettingsError
 
 from backend.app.api.storage import get_storage_readiness
-from backend.app.config import Settings, get_settings
+from backend.app.config import MarketFailoverRuntimeSettings, Settings, get_settings
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
 from backend.app.market.calendar_sync import (
@@ -21,9 +22,13 @@ from backend.app.market.continuity import (
     build_continuity_status_summary,
 )
 from backend.app.market.daily_shadow_models import DAILY_SHADOW_PROFILE
-from backend.app.market.daily_shadow_registry import DailyShadowRegistryReader
+from backend.app.market.daily_shadow_registry import (
+    DailyShadowRegistryReader,
+    DailyShadowRegistryUnavailable,
+)
 from backend.app.market.failover import (
     FailoverReadinessV1,
+    _validate_priority,
     build_capability_snapshot,
     build_readiness,
 )
@@ -234,17 +239,17 @@ def market_provider_daily_bar_shadow(
     )
 
 
-def read_market_failover_readiness(settings: Settings) -> FailoverReadinessV1:
+def read_market_failover_readiness(
+    settings: Settings | MarketFailoverRuntimeSettings,
+) -> FailoverReadinessV1:
     """Read the advisory failover shield without provider or canonical access."""
     priority = tuple(settings.market_provider_priority)
     # Validate the complete allowlisted configuration before touching any sidecar path.
     try:
-        build_readiness(
-            configured_auto_failover_enabled=settings.market_auto_failover_enabled,
-            provider_priority=priority,
-            control_state_available=False,
-        )
-    except Exception as exc:
+        _validate_priority(priority)
+        if type(settings.market_auto_failover_enabled) is not bool:
+            raise TypeError("invalid failover boolean")
+    except (TypeError, ValueError) as exc:
         raise ValueError("invalid failover configuration") from exc
 
     kwargs = {
@@ -258,30 +263,45 @@ def read_market_failover_readiness(settings: Settings) -> FailoverReadinessV1:
 
     try:
         layout = StorageLayout(settings)
-        layout.validate_daily_bar_shadow_layout()
+        layout.validate_daily_bar_shadow_layout(
+            canonical_roots=tuple(
+                root
+                for root in (
+                    settings.local_market_dataset_root,
+                    settings.nas_market_dataset_root,
+                    settings.daily_bar_shadow_calendar_root,
+                )
+                if root is not None
+            )
+        )
         status = DailyShadowRegistryReader(
             layout.daily_bar_shadow_database,
             evidence_root=layout.daily_bar_shadow_evidence_root,
             candidate_root=layout.daily_bar_shadow_candidate_root,
             verify_external=True,
         ).read()
-        secondary = build_capability_snapshot(status)
-        return build_readiness(**kwargs, secondary=secondary)
-    except Exception:
+    except (DailyShadowRegistryUnavailable, RegistryUnavailable, OSError, ValueError):
         return build_readiness(**kwargs, control_state_available=False)
+    secondary = build_capability_snapshot(status)
+    return build_readiness(**kwargs, secondary=secondary)
 
 
-@router.get("/failover-readiness", response_model=FailoverReadinessV1)
-def market_failover_readiness(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> FailoverReadinessV1:
+def get_market_failover_api_settings() -> Settings:
+    """Resolve API settings while keeping invalid configuration details private."""
     try:
-        return read_market_failover_readiness(settings)
-    except ValueError as exc:
+        return get_settings()
+    except (SettingsError, ValidationError, ValueError) as exc:
         raise HTTPException(
             status_code=422,
             detail={"code": "invalid_failover_configuration"},
         ) from exc
+
+
+@router.get("/failover-readiness", response_model=FailoverReadinessV1)
+def market_failover_readiness(
+    settings: Annotated[Settings, Depends(get_market_failover_api_settings)],
+) -> FailoverReadinessV1:
+    return read_market_failover_readiness(settings)
 
 
 def get_calendar_sync_store(

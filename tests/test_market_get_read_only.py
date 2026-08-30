@@ -23,6 +23,7 @@ from backend.app.main import app
 from backend.app.market.automation import RefreshRunLock
 from backend.app.market.calendar_sync import CalendarSyncStore
 from backend.app.market.continuity import ContinuityStatusSummary, ContinuityUnavailable
+from backend.app.market.daily_shadow_registry import DailyShadowRegistryUnavailable
 from backend.app.market.evidence import EvidenceReader
 from backend.app.market.models import RefreshResult
 from backend.app.market.normalize import normalize_baostock_rows
@@ -118,6 +119,262 @@ def test_failover_readiness_cli_is_read_only_and_has_no_execute(
     assert payload["canonical_writes"] is False
     with pytest.raises(cli_module._CliArgumentError):
         cli_module.build_parser().parse_args(["market-failover-readiness", "--execute"])
+
+
+def test_failover_readiness_api_does_not_mask_projection_errors(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type("Reader", (), {"read": lambda self: object()})(),
+    )
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_api,
+        "build_capability_snapshot",
+        lambda _status: (_ for _ in ()).throw(RuntimeError("projection")),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings, raise_app_exceptions=False)
+    assert response.status_code == 500
+    assert "projection" not in response.text
+
+
+def test_failover_readiness_does_not_mask_policy_errors(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type("Reader", (), {"read": lambda self: object()})(),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "build_capability_snapshot",
+        lambda _status: object(),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "build_readiness",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("policy")),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings, raise_app_exceptions=False)
+    assert response.status_code == 500
+    assert "policy" not in response.text
+
+
+def test_failover_readiness_api_invalid_environment_is_sanitized_422(monkeypatch) -> None:
+    from backend.app.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("STOCK_EVA_MARKET_PROVIDER_PRIORITY", '["tickflow", "baostock"]')
+
+    async def send() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/api/v1/market/failover-readiness")
+
+    app.dependency_overrides.clear()
+    try:
+        response = asyncio.run(send())
+    finally:
+        app.dependency_overrides.clear()
+        get_settings.cache_clear()
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "invalid_failover_configuration"}}
+    assert "tickflow" not in response.text
+    assert "STOCK_EVA" not in response.text
+
+
+def test_failover_readiness_primary_only_does_not_construct_reader(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock",),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: pytest.fail("primary-only must not read the sidecar"),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_failover_readiness_tushare_first_does_not_skip_to_tickflow(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tushare", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: pytest.fail("Tushare-first must not inspect TickFlow"),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "unavailable"
+    assert payload["blocked_reasons"] == [
+        "CONTROL_STATE_UNAVAILABLE",
+        "SELECTION_EXECUTION_NOT_IMPLEMENTED",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        DailyShadowRegistryUnavailable("locked"),
+        OSError("path secret"),
+        ValueError("malformed"),
+    ],
+)
+def test_failover_readiness_expected_control_failures_are_bounded(
+    tmp_path, monkeypatch, failure
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type(
+            "Reader", (), {"read": lambda self: (_ for _ in ()).throw(failure)}
+        )(),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings, raise_app_exceptions=False)
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert "path secret" not in response.text
+
+
+def test_failover_readiness_layout_overlap_is_bounded_without_writes(tmp_path) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=root,
+        local_market_dataset_root=root,
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    before = tuple(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert tuple(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")) == before
+
+
+def test_failover_readiness_passes_all_configured_canonical_roots_to_layout(
+    tmp_path, monkeypatch
+) -> None:
+    roots = {
+        "dataset": tmp_path / "dataset",
+        "nas": tmp_path / "nas",
+        "calendar": tmp_path / "calendar",
+    }
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        local_market_dataset_root=roots["dataset"],
+        nas_market_dataset_root=roots["nas"],
+        daily_bar_shadow_calendar_root=roots["calendar"],
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    observed = {}
+    monkeypatch.setattr(
+        market_api.StorageLayout,
+        "validate_daily_bar_shadow_layout",
+        lambda _layout, *, canonical_roots: observed.setdefault("roots", canonical_roots),
+    )
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: type(
+            "Reader", (), {"read": lambda self: (_ for _ in ()).throw(OSError("missing"))}
+        )(),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    assert observed["roots"] == (roots["dataset"], roots["nas"], roots["calendar"])
+
+
+def test_failover_readiness_cli_unavailable_has_exit_one_and_no_execute(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    monkeypatch.setattr(cli_module, "get_market_failover_runtime_settings", lambda: settings)
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: pytest.fail("reader should not be reached with missing layout"),
+    )
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-failover-readiness"])
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unavailable"
+    assert payload["provider_requests"] == payload["secondary_requests"] == 0
+    assert payload["canonical_writes"] is False
+
+
+def test_failover_readiness_cli_invalid_priority_exits_two_before_reader(
+    monkeypatch, capsys
+) -> None:
+    invalid = Settings.model_construct(
+        market_auto_failover_enabled=True,
+        market_provider_priority=("tickflow", "baostock"),
+    )
+    monkeypatch.setattr(cli_module, "get_market_failover_runtime_settings", lambda: invalid)
+    monkeypatch.setattr(
+        market_api,
+        "DailyShadowRegistryReader",
+        lambda *_args, **_kwargs: pytest.fail("invalid priority must stop before reader"),
+    )
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-failover-readiness"])
+    assert cli_module.main() == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "canonical_writes": False,
+        "error_code": "INVALID_FAILOVER_CONFIGURATION",
+        "provider_requests": 0,
+        "secondary_requests": 0,
+        "status": "unavailable",
+    }
 
 
 def test_legacy_manifest_missing_source_is_read_only_and_byte_stable(tmp_path: Path) -> None:
@@ -224,6 +481,7 @@ def _publish_fixture(settings: Settings, dataset_root: Path) -> Path:
 
 def _api_get(path: str, settings: Settings, *, raise_app_exceptions: bool = True):
     app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[market_api.get_market_failover_api_settings] = lambda: settings
 
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(

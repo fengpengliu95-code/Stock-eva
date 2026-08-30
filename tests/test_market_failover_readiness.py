@@ -4,7 +4,11 @@ from hashlib import sha256
 import pytest
 from pydantic import ValidationError
 
-from backend.app.config import Settings
+from backend.app.config import (
+    MarketFailoverRuntimeSettings,
+    Settings,
+    get_market_failover_runtime_settings,
+)
 from backend.app.market.failover import (
     BLOCKED_REASON_ORDER,
     POLICY_PAYLOAD,
@@ -466,3 +470,53 @@ def test_failover_settings_default_off_and_primary_only() -> None:
 def test_failover_settings_reject_invalid_provider_priority(priority: tuple[str, ...]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, market_provider_priority=priority)
+
+
+class _SentinelMapping(dict[str, str]):
+    allowed = {
+        "STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED",
+        "STOCK_EVA_MARKET_PROVIDER_PRIORITY",
+        "STOCK_EVA_PROVIDER_SHADOW_ROOT",
+        "STOCK_EVA_PROVIDER_EVIDENCE_ROOT",
+        "STOCK_EVA_LOCAL_CONTROL_DIR",
+        "STOCK_EVA_PROVIDER_REGISTRY_DATABASE_NAME",
+        "STOCK_EVA_DAILY_BAR_SHADOW_DATABASE_NAME",
+        "STOCK_EVA_PROVIDER_HEALTH_DATABASE_NAME",
+        "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT",
+        "STOCK_EVA_NAS_MARKET_DATASET_ROOT",
+        "STOCK_EVA_DAILY_BAR_SHADOW_CALENDAR_ROOT",
+    }
+
+    def get(self, key, default=None):
+        if key not in self.allowed:
+            raise AssertionError(f"unexpected environment key: {key}")
+        return super().get(key, default)
+
+    def __iter__(self):
+        raise AssertionError("CLI settings projection must not enumerate environment")
+
+
+def test_cli_projection_is_frozen_allowlisted_and_uses_private_paths(tmp_path) -> None:
+    values = _SentinelMapping(
+        {
+            "STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED": "true",
+            "STOCK_EVA_MARKET_PROVIDER_PRIORITY": '["baostock", "tickflow"]',
+            "STOCK_EVA_PROVIDER_SHADOW_ROOT": str(tmp_path / "shadow"),
+            "STOCK_EVA_PROVIDER_EVIDENCE_ROOT": str(tmp_path / "evidence"),
+            "STOCK_EVA_LOCAL_CONTROL_DIR": str(tmp_path / "control"),
+            "STOCK_EVA_LOCAL_MARKET_DATASET_ROOT": str(tmp_path / "dataset"),
+        }
+    )
+    values["STOCK_EVA_TICKFLOW_TOKEN"] = "must-not-be-read"
+    projected = get_market_failover_runtime_settings(values)
+    assert type(projected) is MarketFailoverRuntimeSettings
+    assert projected.market_auto_failover_enabled is True
+    assert projected.market_provider_priority == ("baostock", "tickflow")
+    assert projected.provider_shadow_root == tmp_path / "shadow"
+    assert projected.local_control_dir == tmp_path / "control"
+    assert projected.local_market_dataset_root == tmp_path / "dataset"
+
+
+def test_cli_projection_rejects_bad_allowlisted_path_before_reader() -> None:
+    with pytest.raises(ValueError):
+        get_market_failover_runtime_settings({"STOCK_EVA_PROVIDER_SHADOW_ROOT": "relative-shadow"})
