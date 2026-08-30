@@ -164,7 +164,18 @@ class SecondaryCapabilitySnapshotV1(_Frozen):
     canonical_session_failover_state: Literal[CapabilityState.UNQUALIFIED] = (
         CapabilityState.UNQUALIFIED
     )
-    snapshot_sha256: str = Field(default="0" * 64, pattern=_SHA256.pattern)
+    snapshot_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_supplied_null_digest(cls, values: Any) -> Any:
+        if (
+            isinstance(values, dict)
+            and "snapshot_sha256" in values
+            and values["snapshot_sha256"] is None
+        ):
+            raise ValueError("supplied capability digest cannot be null")
+        return values
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> SecondaryCapabilitySnapshotV1:
@@ -275,7 +286,7 @@ class SecondaryCapabilitySnapshotV1(_Frozen):
         ):
             raise ValueError("v1 does not accept canonical qualification evidence")
         expected = _identity(self, "snapshot_sha256", CAPABILITY_DOMAIN)
-        if self.snapshot_sha256 == "0" * 64:
+        if self.snapshot_sha256 is None:
             object.__setattr__(self, "snapshot_sha256", expected)
         elif self.snapshot_sha256 != expected:
             raise ValueError("capability snapshot digest mismatch")
@@ -310,8 +321,11 @@ def _r2f3_projection_constants() -> tuple[str, str, str, str]:
 def build_capability_snapshot(status: Any) -> SecondaryCapabilitySnapshotV1:
     """Project a strict R2-F3 DailyShadowStatus without consulting generic admission."""
 
-    if hasattr(status, "admission_state") or not hasattr(status, "status"):
+    from .daily_shadow_registry import DailyShadowStatus
+
+    if type(status) is not DailyShadowStatus:
         raise TypeError("capability input must be a Daily shadow status")
+    status = DailyShadowStatus.model_validate(status.model_dump(mode="python"))
     adapter_hash, policy_hash, universe_hash, _profile = _r2f3_projection_constants()
     if status.status == "UNAVAILABLE":
         return SecondaryCapabilitySnapshotV1(
@@ -400,13 +414,36 @@ class FailoverReadinessV1(_Frozen):
     provider_requests: Literal[0] = 0
     secondary_requests: Literal[0] = 0
     canonical_writes: Literal[False] = False
-    readiness_sha256: str = Field(default="0" * 64, pattern=_SHA256.pattern)
+    readiness_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_supplied_null_digest(cls, values: Any) -> Any:
+        if (
+            isinstance(values, dict)
+            and "readiness_sha256" in values
+            and values["readiness_sha256"] is None
+        ):
+            raise ValueError("supplied readiness digest cannot be null")
+        return values
 
     @model_validator(mode="after")
     def validate_readiness(self) -> FailoverReadinessV1:
         _validate_priority(self.provider_priority)
         if self.policy_sha256 != POLICY_SHA256:
             raise ValueError("selection policy digest mismatch")
+        if self.status == "ready":
+            if self.provider_priority == ("baostock",):
+                if self.secondary is not None:
+                    raise ValueError("primary-only readiness cannot expose a secondary")
+            elif (
+                self.provider_priority[1] != "tickflow"
+                or self.secondary is None
+                or self.secondary.source_status is not SourceStatus.READY
+            ):
+                raise ValueError("ready readiness requires the first secondary capability")
+        elif self.secondary is not None:
+            raise ValueError("unavailable readiness cannot expose a secondary")
         if len(self.blocked_reasons) != len(set(self.blocked_reasons)):
             raise ValueError("blocked reasons must be unique")
         expected = _expected_reasons(
@@ -416,10 +453,8 @@ class FailoverReadinessV1(_Frozen):
         )
         if self.blocked_reasons != expected:
             raise ValueError("blocked reasons are not the frozen readiness mapping")
-        if self.status == "unavailable" and self.secondary is not None:
-            raise ValueError("unavailable readiness cannot expose a secondary snapshot")
         digest = _identity(self, "readiness_sha256", READINESS_DOMAIN)
-        if self.readiness_sha256 == "0" * 64:
+        if self.readiness_sha256 is None:
             object.__setattr__(self, "readiness_sha256", digest)
         elif self.readiness_sha256 != digest:
             raise ValueError("readiness digest mismatch")
@@ -434,6 +469,12 @@ def build_readiness(
     control_state_available: bool = True,
 ) -> FailoverReadinessV1:
     priority = _validate_priority(tuple(provider_priority))
+    if secondary is not None:
+        if type(secondary) is not SecondaryCapabilitySnapshotV1:
+            raise TypeError("secondary must be an exact capability snapshot")
+        secondary = SecondaryCapabilitySnapshotV1.model_validate(
+            secondary.model_dump(mode="python")
+        )
     if not control_state_available:
         status = "unavailable"
         secondary = None
@@ -473,7 +514,18 @@ class PreflightDecisionV1(_Frozen):
     provider_requests: Literal[0] = 0
     secondary_requests: Literal[0] = 0
     canonical_writes: Literal[False] = False
-    decision_sha256: str = Field(default="0" * 64, pattern=_SHA256.pattern)
+    decision_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_supplied_null_digest(cls, values: Any) -> Any:
+        if (
+            isinstance(values, dict)
+            and "decision_sha256" in values
+            and values["decision_sha256"] is None
+        ):
+            raise ValueError("supplied decision digest cannot be null")
+        return values
 
     @model_validator(mode="after")
     def validate_decision(self) -> PreflightDecisionV1:
@@ -498,7 +550,7 @@ class PreflightDecisionV1(_Frozen):
         if (self.action, self.selected_provider, self.pointer_action, self.reason) != expected:
             raise ValueError("preflight decision contradicts primary state")
         digest = _identity(self, "decision_sha256", DECISION_DOMAIN)
-        if self.decision_sha256 == "0" * 64:
+        if self.decision_sha256 is None:
             object.__setattr__(self, "decision_sha256", digest)
         elif self.decision_sha256 != digest:
             raise ValueError("preflight decision digest mismatch")
@@ -508,6 +560,9 @@ class PreflightDecisionV1(_Frozen):
 def preflight(
     primary_state: PrimaryState | str, readiness: FailoverReadinessV1
 ) -> PreflightDecisionV1:
+    if type(readiness) is not FailoverReadinessV1:
+        raise TypeError("readiness must be an exact readiness snapshot")
+    readiness = FailoverReadinessV1.model_validate(readiness.model_dump(mode="python"))
     state = PrimaryState(primary_state)
     return PreflightDecisionV1(
         primary_state=state,

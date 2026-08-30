@@ -279,3 +279,70 @@ def test_closed_models_reject_generic_admission_and_contradictions() -> None:
             daily_bar_state="QUALIFIED",
             source_qualification_sessions=0,
         )
+
+
+def test_public_capability_boundary_requires_exact_verified_daily_status() -> None:
+    class FakeDailyStatus:
+        status = "UNAVAILABLE"
+
+    class DerivedDailyStatus(FakeDailyStatus):
+        pass
+
+    for value in (
+        {"status": "UNAVAILABLE"},
+        FakeDailyStatus(),
+        DerivedDailyStatus(),
+    ):
+        with pytest.raises((TypeError, ValueError, ValidationError)):
+            build_capability_snapshot(value)
+
+
+def test_explicit_zero_digest_is_not_treated_as_an_omitted_digest() -> None:
+    capability = _qualified_snapshot()
+    with pytest.raises(ValidationError):
+        SecondaryCapabilitySnapshotV1.model_validate(
+            capability.model_dump(mode="json") | {"snapshot_sha256": "0" * 64}
+        )
+    readiness = build_readiness(secondary=capability, provider_priority=("baostock", "tickflow"))
+    with pytest.raises(ValidationError):
+        FailoverReadinessV1.model_validate(
+            readiness.model_dump(mode="json") | {"readiness_sha256": "0" * 64}
+        )
+    decision = preflight("READY", readiness)
+    with pytest.raises(ValidationError):
+        PreflightDecisionV1.model_validate(
+            decision.model_dump(mode="json") | {"decision_sha256": "0" * 64}
+        )
+
+
+def test_preflight_revalidates_exact_readiness_and_rejects_constructed_tamper() -> None:
+    readiness = build_readiness(
+        secondary=_qualified_snapshot(), provider_priority=("baostock", "tickflow")
+    )
+    constructed = FailoverReadinessV1.model_construct(**readiness.model_dump(mode="python"))
+    object.__setattr__(constructed, "blocked_reasons", ("NO_SECONDARY_CONFIGURED",))
+    with pytest.raises(ValidationError):
+        preflight("READY", constructed)
+
+    class FakeReadiness:
+        readiness_sha256 = readiness.readiness_sha256
+
+    with pytest.raises(TypeError):
+        preflight("READY", FakeReadiness())
+
+
+def test_readiness_status_priority_and_secondary_form_a_closed_contract() -> None:
+    capability = _qualified_snapshot()
+    unavailable = build_capability_snapshot(_daily_status("PENDING", status="UNAVAILABLE"))
+    base = build_readiness(secondary=capability, provider_priority=("baostock", "tickflow"))
+    cases = (
+        base.model_dump(mode="json") | {"secondary": None},
+        base.model_dump(mode="json")
+        | {"secondary": capability.model_dump(mode="json"), "status": "unavailable"},
+        base.model_dump(mode="json")
+        | {"secondary": None, "provider_priority": ("baostock", "tushare", "tickflow")},
+        base.model_dump(mode="json") | {"secondary": unavailable.model_dump(mode="json")},
+    )
+    for values in cases:
+        with pytest.raises(ValidationError):
+            FailoverReadinessV1.model_validate(values)
