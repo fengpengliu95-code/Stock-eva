@@ -417,3 +417,29 @@ def test_build_readiness_rejects_constructed_nested_snapshot_bypasses(digest: st
 def test_build_readiness_requires_strict_native_control_bool(value: object) -> None:
     with pytest.raises((TypeError, ValueError, ValidationError)):
         build_readiness(control_state_available=value)  # type: ignore[arg-type]
+
+
+def test_private_builders_reject_any_supplied_digest_mismatch() -> None:
+    cases = []
+    capability = _qualified_snapshot()
+    capability_values = capability.model_dump(mode="python")
+    capability_digest = capability_values.pop("snapshot_sha256")
+    cases.append(
+        (_build_capability_snapshot, "snapshot_sha256", capability_values, capability_digest)
+    )
+
+    readiness = build_readiness(secondary=capability, provider_priority=("baostock", "tickflow"))
+    readiness_values = readiness.model_dump(mode="python")
+    readiness_digest = readiness_values.pop("readiness_sha256")
+    cases.append((_build_readiness, "readiness_sha256", readiness_values, readiness_digest))
+
+    decision = preflight("READY", readiness)
+    decision_values = decision.model_dump(mode="python")
+    decision_digest = decision_values.pop("decision_sha256")
+    cases.append((_build_preflight_decision, "decision_sha256", decision_values, decision_digest))
+
+    for builder, digest_field, values, matching_digest in cases:
+        assert getattr(builder(values), digest_field) == matching_digest
+        for supplied in ("0" * 64, "b" * 64, None, 1):
+            with pytest.raises((TypeError, ValueError, ValidationError)):
+                builder({**values, digest_field: supplied})

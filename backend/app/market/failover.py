@@ -122,6 +122,16 @@ def _identity(model: BaseModel, digest_field: str, domain: str) -> str:
     return domain_sha256(domain, values)
 
 
+def _json_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", by_alias=False, exclude_none=False)
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_json_value(item) for item in value)
+    return value
+
+
 def _build_model(
     model_type: type[BaseModel],
     values: dict[str, Any],
@@ -129,10 +139,23 @@ def _build_model(
     digest_field: str,
     domain: str,
 ) -> BaseModel:
-    candidate = model_type.model_construct(**values)
-    preimage = candidate.model_dump(mode="json", by_alias=False, exclude_none=False)
-    preimage.pop(digest_field, None)
+    supplied = digest_field in values
+    preimage = {}
+    for name, field in model_type.model_fields.items():
+        if name == digest_field:
+            continue
+        if name in values:
+            value = values[name]
+        elif field.is_required():
+            continue
+        else:
+            value = field.get_default(call_default_factory=True)
+        preimage[name] = _json_value(value)
     digest = domain_sha256(domain, preimage)
+    if supplied:
+        if not isinstance(values[digest_field], str) or values[digest_field] != digest:
+            raise ValueError(f"{digest_field} does not match its preimage")
+        return model_type.model_validate(values)
     return model_type.model_validate({**values, digest_field: digest})
 
 
