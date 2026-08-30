@@ -45,7 +45,17 @@ Add tests proving:
 5. primary ready always produces advisory `PRIMARY_ALLOWED/baostock`;
 6. primary unavailable always produces `SECONDARY_BLOCKED/PRESERVE_POINTER`;
 7. canonical capability, readiness and decision hashes are deterministic and reject tampering;
-8. generic `admission_state=qualified` is not accepted as a capability input.
+8. generic `admission_state=qualified` is not accepted as a capability input;
+9. illegal capability enum strings are rejected rather than coerced;
+10. `PENDING`, `OBSERVING`, `RESET`, `SHADOW_QUALIFIED` and unavailable each produce the exact
+    closed state/count/lineage matrix;
+11. contradictory combinations such as ready + zero sessions + Daily qualified fail validation;
+12. `full_session_qualification_state` and canonical failover remain `UNQUALIFIED` in every v1
+    lifecycle;
+13. every source component hash/generation field is either correctly bound or fail-closed null;
+14. every readiness state maps to the exact frozen reason tuple and order;
+15. a priority whose first secondary has no capability source returns control unavailable and does
+    not skip to a later provider.
 
 ### Step 1.2: Run RED
 
@@ -104,7 +114,9 @@ Add tests proving:
 - CLI has no `--execute`, reports zero provider requests/writes and exits 0 for safely blocked ready
   state, 1 for unavailable, 2 for invalid configuration;
 - API and CLI read the strict Daily sidecar and external bundles without initialization;
-- missing/corrupt/locked state is bounded unavailable;
+- missing, corrupt/short, symlinked, wrong-owner, wrong-mode, journaled, locked and external-bundle-
+  mismatched state is bounded unavailable;
+- invalid provider priority is rejected before an injected reader sentinel can be called;
 - ready and unavailable GET/CLI calls preserve complete tree fingerprints, DB hashes and mtimes;
 - configured true plus TickFlow priority still reports effective false and no eligible secondary;
 - serialized output contains no credential, path, URL, payload, SQL or arbitrary exception text.
@@ -201,7 +213,8 @@ Verify and record:
 - production canonical manifest SHA-256 and every declared Parquet object hash;
 - no production provider-control or canonical file was created/modified by R2-F4.0 tests/status;
 - changed-file diff does not include `providers/base.py`, `models.py`, `candidates.py`,
-  `automation.py`, `store.py`, `storage/dataset.py` or any canonical data object.
+  `automation.py`, `store.py`, `storage/dataset.py`, generic provider registry, R2-F3 Daily
+  sidecar/schema/evidence/candidate/worker/provider modules or any canonical data object.
 
 ### Step 3.4: Independent final review
 
@@ -239,10 +252,20 @@ R2-F4.0 MUST produce no diff in:
 - `backend/app/market/automation.py`
 - `backend/app/market/store.py`
 - `backend/app/storage/dataset.py`
+- `backend/app/market/providers/shadow_contracts.py`
+- `backend/app/market/providers/registry.py`
+- `backend/app/market/shadow_registry_schema.py`
+- `backend/app/market/daily_shadow_registry.py`
+- `backend/app/market/daily_shadow_schema.py`
+- `backend/app/market/daily_shadow_models.py`
+- `backend/app/market/daily_shadow_candidates.py`
+- `backend/app/market/daily_shadow_canonical.py`
+- `backend/app/market/daily_shadow_worker.py`
+- `backend/app/market/providers/tickflow_daily_shadow.py`
+- `backend/app/market/shadow_evidence.py`
 - R2-F2 golden fixtures and hashes
 - R2-F3 Daily evidence/candidate/report artifacts
 - production canonical Parquet, manifest and pointer
 
 If implementing a test appears to require changing one of these surfaces, stop and revise the
 R2-F4.0 design rather than widening the slice.
-

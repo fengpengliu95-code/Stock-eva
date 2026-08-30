@@ -1103,109 +1103,16 @@ R2-F4.0 adds only a read-only selection shield and cannot select or publish a se
 Task 14 rewrite remains blocked until a separate canonical-capability qualification proves every
 required semantic and exact-session contract.
 
-### Task 14: Implement default-off whole-session failover
+### PARKED LEGACY Task 14 — DO NOT EXECUTE
 
-**Files:**
+The former executable Task 14 sketch was removed from the current plan because its prerequisite —
+a secondary with complete canonical capability qualification — is false. Its historical text
+remains available in Git before the 2026-08-30 amendment; it is not an implementation authority.
 
-- Modify: `backend/app/config.py`
-- Create: `backend/app/market/failover.py`
-- Modify: `backend/app/market/automation.py`
-- Modify: `backend/app/market/models.py`
-- Modify: `backend/app/market/store.py`
-- Modify: `backend/app/api/market.py`
-- Modify: `.env.example`
-- Create: `tests/test_market_failover.py`
-- Modify: `tests/test_market_candidate_selection.py`
-- Modify: `tests/test_market_automation.py`
-
-**Step 1: Write the complete selection-policy matrix**
-
-Add deterministic cases:
-
-| Primary | Secondary | Admission/config | Expected |
-|---|---|---|---|
-| Ready | Any | Any | Publish primary |
-| Transport/rate/provider unavailable | Ready | Qualified + enabled | Publish whole secondary |
-| Coverage/semantic failure | Ready | Qualified + enabled | Publish whole secondary with validation-failure reason |
-| Failed | Ready | Qualified but kill switch off | No publish; preserve pointer |
-| Failed | Ready | Shadow/unqualified/quarantined | No publish; preserve pointer |
-| Failed | Partial/error | Enabled | No publish; preserve pointer |
-| Ready but material disagreement | Material mismatch | Any | Publish valid primary; quarantine secondary |
-| Both unavailable | None | Any | Repair/retry state only |
-
-For every fallback case assert:
-
-```python
-assert set(row.source for row in canonical_rows) == {selected_provider_id}
-assert manifest.selected_provider_id == selected_provider_id
-assert selection.fallback_from == primary_provider_id
-assert selection.fallback_reason is not None
-```
-
-Add crash points before evidence, after evidence, after candidate, after selection-object staging and
-before/after canonical pointer movement. Only the final pointer decides visibility; restart is
-idempotent.
-
-**Step 2: Run RED**
-
-```bash
-uv run --extra dev pytest -q tests/test_market_failover.py \
-  tests/test_market_candidate_selection.py tests/test_market_automation.py \
-  --basetemp=/tmp/stock-eva-r2f4-failover-red
-```
-
-Expected: no failover policy/config and all publication paths construct BaoStock directly.
-
-**Step 3: Implement the smallest explicit policy**
-
-Add settings with safe defaults:
-
-```text
-STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED=false
-STOCK_EVA_MARKET_PROVIDER_PRIORITY=baostock
-```
-
-The priority parser validates registered provider IDs and rejects duplicates/unknown providers.
-Secrets are configured separately and never included in the priority string.
-
-`SessionSelectionPolicy.select()` receives already validated candidates plus registry snapshots. It
-does not fetch, normalize, write or mutate admission state. `MarketPublicationOrchestrator` owns the
-sequence:
-
-```text
-attempt primary evidence/candidate
--> if primary ready: select primary
--> else if policy permits: obtain exact-date/universe secondary evidence/candidate
--> select one candidate
--> persist selection object
--> invoke existing canonical atomic publication once
-```
-
-The secondary request has its own hard request/time budget. Same-day reconciliation may be
-`unavailable` when the primary has no candidate; selection records that fact. Historical
-qualification plus the secondary's self-gates are mandatory.
-
-**Step 4: Run GREEN and checks**
-
-```bash
-uv run --extra dev pytest -q tests/test_market_failover.py \
-  tests/test_market_candidate_selection.py tests/test_market_automation.py \
-  --basetemp=/tmp/stock-eva-r2f4-failover-green
-uv run --extra dev ruff check backend/app/market/failover.py backend/app/market/automation.py \
-  backend/app/market/models.py backend/app/market/store.py backend/app/api/market.py \
-  backend/app/config.py tests/test_market_failover.py
-git diff --check
-```
-
-**Step 5: Commit**
-
-```bash
-git add backend/app/config.py backend/app/market/failover.py \
-  backend/app/market/automation.py backend/app/market/models.py backend/app/market/store.py \
-  backend/app/api/market.py .env.example tests/test_market_failover.py \
-  tests/test_market_candidate_selection.py tests/test_market_automation.py
-git commit -m "feat(market): select qualified whole-session fallback"
-```
+Task 14 may be rewritten only after R2-F4.0, promoted calendar, exact-session universe and a
+separately reviewed secondary canonical-capability qualification are GO. Until then there is no
+secondary selection/publication task, no canonical model migration and no automation branch to
+implement.
 
 ---
 

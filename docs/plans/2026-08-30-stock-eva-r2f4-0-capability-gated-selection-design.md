@@ -92,11 +92,44 @@ fixed false in R2-F4.0.
 
 - FR-11: Stable blocked reasons
 
-Status uses an ordered allowlist such as `NO_SECONDARY_CONFIGURED`,
-`CONTROL_STATE_UNAVAILABLE`, `DAILY_BAR_ONLY`, `FACTOR_UNQUALIFIED`, `UNITS_UNKNOWN`,
-`SUSPENSION_UNKNOWN`, `EXACT_SESSION_UNIVERSE_UNKNOWN`, `CALENDAR_UNKNOWN`,
-`RAW_RETENTION_UNKNOWN` and `SELECTION_EXECUTION_NOT_IMPLEMENTED`. It never exposes paths, SQL,
-payload rows or exception text.
+Status uses exactly this ordered allowlist:
+
+```text
+CONTROL_STATE_UNAVAILABLE
+NO_SECONDARY_CONFIGURED
+DAILY_BAR_UNQUALIFIED
+DAILY_BAR_ONLY
+ACTIVITY_UNITS_UNKNOWN
+FACTOR_UNQUALIFIED
+SUSPENSION_UNKNOWN
+EXACT_SESSION_UNIVERSE_UNKNOWN
+PROMOTED_CALENDAR_UNKNOWN
+RAW_RETENTION_UNKNOWN
+FULL_SESSION_QUALIFICATION_UNQUALIFIED
+SELECTION_EXECUTION_NOT_IMPLEMENTED
+```
+
+Reasons MUST appear only in the order above, without duplicates. An unavailable source maps to
+`CONTROL_STATE_UNAVAILABLE`; a primary-only priority maps to `NO_SECONDARY_CONFIGURED`; a verified
+but not-yet-qualified Daily lifecycle maps to `DAILY_BAR_UNQUALIFIED`; the qualified Daily-only
+profile maps to every still-missing semantic reason; and every R2-F4.0 result ends with
+`SELECTION_EXECUTION_NOT_IMPLEMENTED`. Public output never exposes paths, SQL, payload rows or
+exception text.
+
+The complete mapping is frozen:
+
+| Input | Exact ordered blocked reasons |
+|---|---|
+| priority is only `baostock` | `NO_SECONDARY_CONFIGURED`, `SELECTION_EXECUTION_NOT_IMPLEMENTED` |
+| selected priority provider has no verified capability source | `CONTROL_STATE_UNAVAILABLE`, `SELECTION_EXECUTION_NOT_IMPLEMENTED` |
+| TickFlow Daily is pending/observing/reset | `DAILY_BAR_UNQUALIFIED`, all seven missing semantic/full-session reasons, `SELECTION_EXECUTION_NOT_IMPLEMENTED` |
+| TickFlow Daily is shadow-qualified | `DAILY_BAR_ONLY`, all seven missing semantic/full-session reasons, `SELECTION_EXECUTION_NOT_IMPLEMENTED` |
+
+“Seven missing semantic/full-session reasons” means, in exact order:
+`ACTIVITY_UNITS_UNKNOWN`, `FACTOR_UNQUALIFIED`, `SUSPENSION_UNKNOWN`,
+`EXACT_SESSION_UNIVERSE_UNKNOWN`, `PROMOTED_CALENDAR_UNKNOWN`, `RAW_RETENTION_UNKNOWN`, followed by
+`FULL_SESSION_QUALIFICATION_UNQUALIFIED`. If Tushare precedes TickFlow in priority, R2-F4.0 does not
+skip the unprovable Tushare capability to try a later provider.
 
 - FR-12: Read-only API/CLI
 
@@ -148,6 +181,7 @@ secondary branch to automation, or modify canonical publication.
 | `source_status` | enum | `READY` or `UNAVAILABLE` |
 | capability state fields | enum | `QUALIFIED`, `UNQUALIFIED` or `UNKNOWN` |
 | source descriptor/vector | SHA-256 or null | Present only for verified ready source state |
+| component identity hashes | SHA-256 or null | Adapter, policy, terms, calendar, universe policy and qualification evidence |
 | qualification sessions | integer | `0..20` |
 | canonical failover state | literal | `UNQUALIFIED` in schema v1 |
 | `snapshot_sha256` | SHA-256 | Domain-separated canonical projection |
@@ -167,6 +201,15 @@ SecondaryCapabilitySnapshotV1
   full_session_qualification_state = QUALIFIED | UNQUALIFIED | UNKNOWN
   source_descriptor_sha256 = sha256 | null
   source_version_vector_sha256 = sha256 | null
+  source_adapter_sha256 = sha256 | null
+  source_policy_sha256 = sha256 | null
+  source_terms_evidence_sha256 = sha256 | null
+  source_calendar_generation = safe-id | null
+  source_calendar_sha256 = sha256 | null
+  source_universe_policy_sha256 = sha256 | null
+  source_exact_universe_sha256 = sha256 | null
+  source_qualification_evidence_sha256 = sha256 | null
+  source_qualification_candidate_sha256 = sha256 | null
   source_qualification_sessions = 0..20
   canonical_session_failover_state = UNQUALIFIED
   snapshot_sha256 = sha256(canonical domain-separated projection)
@@ -175,6 +218,21 @@ SecondaryCapabilitySnapshotV1
 `canonical_session_failover_state` is intentionally a literal `UNQUALIFIED` in v1. A future
 canonical-capability qualification must introduce a new schema/profile and direct evidence rather
 than mutating the meaning of v1.
+
+Cross-field validation is fail closed:
+
+- `source_status=UNAVAILABLE` requires every lineage hash/generation null, sessions zero and every
+  capability `UNKNOWN` except the literal canonical state `UNQUALIFIED`;
+- a ready `PENDING`, `OBSERVING` or `RESET` lifecycle requires Daily Bar `UNQUALIFIED`, full-session
+  qualification `UNQUALIFIED` and canonical failover `UNQUALIFIED`;
+- Daily Bar `QUALIFIED` requires ready `SHADOW_QUALIFIED`, exactly 20 sessions and the descriptor,
+  vector, adapter, policy, terms, calendar and universe-policy identities;
+- `full_session_qualification_state` is a literal `UNQUALIFIED` in v1;
+- exact-universe and qualification evidence/candidate hashes remain null in the current Daily
+  projection because the strict Daily status does not grant canonical authority; a future v2 must
+  require every component non-null before it can represent canonical qualification;
+- illegal enum values, contradictory counts/states and missing required ready lineage are rejected,
+  never normalized.
 
 ### Readiness snapshot
 
@@ -208,12 +266,28 @@ FailoverReadinessV1
 
 ### Preflight decision
 
+| Field | Type | Constraints |
+|---|---|---|
+| `schema_version` | literal | `1` |
+| policy version/hash | literal/SHA-256 | Exact R2-F4.0 shield identity |
+| `primary_state` | enum | `READY` or `UNAVAILABLE` |
+| `readiness_sha256` | SHA-256 | Exact validated readiness input |
+| `action` | enum | `PRIMARY_ALLOWED` or `SECONDARY_BLOCKED` |
+| `selected_provider` | literal or null | `baostock` only for primary-ready |
+| `pointer_action` | enum | `PRIMARY_PUBLICATION_MAY_PROCEED` or `PRESERVE_POINTER` |
+| `reason` | enum | `PRIMARY_READY` or `SECONDARY_NOT_CANONICALLY_QUALIFIED` |
+| request/write fields | literals | Zero and false |
+| `decision_sha256` | SHA-256 | Domain-separated canonical projection without the digest field |
+
 ```text
-primary READY       -> PRIMARY_ALLOWED, selected_provider=baostock
-primary UNAVAILABLE -> SECONDARY_BLOCKED, selected_provider=null, PRESERVE_POINTER
+primary READY -> PRIMARY_ALLOWED / baostock / PRIMARY_PUBLICATION_MAY_PROCEED / PRIMARY_READY
+primary UNAVAILABLE -> SECONDARY_BLOCKED / null / PRESERVE_POINTER /
+                       SECONDARY_NOT_CANONICALLY_QUALIFIED
 ```
 
-The decision is advisory and confers no `PublishedSelection` or canonical write capability.
+The decision is advisory and confers no `PublishedSelection` or canonical write capability. Its
+canonical preimage is every field above except `decision_sha256`, encoded with the same sorted,
+compact, UTF-8 canonical JSON plus the domain `stock-eva/r2f4.0/preflight-decision/v1`.
 
 ## API contracts
 
