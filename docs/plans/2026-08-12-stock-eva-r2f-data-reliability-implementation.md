@@ -1093,6 +1093,16 @@ retention decision. Canonical publication remains BaoStock-only.
 
 ## R2-F4 — Controlled Failover and Operations
 
+**2026-08-30 blocking amendment:** The reviewed R2-F3 outcome qualifies only credentialless Free
+historical Daily OHLC. Factor is `UNQUALIFIED`; activity units, suspension, exact-session universe/
+calendar authority and raw-retention semantics remain `UNKNOWN`; publication and failover remain
+false. Direct implementation of the legacy Task 14 below is therefore NO-GO. First execute the
+dedicated [R2-F4.0 capability-gated selection design](2026-08-30-stock-eva-r2f4-0-capability-gated-selection-design.md)
+and [implementation plan](2026-08-30-stock-eva-r2f4-0-capability-gated-selection-implementation.md).
+R2-F4.0 adds only a read-only selection shield and cannot select or publish a secondary. A future
+Task 14 rewrite remains blocked until a separate canonical-capability qualification proves every
+required semantic and exact-session contract.
+
 ### Task 14: Implement default-off whole-session failover
 
 **Files:**

@@ -289,6 +289,21 @@ status never exposes provider response bodies or arbitrary exception strings.
 
 ## 7. R2-F version plan
 
+### 2026-08-30 R2-F3 Daily Bar / R2-F4.0 checkpoint
+
+- Credentialless TickFlow Free historical 1d OHLC reached the narrow
+  `R2-F3 DAILY BAR SHADOW GO` gate at reviewed commit
+  `8095d54825ddf3e32de783a64d25e8c3fbe547a7` after 20/20 consecutive sessions.
+- This does not qualify adjustment factors, activity units, suspension semantics, exact-session
+  universe/calendar authority or raw-retention semantics. Publication and automatic failover remain
+  false.
+- Direct execution of the legacy R2-F4 Task 14 is therefore NO-GO. The blocking
+  [R2-F4.0 capability-gated selection design](2026-08-30-stock-eva-r2f4-0-capability-gated-selection-design.md)
+  and its
+  [implementation plan](2026-08-30-stock-eva-r2f4-0-capability-gated-selection-implementation.md)
+  supersede only the assumption that Daily Bar shadow qualification is canonical failover
+  authority. R2-F4.0 must keep the secondary blocked and changes no canonical publication path.
+
 | Version | Objective | Main deliverables | Exit gate | Planning size |
 |---|---|---|---|---|
 | R2-F0 | Close the active incident without weakening quality | Suspended/factor contract fix, typed failures, 2026-08-11 regression, supervised republish | Incident fixture GREEN; invalid active rows still fail; exact missing session publishes; old pointer preserved on negative tests | 2-3 engineering days |
