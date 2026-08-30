@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Mapping
 from datetime import date
@@ -66,6 +67,8 @@ class Settings(BaseSettings):
     supplemental_audit_database_name: str = "supplemental_ingestion.sqlite3"
     akshare_supplemental_enabled: bool = False
     auto_refresh_enabled: bool = False
+    market_auto_failover_enabled: bool = False
+    market_provider_priority: tuple[str, ...] = ("baostock",)
     scheduled_refresh_enabled: bool = False
     auto_refresh_min_request_interval_seconds: float = Field(
         default=0.5,
@@ -84,6 +87,27 @@ class Settings(BaseSettings):
     market_repair_max_attempts: int = Field(default=4, ge=1, le=20)
     market_repair_lease_seconds: int = Field(default=1800, ge=60, le=86400)
     market_repair_retry_base_seconds: int = Field(default=3600, ge=900, le=86400)
+
+    @field_validator("market_provider_priority", mode="before")
+    @classmethod
+    def validate_market_provider_priority(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = tuple(value.split(","))
+        if not isinstance(value, (tuple, list)):
+            raise ValueError("invalid market provider priority")
+        priority = tuple(value)
+        known = {"baostock", "tickflow", "tushare"}
+        if any(
+            not isinstance(item, str) or not item or item.strip() != item or item not in known
+            for item in priority
+        ):
+            raise ValueError("invalid market provider priority")
+        if not priority or priority[0] != "baostock" or len(set(priority)) != len(priority):
+            raise ValueError("invalid market provider priority")
+        return priority
 
     @field_validator("provider_evidence_max_object_bytes")
     @classmethod
@@ -237,6 +261,29 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_market_failover_runtime_settings(
+    environ: Mapping[str, str] | None = None,
+) -> Settings:
+    """Build the failover CLI settings from its two non-credential allowlisted values.
+
+    ``model_validate`` is intentional here: unlike ``Settings()``, it does not enumerate
+    process environment variables.  Runtime paths therefore remain the safe local defaults
+    unless a caller injects a fully constructed Settings object for an isolated test root.
+    """
+
+    source = os.environ if environ is None else environ
+    return Settings.model_validate(
+        {
+            "market_auto_failover_enabled": source.get(
+                "STOCK_EVA_MARKET_AUTO_FAILOVER_ENABLED", False
+            ),
+            "market_provider_priority": source.get(
+                "STOCK_EVA_MARKET_PROVIDER_PRIORITY", ("baostock",)
+            ),
+        }
+    )
 
 
 class TickFlowFreeRuntimeSettings(BaseModel):

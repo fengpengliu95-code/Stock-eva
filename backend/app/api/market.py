@@ -22,6 +22,11 @@ from backend.app.market.continuity import (
 )
 from backend.app.market.daily_shadow_models import DAILY_SHADOW_PROFILE
 from backend.app.market.daily_shadow_registry import DailyShadowRegistryReader
+from backend.app.market.failover import (
+    FailoverReadinessV1,
+    build_capability_snapshot,
+    build_readiness,
+)
 from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
@@ -227,6 +232,56 @@ def market_provider_daily_bar_shadow(
         circuit_state=status.circuit_state,
         daily_bar_qualified=qualified,
     )
+
+
+def read_market_failover_readiness(settings: Settings) -> FailoverReadinessV1:
+    """Read the advisory failover shield without provider or canonical access."""
+    priority = tuple(settings.market_provider_priority)
+    # Validate the complete allowlisted configuration before touching any sidecar path.
+    try:
+        build_readiness(
+            configured_auto_failover_enabled=settings.market_auto_failover_enabled,
+            provider_priority=priority,
+            control_state_available=False,
+        )
+    except Exception as exc:
+        raise ValueError("invalid failover configuration") from exc
+
+    kwargs = {
+        "configured_auto_failover_enabled": settings.market_auto_failover_enabled,
+        "provider_priority": priority,
+    }
+    if priority == ("baostock",):
+        return build_readiness(**kwargs)
+    if priority[1] != "tickflow":
+        return build_readiness(**kwargs, control_state_available=False)
+
+    try:
+        layout = StorageLayout(settings)
+        layout.validate_daily_bar_shadow_layout()
+        status = DailyShadowRegistryReader(
+            layout.daily_bar_shadow_database,
+            evidence_root=layout.daily_bar_shadow_evidence_root,
+            candidate_root=layout.daily_bar_shadow_candidate_root,
+            verify_external=True,
+        ).read()
+        secondary = build_capability_snapshot(status)
+        return build_readiness(**kwargs, secondary=secondary)
+    except Exception:
+        return build_readiness(**kwargs, control_state_available=False)
+
+
+@router.get("/failover-readiness", response_model=FailoverReadinessV1)
+def market_failover_readiness(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> FailoverReadinessV1:
+    try:
+        return read_market_failover_readiness(settings)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_failover_configuration"},
+        ) from exc
 
 
 def get_calendar_sync_store(

@@ -75,6 +75,51 @@ def test_market_get_missing_provider_evidence_root_is_write_free(tmp_path: Path)
     assert not root.exists()
 
 
+def test_failover_readiness_api_missing_sidecar_is_bounded_read_only(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    before = tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "unavailable"
+    assert payload["provider_requests"] == 0
+    assert payload["secondary_requests"] == 0
+    assert payload["canonical_writes"] is False
+    assert payload["effective_auto_failover_enabled"] is False
+    assert payload["eligible_secondary"] is None
+    assert "CONTROL_STATE_UNAVAILABLE" in payload["blocked_reasons"]
+    assert (
+        tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
+        == before
+    )
+
+
+def test_failover_readiness_cli_is_read_only_and_has_no_execute(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        market_provider_priority=("baostock",),
+    )
+    monkeypatch.setattr(cli_module, "get_market_failover_runtime_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-failover-readiness"])
+    assert cli_module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ready"
+    assert payload["provider_requests"] == 0
+    assert payload["secondary_requests"] == 0
+    assert payload["canonical_writes"] is False
+    with pytest.raises(cli_module._CliArgumentError):
+        cli_module.build_parser().parse_args(["market-failover-readiness", "--execute"])
+
+
 def test_legacy_manifest_missing_source_is_read_only_and_byte_stable(tmp_path: Path) -> None:
     dataset_root = tmp_path / "dataset"
     settings = _settings(tmp_path, dataset_root)

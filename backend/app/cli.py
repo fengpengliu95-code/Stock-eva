@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from backend.app.api.market import read_market_failover_readiness
 from backend.app.classification.failures import (
     ClassificationFailure,
     ClassificationFailureError,
@@ -17,7 +18,11 @@ from backend.app.classification.failures import (
 from backend.app.classification.provider import BaoStockClassificationProvider
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
-from backend.app.config import get_settings, get_tickflow_free_runtime_settings
+from backend.app.config import (
+    get_market_failover_runtime_settings,
+    get_settings,
+    get_tickflow_free_runtime_settings,
+)
 from backend.app.market.automation import (
     AutomationOutcome,
     BaoStockProbeRunner,
@@ -53,6 +58,7 @@ from backend.app.market.continuity import (
 )
 from backend.app.market.evidence import replay_cli_payload
 from backend.app.market.factor_cache import AdjustmentFactorCache
+from backend.app.market.failover import canonical_json_bytes
 from backend.app.market.failures import (
     MarketFailure,
     MarketFailureError,
@@ -438,6 +444,10 @@ def build_parser() -> argparse.ArgumentParser:
     provider_status.add_argument(
         "--provider",
         choices=tuple(item.value for item in ShadowProviderId),
+    )
+    subparsers.add_parser(
+        "market-failover-readiness",
+        help="read-only advisory status of the failover capability shield",
     )
     daily_shadow = subparsers.add_parser(
         "market-provider-daily-shadow",
@@ -1113,6 +1123,26 @@ def main() -> int:
         return _market_continuity_command(args)
     if args.command == "market-provider-daily-shadow":
         return _market_provider_daily_shadow_command(args)
+    if args.command == "market-failover-readiness":
+        try:
+            readiness = read_market_failover_readiness(get_market_failover_runtime_settings())
+        except (ValidationError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "status": "unavailable",
+                        "error_code": "INVALID_FAILOVER_CONFIGURATION",
+                        "provider_requests": 0,
+                        "secondary_requests": 0,
+                        "canonical_writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        print(canonical_json_bytes(readiness.model_dump(mode="json")).decode("utf-8"), end="")
+        return 0 if readiness.status == "ready" else 1
     if args.command == "market-provider-status":
         settings = get_settings()
         provider = args.provider

@@ -4,6 +4,7 @@ from hashlib import sha256
 import pytest
 from pydantic import ValidationError
 
+from backend.app.config import Settings
 from backend.app.market.failover import (
     BLOCKED_REASON_ORDER,
     POLICY_PAYLOAD,
@@ -443,3 +444,25 @@ def test_private_builders_reject_any_supplied_digest_mismatch() -> None:
         for supplied in ("0" * 64, "b" * 64, None, 1):
             with pytest.raises((TypeError, ValueError, ValidationError)):
                 builder({**values, digest_field: supplied})
+
+
+def test_failover_settings_default_off_and_primary_only() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.market_auto_failover_enabled is False
+    assert settings.market_provider_priority == ("baostock",)
+
+
+@pytest.mark.parametrize(
+    "priority",
+    [
+        (),
+        ("tickflow", "baostock"),
+        ("baostock", "baostock"),
+        ("baostock", "unknown"),
+        ("baostock", "tick flow"),
+        ("baostock", "STOCK_EVA_TICKFLOW_TOKEN=secret"),
+    ],
+)
+def test_failover_settings_reject_invalid_provider_priority(priority: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, market_provider_priority=priority)
