@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import stat
@@ -451,6 +452,88 @@ def test_failover_readiness_cli_invalid_priority_exits_two_before_reader(
         "secondary_requests": 0,
         "status": "unavailable",
     }
+
+
+def test_failover_readiness_never_touches_provider_or_production_paths(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import backend.app.market.providers.baostock as baostock_provider
+    import backend.app.market.providers.tickflow_daily_shadow as tickflow_provider
+
+    blocked_roots = (
+        "/Users/finlay/Library/Application Support",
+        "/Volumes/Stock",
+    )
+
+    def reject_blocked_path(value: object) -> None:
+        try:
+            raw = os.fspath(value)
+        except TypeError:
+            return
+        if not isinstance(raw, (str, bytes)):
+            return
+        normalized = os.path.abspath(os.fsdecode(raw))
+        for blocked in blocked_roots:
+            if normalized == blocked or normalized.startswith(blocked + os.sep):
+                pytest.fail(f"readiness touched forbidden production path: {blocked}")
+
+    original_open = os.open
+    original_stat = os.stat
+    original_lstat = os.lstat
+    original_listdir = os.listdir
+    original_scandir = os.scandir
+
+    def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+        reject_blocked_path(path)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def guarded_stat(path, *, dir_fd=None, follow_symlinks=True):
+        reject_blocked_path(path)
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def guarded_lstat(path, *, dir_fd=None):
+        reject_blocked_path(path)
+        return original_lstat(path, dir_fd=dir_fd)
+
+    def guarded_listdir(path=None):
+        reject_blocked_path(path)
+        return original_listdir(path)
+
+    def guarded_scandir(path=None):
+        reject_blocked_path(path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "open", guarded_open)
+    monkeypatch.setattr(os, "stat", guarded_stat)
+    monkeypatch.setattr(os, "lstat", guarded_lstat)
+    monkeypatch.setattr(os, "listdir", guarded_listdir)
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    monkeypatch.setattr(
+        baostock_provider.BaoStockProviderAdapter,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail("readiness must not construct BaoStock"),
+    )
+    monkeypatch.setattr(
+        tickflow_provider.TickFlowFreeDailyShadowAdapter,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail("readiness must not construct TickFlow"),
+    )
+
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        provider_shadow_root=tmp_path / "shadow",
+        provider_evidence_root=tmp_path / "provider-evidence",
+        market_provider_priority=("baostock", "tickflow"),
+    )
+    response = _api_get("/api/v1/market/failover-readiness", settings)
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+
+    monkeypatch.setattr(cli_module, "get_market_failover_runtime_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "market-failover-readiness"])
+    assert cli_module.main() == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
 
 
 def test_legacy_manifest_missing_source_is_read_only_and_byte_stable(tmp_path: Path) -> None:
