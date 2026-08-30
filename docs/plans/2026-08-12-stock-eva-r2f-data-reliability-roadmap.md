@@ -306,7 +306,7 @@ status never exposes provider response bodies or arbitrary exception strings.
 
 **R2-F4.0 delivery status:** **DELIVERED — `R2-F4.0 SELECTION CONTRACT GO / SECONDARY
 BLOCKED / R2-F4 NO-GO`** at reviewed implementation baseline
-`bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1`.
+`eed3e8d864bd56186a07e5c1c7adbf0aea98188d`.
 This is an offline, read-only capability admission shield. It records TickFlow's
 `DAILY_BAR_SHADOW_QUALIFIED` projection while keeping adjustment factors `UNQUALIFIED`,
 activity units/suspension/exact-session universe/promoted calendar/raw retention `UNKNOWN`,

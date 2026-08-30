@@ -5,7 +5,7 @@
 **R2-F4.0 SELECTION CONTRACT GO / SECONDARY BLOCKED / R2-F4 NO-GO**
 
 The reviewed implementation baseline is
-`bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1`. R2-F4.0 delivers an offline,
+`eed3e8d864bd56186a07e5c1c7adbf0aea98188d`. R2-F4.0 delivers an offline,
 read-only capability admission shield. It makes the narrow R2-F3 TickFlow Free Daily Bar shadow
 qualification visible without granting canonical publication or failover authority.
 
@@ -42,7 +42,9 @@ path was widened.
 - Approved R2-F4.0 specification: `89f0761b70e37e896fa3f3c7ebae5d18318ba601`
 - Task 1 final identity/readiness shield: `3537e63d983509972cadc2a3b9681a367711334f`
 - Task 2 final API/CLI/config boundary: `e02967e47333652cfe7e501c18e5d0b87d3fce9f`
-- Zero-provider/production-path sentinel proof: `bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1`
+- Initial zero-provider/production-path sentinel proof: `bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1`
+- Strengthened built-in-open/strict-reader sentinel proof:
+  `eed3e8d864bd56186a07e5c1c7adbf0aea98188d`
 
 Task 1 used four independent review/fix cycles before CODE GO. Task 2 used three independent
 review/fix cycles before CODE GO. The final Task 1 review was H=0/M=0/L=1; the final Task 2 review
@@ -91,11 +93,13 @@ unchanged. Independent Task 2 review also replayed strict ready, short/corrupt, 
 journaled and locked sidecars; every invalid case returned bounded unavailable and repeated reads
 preserved tree, database bytes and mtimes.
 
-The final zero-access test wraps filesystem `open/stat/lstat/listdir/scandir` with hard sentinels for
+The final zero-access test wraps both `builtins.open` and filesystem
+`open/stat/lstat/listdir/scandir` with hard sentinels for
 `/Users/finlay/Library/Application Support` and `/Volumes/Stock`, replaces BaoStock and TickFlow
-adapter constructors with failure sentinels, and executes both the API and CLI against a private
-missing sidecar. Both remain unavailable with zero provider construction and no forbidden path
-access.
+adapter constructors with failure sentinels, and executes both the API and CLI through a valid
+private layout into the real strict reader with `verify_external=true`. The deliberately absent
+private database remains unavailable; both entry points invoke the strict reader, construct no
+provider, and access no forbidden path.
 
 ## Protected compatibility evidence
 

@@ -61,7 +61,9 @@ additional semantic authority.
 
 ## Task11 shadow adapter contract
 
-Task11 adds source-shaped, injected adapters only. Task14's bounded TickFlow policy uses
+Task11 adds source-shaped, injected adapters only. The following four-request Task14 policy is a
+**legacy parked contract** retained for audit history; R2-F4.0 does not execute or authorize it.
+That parked policy uses
 5-second connect/write/pool and 30-second read timeouts, exactly one attempt, four total
 requests, no retry/sleep, exact HTTPS host/TLS and no redirects, plus bounded response bytes/rows. Transport failures are
 typed and sanitized; raw payloads, URLs, headers and credentials are not reports.

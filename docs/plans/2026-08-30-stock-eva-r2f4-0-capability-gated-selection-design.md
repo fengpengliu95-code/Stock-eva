@@ -4,7 +4,8 @@
 
 **Date:** 2026-08-30 (Asia/Shanghai)
 
-**Status:** SPEC DRAFT / DIRECT LEGACY TASK 14 NO-GO / IMPLEMENTATION NOT STARTED
+**Status:** SPEC APPROVED / IMPLEMENTED AT
+`eed3e8d864bd56186a07e5c1c7adbf0aea98188d` / DIRECT LEGACY TASK 14 PARKED / R2-F4 NO-GO
 
 **Scope:** One blocking, offline-only selection shield between the narrow R2-F3 Daily Bar
 qualification and any future R2-F4 canonical whole-session failover.

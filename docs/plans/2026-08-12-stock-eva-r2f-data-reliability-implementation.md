@@ -1106,7 +1106,7 @@ required semantic and exact-session contract.
 ### R2-F4.0 delivered — capability-gated selection shield
 
 The R2-F4.0 slice is delivered at reviewed implementation baseline
-`bbbd9d6da4aece3497f0dc5a3c461510c6e2bfc1` with the decision
+`eed3e8d864bd56186a07e5c1c7adbf0aea98188d` with the decision
 `R2-F4.0 SELECTION CONTRACT GO / SECONDARY BLOCKED / R2-F4 NO-GO`. Its isolated domain,
 allowlisted configuration and read-only API/CLI status make the R2-F3 Daily qualification
 explicitly non-canonical: Daily Bar is `QUALIFIED` only; adjustment factor is `UNQUALIFIED`;
