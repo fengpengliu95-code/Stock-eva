@@ -15,6 +15,9 @@ from backend.app.market.failover import (
     PreflightDecisionV1,
     PrimaryState,
     SecondaryCapabilitySnapshotV1,
+    _build_capability_snapshot,
+    _build_preflight_decision,
+    _build_readiness,
     build_capability_snapshot,
     build_readiness,
     canonical_json_bytes,
@@ -319,7 +322,10 @@ def test_preflight_revalidates_exact_readiness_and_rejects_constructed_tamper() 
     readiness = build_readiness(
         secondary=_qualified_snapshot(), provider_priority=("baostock", "tickflow")
     )
-    constructed = FailoverReadinessV1.model_construct(**readiness.model_dump(mode="python"))
+    constructed = FailoverReadinessV1.model_construct(
+        **readiness.model_dump(mode="python", exclude={"secondary"}),
+        secondary=readiness.secondary,
+    )
     object.__setattr__(constructed, "blocked_reasons", ("NO_SECONDARY_CONFIGURED",))
     with pytest.raises(ValidationError):
         preflight("READY", constructed)
@@ -346,3 +352,68 @@ def test_readiness_status_priority_and_secondary_form_a_closed_contract() -> Non
     for values in cases:
         with pytest.raises(ValidationError):
             FailoverReadinessV1.model_validate(values)
+
+
+def test_public_digest_fields_are_required_nonnullable_and_serialized_as_sha256() -> None:
+    for model, digest in (
+        (SecondaryCapabilitySnapshotV1, "snapshot_sha256"),
+        (FailoverReadinessV1, "readiness_sha256"),
+        (PreflightDecisionV1, "decision_sha256"),
+    ):
+        schema = model.model_json_schema()
+        assert digest in schema["required"]
+        assert schema["properties"][digest]["type"] == "string"
+        assert schema["properties"][digest]["pattern"] == "^[0-9a-f]{64}$"
+
+
+def test_public_normal_construction_without_digest_fails() -> None:
+    capability = _qualified_snapshot().model_dump(mode="json")
+    capability.pop("snapshot_sha256")
+    with pytest.raises(ValidationError):
+        SecondaryCapabilitySnapshotV1.model_validate(capability)
+    readiness = build_readiness(
+        secondary=_qualified_snapshot(), provider_priority=("baostock", "tickflow")
+    )
+    readiness_values = readiness.model_dump(mode="json")
+    readiness_values.pop("readiness_sha256")
+    with pytest.raises(ValidationError):
+        FailoverReadinessV1.model_validate(readiness_values)
+    decision_values = preflight("READY", readiness).model_dump(mode="json")
+    decision_values.pop("decision_sha256")
+    with pytest.raises(ValidationError):
+        PreflightDecisionV1.model_validate(decision_values)
+
+
+def test_private_builders_generate_valid_public_digests() -> None:
+    capability = _qualified_snapshot()
+    capability_values = capability.model_dump(mode="python")
+    capability_values.pop("snapshot_sha256")
+    built_capability = _build_capability_snapshot(capability_values)
+    assert len(built_capability.snapshot_sha256) == 64
+    readiness = build_readiness(secondary=capability, provider_priority=("baostock", "tickflow"))
+    readiness_values = readiness.model_dump(mode="python")
+    readiness_values.pop("readiness_sha256")
+    built_readiness = _build_readiness(readiness_values)
+    assert len(built_readiness.readiness_sha256) == 64
+    decision = preflight("READY", readiness)
+    decision_values = decision.model_dump(mode="python")
+    decision_values.pop("decision_sha256")
+    built_decision = _build_preflight_decision(decision_values)
+    assert len(built_decision.decision_sha256) == 64
+
+
+@pytest.mark.parametrize("digest", [None, "0" * 64, "b" * 64])
+def test_build_readiness_rejects_constructed_nested_snapshot_bypasses(digest: str | None) -> None:
+    capability = _qualified_snapshot()
+    constructed = SecondaryCapabilitySnapshotV1.model_construct(
+        **capability.model_dump(mode="python")
+    )
+    object.__setattr__(constructed, "snapshot_sha256", digest)
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        build_readiness(provider_priority=("baostock", "tickflow"), secondary=constructed)
+
+
+@pytest.mark.parametrize("value", [1, 0, "false", None])
+def test_build_readiness_requires_strict_native_control_bool(value: object) -> None:
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        build_readiness(control_state_available=value)  # type: ignore[arg-type]

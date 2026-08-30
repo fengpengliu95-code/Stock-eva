@@ -122,6 +122,20 @@ def _identity(model: BaseModel, digest_field: str, domain: str) -> str:
     return domain_sha256(domain, values)
 
 
+def _build_model(
+    model_type: type[BaseModel],
+    values: dict[str, Any],
+    *,
+    digest_field: str,
+    domain: str,
+) -> BaseModel:
+    candidate = model_type.model_construct(**values)
+    preimage = candidate.model_dump(mode="json", by_alias=False, exclude_none=False)
+    preimage.pop(digest_field, None)
+    digest = domain_sha256(domain, preimage)
+    return model_type.model_validate({**values, digest_field: digest})
+
+
 class _Frozen(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -164,133 +178,132 @@ class SecondaryCapabilitySnapshotV1(_Frozen):
     canonical_session_failover_state: Literal[CapabilityState.UNQUALIFIED] = (
         CapabilityState.UNQUALIFIED
     )
-    snapshot_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_supplied_null_digest(cls, values: Any) -> Any:
-        if (
-            isinstance(values, dict)
-            and "snapshot_sha256" in values
-            and values["snapshot_sha256"] is None
-        ):
-            raise ValueError("supplied capability digest cannot be null")
-        return values
+    snapshot_sha256: str = Field(pattern=_SHA256.pattern)
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> SecondaryCapabilitySnapshotV1:
         if self.source_status is SourceStatus.UNAVAILABLE:
-            if (
-                self.source_lifecycle_state is not None
-                or self.source_qualification_sessions != 0
-                or any(
-                    getattr(self, field) is not CapabilityState.UNKNOWN
-                    for field in (
-                        "daily_bar_state",
-                        "activity_units_state",
-                        "adjustment_factor_state",
-                        "suspension_semantics_state",
-                        "exact_session_universe_state",
-                        "promoted_calendar_state",
-                        "raw_retention_contract_state",
-                    )
-                )
-                or any(
-                    getattr(self, field) is not None
-                    for field in (
-                        "source_descriptor_sha256",
-                        "source_version_vector_sha256",
-                        "source_adapter_sha256",
-                        "source_policy_sha256",
-                        "source_terms_evidence_sha256",
-                        "source_calendar_generation",
-                        "source_calendar_sha256",
-                        "source_universe_policy_sha256",
-                        "source_exact_universe_sha256",
-                        "source_qualification_evidence_sha256",
-                        "source_qualification_candidate_sha256",
-                    )
-                )
-            ):
-                raise ValueError("unavailable capability has lineage or qualification")
+            _validate_unavailable_snapshot(self)
         else:
-            if self.source_lifecycle_state is None:
-                raise ValueError("ready capability requires a lifecycle state")
-            if self.source_descriptor_sha256 is None or self.source_terms_evidence_sha256 is None:
-                raise ValueError("ready capability requires descriptor and terms identity")
-            if (
-                self.activity_units_state is not CapabilityState.UNKNOWN
-                or self.adjustment_factor_state is not CapabilityState.UNQUALIFIED
-                or self.suspension_semantics_state is not CapabilityState.UNKNOWN
-                or self.exact_session_universe_state is not CapabilityState.UNKNOWN
-                or self.promoted_calendar_state is not CapabilityState.UNKNOWN
-                or self.raw_retention_contract_state is not CapabilityState.UNKNOWN
-            ):
-                raise ValueError("Daily Bar capability cannot imply other semantics")
-            adapter_hash, policy_hash, universe_hash, _ = _r2f3_projection_constants()
-            if (
-                self.source_adapter_sha256 not in {None, adapter_hash}
-                or self.source_policy_sha256 not in {None, policy_hash}
-                or self.source_universe_policy_sha256 not in {None, universe_hash}
-            ):
-                raise ValueError("Daily source component identity mismatch")
-            if self.source_lifecycle_state is DailyLifecycleState.PENDING:
-                if (
-                    self.daily_bar_state is not CapabilityState.UNQUALIFIED
-                    or self.source_qualification_sessions != 0
-                    or self.source_version_vector_sha256 is not None
-                    or self.source_calendar_generation is not None
-                    or self.source_calendar_sha256 is not None
-                ):
-                    raise ValueError("pending capability matrix is inconsistent")
-            elif self.source_lifecycle_state in {
-                DailyLifecycleState.OBSERVING,
-                DailyLifecycleState.RESET,
-            }:
-                if (
-                    self.daily_bar_state is not CapabilityState.UNQUALIFIED
-                    or self.source_qualification_sessions >= 20
-                    or any(
-                        value is None
-                        for value in (
-                            self.source_version_vector_sha256,
-                            self.source_calendar_generation,
-                            self.source_calendar_sha256,
-                        )
-                    )
-                ):
-                    raise ValueError("observing capability matrix is inconsistent")
-            elif (
-                self.daily_bar_state is not CapabilityState.QUALIFIED
-                or self.source_qualification_sessions != 20
-                or any(
-                    value is None
-                    for value in (
-                        self.source_version_vector_sha256,
-                        self.source_adapter_sha256,
-                        self.source_policy_sha256,
-                        self.source_calendar_generation,
-                        self.source_calendar_sha256,
-                        self.source_universe_policy_sha256,
-                    )
-                )
-            ):
-                raise ValueError("shadow-qualified capability matrix is inconsistent")
-        if any(
-            value is not None
-            for value in (
-                self.source_exact_universe_sha256,
-                self.source_qualification_evidence_sha256,
-                self.source_qualification_candidate_sha256,
-            )
-        ):
-            raise ValueError("v1 does not accept canonical qualification evidence")
+            _validate_ready_snapshot(self)
         expected = _identity(self, "snapshot_sha256", CAPABILITY_DOMAIN)
-        if self.snapshot_sha256 is None:
-            object.__setattr__(self, "snapshot_sha256", expected)
-        elif self.snapshot_sha256 != expected:
+        if self.snapshot_sha256 != expected:
             raise ValueError("capability snapshot digest mismatch")
         return self
+
+
+def _validate_unavailable_snapshot(value: SecondaryCapabilitySnapshotV1) -> None:
+    capability_fields = (
+        "daily_bar_state",
+        "activity_units_state",
+        "adjustment_factor_state",
+        "suspension_semantics_state",
+        "exact_session_universe_state",
+        "promoted_calendar_state",
+        "raw_retention_contract_state",
+    )
+    lineage_fields = (
+        "source_descriptor_sha256",
+        "source_version_vector_sha256",
+        "source_adapter_sha256",
+        "source_policy_sha256",
+        "source_terms_evidence_sha256",
+        "source_calendar_generation",
+        "source_calendar_sha256",
+        "source_universe_policy_sha256",
+        "source_exact_universe_sha256",
+        "source_qualification_evidence_sha256",
+        "source_qualification_candidate_sha256",
+    )
+    if (
+        value.source_lifecycle_state is not None
+        or value.source_qualification_sessions != 0
+        or any(getattr(value, field) is not CapabilityState.UNKNOWN for field in capability_fields)
+        or any(getattr(value, field) is not None for field in lineage_fields)
+    ):
+        raise ValueError("unavailable capability has lineage or qualification")
+
+
+def _validate_ready_snapshot(value: SecondaryCapabilitySnapshotV1) -> None:
+    if value.source_lifecycle_state is None:
+        raise ValueError("ready capability requires a lifecycle state")
+    if value.source_descriptor_sha256 is None or value.source_terms_evidence_sha256 is None:
+        raise ValueError("ready capability requires descriptor and terms identity")
+    if (
+        value.activity_units_state is not CapabilityState.UNKNOWN
+        or value.adjustment_factor_state is not CapabilityState.UNQUALIFIED
+        or value.suspension_semantics_state is not CapabilityState.UNKNOWN
+        or value.exact_session_universe_state is not CapabilityState.UNKNOWN
+        or value.promoted_calendar_state is not CapabilityState.UNKNOWN
+        or value.raw_retention_contract_state is not CapabilityState.UNKNOWN
+    ):
+        raise ValueError("Daily Bar capability cannot imply other semantics")
+    adapter_hash, policy_hash, universe_hash, _ = _r2f3_projection_constants()
+    if (
+        value.source_adapter_sha256 not in {None, adapter_hash}
+        or value.source_policy_sha256 not in {None, policy_hash}
+        or value.source_universe_policy_sha256 not in {None, universe_hash}
+    ):
+        raise ValueError("Daily source component identity mismatch")
+    if value.source_lifecycle_state is DailyLifecycleState.PENDING:
+        _validate_pending_snapshot(value)
+    elif value.source_lifecycle_state in {
+        DailyLifecycleState.OBSERVING,
+        DailyLifecycleState.RESET,
+    }:
+        _validate_observing_snapshot(value)
+    elif (
+        value.daily_bar_state is not CapabilityState.QUALIFIED
+        or value.source_qualification_sessions != 20
+        or any(
+            item is None
+            for item in (
+                value.source_version_vector_sha256,
+                value.source_adapter_sha256,
+                value.source_policy_sha256,
+                value.source_calendar_generation,
+                value.source_calendar_sha256,
+                value.source_universe_policy_sha256,
+            )
+        )
+    ):
+        raise ValueError("shadow-qualified capability matrix is inconsistent")
+    if any(
+        item is not None
+        for item in (
+            value.source_exact_universe_sha256,
+            value.source_qualification_evidence_sha256,
+            value.source_qualification_candidate_sha256,
+        )
+    ):
+        raise ValueError("v1 does not accept canonical qualification evidence")
+
+
+def _validate_pending_snapshot(value: SecondaryCapabilitySnapshotV1) -> None:
+    if (
+        value.daily_bar_state is not CapabilityState.UNQUALIFIED
+        or value.source_qualification_sessions != 0
+        or value.source_version_vector_sha256 is not None
+        or value.source_calendar_generation is not None
+        or value.source_calendar_sha256 is not None
+    ):
+        raise ValueError("pending capability matrix is inconsistent")
+
+
+def _validate_observing_snapshot(value: SecondaryCapabilitySnapshotV1) -> None:
+    if (
+        value.daily_bar_state is not CapabilityState.UNQUALIFIED
+        or value.source_qualification_sessions >= 20
+        or any(
+            item is None
+            for item in (
+                value.source_version_vector_sha256,
+                value.source_calendar_generation,
+                value.source_calendar_sha256,
+            )
+        )
+    ):
+        raise ValueError("observing capability matrix is inconsistent")
 
 
 def _r2f3_projection_constants() -> tuple[str, str, str, str]:
@@ -328,42 +341,57 @@ def build_capability_snapshot(status: Any) -> SecondaryCapabilitySnapshotV1:
     status = DailyShadowStatus.model_validate(status.model_dump(mode="python"))
     adapter_hash, policy_hash, universe_hash, _profile = _r2f3_projection_constants()
     if status.status == "UNAVAILABLE":
-        return SecondaryCapabilitySnapshotV1(
-            source_status=SourceStatus.UNAVAILABLE,
-            source_lifecycle_state=None,
-            daily_bar_state=CapabilityState.UNKNOWN,
-            activity_units_state=CapabilityState.UNKNOWN,
-            adjustment_factor_state=CapabilityState.UNKNOWN,
-            suspension_semantics_state=CapabilityState.UNKNOWN,
-            exact_session_universe_state=CapabilityState.UNKNOWN,
-            promoted_calendar_state=CapabilityState.UNKNOWN,
-            raw_retention_contract_state=CapabilityState.UNKNOWN,
-            source_qualification_sessions=0,
+        return _build_capability_snapshot(
+            {
+                "source_status": SourceStatus.UNAVAILABLE,
+                "source_lifecycle_state": None,
+                "daily_bar_state": CapabilityState.UNKNOWN,
+                "activity_units_state": CapabilityState.UNKNOWN,
+                "adjustment_factor_state": CapabilityState.UNKNOWN,
+                "suspension_semantics_state": CapabilityState.UNKNOWN,
+                "exact_session_universe_state": CapabilityState.UNKNOWN,
+                "promoted_calendar_state": CapabilityState.UNKNOWN,
+                "raw_retention_contract_state": CapabilityState.UNKNOWN,
+                "source_qualification_sessions": 0,
+            }
         )
     window = status.window
     lifecycle = DailyLifecycleState.PENDING if window is None else DailyLifecycleState(window.state)
     sessions = 0 if window is None else window.consecutive_sessions
     qualified = lifecycle is DailyLifecycleState.SHADOW_QUALIFIED
-    return SecondaryCapabilitySnapshotV1(
-        source_status=SourceStatus.READY,
-        source_lifecycle_state=lifecycle,
-        daily_bar_state=CapabilityState.QUALIFIED if qualified else CapabilityState.UNQUALIFIED,
-        activity_units_state=CapabilityState.UNKNOWN,
-        adjustment_factor_state=CapabilityState.UNQUALIFIED,
-        suspension_semantics_state=CapabilityState.UNKNOWN,
-        exact_session_universe_state=CapabilityState.UNKNOWN,
-        promoted_calendar_state=CapabilityState.UNKNOWN,
-        raw_retention_contract_state=CapabilityState.UNKNOWN,
-        source_descriptor_sha256=status.descriptor_sha256,
-        source_version_vector_sha256=status.version_vector_sha256,
-        source_adapter_sha256=adapter_hash,
-        source_policy_sha256=policy_hash,
-        source_terms_evidence_sha256=status.terms_evidence_sha256,
-        source_calendar_generation=status.calendar_generation,
-        source_calendar_sha256=status.calendar_sha256,
-        source_universe_policy_sha256=universe_hash,
-        source_qualification_sessions=sessions,
+    return _build_capability_snapshot(
+        {
+            "source_status": SourceStatus.READY,
+            "source_lifecycle_state": lifecycle,
+            "daily_bar_state": CapabilityState.QUALIFIED
+            if qualified
+            else CapabilityState.UNQUALIFIED,
+            "activity_units_state": CapabilityState.UNKNOWN,
+            "adjustment_factor_state": CapabilityState.UNQUALIFIED,
+            "suspension_semantics_state": CapabilityState.UNKNOWN,
+            "exact_session_universe_state": CapabilityState.UNKNOWN,
+            "promoted_calendar_state": CapabilityState.UNKNOWN,
+            "raw_retention_contract_state": CapabilityState.UNKNOWN,
+            "source_descriptor_sha256": status.descriptor_sha256,
+            "source_version_vector_sha256": status.version_vector_sha256,
+            "source_adapter_sha256": adapter_hash,
+            "source_policy_sha256": policy_hash,
+            "source_terms_evidence_sha256": status.terms_evidence_sha256,
+            "source_calendar_generation": status.calendar_generation,
+            "source_calendar_sha256": status.calendar_sha256,
+            "source_universe_policy_sha256": universe_hash,
+            "source_qualification_sessions": sessions,
+        }
     )
+
+
+def _build_capability_snapshot(values: dict[str, Any]) -> SecondaryCapabilitySnapshotV1:
+    return _build_model(
+        SecondaryCapabilitySnapshotV1,
+        values,
+        digest_field="snapshot_sha256",
+        domain=CAPABILITY_DOMAIN,
+    )  # type: ignore[return-value]
 
 
 def capability_from_registry_record(record: Any) -> SecondaryCapabilitySnapshotV1:
@@ -414,17 +442,21 @@ class FailoverReadinessV1(_Frozen):
     provider_requests: Literal[0] = 0
     secondary_requests: Literal[0] = 0
     canonical_writes: Literal[False] = False
-    readiness_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
+    readiness_sha256: str = Field(pattern=_SHA256.pattern)
 
     @model_validator(mode="before")
     @classmethod
-    def reject_supplied_null_digest(cls, values: Any) -> Any:
-        if (
-            isinstance(values, dict)
-            and "readiness_sha256" in values
-            and values["readiness_sha256"] is None
-        ):
-            raise ValueError("supplied readiness digest cannot be null")
+    def revalidate_nested_secondary(cls, values: Any) -> Any:
+        if not isinstance(values, dict) or values.get("secondary") is None:
+            return values
+        secondary = values["secondary"]
+        if isinstance(secondary, SecondaryCapabilitySnapshotV1):
+            if type(secondary) is not SecondaryCapabilitySnapshotV1:
+                raise TypeError("secondary must be an exact capability snapshot")
+            values = dict(values)
+            values["secondary"] = SecondaryCapabilitySnapshotV1.model_validate(
+                secondary.model_dump(mode="python")
+            )
         return values
 
     @model_validator(mode="after")
@@ -454,9 +486,7 @@ class FailoverReadinessV1(_Frozen):
         if self.blocked_reasons != expected:
             raise ValueError("blocked reasons are not the frozen readiness mapping")
         digest = _identity(self, "readiness_sha256", READINESS_DOMAIN)
-        if self.readiness_sha256 is None:
-            object.__setattr__(self, "readiness_sha256", digest)
-        elif self.readiness_sha256 != digest:
+        if self.readiness_sha256 != digest:
             raise ValueError("readiness digest mismatch")
         return self
 
@@ -468,6 +498,8 @@ def build_readiness(
     secondary: SecondaryCapabilitySnapshotV1 | None = None,
     control_state_available: bool = True,
 ) -> FailoverReadinessV1:
+    if type(control_state_available) is not bool:
+        raise TypeError("control_state_available must be a native bool")
     priority = _validate_priority(tuple(provider_priority))
     if secondary is not None:
         if type(secondary) is not SecondaryCapabilitySnapshotV1:
@@ -490,15 +522,29 @@ def build_readiness(
         secondary = None
     else:
         status = "ready"
-    return FailoverReadinessV1(
-        status=status,
-        configured_auto_failover_enabled=configured_auto_failover_enabled,
-        provider_priority=priority,
-        secondary=secondary,
-        blocked_reasons=_expected_reasons(
-            status=status, provider_priority=priority, secondary=secondary
-        ),
+    return _build_readiness(
+        {
+            "status": status,
+            "configured_auto_failover_enabled": configured_auto_failover_enabled,
+            "provider_priority": priority,
+            "secondary": secondary,
+            "blocked_reasons": _expected_reasons(
+                status=status, provider_priority=priority, secondary=secondary
+            ),
+        }
     )
+
+
+def _build_readiness(values: dict[str, Any]) -> FailoverReadinessV1:
+    if isinstance(values.get("secondary"), dict):
+        values = dict(values)
+        values["secondary"] = SecondaryCapabilitySnapshotV1.model_validate(values["secondary"])
+    return _build_model(
+        FailoverReadinessV1,
+        values,
+        digest_field="readiness_sha256",
+        domain=READINESS_DOMAIN,
+    )  # type: ignore[return-value]
 
 
 class PreflightDecisionV1(_Frozen):
@@ -514,18 +560,7 @@ class PreflightDecisionV1(_Frozen):
     provider_requests: Literal[0] = 0
     secondary_requests: Literal[0] = 0
     canonical_writes: Literal[False] = False
-    decision_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_supplied_null_digest(cls, values: Any) -> Any:
-        if (
-            isinstance(values, dict)
-            and "decision_sha256" in values
-            and values["decision_sha256"] is None
-        ):
-            raise ValueError("supplied decision digest cannot be null")
-        return values
+    decision_sha256: str = Field(pattern=_SHA256.pattern)
 
     @model_validator(mode="after")
     def validate_decision(self) -> PreflightDecisionV1:
@@ -550,9 +585,7 @@ class PreflightDecisionV1(_Frozen):
         if (self.action, self.selected_provider, self.pointer_action, self.reason) != expected:
             raise ValueError("preflight decision contradicts primary state")
         digest = _identity(self, "decision_sha256", DECISION_DOMAIN)
-        if self.decision_sha256 is None:
-            object.__setattr__(self, "decision_sha256", digest)
-        elif self.decision_sha256 != digest:
+        if self.decision_sha256 != digest:
             raise ValueError("preflight decision digest mismatch")
         return self
 
@@ -564,24 +597,35 @@ def preflight(
         raise TypeError("readiness must be an exact readiness snapshot")
     readiness = FailoverReadinessV1.model_validate(readiness.model_dump(mode="python"))
     state = PrimaryState(primary_state)
-    return PreflightDecisionV1(
-        primary_state=state,
-        readiness_sha256=readiness.readiness_sha256,
-        action=(
-            PreflightAction.PRIMARY_ALLOWED
+    return _build_preflight_decision(
+        {
+            "primary_state": state,
+            "readiness_sha256": readiness.readiness_sha256,
+            "action": (
+                PreflightAction.PRIMARY_ALLOWED
+                if state is PrimaryState.READY
+                else PreflightAction.SECONDARY_BLOCKED
+            ),
+            "selected_provider": "baostock" if state is PrimaryState.READY else None,
+            "pointer_action": (
+                PointerAction.PRIMARY_PUBLICATION_MAY_PROCEED
+                if state is PrimaryState.READY
+                else PointerAction.PRESERVE_POINTER
+            ),
+            "reason": "PRIMARY_READY"
             if state is PrimaryState.READY
-            else PreflightAction.SECONDARY_BLOCKED
-        ),
-        selected_provider="baostock" if state is PrimaryState.READY else None,
-        pointer_action=(
-            PointerAction.PRIMARY_PUBLICATION_MAY_PROCEED
-            if state is PrimaryState.READY
-            else PointerAction.PRESERVE_POINTER
-        ),
-        reason="PRIMARY_READY"
-        if state is PrimaryState.READY
-        else "SECONDARY_NOT_CANONICALLY_QUALIFIED",
+            else "SECONDARY_NOT_CANONICALLY_QUALIFIED",
+        }
     )
+
+
+def _build_preflight_decision(values: dict[str, Any]) -> PreflightDecisionV1:
+    return _build_model(
+        PreflightDecisionV1,
+        values,
+        digest_field="decision_sha256",
+        domain=DECISION_DOMAIN,
+    )  # type: ignore[return-value]
 
 
 # Descriptive aliases keep the public v1 contract discoverable without introducing
