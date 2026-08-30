@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import hashlib
 import json
 import os
@@ -464,6 +465,8 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
         "/Users/finlay/Library/Application Support",
         "/Volumes/Stock",
     )
+    (tmp_path / "control").mkdir(mode=0o700)
+    (tmp_path / "shadow").mkdir(mode=0o700)
 
     def reject_blocked_path(value: object) -> None:
         try:
@@ -478,6 +481,7 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
                 pytest.fail(f"readiness touched forbidden production path: {blocked}")
 
     original_open = os.open
+    original_builtin_open = builtins.open
     original_stat = os.stat
     original_lstat = os.lstat
     original_listdir = os.listdir
@@ -486,6 +490,10 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
     def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
         reject_blocked_path(path)
         return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def guarded_builtin_open(file, *args, **kwargs):
+        reject_blocked_path(file)
+        return original_builtin_open(file, *args, **kwargs)
 
     def guarded_stat(path, *, dir_fd=None, follow_symlinks=True):
         reject_blocked_path(path)
@@ -504,6 +512,7 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
         return original_scandir(path)
 
     monkeypatch.setattr(os, "open", guarded_open)
+    monkeypatch.setattr(builtins, "open", guarded_builtin_open)
     monkeypatch.setattr(os, "stat", guarded_stat)
     monkeypatch.setattr(os, "lstat", guarded_lstat)
     monkeypatch.setattr(os, "listdir", guarded_listdir)
@@ -518,6 +527,15 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
         "__init__",
         lambda *_args, **_kwargs: pytest.fail("readiness must not construct TickFlow"),
     )
+
+    real_reader = market_api.DailyShadowRegistryReader
+    reader_calls = []
+
+    def observed_reader(*args, **kwargs):
+        reader_calls.append((args, kwargs))
+        return real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(market_api, "DailyShadowRegistryReader", observed_reader)
 
     settings = Settings(
         _env_file=None,
@@ -534,6 +552,8 @@ def test_failover_readiness_never_touches_provider_or_production_paths(
     monkeypatch.setattr(sys, "argv", ["stock-eva", "market-failover-readiness"])
     assert cli_module.main() == 1
     assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
+    assert len(reader_calls) == 2
+    assert all(call[1]["verify_external"] is True for call in reader_calls)
 
 
 def test_legacy_manifest_missing_source_is_read_only_and_byte_stable(tmp_path: Path) -> None:
