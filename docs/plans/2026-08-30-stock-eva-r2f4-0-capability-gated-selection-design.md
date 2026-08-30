@@ -265,7 +265,7 @@ SecondaryCapabilitySnapshotV1
   exact_session_universe_state = QUALIFIED | UNQUALIFIED | UNKNOWN
   promoted_calendar_state = QUALIFIED | UNQUALIFIED | UNKNOWN
   raw_retention_contract_state = QUALIFIED | UNQUALIFIED | UNKNOWN
-  full_session_qualification_state = QUALIFIED | UNQUALIFIED | UNKNOWN
+  full_session_qualification_state = UNQUALIFIED
   source_descriptor_sha256 = sha256 | null
   source_version_vector_sha256 = sha256 | null
   source_adapter_sha256 = sha256 | null
