@@ -436,6 +436,13 @@ class CalendarHead(_Frozen):
         return self
 
 
+class CalendarControlSnapshot(_Frozen):
+    read_result: CalendarReadResult
+    candidates: tuple[CalendarCandidate, ...] = ()
+    promoted_sources: tuple[CalendarSourceBundleV1, ...] = ()
+    attempts: tuple[CalendarMaintenanceAttempt, ...] = ()
+
+
 def _projection(model: BaseModel, excluded: str) -> dict[str, Any]:
     values = model.model_dump(mode="json", warnings="error")
     values.pop(excluded, None)
@@ -1344,6 +1351,7 @@ class CalendarGenerationStore:
             objects.add(obj["body_sha256"])
 
         attempt_rows: dict[tuple[int, str], dict[str, Any]] = {}
+        attempts: list[CalendarMaintenanceAttempt] = []
         attempt_cursor = connection.execute("SELECT * FROM calendar_maintenance_attempt")
         for attempt_row in attempt_cursor:
             if (
@@ -1387,6 +1395,7 @@ class CalendarGenerationStore:
             except (TypeError, ValueError, KeyError) as exc:
                 raise CalendarStoreUnavailable("calendar attempt unavailable") from exc
             attempt_rows[(attempt_row["target_year"], attempt_row["slot_date"])] = dict(attempt_row)
+            attempts.append(attempt)
 
         promotion_count = connection.execute(
             "SELECT COUNT(*) FROM calendar_generation_promotion"
@@ -1526,16 +1535,25 @@ class CalendarGenerationStore:
             "candidate_sources": candidate_sources,
             "objects": objects,
             "attempt_rows": attempt_rows,
+            "attempts": tuple(
+                sorted(attempts, key=lambda item: (item.target_year, item.slot_date))
+            ),
             "generations": generations,
             "promoted_sources": promoted_sources,
             "year_maps": prior_maps,
             "bundled": bundled,
         }
 
-    def read(self) -> CalendarReadResult:
-        if not self.path.exists():
-            return CalendarReadResult(status="unavailable", calendar=EMPTY_CALENDAR)
+    @staticmethod
+    def _empty_control() -> CalendarControlSnapshot:
+        return CalendarControlSnapshot(
+            read_result=CalendarReadResult(status="unavailable", calendar=EMPTY_CALENDAR)
+        )
+
+    def read_control(self) -> CalendarControlSnapshot:
         try:
+            if not self.path.exists():
+                return self._empty_control()
             self._check_path(allow_missing=False)
             with _lock(self.path.with_name(self.path.name + ".lock"), False, create=False):
                 connection = self._connect(readonly=True)
@@ -1550,7 +1568,7 @@ class CalendarGenerationStore:
                         if generation is not None
                         else None
                     )
-                    return CalendarReadResult(
+                    read_result = CalendarReadResult(
                         status="ready",
                         generation=generation,
                         bundled=verified["bundled"],
@@ -1564,13 +1582,33 @@ class CalendarGenerationStore:
                             ),
                         ),
                     )
+                    candidates = tuple(
+                        CalendarCandidate(
+                            source_sha256=row["source_sha256"],
+                            canonical_source_bytes=row["payload_json"].encode("utf-8"),
+                            staged_at=_parse_stamp(row["staged_at"]),
+                            staging_sequence=row["staging_sequence"],
+                            admission=row["admission"],
+                            reason=row["reason"],
+                        )
+                        for row in verified["candidates"]
+                    )
+                    return CalendarControlSnapshot(
+                        read_result=read_result,
+                        candidates=candidates,
+                        promoted_sources=tuple(verified["promoted_sources"]),
+                        attempts=verified["attempts"],
+                    )
                 finally:
                     fd = self._reader_fds.pop(id(connection), None)
                     connection.close()
                     if fd is not None:
                         os.close(fd)
         except (OSError, sqlite3.Error, CalendarGenerationError, CalendarStoreUnavailable):
-            return CalendarReadResult(status="unavailable", calendar=EMPTY_CALENDAR)
+            return self._empty_control()
+
+    def read(self) -> CalendarReadResult:
+        return self.read_control().read_result
 
     def reserve_attempt(
         self,
@@ -1638,6 +1676,53 @@ class CalendarGenerationStore:
             finally:
                 self._close_connection(connection)
 
+    def finish_attempt(
+        self,
+        attempt: CalendarMaintenanceAttempt,
+        outcome: str,
+        official_requests: int,
+        machine_requests: int,
+        *,
+        finished_at: datetime,
+    ) -> bool:
+        """Best-effort public terminal audit update without granting authority."""
+        if not isinstance(outcome, str) or outcome not in {
+            "OFFICIAL_UNAVAILABLE",
+            "OFFICIAL_HASH_MISMATCH",
+            "MACHINE_UNAVAILABLE",
+            "MACHINE_CONFLICT",
+            "SKIPPED_CIRCUIT_OPEN",
+            "PARENT_CHANGED",
+            "HISTORY_CHANGE",
+            "CONTROL_STATE_UNAVAILABLE",
+        }:
+            raise CalendarGenerationError("invalid attempt outcome")
+        if type(official_requests) is not int or type(machine_requests) is not int:
+            raise CalendarGenerationError("request counts must be integers")
+        if (official_requests, machine_requests) not in {
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (2, 1),
+        }:
+            raise CalendarGenerationError("invalid request counts")
+        attempt = _revalidate_attempt(attempt)
+        if attempt.outcome != "RUNNING":
+            return False
+        try:
+            finished_at = _utc(finished_at)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CalendarGenerationError("finished_at must be timezone aware") from exc
+        if finished_at < attempt.started_at:
+            raise CalendarGenerationError("attempt finished before it started")
+        return self._spend_attempt(
+            attempt,
+            outcome,
+            official_requests,
+            machine_requests,
+            finished_at=finished_at,
+        )
+
     def _spend_attempt(
         self,
         attempt: CalendarMaintenanceAttempt,
@@ -1646,7 +1731,7 @@ class CalendarGenerationStore:
         machine: int,
         *,
         finished_at: datetime,
-    ) -> None:
+    ) -> bool:
         """Best-effort terminal audit update; never grants authority."""
         if outcome not in {
             "OFFICIAL_UNAVAILABLE",
@@ -1658,21 +1743,22 @@ class CalendarGenerationStore:
             "HISTORY_CHANGE",
             "CONTROL_STATE_UNAVAILABLE",
         }:
-            return
+            return False
         try:
             attempt = _revalidate_attempt(attempt)
             finished_at = _utc(finished_at)
         except CalendarGenerationError:
-            return
+            return False
         if finished_at < attempt.started_at or (official, machine) not in {
             (0, 0),
+            (1, 0),
             (2, 0),
             (2, 1),
         }:
-            return
-        if not self.path.exists():
-            return
+            return False
         try:
+            if not self.path.exists():
+                return False
             with _lock(self.path.with_name(self.path.name + ".lock"), True, create=False):
                 connection = self._connect()
                 try:
@@ -1689,8 +1775,8 @@ class CalendarGenerationStore:
                         or row["started_at"] != _stamp(attempt.started_at)
                     ):
                         connection.rollback()
-                        return
-                    connection.execute(
+                        return False
+                    update = connection.execute(
                         "UPDATE calendar_maintenance_attempt SET finished_at=?, outcome=?, "
                         "official_requests=?, machine_requests=? "
                         "WHERE target_year=? AND slot_date=? AND outcome='RUNNING'",
@@ -1703,12 +1789,16 @@ class CalendarGenerationStore:
                             attempt.slot_date.isoformat(),
                         ),
                     )
+                    if update.rowcount != 1:
+                        connection.rollback()
+                        return False
                     self._assert_writer_identity(connection)
                     connection.commit()
+                    return True
                 finally:
                     self._close_connection(connection)
-        except (OSError, sqlite3.Error, CalendarStoreUnavailable):
-            return
+        except (OSError, sqlite3.Error, CalendarGenerationError, CalendarStoreUnavailable):
+            return False
 
     def promote(
         self,
@@ -1978,6 +2068,7 @@ __all__ = [
     "CalendarStoreUnavailable",
     "CalendarGenerationStore",
     "CalendarCandidate",
+    "CalendarControlSnapshot",
     "CalendarOfficialObject",
     "CalendarHead",
     "CalendarGenerationV1",

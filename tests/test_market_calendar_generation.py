@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from backend.app.market import calendar_generation as calendar_module
 from backend.app.market.calendar_generation import (
     SCHEMA_SHA256,
+    CalendarGenerationError,
     CalendarGenerationStore,
     CalendarGenerationV1,
     CalendarMachineDayV1,
@@ -898,6 +899,299 @@ def test_store_writer_refuses_corrupt_existing_database(tmp_path) -> None:
             _valid_source(), datetime(2026, 12, 22, 1, tzinfo=UTC)
         )
     assert path.read_bytes() == before
+
+
+def test_control_snapshot_exposes_verified_attempt_and_public_one_request_failure_audit(
+    tmp_path,
+) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar_generations.sqlite3")
+    store.stage_execute(source, now)
+
+    before = store.read_control()
+    assert before.read_result.status == "ready"
+    assert before.candidates[0].canonical_source_bytes == canonical_json_bytes(
+        source.model_dump(mode="json")
+    )
+    attempt = store.reserve_attempt(source, now)
+    assert before.attempts == ()
+
+    finished_at = now + timedelta(minutes=5)
+    assert store.finish_attempt(
+        attempt,
+        "OFFICIAL_UNAVAILABLE",
+        1,
+        0,
+        finished_at=finished_at,
+    )
+    after = store.read_control()
+    assert after.attempts[0].outcome == "OFFICIAL_UNAVAILABLE"
+    assert after.attempts[0].official_requests == 1
+    assert after.attempts[0].machine_requests == 0
+    assert after.attempts[0].finished_at == finished_at
+
+
+def _control_fixture(tmp_path):
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    source = _valid_source()
+    store.stage_execute(source, now)
+    return store, store.reserve_attempt(source, now), now
+
+
+class _ForbiddenCalendarPath:
+    def exists(self):
+        raise AssertionError("invalid public input reached path access")
+
+
+class _UnreadableCalendarPath:
+    def exists(self):
+        raise PermissionError("synthetic inaccessible control ancestor")
+
+
+@pytest.mark.parametrize(
+    "outcome,official,machine,finished",
+    [
+        ("RUNNING", 0, 0, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("PROMOTED", 2, 1, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ([], 0, 0, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", True, 0, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", 1.0, 0, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", 1, False, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", 1, 1, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", 3, 0, datetime(2026, 12, 22, 1, tzinfo=UTC)),
+        ("OFFICIAL_UNAVAILABLE", 1, 0, "2026-12-22T01:00:00Z"),
+        ("OFFICIAL_UNAVAILABLE", 1, 0, datetime(2026, 12, 22)),
+        (
+            "OFFICIAL_UNAVAILABLE",
+            1,
+            0,
+            datetime(2026, 12, 22, 0, 59, 59, tzinfo=UTC),
+        ),
+    ],
+)
+def test_public_finish_rejects_malformed_inputs_before_path(
+    tmp_path, outcome, official, machine, finished
+):
+    store, attempt, _now = _control_fixture(tmp_path)
+    store.path = _ForbiddenCalendarPath()
+    with pytest.raises(CalendarGenerationError):
+        store.finish_attempt(attempt, outcome, official, machine, finished_at=finished)
+
+
+def test_public_finish_revalidates_hostile_pydantic_escape_hatch_before_path(tmp_path):
+    store, attempt, now = _control_fixture(tmp_path)
+    forged = BaseModel.model_construct.__func__(
+        CalendarMaintenanceAttempt,
+        **{**attempt.model_dump(), "source_sha256": None},
+    )
+    store.path = _ForbiddenCalendarPath()
+    with pytest.raises(CalendarGenerationError):
+        store.finish_attempt(forged, "OFFICIAL_UNAVAILABLE", 1, 0, finished_at=now)
+
+
+@pytest.mark.parametrize("official,machine", [(0, 0), (1, 0), (2, 0), (2, 1)])
+def test_public_finish_persists_actual_allowed_counts_without_authority(
+    tmp_path, official, machine
+):
+    store, attempt, now = _control_fixture(tmp_path)
+    assert (
+        store.finish_attempt(
+            attempt,
+            "CONTROL_STATE_UNAVAILABLE",
+            official,
+            machine,
+            finished_at=now + timedelta(seconds=3),
+        )
+        is True
+    )
+    snapshot = store.read_control()
+    assert snapshot.read_result.status == "ready"
+    assert snapshot.read_result.generation is None
+    assert snapshot.promoted_sources == ()
+    assert snapshot.attempts[0].official_requests == official
+    assert snapshot.attempts[0].machine_requests == machine
+    before = store.path.read_bytes()
+    assert (
+        store.finish_attempt(
+            attempt,
+            "MACHINE_UNAVAILABLE",
+            2,
+            1,
+            finished_at=now + timedelta(seconds=4),
+        )
+        is False
+    )
+    assert store.path.read_bytes() == before
+
+
+def test_public_finish_unreadable_path_is_best_effort_false(tmp_path):
+    store, attempt, now = _control_fixture(tmp_path)
+    store.path = _UnreadableCalendarPath()
+    assert store.finish_attempt(attempt, "OFFICIAL_UNAVAILABLE", 1, 0, finished_at=now) is False
+
+
+def test_control_read_unreadable_path_is_empty_unavailable(tmp_path):
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    store.path = _UnreadableCalendarPath()
+    result = store.read_control()
+    assert result.read_result.status == "unavailable"
+    assert result.candidates == result.promoted_sources == result.attempts == ()
+
+
+def test_missing_control_read_is_empty_without_initialization(tmp_path):
+    store = CalendarGenerationStore(tmp_path / "missing" / "calendar.sqlite3")
+    result = store.read_control()
+    assert result.read_result.status == "unavailable"
+    assert result.read_result.calendar.configs == {}
+    assert result.candidates == result.promoted_sources == result.attempts == ()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_control_read_does_not_export_rows_after_schema_corruption(tmp_path):
+    store, _attempt, _now = _control_fixture(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("CREATE TABLE unexpected (value TEXT)")
+    before = store.path.read_bytes()
+    result = store.read_control()
+    assert result.read_result.status == "unavailable"
+    assert result.candidates == result.promoted_sources == result.attempts == ()
+    assert store.path.read_bytes() == before
+
+
+def test_control_snapshot_keeps_latest_quarantined_candidate_in_staging_order(tmp_path):
+    source = _valid_source()
+    changed_schedule = source.schedules[1].model_copy(
+        update={"closed_dates": (date(2027, 1, 1), date(2027, 1, 4)), "schedule_sha256": "0" * 64}
+    )
+    changed_schedule = changed_schedule.model_copy(
+        update={"schedule_sha256": build_schedule_sha256(changed_schedule)}
+    )
+    conflict = source.model_copy(
+        update={"schedules": (source.schedules[0], changed_schedule), "source_sha256": "0" * 64}
+    )
+    conflict = conflict.model_copy(update={"source_sha256": build_source_sha256(conflict)})
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    assert store.stage_execute(conflict, now).outcome == "SOURCE_CONFLICT"
+    snapshot = store.read_control()
+    assert [item.staging_sequence for item in snapshot.candidates] == [1, 2]
+    assert snapshot.candidates[-1].source_sha256 == conflict.source_sha256
+    assert snapshot.candidates[-1].admission == "quarantined"
+    assert snapshot.candidates[-1].reason == "SOURCE_CONFLICT"
+
+
+def test_control_snapshot_promoted_sources_preserve_generation_order_and_latest_years(tmp_path):
+    _path, store, _now = _promote_two_generations(tmp_path)
+    snapshot = store.read_control()
+    assert [source.year for source in snapshot.promoted_sources] == [2026, 2027]
+    latest_by_year = {source.year: source for source in snapshot.promoted_sources}
+    assert latest_by_year[2026] == snapshot.promoted_sources[0]
+    assert latest_by_year[2027] == snapshot.promoted_sources[1]
+    assert latest_by_year[2027].source_sha256 == snapshot.read_result.source.source_sha256
+
+
+def test_control_snapshot_running_attempt_and_old_snapshot_are_independent(tmp_path):
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    store.stage_execute(source, now)
+    old = store.read_control()
+    attempt = store.reserve_attempt(source, now)
+    current = store.read_control()
+    assert old.attempts == ()
+    assert current.attempts == (attempt,)
+    assert current.attempts[0].outcome == "RUNNING"
+
+
+def test_control_snapshot_uses_one_readonly_connection_and_full_verified_graph(
+    tmp_path, monkeypatch
+):
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    store.stage_execute(source, now)
+    original_connect = store._connect
+    calls = []
+
+    def connect_spy(*, readonly=False):
+        calls.append(readonly)
+        return original_connect(readonly=readonly)
+
+    monkeypatch.setattr(store, "_connect", connect_spy)
+    before_bytes = store.path.read_bytes()
+    before_mtime = store.path.stat().st_mtime_ns
+    snapshot = store.read_control()
+    assert snapshot.read_result.status == "ready"
+    assert calls == [True]
+    assert store.path.read_bytes() == before_bytes
+    assert store.path.stat().st_mtime_ns == before_mtime
+
+
+@pytest.mark.parametrize("field", ["source_sha256", "expected_parent_sha256", "started_at"])
+def test_public_finish_wrong_bound_attempt_is_false_without_mutation(tmp_path, field):
+    store, attempt, now = _control_fixture(tmp_path)
+    value = {
+        "source_sha256": "f" * 64,
+        "expected_parent_sha256": "f" * 64,
+        "started_at": now + timedelta(hours=1),
+    }[field]
+    forged = attempt.model_copy(update={field: value})
+    before = store.path.read_bytes()
+    assert (
+        store.finish_attempt(
+            forged,
+            "CONTROL_STATE_UNAVAILABLE",
+            1,
+            0,
+            finished_at=now + timedelta(hours=2),
+        )
+        is False
+    )
+    assert store.path.read_bytes() == before
+    assert store.read_control().attempts[0].outcome == "RUNNING"
+
+
+def test_public_finish_commit_failure_preserves_running_attempt_and_head(tmp_path, monkeypatch):
+    store, attempt, now = _control_fixture(tmp_path)
+    original_connect = store._connect
+    state = {"injected": False}
+
+    class CommitFailure:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def commit(self):
+            state["injected"] = True
+            raise sqlite3.OperationalError("injected commit failure")
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect_with_fault(*, readonly=False):
+        if readonly:
+            return original_connect(readonly=True)
+        return CommitFailure(original_connect(readonly=readonly))
+
+    monkeypatch.setattr(store, "_connect", connect_with_fault)
+    before = store.path.read_bytes()
+    assert (
+        store.finish_attempt(
+            attempt,
+            "CONTROL_STATE_UNAVAILABLE",
+            1,
+            0,
+            finished_at=now + timedelta(seconds=3),
+        )
+        is False
+    )
+    assert state["injected"]
+    assert store.path.read_bytes() == before
+    snapshot = store.read_control()
+    assert snapshot.read_result.generation is None
+    assert snapshot.attempts[0].outcome == "RUNNING"
 
 
 def test_quality_new_promotion_cannot_commit_backwards_timestamp(tmp_path):

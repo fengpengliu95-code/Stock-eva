@@ -49,6 +49,22 @@ All backend/tests ruff and format (199 files), compileall, diff check, strict sp
 No real acquisition occurred. This is a development checkpoint only; independent Task 2 SPEC
 and QUALITY reviews follow completion of Task 2b, and no Task 2/version GO is claimed here.
 
+**Task 2b control-interface checkpoint:** `read_control()` now exposes an immutable
+`CalendarControlSnapshot` containing the original read result, staging-ordered candidates,
+generation-ordered promoted sources and ordered attempts, from the same complete verified
+connection. `read()` delegates without changing its result contract. Public `finish_attempt()`
+revalidates failed outcomes, identities, timestamps and strict request counts, including actual
+1/0 failures; it cannot promote, reset or overwrite a spent attempt. Root reproduced and fixed
+two pre-try permission-error escapes in the read and failure-audit paths. Twenty private control
+probes are retained as repository regressions alongside ordering, transaction and read-only
+coverage. Root final combined replay: 159 calendar-generation cases, 124 BaoStock/calendar-sync
+cases and 102 private probes, 385 passed. A legacy private FIFO probe was switched from fork to
+spawn before the final combined replay to avoid fork-after-thread warnings; no production
+transport behavior changed. All backend/tests ruff/format, compileall and diff checks passed.
+The DDL digest and bundled projection digest remain unchanged. This checkpoint did not rerun
+full pytest; the latest full result remains the Task 2a 2360-case run. Health preflight and
+bounded acquisition/worker implementation, then complete Task 2 double review, remain pending.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
