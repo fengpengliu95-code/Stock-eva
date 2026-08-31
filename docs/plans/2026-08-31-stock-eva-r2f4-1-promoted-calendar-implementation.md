@@ -92,11 +92,30 @@ The implementation SHA-256 is
 Task 1 is now entering frozen-candidate review, not accepted. No unverified path-race claim is
 acceptance evidence; the independent specification and quality reviews remain required.
 
+Task 1 candidate commit `a9e4145305803747f8c9a4407f06367c0fdcf7fc` passed root full pytest
+(2318, exit 0), all backend/tests ruff and format (199 files), compileall, diff checks and nine
+R2-F2 golden digests. The run reported the existing Starlette warning and a new FIFO-test fork
+warning under the multi-threaded full suite. It is not an acceptance verdict.
+Independent specification review R1 returned NO-GO (reported H=3/M=0, plus one test-reliability L):
+the reader could adopt a valid foreign database swapped immediately before open, a FIFO swap
+could block before descriptor checks, and SQLite BLOB/TEXT storage-type corruption escaped the
+shared verifier as TypeError. Root reproduced all three as ten private RED cases, including all
+read/stage/reserve/promote paths for both storage-type variants. The first repair passed those
+ten cases, but root then reproduced a remaining post-validation/pre-open foreign swap: a second
+lstat had re-adopted unverified identity. R1b now carries the original validated path proof into
+both connection branches, uses nonblocking regular-file reader descriptors, explicitly checks
+control FD types and validates SQLite column types before parsing. Test-only FIFO workers use
+bounded spawn instead of fork. Root replayed 127 repository cases plus all 60 private probes:
+187 passed, with full backend/tests ruff/format, compileall and diff checks passing, at SHA-256
+`237e07b7688ee11a9a64139e64f4ceb2783bfcd9f1aa34e70be2d933b24fc7de`.
+This repair is awaiting exact-commit specification re-review. Quality review and Task 2 have not
+started; a green test run does not close the independent review by itself.
+
 Protected regression checkpoint: existing calendar-sync, R2-F2 golden compatibility and R2-F4.0
 failover-readiness tests passed (68), and all nine R2-F2 golden file digests match. Existing tracked
 backend/test/script files remain unchanged; this does not replace the final full regression gate.
-No Task 2 work or Task 1 acceptance is authorized by a partial green checkpoint. An earlier full
-regression run passed before these expanded RED cases; it is not the current acceptance gate.
+No Task 2 work or Task 1 acceptance is authorized by a partial green checkpoint. Even the green
+full regression at the R1 candidate does not override its independently reproduced blockers.
 
 ## Execution boundaries
 

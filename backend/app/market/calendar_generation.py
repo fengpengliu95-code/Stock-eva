@@ -769,7 +769,12 @@ def _lock(path: Path, exclusive: bool, *, create: bool = True):
         raise
     try:
         lock_info = os.fstat(fd)
-        if lock_info.st_nlink != 1 or lock_info.st_uid != os.getuid() or lock_info.st_mode & 0o077:
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_uid != os.getuid()
+            or lock_info.st_mode & 0o077
+        ):
             raise CalendarStoreUnavailable("unsafe calendar store lock")
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
@@ -835,7 +840,7 @@ class CalendarGenerationStore:
             admission="quarantined" if conflict else "awaiting_machine",
         )
 
-    def _check_path(self, *, allow_missing: bool) -> None:
+    def _check_path(self, *, allow_missing: bool) -> os.stat_result | None:
         path = self.path
         self._check_ancestors()
         try:
@@ -866,6 +871,7 @@ class CalendarGenerationStore:
                 sidecar_exists = False
             if sidecar_exists:
                 raise CalendarStoreUnavailable("calendar store has active sidecar")
+        return path_info
 
     def _check_ancestors(self) -> None:
         private_parent = self.path.parent
@@ -898,11 +904,22 @@ class CalendarGenerationStore:
             current = parent
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
-        self._check_path(allow_missing=not readonly)
+        proof = self._check_path(allow_missing=not readonly)
         if readonly:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            if proof is None:
+                raise CalendarStoreUnavailable("calendar store unavailable")
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
                 before = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1
+                    or before.st_uid != os.getuid()
+                    or before.st_mode & 0o077
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    != (proof.st_dev, proof.st_ino, proof.st_size, proof.st_mtime_ns)
+                ):
+                    raise CalendarStoreUnavailable("calendar store changed")
                 connection = sqlite3.connect(f"file:/dev/fd/{fd}?mode=ro", uri=True, timeout=0)
                 after = os.fstat(fd)
                 if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
@@ -924,10 +941,7 @@ class CalendarGenerationStore:
             # descriptor alive for the connection also lets the commit-time
             # identity proof detect that the public path was replaced.
             alias_path: Path | None = None
-            try:
-                expected = self.path.lstat()
-            except FileNotFoundError:
-                expected = None
+            expected = proof
             if expected is not None:
                 alias_path = self.path.with_name(f".{self.path.name}.bound-{secrets.token_hex(12)}")
                 os.link(self.path, alias_path, follow_symlinks=False)
@@ -944,7 +958,8 @@ class CalendarGenerationStore:
                 ):
                     raise CalendarStoreUnavailable("calendar store changed")
                 if (
-                    opened.st_nlink != (2 if expected is not None else 1)
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != (2 if expected is not None else 1)
                     or opened.st_uid != os.getuid()
                     or opened.st_mode & 0o077
                 ):
@@ -1117,6 +1132,8 @@ class CalendarGenerationStore:
         meta = rows[0]
         if (
             type(meta["schema_version"]) is not int
+            or type(meta["schema_sha256"]) is not str
+            or type(meta["bundled_sha256"]) is not str
             or meta["schema_version"] != 1
             or meta["schema_sha256"] != SCHEMA_SHA256
             or meta["bundled_sha256"] != bundled_sha256(bundled)
@@ -1220,7 +1237,10 @@ class CalendarGenerationStore:
             or (head["sequence"] == 0) != (head["generation_sha256"] is None)
             or (
                 head["generation_sha256"] is not None
-                and SHA256_RE.fullmatch(head["generation_sha256"]) is None
+                and (
+                    type(head["generation_sha256"]) is not str
+                    or SHA256_RE.fullmatch(head["generation_sha256"]) is None
+                )
             )
         ):
             raise CalendarStoreUnavailable("calendar head unavailable")
@@ -1242,6 +1262,15 @@ class CalendarGenerationStore:
         candidate_sources: dict[str, CalendarSourceBundleV1] = {}
         candidate_staged_at: dict[str, str] = {}
         for candidate in candidates:
+            if (
+                type(candidate["staging_sequence"]) is not int
+                or type(candidate["source_sha256"]) is not str
+                or type(candidate["payload_json"]) is not str
+                or type(candidate["staged_at"]) is not str
+                or type(candidate["admission"]) is not str
+                or type(candidate["reason"]) is not str
+            ):
+                raise CalendarStoreUnavailable("calendar candidate unavailable")
             try:
                 payload = candidate["payload_json"]
                 source = CalendarSourceBundleV1.model_validate_json(payload)
@@ -1272,7 +1301,9 @@ class CalendarGenerationStore:
             "SELECT body_sha256,body_bytes FROM calendar_official_object"
         )
         for obj in object_cursor:
-            raw = bytes(obj["body_bytes"])
+            if type(obj["body_sha256"]) is not str or type(obj["body_bytes"]) is not bytes:
+                raise CalendarStoreUnavailable("calendar graph unavailable")
+            raw = obj["body_bytes"]
             if not raw or len(raw) > MAX_BODY_BYTES or body_sha256(raw) != obj["body_sha256"]:
                 raise CalendarStoreUnavailable("calendar graph unavailable")
             objects.add(obj["body_sha256"])
@@ -1280,6 +1311,24 @@ class CalendarGenerationStore:
         attempt_rows: dict[tuple[int, str], dict[str, Any]] = {}
         attempt_cursor = connection.execute("SELECT * FROM calendar_maintenance_attempt")
         for attempt_row in attempt_cursor:
+            if (
+                type(attempt_row["target_year"]) is not int
+                or type(attempt_row["slot_date"]) is not str
+                or type(attempt_row["source_sha256"]) is not str
+                or (
+                    attempt_row["expected_parent_sha256"] is not None
+                    and type(attempt_row["expected_parent_sha256"]) is not str
+                )
+                or type(attempt_row["started_at"]) is not str
+                or (
+                    attempt_row["finished_at"] is not None
+                    and type(attempt_row["finished_at"]) is not str
+                )
+                or type(attempt_row["outcome"]) is not str
+                or type(attempt_row["official_requests"]) is not int
+                or type(attempt_row["machine_requests"]) is not int
+            ):
+                raise CalendarStoreUnavailable("calendar attempt unavailable")
             try:
                 attempt = CalendarMaintenanceAttempt.model_validate_json(
                     json.dumps(dict(attempt_row))
@@ -1324,6 +1373,17 @@ class CalendarGenerationStore:
             promoted_attempt_keys: set[tuple[int, str]] = set()
             object_hashes = objects
             for row in rows:
+                if (
+                    type(row["sequence"]) is not int
+                    or type(row["generation_sha256"]) is not str
+                    or (row["parent_sha256"] is not None and type(row["parent_sha256"]) is not str)
+                    or type(row["source_sha256"]) is not str
+                    or type(row["attempt_target_year"]) is not int
+                    or type(row["attempt_slot_date"]) is not str
+                    or type(row["payload_json"]) is not str
+                    or type(row["promoted_at"]) is not str
+                ):
+                    raise CalendarStoreUnavailable("calendar chain unavailable")
                 try:
                     generation = CalendarGenerationV1.model_validate_json(row["payload_json"])
                     canonical_generation = _model_json_bytes(generation).decode("utf-8")

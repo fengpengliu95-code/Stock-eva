@@ -8,6 +8,7 @@ import json
 import logging
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import warnings
 from datetime import UTC, date, datetime, timedelta
@@ -2467,7 +2468,7 @@ def _read_fifo_source(path: Path, result_queue) -> None:
 def test_fifo_source_is_rejected_without_blocking_before_open(tmp_path) -> None:
     fifo = tmp_path / "source.json"
     os.mkfifo(fifo, 0o600)
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     results = context.Queue()
     child = context.Process(target=_read_fifo_source, args=(fifo, results))
     child.start()
@@ -2606,3 +2607,163 @@ def test_reader_rejects_non_normative_singleton_rows(tmp_path, kind) -> None:
     assert result.status == "unavailable"
     assert not result.calendar.configs
     assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("swap_phase", ["at_open", "after_validated_check"])
+def test_r1_reader_rejects_valid_foreign_database_replaced_during_open(
+    tmp_path, monkeypatch, swap_phase
+):
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    source = _valid_source()
+    path = tmp_path / "calendar_generations.sqlite3"
+    store = calendar_module.CalendarGenerationStore(path)
+    store.stage_execute(source, now)
+    foreign_path = tmp_path / "foreign.sqlite3"
+    foreign = calendar_module.CalendarGenerationStore(foreign_path)
+    foreign.stage_execute(source, now)
+    attempt = foreign.reserve_attempt(source, now)
+    assert (
+        foreign.promote(
+            attempt,
+            source,
+            (b"sse body", b"szse body"),
+            _machine_for(source, now),
+            now + timedelta(hours=1),
+        ).outcome
+        == "PROMOTED"
+    )
+    original_bytes, foreign_bytes = path.read_bytes(), foreign_path.read_bytes()
+    backup = tmp_path / "original.sqlite3"
+    real_open = os.open
+    swapped = False
+    real_check = store._check_path
+    checks = 0
+
+    def swap_database():
+        nonlocal swapped
+        swapped = True
+        path.rename(backup)
+        shutil.copyfile(foreign_path, path)
+        path.chmod(0o600)
+
+    def open_with_swap(file, flags, *args, **kwargs):
+        nonlocal swapped
+        if os.fspath(file) == os.fspath(path) and not swapped:
+            swap_database()
+        return real_open(file, flags, *args, **kwargs)
+
+    def check_then_swap(*, allow_missing):
+        nonlocal checks
+        proof = real_check(allow_missing=allow_missing)
+        checks += 1
+        if checks == 2:
+            swap_database()
+        return proof
+
+    if swap_phase == "at_open":
+        monkeypatch.setattr(calendar_module.os, "open", open_with_swap)
+    else:
+        monkeypatch.setattr(store, "_check_path", check_then_swap)
+    result = store.read()
+    assert swapped
+    assert backup.read_bytes() == original_bytes
+    assert foreign_path.read_bytes() == foreign_bytes
+    assert path.read_bytes() == foreign_bytes
+    assert result.status == "unavailable"
+    assert not result.calendar.configs
+
+
+def _r1_read_database_with_fifo_swap(path, backup, results):
+    real_open = os.open
+    swapped = False
+
+    def open_with_swap(file, flags, *args, **kwargs):
+        nonlocal swapped
+        if os.fspath(file) == os.fspath(path) and not swapped:
+            swapped = True
+            path.rename(backup)
+            os.mkfifo(path, 0o600)
+        return real_open(file, flags, *args, **kwargs)
+
+    calendar_module.os.open = open_with_swap
+    try:
+        result = calendar_module.CalendarGenerationStore(path).read()
+        results.put((swapped, result.status, bool(result.calendar.configs)))
+    finally:
+        calendar_module.os.open = real_open
+
+
+def test_r1_reader_database_fifo_swap_is_nonblocking(tmp_path):
+    path = tmp_path / "calendar_generations.sqlite3"
+    backup = tmp_path / "original.sqlite3"
+    store = calendar_module.CalendarGenerationStore(path)
+    store.stage_execute(_valid_source(), datetime(2026, 12, 22, 1, tzinfo=UTC))
+    original_bytes = path.read_bytes()
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    child = context.Process(target=_r1_read_database_with_fifo_swap, args=(path, backup, results))
+    child.start()
+    child.join(5)
+    blocked = child.is_alive()
+    if blocked:
+        child.terminate()
+        child.join(2)
+    try:
+        assert backup.read_bytes() == original_bytes
+        assert path.is_fifo()
+        assert not blocked, "database open blocks before descriptor rejection"
+        assert child.exitcode == 0
+        assert results.get(timeout=1) == (True, "unavailable", False)
+    finally:
+        child.close()
+        results.close()
+
+
+@pytest.mark.parametrize("kind", ["head_blob", "object_text"])
+@pytest.mark.parametrize("operation", ["read", "stage", "reserve", "promote"])
+def test_r1_sqlite_storage_type_corruption_is_safe(tmp_path, kind, operation):
+    path, store, _, now = _promote_old_2026_authority(tmp_path)
+    source = _valid_source()
+    store.stage_execute(source, now)
+    attempt = store.reserve_attempt(source, now)
+    if kind == "head_blob":
+        with sqlite3.connect(path) as connection:
+            digest = connection.execute(
+                "SELECT generation_sha256 FROM calendar_generation_head"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE calendar_generation_head SET generation_sha256=?",
+                (sqlite3.Binary(digest.encode("ascii")),),
+            )
+    else:
+        _tamper_triggered_update(
+            path,
+            "calendar_object_no_update",
+            "UPDATE calendar_official_object SET body_bytes=CAST(body_bytes AS TEXT)",
+            (),
+        )
+    before = path.read_bytes()
+    if operation == "read":
+        result = store.read()
+        assert result.status == "unavailable"
+        assert not result.calendar.configs
+    else:
+        try:
+            if operation == "stage":
+                store.stage_execute(source, now)
+            elif operation == "reserve":
+                store.reserve_attempt(source, now + timedelta(days=1))
+            else:
+                result = store.promote(
+                    attempt,
+                    source,
+                    (b"sse body", b"szse body"),
+                    _machine_for(source, now),
+                    now + timedelta(hours=1),
+                )
+                assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+        except calendar_module.CalendarStoreUnavailable:
+            pass
+        else:
+            assert operation == "promote", "corrupt store was accepted by a writer"
+    assert path.read_bytes() == before
