@@ -4,7 +4,11 @@
 
 **Date:** 2026-08-31 (Asia/Shanghai)
 
-**Status:** IN REVIEW / IMPLEMENTATION NOT STARTED / R2-F4 NO-GO
+**Status:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F4 NO-GO
+
+**Specification review:** Independent SPEC GO at
+`790c832684f9f540488310080715dad12a92f27a` (H=0, M=0). The implementation must use
+an explicit closed Literal/enum for `last_outcome`, as required by FR-26.
 
 **Reviewers:** One independent reviewer at a time; human approval is required at the completed
 subversion GO gate. The owner has delegated intermediate technical choices to the delivery lead.

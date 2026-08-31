@@ -26,6 +26,10 @@ and complete BaoStock civil-day reconciliation in the existing calendar job.
 **Initial evidence:** offline frozen uv sync succeeded; full baseline pytest completed with exit 0
 (2202 tests), with only the existing Starlette TestClient/httpx deprecation warning.
 
+**Task 0:** Independent SPEC GO at `790c832684f9f540488310080715dad12a92f27a`, H=0/M=0;
+strict validator 100/100 with zero warnings. Implementation may begin. Final subversion GO is
+not yet claimed.
+
 ## Execution boundaries
 
 - No real HTTP/Provider, credential reads, Application Support, production control/canonical,
