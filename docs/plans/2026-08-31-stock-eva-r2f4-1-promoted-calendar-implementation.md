@@ -65,6 +65,24 @@ The DDL digest and bundled projection digest remain unchanged. This checkpoint d
 full pytest; the latest full result remains the Task 2a 2360-case run. Health preflight and
 bounded acquisition/worker implementation, then complete Task 2 double review, remain pending.
 
+**Task 2b existing-health checkpoint:** The new maintenance-only adapter now proves the exact
+existing health schema/version and six bounded, state-valid circuits before any snapshot or audit
+write. Reads are descriptor-bound, query-only and nonblocking; they preserve expired HALF_OPEN
+leases and reject file/content changes, unsafe paths and sidecars without initialization. Existing
+0644 health files remain supported. Audit writes use an existing-only, inode-bound owned alias,
+preserve the original outcome semantics and reject malformed selected idempotency rows without
+unbounded text reads. Initialize/reset/probe entrypoints are forbidden; `provider_health.py` is
+byte-identical to the baseline.
+Root observed five failing race/error probes during development: foreign-alias commit, foreign
+alias deletion during creation, TypeError/ValueError masking, and in-place modification returning
+a cached CLOSED result. All now pass and are retained in the repository suite. The final module
+contains 59 retained cases; with 41 legacy provider-health tests and 29 private probes, 129 pass.
+Root combined Task1/Task2 replay: 514 passed. Full repository: 2448 passed, one existing Starlette
+warning, 130.47 seconds. All backend/tests ruff/format (201 files), compileall, diff check, strict
+spec validation (100/100, zero warnings) and nine R2-F2 golden checks passed. No live acquisition
+occurred. This is still a development checkpoint, not independent Task 2 or R2-F4.1 GO; bounded
+official acquisition and the policy/slot worker remain next, followed by both independent reviews.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
@@ -330,6 +348,9 @@ Task 2b is implemented in two serial checkpoints: first the verified control sna
 interfaces and existing-health adapter, then official acquisition and the policy/slot worker.
 These remain one Task 2 review scope, not independent GO gates. The health adapter is separate
 from the worker so its file/schema proof and audit-write restrictions can be tested directly.
+Within the acquisition/worker checkpoint, implement and verify the bounded official fetcher
+first, then integrate policy, slots and machine reconciliation. Keep one active developer;
+these smaller handoffs do not replace the complete Task 2 specification and quality reviews.
 
 The existing health store's `provider_health()` may reap expired leases, while its
 `provider_health_snapshot()` still opens a read/write SQLite connection. Neither is the new
@@ -380,6 +401,12 @@ canonical path depend on the new method.
 Official fetcher: injectable httpx client, `trust_env=False`, TLS verification, no redirects,
 max_attempts=1, fixed 5/30-second timeouts, stream-bound 1 MiB; count a request only once the client
 is called. Accept only the two staged official source URLs. Preserve safe error class/counts.
+Client construction must remain lazy until validated execution. Use a fresh credentialless
+client for each official request, or an equivalently explicit cookie-free request path, so a
+response cookie cannot be carried into the other request. Offline tests must inspect actual
+request headers and client configuration, exercise standard decoded content hashing, and prove
+that first-request failures report 1/0 while client-construction failures report 0/0. Internal
+successful body bytes are never part of a public operational result or exception.
 
 Maintenance: no candidate or policy not due -> zero-request safe outcome. Before acquisition,
 validate source/admission, current parent and existing health; missing/corrupt health is
