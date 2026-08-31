@@ -3,7 +3,7 @@ import signal
 import socket
 import threading
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,6 +91,295 @@ class FakeBaoStock:
             ["code", "tradeStatus", "code_name"],
             [[row[code_index], "1", row[code_index]] for row in self.payload["daily_rows"]],
         )
+
+
+class CalendarRowsClient(FakeBaoStock):
+    def __init__(self, fields, rows) -> None:
+        super().__init__(json.loads(FIXTURE_PATH.read_text()))
+        self.calendar_fields = fields
+        self.calendar_rows = rows
+        self.calendar_kwargs = []
+        self.login_calls = 0
+        self.logout_calls = 0
+
+    def login(self):
+        self.login_calls += 1
+        return FakeResult([], [])
+
+    def logout(self):
+        self.logout_calls += 1
+        super().logout()
+
+    def query_trade_dates(self, **kwargs):
+        self.calendar_kwargs.append(kwargs)
+        return FakeResult(self.calendar_fields, self.calendar_rows)
+
+
+class ScopedCalendarRowsClient(CalendarRowsClient):
+    def __init__(self, fields, rows) -> None:
+        super().__init__(fields, rows)
+        self.contexts = []
+
+    def login(self):
+        self.contexts.append(("login", current_request_context()))
+        return super().login()
+
+    def query_trade_dates(self, **kwargs):
+        self.contexts.append(("query", current_request_context()))
+        return super().query_trade_dates(**kwargs)
+
+
+class TimeoutCalendarRowsClient(CalendarRowsClient):
+    def query_trade_dates(self, **kwargs):
+        self.calendar_kwargs.append(kwargs)
+        raise TimeoutError("synthetic calendar timeout")
+
+
+class LoginFailureCalendarRowsClient(CalendarRowsClient):
+    def login(self):
+        self.login_calls += 1
+        raise TimeoutError("synthetic calendar login timeout")
+
+
+def _calendar_rows(start: date, end: date, *, open_dates: set[date] | None = None):
+    open_dates = open_dates or set()
+    rows = []
+    current = start
+    while current <= end:
+        rows.append([current.isoformat(), "1" if current in open_dates else "0"])
+        current = date.fromordinal(current.toordinal() + 1)
+    return rows
+
+
+def test_calendar_days_reads_full_leap_year_exactly_once() -> None:
+    start, end = date(2024, 1, 1), date(2024, 12, 31)
+    open_dates = {
+        start + timedelta(days=offset)
+        for offset in range((end - start).days + 1)
+        if (start + timedelta(days=offset)).weekday() < 5
+    }
+    client = CalendarRowsClient(
+        ["calendar_date", "is_trading_day"],
+        _calendar_rows(start, end, open_dates=open_dates),
+    )
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    expected = [
+        (start + timedelta(days=offset), (start + timedelta(days=offset)).weekday() < 5)
+        for offset in range((end - start).days + 1)
+    ]
+    result = provider.calendar_days(start, end)
+    assert result == expected
+    assert len(result) == 366
+    assert client.login_calls == 1
+    assert client.logout_calls == 1
+
+
+def test_calendar_days_reads_full_non_leap_year_exactly_once() -> None:
+    start, end = date(2023, 1, 1), date(2023, 12, 31)
+    client = CalendarRowsClient(
+        ["calendar_date", "is_trading_day"],
+        _calendar_rows(start, end, open_dates={start + timedelta(days=1)}),
+    )
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    expected = [
+        (start + timedelta(days=offset), (start + timedelta(days=offset)) == date(2023, 1, 2))
+        for offset in range((end - start).days + 1)
+    ]
+    result = provider.calendar_days(start, end)
+    assert result == expected
+    assert len(result) == 365
+    assert client.login_calls == 1
+    assert client.logout_calls == 1
+
+
+def test_calendar_days_returns_leap_day_boundary_with_exact_contract() -> None:
+    start, end = date(2024, 2, 28), date(2024, 3, 1)
+    client = CalendarRowsClient(
+        ["calendar_date", "is_trading_day"],
+        _calendar_rows(start, end, open_dates={date(2024, 2, 28), date(2024, 2, 29)}),
+    )
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    assert provider.calendar_days(start, end) == [
+        (date(2024, 2, 28), True),
+        (date(2024, 2, 29), True),
+        (date(2024, 3, 1), False),
+    ]
+    assert client.calendar_kwargs == [{"start_date": "2024-02-28", "end_date": "2024-03-01"}]
+    assert client.login_calls == 1
+    assert client.logout_calls == 1
+
+
+def test_calendar_days_returns_non_leap_boundary_with_exact_contract() -> None:
+    start, end = date(2023, 2, 28), date(2023, 3, 1)
+    provider = BaoStockProvider(
+        client=CalendarRowsClient(
+            ["calendar_date", "is_trading_day"],
+            _calendar_rows(start, end, open_dates={start, end}),
+        ),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    assert provider.calendar_days(start, end) == [(start, True), (date(2023, 3, 1), True)]
+
+
+@pytest.mark.parametrize(
+    "fields, rows, failure_class",
+    [
+        (
+            ["is_trading_day", "calendar_date"],
+            _calendar_rows(date(2024, 2, 28), date(2024, 3, 1)),
+            "schema",
+        ),
+        (
+            ["calendar_date", "is_trading_day", "extra"],
+            [[*row, "x"] for row in _calendar_rows(date(2024, 2, 28), date(2024, 3, 1))],
+            "schema",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [[*row, "extra"] for row in _calendar_rows(date(2024, 2, 28), date(2024, 3, 1))],
+            "schema",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [[row[0], True] for row in _calendar_rows(date(2024, 2, 28), date(2024, 3, 1))],
+            "semantic",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [[row[0], "2"] for row in _calendar_rows(date(2024, 2, 28), date(2024, 3, 1))],
+            "semantic",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [["20240228", "1"], ["2024-02-29", "0"], ["2024-03-01", "0"]],
+            "semantic",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [["2024-02-28", "1"], ["2024-02-28", "0"], ["2024-03-01", "0"]],
+            "semantic",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [["2024-02-29", "1"], ["2024-02-28", "0"], ["2024-03-01", "0"]],
+            "semantic",
+        ),
+        (
+            ["calendar_date", "is_trading_day"],
+            [object(), ["2024-02-29", "0"], ["2024-03-01", "0"]],
+            "schema",
+        ),
+    ],
+)
+def test_calendar_days_rejects_invalid_schema_flags_dates_and_order(
+    fields, rows, failure_class
+) -> None:
+    provider = BaoStockProvider(
+        client=CalendarRowsClient(fields, rows),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(BaoStockError) as captured:
+        provider.calendar_days(date(2024, 2, 28), date(2024, 3, 1))
+    assert captured.value.failure.failure_class == failure_class
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [["2024-02-28", "1"]],
+        [["2024-02-28", "1"], ["2024-03-02", "0"]],
+        [["2024-02-28", "1"], ["2024-03-01", "0"]],
+    ],
+)
+def test_calendar_days_rejects_missing_closed_tail_gaps_and_out_of_range(rows) -> None:
+    provider = BaoStockProvider(
+        client=CalendarRowsClient(["calendar_date", "is_trading_day"], rows),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(BaoStockError) as captured:
+        provider.calendar_days(date(2024, 2, 28), date(2024, 3, 1))
+    assert captured.value.failure.failure_class == "semantic"
+
+
+def test_calendar_days_rejects_out_of_range_row_with_complete_row_count() -> None:
+    client = CalendarRowsClient(
+        ["calendar_date", "is_trading_day"],
+        [["2024-02-28", "1"], ["2024-02-29", "0"], ["2024-03-02", "0"]],
+    )
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(BaoStockError) as captured:
+        provider.calendar_days(date(2024, 2, 28), date(2024, 3, 1))
+    assert captured.value.failure.failure_class == "semantic"
+
+
+def test_calendar_days_rejects_inverted_range_before_client_calls() -> None:
+    client = CalendarRowsClient(["calendar_date", "is_trading_day"], [])
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(BaoStockError):
+        provider.calendar_days(date(2024, 3, 1), date(2024, 2, 28))
+
+    assert client.login_calls == 0
+    assert client.calendar_kwargs == []
+
+
+def test_calendar_days_uses_trade_dates_scope_and_one_attempt() -> None:
+    client = ScopedCalendarRowsClient(["calendar_date", "is_trading_day"], [["2024-02-28", "1"]])
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+    observations = []
+
+    with transport_observation_sink(observations.append):
+        assert provider.calendar_days(date(2024, 2, 28), date(2024, 2, 28)) == [
+            (date(2024, 2, 28), True)
+        ]
+
+    assert [name for name, _context in client.contexts] == ["login", "query"]
+    assert {context.endpoint for _name, context in client.contexts} == {
+        ProviderEndpoint.TRADE_DATES
+    }
+    assert {context.attempt for _name, context in client.contexts} == {1}
+    assert len({context.refresh_id for _name, context in client.contexts}) == 1
+    assert len({context.provider_session_id for _name, context in client.contexts}) == 1
+    request_ids = [context.request_id for _name, context in client.contexts]
+    assert all(request_ids)
+    assert len(set(request_ids)) == 2
+    operations = [item for item in observations if item.protocol_stage == ProtocolStage.OPERATION]
+    assert len(operations) == 1
+    assert operations[0].endpoint == ProviderEndpoint.TRADE_DATES
+    assert operations[0].attempt == 1
+    assert operations[0].request_id == client.contexts[1][1].request_id
+
+
+def test_calendar_days_query_timeout_logs_out_without_retry() -> None:
+    client = TimeoutCalendarRowsClient(["calendar_date", "is_trading_day"], [])
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(BaoStockError):
+        provider.calendar_days(date(2024, 2, 28), date(2024, 2, 28))
+
+    assert client.calendar_kwargs == [{"start_date": "2024-02-28", "end_date": "2024-02-28"}]
+    assert provider._session_usable is False
+
+
+def test_calendar_days_login_timeout_does_not_retry() -> None:
+    client = LoginFailureCalendarRowsClient(["calendar_date", "is_trading_day"], [])
+    provider = BaoStockProvider(client=client, max_attempts=1, min_request_interval_seconds=0)
+
+    with pytest.raises(BaoStockError):
+        provider.calendar_days(date(2024, 2, 28), date(2024, 2, 28))
+
+    assert client.login_calls == 1
+    assert client.calendar_kwargs == []
 
 
 def test_provider_logs_out_and_returns_canonical_explicit_slice() -> None:

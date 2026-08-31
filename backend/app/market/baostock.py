@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from time import monotonic, sleep
 from typing import Any
 
@@ -768,6 +768,77 @@ class BaoStockProvider:
             self._login(ProviderEndpoint.TRADE_DATES)
             try:
                 return self._trading_dates(start_date, end_date)
+            finally:
+                self._logout()
+
+    def calendar_days(self, start_date: date, end_date: date) -> list[tuple[date, bool]]:
+        if start_date > end_date:
+            raise BaoStockError(
+                "start date must not be after end date",
+                failure=MarketFailure(
+                    failure_stage="validate",
+                    failure_class="calendar",
+                    retryable=False,
+                ),
+            )
+        with self._refresh_operation():
+            self._login(ProviderEndpoint.TRADE_DATES)
+            try:
+                fields, rows = self._read(
+                    ProviderEndpoint.TRADE_DATES,
+                    lambda: self.client.query_trade_dates(
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat(),
+                    ),
+                )
+                if fields != ["calendar_date", "is_trading_day"]:
+                    raise BaoStockError(
+                        "BaoStock calendar response schema is invalid",
+                        failure=MarketFailure(
+                            failure_stage="normalize",
+                            failure_class="schema",
+                            retryable=False,
+                        ),
+                    )
+                expected_days = (end_date - start_date).days + 1
+                if len(rows) != expected_days:
+                    raise BaoStockError(
+                        "BaoStock calendar response coverage is incomplete",
+                        failure=MarketFailure(
+                            failure_stage="normalize",
+                            failure_class="semantic",
+                            retryable=False,
+                        ),
+                    )
+                result: list[tuple[date, bool]] = []
+                for offset, row in enumerate(rows):
+                    if not isinstance(row, (list, tuple)) or len(row) != 2:
+                        raise BaoStockError(
+                            "BaoStock calendar response schema is invalid",
+                            failure=MarketFailure(
+                                failure_stage="normalize",
+                                failure_class="schema",
+                                retryable=False,
+                            ),
+                        )
+                    calendar_date, is_trading_day = row
+                    expected_date = start_date + timedelta(days=offset)
+                    if (
+                        type(calendar_date) is not str
+                        or calendar_date != expected_date.isoformat()
+                        or type(is_trading_day) is not str
+                        or is_trading_day not in {"0", "1"}
+                    ):
+                        raise BaoStockError(
+                            "BaoStock calendar response semantics are invalid",
+                            failure=MarketFailure(
+                                failure_stage="normalize",
+                                failure_class="semantic",
+                                retryable=False,
+                            ),
+                        )
+                    result.append((expected_date, is_trading_day == "1"))
+                return result
             finally:
                 self._logout()
 

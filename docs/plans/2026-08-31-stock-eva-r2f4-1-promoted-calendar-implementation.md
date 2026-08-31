@@ -36,6 +36,19 @@ Starlette warning. Root focused replay: 130 repository cases plus 62 private pro
 All backend/tests ruff/format, compileall, diff and nine R2-F2 golden digest checks passed. This is
 Task 1 GO only; R2-F4.1 remains NO-GO until Tasks 2-4 and final exact-HEAD review are complete.
 
+**Task 2a checkpoint:** Complete civil-day transport validation and per-operation calendar-sync
+snapshot/authority drift protection are implemented. The developer reported initial scoped RED
+as 18 failed/96 passed. Root independently observed 15 failures/1 legacy-compatibility pass before
+implementation. Root review then corrected insufficiently isolated negative fixtures and added
+full 365/366-day, audit identity, real SQLite last-good preservation and mid-operation snapshot
+change coverage. Fresh root replay: 124 repository cases plus 20 private probes, 144 passed.
+Full repository: 2360 passed, one existing Starlette TestClient/httpx warning, 129.87 seconds.
+All backend/tests ruff and format (199 files), compileall, diff check, strict spec validator
+(100/100, zero warnings), and nine R2-F2 golden checks passed. Task 1 module SHA-256 remains
+`2e3c6ceeb9d543bda52a1e806e3c2f5319c4ec551b0d3af09e2e34cb89ce7611`.
+No real acquisition occurred. This is a development checkpoint only; independent Task 2 SPEC
+and QUALITY reviews follow completion of Task 2b, and no Task 2/version GO is claimed here.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
@@ -271,11 +284,14 @@ Fix H/M via RED/GREEN and re-review the exact new commit before Task2.
 
 - Add one method to `backend/app/market/baostock.py`
 - Create `backend/app/market/calendar_maintenance.py`
+- Create `backend/app/market/calendar_maintenance_health.py` for the maintenance-only verified
+  existing-health adapter; keep `provider_health.py` unchanged.
 - Extend `backend/app/market/calendar_generation.py` only with narrow verified-control snapshot
   and terminal-attempt interfaces required by maintenance; preserve its DDL, hashes and existing
   authority checks, and add corresponding `tests/test_market_calendar_generation.py` coverage.
 - Modify `backend/app/market/calendar_sync.py` only for mixed-range/stale-plan safety and reuse
 - Create `tests/test_market_calendar_maintenance.py`
+- Create `tests/test_market_calendar_maintenance_health.py`
 - Add scoped cases in `tests/test_baostock_provider.py` and `tests/test_calendar_sync.py`
 
 **Serial implementation checkpoints (one subagent at a time):**
@@ -293,6 +309,23 @@ the terminal-attempt interface must not fabricate two requests when only one cli
 Calendar-sync authority checksums must include verified generation/bundled identities when present,
 so equal legacy config projections with different reviewed generations still invalidate old plans.
 Concrete legacy calendars retain their old config-only checksum and injection behavior.
+
+Task 2b is implemented in two serial checkpoints: first the verified control snapshot/terminal
+interfaces and existing-health adapter, then official acquisition and the policy/slot worker.
+These remain one Task 2 review scope, not independent GO gates. The health adapter is separate
+from the worker so its file/schema proof and audit-write restrictions can be tested directly.
+
+The existing health store's `provider_health()` may reap expired leases, while its
+`provider_health_snapshot()` still opens a read/write SQLite connection. Neither is the new
+maintenance preflight. The adapter must use a bounded descriptor-bound read-only connection,
+prove the existing schema/version and exactly six valid endpoint circuit rows, and preserve
+OPEN/HALF_OPEN without probing or reaping. Validate SQLite storage types and state-dependent
+timestamp/lease shapes before constructing a health model. Readable-by-other legacy health
+files are not automatically unsafe; FR-18 forbids writable-by-other state, unsafe ownership,
+links, non-regular files and active sidecars. Do not silently require a new health migration.
+Audit writes reuse the existing observation/terminal-outcome logic only through an existing-only
+validated handle; a missing/replaced/corrupt health database must never be recreated or adopted.
+No preflight may call initialize, health repair, or any network operation.
 
 ### Step 2.1: Write RED acquisition, policy and slot tests
 

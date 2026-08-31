@@ -19,6 +19,7 @@ from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.calendar_sync import (
     CalendarSyncPolicy,
+    CalendarSyncResult,
     CalendarSyncService,
     CalendarSyncStore,
     CalendarSyncStoreReadError,
@@ -119,11 +120,262 @@ class RecordingHealthStore(InMemoryProviderHealthStore):
         )
 
 
+class SnapshotCalendar:
+    def __init__(self, snapshots) -> None:
+        self.snapshots = list(snapshots)
+        self.calls = 0
+
+    def snapshot(self):
+        self.calls += 1
+        return self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+
+
+class CalendarSnapshot:
+    def __init__(self, calendar, *, bundled_sha256=None, generation_sha256=None) -> None:
+        self.configs = calendar.configs
+        self._calendar = calendar
+        self.bundled_sha256 = bundled_sha256
+        self.generation_sha256 = generation_sha256
+
+    def session_status(self, value):
+        return self._calendar.session_status(value)
+
+
+def _snapshot_calendar(*, bundled_sha256=None, generation_sha256=None):
+    return CalendarSnapshot(
+        synthetic_calendar(),
+        bundled_sha256=bundled_sha256,
+        generation_sha256=generation_sha256,
+    )
+
+
 def _calendar_control_counts(path: Path) -> tuple[int, int]:
     with sqlite3.connect(path) as connection:
         runs = connection.execute("SELECT COUNT(*) FROM calendar_sync_runs").fetchone()[0]
         state = connection.execute("SELECT COUNT(*) FROM calendar_sync_state").fetchone()[0]
     return runs, state
+
+
+def test_calendar_sync_pins_one_snapshot_for_plan_and_one_for_execute(tmp_path: Path) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    calendar = SnapshotCalendar([_snapshot_calendar()])
+    service = CalendarSyncService(
+        store,
+        calendar,
+        CalendarProvider([date(2026, 7, 24)]),
+    )
+
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 7, 24),
+        end_date=date(2026, 7, 24),
+    )
+    assert calendar.calls == 1
+    result = service.execute(plan)
+
+    assert result.status == "ready"
+    assert calendar.calls == 2
+
+
+def test_calendar_sync_stale_plan_fails_before_provider_health_or_state_writes(
+    tmp_path: Path,
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    calendar = SnapshotCalendar(
+        [
+            _snapshot_calendar(generation_sha256="a" * 64),
+            _snapshot_calendar(generation_sha256="b" * 64),
+        ]
+    )
+
+    class UnexpectedProvider(CalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            raise AssertionError("stale plan must not call provider")
+
+    class UnexpectedHealth:
+        def provider_health(self):
+            raise AssertionError("stale plan must not inspect health")
+
+    service = CalendarSyncService(
+        store,
+        calendar,
+        UnexpectedProvider([]),
+        health_store=UnexpectedHealth(),
+    )
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 7, 24),
+        end_date=date(2026, 7, 24),
+    )
+    before_bytes = store.path.read_bytes()
+    before_state = store.state()
+
+    result = service.execute(plan)
+
+    assert result.status == "error"
+    assert result.failure_code == "CALENDAR_AUTHORITY_CHANGED"
+    assert store.path.read_bytes() == before_bytes
+    assert store.state() == before_state
+    with pytest.raises(KeyError):
+        store.run(result.run_id)
+
+
+def test_calendar_sync_checksum_binds_verified_generation_and_bundled_identities(
+    tmp_path: Path,
+) -> None:
+    first = SnapshotCalendar(
+        [_snapshot_calendar(bundled_sha256="1" * 64, generation_sha256="a" * 64)]
+    )
+    second = SnapshotCalendar(
+        [_snapshot_calendar(bundled_sha256="1" * 64, generation_sha256="b" * 64)]
+    )
+    first_service = CalendarSyncService(CalendarSyncStore(tmp_path / "first.sqlite3"), first, None)
+    second_service = CalendarSyncService(
+        CalendarSyncStore(tmp_path / "second.sqlite3"), second, None
+    )
+    now = datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI)
+
+    first_plan = first_service.plan(now=now, mode="light")
+    second_plan = second_service.plan(now=now, mode="light")
+
+    assert first_plan.authority_checksum != second_plan.authority_checksum
+
+
+def test_calendar_sync_mixed_known_unknown_observation_is_observed_only(tmp_path: Path) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    service = CalendarSyncService(
+        store,
+        synthetic_calendar(),
+        CalendarProvider([date(2026, 12, 31)]),
+    )
+    plan = service.plan(
+        now=datetime(2027, 1, 4, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 12, 31),
+        end_date=date(2027, 1, 1),
+    )
+
+    result = service.execute(plan)
+
+    assert result.status == "observed_only"
+    assert result.conflicts == []
+
+
+def test_calendar_sync_execute_keeps_one_snapshot_after_provider_changes_live_authority(
+    tmp_path: Path,
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    first_snapshot = _snapshot_calendar(generation_sha256="a" * 64)
+    later_snapshot = _snapshot_calendar(generation_sha256="b" * 64)
+
+    class MutableLiveCalendar:
+        def __init__(self) -> None:
+            self.current = first_snapshot
+            self.calls = 0
+
+        def snapshot(self):
+            self.calls += 1
+            return self.current
+
+    live = MutableLiveCalendar()
+
+    class MutatingProvider(CalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            live.current = later_snapshot
+            return super().trading_dates(start_date, end_date)
+
+    provider = MutatingProvider([date(2026, 12, 30), date(2026, 12, 31)])
+    service = CalendarSyncService(
+        store, live, provider, clock=lambda: datetime(2026, 12, 31, tzinfo=UTC)
+    )
+    plan = service.plan(
+        now=datetime(2026, 12, 31, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 12, 30),
+        end_date=date(2026, 12, 31),
+    )
+
+    result = service.execute(plan)
+    assert result.status == "ready"
+    assert live.calls == 2
+    assert [item.official_status for item in store.observations(result.run_id)] == [
+        "open",
+        "open",
+    ]
+    with sqlite3.connect(store.path) as connection:
+        payload = connection.execute(
+            "SELECT payload_json FROM calendar_authority_versions WHERE checksum = ?",
+            (plan.authority_checksum,),
+        ).fetchone()[0]
+    assert json.loads(payload)["generation_sha256"] == "a" * 64
+
+    stale = service.execute(plan)
+    assert stale.status == "error"
+    assert stale.failure_code == "CALENDAR_AUTHORITY_CHANGED"
+    assert live.calls == 3
+
+
+def test_mixed_unknown_is_observed_only_without_replacing_last_good_and_conflict_wins(
+    tmp_path: Path,
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    calendar = synthetic_calendar()
+    good_service = CalendarSyncService(store, calendar, CalendarProvider([date(2026, 12, 31)]))
+    good_plan = good_service.plan(
+        now=datetime(2026, 12, 31, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 12, 31),
+        end_date=date(2026, 12, 31),
+    )
+    good = good_service.execute(good_plan)
+    last_good_run_id = store.state().last_good_run_id
+
+    mixed_service = CalendarSyncService(store, calendar, CalendarProvider([date(2026, 12, 31)]))
+    mixed_plan = mixed_service.plan(
+        now=datetime(2027, 1, 1, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 12, 31),
+        end_date=date(2027, 1, 1),
+    )
+    mixed = mixed_service.execute(mixed_plan)
+    assert mixed.status == "observed_only"
+    assert store.state().last_good_run_id == last_good_run_id == good.run_id
+
+    conflict_service = CalendarSyncService(store, calendar, CalendarProvider([]))
+    conflict = conflict_service.execute(
+        conflict_service.plan(
+            now=datetime(2027, 1, 1, 16, 30, tzinfo=SHANGHAI),
+            mode="light",
+            start_date=date(2026, 12, 31),
+            end_date=date(2027, 1, 1),
+        )
+    )
+    assert conflict.status == "quarantined"
+    assert store.state().last_good_run_id == last_good_run_id
+
+
+def test_calendar_sync_result_failure_code_is_strict_and_ordinary_results_serialize_null() -> None:
+    fields = {
+        "run_id": "run",
+        "mode": "light",
+        "status": "ready",
+        "range_start": date(2026, 7, 24),
+        "range_end": date(2026, 7, 24),
+        "fetched_at": datetime(2026, 7, 24, tzinfo=UTC),
+        "completed_at": datetime(2026, 7, 24, tzinfo=UTC),
+        "observed_open_count": 1,
+        "authority_checksum": "a" * 64,
+    }
+    ordinary = CalendarSyncResult(**fields)
+    assert ordinary.failure_code is None
+    assert '"failure_code":null' in ordinary.model_dump_json()
+
+    with pytest.raises(ValueError):
+        CalendarSyncResult(**fields, failure_code="NOT_A_FAILURE")
+    with pytest.raises(ValueError):
+        CalendarSyncResult(**fields, failure_code="CALENDAR_AUTHORITY_CHANGED")
 
 
 def test_calendar_sync_schedule_has_monthly_full_startup_and_1630_light() -> None:

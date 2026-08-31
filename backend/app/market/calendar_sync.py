@@ -18,7 +18,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from backend.app.market.baostock import BaoStockError
 from backend.app.market.baostock_vendor import transport_observation_sink
@@ -117,6 +117,13 @@ class CalendarSyncResult(BaseModel):
     observed_open_count: int
     conflicts: list[dict[str, str]] = Field(default_factory=list)
     authority_checksum: str
+    failure_code: Literal["CALENDAR_AUTHORITY_CHANGED"] | None = None
+
+    @model_validator(mode="after")
+    def _validate_failure_code(self) -> CalendarSyncResult:
+        if self.failure_code is not None and self.status != "error":
+            raise ValueError("failure_code requires an error result")
+        return self
 
 
 class CalendarSyncRun(BaseModel):
@@ -531,7 +538,8 @@ class CalendarSyncService:
             end_date = local.date()
         if start_date > end_date:
             raise ValueError("calendar sync start date must not exceed end date")
-        authority_payload = self.authority_payload()
+        calendar_snapshot = self._calendar_snapshot()
+        authority_payload = self._authority_payload(calendar_snapshot)
         encoded = json.dumps(
             authority_payload,
             ensure_ascii=False,
@@ -545,7 +553,7 @@ class CalendarSyncService:
                 **source.model_dump(mode="json"),
             }
             for config in sorted(
-                self.calendar.configs.values(),
+                calendar_snapshot.configs.values(),
                 key=lambda item: item.year,
             )
             for source in config.sources
@@ -556,23 +564,63 @@ class CalendarSyncService:
             requested_at=local,
             range_start=start_date,
             range_end=end_date,
-            authority_years=sorted(self.calendar.configs),
+            authority_years=sorted(calendar_snapshot.configs),
             authority_checksum=hashlib.sha256(encoded).hexdigest(),
             sources=sources,
         )
 
     def authority_payload(self) -> dict[str, object]:
-        return {
+        return self._authority_payload(self._calendar_snapshot())
+
+    def _calendar_snapshot(self):
+        snapshot = getattr(self.calendar, "snapshot", None)
+        return snapshot() if callable(snapshot) else self.calendar
+
+    @staticmethod
+    def _authority_payload(calendar_snapshot) -> dict[str, object]:
+        payload: dict[str, object] = {
             "configs": [
                 config.model_dump(mode="json")
                 for config in sorted(
-                    self.calendar.configs.values(),
+                    calendar_snapshot.configs.values(),
                     key=lambda item: item.year,
                 )
             ]
         }
+        for identity in ("bundled_sha256", "generation_sha256"):
+            value = getattr(calendar_snapshot, identity, None)
+            if value is not None:
+                payload[identity] = value
+        return payload
+
+    def _authority_checksum(self, calendar_snapshot) -> str:
+        encoded = json.dumps(
+            self._authority_payload(calendar_snapshot),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _authority_changed_result(self, plan: CalendarSyncPlan) -> CalendarSyncResult:
+        completed_at = self.clock().astimezone(UTC)
+        return CalendarSyncResult(
+            run_id=uuid.uuid4().hex,
+            mode=plan.mode,
+            status="error",
+            range_start=plan.range_start,
+            range_end=plan.range_end,
+            fetched_at=completed_at,
+            completed_at=completed_at,
+            observed_open_count=0,
+            authority_checksum=plan.authority_checksum,
+            failure_code="CALENDAR_AUTHORITY_CHANGED",
+        )
 
     def execute(self, plan: CalendarSyncPlan) -> CalendarSyncResult:
+        calendar_snapshot = self._calendar_snapshot()
+        if self._authority_checksum(calendar_snapshot) != plan.authority_checksum:
+            return self._authority_changed_result(plan)
         if self.provider is None:
             raise RuntimeError("calendar sync execution requires a provider")
         fetched_at = self.clock().astimezone(UTC)
@@ -646,7 +694,7 @@ class CalendarSyncService:
                     plan=plan,
                     result=result,
                     observations=[],
-                    authority_payload=self.authority_payload(),
+                    authority_payload=self._authority_payload(calendar_snapshot),
                     next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
                 )
             return result
@@ -674,9 +722,9 @@ class CalendarSyncService:
         observations: list[CalendarObservation] = []
         conflicts: list[dict[str, str]] = []
         current = plan.range_start
-        confirmed_count = 0
+        unknown_count = 0
         while current <= plan.range_end:
-            official = self.calendar.session_status(current)
+            official = calendar_snapshot.session_status(current)
             provider_status = "open" if current in provider_open else "closed"
             observations.append(
                 CalendarObservation(
@@ -686,7 +734,6 @@ class CalendarSyncService:
                 )
             )
             if official != "unknown":
-                confirmed_count += 1
                 if official != provider_status:
                     conflicts.append(
                         {
@@ -695,10 +742,12 @@ class CalendarSyncService:
                             "provider": provider_status,
                         }
                     )
+            else:
+                unknown_count += 1
             current += timedelta(days=1)
         completed_at = self.clock().astimezone(UTC)
         status: SyncStatus = (
-            "quarantined" if conflicts else "ready" if confirmed_count else "observed_only"
+            "quarantined" if conflicts else "ready" if unknown_count == 0 else "observed_only"
         )
         result = CalendarSyncResult(
             run_id=run_id,
@@ -716,7 +765,7 @@ class CalendarSyncService:
             plan=plan,
             result=result,
             observations=observations,
-            authority_payload=self.authority_payload(),
+            authority_payload=self._authority_payload(calendar_snapshot),
             next_sync_at=self.policy.next_scheduled_after(plan.requested_at),
         )
         return result
