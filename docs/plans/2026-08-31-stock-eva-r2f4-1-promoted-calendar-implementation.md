@@ -111,6 +111,21 @@ bounded spawn instead of fork. Root replayed 127 repository cases plus all 60 pr
 This repair is awaiting exact-commit specification re-review. Quality review and Task 2 have not
 started; a green test run does not close the independent review by itself.
 
+At repair commit `92ebf20194298089321d7a55f9e4ef3497a780c4`, independent SPEC R1 re-review passed
+H=0/M=0/L=0 (11 R1 probes, 127 focused cases and 26 selected regressions). Root full pytest passed
+2329 with only the existing Starlette warning; the new fork warning is gone.
+Fresh QUALITY R1 review then returned NO-GO with H=1/M=1: the writer could commit a backwards
+promotion timestamp which its own reader subsequently rejects, and a hardlink created during
+source reading was not rejected by final descriptor checks. Root independently reproduced both
+as two RED cases in a private pytest file. The repair adds a same-transaction comparison with the
+verified head timestamp, permits equal timestamps, and checks final source descriptor/path
+type, owner, mode, link count and content metadata against the initial proof. Root replayed 130
+repository cases plus 62 private probes: 192 passed, with full backend/tests ruff/format,
+compileall and diff checks passing, at implementation SHA-256
+`2e3c6ceeb9d543bda52a1e806e3c2f5319c4ec551b0d3af09e2e34cb89ce7611`.
+Exact-HEAD incremental specification and quality re-review remain required; Task 1 and Task 2
+remain gated.
+
 Protected regression checkpoint: existing calendar-sync, R2-F2 golden compatibility and R2-F4.0
 failover-readiness tests passed (68), and all nine R2-F2 golden file digests match. Existing tracked
 backend/test/script files remain unchanged; this does not replace the final full regression gate.

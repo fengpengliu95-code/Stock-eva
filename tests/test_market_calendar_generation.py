@@ -900,6 +900,115 @@ def test_store_writer_refuses_corrupt_existing_database(tmp_path) -> None:
     assert path.read_bytes() == before
 
 
+def test_quality_new_promotion_cannot_commit_backwards_timestamp(tmp_path):
+    source = _valid_source()
+    store = calendar_module.CalendarGenerationStore(tmp_path / "calendar_generations.sqlite3")
+    first_started = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store.stage_execute(source, first_started)
+    first_attempt = store.reserve_attempt(source, first_started)
+    first = store.promote(
+        first_attempt,
+        source,
+        (b"sse body", b"szse body"),
+        _machine_for(source, first_started),
+        datetime(2027, 1, 1, 0, tzinfo=UTC),
+    )
+    assert first.outcome == "PROMOTED"
+    assert store.read().status == "ready"
+    with sqlite3.connect(store.path) as connection:
+        first_row = connection.execute("SELECT * FROM calendar_generation_promotion").fetchone()
+
+    schedule = source.schedules[0].model_copy(
+        update={"title": "revision", "schedule_sha256": "0" * 64}
+    )
+    schedule = schedule.model_copy(update={"schedule_sha256": build_schedule_sha256(schedule)})
+    revised = source.model_copy(
+        update={"schedules": (schedule, source.schedules[1]), "source_sha256": "0" * 64}
+    )
+    revised = revised.model_copy(update={"source_sha256": build_source_sha256(revised)})
+    second_started = datetime(2026, 12, 23, 1, tzinfo=UTC)
+    store.stage_execute(revised, second_started)
+    second_attempt = store.reserve_attempt(revised, second_started)
+    second = store.promote(
+        second_attempt,
+        revised,
+        (b"sse body", b"szse body"),
+        _machine_for(revised, second_started),
+        datetime(2026, 12, 23, 2, tzinfo=UTC),
+    )
+    assert second.outcome != "PROMOTED"
+    current = store.read()
+    assert current.status == "ready"
+    assert current.generation.generation_sha256 == first.generation_sha256
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT * FROM calendar_generation_promotion").fetchall() == [
+            first_row
+        ]
+
+
+def test_quality_equal_promotion_timestamp_is_allowed(tmp_path):
+    source = _valid_source()
+    first_time = datetime(2027, 1, 1, 0, tzinfo=UTC)
+    first_started = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    second_started = datetime(2026, 12, 23, 1, tzinfo=UTC)
+    schedule = source.schedules[0].model_copy(
+        update={"title": "equal-time revision", "schedule_sha256": "0" * 64}
+    )
+    schedule = schedule.model_copy(update={"schedule_sha256": build_schedule_sha256(schedule)})
+    revised = source.model_copy(
+        update={"schedules": (schedule, source.schedules[1]), "source_sha256": "0" * 64}
+    )
+    revised = revised.model_copy(update={"source_sha256": build_source_sha256(revised)})
+    store = calendar_module.CalendarGenerationStore(tmp_path / "calendar_generations.sqlite3")
+    store.stage_execute(source, first_started)
+    first_attempt = store.reserve_attempt(source, first_started)
+    assert (
+        store.promote(
+            first_attempt,
+            source,
+            (b"sse body", b"szse body"),
+            _machine_for(source, first_started),
+            first_time,
+        ).outcome
+        == "PROMOTED"
+    )
+    store.stage_execute(revised, second_started)
+    second_attempt = store.reserve_attempt(revised, second_started)
+    assert (
+        store.promote(
+            second_attempt,
+            revised,
+            (b"sse body", b"szse body"),
+            _machine_for(revised, second_started),
+            first_time,
+        ).outcome
+        == "PROMOTED"
+    )
+
+
+def test_quality_source_rejects_hardlink_created_after_descriptor_check(tmp_path, monkeypatch):
+    source = tmp_path / "source.json"
+    alias = tmp_path / "source-alias.json"
+    source.write_text(_valid_source().model_dump_json(), encoding="utf-8")
+    initial_bytes = source.read_bytes()
+    real_read = os.read
+    injected = False
+
+    def read_after_link(fd, size):
+        nonlocal injected
+        if not injected:
+            os.link(source, alias)
+            injected = True
+        return real_read(fd, size)
+
+    monkeypatch.setattr(calendar_module.os, "read", read_after_link)
+    with pytest.raises(calendar_module.CalendarGenerationError):
+        load_source(source)
+    assert injected
+    assert source.stat().st_nlink == 2
+    assert source.read_bytes() == alias.read_bytes() == initial_bytes
+
+
 def test_reader_preserves_bytes_on_corrupt_store(tmp_path) -> None:
     path = tmp_path / "calendar_generations.sqlite3"
     path.write_bytes(b"not sqlite")

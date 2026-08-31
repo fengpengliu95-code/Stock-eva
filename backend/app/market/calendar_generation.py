@@ -617,9 +617,44 @@ def load_source(path: Path | str) -> CalendarSourceBundleV1:
             current = source_path.lstat()
             if (
                 len(raw) > MAX_SOURCE_BYTES
-                or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
-                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                != (info.st_dev, info.st_ino, len(raw), info.st_mtime_ns)
+                or not stat.S_ISREG(after.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_uid,
+                    after.st_mode,
+                    after.st_nlink,
+                    after.st_size,
+                    after.st_mtime_ns,
+                )
+                != (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_uid,
+                    info.st_mode,
+                    info.st_nlink,
+                    len(raw),
+                    info.st_mtime_ns,
+                )
+                or (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_uid,
+                    current.st_mode,
+                    current.st_nlink,
+                    current.st_size,
+                    current.st_mtime_ns,
+                )
+                != (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_uid,
+                    info.st_mode,
+                    info.st_nlink,
+                    len(raw),
+                    info.st_mtime_ns,
+                )
             ):
                 raise CalendarGenerationError("source package changed")
         finally:
@@ -1798,6 +1833,17 @@ class CalendarGenerationStore:
                         promoted_at.astimezone(SHANGHAI).year not in verified_years
                         and attempt.target_year == promoted_at.astimezone(SHANGHAI).year + 1
                     )
+                ):
+                    connection.rollback()
+                    return CalendarPromotionResult(
+                        outcome="PARENT_CHANGED",
+                        source_sha256=attempt.source_sha256,
+                        official_requests=2,
+                        machine_requests=1,
+                    )
+                if (
+                    verified["generations"]
+                    and promoted_at < verified["generations"][-1].promoted_at
                 ):
                     connection.rollback()
                     return CalendarPromotionResult(
