@@ -1,15 +1,27 @@
 import gzip
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import BaseModel
 
+from backend.app.market.baostock import BaoStockError
 from backend.app.market.calendar_generation import (
+    CalendarGenerationStore,
     CalendarSourceBundleV1,
     body_sha256,
     build_schedule,
     build_source,
+)
+from backend.app.market.calendar_maintenance_health import CalendarMaintenanceHealthStore
+from backend.app.market.provider_health import SQLiteProviderHealthStore
+from backend.app.market.provider_transport import (
+    NormalizedTransportError,
+    ProtocolStage,
+    ProviderEndpoint,
+    TransportOutcome,
 )
 from tests.test_market_calendar_generation import _valid_source
 
@@ -493,3 +505,205 @@ def _source_with_bodies(first: bytes, second: bytes) -> CalendarSourceBundleV1:
     values = source.model_dump(mode="python")
     values["schedules"] = schedules
     return build_source(**values)
+
+
+def _worker_fixture(tmp_path):
+    source = _valid_source()
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    health_path = tmp_path / "health.sqlite3"
+    SQLiteProviderHealthStore(health_path).initialize()
+    return store, CalendarMaintenanceHealthStore(health_path), source
+
+
+def _official_factory(status=200):
+    calls = []
+
+    def factory(**kwargs):
+        calls.append(kwargs)
+        index = len(calls) - 1
+        body = BODIES[index]
+        return httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(status, content=body if status == 200 else b"error")
+            ),
+            **kwargs,
+        )
+
+    factory.calls = calls
+    return factory
+
+
+def test_worker_early_official_failure_spends_slot_without_provider(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, health, _ = _worker_fixture(tmp_path)
+    providers = []
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(status=503),
+        provider_factory=lambda **kwargs: providers.append(kwargs),
+        clock=lambda: NOW,
+    ).execute()
+
+    assert result.outcome == "OFFICIAL_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (1, 0)
+    assert providers == []
+    assert store.read_control().attempts[-1].outcome == "OFFICIAL_UNAVAILABLE"
+
+
+def test_worker_provider_construction_failure_counts_zero_machine_requests(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, health, _ = _worker_fixture(tmp_path)
+
+    def provider_factory(**kwargs):
+        raise OSError("synthetic provider setup failure")
+
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=provider_factory,
+        clock=lambda: NOW,
+    ).execute()
+
+    assert result.outcome == "MACHINE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 0)
+
+
+def test_worker_machine_failure_without_audit_is_control_unavailable_and_counts_request(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, health, _ = _worker_fixture(tmp_path)
+
+    class FailingProvider:
+        @contextmanager
+        def refresh_operation(self, run_id):
+            yield
+
+        def calendar_days(self, start, end):
+            raise BaoStockError("synthetic machine failure")
+
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: FailingProvider(),
+        clock=lambda: NOW,
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 1)
+
+
+def test_worker_finish_failure_is_control_unavailable_after_reserved_slot(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class FinishFails(CalendarGenerationStore):
+        def finish_attempt(self, *args, **kwargs):
+            return False
+
+    source = _valid_source()
+    store = FinishFails(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    health_path = tmp_path / "health.sqlite3"
+    SQLiteProviderHealthStore(health_path).initialize()
+    health = CalendarMaintenanceHealthStore(health_path)
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(status=503),
+        clock=lambda: NOW,
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert result.writes_calendar_state is True
+
+
+def test_worker_transport_failure_preserves_normalized_error():
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    recorded = []
+
+    class Health:
+        def list_observations(self):
+            return [
+                SimpleNamespace(
+                    refresh_id="refresh-1",
+                    provider_session_id="session-1",
+                    protocol_stage=ProtocolStage.OPERATION,
+                    endpoint=ProviderEndpoint.TRADE_DATES,
+                    attempt=1,
+                    outcome=TransportOutcome.ERROR,
+                    normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+                )
+            ]
+
+        def record_terminal_failure(self, refresh_id, endpoint, error, *, observed_at):
+            recorded.append((refresh_id, endpoint, error))
+
+    service = CalendarMaintenanceService(object(), Health())
+    assert service._record_machine_failure("refresh-1", NOW) is True
+    assert recorded == [
+        ("refresh-1", ProviderEndpoint.TRADE_DATES, NormalizedTransportError.RECV_TIMEOUT)
+    ]
+
+
+def test_worker_semantic_failure_after_success_uses_protocol_error():
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    recorded = []
+
+    class Health:
+        def list_observations(self):
+            return [
+                SimpleNamespace(
+                    refresh_id="refresh-2",
+                    provider_session_id="session-2",
+                    protocol_stage=ProtocolStage.OPERATION,
+                    endpoint=ProviderEndpoint.TRADE_DATES,
+                    attempt=1,
+                    outcome=TransportOutcome.SUCCESS,
+                    normalized_error=None,
+                )
+            ]
+
+        def record_terminal_failure(self, refresh_id, endpoint, error, *, observed_at):
+            recorded.append(error)
+
+    service = CalendarMaintenanceService(object(), Health())
+    assert service._record_machine_failure("refresh-2", NOW) is True
+    assert recorded == [NormalizedTransportError.PROTOCOL_ERROR]
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        [],
+        [
+            SimpleNamespace(
+                refresh_id="refresh-3",
+                provider_session_id="session-3",
+                protocol_stage=ProtocolStage.RECEIVE,
+                endpoint=ProviderEndpoint.TRADE_DATES,
+                attempt=1,
+                outcome=TransportOutcome.ERROR,
+                normalized_error=NormalizedTransportError.EOF,
+            )
+        ],
+    ],
+)
+def test_worker_missing_operation_audit_never_guesses_failure(observations):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class Health:
+        def list_observations(self):
+            return observations
+
+        def record_terminal_failure(self, *args, **kwargs):
+            raise AssertionError("uncertain audit must not mutate circuit state")
+
+    service = CalendarMaintenanceService(object(), Health())
+    assert service._record_machine_failure("refresh-3", NOW) is False

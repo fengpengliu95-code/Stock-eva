@@ -102,6 +102,37 @@ checkpoint did not repeat full pytest; latest full evidence is the preceding 244
 checkpoint. Policy, durable slots and machine/promotion integration remain pending, then complete
 Task 2 independent SPEC and QUALITY reviews; no Task 2 or version GO is claimed.
 
+**Task 2b maintenance-worker checkpoint:** `CalendarMaintenanceService` now derives current/next
+year policy from one verified control snapshot, applies exact Shanghai October 1/December 15
+thresholds, blocks missing current-year authority and quarantined latest candidates, and keeps
+planning zero-write/zero-network. Execution repeats the decision and existing-health preflight,
+reserves the immutable `(target_year, Shanghai_date)` slot before acquisition, then permits at
+most two official requests and one dedicated BaoStock `trade_dates` operation. A second health
+snapshot gates the machine request. Actual request counts and every attempted control write are
+reported; failed terminal recording degrades to `CONTROL_STATE_UNAVAILABLE`.
+
+Root review added strict operation-audit proof before endpoint outcomes: one refresh/session,
+endpoint `trade_dates`, attempt 1 and exactly one operation outcome. A proven transport failure
+retains its observed normalized error; a proven successful operation followed by civil-day
+semantic failure becomes `PROTOCOL_ERROR`; missing, multi-session or contradictory audit never
+guesses an error or mutates the breaker. Unexpected calendar-generation invariant errors
+propagate and leave the already-reserved slot spent. Private offline probes also prove a real
+BaoStock fake-client success/timeout/semantic path, same-day crash and changed-source suppression,
+post-official OPEN health blocking, exact `2/1` success and immutable promotion readback.
+
+Fresh root worker replay: 42 retained maintenance cases plus 26 private policy/execution probes,
+68 passed. Complete Task 2 focused modules: 384 passed. Full repository: 2490 collected and
+passed, with the existing Starlette deprecation warning and a non-failing macOS pytest cleanup
+warning for pre-existing temporary garbage. Ruff check/format, compile and diff checks pass. The
+protected BaoStock, calendar-sync, generation and provider-health SHA-256 values remain
+`aef4bb5b7a01ccf95bc992ec9887bc43fc7c53a3c69055ab2a742b3348079961`,
+`f2927103dc5353d77b65a91185b4e07d551a0a8e30ce1aedb109ff6da10bbcf6`,
+`491b1b4fb56b27d834d2191ea10f0757afa88d18f9b537ac90999e6bda5abe6f` and
+`c83e821a8ab49d96720560fa5a26c8707b74c6fd6a1362b7614835f662dd706e`. No real HTTP/provider,
+production state, market canonical, deployment or LaunchAgent operation occurred. This remains a
+development checkpoint; complete Task 2 independent SPEC and QUALITY reviews are still required,
+and neither Task 2 nor R2-F4.1 GO is claimed.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
