@@ -83,6 +83,25 @@ spec validation (100/100, zero warnings) and nine R2-F2 golden checks passed. No
 occurred. This is still a development checkpoint, not independent Task 2 or R2-F4.1 GO; bounded
 official acquisition and the policy/slot worker remain next, followed by both independent reviews.
 
+**Task 2b official-fetcher checkpoint:** `fetch_official_calendars` pins one bounded, strictly
+validated source snapshot before constructing clients. It uses a fresh credentialless client per
+exact reviewed URL, fixed timeouts, no redirects/retries/environment proxy, explicit gzip/deflate
+negotiation, bounded decoded streaming and exact reviewed body hashes. Complete dual success is
+the only result carrying internal body bytes; operational results never expose them. Actual
+request counts distinguish client setup failure (0), first-request failure (1), and second-request
+failure (2). Resource-close transport failures fail closed without masking a primary programming
+failure. Source validation/conflict paths are client-free and zero-write.
+Developer initial RED: 24 failures before implementation; root initial RED: 13 missing-interface
+failures. Root then reproduced three contract failures: mutable caller source reused after
+validation, ignored client-close failure, and unknown HTTP content encoding accepted as identity.
+All are fixed and retained, including isolated streamed encoding/decoder and resource-close tests.
+Fresh root combined replay: 565 passed, including 34 retained fetcher cases and 17 private fetcher
+probes. All backend/tests ruff/format (203 files), compileall and diff checks pass. No frozen
+health/generation/provider code changed and no real acquisition or persistence occurred. This
+checkpoint did not repeat full pytest; latest full evidence is the preceding 2448-case health
+checkpoint. Policy, durable slots and machine/promotion integration remain pending, then complete
+Task 2 independent SPEC and QUALITY reviews; no Task 2 or version GO is claimed.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
@@ -407,6 +426,10 @@ response cookie cannot be carried into the other request. Offline tests must ins
 request headers and client configuration, exercise standard decoded content hashing, and prove
 that first-request failures report 1/0 while client-construction failures report 0/0. Internal
 successful body bytes are never part of a public operational result or exception.
+Negotiate only standard gzip/deflate encoding (identity is also accepted), and reject unknown or
+malformed Content-Encoding tokens before accepting bytes. HTTPX's permissive unknown-encoding
+identity fallback is not proof of a decoded official body. Keep its standard supported decoding
+and apply the 1 MiB bound and reviewed digest to decoded bytes.
 
 Maintenance: no candidate or policy not due -> zero-request safe outcome. Before acquisition,
 validate source/admission, current parent and existing health; missing/corrupt health is
