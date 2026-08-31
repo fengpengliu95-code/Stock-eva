@@ -63,21 +63,26 @@ calendar. No new token, credential, subscription or full-service secondary capab
   weekday closure dates are closed; all other dates of an explicitly covered full year are open.
   Closure dates MUST belong to that year, be weekdays, and be unique/sorted. Unknown years,
   including their weekends, MUST remain unknown. No generic weekday fallback is permitted.
-- FR-5: Every SHA identity MUST use canonical UTF-8 JSON (sorted keys, compact separators,
+- FR-5: Every structured SHA identity MUST use canonical UTF-8 JSON (sorted keys, compact separators,
   ensure_ascii=false, allow_nan=false, trailing newline) and its versioned domain prefix plus
   newline. Public digest fields MUST be required lowercase 64-hex strings, not optional sentinels.
   All write/authority boundaries MUST revalidate serialized input, including model_copy/construct.
+  Raw official bodies are the explicit exception: `body_sha256=sha256(body_bytes).hexdigest()`.
+  Body bytes mean HTTP payload after standard content decoding, before any text decoding,
+  whitespace normalization or HTML parsing; the 1 MiB bound applies to these decoded bytes.
 - FR-6: Source staging MUST validate metadata, publication/review dates against the trusted
   Shanghai clock and both schedule hashes before writes. Individually valid but disagreeing
   SSE/SZSE schedules MUST be persisted as quarantined candidates and cause zero network requests.
   Malformed source packages MUST fail before creating a database, lock or directory.
-- FR-7: Staging the same source hash MUST be idempotent. Sources and generations MUST be immutable;
+- FR-7: Store construction MUST be lazy and perform zero path access/initialization. Pure
+  `plan_stage(source, now)` MUST finish validation before `stage_execute(source, now)` is allowed
+  to initialize anything. Staging the same source hash MUST be idempotent. Sources and generations MUST be immutable;
   a new notice/extraction requires a new source hash. Source staging MUST never promote a year.
 - FR-8: Source retrieval MUST use HTTPS and exact allowlisted official origins (`www.sse.com.cn`,
   `www.szse.cn`, `investor.szse.cn`), default port only, no userinfo/query/fragment, no redirect,
   no environment credentials/proxy authentication, and no retry. URLs remain local authority
   metadata; public operational errors MUST NOT include URLs, body content or raw exceptions.
-- FR-9: Each official body MUST be bounded at 1 MiB and match the staged SHA-256 exactly. Missing,
+- FR-9: Each official body MUST be nonempty, bounded at 1 MiB and match the staged SHA-256 exactly. Missing,
   changed, oversized or failed bodies MUST leave the candidate unpromoted. Verified official body
   bytes MUST be retained as immutable calendar-control evidence, never as canonical market RAW.
 - FR-10: Add an isolated BaoStock `calendar_days(start,end)` capability without changing the return
@@ -87,10 +92,17 @@ calendar. No new token, credential, subscription or full-service secondary capab
   date is an incomplete response, even if all expected open dates were returned.
 - FR-11: Live maintenance MUST use the existing pinned BaoStock transport, fixed endpoint
   `trade_dates`, max_attempts=1 and unchanged timeout. It MUST preserve transport identity/audit and
-  persistent health accounting. OPEN/HALF_OPEN health MUST stop acquisition before official or
+  persistent health accounting. The maintenance worker MUST construct a dedicated BaoStock
+  instance with `max_attempts=1`, never mutate/reuse the canonical provider instance. Missing,
+  corrupt or unreadable health state MUST yield `CONTROL_STATE_UNAVAILABLE` with zero requests;
+  the worker MUST NOT initialize/repair it. Only a verified existing CLOSED health snapshot allows
+  acquisition. OPEN/HALF_OPEN health MUST stop acquisition before official or
   machine requests; this worker MUST NOT close circuits, probe, retry or refresh market data.
 - FR-12: Maintenance MUST stage the candidate before requests and reserve a durable slot keyed by
-  `(target_year, Shanghai_date)` before acquisition. At most two official HTTP requests and one
+  `(target_year, Shanghai_date)` before acquisition. Reservation MUST persist the exact source hash
+  and `expected_parent_sha256` observed inside its transaction. Promotion MUST use this recorded
+  parent, not a later head; generation and attempt parent/source/slot identities MUST agree.
+  At most two official HTTP requests and one
   logical machine calendar request are permitted in a slot. A crash/rerun or changed candidate
   MUST NOT reuse the slot to issue another request. A later day may try only after health permits.
 - FR-13: A complete successful machine observation MUST bind provider=`baostock`, contract version
@@ -120,21 +132,32 @@ calendar. No new token, credential, subscription or full-service secondary capab
   bounded read-only connections, verify schema/immutable guards and leave bytes/tree/mtime intact.
   Only explicit staging execute may initialize the generation store; scheduled maintenance MUST
   NOT recreate a missing store or repair corruption.
-- FR-19: Every public calendar operation MUST use one immutable runtime snapshot. The default
+- FR-19: `live.snapshot()` MUST return a concrete immutable calendar snapshot loaded once.
+  Every continuity scan, automation decision/run, calendar-sync plan/execute, API market
+  status/summary, portfolio/fund-flow operation and supplement ingestion operation MUST capture
+  it at the external operation boundary and use that same object for all status/range/source
+  calls. Individual live calendar methods also snapshot once before their internal date loops.
+  The default
   calendar factory and long-lived automation/continuity/calendar-sync consumers MUST see a later
   promotion on their next operation without restart. A range MUST NOT mix generations mid-loop.
   Concrete injected test/qualification calendars MUST retain their existing behavior.
 - FR-20: Calendar-sync MUST freeze authority for a plan/execute operation, reject an authority
   checksum change before provider access, and never report `ready` for mixed known/unknown ranges.
-  Existing conflicts still quarantine; unknown portions produce `observed_only`.
+  Existing conflicts still quarantine; unknown portions produce `observed_only`. Stale plan
+  execution MUST return `CalendarSyncResult(status='error',
+  failure_code='CALENDAR_AUTHORITY_CHANGED')` before provider access, with no sync-state update;
+  CLI exit is 1. This is not `PARENT_CHANGED` (which is generation promotion CAS failure).
 - FR-21: Next-year policy MUST be based on Shanghai dates: before October 1, absent next-year
   authority is `not_due`; October 1 through December 14 is `pending`; from December 15 it is
   `action_required`. Missing current-year authority is always blocking. A future date/year MUST
   never become usable because of policy status alone; a verified bundled or promoted year is
   required. Existing bundled years remain valid baselines, newly added years require promotion.
 - FR-22: The existing `calendar-sync --startup --execute` LaunchAgent and in-process calendar loop
-  MUST invoke at most one due runtime maintenance slot, targeting a missing current year first,
-  otherwise next year from October 1. A missing staged source means `SOURCE_PENDING`, zero
+  MUST invoke at most one due runtime maintenance slot. Select the latest staging_sequence for
+  each year (including a quarantined latest candidate; never silently fall back to an older one).
+  Priority is: an unpromoted current-year revision, then missing current-year authority, then
+  next year from October 1 if missing or if its latest candidate differs from active source.
+  Already-active source with no newer candidate is `NOT_DUE`. A missing staged source means `SOURCE_PENDING`, zero
   requests, no head change. The legacy current/historical reconciliation remains a separate
   bounded operation. No sixth LaunchAgent or change to market refresh cadence is allowed.
 - FR-23: Add zero-write `calendar-generation-status` and
@@ -142,18 +165,29 @@ calendar. No new token, credential, subscription or full-service secondary capab
   conflict states and zero request/write counters, without market store or provider construction.
   Existing `/market/status` keeps its schema and uses the same calendar facade for expected dates.
 - FR-24: Add `calendar-generation-stage --source PATH [--execute]` and
-  `calendar-maintenance [--execute]`. Default planning MUST have zero writes/network requests.
+  `calendar-maintenance [--year YYYY] [--execute]`. Explicit year may be only the current or next
+  Shanghai year and may process a reviewed revision before October 1; it does not bypass health,
+  parent, history, already-active-source or daily-slot gates. Default planning MUST have zero writes/network requests.
   Source files MUST be bounded regular no-symlink JSON with duplicate-key rejection. Staging
   execute writes only calendar control; maintenance execute writes only calendar control/sync and
   existing provider-health audit. Neither may construct market/NAS stores, publish, or auto-shadow.
 - FR-25: No ProviderId, canonical candidate/selection/manifest, frozen R2-F2/R2-F3 contracts or
   R2-F4.0 capability projection may change. Runtime calendar availability MUST NOT silently mark
   the TickFlow promoted-calendar capability QUALIFIED; that needs a later versioned authority.
-- FR-26: Operational failures MUST use a closed safe vocabulary: `SOURCE_PENDING`,
+- FR-26: Public operational outcomes MUST use a closed safe vocabulary: `STAGED`, `ALREADY_STAGED`, `SOURCE_PENDING`,
   `SOURCE_INVALID`, `SOURCE_CONFLICT`, `OFFICIAL_UNAVAILABLE`, `OFFICIAL_HASH_MISMATCH`,
   `MACHINE_UNAVAILABLE`, `MACHINE_CONFLICT`, `SKIPPED_CIRCUIT_OPEN`, `ALREADY_ATTEMPTED`,
-  `PARENT_CHANGED`, `HISTORY_CHANGE`, `CONTROL_STATE_UNAVAILABLE`, `NOT_DUE`, `PROMOTED`.
+  `PARENT_CHANGED`, `HISTORY_CHANGE`, `CALENDAR_AUTHORITY_CHANGED`, `CONTROL_STATE_UNAVAILABLE`, `NOT_DUE`, `PROMOTED`.
+  Candidate admission is exactly `awaiting_machine` with staging reason `STAGED`, or `quarantined`
+  with reason `SOURCE_CONFLICT`. An idempotent staging call returns `ALREADY_STAGED` without
+  changing the persisted reason; a previously quarantined candidate remains quarantined.
+  `RUNNING` is internal attempt state only; status reports it as `ALREADY_ATTEMPTED`, never success.
   Unexpected programming failures MUST not be disguised as successful or unavailable evidence.
+- FR-27: The new three CLI paths, standalone API and default live calendar factory MUST use an
+  explicit `CalendarRuntimeSettings` plain-model projection, not `BaseSettings/get_settings()`.
+  Read only the exact environment keys listed below (no environment enumeration, `.env` loading,
+  token names, provider clients or StoragePreflight). Embedded callers MAY pass their already
+  resolved Settings through this same field allowlist so the configured private root is retained.
 
 ## Non-functional requirements
 
@@ -175,7 +209,8 @@ calendar. No new token, credential, subscription or full-service secondary capab
 
 ### AC-1: Immutable identity and strict source (FR-3, FR-4, FR-5, FR-6, FR-7)
 Given valid dual-source fixtures and malformed/duplicate/out-of-year/construct-bypassed variants,
-When staging is planned/executed, Then only fully valid identities are admitted; disagreement is
+When staging is planned/executed, Then only fully valid identities are admitted; raw-body versus
+structured-domain vectors and self-digest exclusions match the fixed projection contract; disagreement is
 quarantined with zero network; identical staging is idempotent and never promotes.
 
 ### AC-2: Bounded official acquisition (FR-8, FR-9, FR-12)
@@ -205,17 +240,20 @@ are unchanged; a valid empty initialized store yields only bundled authority.
 
 ### AC-7: Atomicity and races (FR-14, FR-15, NFR-3)
 Given fault injection after insert/before head/at commit and concurrent stale-parent requests,
-When promotion fails, Then previous head and canonical fixture bytes persist; at most one writer
+When promotion fails, Then previous head and canonical fixture bytes persist; attempt source/parent
+remain bound to reservation, at most one writer
 wins and no orphan generation is usable as authority.
 
 ### AC-8: Live consumer visibility (FR-19)
 Given one long-lived default calendar facade held by automation and continuity,
 When a synthetic next-year generation is promoted, Then the next decisions see it without restart;
-each range is pinned to one snapshot even if promotion is injected mid-iteration.
+each external operation is pinned to one snapshot even if promotion is injected between status,
+range and source calls as well as mid-iteration.
 
 ### AC-9: Sync snapshot and mixed range (FR-20)
 Given a plan made at generation A and a changed generation B, or a known/unknown range,
-When sync executes, Then stale authority stops before provider calls and mixed coverage cannot be
+When sync executes, Then stale authority reports CALENDAR_AUTHORITY_CHANGED with zero requests/state
+writes and mixed coverage cannot be
 ready or update last-known-good. Existing confirmed legacy behavior remains green.
 
 ### AC-10: Policy boundaries (FR-21)
@@ -224,11 +262,11 @@ When status/planning runs, Then not_due/pending/action_required/current-year blo
 unknown-year weekdays and weekends never become open from policy alone.
 
 ### AC-11: One durable maintenance slot (FR-11, FR-12, FR-22)
-Given repeated startup/daily/monthly calls, crash after reservation and OPEN/HALF_OPEN health,
+Given repeated startup/daily/monthly calls, crash after reservation, missing/corrupt health and OPEN/HALF_OPEN health,
 When the existing job runs, Then requests stay within one slot budget and zero for a blocked
 circuit; missing sources and interrupted slots never trigger a market refresh or another attempt.
 
-### AC-12: Read-only API/CLI (FR-1, FR-23, FR-24)
+### AC-12: Read-only API/CLI (FR-1, FR-23, FR-24, FR-27)
 Given disabled/valid/missing/corrupt private runtime and hard market/provider/path sentinels,
 When status and default plan commands run, Then they do no writes, provider/market construction
 or production/NAS access; response counters and exit statuses match the documented contract.
@@ -291,7 +329,8 @@ interface CalendarGenerationStatusV1 {
 
 CLI status exits 0 for disabled/ready, 1 unavailable, 2 invalid config/input. Stage/maintenance
 plans exit 0 when valid and include `network_requests=0`, `writes_calendar_state=false`,
-`canonical_writes=false`. Stage execute exits 0 staged/idempotent, 1 quarantined/control failure,
+`canonical_writes=false`. Stage execute exits 0 staged/idempotent, 1 quarantined/control failure
+(including idempotent restaging of a quarantined candidate),
 2 invalid package. Maintenance execute exits 0 promoted/not_due/source_pending/already_attempted,
 1 acquisition/conflict/circuit/control failures, 2 invalid configuration. Execute results include
 safe outcome, source/generation hash or null, actual official/machine request counts and calendar
@@ -307,18 +346,194 @@ source metadata may contain reviewed official URLs; transport/status events may 
 | OfficialCalendarScheduleV1 | exchange, year, coverage_start/end, title, notice_no, official_url, published_on, body_sha256, closed_dates, review_id, reviewed_on, schedule_sha256 | full year; strict sorted weekday closures; exact origin; reviewed hashes/dates |
 | CalendarSourceBundleV1 | schema_version=1, rule_version, year, schedules[2], source_sha256 | exact SSE/SZSE order; all identities required |
 | CalendarMachineObservationV1 | provider, contract_version, range_start/end, observed_at, days[{date,is_open}], observation_sha256 | 365/366 complete ordered dates; strict boolean |
-| CalendarGenerationV1 | sequence, parent_sha256/null, bundled_sha256, source_sha256, official_body_hashes[2], machine, promoted_at, generation_sha256 | derived/validated; parent sequence + 1; complete authority chain |
+| CalendarGenerationV1 | sequence, parent_sha256/null, bundled_sha256, source_sha256, attempt_target_year, attempt_slot_date, official_body_hashes[2], machine, promoted_at, generation_sha256 | derived/validated; parent sequence + 1; complete authority chain |
 | CalendarCandidate | source_sha256, canonical source bytes, staged_at, staging_sequence, admission/reason | immutable; unique hash; disagreement quarantined |
 | CalendarOfficialObject | body_sha256, body_bytes | bounded, immutable, verified bytes |
 | CalendarPromotion | sequence, generation_sha256, canonical generation bytes | append-only; schema guards; no replacement |
 | CalendarHead | singleton=1, sequence, generation_sha256 | atomic compare-and-swap; must equal latest promotion |
-| CalendarMaintenanceAttempt | target_year + slot_date PK, source_sha256, started_at, finished_at/null, outcome | reserve before calls; never reused; terminal outcome safe |
+| CalendarMaintenanceAttempt | target_year + slot_date PK, source_sha256, expected_parent_sha256/null, started_at, finished_at/null, outcome, official_requests, machine_requests | reserve before calls; immutable identity/parent; one terminal update; never reused |
 
 SQLite schema/version and its immutable triggers are frozen in this version. Readers validate the
 schema and complete hash-linked authority graph, not merely the mutable head. A missing terminal
 attempt remains spent; attempts are audit, never promotion authority. `CalendarSyncStore` continues
 to keep machine transport/sync observations; a generation owns a verified immutable observation
 copy rather than trusting a mutable success flag.
+
+### Exact hash projections
+
+Every structured model is projected with `model_dump(mode='json')`: ISO date strings, UTC aware
+datetimes serialized consistently as `...Z`, tuples as JSON arrays, all null/default/false/zero
+fields retained. The only excluded field is the **top-level self digest** shown below; nested
+digests remain included. Model/schema tests MUST freeze a complete valid fixture vector for each
+projection, in addition to the canonical primitive vector. No caller may omit another field.
+
+| Digest | Domain | Exact preimage projection |
+|---|---|---|
+| schedule_sha256 | stock-eva/r2f4.1/calendar-schedule/v1 | all OfficialCalendarScheduleV1 fields except schedule_sha256 |
+| source_sha256 | stock-eva/r2f4.1/calendar-source/v1 | schema_version, rule_version, year, complete schedules including their digests |
+| observation_sha256 | stock-eva/r2f4.1/calendar-machine/v1 | provider, contract_version, range_start, range_end, observed_at, days with exact date/is_open fields |
+| generation_sha256 | stock-eva/r2f4.1/calendar-generation/v1 | all CalendarGenerationV1 fields except generation_sha256; machine includes observation_sha256 |
+| bundled_sha256 | stock-eva/r2f4.1/calendar-bundled/v1 | {configs: [complete existing CalendarConfig JSON values ordered by year]} |
+| body_sha256 | none | exact HTTP decoded payload bytes; standard sha256, no JSON/domain prefix |
+
+Primitive fixed vectors: canonical JSON for `{zero:0, false:false, null:null, empty:[]}` is
+`{"empty":[],"false":false,"null":null,"zero":0}\n` (the final `\n` denotes one byte 0x0a).
+The raw-byte vector `b'abc'` hashes to
+`ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad`.
+The body hashes in a generation are in SSE/SZSE order and MUST equal the source package's expected
+body hashes and stored object's raw-byte hashes. SQLite metadata's `schema_sha256` hashes the
+exact UTF-8 DDL source below, not a structure that includes schema_sha256 itself.
+
+### Non-credential runtime settings contract
+
+`CalendarRuntimeSettings` is a plain immutable model. Its loader calls `os.environ.get` only for
+the keys below, one by one; it does not enumerate environment, call get_settings, inspect .env,
+or load credentials. Defaults match existing Settings where fields overlap. New default runtime
+factory/maintenance/status paths share this one source. Runtime enablement for unattended use
+must be placed in the service process environment; adding the two new keys to a general `.env`
+alone is not claimed to enable this env-only lane. An embedded caller may explicitly project an
+already-resolved settings object by these field names, without invoking another settings loader.
+
+```text
+STOCK_EVA_CALENDAR_RUNTIME_ENABLED                 false
+STOCK_EVA_CALENDAR_GENERATION_DATABASE_NAME        calendar_generations.sqlite3
+STOCK_EVA_CALENDAR_SYNC_DATABASE_NAME              calendar_sync.sqlite3
+STOCK_EVA_LOCAL_CONTROL_DIR                       var/control
+STOCK_EVA_LOCAL_LOCK_DIR                          var/locks
+STOCK_EVA_PROVIDER_HEALTH_DATABASE_NAME           provider_health.sqlite3
+STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS          30.0
+STOCK_EVA_AUTO_REFRESH_MIN_REQUEST_INTERVAL_SECONDS 0.5
+STOCK_EVA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD       3
+STOCK_EVA_PROVIDER_CIRCUIT_COOLDOWN_SECONDS        900.0
+STOCK_EVA_PROVIDER_CIRCUIT_PROBE_LEASE_SECONDS     120.0
+```
+
+Invalid values produce sanitized 422 (API) or exit 2 (CLI) before path/client access. Relative
+control paths are anchored once to the current working directory without resolving symlinks;
+all subsequent reader/writer path checks use the anchored path. Existing path/transport minimums
+and maximums remain unchanged. Database basenames cannot collide with one another.
+
+### SQLite schema v1 and transition contract
+
+The following DDL is the normative v1 schema. Foreign keys MUST be enabled on every writer
+connection; readers MUST verify schema objects/guards and run foreign-key integrity checks
+without migrations. `journal_mode=DELETE`, `synchronous=FULL`, and zero SQLite busy timeout apply.
+Writers use one nonblocking process lock plus `BEGIN IMMEDIATE`; readers use shared nonblocking
+locks and read-only URI connections. Metadata/head initialization occurs only after source
+prevalidation during explicit stage execute. No scheduled worker initialization is allowed.
+
+```sql
+CREATE TABLE calendar_generation_meta (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    schema_sha256 TEXT NOT NULL CHECK(length(schema_sha256) = 64),
+    bundled_sha256 TEXT NOT NULL CHECK(length(bundled_sha256) = 64)
+);
+CREATE TABLE calendar_generation_candidate (
+    staging_sequence INTEGER PRIMARY KEY CHECK(staging_sequence > 0),
+    source_sha256 TEXT NOT NULL UNIQUE CHECK(length(source_sha256) = 64),
+    payload_json TEXT NOT NULL CHECK(length(payload_json) <= 262144),
+    staged_at TEXT NOT NULL,
+    admission TEXT NOT NULL CHECK(admission IN ('awaiting_machine', 'quarantined')),
+    reason TEXT NOT NULL CHECK(
+        (admission = 'awaiting_machine' AND reason = 'STAGED') OR
+        (admission = 'quarantined' AND reason = 'SOURCE_CONFLICT'))
+);
+CREATE TABLE calendar_official_object (
+    body_sha256 TEXT PRIMARY KEY CHECK(length(body_sha256) = 64),
+    body_bytes BLOB NOT NULL CHECK(length(body_bytes) BETWEEN 1 AND 1048576)
+);
+CREATE TABLE calendar_maintenance_attempt (
+    target_year INTEGER NOT NULL CHECK(target_year BETWEEN 1900 AND 9998),
+    slot_date TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL REFERENCES calendar_generation_candidate(source_sha256),
+    expected_parent_sha256 TEXT REFERENCES calendar_generation_promotion(generation_sha256),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT NOT NULL CHECK(outcome IN (
+        'RUNNING', 'OFFICIAL_UNAVAILABLE', 'OFFICIAL_HASH_MISMATCH',
+        'MACHINE_UNAVAILABLE', 'MACHINE_CONFLICT', 'SKIPPED_CIRCUIT_OPEN',
+        'PARENT_CHANGED', 'HISTORY_CHANGE', 'CONTROL_STATE_UNAVAILABLE', 'PROMOTED')),
+    official_requests INTEGER NOT NULL DEFAULT 0 CHECK(official_requests BETWEEN 0 AND 2),
+    machine_requests INTEGER NOT NULL DEFAULT 0 CHECK(machine_requests BETWEEN 0 AND 1),
+    PRIMARY KEY(target_year, slot_date),
+    CHECK((outcome = 'RUNNING' AND finished_at IS NULL AND
+           official_requests = 0 AND machine_requests = 0) OR
+          (outcome != 'RUNNING' AND finished_at IS NOT NULL)),
+    CHECK(outcome != 'PROMOTED' OR (official_requests = 2 AND machine_requests = 1))
+);
+CREATE TABLE calendar_generation_promotion (
+    sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+    generation_sha256 TEXT NOT NULL UNIQUE CHECK(length(generation_sha256) = 64),
+    parent_sha256 TEXT REFERENCES calendar_generation_promotion(generation_sha256),
+    source_sha256 TEXT NOT NULL REFERENCES calendar_generation_candidate(source_sha256),
+    attempt_target_year INTEGER NOT NULL,
+    attempt_slot_date TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK(length(payload_json) <= 262144),
+    promoted_at TEXT NOT NULL,
+    UNIQUE(sequence, generation_sha256),
+    UNIQUE(attempt_target_year, attempt_slot_date),
+    FOREIGN KEY(attempt_target_year, attempt_slot_date)
+        REFERENCES calendar_maintenance_attempt(target_year, slot_date)
+);
+CREATE TABLE calendar_generation_head (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    generation_sha256 TEXT,
+    CHECK((sequence = 0 AND generation_sha256 IS NULL) OR
+          (sequence > 0 AND generation_sha256 IS NOT NULL)),
+    FOREIGN KEY(sequence, generation_sha256)
+        REFERENCES calendar_generation_promotion(sequence, generation_sha256)
+);
+CREATE TRIGGER calendar_meta_no_update BEFORE UPDATE ON calendar_generation_meta
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_meta_no_delete BEFORE DELETE ON calendar_generation_meta
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_candidate_no_update BEFORE UPDATE ON calendar_generation_candidate
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_candidate_no_delete BEFORE DELETE ON calendar_generation_candidate
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_object_no_update BEFORE UPDATE ON calendar_official_object
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_object_no_delete BEFORE DELETE ON calendar_official_object
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_promotion_no_update BEFORE UPDATE ON calendar_generation_promotion
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_promotion_no_delete BEFORE DELETE ON calendar_generation_promotion
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_head_no_delete BEFORE DELETE ON calendar_generation_head
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_attempt_no_delete BEFORE DELETE ON calendar_maintenance_attempt
+BEGIN SELECT RAISE(ABORT, 'calendar_immutable'); END;
+CREATE TRIGGER calendar_attempt_terminal_only BEFORE UPDATE ON calendar_maintenance_attempt
+WHEN OLD.outcome != 'RUNNING' OR NEW.outcome = 'RUNNING'
+  OR NEW.target_year != OLD.target_year OR NEW.slot_date != OLD.slot_date
+  OR NEW.source_sha256 != OLD.source_sha256
+  OR NEW.expected_parent_sha256 IS NOT OLD.expected_parent_sha256
+  OR NEW.started_at != OLD.started_at
+BEGIN SELECT RAISE(ABORT, 'calendar_attempt_immutable'); END;
+```
+
+Writers explicitly allocate `max(staging_sequence)+1` under transaction; no AUTOINCREMENT/internal
+sequence table is needed. Initialization inserts metadata and head `(1,0,NULL)` atomically. Stored
+JSON MUST be canonical, UTF-8 byte-bounded and strict-model valid, regardless of weaker SQL length
+constraints. All text timestamps are normalized aware UTC; slot_date is the Shanghai date of
+started_at. Application validation checks lowercase hex, exact ISO dates and strict types.
+
+Reservation validates the latest candidate, current complete head and admissible target year,
+then inserts one RUNNING row with the observed parent. `promote` takes a reserved slot identity,
+not arbitrary parent authority; it re-reads that RUNNING row and verifies source/parent/timestamps.
+It inserts objects/generation, replays and readback-verifies them, then updates head with
+`WHERE singleton=1 AND sequence=:old_sequence AND generation_sha256 IS :reserved_parent`;
+rowcount MUST be one. The same transaction sets attempt to PROMOTED with actual 2/1 counts.
+Source publication/review must not be after reservation; machine observed_at must be between
+reserved started_at and promoted_at; promotion timestamps must not move backwards along the chain.
+Reader verification requires exact contiguous sequence starting at 1, matching parent links,
+head equal to the highest sequence, and every generation's referenced attempt terminal PROMOTED
+with matching source/parent/slot and counts. Terminal PROMOTED attempts without a generation are
+also invalid. A failed promotion rolls back all these writes; a separate best-effort terminal
+failure update may spend the already-reserved slot without granting any authority. A crash leaves
+RUNNING permanently spent for that day. No slot reset/delete API is provided.
 
 ## Out of scope
 

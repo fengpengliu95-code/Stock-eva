@@ -73,18 +73,19 @@ body-byte fixtures, a fixed Shanghai clock, and complete weekday/closure maps. S
 def test_stage_never_promotes_and_repeated_source_is_idempotent(tmp_path):
     store = CalendarGenerationStore(tmp_path / "calendar_generations.sqlite3")
     source = source_fixture(year=2027)
-    first = store.stage(source, now=NOW)
+    first = store.stage_execute(source, now=NOW)
     before = tree_bytes(tmp_path)
-    assert store.stage(source, now=NOW).source_sha256 == first.source_sha256
+    assert store.stage_execute(source, now=NOW).source_sha256 == first.source_sha256
     assert tree_bytes(tmp_path) == before
     assert store.read().generation_sha256 is None
 
 def test_promoted_runtime_generation_extends_bundled_without_rewrite(tmp_path):
     before = bundled_bytes()
     store = staged_store(tmp_path)
+    attempt = store.reserve_attempt(source_sha256=SOURCE_SHA, target_year=2027, now=NOW)
     result = store.promote(
         source_sha256=SOURCE_SHA, official_bodies=BODIES,
-        machine=complete_machine_fixture(2027), expected_parent=None, now=NOW,
+        machine=complete_machine_fixture(2027), attempt=attempt, now=NOW,
     )
     assert result.outcome == "PROMOTED"
     assert store.read().calendar.session_status(date(2027, 1, 4)) == "open"
@@ -104,6 +105,10 @@ implementation failure. Keep tests asserting actual persisted bytes/authority, n
 ### Step 1.3: Implement the closed domain
 
 Use explicit `build_*` factories for computed hashes; public models require their identities.
+Store construction is path-access-free; pure `plan_stage` validates before `stage_execute` can
+initialize. All structured preimages exclude only their own top-level digest and retain nested
+digests/defaults/nulls exactly as the design's projection table defines. Official body hashes use
+plain raw-byte SHA-256, not the structured helper. Add hardcoded complete-model vectors.
 The common digest contract is exactly:
 
 ```python
@@ -119,8 +124,9 @@ Domains: `stock-eva/r2f4.1/calendar-source/v1`, `.../calendar-schedule/v1`,
 `.../calendar-machine/v1`, `.../calendar-generation/v1`, `.../calendar-bundled/v1`.
 No imports from `failover.py` or changes to its frozen policy hashes.
 
-Implement exact frozen SQLite DDL for candidates, official objects, promotions, head, attempts and
-base/schema metadata. Add immutable update/delete guards for source/object/promotion rows. Validate
+Implement the exact normative SQLite DDL from the design appendix for candidates, official
+objects, promotions, head, parent-bound attempts and base/schema metadata. Preserve all specified
+immutable/terminal-only guards. Validate
 schema and hashes independently on read. Separate explicit initialization/staging from read-only
 open; enabled missing state is unavailable, never an implicit initialization or older fallback.
 
@@ -128,9 +134,9 @@ Promotion ordering:
 
 ```text
 revalidate source + body digests + machine -> BEGIN IMMEDIATE
-read/verify active chain -> compare expected parent -> protect completed history
+read/verify active chain + reserved RUNNING attempt -> compare recorded parent -> protect history
 insert verified official objects -> insert immutable generation -> readback hash
-CAS head -> COMMIT
+CAS head -> mark the same attempt PROMOTED -> COMMIT
 ```
 
 Any exception rolls back. Bound paths with no-follow/regular-file/owner/permission checks and
@@ -168,7 +174,7 @@ def test_machine_missing_closed_day_is_not_success():
     provider = BaoStockProvider(client=fake_calendar_client(rows_without_closed_day()),
                                 max_attempts=1)
     with pytest.raises(BaoStockError):
-        provider.calendar_days(date(2027, 1, 1), date(2027, 12, 31))
+provider.calendar_days(date(2027, 1, 1), date(2027, 12, 31))
 
 def test_next_year_thresholds():
     assert policy_status("2026-09-30") == "not_due"
@@ -196,15 +202,23 @@ max_attempts=1, fixed 5/30-second timeouts, stream-bound 1 MiB; count a request 
 is called. Accept only the two staged official source URLs. Preserve safe error class/counts.
 
 Maintenance: no candidate or policy not due -> zero-request safe outcome. Before acquisition,
-validate source/admission, current parent and health; reserve a slot. Fetch both official bodies,
+validate source/admission, current parent and existing health; missing/corrupt health is
+CONTROL_STATE_UNAVAILABLE with zero requests and no initialization. Construct a dedicated
+BaoStockProvider(max_attempts=1) only when executing the verified path; never mutate a canonical
+instance. Reserve a slot binding source and parent. Fetch both official bodies,
 then a complete machine observation; reconcile exact dates; promote under current-parent CAS.
 Reuse calendar-sync observation/health accounting where possible without trusting its mutable
 success flag as authority. Stage disagreement stays quarantined. Record explicit failure outcome;
 do not auto-shadow, auto-refresh, reset a breaker or replace a last-good generation on failure.
+Implement exact automatic candidate priority and explicit `--year` current/next-only override from
+FR-22/24. Latest quarantined candidates cannot be skipped, current-year future revisions have a
+reachable path, and neither a year override nor changed source bypasses the daily slot.
 
 Fix legacy `CalendarSyncService` to pin a concrete calendar snapshot for each plan/execute and
 reject plan checksum drift before requests. Classify a mixed known/unknown successful observation
 as `observed_only`, not `ready`; retain conflict priority and old known-only semantics.
+Drift returns status=error/failure_code=CALENDAR_AUTHORITY_CHANGED, writes no sync state and exits
+CLI 1. Do not reuse generation PARENT_CHANGED for this distinct stale-plan condition.
 
 ### Step 2.4: GREEN, commit and serial reviews
 
@@ -219,7 +233,9 @@ then independent quality review; repair all H/M before Task3.
 - Modify `backend/app/config.py`, `backend/app/storage/layout.py`, `.env.example`
 - Modify `backend/app/market/calendar.py`, `backend/app/market/calendar_sync.py`
 - Modify `backend/app/api/market.py`, `backend/app/cli.py`, `backend/app/main.py`
-- Modify `backend/app/market/supplement_ingestion.py` only if required for explicit injection
+- Modify `backend/app/market/continuity.py`, `backend/app/market/automation.py`,
+  `backend/app/market/supplement_ingestion.py`, `backend/app/fund_flow/service.py`,
+  `backend/app/api/user.py`, `backend/app/api/fund_flow.py` only for operation-snapshot pinning
 - Add `tests/test_market_calendar_runtime.py`
 - Extend `tests/test_market_get_read_only.py`, `tests/test_market_automation.py`,
   `tests/test_calendar_sync.py`, `tests/test_launchagent_assets.py`
@@ -251,9 +267,17 @@ add `snapshot()` returning itself. The default factory returns a settings-bound 
 public operations delegate to one fresh concrete snapshot. Do not cache runtime authority across
 operations or follow a mutable pointer once per day inside a range.
 
-New settings: `calendar_runtime_enabled=false` and the safe generation database basename. Honor
-the settings used by each API/CLI/service, avoiding accidental global/default-root reads in tests
-or embedded clients. Existing qualification readers remain explicit concrete snapshots.
+New settings: `calendar_runtime_enabled=false` and the safe generation database basename, with
+the design's exact 11-key plain-model `CalendarRuntimeSettings` environment allowlist. New CLI/API
+and default live factory do not call get_settings or read .env. Document this env-only lane in
+.env.example; a general .env entry alone is not runtime enablement. Use the same projection across
+default consumers, maintenance and status; embedded callers may explicitly project already-resolved
+settings. Avoid accidental global/default-root reads. Existing qualification readers stay concrete.
+
+At each external continuity scan, automation decision/run, API market status/summary,
+portfolio/fund-flow operation and supplement-ingestion operation, capture `calendar.snapshot()`
+once and use that object for every status/range/source query. Tests inject promotion between two
+calendar methods to prove the outer operation does not mix generations.
 
 Add the three specified CLI commands before generic StoragePreflight, market-store or runtime-dir
 initialization. Add standalone calendar-generation API/status models in the new calendar domain.
