@@ -73,6 +73,9 @@ calendar. No new token, credential, subscription or full-service secondary capab
 - FR-6: Source staging MUST validate metadata, publication/review dates against the trusted
   Shanghai clock and both schedule hashes before writes. Individually valid but disagreeing
   SSE/SZSE schedules MUST be persisted as quarantined candidates and cause zero network requests.
+  Agreement means equality of the complete civil-day open/closed maps derived independently using
+  FR-4. Metadata, notice body hashes and schedule hashes are independently verified and are NOT
+  required to be equal between exchanges; different valid announcements may express the same map.
   Malformed source packages MUST fail before creating a database, lock or directory.
 - FR-7: Store construction MUST be lazy and perform zero path access/initialization. Pure
   `plan_stage(source, now)` MUST finish validation before `stage_execute(source, now)` is allowed
@@ -119,7 +122,9 @@ calendar. No new token, credential, subscription or full-service secondary capab
   object, head rewind/mismatch or invalid semantic transition. A caller-supplied calendar config
   MUST NOT be sufficient promotion authority.
 - FR-16: Applying a year may extend the greatest covered year by one or amend an already covered
-  year. It MUST NOT skip a year. It MUST NOT change any open/closed status on or before the prior
+  year, but this version supports promotion targets only in the trusted clock's current or next
+  Shanghai year (including the low-level promotion boundary). Historical years and years beyond
+  next year are outside this contract. It MUST NOT skip a year. It MUST NOT change any open/closed status on or before the prior
   calendar's latest completed session at promotion time (18:10 Shanghai availability boundary).
   If the clock's current year is not yet covered, the protected horizon includes every known day
   before the current date. Future-only amendments retain all previous generation bytes.
@@ -147,6 +152,10 @@ calendar. No new token, credential, subscription or full-service secondary capab
   execution MUST return `CalendarSyncResult(status='error',
   failure_code='CALENDAR_AUTHORITY_CHANGED')` before provider access, with no sync-state update;
   CLI exit is 1. This is not `PARENT_CHANGED` (which is generation promotion CAS failure).
+  Add `failure_code: Literal['CALENDAR_AUTHORITY_CHANGED'] | None = None` to CalendarSyncResult;
+  ordinary results serialize it as null. This additive top-level CLI result field is not added to
+  MarketDataStatus. Revalidate the result before output; a non-null failure_code requires status
+  error, and authority drift must never produce a persisted CalendarSyncRun.
 - FR-21: Next-year policy MUST be based on Shanghai dates: before October 1, absent next-year
   authority is `not_due`; October 1 through December 14 is `pending`; from December 15 it is
   `action_required`. Missing current-year authority is always blocking. A future date/year MUST
@@ -335,6 +344,8 @@ plans exit 0 when valid and include `network_requests=0`, `writes_calendar_state
 1 acquisition/conflict/circuit/control failures, 2 invalid configuration. Execute results include
 safe outcome, source/generation hash or null, actual official/machine request counts and calendar
 write flag. No body, URL, file path, SQL, token or original exception is returned.
+For idempotent staging, the payload outcome is ALREADY_STAGED in both cases; admission remains
+awaiting_machine with exit 0, or quarantined with admission reason SOURCE_CONFLICT and exit 1.
 
 ## Data models
 
@@ -352,6 +363,7 @@ source metadata may contain reviewed official URLs; transport/status events may 
 | CalendarPromotion | sequence, generation_sha256, canonical generation bytes | append-only; schema guards; no replacement |
 | CalendarHead | singleton=1, sequence, generation_sha256 | atomic compare-and-swap; must equal latest promotion |
 | CalendarMaintenanceAttempt | target_year + slot_date PK, source_sha256, expected_parent_sha256/null, started_at, finished_at/null, outcome, official_requests, machine_requests | reserve before calls; immutable identity/parent; one terminal update; never reused |
+| CalendarSyncResult additive field | failure_code: Literal["CALENDAR_AUTHORITY_CHANGED"] or null, default null | ordinary results null; non-null only with status error; top-level CLI serialization; not persisted for drift |
 
 SQLite schema/version and its immutable triggers are frozen in this version. Readers validate the
 schema and complete hash-linked authority graph, not merely the mutable head. A missing terminal

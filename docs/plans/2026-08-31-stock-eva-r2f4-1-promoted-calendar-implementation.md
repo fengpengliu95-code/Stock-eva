@@ -174,7 +174,7 @@ def test_machine_missing_closed_day_is_not_success():
     provider = BaoStockProvider(client=fake_calendar_client(rows_without_closed_day()),
                                 max_attempts=1)
     with pytest.raises(BaoStockError):
-provider.calendar_days(date(2027, 1, 1), date(2027, 12, 31))
+        provider.calendar_days(date(2027, 1, 1), date(2027, 12, 31))
 
 def test_next_year_thresholds():
     assert policy_status("2026-09-30") == "not_due"
@@ -219,6 +219,8 @@ reject plan checksum drift before requests. Classify a mixed known/unknown succe
 as `observed_only`, not `ready`; retain conflict priority and old known-only semantics.
 Drift returns status=error/failure_code=CALENDAR_AUTHORITY_CHANGED, writes no sync state and exits
 CLI 1. Do not reuse generation PARENT_CHANGED for this distinct stale-plan condition.
+CalendarSyncResult adds only `failure_code: Literal['CALENDAR_AUTHORITY_CHANGED'] | None = None`;
+normal CLI result JSON includes failure_code=null. Enforce non-null only with status error.
 
 ### Step 2.4: GREEN, commit and serial reviews
 
