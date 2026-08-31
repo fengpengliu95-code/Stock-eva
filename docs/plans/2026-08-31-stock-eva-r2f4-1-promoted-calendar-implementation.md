@@ -30,6 +30,13 @@ and complete BaoStock civil-day reconciliation in the existing calendar job.
 strict validator 100/100 with zero warnings. Implementation may begin. Final subversion GO is
 not yet claimed.
 
+**Task 1 progress:** In progress, not accepted. The specification extractor produced 14 private
+scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
+The latest test-first checkpoint has 36 focused cases: 30 passing and 6 expected contract failures.
+Fault injection, descriptor-bound writer races and complete transition-graph verification remain
+required before Task 1 can enter independent spec/quality review. An earlier full regression run
+passed before the expanded RED cases; it is not the current acceptance gate.
+
 ## Execution boundaries
 
 - No real HTTP/Provider, credential reads, Application Support, production control/canonical,
