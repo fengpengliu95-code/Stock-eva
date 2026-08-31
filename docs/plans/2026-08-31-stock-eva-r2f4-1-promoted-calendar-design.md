@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-31 (Asia/Shanghai)
 
-**Status:** SPEC APPROVED / TASK 1 IN PROGRESS / R2-F4.1 NO-GO / R2-F4 NO-GO
+**Status:** SPEC APPROVED / TASK 1 GO / TASK 2 IN PROGRESS / R2-F4.1 NO-GO / R2-F4 NO-GO
 
 **Specification review:** Independent SPEC GO at
 `790c832684f9f540488310080715dad12a92f27a` (H=0, M=0). The implementation must use

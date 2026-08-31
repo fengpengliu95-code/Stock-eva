@@ -30,7 +30,13 @@ and complete BaoStock civil-day reconciliation in the existing calendar job.
 strict validator 100/100 with zero warnings. Implementation may begin. Final subversion GO is
 not yet claimed.
 
-**Task 1 progress:** In progress, not accepted. The specification extractor produced 14 private
+**Task 1 gate:** Accepted at `197bba933ea74d5e860039dbfcaeea1f7a7921f4` after independent SPEC and
+QUALITY re-review, both H=0/M=0/L=0. Root full pytest: 2332 passed, exit 0, only the existing
+Starlette warning. Root focused replay: 130 repository cases plus 62 private probes (192 passed).
+All backend/tests ruff/format, compileall, diff and nine R2-F2 golden digest checks passed. This is
+Task 1 GO only; R2-F4.1 remains NO-GO until Tasks 2-4 and final exact-HEAD review are complete.
+
+**Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
 It covers actual promotion write/commit faults, inserted-generation readback tampering and a
@@ -265,9 +271,28 @@ Fix H/M via RED/GREEN and re-review the exact new commit before Task2.
 
 - Add one method to `backend/app/market/baostock.py`
 - Create `backend/app/market/calendar_maintenance.py`
+- Extend `backend/app/market/calendar_generation.py` only with narrow verified-control snapshot
+  and terminal-attempt interfaces required by maintenance; preserve its DDL, hashes and existing
+  authority checks, and add corresponding `tests/test_market_calendar_generation.py` coverage.
 - Modify `backend/app/market/calendar_sync.py` only for mixed-range/stale-plan safety and reuse
 - Create `tests/test_market_calendar_maintenance.py`
 - Add scoped cases in `tests/test_baostock_provider.py` and `tests/test_calendar_sync.py`
+
+**Serial implementation checkpoints (one subagent at a time):**
+
+1. Task 2a: additive `calendar_days` plus calendar-sync snapshot/checksum/mixed-range safety,
+   with RED/GREEN in the existing two test modules. No live facade or maintenance client yet.
+2. Task 2b: bounded official acquisition, verified read-only health preflight, policy/slot worker
+   and the narrow calendar-control interfaces needed by it, with RED/GREEN maintenance tests.
+3. Freeze the complete Task 2 commit, run the combined regressions, then independent specification
+   and quality review. A checkpoint is not Task 2 GO.
+
+The control snapshot must reuse the existing complete reader proof, not open a parallel ad-hoc
+SQL authority path. Actual failed-acquisition request counts may be 1/0 as well as 2/0 or 2/1;
+the terminal-attempt interface must not fabricate two requests when only one client call occurred.
+Calendar-sync authority checksums must include verified generation/bundled identities when present,
+so equal legacy config projections with different reviewed generations still invalidate old plans.
+Concrete legacy calendars retain their old config-only checksum and injection behavior.
 
 ### Step 2.1: Write RED acquisition, policy and slot tests
 
