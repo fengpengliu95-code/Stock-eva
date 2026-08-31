@@ -32,10 +32,71 @@ not yet claimed.
 
 **Task 1 progress:** In progress, not accepted. The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
-The latest test-first checkpoint has 36 focused cases: 30 passing and 6 expected contract failures.
-Fault injection, descriptor-bound writer races and complete transition-graph verification remain
-required before Task 1 can enter independent spec/quality review. An earlier full regression run
-passed before the expanded RED cases; it is not the current acceptance gate.
+D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).
+It covers actual promotion write/commit faults, inserted-generation readback tampering and a
+valid foreign-database substitution. This is a checkpoint, not Task 1 approval.
+
+D2 extended the module to 61 cases against frozen implementation SHA-256
+`24569d692056050ec0b8cb348d64ef5818a90c51cf86c719eac87f7cefd6b0b7`.
+The independent test agent stopped at a usage limit; the root reviewed its unfinished tests and
+corrected three false-positive traps (promotion-year versus history rejection, exact canonical
+timestamp hashing, and truncated serializer warnings). Twelve contract failures were reproduced:
+inner source/admission/review validation, reverse attempt linkage, SQL/JSON/base/parent identity,
+attempt timestamps, promotion-year/no-skip replay, and warning leakage. These tests are not an
+independent review verdict. Three additional root probes prove existing writers mutate an
+unproven bundled base; they belong in the common verified-state fix.
+
+D2b now shares one complete connection-level verifier between reader and writer paths. Root
+replayed an unrelated-candidate corruption against all three writers and caught additional
+extraction regressions: reverse PROMOTED linkage, monotonic promotion time, quarantined-source
+promotion, and missing stage/reserve transactions. An orphan test was corrected to use canonical
+SQL timestamps so it proves linkage rather than failing on timestamp syntax. These cases now
+pass; root removed 239 unreachable lines of the old duplicated reader. The frozen checkpoint is
+72 repository tests plus 21 private probes (93/93), with ruff/format/diff checks passing, at
+implementation SHA-256 `8729af8302a4802d82c8cdd929bdfd985063eaeb54a17ad7776729449bfdd6ed`.
+
+Nineteen private-root D3 probes were integrated by independent test-only work: 91 collected,
+72 passing and 19 confirmed RED against the frozen D2b implementation. They cover zero-byte DB initialization, unsafe
+control-directory permissions, post-connect reader path substitution, mid-open source symlink
+substitution, non-normative schema index, complete snapshot metadata/methods, unbounded cursor
+materialization, blank extraction review IDs, public official-body digest shape, and factories
+hashing before UTC normalization, plus four failure-audit identity/control-proof bypasses.
+D3a repaired public models, immutable snapshot behavior and failure-audit identity/graph checks.
+Snapshot methods now inherit the existing TradingCalendar rules (including closed/unknown years),
+and retain verified bundled/current-generation identities. Root's subsequent replay, after adding
+the genuine SQLite EXCLUSIVE-lock test, collected 93 repository cases plus 21 private probes:
+107 passed and 7 known failures, at implementation SHA-256
+`dac5f3715c2e0d53a87d2199bac1e1a77f3df8d7d00dace0e2f6d1279df617d1`.
+D3b closed those seven known failures. Root replayed 93 repository cases and 21 private probes:
+114 passed, at implementation SHA-256
+`1458c0babbdb8bed8818e4e0dea815207e17e9aebca11f5ba81737fd8c929bf2`;
+ruff check/format and diff checks also passed. Readers now respect a genuine SQLite EXCLUSIVE
+lock, and the existing descriptor/schema/cap probes pass. This is not Task 1 approval.
+
+D3c test-only work completed: root replayed 113 collected, 96 passed and 17 confirmed RED against
+the frozen D3b implementation. Tests cover failure-audit completion timestamps, serialized public
+attempt validation, typed already-spent outcomes and same-map/different-generation identity.
+Root additionally reproduced a promotion that used an unverified second bundled-base load,
+partial initialization `(metadata=1, head=0)` after an injected failure, adoption of a concurrently
+created empty file, and three malformed singleton states that incorrectly returned ready.
+A real private FIFO source also blocked before descriptor validation; its test terminates only
+its own bounded child process. These confirmed contract failures must close before Task 1 review.
+The FIFO-lock and same-config/different-generation identity probes already pass. Root corrected
+the latter test's initial mistaken assertion: changing review_id does not change legacy config
+metadata, so the generation identity must distinguish otherwise equal config projections.
+D3c implementation checkpoint completed. The repository module now has 116 passing cases,
+including failed-attempt temporal replay and in-range nonzero RUNNING counts. Root replayed the
+module plus all 49 private probes: 165 passed, with ruff check/format and diff checks passing.
+The implementation SHA-256 is
+`e775c5a47dc0fa8987297153676d283bbad1a1d060a060a87c95f7d1879ed57a`.
+Task 1 is now entering frozen-candidate review, not accepted. No unverified path-race claim is
+acceptance evidence; the independent specification and quality reviews remain required.
+
+Protected regression checkpoint: existing calendar-sync, R2-F2 golden compatibility and R2-F4.0
+failover-readiness tests passed (68), and all nine R2-F2 golden file digests match. Existing tracked
+backend/test/script files remain unchanged; this does not replace the final full regression gate.
+No Task 2 work or Task 1 acceptance is authorized by a partial green checkpoint. An earlier full
+regression run passed before these expanded RED cases; it is not the current acceptance gate.
 
 ## Execution boundaries
 
