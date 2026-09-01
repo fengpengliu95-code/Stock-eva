@@ -1676,6 +1676,105 @@ class CalendarGenerationStore:
             finally:
                 self._close_connection(connection)
 
+    def retain_official_evidence(
+        self,
+        attempt: CalendarMaintenanceAttempt,
+        source: CalendarSourceBundleV1,
+        official_bodies: tuple[bytes, bytes],
+    ) -> bool:
+        """Retain both verified official bodies for one still-running slot.
+
+        This existing-store-only write records control-plane evidence without
+        changing the candidate, attempt, generation, or head.  Both bodies are
+        committed together only after exact readback verification.
+        """
+        attempt = _revalidate_attempt(attempt)
+        if not isinstance(source, CalendarSourceBundleV1):
+            raise CalendarGenerationError("source authority invalid")
+        try:
+            source = CalendarSourceBundleV1.model_validate_json(_model_json_bytes(source))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CalendarGenerationError("source authority invalid") from exc
+        planned = self.plan_stage(source, attempt.started_at)
+        if (
+            not isinstance(official_bodies, tuple)
+            or len(official_bodies) != 2
+            or any(
+                not isinstance(body, bytes) or not body or len(body) > MAX_BODY_BYTES
+                for body in official_bodies
+            )
+        ):
+            raise CalendarGenerationError("official evidence invalid")
+        body_hashes = tuple(body_sha256(body) for body in official_bodies)
+        if body_hashes != tuple(schedule.body_sha256 for schedule in source.schedules):
+            raise CalendarGenerationError("official evidence digest mismatch")
+        if (
+            attempt.outcome != "RUNNING"
+            or attempt.target_year != source.year
+            or attempt.source_sha256 != planned.source_sha256
+            or planned.outcome != "STAGED"
+        ):
+            return False
+
+        connection: sqlite3.Connection | None = None
+        try:
+            if not self.path.exists():
+                return False
+            self._check_path(allow_missing=False)
+            with _lock(self.path.with_name(self.path.name + ".lock"), True, create=False):
+                connection = self._connect()
+                connection.execute("BEGIN IMMEDIATE")
+                verified = self._load_verified_state(connection)
+                row = verified["attempt_rows"].get(
+                    (attempt.target_year, attempt.slot_date.isoformat())
+                )
+                bound_source = verified["candidate_sources"].get(attempt.source_sha256)
+                if (
+                    row is None
+                    or row["outcome"] != "RUNNING"
+                    or row["source_sha256"] != attempt.source_sha256
+                    or row["expected_parent_sha256"] != attempt.expected_parent_sha256
+                    or row["started_at"] != _stamp(attempt.started_at)
+                    or bound_source is None
+                    or _model_json_bytes(bound_source) != _model_json_bytes(source)
+                ):
+                    connection.rollback()
+                    return False
+                for digest, body in zip(body_hashes, official_bodies, strict=True):
+                    connection.execute(
+                        "INSERT OR IGNORE INTO calendar_official_object "
+                        "(body_sha256,body_bytes) VALUES (?,?)",
+                        (digest, body),
+                    )
+                for digest, body in zip(body_hashes, official_bodies, strict=True):
+                    readback = connection.execute(
+                        "SELECT body_sha256,body_bytes FROM calendar_official_object "
+                        "WHERE body_sha256=?",
+                        (digest,),
+                    ).fetchone()
+                    if (
+                        readback is None
+                        or type(readback["body_sha256"]) is not str
+                        or type(readback["body_bytes"]) is not bytes
+                        or readback["body_sha256"] != digest
+                        or readback["body_bytes"] != body
+                        or body_sha256(readback["body_bytes"]) != digest
+                    ):
+                        raise CalendarStoreUnavailable("official evidence readback unavailable")
+                self._assert_writer_identity(connection)
+                connection.commit()
+                return True
+        except (OSError, sqlite3.Error, CalendarGenerationError, CalendarStoreUnavailable):
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            return False
+        finally:
+            if connection is not None:
+                self._close_connection(connection)
+
     def finish_attempt(
         self,
         attempt: CalendarMaintenanceAttempt,

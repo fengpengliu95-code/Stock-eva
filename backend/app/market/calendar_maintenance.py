@@ -451,8 +451,8 @@ class CalendarMaintenanceService:
                             current_ready,
                             "not_due",
                         )
-            if target_year == current_year and current_source is None:
-                if not current_ready:
+            if target_year == current_year:
+                if current_source is None and not current_ready:
                     return _MaintenanceDecision(
                         now,
                         current_year,
@@ -577,6 +577,22 @@ class CalendarMaintenanceService:
 
     @staticmethod
     def _eligible(now, target_year, source, source_hash, control, current_ready, next_status):
+        slot_date = now.astimezone(SHANGHAI).date()
+        if any(
+            attempt.target_year == target_year and attempt.slot_date == slot_date
+            for attempt in control.attempts
+        ):
+            return _MaintenanceDecision(
+                now,
+                target_year,
+                source,
+                source_hash,
+                _expected_parent(control),
+                "ALREADY_ATTEMPTED",
+                False,
+                current_ready,
+                next_status,
+            )
         return _MaintenanceDecision(
             now,
             target_year,
@@ -625,12 +641,12 @@ class CalendarMaintenanceService:
         return _safe_plan(decision)
 
     def execute(self, *, target_year: int | None = None) -> CalendarMaintenanceResult:
-        now = _aware_now(self._clock())
-        decision = self._read_decision(now, target_year)
+        started_at = _aware_now(self._clock())
+        decision = self._read_decision(started_at, target_year)
         if not decision.due:
             if decision.outcome == "STAGED":
                 decision = _MaintenanceDecision(
-                    now,
+                    started_at,
                     decision.target_year,
                     decision.source,
                     decision.source_sha256,
@@ -650,17 +666,19 @@ class CalendarMaintenanceService:
         assert decision.source is not None
         try:
             attempt = self._store.reserve_attempt(
-                decision.source, now, target_year=decision.target_year
+                decision.source, started_at, target_year=decision.target_year
             )
         except CalendarAttemptAlreadySpent:
             return _safe_result(_with_outcome(decision, "ALREADY_ATTEMPTED"))
         except (CalendarStoreUnavailable, CalendarGenerationError, OSError, sqlite3.Error):
             return _safe_result(_with_outcome(decision, "CONTROL_STATE_UNAVAILABLE"))
         if attempt.expected_parent_sha256 != decision.expected_parent_sha256:
-            return self._finish_result(decision, attempt, "PARENT_CHANGED", 0, 0, now)
+            return self._finish_result(
+                decision, attempt, "PARENT_CHANGED", 0, 0, self._completion_time()
+            )
 
         official = fetch_official_calendars(
-            decision.source, now=now, client_factory=self._http_client_factory
+            decision.source, now=started_at, client_factory=self._http_client_factory
         )
         if official.failure is not None:
             failure = (
@@ -669,14 +687,49 @@ class CalendarMaintenanceService:
                 else "CONTROL_STATE_UNAVAILABLE"
             )
             return self._finish_result(
-                decision, attempt, failure, official.official_requests, 0, now
+                decision,
+                attempt,
+                failure,
+                official.official_requests,
+                0,
+                self._completion_time(),
+            )
+        assert official.bodies is not None
+        try:
+            retained = self._store.retain_official_evidence(
+                attempt, decision.source, official.bodies
+            )
+        except (CalendarStoreUnavailable, OSError, sqlite3.Error):
+            retained = False
+        if not retained:
+            return self._finish_result(
+                decision,
+                attempt,
+                "CONTROL_STATE_UNAVAILABLE",
+                2,
+                0,
+                self._completion_time(),
             )
         try:
             health = self._health_store.provider_health_snapshot()
         except (ProviderHealthError, OSError):
-            return self._finish_result(decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 0, now)
+            return self._finish_result(
+                decision,
+                attempt,
+                "CONTROL_STATE_UNAVAILABLE",
+                2,
+                0,
+                self._completion_time(),
+            )
         if health.state != CircuitState.CLOSED:
-            return self._finish_result(decision, attempt, "SKIPPED_CIRCUIT_OPEN", 2, 0, now)
+            return self._finish_result(
+                decision,
+                attempt,
+                "SKIPPED_CIRCUIT_OPEN",
+                2,
+                0,
+                self._completion_time(),
+            )
         try:
             provider = self._provider_factory(
                 max_attempts=1,
@@ -684,7 +737,14 @@ class CalendarMaintenanceService:
                 min_request_interval_seconds=self._min_request_interval_seconds,
             )
         except (BaoStockError, OSError, TimeoutError):
-            return self._finish_result(decision, attempt, "MACHINE_UNAVAILABLE", 2, 0, now)
+            return self._finish_result(
+                decision,
+                attempt,
+                "MACHINE_UNAVAILABLE",
+                2,
+                0,
+                self._completion_time(),
+            )
 
         run_id = uuid4().hex
         try:
@@ -707,35 +767,54 @@ class CalendarMaintenanceService:
                     date(attempt.target_year, 1, 1), date(attempt.target_year, 12, 31)
                 )
         except ProviderHealthError:
-            return self._finish_result(decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, now)
+            return self._finish_result(
+                decision,
+                attempt,
+                "CONTROL_STATE_UNAVAILABLE",
+                2,
+                1,
+                self._completion_time(),
+            )
         except (BaoStockError, OSError, TimeoutError):
-            if not self._record_machine_failure(run_id, now):
+            completed_at = self._completion_time()
+            if not self._record_machine_failure(run_id, completed_at):
                 return self._finish_result(
-                    decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, now
+                    decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
                 )
-            return self._finish_result(decision, attempt, "MACHINE_UNAVAILABLE", 2, 1, now)
+            return self._finish_result(decision, attempt, "MACHINE_UNAVAILABLE", 2, 1, completed_at)
 
-        machine = self._build_machine(rows, attempt.target_year, now)
+        completed_at = self._completion_time()
+        if completed_at < attempt.started_at:
+            return self._finish_result(
+                decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
+            )
+        machine = self._build_machine(rows, attempt.target_year, completed_at)
         if machine is None or not self._audit_machine(run_id):
-            if not self._record_machine_failure(run_id, now):
+            if not self._record_machine_failure(run_id, completed_at):
                 return self._finish_result(
-                    decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, now
+                    decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
                 )
-            return self._finish_result(decision, attempt, "MACHINE_UNAVAILABLE", 2, 1, now)
+            return self._finish_result(decision, attempt, "MACHINE_UNAVAILABLE", 2, 1, completed_at)
         try:
             self._health_store.record_terminal_success(
-                run_id, ProviderEndpoint.TRADE_DATES, observed_at=now
+                run_id, ProviderEndpoint.TRADE_DATES, observed_at=completed_at
             )
         except (ProviderHealthError, OSError):
-            return self._finish_result(decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, now)
+            return self._finish_result(
+                decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
+            )
         try:
-            promoted = self._store.promote(attempt, decision.source, official.bodies, machine, now)
+            promoted = self._store.promote(
+                attempt, decision.source, official.bodies, machine, completed_at
+            )
         except (CalendarStoreUnavailable, OSError, sqlite3.Error):
-            return _safe_result(
-                _with_outcome(decision, "CONTROL_STATE_UNAVAILABLE"),
-                official_requests=2,
-                machine_requests=1,
-                writes_calendar_state=True,
+            return self._finish_result(
+                decision,
+                attempt,
+                "CONTROL_STATE_UNAVAILABLE",
+                2,
+                1,
+                completed_at,
             )
         if promoted.outcome == "PROMOTED":
             return _safe_result(
@@ -745,17 +824,30 @@ class CalendarMaintenanceService:
                 machine_requests=1,
                 writes_calendar_state=True,
             )
+        known_promotion_failures = {
+            "OFFICIAL_UNAVAILABLE",
+            "OFFICIAL_HASH_MISMATCH",
+            "MACHINE_UNAVAILABLE",
+            "MACHINE_CONFLICT",
+            "ALREADY_ATTEMPTED",
+            "PARENT_CHANGED",
+            "HISTORY_CHANGE",
+            "CONTROL_STATE_UNAVAILABLE",
+        }
         outcome = (
-            promoted.outcome
-            if promoted.outcome in MaintenanceOutcome.__args__
-            else "PARENT_CHANGED"
+            promoted.outcome if promoted.outcome in known_promotion_failures else "PARENT_CHANGED"
         )
+        if outcome in {"PARENT_CHANGED", "HISTORY_CHANGE", "CONTROL_STATE_UNAVAILABLE"}:
+            return self._finish_result(decision, attempt, outcome, 2, 1, completed_at)
         return _safe_result(
             _with_outcome(decision, outcome),
             official_requests=2,
             machine_requests=1,
             writes_calendar_state=True,
         )
+
+    def _completion_time(self) -> datetime:
+        return _aware_now(self._clock())
 
     def _finish_result(
         self,

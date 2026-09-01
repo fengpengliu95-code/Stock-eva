@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from backend.app.market import calendar_generation as calendar_module
 from backend.app.market.calendar_generation import (
+    MAX_BODY_BYTES,
     SCHEMA_SHA256,
     CalendarGenerationError,
     CalendarGenerationStore,
@@ -1192,6 +1193,133 @@ def test_public_finish_commit_failure_preserves_running_attempt_and_head(tmp_pat
     snapshot = store.read_control()
     assert snapshot.read_result.generation is None
     assert snapshot.attempts[0].outcome == "RUNNING"
+
+
+def test_official_evidence_is_retained_atomically_without_promotion(tmp_path) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+
+    assert store.retain_official_evidence(attempt, source, (b"sse body", b"szse body")) is True
+
+    with sqlite3.connect(store.path) as connection:
+        objects = connection.execute(
+            "SELECT body_sha256,body_bytes FROM calendar_official_object ORDER BY body_sha256"
+        ).fetchall()
+        row = connection.execute(
+            "SELECT outcome,official_requests,machine_requests FROM calendar_maintenance_attempt"
+        ).fetchone()
+        head = connection.execute(
+            "SELECT sequence,generation_sha256 FROM calendar_generation_head"
+        ).fetchone()
+    assert {(digest, bytes(body)) for digest, body in objects} == {
+        (body_sha256(b"sse body"), b"sse body"),
+        (body_sha256(b"szse body"), b"szse body"),
+    }
+    assert row == ("RUNNING", 0, 0)
+    assert head == (0, None)
+
+
+@pytest.mark.parametrize(
+    "bodies",
+    [
+        (b"wrong", b"szse body"),
+        (b"sse body", b"x" * (MAX_BODY_BYTES + 1)),
+    ],
+)
+def test_official_evidence_rejects_bad_hash_and_oversize_without_writing(tmp_path, bodies) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+
+    with pytest.raises(CalendarGenerationError):
+        store.retain_official_evidence(attempt, source, bodies)
+
+    with sqlite3.connect(store.path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM calendar_official_object").fetchone()[0]
+        assert count == 0
+        assert (
+            connection.execute("SELECT outcome FROM calendar_maintenance_attempt").fetchone()[0]
+            == "RUNNING"
+        )
+
+
+def test_official_evidence_rejects_foreign_attempt_binding_without_writing(tmp_path) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+    foreign = attempt.model_copy(update={"source_sha256": "f" * 64})
+
+    assert store.retain_official_evidence(foreign, source, (b"sse body", b"szse body")) is False
+
+    with sqlite3.connect(store.path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM calendar_official_object").fetchone()[0]
+        assert count == 0
+
+
+def test_official_evidence_second_insert_failure_rolls_back_both_bodies(
+    tmp_path, monkeypatch
+) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+    original_connect = store._connect
+    state = {"inserts": 0}
+
+    class SecondInsertFails:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(str(sql).split()).lower()
+            if normalized.startswith("insert or ignore into calendar_official_object"):
+                state["inserts"] += 1
+                if state["inserts"] == 2:
+                    raise sqlite3.OperationalError("injected second evidence failure")
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect_with_fault(*, readonly=False):
+        connection = original_connect(readonly=readonly)
+        return connection if readonly else SecondInsertFails(connection)
+
+    monkeypatch.setattr(store, "_connect", connect_with_fault)
+    assert store.retain_official_evidence(attempt, source, (b"sse body", b"szse body")) is False
+    assert state["inserts"] == 2
+    monkeypatch.setattr(store, "_connect", original_connect)
+
+    with sqlite3.connect(store.path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM calendar_official_object").fetchone()[0]
+        assert count == 0
+        assert (
+            connection.execute("SELECT outcome FROM calendar_maintenance_attempt").fetchone()[0]
+            == "RUNNING"
+        )
+
+
+def test_official_evidence_corrupt_store_fails_closed_without_object_write(tmp_path) -> None:
+    source = _valid_source()
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER calendar_object_no_delete")
+
+    assert store.retain_official_evidence(attempt, source, (b"sse body", b"szse body")) is False
+    with sqlite3.connect(store.path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM calendar_official_object").fetchone()[0]
+        assert count == 0
 
 
 def test_quality_new_promotion_cannot_commit_backwards_timestamp(tmp_path):

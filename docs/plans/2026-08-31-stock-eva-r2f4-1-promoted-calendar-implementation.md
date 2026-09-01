@@ -133,6 +133,32 @@ production state, market canonical, deployment or LaunchAgent operation occurred
 development checkpoint; complete Task 2 independent SPEC and QUALITY reviews are still required,
 and neither Task 2 nor R2-F4.1 GO is claimed.
 
+**Task 2 SPEC-repair checkpoint:** Independent SPEC review of
+`d9c6942ef419318804f73ca3c1acfa24cb574e9d` returned H=0/M=5/L=0 and NO-GO. It reproduced five
+contract gaps: dual verified official bodies were discarded when later machine work failed;
+the worker reused its start instant as observation/completion/promotion time; a returned
+`PARENT_CHANGED` could leave the durable attempt `RUNNING`; explicit current-year planning could
+fall through into an unrelated next-year quarantine; and read-only planning ignored an already
+spent daily slot.
+
+The repair adds an existing-store-only `retain_official_evidence()` transaction. It binds the
+RUNNING attempt and exact staged source, validates both bounded body hashes, inserts both objects
+atomically, verifies exact readback and writer identity, and never changes candidate, attempt,
+generation or head authority. The worker retains evidence immediately after both official
+responses verify, samples a fresh trusted completion instant for terminal/machine/promotion
+records, terminalizes nonterminal promotion failures, stops explicit current-year policy before
+another target, and derives `ALREADY_ATTEMPTED` from the verified attempt snapshot before health.
+Clock rollback, failed evidence atomicity and programmer-error propagation remain fail-closed.
+
+Fresh root evidence after the repair: calendar-generation 165, maintenance 56, health 59,
+BaoStock 91 and calendar-sync 33 cases, for 404/404 focused; 26/26 independent private policy and
+execution probes; full repository 2510/2510 with only the existing Starlette deprecation warning.
+Ruff check/format, compile and diff checks pass. The calendar DDL digest remains
+`cce5586b0a2294ae9f5f754be9e779507f12244f5030d2837b82dbc04ed62c1c`, and the protected BaoStock,
+calendar-sync and provider-health file hashes remain unchanged. All acquisition was injected and
+offline; no production/canonical/NAS/deployment state was accessed. These repairs require a new
+exact-HEAD independent SPEC review, followed by QUALITY review; Task 2 and R2-F4.1 remain NO-GO.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

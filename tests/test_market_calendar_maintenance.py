@@ -1,6 +1,7 @@
 import gzip
+import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -9,21 +10,32 @@ from pydantic import BaseModel
 
 from backend.app.market.baostock import BaoStockError
 from backend.app.market.calendar_generation import (
+    CalendarGenerationError,
     CalendarGenerationStore,
+    CalendarPromotionResult,
     CalendarSourceBundleV1,
     body_sha256,
     build_schedule,
     build_source,
 )
 from backend.app.market.calendar_maintenance_health import CalendarMaintenanceHealthStore
-from backend.app.market.provider_health import SQLiteProviderHealthStore
+from backend.app.market.provider_health import (
+    CircuitState,
+    ProviderHealthError,
+    SQLiteProviderHealthStore,
+)
 from backend.app.market.provider_transport import (
     NormalizedTransportError,
     ProtocolStage,
     ProviderEndpoint,
+    TransportObservation,
     TransportOutcome,
 )
-from tests.test_market_calendar_generation import _valid_source
+from tests.test_market_calendar_generation import (
+    _bundled_2026_revision,
+    _promote_old_2026_authority,
+    _valid_source,
+)
 
 NOW = datetime(2026, 12, 22, 1, tzinfo=UTC)
 BODIES = (b"sse body", b"szse body")
@@ -534,6 +546,97 @@ def _official_factory(status=200):
     return factory
 
 
+def _official_factory_for(source):
+    calls = []
+    bodies = tuple(
+        (
+            f"synthetic-{source.year}-{schedule.exchange.lower()}".encode()
+            if source.year != 2026
+            else f"bundled-2026-{schedule.exchange.lower()}-revision".encode()
+        )
+        for schedule in source.schedules
+    )
+    assert tuple(body_sha256(body) for body in bodies) == tuple(
+        schedule.body_sha256 for schedule in source.schedules
+    )
+
+    def factory(**kwargs):
+        index = len(calls)
+        calls.append(kwargs)
+        return httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bodies[index])),
+            **kwargs,
+        )
+
+    factory.calls = calls
+    return factory
+
+
+class _ClosedHealth:
+    def __init__(self):
+        self.observations = []
+        self.terminal_success = []
+        self.snapshots = 0
+
+    def provider_health_snapshot(self):
+        self.snapshots += 1
+        return SimpleNamespace(state=CircuitState.CLOSED)
+
+    def record_observation(self, observation):
+        self.observations.append(observation)
+
+    def list_observations(self):
+        return list(self.observations)
+
+    def record_terminal_success(self, refresh_id, endpoint, *, observed_at):
+        self.terminal_success.append((refresh_id, endpoint, observed_at))
+
+
+class _AuditedProvider:
+    def __init__(self, source):
+        self.source = source
+        self.run_id = None
+
+    @contextmanager
+    def refresh_operation(self, run_id):
+        self.run_id = run_id
+        yield
+
+    def calendar_days(self, start, end):
+        from backend.app.market import baostock_vendor
+
+        assert self.run_id is not None
+        sink = baostock_vendor._observation_sink.get()
+        assert sink is not None
+        sink(
+            TransportObservation(
+                refresh_id=self.run_id,
+                provider_session_id="calendar-session",
+                request_id="calendar-request",
+                endpoint=ProviderEndpoint.TRADE_DATES,
+                attempt=1,
+                page=1,
+                protocol_stage=ProtocolStage.OPERATION,
+                elapsed_ms=1,
+                recv_calls=1,
+                response_bytes=1,
+                end_marker_seen=True,
+                normalized_error=None,
+                outcome=TransportOutcome.SUCCESS,
+                observed_at=NOW,
+            )
+        )
+        closed = set(self.source.schedules[0].closed_dates)
+        return [
+            (
+                start + timedelta(days=offset),
+                (start + timedelta(days=offset)).weekday() < 5
+                and start + timedelta(days=offset) not in closed,
+            )
+            for offset in range((end - start).days + 1)
+        ]
+
+
 def test_worker_early_official_failure_spends_slot_without_provider(tmp_path):
     from backend.app.market.calendar_maintenance import CalendarMaintenanceService
 
@@ -707,3 +810,380 @@ def test_worker_missing_operation_audit_never_guesses_failure(observations):
 
     service = CalendarMaintenanceService(object(), Health())
     assert service._record_machine_failure("refresh-3", NOW) is False
+
+
+def test_worker_retains_verified_official_evidence_before_second_health_failure(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, _health, _ = _worker_fixture(tmp_path)
+
+    class SecondSnapshotFails(_ClosedHealth):
+        def provider_health_snapshot(self):
+            self.snapshots += 1
+            if self.snapshots == 2:
+                raise ProviderHealthError("synthetic unavailable health")
+            return SimpleNamespace(state=CircuitState.CLOSED)
+
+    health = SecondSnapshotFails()
+    providers = []
+    times = iter((NOW, NOW + timedelta(minutes=1)))
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: providers.append(kwargs),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 0)
+    assert providers == []
+    with sqlite3.connect(store.path) as connection:
+        objects = connection.execute(
+            "SELECT body_sha256,body_bytes FROM calendar_official_object"
+        ).fetchall()
+    assert {(digest, bytes(body)) for digest, body in objects} == {
+        (body_sha256(b"sse body"), b"sse body"),
+        (body_sha256(b"szse body"), b"szse body"),
+    }
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert attempt.finished_at == NOW + timedelta(minutes=1)
+
+
+def test_worker_evidence_retention_failure_is_terminal_before_provider(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class RetainFails(CalendarGenerationStore):
+        def retain_official_evidence(self, *args, **kwargs):
+            return False
+
+    source = _valid_source()
+    store = RetainFails(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    health = _ClosedHealth()
+    providers = []
+    times = iter((NOW, NOW + timedelta(minutes=1)))
+
+    def provider_factory(**kwargs):
+        providers.append(kwargs)
+        raise OSError("provider must not be constructed after evidence failure")
+
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=provider_factory,
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 0)
+    assert providers == []
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert attempt.finished_at == NOW + timedelta(minutes=1)
+
+
+def test_worker_propagates_programmer_error_from_evidence_retention(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class RetainHasInvariantBug(CalendarGenerationStore):
+        def retain_official_evidence(self, *args, **kwargs):
+            raise CalendarGenerationError("synthetic retention invariant bug")
+
+    source = _valid_source()
+    store = RetainHasInvariantBug(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    providers = []
+    worker = CalendarMaintenanceService(
+        store,
+        _ClosedHealth(),
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: providers.append(kwargs),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(CalendarGenerationError, match="retention invariant bug"):
+        worker.execute()
+
+    assert providers == []
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "RUNNING"
+    assert attempt.finished_at is None
+
+
+def test_worker_uses_one_fresh_machine_completion_time_across_1810_boundary(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    started = datetime(2026, 12, 23, 10, 9, 59, tzinfo=UTC)
+    completed = datetime(2026, 12, 23, 10, 10, tzinfo=UTC)
+    source = _bundled_2026_revision()
+
+    class CapturePromotion(CalendarGenerationStore):
+        promoted = None
+
+        def promote(self, attempt, source, official_bodies, machine, promoted_at):
+            self.promoted = (machine, promoted_at)
+            return super().promote(attempt, source, official_bodies, machine, promoted_at)
+
+    store = CapturePromotion(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, started).outcome == "STAGED"
+    health = _ClosedHealth()
+    times = iter((started, completed))
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory_for(source),
+        provider_factory=lambda **kwargs: _AuditedProvider(source),
+        clock=lambda: next(times),
+    ).execute(target_year=2026)
+
+    assert result.outcome == "HISTORY_CHANGE"
+    assert (result.official_requests, result.machine_requests) == (2, 1)
+    assert store.promoted is not None
+    machine, promoted_at = store.promoted
+    assert machine.observed_at == completed
+    assert promoted_at == completed
+    assert health.terminal_success[-1][2] == completed
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "HISTORY_CHANGE"
+    assert attempt.finished_at == completed
+    assert store.read().generation is None
+
+
+def test_worker_clock_rollback_fails_closed_without_false_terminal_timestamp(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, health, _ = _worker_fixture(tmp_path)
+    times = iter((NOW, NOW - timedelta(seconds=1)))
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(status=503),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (1, 0)
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "RUNNING"
+    assert attempt.finished_at is None
+
+
+def test_worker_machine_completion_clock_rollback_is_control_unavailable(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    source = _valid_source()
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    times = iter((NOW, NOW - timedelta(seconds=1)))
+    result = CalendarMaintenanceService(
+        store,
+        _ClosedHealth(),
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: _AuditedProvider(source),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 1)
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "RUNNING"
+    assert attempt.finished_at is None
+
+
+@pytest.mark.parametrize(
+    "promotion_outcome",
+    ["PARENT_CHANGED", "HISTORY_CHANGE", "CONTROL_STATE_UNAVAILABLE"],
+)
+def test_worker_terminalizes_nonterminal_promotion_failures(tmp_path, promotion_outcome):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class NonterminalPromotion(CalendarGenerationStore):
+        def promote(self, *args, **kwargs):
+            return CalendarPromotionResult(
+                outcome=promotion_outcome,
+                source_sha256=args[0].source_sha256,
+                official_requests=2,
+                machine_requests=1,
+            )
+
+    source = _valid_source()
+    store = NonterminalPromotion(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    health = _ClosedHealth()
+    completed = NOW + timedelta(minutes=1)
+    times = iter((NOW, completed))
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: _AuditedProvider(source),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == promotion_outcome
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == promotion_outcome
+    assert (attempt.official_requests, attempt.machine_requests) == (2, 1)
+    assert attempt.finished_at == completed
+
+
+def test_worker_reports_control_unavailable_when_promotion_failure_cannot_finish(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class FinishFails(CalendarGenerationStore):
+        def promote(self, attempt, *args, **kwargs):
+            return CalendarPromotionResult(
+                outcome="PARENT_CHANGED",
+                source_sha256=attempt.source_sha256,
+                official_requests=2,
+                machine_requests=1,
+            )
+
+        def finish_attempt(self, *args, **kwargs):
+            return False
+
+    source = _valid_source()
+    store = FinishFails(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    times = iter((NOW, NOW + timedelta(minutes=1)))
+    result = CalendarMaintenanceService(
+        store,
+        _ClosedHealth(),
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: _AuditedProvider(source),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert store.read_control().attempts[-1].outcome == "RUNNING"
+
+
+def test_worker_does_not_finish_twice_when_promotion_terminalizes_machine_conflict(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    class CountFinish(CalendarGenerationStore):
+        finish_calls = 0
+
+        def finish_attempt(self, *args, **kwargs):
+            self.finish_calls += 1
+            return super().finish_attempt(*args, **kwargs)
+
+    source = _valid_source()
+
+    class ConflictingProvider(_AuditedProvider):
+        def calendar_days(self, start, end):
+            rows = super().calendar_days(start, end)
+            day, flag = rows[1]
+            rows[1] = (day, not flag)
+            return rows
+
+    store = CountFinish(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    completed = NOW + timedelta(minutes=1)
+    times = iter((NOW, completed))
+    result = CalendarMaintenanceService(
+        store,
+        _ClosedHealth(),
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: ConflictingProvider(source),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "MACHINE_CONFLICT"
+    assert store.finish_calls == 0
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "MACHINE_CONFLICT"
+    assert attempt.finished_at == completed
+
+
+def test_explicit_active_current_year_ignores_unrelated_quarantined_next_year(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    _path, store, _source, _now = _promote_old_2026_authority(tmp_path)
+    valid_next = _valid_source()
+    changed = build_schedule(
+        **{
+            **valid_next.schedules[1].model_dump(mode="python"),
+            "closed_dates": (date(2027, 1, 1), date(2027, 1, 4)),
+        }
+    )
+    conflict = build_source(
+        **{
+            **valid_next.model_dump(mode="python"),
+            "schedules": (valid_next.schedules[0], changed),
+        }
+    )
+    assert store.stage_execute(conflict, NOW).outcome == "SOURCE_CONFLICT"
+
+    class HealthMustNotBeRead:
+        def provider_health_snapshot(self):
+            raise AssertionError("explicit current-year NOT_DUE must not inspect health")
+
+    plan = CalendarMaintenanceService(store, HealthMustNotBeRead()).plan(now=NOW, target_year=2026)
+
+    assert plan.outcome == "NOT_DUE"
+    assert plan.target_year == 2026
+    assert plan.due is False
+    assert plan.network_requests == 0
+
+
+def test_plan_same_day_running_slot_is_already_attempted_before_health(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    source = _valid_source()
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    store.reserve_attempt(source, NOW)
+
+    class HealthMustNotBeRead:
+        def provider_health_snapshot(self):
+            raise AssertionError("spent slot must stop before health")
+
+    plan = CalendarMaintenanceService(store, HealthMustNotBeRead()).plan(now=NOW, target_year=2027)
+
+    assert plan.outcome == "ALREADY_ATTEMPTED"
+    assert plan.target_year == 2027
+    assert plan.due is False
+    assert plan.network_requests == 0
+
+
+def test_changed_source_cannot_bypass_same_day_terminal_slot(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    source = _valid_source()
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    assert store.stage_execute(source, NOW).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, NOW)
+    assert store.finish_attempt(
+        attempt,
+        "OFFICIAL_UNAVAILABLE",
+        1,
+        0,
+        finished_at=NOW + timedelta(seconds=1),
+    )
+    revised_schedules = tuple(
+        build_schedule(
+            **{
+                **schedule.model_dump(mode="python"),
+                "review_id": "same-day-new-review",
+            }
+        )
+        for schedule in source.schedules
+    )
+    revised = build_source(**{**source.model_dump(mode="python"), "schedules": revised_schedules})
+    assert store.stage_execute(revised, NOW + timedelta(seconds=2)).outcome == "STAGED"
+
+    class HealthMustNotBeRead:
+        def provider_health_snapshot(self):
+            raise AssertionError("changed source must not bypass spent slot")
+
+    plan = CalendarMaintenanceService(store, HealthMustNotBeRead()).plan(
+        now=NOW + timedelta(seconds=3), target_year=2027
+    )
+
+    assert plan.outcome == "ALREADY_ATTEMPTED"
+    assert plan.source_sha256 == revised.source_sha256
+    assert plan.due is False
