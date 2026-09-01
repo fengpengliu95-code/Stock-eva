@@ -83,7 +83,7 @@ async def _calendar_only_lifespan():
         try:
             with RefreshRunLock(layout.market_refresh_lock):
                 return CalendarSyncService(
-                    CalendarSyncStore(calendar_sync_path),
+                    CalendarSyncStore(calendar_sync_path, initialize=False),
                     calendar_service.calendar,
                     calendar_service.provider,
                     health_store=runtime_health,
@@ -283,7 +283,7 @@ async def lifespan(_: FastAPI):
         try:
             with RefreshRunLock(layout.market_refresh_lock):
                 writer_service = CalendarSyncService(
-                    CalendarSyncStore(calendar_sync_path),
+                    CalendarSyncStore(calendar_sync_path, initialize=False),
                     calendar_service.calendar,
                     calendar_service.provider,
                     health_store=health_store,
