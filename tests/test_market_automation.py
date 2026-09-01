@@ -596,6 +596,85 @@ def test_automation_run_pins_calendar_for_initial_and_revalidation_decisions(
     assert calendar.snapshot_calls == 2
 
 
+def test_automation_repair_scanner_is_pinned_to_operation_calendar(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 24))
+    provider = CompleteProvider(fixture_bars())
+    concrete = synthetic_calendar()
+    calendar = SnapshottingCalendar(concrete)
+    captured = {}
+
+    class OperationScanner:
+        def for_snapshot(self, snapshot):
+            captured["snapshot"] = snapshot
+            return self
+
+    class FakeRepairExecutor:
+        def execute_once(self, **kwargs):
+            captured["scanner"] = kwargs["scanner"]
+            decision = kwargs["freshness"]
+            return RepairExecutionResult(
+                status="skipped",
+                decision=ContinuityDecision(
+                    action=decision.action,
+                    lane="freshness",
+                    target_session=decision.target_session,
+                    reason_code="FRESHNESS_WAIT",
+                ),
+                reason_code="FRESHNESS_WAIT",
+                provider_requests=0,
+            )
+
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        calendar,
+        required_symbols=lambda: {"sh.600000"},
+        continuity=OperationScanner(),
+        repair_enabled=True,
+        repair_executor=FakeRepairExecutor(),
+    )
+
+    service.run_due_once(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI))
+
+    assert captured["scanner"].__class__.__name__ == "OperationScanner"
+    assert captured["snapshot"] is concrete
+    assert calendar.snapshot_calls == 1
+
+
+def test_automation_repair_snapshot_error_propagates_before_provider_or_write(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, date(2026, 7, 23))
+    before_refreshes = store.list_refreshes()
+    provider = CompleteProvider(fixture_bars())
+
+    class BrokenScanner:
+        def for_snapshot(self, _snapshot):
+            raise RuntimeError("private calendar detail")
+
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        SnapshottingCalendar(synthetic_calendar()),
+        required_symbols=lambda: {"sh.600000"},
+        continuity=BrokenScanner(),
+        repair_enabled=True,
+        repair_executor=SimpleNamespace(execute_once=lambda **_kwargs: None),
+    )
+
+    with pytest.raises(RuntimeError, match="private calendar detail"):
+        service.run_due_once(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI))
+
+    assert provider.fetch_calls == provider.calendar_calls == 0
+    assert store.list_refreshes() == before_refreshes
+
+
 def test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider(
     tmp_path: Path,
 ) -> None:

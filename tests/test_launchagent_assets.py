@@ -176,6 +176,57 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
     assert loop_captured["runtime_maintenance"] is not None
 
 
+def test_lifespan_runs_calendar_lane_without_market_automation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        auto_refresh_enabled=False,
+        calendar_runtime_enabled=True,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    captured = {}
+
+    class ForbiddenMarket:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("market automation lane must stay disabled")
+
+    class CapturingCalendarService:
+        def __init__(self, *_args, **kwargs):
+            captured["calendar"] = _args[1]
+            captured.update(kwargs)
+
+    async def idle_loop(_service, stop, **kwargs) -> None:
+        captured["runtime_maintenance"] = kwargs.get("runtime_maintenance")
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "settings", settings)
+    monkeypatch.setattr(main_module, "StoragePreflight", ForbiddenMarket)
+    monkeypatch.setattr(main_module.StorageLayout, "ensure_local_runtime_dirs", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "MarketStore", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "MarketAutomationService", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "CalendarSyncService", CapturingCalendarService)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "run_automation_loop", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def exercise() -> None:
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(exercise())
+    assert captured["calendar"] is not None
+    assert captured["runtime_maintenance"] is not None
+
+
 def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:
     calendar = rendered_plist("com.finlay.stock-eva.calendar.plist.in")
     backup = rendered_plist("com.finlay.stock-eva.backup.plist.in")

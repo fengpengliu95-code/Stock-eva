@@ -1339,6 +1339,94 @@ def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_c
     assert calls == 0
 
 
+def test_calendar_sync_cli_revalidates_result_before_publication(monkeypatch, capsys, tmp_path):
+    settings = Settings(
+        _env_file=None,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    moment = datetime(2026, 7, 24, 8, tzinfo=UTC)
+    valid = CalendarSyncResult(
+        run_id="safe-run",
+        mode="light",
+        status="ready",
+        range_start=date(2026, 7, 24),
+        range_end=date(2026, 7, 24),
+        fetched_at=moment,
+        completed_at=moment,
+        observed_open_count=1,
+        authority_checksum="a" * 64,
+    )
+    malicious = valid.model_copy(update={"failure_code": "CALENDAR_AUTHORITY_CHANGED"})
+
+    class FakeStore:
+        def __init__(self, _path, *, initialize):
+            pass
+
+    class FakeService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def plan(self, **_kwargs):
+            return SimpleNamespace(mode="light", model_dump=lambda **_dump: {})
+
+        def execute(self, _plan):
+            return malicious
+
+    class FakeHealth:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def initialize(self):
+            pass
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+    class FakeLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class ReadyPreflight:
+        def __init__(self, _settings):
+            pass
+
+        def inspect(self):
+            return SimpleNamespace(market_data_available=True, mode="local")
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(cli, "CalendarSyncStore", FakeStore)
+    monkeypatch.setattr(cli, "CalendarSyncService", FakeService)
+    monkeypatch.setattr(cli, "SQLiteProviderHealthStore", FakeHealth)
+    monkeypatch.setattr(cli, "BaoStockProvider", FakeProvider)
+    monkeypatch.setattr(cli, "RefreshRunLock", FakeLock)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync", "--execute"])
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "error",
+        "error_code": "INVALID_CALENDAR_SYNC_RESULT",
+        "network_requests": None,
+        "writes_calendar_state": False,
+        "canonical_writes": False,
+    }
+
+
 def test_market_status_exposes_calendar_maintenance_without_client_input(
     tmp_path: Path,
 ) -> None:

@@ -1242,31 +1242,30 @@ class MarketAutomationService:
                 state=current,
             )
 
-        try:
-            if self.repair_executor is not None:
-                result = self.repair_executor.execute_once(
-                    freshness=decision,
-                    latest_expected_session=target,
-                    repair_enabled=True,
-                    revalidator=revalidate,
-                )
-                self.last_repair_result = result
-                self.last_continuity_decision = result.decision
-                return result
-            self.last_continuity_decision = self.continuity.claim_ready_once(
+        if self.repair_executor is not None:
+            operation_scanner = self.continuity
+            for_snapshot = getattr(operation_scanner, "for_snapshot", None)
+            if callable(for_snapshot):
+                operation_scanner = for_snapshot(policy.calendar)
+            result = self.repair_executor.execute_once(
                 freshness=decision,
                 latest_expected_session=target,
                 repair_enabled=True,
-                now=local.astimezone(UTC),
                 revalidator=revalidate,
-                lease_consumer=None,
+                scanner=operation_scanner,
             )
-            return None
-        except Exception:
-            self.last_continuity_decision = None
-            self.last_repair_result = None
-            _log_event(logging.WARNING, "market_continuity_decision_unavailable")
-            return None
+            self.last_repair_result = result
+            self.last_continuity_decision = result.decision
+            return result
+        self.last_continuity_decision = self.continuity.claim_ready_once(
+            freshness=decision,
+            latest_expected_session=target,
+            repair_enabled=True,
+            now=local.astimezone(UTC),
+            revalidator=revalidate,
+            lease_consumer=None,
+        )
+        return None
 
     def _execute_due(
         self,

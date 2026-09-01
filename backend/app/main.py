@@ -47,8 +47,74 @@ settings = get_settings()
 
 
 @asynccontextmanager
+async def _calendar_only_lifespan():
+    """Run the promoted-calendar lane without starting market automation dependencies."""
+    layout = StorageLayout(settings)
+    calendar_runtime = CalendarRuntimeSettings.from_settings(settings)
+    runtime_health = CalendarMaintenanceHealthStore(
+        layout.local_paths.control / calendar_runtime.provider_health_database_name,
+        failure_threshold=calendar_runtime.provider_circuit_failure_threshold,
+        cooldown_seconds=calendar_runtime.provider_circuit_cooldown_seconds,
+        probe_lease_seconds=calendar_runtime.provider_circuit_probe_lease_seconds,
+        clock=get_market_clock(),
+    )
+    runtime_service = CalendarMaintenanceService(
+        CalendarGenerationStore(
+            layout.local_paths.control / calendar_runtime.calendar_generation_database_name
+        ),
+        runtime_health,
+        clock=get_market_clock(),
+        socket_timeout_seconds=calendar_runtime.baostock_socket_timeout_seconds,
+        min_request_interval_seconds=calendar_runtime.auto_refresh_min_request_interval_seconds,
+    )
+    trading_calendar = build_live_trading_calendar(calendar_runtime)
+    calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
+    calendar_service = CalendarSyncService(
+        CalendarSyncStore(calendar_sync_path, initialize=False),
+        trading_calendar,
+        BaoStockProvider(
+            min_request_interval_seconds=settings.auto_refresh_min_request_interval_seconds,
+            socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+        ),
+        health_store=runtime_health,
+    )
+
+    def execute_calendar_plan(plan):
+        try:
+            with RefreshRunLock(layout.market_refresh_lock):
+                return CalendarSyncService(
+                    CalendarSyncStore(calendar_sync_path),
+                    calendar_service.calendar,
+                    calendar_service.provider,
+                    health_store=runtime_health,
+                ).execute(plan)
+        except RefreshAlreadyRunning:
+            return None
+
+    stop = asyncio.Event()
+    calendar_task = asyncio.create_task(
+        run_calendar_sync_loop(
+            calendar_service,
+            stop,
+            clock=get_market_clock(),
+            execute_plan=execute_calendar_plan,
+            runtime_maintenance=runtime_service.execute,
+        )
+    )
+    try:
+        yield
+    finally:
+        stop.set()
+        await calendar_task
+
+
+@asynccontextmanager
 async def lifespan(_: FastAPI):
     if not settings.auto_refresh_enabled:
+        if settings.calendar_runtime_enabled:
+            async with _calendar_only_lifespan():
+                yield
+            return
         yield
         return
     readiness = StoragePreflight(settings).inspect()

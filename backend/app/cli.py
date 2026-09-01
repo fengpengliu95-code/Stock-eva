@@ -54,6 +54,7 @@ from backend.app.market.calendar_maintenance import CalendarMaintenanceService
 from backend.app.market.calendar_maintenance_health import CalendarMaintenanceHealthStore
 from backend.app.market.calendar_runtime import build_calendar_generation_status
 from backend.app.market.calendar_sync import (
+    CalendarSyncResult,
     CalendarSyncService,
     CalendarSyncStore,
     read_calendar_conflict,
@@ -2357,12 +2358,31 @@ def main() -> int:
                 )
             )
             return 1
+        try:
+            public_result = CalendarSyncResult.model_validate(result.model_dump(mode="python"))
+        except (ValidationError, TypeError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "INVALID_CALENDAR_SYNC_RESULT",
+                        # Validation occurs after execute; request accounting cannot be
+                        # proven from an invalid result and must not be reported as zero.
+                        "network_requests": None,
+                        "writes_calendar_state": False,
+                        "canonical_writes": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         print(
             json.dumps(
                 {
-                    **result.model_dump(mode="json"),
+                    **public_result.model_dump(mode="json"),
                     "writes_calendar_state": (
-                        result.status != "skipped_circuit_open" and result.failure_code is None
+                        public_result.status != "skipped_circuit_open"
+                        and public_result.failure_code is None
                     ),
                     **(
                         {

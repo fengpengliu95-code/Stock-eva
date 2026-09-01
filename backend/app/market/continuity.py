@@ -354,6 +354,15 @@ class ContinuityInventory:
     def calendar_conflict_is_dynamic(self) -> bool:
         return callable(self._calendar_conflict)
 
+    def for_snapshot(self, calendar: ConfirmedCalendarReader) -> "ContinuityInventory":
+        """Bind a scanner to one operation's already-captured calendar snapshot."""
+        return type(self)(
+            calendar=calendar,
+            inventory_reader=self._inventory_reader,
+            inventory_mode=self._inventory_mode,
+            calendar_conflict=self._calendar_conflict,
+        )
+
     def scan(
         self,
         *,
@@ -1766,19 +1775,21 @@ class ContinuityRepairExecutor:
         latest_expected_session: date,
         repair_enabled: bool,
         revalidator: Callable[[], FreshnessDecision],
+        scanner: ContinuityInventory | None = None,
     ) -> RepairExecutionResult:
         timestamp = require_utc(self.clock())
         holder: dict[str, RefreshResult] = {}
+        operation_scanner = scanner if scanner is not None else self.scanner
 
         def prepare() -> None:
             # A strict inventory read is the only authority for crash reconciliation.  When a
             # scanner is configured it also proves calendar coverage before any queue mutation.
             scan: ContinuityScanResult | ContinuityUnavailable | None = None
             inventory: VerifiedReadySessionInventory | None = None
-            if self.scanner is not None:
+            if operation_scanner is not None:
                 if self.configured_start is None:
                     raise RepairQueueError("continuity start is unconfigured")
-                scan = self.scanner.scan(
+                scan = operation_scanner.scan(
                     configured_start=self.configured_start,
                     latest_completed_session=latest_expected_session,
                 )
