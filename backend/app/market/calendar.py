@@ -43,6 +43,10 @@ class TradingCalendar:
     def __init__(self, configs: list[CalendarConfig]) -> None:
         self.configs = {item.year: item for item in configs}
 
+    def snapshot(self) -> "TradingCalendar":
+        """Return this concrete calendar for operation-boundary pinning."""
+        return self
+
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "TradingCalendar":
         return cls([CalendarConfig.model_validate(payload)])
@@ -131,10 +135,107 @@ CALENDAR_DIRECTORY = CALENDAR_PATH.parent
 
 
 @lru_cache
-def get_trading_calendar() -> TradingCalendar:
+def _load_bundled_snapshot() -> TradingCalendar:
+    # The generation module is intentionally imported lazily: it depends on
+    # TradingCalendar for its immutable snapshot type.
+    from .calendar_generation import (
+        CalendarConfigSnapshot,
+        CalendarSourceMetadata,
+        ImmutableCalendarSnapshot,
+        bundled_sha256,
+    )
+
+    payloads: list[dict[str, object]] = []
     configs: list[CalendarConfig] = []
     for path in sorted(CALENDAR_DIRECTORY.glob("cn_a_share_*.json")):
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         raw_configs = payload if isinstance(payload, list) else [payload]
+        payloads.extend(raw_configs)
         configs.extend(CalendarConfig.model_validate(item) for item in raw_configs)
-    return TradingCalendar(configs)
+    snapshots = tuple(
+        CalendarConfigSnapshot(
+            year=config.year,
+            status="confirmed",
+            published_on=config.published_on,
+            sources=tuple(
+                CalendarSourceMetadata(
+                    exchange=source.exchange,
+                    title=source.title,
+                    url=source.url,
+                    notice_no=source.notice_no,
+                )
+                for source in config.sources
+            ),
+            closed_dates=tuple(config.closed_dates),
+        )
+        for config in sorted(configs, key=lambda item: item.year)
+    )
+    return ImmutableCalendarSnapshot(
+        snapshots,
+        bundled_sha256=bundled_sha256(tuple(payloads)),
+    )
+
+
+class LiveTradingCalendar(TradingCalendar):
+    """A long-lived facade that reads runtime authority at every boundary."""
+
+    def __init__(self, settings) -> None:
+        from backend.app.config import CalendarRuntimeSettings, Settings
+
+        if isinstance(settings, Settings):
+            settings = CalendarRuntimeSettings.from_settings(settings)
+        if not isinstance(settings, CalendarRuntimeSettings):
+            raise TypeError("settings must be CalendarRuntimeSettings or Settings")
+        self.settings = settings
+
+    @property
+    def configs(self):
+        # Compatibility for existing readers that inspect a frozen concrete
+        # map. New operations should use snapshot() explicitly.
+        return self.snapshot().configs
+
+    def snapshot(self) -> TradingCalendar:
+        if not self.settings.calendar_runtime_enabled:
+            return _load_bundled_snapshot()
+        from .calendar_generation import EMPTY_CALENDAR, CalendarGenerationStore
+
+        result = CalendarGenerationStore(
+            self.settings.local_control_dir / self.settings.calendar_generation_database_name
+        ).read()
+        if result.status != "ready" or result.calendar is None:
+            return EMPTY_CALENDAR
+        return result.calendar
+
+    def session_status(self, value: date) -> SessionStatus:
+        return self.snapshot().session_status(value)
+
+    def confirmed_open_sessions(self, start: date, end: date) -> tuple[date, ...] | None:
+        return self.snapshot().confirmed_open_sessions(start, end)
+
+    def previous_session(self, value: date) -> date | None:
+        return self.snapshot().previous_session(value)
+
+    def latest_expected_session(self, now: datetime) -> date | None:
+        return self.snapshot().latest_expected_session(now)
+
+    def market_phase(self, now: datetime) -> MarketPhase:
+        return self.snapshot().market_phase(now)
+
+    @property
+    def status(self) -> Literal["confirmed", "unavailable"]:
+        return self.snapshot().status
+
+    def sources_for(self, year: int) -> list[CalendarSource]:
+        return self.snapshot().sources_for(year)
+
+
+def build_live_trading_calendar(settings) -> TradingCalendar:
+    """Project already-resolved settings into a long-lived live facade."""
+    return LiveTradingCalendar(settings)
+
+
+def get_trading_calendar() -> TradingCalendar:
+    """Return the default env-only facade without exposing dependency inputs."""
+    from backend.app.config import get_calendar_runtime_settings
+
+    return build_live_trading_calendar(get_calendar_runtime_settings())

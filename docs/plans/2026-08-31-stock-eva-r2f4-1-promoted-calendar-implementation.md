@@ -200,6 +200,24 @@ Accepted evidence is 408/408 focused and 2514/2514 full-repository tests, strict
 compile, Ruff, format and diff checks, with unchanged DDL and protected hashes. Task 2 is CODE GO;
 this is not R2-F4.1 GO and authorizes no production enablement.
 
+**Task 3a runtime-core checkpoint:** Added the exact eleven-key, credential-free
+`CalendarRuntimeSettings` projection, default-disabled generation settings and isolated storage
+layout path. The bundled loader is now a concrete immutable snapshot, while the default no-argument
+dependency returns a long-lived live facade: disabled mode never touches runtime control state;
+enabled mode reads one fresh verified generation snapshot per public operation and returns an empty
+unavailable calendar for missing, corrupt, deleted or unsafe state without bundled or stale
+fallback. Concrete injected calendars still return themselves from `snapshot()`.
+
+Twelve retained runtime tests prove the no-argument dependency surface, exact environment-key
+access without `BaseSettings`/`.env`, one-time relative path anchoring, safe database names, disabled
+zero runtime access, valid empty-store composition, same-process promotion visibility, immediate
+fail-closed behavior after corruption/deletion/symlink substitution, and one-snapshot range reads.
+Root evidence: 489/489 affected calendar/automation/fund-flow/read-only/supplement/storage/API
+tests and 2526/2526 full repository tests; compile, Ruff, 204-file format and diff checks pass.
+No real Provider, HTTP, production control/canonical, NAS, deployment or LaunchAgent operation
+occurred. Task 3b consumer pinning and Task 3c public/job integration remain pending; this is not
+Task 3 or R2-F4.1 GO.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

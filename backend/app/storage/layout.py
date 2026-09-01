@@ -44,6 +44,10 @@ class StorageLayout:
         return self.settings.local_control_dir / self.settings.regime_snapshot_database_name
 
     @property
+    def calendar_generation_database(self) -> Path:
+        return self.settings.local_control_dir / self.settings.calendar_generation_database_name
+
+    @property
     def provider_health_database(self) -> Path:
         return self.local_paths.provider_health_database
 

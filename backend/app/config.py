@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     local_control_dir: Path = Path("var/control")
     factor_cache_database_name: str = "baostock_back_factor_cache.sqlite3"
     calendar_sync_database_name: str = "calendar_sync.sqlite3"
+    calendar_runtime_enabled: bool = False
+    calendar_generation_database_name: str = "calendar_generations.sqlite3"
     regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
     provider_health_database_name: str = "provider_health.sqlite3"
     provider_registry_database_name: str = "provider_registry.sqlite3"
@@ -141,7 +143,11 @@ class Settings(BaseSettings):
             raise ValueError("provider evidence contract version is unsupported")
         return value
 
-    @field_validator("provider_registry_database_name", "daily_bar_shadow_database_name")
+    @field_validator(
+        "provider_registry_database_name",
+        "daily_bar_shadow_database_name",
+        "calendar_generation_database_name",
+    )
     @classmethod
     def validate_provider_registry_database_name(cls, value: str) -> str:
         candidate = Path(value)
@@ -252,6 +258,7 @@ class Settings(BaseSettings):
         control_databases = (
             self.factor_cache_database_name,
             self.calendar_sync_database_name,
+            self.calendar_generation_database_name,
             self.regime_snapshot_database_name,
             self.provider_health_database_name,
             self.provider_registry_database_name,
@@ -265,6 +272,169 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class CalendarRuntimeSettings(BaseModel):
+    """The closed, credential-free settings surface for runtime calendars."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False)
+
+    calendar_runtime_enabled: bool = False
+    calendar_generation_database_name: str = "calendar_generations.sqlite3"
+    calendar_sync_database_name: str = "calendar_sync.sqlite3"
+    local_control_dir: Path = Path.cwd() / "var/control"
+    local_lock_dir: Path = Path.cwd() / "var/locks"
+    provider_health_database_name: str = "provider_health.sqlite3"
+    baostock_socket_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+    auto_refresh_min_request_interval_seconds: float = Field(default=0.5, ge=0.2)
+    provider_circuit_failure_threshold: int = Field(default=3, gt=0)
+    provider_circuit_cooldown_seconds: float = Field(default=900.0, gt=0)
+    provider_circuit_probe_lease_seconds: float = Field(default=120.0, gt=0)
+
+    @field_validator(
+        "calendar_generation_database_name",
+        "calendar_sync_database_name",
+        "provider_health_database_name",
+    )
+    @classmethod
+    def validate_calendar_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("calendar runtime database name must be a local .sqlite3 basename")
+        return value
+
+    @field_validator("local_control_dir", "local_lock_dir")
+    @classmethod
+    def validate_calendar_runtime_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("calendar runtime path must be absolute")
+        return value
+
+    @model_validator(mode="after")
+    def calendar_database_names_are_distinct(self) -> "CalendarRuntimeSettings":
+        names = (
+            self.calendar_generation_database_name,
+            self.calendar_sync_database_name,
+            self.provider_health_database_name,
+        )
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("calendar runtime database names must be distinct")
+        return self
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "CalendarRuntimeSettings":
+        if not isinstance(settings, Settings):
+            raise TypeError("settings must be Settings")
+        return cls(
+            calendar_runtime_enabled=settings.calendar_runtime_enabled,
+            calendar_generation_database_name=settings.calendar_generation_database_name,
+            calendar_sync_database_name=settings.calendar_sync_database_name,
+            local_control_dir=_anchor_runtime_path(settings.local_control_dir),
+            local_lock_dir=_anchor_runtime_path(settings.local_lock_dir),
+            provider_health_database_name=settings.provider_health_database_name,
+            baostock_socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+            auto_refresh_min_request_interval_seconds=settings.auto_refresh_min_request_interval_seconds,
+            provider_circuit_failure_threshold=settings.provider_circuit_failure_threshold,
+            provider_circuit_cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+            provider_circuit_probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+        )
+
+
+def _anchor_runtime_path(value: Path | str) -> Path:
+    """Anchor once without resolving symlinks or touching the filesystem."""
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _runtime_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("calendar runtime boolean setting is invalid")
+
+
+def _runtime_float(value: str | None, *, default: float) -> float:
+    if value is None or not value.strip():
+        if value is None:
+            return default
+        raise ValueError("calendar runtime numeric setting is invalid")
+    return float(value)
+
+
+def _runtime_int(value: str | None, *, default: int) -> int:
+    if value is None or not value.strip():
+        if value is None:
+            return default
+        raise ValueError("calendar runtime numeric setting is invalid")
+    return int(value)
+
+
+def _runtime_path(value: str | None, *, default: Path) -> Path:
+    if value is None:
+        return default
+    if not value.strip():
+        raise ValueError("calendar runtime path setting is invalid")
+    return _anchor_runtime_path(value)
+
+
+def get_calendar_runtime_settings(
+    settings: Settings | Mapping[str, str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> CalendarRuntimeSettings:
+    """Load exactly the calendar runtime allowlist, or project resolved Settings.
+
+    This intentionally does not use ``Settings()``: that would load ``.env`` and
+    inspect unrelated credentials.  The eleven ``get`` calls below are the full
+    process-environment boundary for the runtime calendar lane.
+    """
+    if isinstance(settings, Mapping):
+        if environ is not None:
+            raise ValueError("settings and environ are mutually exclusive")
+        environ = settings
+        settings = None
+    if settings is not None:
+        if environ is not None:
+            raise ValueError("settings and environ are mutually exclusive")
+        return CalendarRuntimeSettings.from_settings(settings)
+    source = os.environ if environ is None else environ
+    enabled = source.get("STOCK_EVA_CALENDAR_RUNTIME_ENABLED")
+    generation_name = source.get("STOCK_EVA_CALENDAR_GENERATION_DATABASE_NAME")
+    sync_name = source.get("STOCK_EVA_CALENDAR_SYNC_DATABASE_NAME")
+    control_dir = source.get("STOCK_EVA_LOCAL_CONTROL_DIR")
+    lock_dir = source.get("STOCK_EVA_LOCAL_LOCK_DIR")
+    health_name = source.get("STOCK_EVA_PROVIDER_HEALTH_DATABASE_NAME")
+    timeout = source.get("STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS")
+    interval = source.get("STOCK_EVA_AUTO_REFRESH_MIN_REQUEST_INTERVAL_SECONDS")
+    threshold = source.get("STOCK_EVA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD")
+    cooldown = source.get("STOCK_EVA_PROVIDER_CIRCUIT_COOLDOWN_SECONDS")
+    lease = source.get("STOCK_EVA_PROVIDER_CIRCUIT_PROBE_LEASE_SECONDS")
+    return CalendarRuntimeSettings(
+        calendar_runtime_enabled=_runtime_bool(enabled, default=False),
+        calendar_generation_database_name=(
+            generation_name if generation_name is not None else "calendar_generations.sqlite3"
+        ),
+        calendar_sync_database_name=sync_name if sync_name is not None else "calendar_sync.sqlite3",
+        local_control_dir=_runtime_path(control_dir, default=Path.cwd() / "var/control"),
+        local_lock_dir=_runtime_path(lock_dir, default=Path.cwd() / "var/locks"),
+        provider_health_database_name=(
+            health_name if health_name is not None else "provider_health.sqlite3"
+        ),
+        baostock_socket_timeout_seconds=_runtime_float(timeout, default=30.0),
+        auto_refresh_min_request_interval_seconds=_runtime_float(interval, default=0.5),
+        provider_circuit_failure_threshold=_runtime_int(threshold, default=3),
+        provider_circuit_cooldown_seconds=_runtime_float(cooldown, default=900.0),
+        provider_circuit_probe_lease_seconds=_runtime_float(lease, default=120.0),
+    )
 
 
 class MarketFailoverRuntimeSettings(BaseModel):
