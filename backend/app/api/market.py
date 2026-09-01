@@ -8,9 +8,19 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from pydantic_settings import SettingsError
 
 from backend.app.api.storage import get_storage_readiness
-from backend.app.config import MarketFailoverRuntimeSettings, Settings, get_settings
+from backend.app.config import (
+    CalendarRuntimeSettings,
+    MarketFailoverRuntimeSettings,
+    Settings,
+    get_calendar_runtime_settings,
+    get_settings,
+)
 from backend.app.market.automation import get_market_clock
 from backend.app.market.calendar import SHANGHAI, TradingCalendar, get_trading_calendar
+from backend.app.market.calendar_runtime import (
+    CalendarGenerationStatusV1,
+    build_calendar_generation_status,
+)
 from backend.app.market.calendar_sync import (
     CalendarSyncPolicy,
     CalendarSyncStore,
@@ -53,6 +63,29 @@ from backend.app.storage.models import StorageReadiness
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+def get_calendar_generation_api_settings() -> CalendarRuntimeSettings:
+    """Resolve only the credential-free calendar runtime environment allowlist."""
+    try:
+        return get_calendar_runtime_settings()
+    except (ValidationError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_calendar_runtime_configuration"},
+        ) from None
+
+
+@router.get(
+    "/calendar-generation",
+    response_model=CalendarGenerationStatusV1,
+    responses={422: {"description": "invalid calendar runtime configuration"}},
+)
+def market_calendar_generation_status(
+    settings: Annotated[CalendarRuntimeSettings, Depends(get_calendar_generation_api_settings)],
+) -> CalendarGenerationStatusV1:
+    """Read the standalone promoted-calendar runtime status."""
+    return build_calendar_generation_status(settings)
 
 
 class InvalidFailoverConfiguration(ValueError):

@@ -19,6 +19,7 @@ from backend.app.classification.provider import BaoStockClassificationProvider
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.config import (
+    get_calendar_runtime_settings,
     get_market_failover_runtime_settings,
     get_settings,
     get_tickflow_free_runtime_settings,
@@ -41,6 +42,15 @@ from backend.app.market.backfill import (
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import get_trading_calendar
+from backend.app.market.calendar_generation import (
+    CalendarGenerationError,
+    CalendarGenerationStore,
+    CalendarStoreUnavailable,
+    load_source,
+)
+from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+from backend.app.market.calendar_maintenance_health import CalendarMaintenanceHealthStore
+from backend.app.market.calendar_runtime import build_calendar_generation_status
 from backend.app.market.calendar_sync import (
     CalendarSyncService,
     CalendarSyncStore,
@@ -528,6 +538,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=_socket_timeout_value,
         help="BaoStock socket timeout; defaults to STOCK_EVA_BAOSTOCK_SOCKET_TIMEOUT_SECONDS",
     )
+    subparsers.add_parser(
+        "calendar-generation-status",
+        help="read-only status of the promoted calendar runtime",
+    )
+    calendar_stage = subparsers.add_parser(
+        "calendar-generation-stage",
+        help="validate and optionally stage one reviewed calendar source package",
+    )
+    calendar_stage.add_argument("--source", required=True, type=Path)
+    calendar_stage.add_argument("--execute", action="store_true")
+    calendar_maintenance = subparsers.add_parser(
+        "calendar-maintenance",
+        help="plan or execute one bounded promoted-calendar maintenance slot",
+    )
+    calendar_maintenance.add_argument("--year", type=int, dest="target_year")
+    calendar_maintenance.add_argument("--execute", action="store_true")
     storage_init = subparsers.add_parser(
         "storage-init",
         help="initialize a new empty NAS market dataset",
@@ -642,6 +668,224 @@ def _continuity_cli_payload(
     else:
         payload["execute_requires"] = "--execute"
     return payload
+
+
+def _calendar_runtime_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _calendar_generation_status_command(_args: argparse.Namespace) -> int:
+    try:
+        settings = get_calendar_runtime_settings()
+    except (ValidationError, ValueError):
+        print(
+            json.dumps(
+                {
+                    "status": "unavailable",
+                    "error_code": "INVALID_CALENDAR_RUNTIME_CONFIGURATION",
+                    "provider_requests": 0,
+                    "canonical_writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    status = build_calendar_generation_status(settings, now=_calendar_runtime_now())
+    print(json.dumps(status.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
+    return 0 if status.status in {"disabled", "ready"} else 1
+
+
+def _calendar_stage_payload(
+    *,
+    outcome: str,
+    source_sha256: str | None = None,
+    admission: str | None = None,
+    target_year: int | None = None,
+    writes_calendar_state: bool = False,
+    execute: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "completed" if execute else "planned",
+        "outcome": outcome,
+        "source_sha256": source_sha256,
+        "target_year": target_year,
+        "admission": admission,
+        "policy": "reviewed_source_admission",
+        "network_requests": 0,
+        "official_requests": 0,
+        "machine_requests": 0,
+        "writes_calendar_state": writes_calendar_state,
+        "canonical_writes": False,
+    }
+    if not execute:
+        payload["execute_requires"] = "--execute"
+    return payload
+
+
+def _calendar_generation_stage_command(args: argparse.Namespace) -> int:
+    # Source admission happens before settings/path construction so malformed input cannot
+    # initialize a calendar database or its parent directory.
+    try:
+        source = load_source(args.source)
+    except (CalendarGenerationError, OSError, TypeError, ValueError):
+        payload = _calendar_stage_payload(outcome="SOURCE_INVALID", execute=args.execute)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    try:
+        settings = get_calendar_runtime_settings()
+    except (ValidationError, ValueError):
+        payload = _calendar_stage_payload(
+            outcome="CONTROL_STATE_UNAVAILABLE", target_year=source.year, execute=args.execute
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    now = _calendar_runtime_now()
+    store = CalendarGenerationStore(
+        settings.local_control_dir / settings.calendar_generation_database_name
+    )
+    try:
+        planned = store.plan_stage(source, now)
+    except CalendarGenerationError:
+        payload = _calendar_stage_payload(
+            outcome="SOURCE_INVALID", target_year=source.year, execute=args.execute
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    if not args.execute:
+        payload = _calendar_stage_payload(
+            outcome=planned.outcome,
+            source_sha256=planned.source_sha256,
+            admission=planned.admission,
+            target_year=source.year,
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    try:
+        result = store.stage_execute(source, now)
+    except CalendarGenerationError:
+        payload = _calendar_stage_payload(
+            outcome="SOURCE_INVALID", target_year=source.year, execute=True
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    except (CalendarStoreUnavailable, OSError):
+        payload = _calendar_stage_payload(
+            outcome="CONTROL_STATE_UNAVAILABLE", target_year=source.year, execute=True
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 1
+    wrote = result.outcome == "STAGED" or (
+        result.outcome == "SOURCE_CONFLICT" and result.admission == "quarantined"
+    )
+    payload = _calendar_stage_payload(
+        outcome=result.outcome,
+        source_sha256=result.source_sha256,
+        admission=result.admission,
+        target_year=source.year,
+        writes_calendar_state=wrote,
+        execute=True,
+    )
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return (
+        0
+        if result.outcome in {"STAGED", "ALREADY_STAGED"} and result.admission != "quarantined"
+        else 1
+    )
+
+
+def _calendar_maintenance_payload(result: object, *, execute: bool) -> dict[str, object]:
+    values = {
+        "status": "completed" if execute else "planned",
+        "outcome": result.outcome,
+        "target_year": result.target_year,
+        "source_sha256": result.source_sha256,
+        "generation_sha256": getattr(result, "generation_sha256", None),
+        "policy": result.next_year_status,
+        "network_requests": result.network_requests,
+        "official_requests": result.official_requests,
+        "machine_requests": result.machine_requests,
+        "writes_calendar_state": result.writes_calendar_state,
+        "canonical_writes": False,
+    }
+    if not execute:
+        values["execute_requires"] = "--execute"
+    return values
+
+
+def _calendar_maintenance_command(args: argparse.Namespace) -> int:
+    try:
+        settings = get_calendar_runtime_settings()
+    except (ValidationError, ValueError):
+        print(
+            json.dumps(
+                {
+                    "status": "unavailable",
+                    "outcome": "CONTROL_STATE_UNAVAILABLE",
+                    "error_code": "INVALID_CALENDAR_RUNTIME_CONFIGURATION",
+                    "network_requests": 0,
+                    "official_requests": 0,
+                    "machine_requests": 0,
+                    "writes_calendar_state": False,
+                    "canonical_writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    now = _calendar_runtime_now()
+    store = CalendarGenerationStore(
+        settings.local_control_dir / settings.calendar_generation_database_name
+    )
+    maintenance_clock = _calendar_runtime_now if args.execute else (lambda: now)
+    health = CalendarMaintenanceHealthStore(
+        settings.local_control_dir / settings.provider_health_database_name,
+        failure_threshold=settings.provider_circuit_failure_threshold,
+        cooldown_seconds=settings.provider_circuit_cooldown_seconds,
+        probe_lease_seconds=settings.provider_circuit_probe_lease_seconds,
+        clock=maintenance_clock,
+    )
+    service = CalendarMaintenanceService(
+        store,
+        health,
+        clock=maintenance_clock,
+        socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
+        min_request_interval_seconds=settings.auto_refresh_min_request_interval_seconds,
+    )
+    try:
+        if args.execute:
+            result = service.execute(target_year=args.target_year)
+        else:
+            result = service.plan(now=now, target_year=args.target_year)
+    except CalendarGenerationError:
+        print(
+            json.dumps(
+                {
+                    "status": "unavailable",
+                    "outcome": "CONTROL_STATE_UNAVAILABLE",
+                    "error_code": "INVALID_CALENDAR_MAINTENANCE_INPUT",
+                    "network_requests": 0,
+                    "official_requests": 0,
+                    "machine_requests": 0,
+                    "writes_calendar_state": False,
+                    "canonical_writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    payload = _calendar_maintenance_payload(result, execute=args.execute)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    success = {
+        "STAGED",
+        "SOURCE_PENDING",
+        "ALREADY_ATTEMPTED",
+        "NOT_DUE",
+        "PROMOTED",
+    }
+    return 0 if result.outcome in success else 1
 
 
 def _market_continuity_command(args: argparse.Namespace) -> int:
@@ -1119,6 +1363,12 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "calendar-generation-status":
+        return _calendar_generation_status_command(args)
+    if args.command == "calendar-generation-stage":
+        return _calendar_generation_stage_command(args)
+    if args.command == "calendar-maintenance":
+        return _calendar_maintenance_command(args)
     if args.command == "market-continuity":
         return _market_continuity_command(args)
     if args.command == "market-provider-daily-shadow":
