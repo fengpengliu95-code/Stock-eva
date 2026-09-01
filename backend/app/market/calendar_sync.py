@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -57,6 +58,14 @@ _TRANSPORT_ERROR_PRIORITY = {
         )
     )
 }
+_RUNTIME_MAINTENANCE_SUCCESS = {
+    "STAGED",
+    "SOURCE_PENDING",
+    "ALREADY_ATTEMPTED",
+    "NOT_DUE",
+    "PROMOTED",
+}
+logger = logging.getLogger(__name__)
 
 
 class TradingDateProvider(Protocol):
@@ -514,6 +523,12 @@ class CalendarSyncService:
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> CalendarSyncPlan | None:
+        # Capture authority before consulting legacy sync control.  An unavailable live
+        # generation must not even open that reader, and all subsequent range/source work in
+        # this operation is bound to the same concrete object.
+        calendar_snapshot = self._calendar_snapshot()
+        if getattr(calendar_snapshot, "status", "confirmed") != "confirmed":
+            return None
         local = now.astimezone(SHANGHAI)
         if mode == "auto":
             decision = self.policy.decide(
@@ -538,7 +553,6 @@ class CalendarSyncService:
             end_date = local.date()
         if start_date > end_date:
             raise ValueError("calendar sync start date must not exceed end date")
-        calendar_snapshot = self._calendar_snapshot()
         authority_payload = self._authority_payload(calendar_snapshot)
         encoded = json.dumps(
             authority_payload,
@@ -829,15 +843,37 @@ async def run_calendar_sync_loop(
     clock: Callable[[], datetime],
     poll_seconds: float = 60,
     execute_plan: Callable[[CalendarSyncPlan], CalendarSyncResult | None] | None = None,
+    runtime_maintenance: Callable[[], object] | None = None,
 ) -> None:
-    """Run one startup check, then monthly/daily slots without blocking the API."""
+    """Run runtime maintenance plus legacy monthly/daily checks without blocking the API."""
 
     startup = True
     while not stop.is_set():
-        plan = service.plan(
-            now=clock(),
-            mode="auto",
-            startup=startup,
+        runtime_blocked = False
+        if runtime_maintenance is not None:
+            try:
+                runtime_result = await asyncio.to_thread(runtime_maintenance)
+            except Exception:
+                # A runtime maintenance bug/control failure must not terminate the existing
+                # scheduler or fall through to a legacy provider request in this iteration.
+                logger.error(
+                    "calendar runtime maintenance iteration failed",
+                    extra={"error_code": "CALENDAR_RUNTIME_MAINTENANCE_FAILED"},
+                )
+                runtime_blocked = True
+            else:
+                runtime_blocked = (
+                    runtime_result is None
+                    or getattr(runtime_result, "outcome", None) not in _RUNTIME_MAINTENANCE_SUCCESS
+                )
+        plan = (
+            None
+            if runtime_blocked
+            else service.plan(
+                now=clock(),
+                mode="auto",
+                startup=startup,
+            )
         )
         if plan is not None:
             result = await asyncio.to_thread(

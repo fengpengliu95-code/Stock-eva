@@ -136,19 +136,24 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
 
     class CapturingAutomationService:
         def __init__(self, *_args, **kwargs) -> None:
+            captured["calendar"] = _args[2]
             captured.update(kwargs)
 
     class CapturingCalendarService:
         def __init__(self, *_args, **kwargs) -> None:
+            calendar_captured["calendar"] = _args[1]
             calendar_captured.update(kwargs)
 
-    async def idle_loop(_service, stop, **_kwargs) -> None:
+    loop_captured = {}
+
+    async def idle_loop(_service, stop, **kwargs) -> None:
+        loop_captured.update(kwargs)
         await stop.wait()
 
     monkeypatch.setattr(
         main_module,
         "settings",
-        base.model_copy(update={"auto_refresh_enabled": True}),
+        base.model_copy(update={"auto_refresh_enabled": True, "calendar_runtime_enabled": True}),
     )
     monkeypatch.setattr(main_module, "MarketAutomationService", CapturingAutomationService)
     monkeypatch.setattr(main_module, "CalendarSyncService", CapturingCalendarService)
@@ -166,7 +171,9 @@ def test_lifespan_initializes_provider_health_only_when_automatic_refresh_is_ena
     assert health_path.exists()
     assert isinstance(captured["health_store"], SQLiteProviderHealthStore)
     assert calendar_captured["health_store"] is captured["health_store"]
+    assert calendar_captured["calendar"] is captured["calendar"]
     assert captured["probe_runner"] is not None
+    assert loop_captured["runtime_maintenance"] is not None
 
 
 def test_calendar_and_private_backup_agents_have_bounded_scopes() -> None:

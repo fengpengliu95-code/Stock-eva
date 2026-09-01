@@ -456,7 +456,8 @@ def market_summary(
             status_code=422,
             detail="market summary does not accept client freshness parameters",
         )
-    expected_session = calendar.latest_expected_session(clock())
+    calendar_snapshot = calendar.snapshot()
+    expected_session = calendar_snapshot.latest_expected_session(clock())
     return MarketSummaryService(store).latest(expected_session=expected_session)
 
 
@@ -471,8 +472,12 @@ def market_status(
         Depends(get_calendar_sync_store),
     ],
 ) -> MarketDataStatus:
+    # Pin the promoted authority once for the complete response.  Calling methods on the
+    # live facade separately could otherwise mix generations if maintenance publishes between
+    # those calls.
+    calendar_snapshot = calendar.snapshot()
     now = clock().astimezone(SHANGHAI)
-    expected = calendar.latest_expected_session(now)
+    expected = calendar_snapshot.latest_expected_session(now)
     published = store.published_refresh()
     scheduler = store.scheduler_state()
     try:
@@ -494,7 +499,11 @@ def market_status(
         if calendar_maintenance.conflict_detected
         else scheduler.calendar_status
         if scheduler is not None and scheduler.calendar_status != "confirmed"
-        else ("confirmed" if calendar.session_status(now.date()) != "unknown" else "unavailable")
+        else (
+            "confirmed"
+            if calendar_snapshot.session_status(now.date()) != "unknown"
+            else "unavailable"
+        )
     )
     refresh_enabled = settings.auto_refresh_enabled or settings.scheduled_refresh_enabled
     refresh_state = (
@@ -504,7 +513,7 @@ def market_status(
         if refresh_enabled
         else "disabled"
     )
-    phase = calendar.market_phase(now)
+    phase = calendar_snapshot.market_phase(now)
     if phase == "after_close_waiting":
         if refresh_state == "running":
             phase = "refreshing"
@@ -516,7 +525,7 @@ def market_status(
             phase = "delayed"
     if isinstance(store, NasMarketStore):
         continuity_scanner = ContinuityInventory(
-            calendar=calendar,
+            calendar=calendar_snapshot,
             inventory_reader=store,
             inventory_mode="immutable_dataset",
             calendar_conflict=lambda: calendar_maintenance.conflict_detected,
@@ -574,7 +583,7 @@ def market_status(
         calendar_conflict_detected=calendar_maintenance.conflict_detected,
         calendar_conflict_at=calendar_maintenance.conflict_at,
         calendar_next_sync_at=(calendar_decision.next_sync_at or calendar_maintenance.next_sync_at),
-        calendar_sources=[item.model_dump() for item in calendar.sources_for(now.year)],
+        calendar_sources=[item.model_dump() for item in calendar_snapshot.sources_for(now.year)],
         **continuity.model_dump(mode="python"),
     )
     return MarketDataStatus.model_validate(status.model_dump(mode="python", round_trip=True))

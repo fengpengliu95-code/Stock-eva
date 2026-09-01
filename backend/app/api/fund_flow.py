@@ -78,4 +78,5 @@ def fund_flow_evidence(
         scope=scope,
         scope_id=normalized_scope_id,
     )
-    return FundFlowEvidenceService(calendar).evaluate(snapshot)
+    calendar_snapshot = calendar.snapshot()
+    return FundFlowEvidenceService(calendar_snapshot).evaluate(snapshot)

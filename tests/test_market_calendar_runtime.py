@@ -975,6 +975,298 @@ def test_cli_calendar_maintenance_valid_plan_is_zero_network_and_no_provider(
     assert source.exists()
 
 
+def test_cli_calendar_sync_runtime_runs_once_then_rejects_stale_legacy_plan(
+    monkeypatch, capsys, tmp_path
+):
+    settings = Settings(
+        _env_file=None,
+        calendar_runtime_enabled=True,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    first = TradingCalendar.from_dict(
+        {
+            "year": 2026,
+            "status": "confirmed",
+            "published_on": "2025-12-20",
+            "sources": [],
+            "closed_dates": ["2026-01-01"],
+        }
+    )
+    second = TradingCalendar.from_dict(
+        {
+            "year": 2026,
+            "status": "confirmed",
+            "published_on": "2025-12-20",
+            "sources": [],
+            "closed_dates": ["2026-01-02"],
+        }
+    )
+    events: list[str] = []
+
+    class Live:
+        def __init__(self):
+            self.snapshots = [first, second]
+
+        def snapshot(self):
+            events.append("snapshot")
+            return self.snapshots.pop(0)
+
+    live = Live()
+
+    class RuntimeService:
+        def execute(self):
+            events.append("runtime")
+            return SimpleNamespace(
+                outcome="NOT_DUE",
+                target_year=2026,
+                source_sha256=None,
+                generation_sha256=None,
+                next_year_status="not_due",
+                network_requests=0,
+                official_requests=0,
+                machine_requests=0,
+                writes_calendar_state=False,
+            )
+
+    class NoWriteCalendarStore:
+        def __init__(self, _path, *, initialize):
+            events.append(f"legacy-store:{initialize}")
+
+    class NoCallProvider:
+        def trading_dates(self, *_args):
+            events.append("provider-request")
+            raise AssertionError("stale plan must not request provider")
+
+    class NoInitHealth:
+        def __init__(self, *_args, **_kwargs):
+            events.append("legacy-health")
+
+        def initialize(self):
+            events.append("legacy-health-init")
+
+        def provider_health(self):
+            return SimpleNamespace(state="CLOSED")
+
+    class NoLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class ReadyPreflight:
+        def __init__(self, _settings):
+            pass
+
+        def inspect(self):
+            return SimpleNamespace(market_data_available=True, mode="local")
+
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(cli_module, "_calendar_runtime_service", lambda _settings: RuntimeService())
+    monkeypatch.setattr(cli_module, "build_live_trading_calendar", lambda _settings: live)
+    monkeypatch.setattr(cli_module, "CalendarSyncStore", NoWriteCalendarStore)
+    monkeypatch.setattr(cli_module, "SQLiteProviderHealthStore", NoInitHealth)
+    monkeypatch.setattr(cli_module, "BaoStockProvider", lambda **_kwargs: NoCallProvider())
+    monkeypatch.setattr(cli_module, "RefreshRunLock", NoLock)
+    monkeypatch.setattr(
+        cli_module,
+        "get_market_clock",
+        lambda: lambda: datetime(2026, 7, 24, 16, 30, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "calendar-sync",
+            "--mode",
+            "light",
+            "--start",
+            "2026-07-24",
+            "--end",
+            "2026-07-24",
+            "--execute",
+        ],
+    )
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failure_code"] == "CALENDAR_AUTHORITY_CHANGED"
+    assert payload["writes_calendar_state"] is False
+    assert payload["calendar_maintenance"]["outcome"] == "NOT_DUE"
+    assert events[:2] == ["runtime", "snapshot"]
+    assert events.count("snapshot") == 2
+    assert "provider-request" not in events
+
+
+def test_cli_calendar_sync_runtime_unavailable_blocks_legacy_construction(
+    monkeypatch, capsys, tmp_path
+):
+    settings = Settings(
+        _env_file=None,
+        calendar_runtime_enabled=True,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    events: list[str] = []
+
+    class RuntimeService:
+        def execute(self):
+            events.append("runtime")
+            return SimpleNamespace(
+                outcome="CONTROL_STATE_UNAVAILABLE",
+                target_year=2026,
+                source_sha256=None,
+                generation_sha256=None,
+                next_year_status="not_due",
+                network_requests=0,
+                official_requests=0,
+                machine_requests=0,
+                writes_calendar_state=False,
+            )
+
+    class UnavailableLive:
+        def snapshot(self):
+            events.append("snapshot")
+            return EMPTY_CALENDAR
+
+    class Forbidden:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("legacy calendar/provider/health must not be constructed")
+
+    class ReadyPreflight:
+        def __init__(self, _settings):
+            pass
+
+        def inspect(self):
+            return SimpleNamespace(market_data_available=True, mode="local")
+
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(cli_module, "_calendar_runtime_service", lambda _settings: RuntimeService())
+    monkeypatch.setattr(
+        cli_module, "build_live_trading_calendar", lambda _settings: UnavailableLive()
+    )
+    monkeypatch.setattr(cli_module, "CalendarSyncStore", Forbidden)
+    monkeypatch.setattr(cli_module, "SQLiteProviderHealthStore", Forbidden)
+    monkeypatch.setattr(cli_module, "BaoStockProvider", Forbidden)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync", "--execute"])
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "unavailable",
+        "outcome": "CONTROL_STATE_UNAVAILABLE",
+        "network_requests": 0,
+        "writes_calendar_state": False,
+        "canonical_writes": False,
+    }
+    assert events == ["runtime", "snapshot"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "OFFICIAL_UNAVAILABLE",
+        "MACHINE_UNAVAILABLE",
+        "SKIPPED_CIRCUIT_OPEN",
+        "CONTROL_STATE_UNAVAILABLE",
+    ],
+)
+def test_cli_calendar_sync_runtime_terminal_failure_is_not_reported_success(
+    outcome, monkeypatch, capsys, tmp_path
+):
+    settings = Settings(
+        _env_file=None,
+        calendar_runtime_enabled=True,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    calendar = TradingCalendar.from_dict(
+        {
+            "year": 2026,
+            "status": "confirmed",
+            "published_on": "2025-12-20",
+            "sources": [],
+            "closed_dates": [],
+        }
+    )
+
+    class RuntimeService:
+        def execute(self):
+            return SimpleNamespace(
+                outcome=outcome,
+                target_year=2026,
+                source_sha256="a" * 64,
+                generation_sha256=None,
+                next_year_status="pending",
+                network_requests=3,
+                official_requests=2,
+                machine_requests=1,
+                writes_calendar_state=True,
+            )
+
+    class Live:
+        def snapshot(self):
+            return calendar
+
+    class NoWriteCalendarStore:
+        def __init__(self, _path, *, initialize):
+            assert initialize is True
+
+    class NoLegacyPlan:
+        def __init__(self, *_args, **_kwargs):
+            self.policy = SimpleNamespace()
+
+        def plan(self, **_kwargs):
+            return None
+
+    class ReadyPreflight:
+        def __init__(self, _settings):
+            pass
+
+        def inspect(self):
+            return SimpleNamespace(market_data_available=True, mode="local")
+
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "StoragePreflight", ReadyPreflight)
+    monkeypatch.setattr(cli_module, "_calendar_runtime_service", lambda _settings: RuntimeService())
+    monkeypatch.setattr(cli_module, "build_live_trading_calendar", lambda _settings: Live())
+    monkeypatch.setattr(cli_module, "CalendarSyncStore", NoWriteCalendarStore)
+    monkeypatch.setattr(cli_module, "CalendarSyncService", NoLegacyPlan)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync", "--execute"])
+
+    assert cli_module.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "not-due"
+    assert payload["calendar_maintenance"]["outcome"] == outcome
+    assert payload["calendar_maintenance"]["network_requests"] == 3
+    assert payload["calendar_maintenance"]["writes_calendar_state"] is True
+
+
 def test_enabled_runtime_rejects_symlink_without_following_or_repairing(tmp_path):
     target = tmp_path / "target" / "calendar_generations.sqlite3"
     _promote_2027(target)

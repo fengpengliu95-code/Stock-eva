@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.app.api.router import api_router
-from backend.app.config import get_settings
+from backend.app.config import CalendarRuntimeSettings, get_settings
 from backend.app.market.automation import (
     BaoStockProbeRunner,
     MarketAutomationService,
@@ -18,7 +18,10 @@ from backend.app.market.automation import (
     run_automation_loop,
 )
 from backend.app.market.baostock import BaoStockProvider
-from backend.app.market.calendar import get_trading_calendar
+from backend.app.market.calendar import build_live_trading_calendar
+from backend.app.market.calendar_generation import CalendarGenerationStore
+from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+from backend.app.market.calendar_maintenance_health import CalendarMaintenanceHealthStore
 from backend.app.market.calendar_sync import (
     CalendarSyncService,
     CalendarSyncStore,
@@ -83,7 +86,30 @@ async def lifespan(_: FastAPI):
             yield
             return
     user_store = UserStore(layout.local_paths.user_database)
-    trading_calendar = get_trading_calendar()
+    calendar_runtime = CalendarRuntimeSettings.from_settings(settings)
+    trading_calendar = build_live_trading_calendar(calendar_runtime)
+    runtime_maintenance = None
+    if calendar_runtime.calendar_runtime_enabled:
+        # The in-process calendar loop owns the same one-slot runtime maintenance boundary as
+        # the calendar-sync CLI.  The existing-only health adapter keeps control failures
+        # fail-closed and the clock callable is intentionally fresh for each service phase.
+        runtime_health = CalendarMaintenanceHealthStore(
+            layout.local_paths.control / calendar_runtime.provider_health_database_name,
+            failure_threshold=calendar_runtime.provider_circuit_failure_threshold,
+            cooldown_seconds=calendar_runtime.provider_circuit_cooldown_seconds,
+            probe_lease_seconds=calendar_runtime.provider_circuit_probe_lease_seconds,
+            clock=get_market_clock(),
+        )
+        runtime_service = CalendarMaintenanceService(
+            CalendarGenerationStore(
+                layout.local_paths.control / calendar_runtime.calendar_generation_database_name
+            ),
+            runtime_health,
+            clock=get_market_clock(),
+            socket_timeout_seconds=calendar_runtime.baostock_socket_timeout_seconds,
+            min_request_interval_seconds=calendar_runtime.auto_refresh_min_request_interval_seconds,
+        )
+        runtime_maintenance = runtime_service.execute
     provider = BaoStockProvider(
         min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
         factor_cache_path=str(layout.local_paths.factor_cache_database),
@@ -177,7 +203,9 @@ async def lifespan(_: FastAPI):
         # The loop may plan a repair before calendar control state exists.  Its reader must
         # never create that state; the explicit execution callback below owns initialization.
         CalendarSyncStore(calendar_sync_path, initialize=False),
-        get_trading_calendar(),
+        # Reuse the long-lived live facade.  Each sync plan/execute still pins its own
+        # concrete snapshot and therefore observes a later promoted generation next operation.
+        trading_calendar,
         BaoStockProvider(
             min_request_interval_seconds=(settings.auto_refresh_min_request_interval_seconds),
             socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
@@ -212,6 +240,7 @@ async def lifespan(_: FastAPI):
             stop,
             clock=get_market_clock(),
             execute_plan=execute_calendar_plan,
+            runtime_maintenance=runtime_maintenance,
         )
     )
     try:

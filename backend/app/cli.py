@@ -19,6 +19,8 @@ from backend.app.classification.provider import BaoStockClassificationProvider
 from backend.app.classification.store import ClassificationStore
 from backend.app.classification.sync import run_classification_sync
 from backend.app.config import (
+    CalendarRuntimeSettings,
+    Settings,
     get_calendar_runtime_settings,
     get_market_failover_runtime_settings,
     get_settings,
@@ -41,7 +43,7 @@ from backend.app.market.backfill import (
     resolve_effective_window,
 )
 from backend.app.market.baostock import BaoStockProvider
-from backend.app.market.calendar import get_trading_calendar
+from backend.app.market.calendar import build_live_trading_calendar, get_trading_calendar
 from backend.app.market.calendar_generation import (
     CalendarGenerationError,
     CalendarGenerationStore,
@@ -886,6 +888,24 @@ def _calendar_maintenance_command(args: argparse.Namespace) -> int:
         "PROMOTED",
     }
     return 0 if result.outcome in success else 1
+
+
+def _calendar_runtime_service(settings: Settings) -> CalendarMaintenanceService:
+    """Build the existing-control runtime worker from the resolved Settings projection."""
+    runtime = CalendarRuntimeSettings.from_settings(settings)
+    return CalendarMaintenanceService(
+        CalendarGenerationStore(
+            runtime.local_control_dir / runtime.calendar_generation_database_name
+        ),
+        CalendarMaintenanceHealthStore(
+            runtime.local_control_dir / runtime.provider_health_database_name,
+            failure_threshold=runtime.provider_circuit_failure_threshold,
+            cooldown_seconds=runtime.provider_circuit_cooldown_seconds,
+            probe_lease_seconds=runtime.provider_circuit_probe_lease_seconds,
+        ),
+        socket_timeout_seconds=runtime.baostock_socket_timeout_seconds,
+        min_request_interval_seconds=runtime.auto_refresh_min_request_interval_seconds,
+    )
 
 
 def _market_continuity_command(args: argparse.Namespace) -> int:
@@ -2197,14 +2217,37 @@ def main() -> int:
                 )
             )
             return 2
+        now = get_market_clock()()
+        runtime_result = None
+        if args.execute and settings.calendar_runtime_enabled:
+            # The existing calendar-sync job owns one optional runtime slot.  Run it before
+            # planning legacy reconciliation so a newly promoted authority gets a fresh plan.
+            runtime_result = _calendar_runtime_service(settings).execute()
+        runtime_calendar = build_live_trading_calendar(
+            CalendarRuntimeSettings.from_settings(settings)
+        )
+        calendar_snapshot = runtime_calendar.snapshot()
+        if settings.calendar_runtime_enabled and calendar_snapshot.status != "confirmed":
+            print(
+                json.dumps(
+                    {
+                        "status": "unavailable",
+                        "outcome": "CONTROL_STATE_UNAVAILABLE",
+                        "network_requests": 0,
+                        "writes_calendar_state": False,
+                        "canonical_writes": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         calendar_store = CalendarSyncStore(
             layout.local_paths.control / settings.calendar_sync_database_name,
             initialize=args.execute,
         )
-        now = get_market_clock()()
         planning_service = CalendarSyncService(
             calendar_store,
-            get_trading_calendar(),
+            calendar_snapshot,
             None,
         )
         plan = planning_service.plan(
@@ -2245,11 +2288,32 @@ def main() -> int:
                     {
                         "status": "not-due",
                         "writes_calendar_state": False,
+                        **(
+                            {
+                                "calendar_maintenance": _calendar_maintenance_payload(
+                                    runtime_result, execute=True
+                                )
+                            }
+                            if runtime_result is not None
+                            else {}
+                        ),
                     },
                     ensure_ascii=False,
                 )
             )
-            return 0
+            return (
+                0
+                if runtime_result is None
+                or runtime_result.outcome
+                in {
+                    "STAGED",
+                    "SOURCE_PENDING",
+                    "ALREADY_ATTEMPTED",
+                    "NOT_DUE",
+                    "PROMOTED",
+                }
+                else 1
+            )
         try:
             calendar_health_store = SQLiteProviderHealthStore(
                 layout.provider_health_database,
@@ -2265,7 +2329,7 @@ def main() -> int:
             with RefreshRunLock(layout.market_refresh_lock):
                 result = CalendarSyncService(
                     calendar_store,
-                    get_trading_calendar(),
+                    runtime_calendar,
                     provider,
                     health_store=calendar_health_store,
                 ).execute(plan)
@@ -2297,12 +2361,30 @@ def main() -> int:
             json.dumps(
                 {
                     **result.model_dump(mode="json"),
-                    "writes_calendar_state": result.status != "skipped_circuit_open",
+                    "writes_calendar_state": (
+                        result.status != "skipped_circuit_open" and result.failure_code is None
+                    ),
+                    **(
+                        {
+                            "calendar_maintenance": _calendar_maintenance_payload(
+                                runtime_result, execute=True
+                            )
+                        }
+                        if runtime_result is not None
+                        else {}
+                    ),
                 },
                 ensure_ascii=False,
             )
         )
-        return 0 if result.status in {"ready", "observed_only"} else 1
+        runtime_ok = runtime_result is None or runtime_result.outcome in {
+            "STAGED",
+            "SOURCE_PENDING",
+            "ALREADY_ATTEMPTED",
+            "NOT_DUE",
+            "PROMOTED",
+        }
+        return 0 if result.status in {"ready", "observed_only"} and runtime_ok else 1
     control_store = MarketStore(
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,

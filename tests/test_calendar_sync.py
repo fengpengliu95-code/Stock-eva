@@ -5,6 +5,7 @@ import sys
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1096,6 +1097,142 @@ def test_calendar_loop_checks_startup_then_daily_slot(tmp_path: Path) -> None:
     assert len(provider.calls) == 2
     assert store.state().last_startup_slot_date == date(2026, 7, 24)
     assert store.state().last_light_slot_date == date(2026, 7, 24)
+
+
+def test_calendar_sync_plan_fails_closed_for_unavailable_calendar(tmp_path: Path) -> None:
+    class NoCallProvider:
+        def trading_dates(self, *_args) -> list[date]:
+            raise AssertionError("unavailable calendar must not reach provider")
+
+    class NoControlRead:
+        def state(self):
+            raise AssertionError("unavailable calendar must not read legacy control")
+
+    path = tmp_path / "calendar.sqlite3"
+    service = CalendarSyncService(
+        NoControlRead(),
+        TradingCalendar([]),
+        NoCallProvider(),
+    )
+
+    assert (
+        service.plan(
+            now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+            mode="auto",
+            startup=True,
+        )
+        is None
+    )
+    assert not path.exists()
+
+
+def test_calendar_loop_invokes_one_runtime_maintenance_callback_per_poll(tmp_path: Path) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    service = CalendarSyncService(store, synthetic_calendar(), CalendarProvider([]))
+    stop = asyncio.Event()
+    calls: list[int] = []
+
+    async def exercise() -> None:
+        def clock() -> datetime:
+            stop.set()
+            return datetime(2026, 7, 24, 9, 0, tzinfo=SHANGHAI)
+
+        def runtime():
+            calls.append(1)
+            return SimpleNamespace(outcome="NOT_DUE")
+
+        await run_calendar_sync_loop(
+            service,
+            stop,
+            clock=clock,
+            runtime_maintenance=runtime,
+            poll_seconds=0.001,
+        )
+
+    asyncio.run(exercise())
+    assert calls == [1]
+
+
+def test_calendar_loop_runtime_failure_does_not_kill_or_fall_through_to_legacy_provider() -> None:
+    stop = asyncio.Event()
+    calls: list[str] = []
+
+    class NoLegacyPlan:
+        def plan(self, **_kwargs):
+            calls.append("legacy-plan")
+            raise AssertionError("runtime failure must block legacy planning")
+
+    def broken_runtime() -> None:
+        calls.append("runtime")
+        stop.set()
+        raise RuntimeError("private provider detail")
+
+    async def exercise() -> None:
+        await run_calendar_sync_loop(
+            NoLegacyPlan(),
+            stop,
+            clock=lambda: (_ for _ in ()).throw(AssertionError("clock must not run")),
+            runtime_maintenance=broken_runtime,
+            poll_seconds=0.001,
+        )
+
+    asyncio.run(exercise())
+    assert calls == ["runtime"]
+
+
+@pytest.mark.parametrize("runtime_result", [None, SimpleNamespace(outcome="UNKNOWN")])
+def test_calendar_loop_unprovable_runtime_result_blocks_legacy_plan(runtime_result) -> None:
+    stop = asyncio.Event()
+
+    class NoLegacyPlan:
+        def plan(self, **_kwargs):
+            raise AssertionError("unprovable runtime result must block legacy planning")
+
+    def runtime():
+        stop.set()
+        return runtime_result
+
+    asyncio.run(
+        run_calendar_sync_loop(
+            NoLegacyPlan(),
+            stop,
+            clock=lambda: (_ for _ in ()).throw(AssertionError("clock must not run")),
+            runtime_maintenance=runtime,
+            poll_seconds=0.001,
+        )
+    )
+
+
+def test_calendar_loop_retries_after_runtime_exception_on_next_poll() -> None:
+    stop = asyncio.Event()
+    events: list[str] = []
+
+    class LegacyPlan:
+        def plan(self, **_kwargs):
+            events.append("legacy-plan")
+            stop.set()
+            return None
+
+    runtime_calls = 0
+
+    def runtime():
+        nonlocal runtime_calls
+        runtime_calls += 1
+        events.append(f"runtime-{runtime_calls}")
+        if runtime_calls == 1:
+            raise RuntimeError("private provider detail")
+        return SimpleNamespace(outcome="NOT_DUE")
+
+    asyncio.run(
+        run_calendar_sync_loop(
+            LegacyPlan(),
+            stop,
+            clock=lambda: datetime(2026, 7, 24, 9, 0, tzinfo=SHANGHAI),
+            runtime_maintenance=runtime,
+            poll_seconds=0.001,
+        )
+    )
+    assert events == ["runtime-1", "runtime-2", "legacy-plan"]
 
 
 def test_calendar_sync_cli_defaults_to_network_free_plan(

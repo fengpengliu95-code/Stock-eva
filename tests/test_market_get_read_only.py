@@ -10,12 +10,16 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import httpx
 import pytest
+from starlette.requests import Request
 
+import backend.app.api.fund_flow as fund_flow_api
 import backend.app.api.market as market_api
+import backend.app.api.user as user_api
 import backend.app.cli as cli_module
 import backend.app.main as main_module
 import backend.app.market.store as market_store_module
@@ -23,7 +27,8 @@ from backend.app.classification.models import TAXONOMY_BAOSTOCK_INDUSTRY
 from backend.app.config import Settings, get_settings
 from backend.app.main import app
 from backend.app.market.automation import RefreshRunLock
-from backend.app.market.calendar_sync import CalendarSyncStore
+from backend.app.market.calendar import SHANGHAI, get_trading_calendar
+from backend.app.market.calendar_sync import CalendarSyncState, CalendarSyncStore
 from backend.app.market.continuity import ContinuityStatusSummary, ContinuityUnavailable
 from backend.app.market.daily_shadow_registry import DailyShadowRegistryUnavailable
 from backend.app.market.evidence import EvidenceReader
@@ -957,6 +962,100 @@ def test_market_status_outer_continuity_model_is_revalidated_and_sanitized(
     serialized = json.dumps(payload)
     assert "raw token=secret" not in serialized
     assert "/private/status" not in serialized
+
+
+class _OperationCalendar:
+    """Facade that rejects direct calls, forcing callers to pin one snapshot."""
+
+    def __init__(self):
+        self.concrete = get_trading_calendar().snapshot()
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return self.concrete
+
+    def __getattr__(self, name):
+        raise AssertionError(f"calendar method {name} bypassed operation snapshot")
+
+
+def _empty_request() -> Request:
+    return Request({"type": "http", "method": "GET", "path": "/", "query_string": b""})
+
+
+def test_market_summary_and_status_pin_one_concrete_calendar_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calendar = _OperationCalendar()
+    now = datetime(2026, 7, 23, 18, 20, tzinfo=SHANGHAI)
+    settings = Settings(_env_file=None, local_control_dir=tmp_path / "control")
+
+    class Store:
+        def published_refresh(self):
+            return None
+
+        def scheduler_state(self):
+            return None
+
+    monkeypatch.setattr(
+        market_api,
+        "MarketSummaryService",
+        lambda _store: SimpleNamespace(latest=lambda *, expected_session: expected_session),
+    )
+    summary = market_api.market_summary(_empty_request(), Store(), calendar, lambda: now)
+    assert summary == date(2026, 7, 23)
+    assert calendar.snapshot_calls == 1
+
+    status = market_api.market_status(
+        Store(),
+        calendar,
+        lambda: now,
+        settings,
+        SimpleNamespace(state=lambda: CalendarSyncState()),
+    )
+    assert status.latest_expected_session == date(2026, 7, 23)
+    assert calendar.snapshot_calls == 2
+
+
+def test_portfolio_and_fund_flow_outer_operations_pass_concrete_calendar_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calendar = _OperationCalendar()
+    now = datetime(2026, 7, 23, 18, 20, tzinfo=SHANGHAI)
+
+    monkeypatch.setattr(
+        user_api,
+        "PortfolioValuationService",
+        lambda *_args: SimpleNamespace(latest=lambda expected_session: expected_session),
+    )
+    valuation = user_api.portfolio_valuation(
+        _empty_request(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        calendar,
+        lambda: now,
+    )
+    assert valuation == date(2026, 7, 23)
+    assert calendar.snapshot_calls == 1
+
+    class FundFlowService:
+        def __init__(self, received):
+            assert received is calendar.concrete
+
+        def evaluate(self, _snapshot):
+            return "evaluated"
+
+    monkeypatch.setattr(fund_flow_api, "FundFlowEvidenceService", FundFlowService)
+    result = fund_flow_api.fund_flow_evidence(
+        as_of=date(2026, 7, 23),
+        scope="market",
+        scope_id=None,
+        store=SimpleNamespace(read=lambda **_: object()),
+        calendar=calendar,
+        today=date(2026, 7, 23),
+    )
+    assert result == "evaluated"
+    assert calendar.snapshot_calls == 2
 
 
 def test_market_continuity_execute_enqueues_only_after_strict_rescan(

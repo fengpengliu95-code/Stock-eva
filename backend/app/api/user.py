@@ -119,8 +119,9 @@ def portfolio_valuation(
             status_code=422,
             detail="portfolio valuation does not accept client freshness parameters",
         )
+    calendar_snapshot = calendar.snapshot()
     return PortfolioValuationService(user_store, market_store).latest(
-        calendar.latest_expected_session(clock())
+        calendar_snapshot.latest_expected_session(clock())
     )
 
 
