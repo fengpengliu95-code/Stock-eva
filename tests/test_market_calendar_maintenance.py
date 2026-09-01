@@ -637,6 +637,42 @@ class _AuditedProvider:
         ]
 
 
+class _AuditedFailureProvider:
+    def __init__(self):
+        self.run_id = None
+
+    @contextmanager
+    def refresh_operation(self, run_id):
+        self.run_id = run_id
+        yield
+
+    def calendar_days(self, start, end):
+        from backend.app.market import baostock_vendor
+
+        assert self.run_id is not None
+        sink = baostock_vendor._observation_sink.get()
+        assert sink is not None
+        sink(
+            TransportObservation(
+                refresh_id=self.run_id,
+                provider_session_id="calendar-failure-session",
+                request_id="calendar-failure-request",
+                endpoint=ProviderEndpoint.TRADE_DATES,
+                attempt=1,
+                page=1,
+                protocol_stage=ProtocolStage.OPERATION,
+                elapsed_ms=1,
+                recv_calls=1,
+                response_bytes=1,
+                end_marker_seen=False,
+                normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+                outcome=TransportOutcome.ERROR,
+                observed_at=NOW,
+            )
+        )
+        raise BaoStockError("synthetic audited timeout")
+
+
 def test_worker_early_official_failure_spends_slot_without_provider(tmp_path):
     from backend.app.market.calendar_maintenance import CalendarMaintenanceService
 
@@ -913,11 +949,12 @@ def test_worker_propagates_programmer_error_from_evidence_retention(tmp_path):
     assert attempt.finished_at is None
 
 
-def test_worker_uses_one_fresh_machine_completion_time_across_1810_boundary(tmp_path):
+def test_worker_resamples_promotion_time_after_health_audit_crosses_1810(tmp_path):
     from backend.app.market.calendar_maintenance import CalendarMaintenanceService
 
-    started = datetime(2026, 12, 23, 10, 9, 59, tzinfo=UTC)
-    completed = datetime(2026, 12, 23, 10, 10, tzinfo=UTC)
+    started = datetime(2026, 12, 23, 10, 9, 58, tzinfo=UTC)
+    machine_completed = datetime(2026, 12, 23, 10, 9, 59, tzinfo=UTC)
+    promoted_at = datetime(2026, 12, 23, 10, 10, tzinfo=UTC)
     source = _bundled_2026_revision()
 
     class CapturePromotion(CalendarGenerationStore):
@@ -930,7 +967,7 @@ def test_worker_uses_one_fresh_machine_completion_time_across_1810_boundary(tmp_
     store = CapturePromotion(tmp_path / "calendar.sqlite3")
     assert store.stage_execute(source, started).outcome == "STAGED"
     health = _ClosedHealth()
-    times = iter((started, completed))
+    times = iter((started, machine_completed, promoted_at))
     result = CalendarMaintenanceService(
         store,
         health,
@@ -943,12 +980,12 @@ def test_worker_uses_one_fresh_machine_completion_time_across_1810_boundary(tmp_
     assert (result.official_requests, result.machine_requests) == (2, 1)
     assert store.promoted is not None
     machine, promoted_at = store.promoted
-    assert machine.observed_at == completed
-    assert promoted_at == completed
-    assert health.terminal_success[-1][2] == completed
+    assert machine.observed_at == machine_completed
+    assert promoted_at == datetime(2026, 12, 23, 10, 10, tzinfo=UTC)
+    assert health.terminal_success[-1][2] == machine_completed
     attempt = store.read_control().attempts[-1]
     assert attempt.outcome == "HISTORY_CHANGE"
-    assert attempt.finished_at == completed
+    assert attempt.finished_at == promoted_at
     assert store.read().generation is None
 
 
@@ -993,6 +1030,35 @@ def test_worker_machine_completion_clock_rollback_is_control_unavailable(tmp_pat
     assert attempt.finished_at is None
 
 
+def test_worker_failure_clock_rollback_does_not_mutate_breaker_or_endpoint_outcome(tmp_path):
+    from backend.app.market.calendar_maintenance import CalendarMaintenanceService
+
+    store, health, _source = _worker_fixture(tmp_path)
+    times = iter((NOW, NOW - timedelta(seconds=1)))
+    result = CalendarMaintenanceService(
+        store,
+        health,
+        http_client_factory=_official_factory(),
+        provider_factory=lambda **kwargs: _AuditedFailureProvider(),
+        clock=lambda: next(times),
+    ).execute()
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert (result.official_requests, result.machine_requests) == (2, 1)
+    attempt = store.read_control().attempts[-1]
+    assert attempt.outcome == "RUNNING"
+    assert attempt.finished_at is None
+    with sqlite3.connect(health.path) as connection:
+        circuit = connection.execute(
+            "SELECT state,consecutive_failures FROM endpoint_circuits WHERE endpoint='trade_dates'"
+        ).fetchone()
+        outcomes = connection.execute(
+            "SELECT COUNT(*) FROM endpoint_outcomes WHERE endpoint='trade_dates'"
+        ).fetchone()[0]
+    assert circuit == ("CLOSED", 0)
+    assert outcomes == 0
+
+
 @pytest.mark.parametrize(
     "promotion_outcome",
     ["PARENT_CHANGED", "HISTORY_CHANGE", "CONTROL_STATE_UNAVAILABLE"],
@@ -1014,7 +1080,7 @@ def test_worker_terminalizes_nonterminal_promotion_failures(tmp_path, promotion_
     assert store.stage_execute(source, NOW).outcome == "STAGED"
     health = _ClosedHealth()
     completed = NOW + timedelta(minutes=1)
-    times = iter((NOW, completed))
+    times = iter((NOW, completed, completed))
     result = CalendarMaintenanceService(
         store,
         health,
@@ -1048,7 +1114,8 @@ def test_worker_reports_control_unavailable_when_promotion_failure_cannot_finish
     source = _valid_source()
     store = FinishFails(tmp_path / "calendar.sqlite3")
     assert store.stage_execute(source, NOW).outcome == "STAGED"
-    times = iter((NOW, NOW + timedelta(minutes=1)))
+    completed = NOW + timedelta(minutes=1)
+    times = iter((NOW, completed, completed))
     result = CalendarMaintenanceService(
         store,
         _ClosedHealth(),
@@ -1083,7 +1150,7 @@ def test_worker_does_not_finish_twice_when_promotion_terminalizes_machine_confli
     store = CountFinish(tmp_path / "calendar.sqlite3")
     assert store.stage_execute(source, NOW).outcome == "STAGED"
     completed = NOW + timedelta(minutes=1)
-    times = iter((NOW, completed))
+    times = iter((NOW, completed, completed))
     result = CalendarMaintenanceService(
         store,
         _ClosedHealth(),

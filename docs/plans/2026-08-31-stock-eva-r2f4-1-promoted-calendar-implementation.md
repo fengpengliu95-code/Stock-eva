@@ -159,6 +159,23 @@ calendar-sync and provider-health file hashes remain unchanged. All acquisition 
 offline; no production/canonical/NAS/deployment state was accessed. These repairs require a new
 exact-HEAD independent SPEC review, followed by QUALITY review; Task 2 and R2-F4.1 remain NO-GO.
 
+**Task 2 time-boundary repair checkpoint:** The next independent SPEC re-review of
+`293ab334da21f96c1542b458b50086998c07080f` returned H=0/M=2/L=0 and NO-GO. It reproduced two
+remaining trusted-time gaps: promotion still reused the machine-completion instant after the
+health audit, so a call crossing 18:10 could publish; and the failure path could mutate the
+breaker and endpoint outcome before rejecting a completion clock rollback.
+
+The worker now samples a distinct promotion instant after the terminal health audit, passes that
+instant to the store and terminal attempt, and lets the store enforce the 18:10 boundary at the
+actual promotion step. A machine-failure completion instant older than the durable attempt start
+now returns `CONTROL_STATE_UNAVAILABLE` before any breaker or endpoint-outcome mutation. Retained
+RED/GREEN tests use the real generation and health stores to prove both boundaries. Fresh root
+evidence: calendar-generation 165, maintenance 57, health 59, BaoStock 91 and calendar-sync 33,
+for 405/405 focused; 26/26 independent private policy and execution probes; full repository
+2511/2511 with only the existing Starlette deprecation warning. This checkpoint still requires a
+new exact-HEAD independent SPEC review followed by QUALITY review; Task 2 and R2-F4.1 remain
+NO-GO.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

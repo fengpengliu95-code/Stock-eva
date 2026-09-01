@@ -777,6 +777,13 @@ class CalendarMaintenanceService:
             )
         except (BaoStockError, OSError, TimeoutError):
             completed_at = self._completion_time()
+            if completed_at < attempt.started_at:
+                return _safe_result(
+                    _with_outcome(decision, "CONTROL_STATE_UNAVAILABLE"),
+                    official_requests=2,
+                    machine_requests=1,
+                    writes_calendar_state=True,
+                )
             if not self._record_machine_failure(run_id, completed_at):
                 return self._finish_result(
                     decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
@@ -803,9 +810,17 @@ class CalendarMaintenanceService:
             return self._finish_result(
                 decision, attempt, "CONTROL_STATE_UNAVAILABLE", 2, 1, completed_at
             )
+        promoted_at = self._completion_time()
+        if promoted_at < completed_at:
+            return _safe_result(
+                _with_outcome(decision, "CONTROL_STATE_UNAVAILABLE"),
+                official_requests=2,
+                machine_requests=1,
+                writes_calendar_state=True,
+            )
         try:
             promoted = self._store.promote(
-                attempt, decision.source, official.bodies, machine, completed_at
+                attempt, decision.source, official.bodies, machine, promoted_at
             )
         except (CalendarStoreUnavailable, OSError, sqlite3.Error):
             return self._finish_result(
@@ -814,7 +829,7 @@ class CalendarMaintenanceService:
                 "CONTROL_STATE_UNAVAILABLE",
                 2,
                 1,
-                completed_at,
+                promoted_at,
             )
         if promoted.outcome == "PROMOTED":
             return _safe_result(
@@ -838,7 +853,7 @@ class CalendarMaintenanceService:
             promoted.outcome if promoted.outcome in known_promotion_failures else "PARENT_CHANGED"
         )
         if outcome in {"PARENT_CHANGED", "HISTORY_CHANGE", "CONTROL_STATE_UNAVAILABLE"}:
-            return self._finish_result(decision, attempt, outcome, 2, 1, completed_at)
+            return self._finish_result(decision, attempt, outcome, 2, 1, promoted_at)
         return _safe_result(
             _with_outcome(decision, outcome),
             official_requests=2,
