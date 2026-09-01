@@ -176,6 +176,21 @@ for 405/405 focused; 26/26 independent private policy and execution probes; full
 new exact-HEAD independent SPEC review followed by QUALITY review; Task 2 and R2-F4.1 remain
 NO-GO.
 
+**Task 2 terminal-audit repair checkpoint:** Independent QUALITY review of
+`e45283201f94120c52dfcf8c491841b6b070e828` returned H=0/M=1/L=0 and NO-GO. Several direct
+promotion-failure branches returned their specific outcome even when the durable attempt terminal
+audit failed, allowing the public result to contradict an attempt still recorded as `RUNNING`.
+
+All seven direct promotion-failure branches now use one fail-closed result path: a successful
+`_spend_attempt()` preserves the specific safe outcome and exact request counts, while a failed
+terminal write returns `CONTROL_STATE_UNAVAILABLE` with the same safe counts and source identity.
+Retained parameterized RED/GREEN coverage proves `OFFICIAL_HASH_MISMATCH`, `MACHINE_CONFLICT` and
+`MACHINE_UNAVAILABLE` terminal-write failures, while existing cases preserve successful audit
+semantics. Fresh root evidence: calendar-generation 168 and complete Task 2 focused 408/408; full
+repository 2514/2514 with only the existing Starlette deprecation warning. DDL and protected
+provider/calendar-sync/health hashes remain unchanged. A new exact-HEAD SPEC review followed by
+QUALITY review is required; Task 2 and R2-F4.1 remain NO-GO.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

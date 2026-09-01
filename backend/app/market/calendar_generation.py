@@ -1899,6 +1899,29 @@ class CalendarGenerationStore:
         except (OSError, sqlite3.Error, CalendarGenerationError, CalendarStoreUnavailable):
             return False
 
+    def _failure_result(
+        self,
+        attempt: CalendarMaintenanceAttempt,
+        outcome: str,
+        official_requests: int,
+        machine_requests: int,
+        *,
+        finished_at: datetime,
+    ) -> CalendarPromotionResult:
+        terminalized = self._spend_attempt(
+            attempt,
+            outcome,
+            official_requests,
+            machine_requests,
+            finished_at=finished_at,
+        )
+        return CalendarPromotionResult(
+            outcome=outcome if terminalized else "CONTROL_STATE_UNAVAILABLE",
+            source_sha256=attempt.source_sha256,
+            official_requests=official_requests,
+            machine_requests=machine_requests,
+        )
+
     def promote(
         self,
         attempt: CalendarMaintenanceAttempt,
@@ -1918,60 +1941,31 @@ class CalendarGenerationStore:
         try:
             machine = CalendarMachineObservationV1.model_validate_json(_model_json_bytes(machine))
         except (TypeError, ValueError):
-            self._spend_attempt(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="MACHINE_CONFLICT",
-                source_sha256=attempt.source_sha256,
-                official_requests=2,
-                machine_requests=1,
-            )
+            return self._failure_result(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
         if planned.source_sha256 != attempt.source_sha256 or planned.outcome == "SOURCE_CONFLICT":
-            self._spend_attempt(attempt, "MACHINE_CONFLICT", 0, 0, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="MACHINE_CONFLICT", source_sha256=attempt.source_sha256
-            )
+            return self._failure_result(attempt, "MACHINE_CONFLICT", 0, 0, finished_at=promoted_at)
         if len(official_bodies) != 2 or any(
             not isinstance(body, bytes) or not body or len(body) > MAX_BODY_BYTES
             for body in official_bodies
         ):
-            self._spend_attempt(attempt, "OFFICIAL_UNAVAILABLE", 2, 0, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="OFFICIAL_UNAVAILABLE", source_sha256=attempt.source_sha256
+            return self._failure_result(
+                attempt, "OFFICIAL_UNAVAILABLE", 2, 0, finished_at=promoted_at
             )
         body_hashes = tuple(body_sha256(body) for body in official_bodies)
         if body_hashes != tuple(schedule.body_sha256 for schedule in source.schedules):
-            self._spend_attempt(attempt, "OFFICIAL_HASH_MISMATCH", 2, 0, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="OFFICIAL_HASH_MISMATCH",
-                source_sha256=attempt.source_sha256,
-                official_requests=2,
+            return self._failure_result(
+                attempt, "OFFICIAL_HASH_MISMATCH", 2, 0, finished_at=promoted_at
             )
         if machine.observed_at < attempt.started_at or machine.observed_at > promoted_at:
-            self._spend_attempt(attempt, "MACHINE_UNAVAILABLE", 2, 1, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="MACHINE_UNAVAILABLE",
-                source_sha256=attempt.source_sha256,
-                official_requests=2,
-                machine_requests=1,
+            return self._failure_result(
+                attempt, "MACHINE_UNAVAILABLE", 2, 1, finished_at=promoted_at
             )
         source_map = _calendar_map(source.schedules[0])
         machine_map = {item.date: item.is_open for item in machine.days}
         if machine_map != source_map:
-            self._spend_attempt(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="MACHINE_CONFLICT",
-                source_sha256=attempt.source_sha256,
-                official_requests=2,
-                machine_requests=1,
-            )
+            return self._failure_result(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
         if build_observation_sha256(machine) != machine.observation_sha256:
-            self._spend_attempt(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
-            return CalendarPromotionResult(
-                outcome="MACHINE_CONFLICT",
-                source_sha256=attempt.source_sha256,
-                official_requests=2,
-                machine_requests=1,
-            )
+            return self._failure_result(attempt, "MACHINE_CONFLICT", 2, 1, finished_at=promoted_at)
         if not self.path.exists():
             return CalendarPromotionResult(
                 outcome="CONTROL_STATE_UNAVAILABLE", source_sha256=attempt.source_sha256

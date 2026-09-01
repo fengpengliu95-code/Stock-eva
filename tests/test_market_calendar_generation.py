@@ -2891,6 +2891,53 @@ def test_failure_audit_uses_promoted_at_and_real_request_counts(tmp_path, failur
     assert store.read().status == "ready"
 
 
+@pytest.mark.parametrize(
+    "failure", ["OFFICIAL_HASH_MISMATCH", "MACHINE_CONFLICT", "MACHINE_UNAVAILABLE"]
+)
+def test_promote_fails_closed_when_terminal_audit_cannot_be_spent(
+    tmp_path, monkeypatch, failure
+) -> None:
+    now = datetime(2026, 12, 22, 1, tzinfo=UTC)
+    source = _valid_source()
+    path = tmp_path / "calendar_generations.sqlite3"
+    store = CalendarGenerationStore(path)
+    assert store.stage_execute(source, now).outcome == "STAGED"
+    attempt = store.reserve_attempt(source, now)
+    machine = _machine_for(source, now)
+    bodies = (b"sse body", b"szse body")
+    expected_counts = (2, 0)
+    if failure == "OFFICIAL_HASH_MISMATCH":
+        bodies = (b"mismatched body", b"szse body")
+    elif failure == "MACHINE_CONFLICT":
+        days = list(machine.days)
+        days[0] = CalendarMachineDayV1(date=days[0].date, is_open=not days[0].is_open)
+        machine = build_observation(
+            provider=machine.provider,
+            contract_version=machine.contract_version,
+            range_start=machine.range_start,
+            range_end=machine.range_end,
+            observed_at=machine.observed_at,
+            days=tuple(days),
+        )
+        expected_counts = (2, 1)
+    else:
+        machine = _machine_for(source, now - timedelta(minutes=1))
+        expected_counts = (2, 1)
+
+    monkeypatch.setattr(store, "_spend_attempt", lambda *args, **kwargs: False)
+    result = store.promote(attempt, source, bodies, machine, now + timedelta(hours=1))
+
+    assert result.outcome == "CONTROL_STATE_UNAVAILABLE"
+    assert result.source_sha256 == attempt.source_sha256
+    assert (result.official_requests, result.machine_requests) == expected_counts
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT outcome,finished_at,official_requests,machine_requests "
+            "FROM calendar_maintenance_attempt"
+        ).fetchone()
+    assert row == ("RUNNING", None, 0, 0)
+
+
 def test_failure_audit_rejects_finished_before_started_without_writing(tmp_path) -> None:
     now = datetime(2026, 12, 22, 1, tzinfo=UTC)
     source = _valid_source()
