@@ -1072,7 +1072,21 @@ def test_market_continuity_execute_enqueues_only_after_strict_rescan(
     )
     control = _publish_fixture(settings, dataset_root)
     before_dataset = _fingerprint(control, dataset_root)
+    concrete_calendar = get_trading_calendar().snapshot()
+
+    class OperationCalendar:
+        snapshot_calls = 0
+
+        def snapshot(self):
+            self.snapshot_calls += 1
+            return concrete_calendar
+
+        def __getattr__(self, name):
+            raise AssertionError(f"continuity CLI bypassed operation snapshot: {name}")
+
+    operation_calendar = OperationCalendar()
     monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "get_trading_calendar", lambda: operation_calendar)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1106,6 +1120,7 @@ def test_market_continuity_execute_enqueues_only_after_strict_rescan(
     assert payload["writes_manifest"] is False
     assert payload["writes_pointer"] is False
     assert payload["created_count"] == 1
+    assert operation_calendar.snapshot_calls == 1
     after_dataset = _fingerprint(control, dataset_root)
     assert after_dataset.dataset_tree == before_dataset.dataset_tree
     assert after_dataset.calendar_hash == before_dataset.calendar_hash

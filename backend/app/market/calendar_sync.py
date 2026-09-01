@@ -275,6 +275,11 @@ class CalendarSyncStore:
                 """
             )
 
+    def initialize_for_write(self) -> None:
+        """Initialize writer state only after an operation has verified its authority."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
     def state(self) -> CalendarSyncState:
         if not self.path.exists():
             return CalendarSyncState()
@@ -637,6 +642,7 @@ class CalendarSyncService:
             return self._authority_changed_result(plan)
         if self.provider is None:
             raise RuntimeError("calendar sync execution requires a provider")
+        self.store.initialize_for_write()
         fetched_at = self.clock().astimezone(UTC)
         run_id = uuid.uuid4().hex
         if (

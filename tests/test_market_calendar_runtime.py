@@ -1235,7 +1235,7 @@ def test_cli_calendar_sync_runtime_terminal_failure_is_not_reported_success(
 
     class NoWriteCalendarStore:
         def __init__(self, _path, *, initialize):
-            assert initialize is True
+            assert initialize is False
 
     class NoLegacyPlan:
         def __init__(self, *_args, **_kwargs):

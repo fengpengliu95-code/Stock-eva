@@ -930,6 +930,7 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             return 1
 
         calendar = get_trading_calendar()
+        calendar_snapshot = calendar.snapshot()
         calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
         read_control = MarketStore(
             layout.local_paths.market_database,
@@ -942,7 +943,7 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             layout.local_paths.staging,
         )
         scanner = ContinuityInventory(
-            calendar=calendar,
+            calendar=calendar_snapshot,
             inventory_reader=immutable_store,
             inventory_mode="immutable_dataset",
             # Re-read the local sync state on every scan.  The enqueue service invokes a
@@ -951,7 +952,7 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             calendar_conflict=lambda: read_calendar_conflict(calendar_sync_path),
         )
         now = get_market_clock()()
-        latest = calendar.latest_expected_session(now)
+        latest = calendar_snapshot.latest_expected_session(now)
         scan = scanner.scan(
             configured_start=settings.market_continuity_start_date,
             latest_completed_session=latest,
@@ -2244,7 +2245,7 @@ def main() -> int:
             return 1
         calendar_store = CalendarSyncStore(
             layout.local_paths.control / settings.calendar_sync_database_name,
-            initialize=args.execute,
+            initialize=False,
         )
         planning_service = CalendarSyncService(
             calendar_store,

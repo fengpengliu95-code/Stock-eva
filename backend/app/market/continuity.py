@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from backend.app.market.calendar_sync import CalendarSyncStoreReadError
 from backend.app.market.failures import MarketFailureClass, MarketFailureStage
 from backend.app.market.models import RefreshResult
 from backend.app.market.provider_health import ProviderHealth
@@ -105,6 +106,10 @@ class RepairQueueError(RuntimeError):
 
 class RepairQueueConflictError(RepairQueueError):
     """A stale lease or state version failed its compare-and-swap."""
+
+
+class ContinuityOperationError(RuntimeError):
+    """An unexpected operation-scoped continuity dependency failed."""
 
 
 class ContinuityScanResult(BaseModel):
@@ -391,26 +396,26 @@ class ContinuityInventory:
             return ContinuityUnavailable(reason_code="CONTINUITY_RANGE_INVALID")
         if self._inventory_mode != "immutable_dataset":
             return ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
+        snapshot = getattr(self._calendar, "snapshot", None)
+        calendar = snapshot() if callable(snapshot) else self._calendar
         try:
-            snapshot = getattr(self._calendar, "snapshot", None)
-            calendar = snapshot() if callable(snapshot) else self._calendar
             conflict = (
                 self._calendar_conflict()
                 if callable(self._calendar_conflict)
                 else self._calendar_conflict
             )
-            if type(conflict) is not bool:
-                return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
-            if conflict:
-                return ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
-            if calendar.status != "confirmed":
-                return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
-            confirmed_open = calendar.confirmed_open_sessions(
-                effective_start,
-                effective_end,
-            )
-        except Exception:
+        except CalendarSyncStoreReadError:
             return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        if type(conflict) is not bool:
+            return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        if conflict:
+            return ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
+        if calendar.status != "confirmed":
+            return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
+        confirmed_open = calendar.confirmed_open_sessions(
+            effective_start,
+            effective_end,
+        )
         day_count = (effective_end - effective_start).days + 1
         if (
             confirmed_open is None
@@ -1472,6 +1477,8 @@ class RepairClaimCoordinator:
                 return self._replace_decision(refreshed, reason_code="REPAIR_CLAIMED")
         except RefreshAlreadyRunning:
             return self._repair_wait(initial, "ALREADY_RUNNING")
+        except ContinuityOperationError:
+            raise
         except Exception:
             return self._repair_wait(initial, "CONTROL_STATE_UNAVAILABLE")
 
@@ -1789,10 +1796,13 @@ class ContinuityRepairExecutor:
             if operation_scanner is not None:
                 if self.configured_start is None:
                     raise RepairQueueError("continuity start is unconfigured")
-                scan = operation_scanner.scan(
-                    configured_start=self.configured_start,
-                    latest_completed_session=latest_expected_session,
-                )
+                try:
+                    scan = operation_scanner.scan(
+                        configured_start=self.configured_start,
+                        latest_completed_session=latest_expected_session,
+                    )
+                except Exception as exc:
+                    raise ContinuityOperationError("operation continuity scan failed") from exc
                 if isinstance(scan, ContinuityUnavailable):
                     raise RepairQueueError("continuity evidence is unavailable")
             else:

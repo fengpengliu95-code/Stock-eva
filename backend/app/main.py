@@ -259,7 +259,7 @@ async def lifespan(_: FastAPI):
                 socket_timeout_seconds=settings.baostock_socket_timeout_seconds,
             )
         ),
-        continuity=coordinator if repair_executor is not None else None,
+        continuity=continuity if repair_executor is not None else None,
         repair_enabled=(repair_executor is not None),
         repair_executor=repair_executor,
         canonical_refresh=canonical_refresh,

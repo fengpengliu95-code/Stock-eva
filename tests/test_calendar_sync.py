@@ -223,6 +223,33 @@ def test_calendar_sync_stale_plan_fails_before_provider_health_or_state_writes(
         store.run(result.run_id)
 
 
+def test_calendar_sync_stale_plan_does_not_initialize_missing_store(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "calendar.sqlite3"
+    store = CalendarSyncStore(path, initialize=False)
+    calendar = SnapshotCalendar(
+        [
+            _snapshot_calendar(generation_sha256="a" * 64),
+            _snapshot_calendar(generation_sha256="b" * 64),
+        ]
+    )
+
+    class UnexpectedProvider(CalendarProvider):
+        def trading_dates(self, start_date, end_date):
+            raise AssertionError("stale plan must not call provider")
+
+    service = CalendarSyncService(store, calendar, UnexpectedProvider([]))
+    plan = service.plan(
+        now=datetime(2026, 7, 24, 16, 30, tzinfo=SHANGHAI),
+        mode="light",
+        start_date=date(2026, 7, 24),
+        end_date=date(2026, 7, 24),
+    )
+    result = service.execute(plan)
+
+    assert result.failure_code == "CALENDAR_AUTHORITY_CHANGED"
+    assert not path.parent.exists()
+
+
 def test_calendar_sync_checksum_binds_verified_generation_and_bundled_identities(
     tmp_path: Path,
 ) -> None:

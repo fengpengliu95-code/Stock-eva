@@ -2255,7 +2255,7 @@ def test_scan_pins_one_calendar_snapshot_and_next_scan_sees_new_snapshot() -> No
     assert calendar.snapshot_calls == 2
 
 
-def test_scan_snapshot_failure_is_unavailable_without_legacy_calendar_access() -> None:
+def test_scan_unexpected_snapshot_failure_propagates_without_inventory_access() -> None:
     module = continuity_module()
 
     class FailingCalendar:
@@ -2273,13 +2273,11 @@ def test_scan_snapshot_failure_is_unavailable_without_legacy_calendar_access() -
         inventory_mode="immutable_dataset",
     )
 
-    result = scanner.scan(
-        configured_start=date(2026, 8, 3),
-        latest_completed_session=date(2026, 8, 3),
-    )
-
-    assert result.status == "unavailable"
-    assert result.reason_code == "CALENDAR_UNAVAILABLE"
+    with pytest.raises(RuntimeError, match="calendar snapshot unavailable"):
+        scanner.scan(
+            configured_start=date(2026, 8, 3),
+            latest_completed_session=date(2026, 8, 3),
+        )
     assert reader.calls == []
 
 
@@ -3357,7 +3355,7 @@ def test_enqueue_dynamic_conflict_reader_exception_is_sanitized_before_lock(
     )
 
     assert result.status == "unavailable"
-    assert result.reason_code == "CALENDAR_UNAVAILABLE"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert "token" not in result.model_dump_json()
     assert lock_path.parent.exists() is False
 
