@@ -218,6 +218,23 @@ No real Provider, HTTP, production control/canonical, NAS, deployment or LaunchA
 occurred. Task 3b consumer pinning and Task 3c public/job integration remain pending; this is not
 Task 3 or R2-F4.1 GO.
 
+**Task 3b consumer-pinning checkpoint:** Continuity scans, automation decisions/runs, fund-flow
+evidence evaluation and supplemental ingestion now capture exactly one concrete calendar snapshot
+at each external operation boundary. Every status/range/previous-session check and automation
+continuity revalidation in that operation uses the pinned object; the next operation on the same
+long-lived service captures again and can observe a later promotion. Concrete legacy fakes without
+`snapshot()` retain their previous behavior. Expected runtime corruption is represented by the
+live facade's empty calendar, while unexpected snapshot programming errors are not disguised as
+unavailable outcomes and occur before store/provider side effects.
+
+Nine retained tests cover fresh-next-operation visibility, intra-operation generation changes,
+automation revalidation, fail-closed empty calendars and unexpected-error zero-side-effect paths.
+Root evidence: 353/353 complete continuity/automation/fund-flow/supplement domains, 213/213
+runtime/generation/calendar-sync tests and 2535/2535 full repository tests; compile, Ruff,
+204-file format and diff checks pass. All work was offline against private temporary stores. Task
+3c CLI/API/existing-calendar-job integration and the complete Task 3 independent reviews remain
+pending; this is not Task 3 or R2-F4.1 GO.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

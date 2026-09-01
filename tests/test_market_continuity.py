@@ -222,6 +222,18 @@ class RecordingConfirmedCalendar:
         return tuple(opened)
 
 
+class SnapshottingConfirmedCalendar:
+    """Return a different immutable reader on each operation boundary."""
+
+    def __init__(self, *snapshots) -> None:
+        self.snapshots = iter(snapshots)
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return next(self.snapshots)
+
+
 def ready_inventory(*sessions: date) -> VerifiedReadySessionInventory:
     return ready_inventory_generation("generation-task3", *sessions)
 
@@ -2212,6 +2224,63 @@ def test_scan_is_current_when_every_confirmed_open_session_is_verified_ready() -
 
     assert result.status == "current"
     assert result.missing_sessions == ()
+
+
+def test_scan_pins_one_calendar_snapshot_and_next_scan_sees_new_snapshot() -> None:
+    module = continuity_module()
+    sessions = (date(2026, 8, 3), date(2026, 8, 4))
+    first = RecordingConfirmedCalendar({session: "open" for session in sessions})
+    second = RecordingConfirmedCalendar({sessions[0]: "open", sessions[1]: "closed"})
+    calendar = SnapshottingConfirmedCalendar(first, second)
+    scanner = module.ContinuityInventory(
+        calendar=calendar,
+        inventory_reader=RecordingInventoryReader(ready_inventory(sessions[0])),
+        inventory_mode="immutable_dataset",
+    )
+
+    initial = scanner.scan(
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+    )
+    later = scanner.scan(
+        configured_start=sessions[0],
+        latest_completed_session=sessions[-1],
+    )
+
+    assert initial.status == "gaps"
+    assert initial.confirmed_open_sessions == sessions
+    assert initial.missing_sessions == (sessions[1],)
+    assert later.status == "current"
+    assert later.confirmed_open_sessions == (sessions[0],)
+    assert calendar.snapshot_calls == 2
+
+
+def test_scan_snapshot_failure_is_unavailable_without_legacy_calendar_access() -> None:
+    module = continuity_module()
+
+    class FailingCalendar:
+        def snapshot(self):
+            raise RuntimeError("calendar snapshot unavailable")
+
+        @property
+        def status(self):
+            raise AssertionError("must not read the live calendar after snapshot failure")
+
+    reader = RecordingInventoryReader(ready_inventory(date(2026, 8, 3)))
+    scanner = module.ContinuityInventory(
+        calendar=FailingCalendar(),
+        inventory_reader=reader,
+        inventory_mode="immutable_dataset",
+    )
+
+    result = scanner.scan(
+        configured_start=date(2026, 8, 3),
+        latest_completed_session=date(2026, 8, 3),
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CALENDAR_UNAVAILABLE"
+    assert reader.calls == []
 
 
 def test_unknown_calendar_day_rejects_the_entire_scan_before_inventory() -> None:

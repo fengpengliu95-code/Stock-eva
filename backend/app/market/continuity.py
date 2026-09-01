@@ -383,6 +383,8 @@ class ContinuityInventory:
         if self._inventory_mode != "immutable_dataset":
             return ContinuityUnavailable(reason_code="MANIFEST_INVENTORY_UNAVAILABLE")
         try:
+            snapshot = getattr(self._calendar, "snapshot", None)
+            calendar = snapshot() if callable(snapshot) else self._calendar
             conflict = (
                 self._calendar_conflict()
                 if callable(self._calendar_conflict)
@@ -392,9 +394,9 @@ class ContinuityInventory:
                 return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
             if conflict:
                 return ContinuityUnavailable(reason_code="CALENDAR_CONFLICT")
-            if self._calendar.status != "confirmed":
+            if calendar.status != "confirmed":
                 return ContinuityUnavailable(reason_code="CALENDAR_UNAVAILABLE")
-            confirmed_open = self._calendar.confirmed_open_sessions(
+            confirmed_open = calendar.confirmed_open_sessions(
                 effective_start,
                 effective_end,
             )

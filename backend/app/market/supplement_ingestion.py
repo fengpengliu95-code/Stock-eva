@@ -862,10 +862,12 @@ class SupplementalIngestionService:
         today = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
         if request.through_date > today:
             raise ValueError("supplemental through_date must not be in the future")
-        session_status = self.calendar.session_status(request.through_date)
+        snapshot = getattr(self.calendar, "snapshot", None)
+        calendar = snapshot() if callable(snapshot) else self.calendar
+        session_status = calendar.session_status(request.through_date)
         if session_status != "open":
             raise ValueError("supplemental through_date must be a confirmed open trading session")
-        latest_ready_session = self.calendar.latest_expected_session(now)
+        latest_ready_session = calendar.latest_expected_session(now)
         if latest_ready_session is None or request.through_date > latest_ready_session:
             raise ValueError(
                 "supplemental through_date must be a data-ready completed trading session"

@@ -14,6 +14,7 @@ from backend.app.market.akshare_supplemental import (
     SupplementalDataError,
     SupplementalSourceUnavailableError,
 )
+from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.supplement_ingestion import (
     SupplementalDatasetInitializer,
     SupplementalIngestionRequest,
@@ -94,6 +95,16 @@ def request() -> SupplementalIngestionRequest:
         sector_names=["银行"],
         canary=True,
     )
+
+
+class SnapshottingSupplementalCalendar:
+    def __init__(self, *snapshots) -> None:
+        self.snapshots = iter(snapshots)
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return next(self.snapshots)
 
 
 def initialized_store(tmp_path: Path) -> SupplementalStore:
@@ -251,6 +262,49 @@ def test_execute_publishes_validated_immutable_parquet_and_is_idempotent(
     assert {"source", "upstream", "endpoint", "observed_at", "trade_date"} <= columns
     assert not {"open", "high", "low", "close", "volume", "amount"} & columns
     assert {item.status for item in store.list_runs()} == {"ready"}
+
+
+def test_execute_pins_one_calendar_snapshot_and_fails_closed_on_next_unavailable_snapshot(
+    tmp_path: Path,
+) -> None:
+    source_calendar = get_trading_calendar().snapshot()
+    calendar = SnapshottingSupplementalCalendar(source_calendar, TradingCalendar([]))
+    client = FakeAKShareClient()
+    service = SupplementalIngestionService(
+        initialized_store(tmp_path),
+        provider(client),
+        calendar=calendar,
+    )
+
+    first = service.execute(request())
+    with pytest.raises(ValueError, match="confirmed open trading session"):
+        service.execute(request().model_copy(update={"through_date": date(2026, 7, 23)}))
+
+    assert first.status == "ready"
+    assert calendar.snapshot_calls == 2
+    assert client.calls == [
+        "stock_industry_clf_hist_sw",
+        "stock_market_fund_flow",
+        "stock_sector_fund_flow_hist:银行",
+    ]
+
+
+def test_execute_does_not_disguise_snapshot_failure_or_begin_provider_work(tmp_path: Path) -> None:
+    class FailingCalendar:
+        def snapshot(self):
+            raise RuntimeError("calendar snapshot unavailable")
+
+    client = FakeAKShareClient()
+    store = initialized_store(tmp_path)
+    with pytest.raises(RuntimeError, match="calendar snapshot unavailable"):
+        SupplementalIngestionService(
+            store,
+            provider(client),
+            calendar=FailingCalendar(),
+        ).execute(request())
+
+    assert client.calls == []
+    assert store.list_runs() == []
 
 
 class MissingDateClient(FakeAKShareClient):

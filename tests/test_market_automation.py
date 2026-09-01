@@ -122,6 +122,35 @@ def synthetic_calendar():
     )
 
 
+class SnapshottingCalendar:
+    def __init__(self, *snapshots) -> None:
+        self.snapshots = iter(snapshots)
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return next(self.snapshots)
+
+
+def calendar_with_extra_closure(*closed_dates: str):
+    module = load_module("backend.app.market.calendar")
+    return module.TradingCalendar.from_dict(
+        {
+            "year": 2026,
+            "status": "confirmed",
+            "published_on": "2025-12-22",
+            "sources": [
+                {
+                    "exchange": "SSE",
+                    "title": "synthetic official closure notice",
+                    "url": "https://example.test/sse-2026",
+                }
+            ],
+            "closed_dates": [*closed_dates],
+        }
+    )
+
+
 def fixture_bars(trade_date: date = date(2026, 7, 23)):
     payload = fixture_payload()
     bars = normalize_baostock_rows(
@@ -237,6 +266,30 @@ def test_schedule_policy_runs_catch_up_and_uses_finite_retry_slots() -> None:
         )
         is None
     )
+
+
+def test_schedule_policy_pins_one_snapshot_per_decision() -> None:
+    module = load_module("backend.app.market.automation")
+    calendar = SnapshottingCalendar(
+        synthetic_calendar(),
+        calendar_with_extra_closure("2026-07-23"),
+    )
+    policy = module.SchedulePolicy(calendar)
+
+    first = policy.decide(
+        datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI),
+        published_as_of=None,
+        state=None,
+    )
+    second = policy.decide(
+        datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI),
+        published_as_of=None,
+        state=None,
+    )
+
+    assert first.target_session == date(2026, 7, 23)
+    assert second.target_session == date(2026, 7, 22)
+    assert calendar.snapshot_calls == 2
 
 
 class CompleteProvider:
@@ -485,6 +538,85 @@ def test_automation_optional_continuity_hook_is_planning_only_and_never_consumes
     assert service.last_continuity_decision == {"reason_code": "REPAIR_READY"}
     assert provider.fetch_calls == provider.calendar_calls == 0
     assert store.repair_queue_snapshot().status == "unavailable"
+
+
+def test_automation_run_pins_calendar_for_initial_and_revalidation_decisions(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    calendar = SnapshottingCalendar(
+        synthetic_calendar(),
+        calendar_with_extra_closure("2026-07-23"),
+    )
+
+    class RevalidatingContinuity:
+        def claim_ready_once(self, **kwargs):
+            refreshed = kwargs["revalidator"]()
+            assert refreshed.target_session == kwargs["freshness"].target_session
+            return ContinuityDecision(
+                action="run",
+                lane="freshness",
+                target_session=refreshed.target_session,
+                reason_code="FRESHNESS_DUE",
+            )
+
+    def canonical(**kwargs):
+        target = kwargs["trade_date"]
+        return RefreshResult(
+            run_id=kwargs["run_id"],
+            request_key=kwargs["request_key"],
+            run_kind="daily",
+            requested_date=target,
+            source="baostock",
+            status="ready",
+            requested_count=1,
+            succeeded_count=1,
+            coverage_ratio=1,
+            started_at=datetime(2026, 7, 23, 10, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 23, 10, 1, tzinfo=UTC),
+        )
+
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        calendar,
+        required_symbols=lambda: {"sh.600000"},
+        continuity=RevalidatingContinuity(),
+        repair_enabled=True,
+        canonical_refresh=canonical,
+    )
+
+    first = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    second = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert first.decision.target_session == date(2026, 7, 23)
+    assert second.decision.target_session == date(2026, 7, 22)
+    assert calendar.snapshot_calls == 2
+
+
+def test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+
+    class FailingCalendar:
+        def snapshot(self):
+            raise RuntimeError("calendar snapshot unavailable")
+
+    store = MarketStore(tmp_path / "market.duckdb")
+    provider = CompleteProvider(fixture_bars())
+    with pytest.raises(RuntimeError, match="calendar snapshot unavailable"):
+        module.MarketAutomationService(
+            store,
+            provider,
+            FailingCalendar(),
+            required_symbols=lambda: {"sh.600000"},
+        ).run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert provider.calendar_calls == provider.fetch_calls == 0
+    assert store.list_refreshes() == []
 
 
 def test_automation_executes_one_repair_result_without_entering_freshness_lane(

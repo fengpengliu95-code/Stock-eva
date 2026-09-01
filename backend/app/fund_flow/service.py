@@ -40,6 +40,11 @@ DEFAULT_FUND_FLOW_POLICY = FundFlowEvidencePolicy(
 )
 
 
+def _calendar_snapshot(calendar: TradingCalendar) -> TradingCalendar:
+    snapshot = getattr(calendar, "snapshot", None)
+    return snapshot() if callable(snapshot) else calendar
+
+
 class FundFlowEvidenceService:
     def __init__(
         self,
@@ -53,6 +58,7 @@ class FundFlowEvidenceService:
         self,
         snapshot: FundFlowEvidenceSnapshot,
     ) -> FundFlowEvidenceResult:
+        calendar = _calendar_snapshot(self.calendar)
         issues = set(snapshot.quality_issues)
         points = sorted(
             (point for point in snapshot.points if point.trade_date <= snapshot.as_of),
@@ -63,7 +69,7 @@ class FundFlowEvidenceService:
         )
         if discarded_future:
             issues.add("future_source_points_discarded")
-        analysis_session_status = self.calendar.session_status(snapshot.as_of)
+        analysis_session_status = calendar.session_status(snapshot.as_of)
         if analysis_session_status == "closed":
             issues.add("analysis_as_of_closed_session")
         elif analysis_session_status == "unknown":
@@ -71,7 +77,7 @@ class FundFlowEvidenceService:
 
         if snapshot.source_status in {"not_configured", "empty", "error"}:
             return self._empty_result(snapshot, issues=issues)
-        invalid_issue = self._invalid_issue(points, snapshot)
+        invalid_issue = self._invalid_issue(points, snapshot, calendar)
         if invalid_issue is not None:
             issues.add(invalid_issue)
             historical_unverifiable = invalid_issue == "historical_observation_not_visible_as_of"
@@ -120,7 +126,7 @@ class FundFlowEvidenceService:
         )
         data_as_of = points[-1].trade_date
         publication_session_status = (
-            self.calendar.session_status(snapshot.publication_as_of)
+            calendar.session_status(snapshot.publication_as_of)
             if snapshot.publication_as_of is not None
             else "unknown"
         )
@@ -128,7 +134,7 @@ class FundFlowEvidenceService:
             issues.add("publication_as_of_closed_session")
         elif publication_session_status == "unknown":
             issues.add("trading_calendar_unverifiable")
-        expected, calendar_issue = self._expected_sessions(data_as_of)
+        expected, calendar_issue = self._expected_sessions(data_as_of, calendar)
         if calendar_issue:
             issues.add(calendar_issue)
         present_dates = {point.trade_date for point in points}
@@ -142,6 +148,7 @@ class FundFlowEvidenceService:
         staleness_sessions, staleness_issue = self._staleness_sessions(
             data_as_of,
             snapshot.as_of,
+            calendar,
         )
         if staleness_issue:
             issues.add(staleness_issue)
@@ -270,6 +277,7 @@ class FundFlowEvidenceService:
         self,
         points: list[ReportedFundFlowPoint],
         snapshot: FundFlowEvidenceSnapshot,
+        calendar: TradingCalendar,
     ) -> str | None:
         if any(
             not math.isfinite(value)
@@ -319,7 +327,7 @@ class FundFlowEvidenceService:
             for point in points
         ):
             return "mixed_source_or_semantics"
-        session_statuses = {self.calendar.session_status(point.trade_date) for point in points}
+        session_statuses = {calendar.session_status(point.trade_date) for point in points}
         if "unknown" in session_statuses:
             return "trading_calendar_unverifiable"
         if "closed" in session_statuses:
@@ -337,12 +345,16 @@ class FundFlowEvidenceService:
                 return "historical_observation_not_visible_as_of"
         return None
 
-    def _expected_sessions(self, end: date) -> tuple[list[date], str | None]:
-        if self.calendar.session_status(end) != "open":
+    def _expected_sessions(
+        self,
+        end: date,
+        calendar: TradingCalendar,
+    ) -> tuple[list[date], str | None]:
+        if calendar.session_status(end) != "open":
             return [], "trading_calendar_unverifiable"
         sessions = [end]
         while len(sessions) < WINDOW_SESSIONS:
-            previous = self.calendar.previous_session(sessions[0])
+            previous = calendar.previous_session(sessions[0])
             if previous is None:
                 return [], "trading_calendar_unverifiable"
             sessions.insert(0, previous)
@@ -352,13 +364,14 @@ class FundFlowEvidenceService:
         self,
         data_as_of: date,
         as_of: date,
+        calendar: TradingCalendar,
     ) -> tuple[int | None, str | None]:
         if data_as_of > as_of:
             return None, "future_source_points_discarded"
         stale = 0
         current = data_as_of + timedelta(days=1)
         while current <= as_of:
-            status = self.calendar.session_status(current)
+            status = calendar.session_status(current)
             if status == "unknown":
                 return None, "trading_calendar_unverifiable"
             if status == "open":

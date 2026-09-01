@@ -111,6 +111,44 @@ def _snapshot(
     )
 
 
+class SnapshottingEvaluationCalendar:
+    def __init__(self, *snapshots) -> None:
+        self.snapshots = iter(snapshots)
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return next(self.snapshots)
+
+
+def test_evaluate_pins_one_calendar_snapshot_and_next_evaluation_is_fresh() -> None:
+    source_calendar = get_trading_calendar().snapshot()
+    sessions = _sessions(source_calendar, end=AS_OF, count=20)
+    calendar = SnapshottingEvaluationCalendar(
+        source_calendar,
+        TradingCalendar([]),
+    )
+    service = FundFlowEvidenceService(calendar)
+
+    first = service.evaluate(_snapshot(_points(sessions)))
+    second = service.evaluate(_snapshot(_points(sessions)))
+
+    assert first.availability == "ready"
+    assert first.can_publish_trend is True
+    assert second.can_publish_trend is False
+    assert "trading_calendar_unverifiable" in second.quality_issues
+    assert calendar.snapshot_calls == 2
+
+
+def test_evaluate_does_not_disguise_unexpected_snapshot_failure() -> None:
+    class FailingCalendar:
+        def snapshot(self):
+            raise RuntimeError("calendar snapshot unavailable")
+
+    with pytest.raises(RuntimeError, match="calendar snapshot unavailable"):
+        FundFlowEvidenceService(FailingCalendar()).evaluate(_snapshot([]))
+
+
 def test_exactly_19_is_insufficient_and_exactly_20_publishes_all_windows() -> None:
     calendar = get_trading_calendar()
     sessions = _sessions(calendar, end=AS_OF, count=20)

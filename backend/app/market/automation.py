@@ -9,6 +9,7 @@ import os
 import uuid
 from collections.abc import Callable
 from contextlib import nullcontext
+from copy import copy
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
@@ -99,6 +100,11 @@ _TRANSPORT_ERROR_PRIORITY = {
         )
     )
 }
+
+
+def _calendar_snapshot(calendar: TradingCalendar) -> TradingCalendar:
+    snapshot = getattr(calendar, "snapshot", None)
+    return snapshot() if callable(snapshot) else calendar
 
 
 def publish_provider_evidence(
@@ -797,8 +803,15 @@ class SchedulePolicy:
     RETRY_TIMES = (time(18, 40), time(19, 20), time(20, 10), time(21, 0))
     CORRECTION_TIME = time(7, 15)
 
-    def __init__(self, calendar: TradingCalendar) -> None:
+    def __init__(self, calendar: TradingCalendar, *, _pinned: bool = False) -> None:
         self.calendar = calendar
+        self._pinned = _pinned
+
+    def for_snapshot(self, calendar: TradingCalendar) -> "SchedulePolicy":
+        operation = copy(self)
+        operation.calendar = calendar
+        operation._pinned = True
+        return operation
 
     @staticmethod
     def availability_for(session: date) -> datetime:
@@ -824,7 +837,8 @@ class SchedulePolicy:
         state: SchedulerState | None,
     ) -> ScheduleDecision:
         local = now.astimezone(SHANGHAI)
-        target = self.calendar.latest_expected_session(local)
+        calendar = self.calendar if self._pinned else _calendar_snapshot(self.calendar)
+        target = calendar.latest_expected_session(local)
         if target is None:
             return ScheduleDecision(
                 action="none",
@@ -1121,9 +1135,10 @@ class MarketAutomationService:
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
         local = now.astimezone(SHANGHAI)
+        operation_policy = self.policy.for_snapshot(_calendar_snapshot(self.calendar))
         published = self.store.published_refresh()
         current = self.store.scheduler_state()
-        decision = self.policy.decide(
+        decision = operation_policy.decide(
             local,
             published_as_of=published.requested_date if published else None,
             state=current,
@@ -1136,7 +1151,7 @@ class MarketAutomationService:
             target_session=decision.target_session,
             next_run_at=decision.next_run_at,
         )
-        repair_result = self._plan_continuity(decision, local)
+        repair_result = self._plan_continuity(decision, local, operation_policy)
         if repair_result is not None and repair_result.status != "skipped":
             # A repair must never rewrite the daily freshness state.  Return the prior
             # state (or an unsaved projection when no state exists) and expose repair evidence
@@ -1175,10 +1190,12 @@ class MarketAutomationService:
         lease = RefreshRunLock(self.lock_path) if self.lock_path is not None else nullcontext()
         try:
             with lease:
-                outcome = self._execute_due(decision, current, local)
+                outcome = self._execute_due(decision, current, local, operation_policy)
         except RefreshAlreadyRunning:
             target = decision.target_session
-            next_retry = self.policy.next_retry_after(target, local) if target is not None else None
+            next_retry = (
+                operation_policy.next_retry_after(target, local) if target is not None else None
+            )
             state = SchedulerState(
                 target_session=target,
                 refresh_state="retry_wait" if next_retry else "delayed",
@@ -1204,7 +1221,12 @@ class MarketAutomationService:
         self._offer_shadow(outcome)
         return outcome
 
-    def _plan_continuity(self, decision: ScheduleDecision, local: datetime):
+    def _plan_continuity(
+        self,
+        decision: ScheduleDecision,
+        local: datetime,
+        policy: SchedulePolicy,
+    ):
         if not self.repair_enabled or self.continuity is None:
             return None
         target = decision.target_session
@@ -1214,7 +1236,7 @@ class MarketAutomationService:
         def revalidate() -> ScheduleDecision:
             published = self.store.published_refresh()
             current = self.store.scheduler_state()
-            return self.policy.decide(
+            return policy.decide(
                 local,
                 published_as_of=published.requested_date if published else None,
                 state=current,
@@ -1251,6 +1273,7 @@ class MarketAutomationService:
         decision: ScheduleDecision,
         current: SchedulerState | None,
         local: datetime,
+        policy: SchedulePolicy,
     ) -> AutomationOutcome:
         target = decision.target_session
         if target is None:
@@ -1270,6 +1293,7 @@ class MarketAutomationService:
                 current,
                 local,
                 error_code="PROVIDER_HEALTH_UNAVAILABLE",
+                policy=policy,
             )
             self.store.save_scheduler_state(state)
             return AutomationOutcome(decision=decision, state=state)
@@ -1279,6 +1303,7 @@ class MarketAutomationService:
                 current,
                 local,
                 provider_health,
+                policy=policy,
             )
 
         attempt_count = (
@@ -1317,6 +1342,7 @@ class MarketAutomationService:
                     error_code=failure.failure_class,
                     calendar_status="unavailable",
                     retryable=failure.retryable,
+                    policy=policy,
                 )
                 self.store.save_scheduler_state(state)
                 _log_event(
@@ -1382,6 +1408,7 @@ class MarketAutomationService:
                 or ("publication_incomplete" if result.status == "partial" else "internal"),
                 calendar_status="confirmed",
                 retryable=result.retryable is True,
+                policy=policy,
             )
         self.store.save_scheduler_state(state)
         return AutomationOutcome(decision=decision, state=state, result=result)
@@ -1406,6 +1433,8 @@ class MarketAutomationService:
         current: SchedulerState | None,
         local: datetime,
         provider_health,
+        *,
+        policy: SchedulePolicy,
     ) -> AutomationOutcome:
         target = decision.target_session
         assert target is not None
@@ -1424,6 +1453,7 @@ class MarketAutomationService:
                 current,
                 local,
                 error_code="SKIPPED_CIRCUIT_OPEN",
+                policy=policy,
             )
             self.store.save_scheduler_state(state)
             return AutomationOutcome(decision=decision, state=state)
@@ -1470,6 +1500,7 @@ class MarketAutomationService:
             current,
             local,
             error_code=error_code,
+            policy=policy,
         )
         self.store.save_scheduler_state(state)
         _log_event(
@@ -1488,9 +1519,10 @@ class MarketAutomationService:
         now: datetime,
         *,
         error_code: str,
+        policy: SchedulePolicy,
     ) -> SchedulerState:
         target = decision.target_session
-        next_retry = self.policy.next_retry_after(target, now) if target is not None else None
+        next_retry = policy.next_retry_after(target, now) if target is not None else None
         return SchedulerState(
             target_session=target,
             refresh_state="retry_wait" if next_retry is not None else "delayed",
@@ -1528,10 +1560,9 @@ class MarketAutomationService:
         error_code: str,
         calendar_status: Literal["confirmed", "conflict", "unavailable"],
         retryable: bool,
+        policy: SchedulePolicy,
     ) -> SchedulerState:
-        next_retry = (
-            self.policy.next_retry_after(running.target_session, now) if retryable else None
-        )
+        next_retry = policy.next_retry_after(running.target_session, now) if retryable else None
         return running.model_copy(
             update={
                 "refresh_state": (
