@@ -24,6 +24,32 @@ NOW = datetime(2026, 8, 13, 4, 0, tzinfo=UTC)
 UNIVERSE_ID = "all-main-board"
 
 
+def test_inventory_for_snapshot_preserves_subclass_state_without_reconstruction() -> None:
+    module = continuity_module()
+
+    class CustomInventory(module.ContinuityInventory):
+        def __init__(self, required_token: object, **kwargs) -> None:
+            self.required_token = required_token
+            super().__init__(**kwargs)
+
+    original_calendar = object()
+    next_calendar = object()
+    inventory = CustomInventory(
+        object(),
+        calendar=original_calendar,
+        inventory_reader=object(),
+        inventory_mode="control_database",
+    )
+
+    operation = inventory.for_snapshot(next_calendar)
+
+    assert isinstance(operation, CustomInventory)
+    assert operation is not inventory
+    assert operation.required_token is inventory.required_token
+    assert operation._calendar is next_calendar
+    assert inventory._calendar is original_calendar
+
+
 def continuity_module():
     try:
         return importlib.import_module("backend.app.market.continuity")

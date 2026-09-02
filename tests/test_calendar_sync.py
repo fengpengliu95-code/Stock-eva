@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+import threading
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,8 @@ from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.baostock_vendor import emit_terminal_observation
 from backend.app.market.calendar import TradingCalendar, get_trading_calendar
 from backend.app.market.calendar_sync import (
+    CalendarSyncPlan,
+    CalendarSyncPlanError,
     CalendarSyncPolicy,
     CalendarSyncResult,
     CalendarSyncService,
@@ -43,6 +46,79 @@ from backend.app.market.provider_transport import (
 )
 from backend.app.market.store import MarketStore
 from tests.test_baostock_provider import FIXTURE_PATH, FakeBaoStock, FakeResult
+
+
+def test_calendar_sync_store_rejects_aliases_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"owned bytes")
+    before = target.read_bytes()
+    symlink = tmp_path / "symlink.sqlite3"
+    symlink.symlink_to(target)
+    hardlink = tmp_path / "hardlink.sqlite3"
+    hardlink.hardlink_to(target)
+
+    for path in (symlink, hardlink):
+        store = CalendarSyncStore(path, initialize=False)
+        with pytest.raises(CalendarSyncStoreReadError):
+            store.state()
+        with pytest.raises(CalendarSyncStoreReadError):
+            store.initialize_for_write()
+
+    assert target.read_bytes() == before
+
+
+def test_calendar_sync_execute_revalidates_plan_before_dependencies() -> None:
+    class ForbiddenCalendar:
+        def snapshot(self):
+            raise AssertionError("calendar must not be read")
+
+    service = CalendarSyncService(object(), ForbiddenCalendar(), object())
+    invalid = CalendarSyncPlan.model_construct(
+        mode="invalid",
+        reason="test",
+        requested_at=datetime(2026, 8, 3, tzinfo=UTC),
+        range_start=date(2026, 8, 3),
+        range_end=date(2026, 8, 3),
+        authority_years=[],
+        authority_checksum="safe",
+        sources=[],
+    )
+
+    with pytest.raises(CalendarSyncPlanError, match="calendar sync plan is invalid"):
+        service.execute(invalid)
+
+
+def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_runtime():
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return SimpleNamespace(outcome="NOT_DUE")
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            run_calendar_sync_loop(
+                object(),
+                asyncio.Event(),
+                clock=lambda: datetime(2026, 8, 3, tzinfo=UTC),
+                runtime_maintenance=blocking_runtime,
+            )
+        )
+        await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+
+    asyncio.run(exercise())
+
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 

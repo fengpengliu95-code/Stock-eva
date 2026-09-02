@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import hashlib
 import json
 import re
@@ -361,12 +362,9 @@ class ContinuityInventory:
 
     def for_snapshot(self, calendar: ConfirmedCalendarReader) -> "ContinuityInventory":
         """Bind a scanner to one operation's already-captured calendar snapshot."""
-        return type(self)(
-            calendar=calendar,
-            inventory_reader=self._inventory_reader,
-            inventory_mode=self._inventory_mode,
-            calendar_conflict=self._calendar_conflict,
-        )
+        operation = copy.copy(self)
+        operation._calendar = calendar
+        return operation
 
     def scan(
         self,

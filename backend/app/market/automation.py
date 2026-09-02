@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.blocking import run_blocking_drained
 from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
@@ -1591,7 +1592,7 @@ async def run_automation_loop(
     """Re-check regularly so process start and wake both perform catch-up."""
     while not stop.is_set():
         try:
-            await asyncio.to_thread(service.run_due_once, clock())
+            await run_blocking_drained(service.run_due_once, clock())
         except Exception:
             _log_event(
                 logging.ERROR,

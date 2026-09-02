@@ -119,6 +119,10 @@ async def lifespan(_: FastAPI):
         return
     readiness = StoragePreflight(settings).inspect()
     if not readiness.market_data_available:
+        if settings.calendar_runtime_enabled:
+            async with _calendar_only_lifespan():
+                yield
+            return
         yield
         return
     layout = StorageLayout(settings)
@@ -313,7 +317,10 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         stop.set()
-        await asyncio.gather(market_task, calendar_task)
+        results = await asyncio.gather(market_task, calendar_task, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
 
 
 app = FastAPI(

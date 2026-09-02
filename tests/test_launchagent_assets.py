@@ -5,6 +5,7 @@ import stat
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -224,6 +225,60 @@ def test_lifespan_runs_calendar_lane_without_market_automation(
 
     asyncio.run(exercise())
     assert captured["calendar"] is not None
+    assert captured["runtime_maintenance"] is not None
+
+
+def test_unavailable_market_preflight_degrades_to_calendar_only_lane(
+    tmp_path: Path, monkeypatch
+) -> None:
+    configured = Settings(
+        _env_file=None,
+        auto_refresh_enabled=True,
+        calendar_runtime_enabled=True,
+        market_data_dir=tmp_path / "market",
+        user_data_dir=tmp_path / "user",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        nas_market_dataset_root=None,
+        local_market_dataset_root=None,
+    )
+    captured = {}
+
+    class UnavailablePreflight:
+        def __init__(self, _settings):
+            pass
+
+        def inspect(self):
+            return SimpleNamespace(market_data_available=False)
+
+    class ForbiddenMarket:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("market lane must not be constructed")
+
+    class CalendarService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    async def idle_loop(_service, stop, **kwargs):
+        captured["runtime_maintenance"] = kwargs["runtime_maintenance"]
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "settings", configured)
+    monkeypatch.setattr(main_module, "StoragePreflight", UnavailablePreflight)
+    monkeypatch.setattr(main_module, "MarketStore", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "MarketAutomationService", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "run_automation_loop", ForbiddenMarket)
+    monkeypatch.setattr(main_module, "CalendarSyncService", CalendarService)
+    monkeypatch.setattr(main_module, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(main_module, "run_calendar_sync_loop", idle_loop)
+
+    async def exercise():
+        async with main_module.lifespan(None):
+            pass
+
+    asyncio.run(exercise())
     assert captured["runtime_maintenance"] is not None
 
 

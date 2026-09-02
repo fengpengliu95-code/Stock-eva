@@ -11,7 +11,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
+import stat
 import uuid
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -21,6 +23,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
+from backend.app.blocking import run_blocking_drained
 from backend.app.market.baostock import BaoStockError
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
@@ -212,28 +215,105 @@ class CalendarSyncStoreReadError(RuntimeError):
     """A SELECT-only calendar control database cannot be read safely."""
 
 
+class CalendarSyncPlanError(ValueError):
+    """A caller supplied a calendar sync plan that fails the public contract."""
+
+
 class CalendarSyncStore:
     """Local SQLite control state; no market or user data lives here."""
 
     def __init__(self, path: Path, *, initialize: bool = True) -> None:
         self.path = path
         if initialize:
+            self._validate_ancestors()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize()
 
+    def _validate_ancestors(self) -> None:
+        try:
+            for ancestor in self.path.parents:
+                try:
+                    info = os.lstat(ancestor)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+
+    def _validate_file(self) -> os.stat_result:
+        self._validate_ancestors()
+        try:
+            info = os.lstat(self.path)
+            parent = os.lstat(self.path.parent)
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or parent.st_mode & 0o022
+            or stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+        ):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        return info
+
+    def _ensure_file_for_write(self) -> None:
+        if self.path.exists() or self.path.is_symlink():
+            self._validate_file()
+            return
+        try:
+            parent = os.lstat(self.path.parent)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != os.geteuid()
+                or parent.st_mode & 0o022
+            ):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            descriptor = os.open(
+                self.path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            os.close(descriptor)
+            self._validate_file()
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+
     def _connect(self) -> sqlite3.Connection:
+        self._ensure_file_for_write()
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        self._validate_file()
         return connection
 
     def _connect_reader(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro",
-            uri=True,
-            timeout=0,
-        )
-        connection.row_factory = sqlite3.Row
-        return connection
+        info = self._validate_file()
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            bound = os.fstat(descriptor)
+            if (bound.st_dev, bound.st_ino) != (info.st_dev, info.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            connection = sqlite3.connect(
+                f"file:///dev/fd/{descriptor}?mode=ro", uri=True, timeout=0
+            )
+            connection.row_factory = sqlite3.Row
+            return connection
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -277,11 +357,14 @@ class CalendarSyncStore:
 
     def initialize_for_write(self) -> None:
         """Initialize writer state only after an operation has verified its authority."""
+        self._validate_ancestors()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def state(self) -> CalendarSyncState:
         if not self.path.exists():
+            if self.path.is_symlink():
+                self._validate_file()
             return CalendarSyncState()
         try:
             with self._connect_reader() as connection:
@@ -637,6 +720,10 @@ class CalendarSyncService:
         )
 
     def execute(self, plan: CalendarSyncPlan) -> CalendarSyncResult:
+        try:
+            plan = CalendarSyncPlan.model_validate(plan.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError):
+            raise CalendarSyncPlanError("calendar sync plan is invalid") from None
         calendar_snapshot = self._calendar_snapshot()
         if self._authority_checksum(calendar_snapshot) != plan.authority_checksum:
             return self._authority_changed_result(plan)
@@ -858,7 +945,7 @@ async def run_calendar_sync_loop(
         runtime_blocked = False
         if runtime_maintenance is not None:
             try:
-                runtime_result = await asyncio.to_thread(runtime_maintenance)
+                runtime_result = await run_blocking_drained(runtime_maintenance)
             except Exception:
                 # A runtime maintenance bug/control failure must not terminate the existing
                 # scheduler or fall through to a legacy provider request in this iteration.
@@ -882,7 +969,7 @@ async def run_calendar_sync_loop(
             )
         )
         if plan is not None:
-            result = await asyncio.to_thread(
+            result = await run_blocking_drained(
                 execute_plan or service.execute,
                 plan,
             )
