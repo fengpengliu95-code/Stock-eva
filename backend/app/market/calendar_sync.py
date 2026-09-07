@@ -17,7 +17,7 @@ import sqlite3
 import stat
 import uuid
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
@@ -326,10 +326,9 @@ class CalendarSyncStore:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         self._validate_no_sidecars()
 
-    def _ensure_file_for_write(self) -> None:
+    def _ensure_file_for_write(self) -> os.stat_result:
         if self.path.exists() or self.path.is_symlink():
-            self._validate_file()
-            return
+            return self._validate_file()
         try:
             parent = os.lstat(self.path.parent)
             if (
@@ -345,18 +344,54 @@ class CalendarSyncStore:
                 0o600,
             )
             os.close(descriptor)
-            self._validate_file()
+            return self._validate_file()
         except CalendarSyncStoreReadError:
             raise
         except (OSError, TypeError, ValueError):
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
     def _connect(self) -> sqlite3.Connection:
-        self._ensure_file_for_write()
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        self._validate_file()
-        return connection
+        expected = self._ensure_file_for_write()
+        descriptors_before = self._open_descriptor_count(expected)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self.path)
+            connection.row_factory = sqlite3.Row
+            current = self._validate_file()
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            if self._open_descriptor_count(expected) <= descriptors_before:
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            return connection
+        except CalendarSyncStoreReadError:
+            if connection is not None:
+                connection.close()
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            if connection is not None:
+                connection.close()
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+
+    @staticmethod
+    def _open_descriptor_numbers() -> set[int]:
+        for root in (Path("/dev/fd"), Path("/proc/self/fd")):
+            try:
+                return {int(item.name) for item in root.iterdir() if item.name.isdigit()}
+            except (OSError, TypeError, ValueError):
+                continue
+        raise CalendarSyncStoreReadError("calendar control database is unavailable")
+
+    @classmethod
+    def _open_descriptor_count(cls, expected: os.stat_result) -> int:
+        count = 0
+        for descriptor in cls._open_descriptor_numbers():
+            try:
+                bound = os.fstat(descriptor)
+            except OSError:
+                continue
+            if (bound.st_dev, bound.st_ino) == (expected.st_dev, expected.st_ino):
+                count += 1
+        return count
 
     def _connect_reader(self) -> sqlite3.Connection:
         info = self._validate_file()
@@ -380,7 +415,7 @@ class CalendarSyncStore:
                 os.close(descriptor)
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS calendar_authority_versions (
@@ -429,14 +464,15 @@ class CalendarSyncStore:
         if not self.path.exists():
             if self.path.is_symlink():
                 self._validate_file()
-            try:
-                self._validate_missing_parent()
-            except CalendarSyncStoreReadError:
-                if not self._missing_parent_is_empty or os.path.lexists(self.path.parent):
-                    raise
+            self._validate_ancestors()
+            if not os.path.lexists(self.path.parent):
+                if self._missing_parent_is_empty:
+                    return CalendarSyncState()
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            self._validate_missing_parent()
             return CalendarSyncState()
         try:
-            with self._connect_reader() as connection:
+            with closing(self._connect_reader()) as connection:
                 row = connection.execute(
                     "SELECT payload_json FROM calendar_sync_state WHERE singleton = 1"
                 ).fetchone()
@@ -520,7 +556,7 @@ class CalendarSyncStore:
                 "next_sync_at": next_sync_at,
             }
         )
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO calendar_authority_versions
@@ -585,7 +621,7 @@ class CalendarSyncStore:
             )
 
     def run(self, run_id: str) -> CalendarSyncRun:
-        with self._connect_reader() as connection:
+        with closing(self._connect_reader()) as connection:
             row = connection.execute(
                 "SELECT * FROM calendar_sync_runs WHERE run_id = ?",
                 (run_id,),
@@ -610,7 +646,7 @@ class CalendarSyncStore:
         )
 
     def observations(self, run_id: str) -> list[CalendarObservation]:
-        with self._connect_reader() as connection:
+        with closing(self._connect_reader()) as connection:
             rows = connection.execute(
                 """
                 SELECT session_date, provider_is_open, official_status
@@ -640,7 +676,7 @@ def read_calendar_conflict(path: Path) -> bool:
         raise CalendarSyncStoreReadError("calendar sync control database cannot be read")
     store = CalendarSyncStore(path, initialize=False)
     try:
-        with store._connect_reader() as connection:
+        with closing(store._connect_reader()) as connection:
             row = connection.execute(
                 "SELECT payload_json FROM calendar_sync_state WHERE singleton = 1"
             ).fetchone()

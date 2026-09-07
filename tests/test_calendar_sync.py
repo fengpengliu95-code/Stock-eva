@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 import backend.app.cli as cli
+import backend.app.market.calendar_sync as calendar_sync_module
 from backend.app.api.market import get_calendar_sync_store, get_market_store
 from backend.app.config import Settings
 from backend.app.main import app
@@ -169,6 +170,48 @@ def test_calendar_sync_missing_state_requires_safe_existing_parent(tmp_path: Pat
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(unsafe / "calendar.sqlite3", initialize=False).state()
     assert list(unsafe.iterdir()) == []
+
+
+def test_calendar_sync_missing_parent_exception_rejects_linked_ancestor(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    path = linked / "missing-parent" / "calendar.sqlite3"
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False, missing_parent_is_empty=True).state()
+
+    assert not path.exists()
+
+
+def test_calendar_sync_writer_rejects_path_swap_after_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    replacement = tmp_path / "replacement.sqlite3"
+    CalendarSyncStore(replacement)
+    validated = tmp_path / "validated.sqlite3"
+    swapped = tmp_path / "swapped.sqlite3"
+    real_connect = sqlite3.connect
+
+    def swapping_connect(database, *args, **kwargs):
+        if Path(database) == path:
+            path.rename(validated)
+            replacement.rename(path)
+            connection = real_connect(database, *args, **kwargs)
+            path.rename(swapped)
+            validated.rename(path)
+            return connection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(calendar_sync_module.sqlite3, "connect", swapping_connect)
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert path.stat().st_ino != swapped.stat().st_ino
 
 
 def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
