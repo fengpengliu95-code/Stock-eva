@@ -279,7 +279,7 @@ def test_calendar_sync_writer_rejects_path_swap_during_lock_probe(
 
     def swapping_execute(connection, statement, *args, **kwargs):
         nonlocal swapped
-        if statement.startswith("SELECT store_id, device, inode") and not swapped:
+        if statement.startswith("SELECT singleton, store_id, device, inode") and not swapped:
             path.rename(displaced)
             replacement.rename(path)
             swapped = True

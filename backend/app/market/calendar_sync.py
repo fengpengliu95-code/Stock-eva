@@ -454,20 +454,25 @@ class CalendarSyncStore:
         }
         if triggers != expected_triggers:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        row = connection.execute(
-            "SELECT store_id, device, inode, identity_checksum "
-            "FROM calendar_store_identity WHERE singleton = 1"
-        ).fetchone()
-        if row is None:
+        identity_rows = connection.execute(
+            "SELECT singleton, store_id, device, inode, identity_checksum "
+            "FROM calendar_store_identity ORDER BY singleton"
+        ).fetchall()
+        if (
+            len(identity_rows) != 1
+            or type(identity_rows[0][0]) is not int
+            or identity_rows[0][0] != 1
+        ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        store_id = str(row[0])
+        row = identity_rows[0]
+        store_id = str(row[1])
         if re.fullmatch(r"[0-9a-f]{32}", store_id) is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if type(row[1]) is not int or type(row[2]) is not int:
+        if type(row[2]) is not int or type(row[3]) is not int:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if row[3] != cls._identity_checksum(store_id, row[1], row[2]):
+        if row[4] != cls._identity_checksum(store_id, row[2], row[3]):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        return store_id, row[1], row[2]
+        return store_id, row[2], row[3]
 
     def _read_bound_store_identity(self, descriptor: int) -> tuple[str, int, int]:
         with closing(
