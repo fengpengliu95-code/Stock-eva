@@ -159,6 +159,18 @@ def test_calendar_sync_reader_rejects_missing_identity_guard(tmp_path: Path, tri
         CalendarSyncStore(path, initialize=False).state()
 
 
+def test_calendar_sync_reader_rejects_changed_identity_table_schema(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("ALTER TABLE calendar_store_identity ADD COLUMN extra TEXT")
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+
 def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path, initialize=False)

@@ -249,6 +249,12 @@ class CalendarSyncPlanError(ValueError):
 
 
 _CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
+_IDENTITY_TABLE_SQL = """
+    CREATE TABLE calendar_store_identity
+    (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL,
+    inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL)
+"""
 _IDENTITY_TRIGGERS = {
     "calendar_store_identity_no_update": """
         CREATE TRIGGER calendar_store_identity_no_update
@@ -408,12 +414,7 @@ class CalendarSyncStore:
                     identity_stat.st_dev,
                     identity_stat.st_ino,
                 )
-                connection.execute(
-                    "CREATE TABLE calendar_store_identity "
-                    "(singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
-                    "store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL, "
-                    "inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL)"
-                )
+                connection.execute(_IDENTITY_TABLE_SQL)
                 connection.execute(
                     "INSERT INTO calendar_store_identity "
                     "(singleton, store_id, device, inode, identity_checksum) "
@@ -444,6 +445,14 @@ class CalendarSyncStore:
 
     @classmethod
     def _read_store_identity(cls, connection: sqlite3.Connection) -> tuple[str, int, int]:
+        table_row = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'calendar_store_identity'"
+        ).fetchone()
+        if table_row is None or " ".join(str(table_row[0]).split()) != " ".join(
+            _IDENTITY_TABLE_SQL.split()
+        ):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
         trigger_rows = connection.execute(
             "SELECT name, sql FROM sqlite_master "
             "WHERE type = 'trigger' AND tbl_name = 'calendar_store_identity'"
