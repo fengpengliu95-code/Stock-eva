@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import stat
 import uuid
@@ -111,6 +112,20 @@ class CalendarSyncPlan(BaseModel):
     authority_checksum: str
     sources: list[dict[str, str | None]] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _validate_semantics(self) -> CalendarSyncPlan:
+        if self.requested_at.tzinfo is None or self.requested_at.utcoffset() is None:
+            raise ValueError("requested_at must be timezone-aware")
+        if self.range_start > self.range_end:
+            raise ValueError("range_start must not exceed range_end")
+        if self.authority_years != sorted(set(self.authority_years)) or any(
+            year < 1990 or year > 9999 for year in self.authority_years
+        ):
+            raise ValueError("authority_years must be sorted, unique, and valid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.authority_checksum) is None:
+            raise ValueError("authority_checksum must be lowercase sha256")
+        return self
+
 
 class CalendarObservation(BaseModel):
     session_date: date
@@ -135,6 +150,19 @@ class CalendarSyncResult(BaseModel):
     def _validate_failure_code(self) -> CalendarSyncResult:
         if self.failure_code is not None and self.status != "error":
             raise ValueError("failure_code requires an error result")
+        if self.range_start > self.range_end:
+            raise ValueError("range_start must not exceed range_end")
+        if (
+            self.fetched_at.tzinfo is None
+            or self.fetched_at.utcoffset() is None
+            or self.completed_at.tzinfo is None
+            or self.completed_at.utcoffset() is None
+        ):
+            raise ValueError("result timestamps must be timezone-aware")
+        if self.completed_at < self.fetched_at:
+            raise ValueError("completed_at must not precede fetched_at")
+        if self.observed_open_count < 0:
+            raise ValueError("observed_open_count must be non-negative")
         return self
 
 
@@ -222,8 +250,15 @@ class CalendarSyncPlanError(ValueError):
 class CalendarSyncStore:
     """Local SQLite control state; no market or user data lives here."""
 
-    def __init__(self, path: Path, *, initialize: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        initialize: bool = True,
+        missing_parent_is_empty: bool = False,
+    ) -> None:
         self.path = path
+        self._missing_parent_is_empty = missing_parent_is_empty
         if initialize:
             self._validate_ancestors()
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,7 +296,35 @@ class CalendarSyncStore:
             or info.st_mode & 0o022
         ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        self._validate_no_sidecars()
         return info
+
+    def _validate_no_sidecars(self) -> None:
+        try:
+            for suffix in ("-journal", "-wal", "-shm"):
+                try:
+                    os.lstat(self.path.with_name(self.path.name + suffix))
+                except FileNotFoundError:
+                    continue
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+
+    def _validate_missing_parent(self) -> None:
+        self._validate_ancestors()
+        try:
+            parent = os.lstat(self.path.parent)
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or parent.st_mode & 0o022
+        ):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        self._validate_no_sidecars()
 
     def _ensure_file_for_write(self) -> None:
         if self.path.exists() or self.path.is_symlink():
@@ -275,6 +338,7 @@ class CalendarSyncStore:
                 or parent.st_mode & 0o022
             ):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            self._validate_no_sidecars()
             descriptor = os.open(
                 self.path,
                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -365,6 +429,11 @@ class CalendarSyncStore:
         if not self.path.exists():
             if self.path.is_symlink():
                 self._validate_file()
+            try:
+                self._validate_missing_parent()
+            except CalendarSyncStoreReadError:
+                if not self._missing_parent_is_empty or os.path.lexists(self.path.parent):
+                    raise
             return CalendarSyncState()
         try:
             with self._connect_reader() as connection:
@@ -516,7 +585,7 @@ class CalendarSyncStore:
             )
 
     def run(self, run_id: str) -> CalendarSyncRun:
-        with self._connect() as connection:
+        with self._connect_reader() as connection:
             row = connection.execute(
                 "SELECT * FROM calendar_sync_runs WHERE run_id = ?",
                 (run_id,),
@@ -541,7 +610,7 @@ class CalendarSyncStore:
         )
 
     def observations(self, run_id: str) -> list[CalendarObservation]:
-        with self._connect() as connection:
+        with self._connect_reader() as connection:
             rows = connection.execute(
                 """
                 SELECT session_date, provider_is_open, official_status

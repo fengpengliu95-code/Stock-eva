@@ -25,6 +25,7 @@ from backend.app.market.calendar_sync import (
     CalendarSyncPolicy,
     CalendarSyncResult,
     CalendarSyncService,
+    CalendarSyncState,
     CalendarSyncStore,
     CalendarSyncStoreReadError,
     read_calendar_conflict,
@@ -86,6 +87,88 @@ def test_calendar_sync_execute_revalidates_plan_before_dependencies() -> None:
 
     with pytest.raises(CalendarSyncPlanError, match="calendar sync plan is invalid"):
         service.execute(invalid)
+
+
+def test_calendar_sync_execute_rejects_reverse_range_before_dependencies() -> None:
+    class ForbiddenCalendar:
+        def snapshot(self):
+            raise AssertionError("calendar must not be read")
+
+    service = CalendarSyncService(object(), ForbiddenCalendar(), object())
+    invalid = CalendarSyncPlan.model_construct(
+        mode="light",
+        reason="test",
+        requested_at=datetime(2026, 8, 3, tzinfo=UTC),
+        range_start=date(2026, 8, 4),
+        range_end=date(2026, 8, 3),
+        authority_years=[2026],
+        authority_checksum="a" * 64,
+        sources=[],
+    )
+
+    with pytest.raises(CalendarSyncPlanError, match="calendar sync plan is invalid"):
+        service.execute(invalid)
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_calendar_sync_store_rejects_existing_sidecar_without_mutation(
+    tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    sidecar = path.with_name(path.name + suffix)
+    sidecar.write_bytes(b"untrusted sidecar")
+    before = sidecar.read_bytes()
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+    assert sidecar.read_bytes() == before
+
+
+def test_calendar_sync_writer_does_not_create_database_beside_sidecar(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    sidecar = path.with_name(path.name + "-journal")
+    sidecar.write_bytes(b"untrusted sidecar")
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert not path.exists()
+    assert sidecar.read_bytes() == b"untrusted sidecar"
+
+
+def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    store = CalendarSyncStore(path, initialize=False)
+    before = sorted(tmp_path.iterdir())
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        store.run("missing")
+    with pytest.raises(CalendarSyncStoreReadError):
+        store.observations("missing")
+
+    assert sorted(tmp_path.iterdir()) == before
+
+
+def test_calendar_sync_missing_state_requires_safe_existing_parent(tmp_path: Path) -> None:
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    assert (
+        CalendarSyncStore(safe / "missing.sqlite3", initialize=False).state() == CalendarSyncState()
+    )
+
+    missing_parent = tmp_path / "missing-parent"
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(missing_parent / "calendar.sqlite3", initialize=False).state()
+    assert not missing_parent.exists()
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(unsafe / "calendar.sqlite3", initialize=False).state()
+    assert list(unsafe.iterdir()) == []
 
 
 def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
@@ -1343,17 +1426,19 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
     capsys,
     tmp_path: Path,
 ) -> None:
-    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
     monkeypatch.setattr(sys, "argv", ["stock-eva", "calendar-sync"])
+    control = tmp_path / "control"
+    control.mkdir(mode=0o700)
     settings = Settings(
         _env_file=None,
         market_data_dir=tmp_path / "market",
         user_data_dir=tmp_path / "user",
-        local_control_dir=tmp_path / "control",
+        local_control_dir=control,
         local_staging_dir=tmp_path / "staging",
         local_lock_dir=tmp_path / "locks",
         local_temp_dir=tmp_path / "tmp",
     )
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
 
     def unexpected_provider(*args, **kwargs):

@@ -357,6 +357,7 @@ def get_calendar_sync_store(
     return CalendarSyncStore(
         settings.local_control_dir / settings.calendar_sync_database_name,
         initialize=False,
+        missing_parent_is_empty=True,
     )
 
 
