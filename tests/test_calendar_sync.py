@@ -256,6 +256,37 @@ def test_calendar_sync_legacy_migration_blocks_commit_after_candidate_copy(
     assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
 
 
+def test_calendar_sync_migration_has_no_fallible_validation_after_activation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_validate = CalendarSyncStore._validate_file
+    validation_calls = 0
+
+    def fail_on_old_post_activation_validation(self, **kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 5:
+            raise CalendarSyncStoreReadError("post-activation validation injected")
+        return real_validate(self, **kwargs)
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_validate_file",
+        fail_on_old_post_activation_validation,
+    )
+
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert validation_calls == 4
+    monkeypatch.undo()
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+
+
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

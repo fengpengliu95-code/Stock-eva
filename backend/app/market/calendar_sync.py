@@ -427,12 +427,11 @@ class CalendarSyncStore:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         self._validate_no_sidecars()
 
-    def _ensure_file_for_write(self) -> os.stat_result:
+    def _ensure_file_for_write(self) -> os.stat_result | _CalendarSyncConnection:
         if self.path.exists() or self.path.is_symlink():
             current = self._validate_file()
             if not self._has_identity_table(current):
-                self._migrate_legacy_store(current)
-                return self._validate_file()
+                return self._migrate_legacy_store(current)
             return current
         try:
             parent = os.lstat(self.path.parent)
@@ -492,12 +491,13 @@ class CalendarSyncStore:
         for trigger_sql in _IDENTITY_TRIGGERS.values():
             connection.execute(trigger_sql)
 
-    def _migrate_legacy_store(self, expected: os.stat_result) -> None:
+    def _migrate_legacy_store(self, expected: os.stat_result) -> _CalendarSyncConnection:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.migration")
         source_descriptor: int | None = None
         source: sqlite3.Connection | None = None
         temporary_descriptor: int | None = None
         destination: sqlite3.Connection | None = None
+        activated: _CalendarSyncConnection | None = None
         identity_stat: os.stat_result | None = None
         exchanged = False
         migration_complete = False
@@ -548,21 +548,33 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             if identity_stat is None:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            with closing(sqlite3.connect(self.path)) as activated, activated:
-                identity = self._read_store_identity(activated, require_active=False)
-                if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
-                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
-                activated.execute(
-                    "UPDATE calendar_store_identity SET active = 1 WHERE singleton = 1"
-                )
-                self._read_store_identity(activated)
             published = self._validate_file()
             if (published.st_dev, published.st_ino) != (
                 identity_stat.st_dev,
                 identity_stat.st_ino,
             ):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            activated = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
+            activated.row_factory = sqlite3.Row
+            with activated:
+                identity = self._read_store_identity(activated, require_active=False)
+                if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
+                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
+                published = self._validate_file()
+                if (published.st_dev, published.st_ino) != (
+                    identity_stat.st_dev,
+                    identity_stat.st_ino,
+                ):
+                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
+                activated.execute(
+                    "UPDATE calendar_store_identity SET active = 1 WHERE singleton = 1"
+                )
+                self._read_store_identity(activated)
+            # The active=1 commit is the irreversible success point.  All fallible
+            # publication validation precedes it, so an adopted active candidate is
+            # never reported as a failed migration.
             migration_complete = True
+            return activated
         except BaseException:
             if exchanged and not migration_complete:
                 try:
@@ -572,10 +584,20 @@ class CalendarSyncStore:
                     pass
             raise
         finally:
-            if source is not None:
-                source.close()
+            connections = (source,) if migration_complete else (activated, source)
+            for connection in connections:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except BaseException:
+                        if not migration_complete:
+                            raise
             if source_descriptor is not None:
-                os.close(source_descriptor)
+                try:
+                    os.close(source_descriptor)
+                except BaseException:
+                    if not migration_complete:
+                        raise
             if temporary_descriptor is not None:
                 os.close(temporary_descriptor)
             if destination is not None:
@@ -732,7 +754,12 @@ class CalendarSyncStore:
         connection: sqlite3.Connection | None = None
         descriptor: int | None = None
         try:
-            expected = self._ensure_file_for_write()
+            ensured = self._ensure_file_for_write()
+            if isinstance(ensured, _CalendarSyncConnection):
+                ensured.bind_calendar_sync_lock()
+                lock_owned = False
+                return ensured
+            expected = ensured
             descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
             bound = os.fstat(descriptor)
             if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
@@ -818,8 +845,8 @@ class CalendarSyncStore:
                     pass
 
     def _initialize(self) -> None:
-        with closing(self._connect()) as connection:
-            self._validate_core_schema(connection, require_identity=True)
+        with closing(self._connect()):
+            pass
 
     def initialize_for_write(self) -> None:
         """Initialize writer state only after an operation has verified its authority."""
