@@ -499,6 +499,8 @@ class CalendarSyncStore:
         destination: sqlite3.Connection | None = None
         identity_stat: os.stat_result | None = None
         cleanup_temporary = True
+        exchanged = False
+        migration_complete = False
         try:
             source_descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
             bound = os.fstat(source_descriptor)
@@ -528,13 +530,10 @@ class CalendarSyncStore:
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             self._exchange_paths(temporary, self.path)
+            exchanged = True
+            cleanup_temporary = False
             displaced = os.lstat(temporary)
             if (displaced.st_dev, displaced.st_ino) != (expected.st_dev, expected.st_ino):
-                try:
-                    self._exchange_paths(temporary, self.path)
-                except BaseException:
-                    cleanup_temporary = False
-                    raise
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             if identity_stat is None:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -551,8 +550,18 @@ class CalendarSyncStore:
                 identity_stat.st_dev,
                 identity_stat.st_ino,
             ):
-                cleanup_temporary = False
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            migration_complete = True
+            cleanup_temporary = True
+        except BaseException:
+            if exchanged and not migration_complete:
+                try:
+                    self._exchange_paths(temporary, self.path)
+                    exchanged = False
+                except BaseException:
+                    pass
+                cleanup_temporary = False
+            raise
         finally:
             if source_descriptor is not None:
                 os.close(source_descriptor)

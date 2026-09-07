@@ -245,7 +245,10 @@ def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     assert path.read_bytes() == replacement_bytes
     assert displaced.exists()
     assert calls == 2
-    assert not list(tmp_path.glob(".*.migration"))
+    preserved = list(tmp_path.glob(".*.migration"))
+    assert len(preserved) == 1
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(preserved[0], initialize=False).state()
 
 
 def test_calendar_sync_failed_migration_rollback_removes_only_generated_canonical(
