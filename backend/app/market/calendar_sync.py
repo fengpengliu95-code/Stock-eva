@@ -556,6 +556,9 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             activated = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
             activated.row_factory = sqlite3.Row
+            # Bind lock ownership before activation.  active=1 must remain the final
+            # fallible commit point; the caller receives an already-bound connection.
+            activated.bind_calendar_sync_lock()
             with activated:
                 identity = self._read_store_identity(activated, require_active=False)
                 if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
@@ -588,6 +591,11 @@ class CalendarSyncStore:
             for connection in connections:
                 if connection is not None:
                     try:
+                        if connection is activated and activated._calendar_sync_lock_held:
+                            # _connect() still owns and will release the outer lock when
+                            # migration fails before activation commits.
+                            activated._calendar_sync_lock_held = False
+                            activated._calendar_sync_lock_owner = None
                         connection.close()
                     except BaseException:
                         if not migration_complete:
@@ -756,7 +764,6 @@ class CalendarSyncStore:
         try:
             ensured = self._ensure_file_for_write()
             if isinstance(ensured, _CalendarSyncConnection):
-                ensured.bind_calendar_sync_lock()
                 lock_owned = False
                 return ensured
             expected = ensured
