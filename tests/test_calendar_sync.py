@@ -171,6 +171,45 @@ def test_calendar_sync_reader_rejects_changed_identity_table_schema(tmp_path: Pa
         CalendarSyncStore(path, initialize=False).initialize_for_write()
 
 
+def test_calendar_sync_reader_rejects_changed_core_table_schema(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("ALTER TABLE calendar_sync_state ADD COLUMN injected TEXT")
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+
+def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+        connection.execute(
+            "INSERT INTO calendar_authority_versions "
+            "(checksum, payload_json, first_seen_at) VALUES (?, ?, ?)",
+            ("a" * 64, '{"years":[2026]}', "2026-08-01T00:00:00+00:00"),
+        )
+    path.chmod(0o600)
+    old_inode = path.stat().st_ino
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert path.stat().st_ino != old_inode
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT checksum FROM calendar_authority_versions"
+        ).fetchall() == [("a" * 64,)]
+    assert not list(tmp_path.glob(".*.migration"))
+
+
 def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path, initialize=False)
