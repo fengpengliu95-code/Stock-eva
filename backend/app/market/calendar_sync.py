@@ -498,7 +498,6 @@ class CalendarSyncStore:
         temporary_descriptor: int | None = None
         destination: sqlite3.Connection | None = None
         identity_stat: os.stat_result | None = None
-        cleanup_temporary = True
         exchanged = False
         migration_complete = False
         try:
@@ -531,7 +530,6 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             self._exchange_paths(temporary, self.path)
             exchanged = True
-            cleanup_temporary = False
             displaced = os.lstat(temporary)
             if (displaced.st_dev, displaced.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -552,7 +550,6 @@ class CalendarSyncStore:
             ):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             migration_complete = True
-            cleanup_temporary = False
         except BaseException:
             if exchanged and not migration_complete:
                 try:
@@ -560,7 +557,6 @@ class CalendarSyncStore:
                     exchanged = False
                 except BaseException:
                     pass
-                cleanup_temporary = False
             raise
         finally:
             if source_descriptor is not None:
@@ -569,11 +565,6 @@ class CalendarSyncStore:
                 os.close(temporary_descriptor)
             if destination is not None:
                 destination.close()
-            if cleanup_temporary:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
 
     @staticmethod
     def _exchange_paths(first: Path, second: Path) -> None:
