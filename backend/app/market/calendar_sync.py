@@ -510,6 +510,7 @@ class CalendarSyncStore:
         activated: _CalendarSyncConnection | None = None
         identity_stat: os.stat_result | None = None
         exchanged = False
+        activation_confirmed = False
         migration_complete = False
         try:
             guard_descriptor = os.open(
@@ -592,8 +593,10 @@ class CalendarSyncStore:
                 )
                 self._read_store_identity(activated)
                 activated.commit()
+                activation_confirmed = True
             except BaseException:
                 if self._activation_committed(activated, identity_stat):
+                    activation_confirmed = True
                     self._remove_migration_guard(guard, guard_stat)
                     migration_complete = True
                     return activated
@@ -606,6 +609,9 @@ class CalendarSyncStore:
             return activated
         except BaseException:
             if exchanged and not migration_complete:
+                if activation_confirmed and self._migration_guard_completed(guard, guard_stat):
+                    migration_complete = True
+                    return activated
                 if (
                     activated is not None
                     and identity_stat is not None
@@ -670,6 +676,28 @@ class CalendarSyncStore:
 
     def _migration_guard_path(self) -> Path:
         return self.path.with_name(f".{self.path.name}.migration-in-progress")
+
+    @staticmethod
+    def _migration_guard_completed(
+        guard: Path,
+        expected: os.stat_result | None,
+    ) -> bool:
+        if expected is None:
+            return False
+        try:
+            for candidate in guard.parent.glob(f".{guard.name}.*.removed"):
+                current = os.lstat(candidate)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and current.st_uid == os.geteuid()
+                    and current.st_nlink == 1
+                    and not current.st_mode & 0o022
+                    and (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+                ):
+                    return True
+        except (OSError, TypeError, ValueError):
+            return False
+        return False
 
     @staticmethod
     def _remove_migration_guard(

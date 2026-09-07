@@ -499,6 +499,49 @@ def test_calendar_sync_guard_removal_never_overwrites_existing_target(
     assert target.read_bytes() == b"preexisting"
 
 
+def test_calendar_sync_guard_completed_evidence_resolves_post_move_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_remove = CalendarSyncStore._remove_migration_guard
+    real_exchange = CalendarSyncStore._exchange_paths
+    remove_injected = False
+    exchanges = 0
+
+    def remove_then_error(guard, expected):
+        nonlocal remove_injected
+        real_remove(guard, expected)
+        if not remove_injected:
+            remove_injected = True
+            raise RuntimeError("post-move injected")
+
+    def count_exchange(first, second):
+        nonlocal exchanges
+        exchanges += 1
+        return real_exchange(first, second)
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_remove_migration_guard",
+        staticmethod(remove_then_error),
+    )
+    monkeypatch.setattr(CalendarSyncStore, "_activation_committed", lambda *_args: False)
+    monkeypatch.setattr(CalendarSyncStore, "_exchange_paths", staticmethod(count_exchange))
+
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert remove_injected is True
+    assert exchanges == 1
+    assert not (tmp_path / ".calendar.sqlite3.migration-in-progress").exists()
+    assert list(tmp_path.glob(".*.removed"))
+    monkeypatch.undo()
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+
+
 def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
