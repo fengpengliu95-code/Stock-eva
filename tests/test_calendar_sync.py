@@ -236,9 +236,12 @@ def test_calendar_sync_wrong_thread_close_does_not_leak_process_lock(tmp_path: P
     assert not wrong_owner.is_alive()
     assert errors and isinstance(errors[0], sqlite3.ProgrammingError)
 
-    connection.close()
     recovered = threading.Thread(target=lambda: store._connect().close())
     recovered.start()
+    recovered.join(timeout=0.05)
+    assert recovered.is_alive()
+
+    connection.close()
     recovered.join(timeout=2)
     assert not recovered.is_alive()
 
@@ -256,7 +259,7 @@ def test_calendar_sync_writer_rejects_path_swap_during_lock_probe(
 
     def swapping_execute(connection, statement, *args, **kwargs):
         nonlocal swapped
-        if statement == "BEGIN EXCLUSIVE" and not swapped:
+        if statement.startswith("SELECT store_id, device, inode") and not swapped:
             path.rename(displaced)
             replacement.rename(path)
             swapped = True
@@ -273,6 +276,17 @@ def test_calendar_sync_writer_rejects_path_swap_during_lock_probe(
 
     assert swapped
     assert path.stat().st_ino != displaced.stat().st_ino
+
+
+def test_calendar_sync_writer_rejects_copied_store_identity(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite3"
+    CalendarSyncStore(source)
+    copied = tmp_path / "copied.sqlite3"
+    copied.write_bytes(source.read_bytes())
+    copied.chmod(0o600)
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(copied, initialize=False).initialize_for_write()
 
 
 def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:

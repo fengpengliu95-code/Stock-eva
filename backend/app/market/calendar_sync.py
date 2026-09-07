@@ -15,8 +15,6 @@ import os
 import re
 import sqlite3
 import stat
-import subprocess
-import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -250,41 +248,27 @@ class CalendarSyncPlanError(ValueError):
     """A caller supplied a calendar sync plan that fails the public contract."""
 
 
-_CALENDAR_SYNC_CONNECTION_LOCK = threading.Lock()
-_LOCK_PROBE = """\
-import fcntl
-import os
-import sys
-
-try:
-    fcntl.lockf(
-        int(sys.argv[1]),
-        fcntl.LOCK_EX | fcntl.LOCK_NB,
-        1,
-        0x40000002,
-        os.SEEK_SET,
-    )
-except BlockingIOError:
-    raise SystemExit(1)
-raise SystemExit(0)
-"""
+_CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
 
 
 class _CalendarSyncConnection(sqlite3.Connection):
     """A connection that owns the process-local pathname verification lock."""
 
     _calendar_sync_lock_held = False
+    _calendar_sync_lock_owner: int | None = None
 
     def bind_calendar_sync_lock(self) -> None:
         self._calendar_sync_lock_held = True
+        self._calendar_sync_lock_owner = threading.get_ident()
 
     def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            if self._calendar_sync_lock_held:
-                self._calendar_sync_lock_held = False
-                _CALENDAR_SYNC_CONNECTION_LOCK.release()
+        super().close()
+        if self._calendar_sync_lock_held:
+            if self._calendar_sync_lock_owner != threading.get_ident():
+                raise RuntimeError("calendar connection closed by non-owner")
+            self._calendar_sync_lock_held = False
+            self._calendar_sync_lock_owner = None
+            _CALENDAR_SYNC_CONNECTION_LOCK.release()
 
 
 class CalendarSyncStore:
@@ -379,17 +363,70 @@ class CalendarSyncStore:
             ):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             self._validate_no_sidecars()
-            descriptor = os.open(
-                self.path,
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-            os.close(descriptor)
+            self._publish_identity_database()
             return self._validate_file()
         except CalendarSyncStoreReadError:
             raise
         except (OSError, TypeError, ValueError):
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+
+    def _publish_identity_database(self) -> None:
+        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.bootstrap")
+        descriptor: int | None = None
+        identity_stat: os.stat_result | None = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            identity_stat = os.fstat(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            with closing(sqlite3.connect(temporary)) as connection, connection:
+                connection.execute(
+                    "CREATE TABLE calendar_store_identity "
+                    "(singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                    "store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL, "
+                    "inode INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO calendar_store_identity "
+                    "(singleton, store_id, device, inode) VALUES (1, ?, ?, ?)",
+                    (uuid.uuid4().hex, identity_stat.st_dev, identity_stat.st_ino),
+                )
+            os.link(temporary, self.path, follow_symlinks=False)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _read_store_identity(connection: sqlite3.Connection) -> tuple[str, int, int]:
+        row = connection.execute(
+            "SELECT store_id, device, inode FROM calendar_store_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        store_id = str(row[0])
+        if re.fullmatch(r"[0-9a-f]{32}", store_id) is None:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if type(row[1]) is not int or type(row[2]) is not int:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        return store_id, row[1], row[2]
+
+    def _read_bound_store_identity(self, descriptor: int) -> tuple[str, int, int]:
+        with closing(
+            sqlite3.connect(f"file:///dev/fd/{descriptor}?mode=ro", uri=True, timeout=0)
+        ) as connection:
+            identity = self._read_store_identity(connection)
+        bound = os.fstat(descriptor)
+        if identity[1:] != (bound.st_dev, bound.st_ino):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        return identity
 
     def _connect(self) -> sqlite3.Connection:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
@@ -402,8 +439,7 @@ class CalendarSyncStore:
             bound = os.fstat(descriptor)
             if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            if not self._probe_inode_lock(descriptor, expect_locked=False):
-                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            expected_identity = self._read_bound_store_identity(descriptor)
             connection = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
             connection.bind_calendar_sync_lock()
             lock_owned = False
@@ -411,13 +447,8 @@ class CalendarSyncStore:
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            connection.execute("BEGIN EXCLUSIVE")
-            if not self._probe_inode_lock(descriptor, expect_locked=True):
+            if self._read_store_identity(connection) != expected_identity:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            current = self._validate_file(allow_transaction_sidecars=True)
-            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
-                raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            connection.rollback()
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -442,20 +473,6 @@ class CalendarSyncStore:
                     os.close(descriptor)
                 except BaseException:
                     pass
-
-    @staticmethod
-    def _probe_inode_lock(descriptor: int, *, expect_locked: bool) -> bool:
-        result = subprocess.run(
-            [sys.executable, "-c", _LOCK_PROBE, str(descriptor)],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            pass_fds=(descriptor,),
-            timeout=2,
-        )
-        expected_code = 1 if expect_locked else 0
-        return result.returncode == expected_code
 
     def _connect_reader(self) -> sqlite3.Connection:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
