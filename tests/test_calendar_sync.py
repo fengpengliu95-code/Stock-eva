@@ -1457,6 +1457,46 @@ def test_calendar_sync_cli_defaults_to_network_free_plan(
     assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
 
 
+@pytest.mark.parametrize("mode", ["light", "auto"])
+def test_calendar_sync_cli_rejects_reverse_range_before_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "calendar-sync",
+            "--mode",
+            mode,
+            "--start",
+            "2026-08-04",
+            "--end",
+            "2026-08-03",
+            "--execute",
+        ],
+    )
+
+    def forbidden_settings():
+        raise AssertionError("invalid range must be rejected before dependencies")
+
+    monkeypatch.setattr(cli, "get_settings", forbidden_settings)
+    before = sorted(tmp_path.rglob("*"))
+
+    assert cli.main() == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_code": "INVALID_CALENDAR_SYNC_RANGE",
+        "network_requests": 0,
+        "writes_calendar_state": False,
+        "canonical_writes": False,
+    }
+    assert sorted(tmp_path.rglob("*")) == before
+
+
 def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_call(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

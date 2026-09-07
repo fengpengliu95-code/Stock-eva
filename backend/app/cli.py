@@ -1385,6 +1385,34 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "calendar-sync":
+        if (args.start is None) != (args.end is None):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "message": "--start and --end must be used together",
+                        "writes_calendar_state": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        if args.start is not None and args.end is not None and args.start > args.end:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "INVALID_CALENDAR_SYNC_RANGE",
+                        "network_requests": 0,
+                        "writes_calendar_state": False,
+                        "canonical_writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
     if args.command == "calendar-generation-status":
         return _calendar_generation_status_command(args)
     if args.command == "calendar-generation-stage":
@@ -2207,18 +2235,6 @@ def main() -> int:
         )
         return 0
     if args.command == "calendar-sync":
-        if (args.start is None) != (args.end is None):
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "message": "--start and --end must be used together",
-                        "writes_calendar_state": False,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return 2
         now = get_market_clock()()
         runtime_result = None
         if args.execute and settings.calendar_runtime_enabled:
