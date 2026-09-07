@@ -628,6 +628,15 @@ class CalendarSyncStore:
                         migration_complete = True
                         return activated
                 else:
+                    restored = self._validate_file(allow_migration_guard=True)
+                    displaced_candidate = os.lstat(temporary)
+                    if (
+                        (restored.st_dev, restored.st_ino) != (expected.st_dev, expected.st_ino)
+                        or identity_stat is None
+                        or (displaced_candidate.st_dev, displaced_candidate.st_ino)
+                        != (identity_stat.st_dev, identity_stat.st_ino)
+                    ):
+                        raise CalendarSyncStoreReadError("calendar control database is unavailable")
                     self._remove_migration_guard(guard, guard_stat)
             elif not exchanged:
                 self._remove_migration_guard(guard, guard_stat)
@@ -669,8 +678,12 @@ class CalendarSyncStore:
     ) -> None:
         if expected is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        quarantine = guard.with_name(f".{guard.name}.{uuid.uuid4().hex}.removing")
+        moved = False
         try:
-            current = os.lstat(guard)
+            os.rename(guard, quarantine)
+            moved = True
+            current = os.lstat(quarantine)
             if (
                 not stat.S_ISREG(current.st_mode)
                 or current.st_uid != os.geteuid()
@@ -678,12 +691,25 @@ class CalendarSyncStore:
                 or current.st_mode & 0o022
                 or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
             ):
+                try:
+                    os.link(quarantine, guard, follow_symlinks=False)
+                except FileExistsError:
+                    pass
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            os.unlink(guard)
+            os.unlink(quarantine)
+            moved = False
         except CalendarSyncStoreReadError:
             raise
         except (OSError, TypeError, ValueError):
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        finally:
+            # A mismatched object is evidence, not ours to delete.  If the guard pathname
+            # could not be restored because another object occupies it, both remain.
+            if moved and not os.path.lexists(guard):
+                try:
+                    os.link(quarantine, guard, follow_symlinks=False)
+                except (FileExistsError, OSError):
+                    pass
 
     def _activation_is_durable(self, expected: os.stat_result) -> bool:
         descriptor: int | None = None

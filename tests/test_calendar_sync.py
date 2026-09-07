@@ -449,6 +449,69 @@ def test_calendar_sync_guard_blocks_active_candidate_when_commit_stays_ambiguous
         CalendarSyncStore(path, initialize=False).state()
 
 
+def test_calendar_sync_guard_removal_does_not_delete_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard = tmp_path / ".calendar.sqlite3.migration-in-progress"
+    guard.write_bytes(b"owned guard")
+    guard.chmod(0o600)
+    expected = guard.stat()
+    saved = tmp_path / "saved-guard"
+    decoy = tmp_path / "decoy"
+    decoy.write_bytes(b"replacement")
+    decoy.chmod(0o600)
+    real_rename = calendar_sync_module.os.rename
+
+    def swap_before_rename(source, destination):
+        real_rename(source, saved)
+        real_rename(decoy, source)
+        real_rename(source, destination)
+
+    monkeypatch.setattr(calendar_sync_module.os, "rename", swap_before_rename)
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore._remove_migration_guard(guard, expected)
+
+    assert saved.read_bytes() == b"owned guard"
+    assert guard.read_bytes() == b"replacement"
+    assert any(path.read_bytes() == b"replacement" for path in tmp_path.glob("*.removing"))
+
+
+def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_exchange = CalendarSyncStore._exchange_paths
+    exchanges = 0
+
+    def fail_commit(_connection):
+        raise RuntimeError("commit injected")
+
+    def no_op_rollback(first, second):
+        nonlocal exchanges
+        exchanges += 1
+        if exchanges == 1:
+            return real_exchange(first, second)
+        return None
+
+    monkeypatch.setattr(calendar_sync_module._CalendarSyncConnection, "commit", fail_commit)
+    monkeypatch.setattr(CalendarSyncStore, "_activation_committed", lambda *_args: False)
+    monkeypatch.setattr(CalendarSyncStore, "_exchange_paths", staticmethod(no_op_rollback))
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert exchanges == 2
+    assert (tmp_path / ".calendar.sqlite3.migration-in-progress").is_file()
+    monkeypatch.undo()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
