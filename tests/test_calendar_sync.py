@@ -542,6 +542,50 @@ def test_calendar_sync_guard_completed_evidence_resolves_post_move_error(
     assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
 
 
+def test_calendar_sync_restores_blocker_when_completed_marker_is_replaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_remove = CalendarSyncStore._remove_migration_guard
+    real_exchange = CalendarSyncStore._exchange_paths
+    exchanges = 0
+
+    def replace_completed_then_error(guard, expected):
+        real_remove(guard, expected)
+        completed = next(guard.parent.glob(f".{guard.name}.*.removed"))
+        completed.unlink()
+        completed.write_bytes(b"replacement")
+        raise RuntimeError("completed marker replaced")
+
+    def fail_rollback(first, second):
+        nonlocal exchanges
+        exchanges += 1
+        if exchanges == 2:
+            raise OSError("rollback injected")
+        return real_exchange(first, second)
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_remove_migration_guard",
+        staticmethod(replace_completed_then_error),
+    )
+    monkeypatch.setattr(CalendarSyncStore, "_activation_committed", lambda *_args: False)
+    monkeypatch.setattr(CalendarSyncStore, "_exchange_paths", staticmethod(fail_rollback))
+
+    with pytest.raises(RuntimeError, match="completed marker replaced"):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    blocker = tmp_path / ".calendar.sqlite3.migration-in-progress"
+    assert blocker.is_file()
+    monkeypatch.undo()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+
 def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

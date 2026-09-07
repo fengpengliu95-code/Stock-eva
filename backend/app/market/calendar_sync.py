@@ -633,6 +633,7 @@ class CalendarSyncStore:
                             self._remove_migration_guard(guard, guard_stat)
                         migration_complete = True
                         return activated
+                    self._ensure_migration_guard_blocking(guard)
                 else:
                     restored = self._validate_file(allow_migration_guard=True)
                     displaced_candidate = os.lstat(temporary)
@@ -676,6 +677,30 @@ class CalendarSyncStore:
 
     def _migration_guard_path(self) -> Path:
         return self.path.with_name(f".{self.path.name}.migration-in-progress")
+
+    @staticmethod
+    def _ensure_migration_guard_blocking(guard: Path) -> None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                guard,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+        except FileExistsError:
+            return
+        except (OSError, TypeError, ValueError):
+            if os.path.lexists(guard):
+                return
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+        if not os.path.lexists(guard):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
 
     @staticmethod
     def _migration_guard_completed(
