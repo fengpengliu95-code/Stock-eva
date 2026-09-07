@@ -248,6 +248,49 @@ def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     assert not list(tmp_path.glob(".*.migration"))
 
 
+def test_calendar_sync_failed_migration_rollback_removes_only_generated_canonical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    displaced = tmp_path / "displaced.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    CalendarSyncStore(replacement)
+    replacement_bytes = replacement.read_bytes()
+    real_exchange = CalendarSyncStore._exchange_paths
+    calls = 0
+
+    def failing_rollback(first: Path, second: Path) -> None:
+        nonlocal calls
+        if calls == 0:
+            path.rename(displaced)
+            replacement.rename(path)
+            calls += 1
+            real_exchange(first, second)
+            return
+        calls += 1
+        raise OSError("rollback injected")
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_exchange_paths",
+        staticmethod(failing_rollback),
+    )
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert not path.exists()
+    assert displaced.exists()
+    preserved = list(tmp_path.glob(".*.migration"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == replacement_bytes
+    assert calls == 2
+
+
 def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path, initialize=False)

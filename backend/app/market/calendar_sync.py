@@ -516,6 +516,12 @@ class CalendarSyncStore:
                     self._exchange_paths(temporary, self.path)
                 except BaseException:
                     cleanup_temporary = False
+                    canonical = os.lstat(self.path)
+                    if identity_stat is not None and (canonical.st_dev, canonical.st_ino) == (
+                        identity_stat.st_dev,
+                        identity_stat.st_ino,
+                    ):
+                        os.unlink(self.path)
                     raise
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             published = self._validate_file()
