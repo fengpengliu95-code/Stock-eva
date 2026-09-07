@@ -207,7 +207,9 @@ def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: P
         assert connection.execute(
             "SELECT checksum FROM calendar_authority_versions"
         ).fetchall() == [("a" * 64,)]
-    assert not list(tmp_path.glob(".*.migration"))
+    backups = list(tmp_path.glob(".*.migration"))
+    assert len(backups) == 1
+    assert backups[0].stat().st_ino == old_inode
 
 
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(

@@ -552,7 +552,7 @@ class CalendarSyncStore:
             ):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             migration_complete = True
-            cleanup_temporary = True
+            cleanup_temporary = False
         except BaseException:
             if exchanged and not migration_complete:
                 try:
