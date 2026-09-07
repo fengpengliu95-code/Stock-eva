@@ -407,6 +407,48 @@ def test_calendar_sync_migration_rechecks_commit_after_failed_rollback(
     assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
 
 
+def test_calendar_sync_guard_blocks_active_candidate_when_commit_stays_ambiguous(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_commit = calendar_sync_module._CalendarSyncConnection.commit
+    real_exchange = CalendarSyncStore._exchange_paths
+    commit_injected = False
+    exchanges = 0
+
+    def commit_then_error(connection):
+        nonlocal commit_injected
+        real_commit(connection)
+        if not commit_injected:
+            commit_injected = True
+            raise RuntimeError("post-commit injected")
+
+    def fail_rollback(first, second):
+        nonlocal exchanges
+        exchanges += 1
+        if exchanges == 2:
+            raise OSError("rollback injected")
+        return real_exchange(first, second)
+
+    monkeypatch.setattr(calendar_sync_module._CalendarSyncConnection, "commit", commit_then_error)
+    monkeypatch.setattr(CalendarSyncStore, "_activation_committed", lambda *_args: False)
+    monkeypatch.setattr(CalendarSyncStore, "_exchange_paths", staticmethod(fail_rollback))
+
+    with pytest.raises(RuntimeError, match="post-commit injected"):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert commit_injected is True
+    assert exchanges == 2
+    assert (tmp_path / ".calendar.sqlite3.migration-in-progress").is_file()
+    monkeypatch.undo()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

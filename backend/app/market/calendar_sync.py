@@ -378,7 +378,12 @@ class CalendarSyncStore:
         except (OSError, TypeError, ValueError):
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
-    def _validate_file(self, *, allow_transaction_sidecars: bool = False) -> os.stat_result:
+    def _validate_file(
+        self,
+        *,
+        allow_transaction_sidecars: bool = False,
+        allow_migration_guard: bool = False,
+    ) -> os.stat_result:
         self._validate_ancestors()
         try:
             info = os.lstat(self.path)
@@ -397,16 +402,18 @@ class CalendarSyncStore:
         ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         if not allow_transaction_sidecars:
-            self._validate_no_sidecars()
+            self._validate_no_sidecars(allow_migration_guard=allow_migration_guard)
         return info
 
-    def _validate_no_sidecars(self) -> None:
+    def _validate_no_sidecars(self, *, allow_migration_guard: bool = False) -> None:
         try:
             for suffix in ("-journal", "-wal", "-shm"):
                 try:
                     os.lstat(self.path.with_name(self.path.name + suffix))
                 except FileNotFoundError:
                     continue
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            if not allow_migration_guard and os.path.lexists(self._migration_guard_path()):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
         except CalendarSyncStoreReadError:
             raise
@@ -493,6 +500,9 @@ class CalendarSyncStore:
 
     def _migrate_legacy_store(self, expected: os.stat_result) -> _CalendarSyncConnection:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.migration")
+        guard = self._migration_guard_path()
+        guard_descriptor: int | None = None
+        guard_stat: os.stat_result | None = None
         source_descriptor: int | None = None
         source: sqlite3.Connection | None = None
         temporary_descriptor: int | None = None
@@ -502,6 +512,14 @@ class CalendarSyncStore:
         exchanged = False
         migration_complete = False
         try:
+            guard_descriptor = os.open(
+                guard,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            guard_stat = os.fstat(guard_descriptor)
+            os.close(guard_descriptor)
+            guard_descriptor = None
             source_descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
             bound = os.fstat(source_descriptor)
             if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
@@ -538,7 +556,7 @@ class CalendarSyncStore:
                     candidate_rows = candidate.execute(f'SELECT * FROM "{table}"').fetchall()
                     if sorted(source_rows, key=repr) != sorted(candidate_rows, key=repr):
                         raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            current = self._validate_file()
+            current = self._validate_file(allow_migration_guard=True)
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             self._exchange_paths(temporary, self.path)
@@ -548,7 +566,7 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             if identity_stat is None:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            published = self._validate_file()
+            published = self._validate_file(allow_migration_guard=True)
             if (published.st_dev, published.st_ino) != (
                 identity_stat.st_dev,
                 identity_stat.st_ino,
@@ -563,7 +581,7 @@ class CalendarSyncStore:
                 identity = self._read_store_identity(activated, require_active=False)
                 if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
                     raise CalendarSyncStoreReadError("calendar control database is unavailable")
-                published = self._validate_file()
+                published = self._validate_file(allow_migration_guard=True)
                 if (published.st_dev, published.st_ino) != (
                     identity_stat.st_dev,
                     identity_stat.st_ino,
@@ -576,16 +594,26 @@ class CalendarSyncStore:
                 activated.commit()
             except BaseException:
                 if self._activation_committed(activated, identity_stat):
+                    self._remove_migration_guard(guard, guard_stat)
                     migration_complete = True
                     return activated
                 raise
             # The active=1 commit is the irreversible success point.  All fallible
             # publication validation precedes it, so an adopted active candidate is
             # never reported as a failed migration.
+            self._remove_migration_guard(guard, guard_stat)
             migration_complete = True
             return activated
         except BaseException:
             if exchanged and not migration_complete:
+                if (
+                    activated is not None
+                    and identity_stat is not None
+                    and not os.path.lexists(guard)
+                    and self._activation_committed(activated, identity_stat)
+                ):
+                    migration_complete = True
+                    return activated
                 try:
                     self._exchange_paths(temporary, self.path)
                     exchanged = False
@@ -595,8 +623,14 @@ class CalendarSyncStore:
                         and identity_stat is not None
                         and self._activation_committed(activated, identity_stat)
                     ):
+                        if os.path.lexists(guard):
+                            self._remove_migration_guard(guard, guard_stat)
                         migration_complete = True
                         return activated
+                else:
+                    self._remove_migration_guard(guard, guard_stat)
+            elif not exchanged:
+                self._remove_migration_guard(guard, guard_stat)
             raise
         finally:
             connections = (source,) if migration_complete else (activated, source)
@@ -622,11 +656,39 @@ class CalendarSyncStore:
                 os.close(temporary_descriptor)
             if destination is not None:
                 destination.close()
+            if guard_descriptor is not None:
+                os.close(guard_descriptor)
+
+    def _migration_guard_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.migration-in-progress")
+
+    @staticmethod
+    def _remove_migration_guard(
+        guard: Path,
+        expected: os.stat_result | None,
+    ) -> None:
+        if expected is None:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        try:
+            current = os.lstat(guard)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or current.st_nlink != 1
+                or current.st_mode & 0o022
+                or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+            ):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            os.unlink(guard)
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
     def _activation_is_durable(self, expected: os.stat_result) -> bool:
         descriptor: int | None = None
         try:
-            published = self._validate_file()
+            published = self._validate_file(allow_migration_guard=True)
             if (published.st_dev, published.st_ino) != (expected.st_dev, expected.st_ino):
                 return False
             descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
