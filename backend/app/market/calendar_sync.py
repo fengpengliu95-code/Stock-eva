@@ -373,12 +373,14 @@ class CalendarSyncStore:
 
     def _connect(self) -> sqlite3.Connection:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
+        lock_owned = True
         connection: sqlite3.Connection | None = None
         try:
             expected = self._ensure_file_for_write()
             descriptors_before = self._open_descriptor_count(expected)
             connection = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
             connection.bind_calendar_sync_lock()
+            lock_owned = False
             connection.row_factory = sqlite3.Row
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
@@ -389,7 +391,7 @@ class CalendarSyncStore:
         except BaseException as error:
             if connection is not None:
                 connection.close()
-            else:
+            if lock_owned:
                 _CALENDAR_SYNC_CONNECTION_LOCK.release()
             if isinstance(error, CalendarSyncStoreReadError):
                 raise
@@ -422,6 +424,7 @@ class CalendarSyncStore:
 
     def _connect_reader(self) -> sqlite3.Connection:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
+        lock_owned = True
         descriptor: int | None = None
         connection: sqlite3.Connection | None = None
         try:
@@ -437,12 +440,15 @@ class CalendarSyncStore:
                 factory=_CalendarSyncConnection,
             )
             connection.bind_calendar_sync_lock()
+            lock_owned = False
             connection.row_factory = sqlite3.Row
+            os.close(descriptor)
+            descriptor = None
             return connection
         except BaseException as error:
             if connection is not None:
                 connection.close()
-            else:
+            if lock_owned:
                 _CALENDAR_SYNC_CONNECTION_LOCK.release()
             if isinstance(error, CalendarSyncStoreReadError):
                 raise
@@ -453,7 +459,10 @@ class CalendarSyncStore:
             raise
         finally:
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
 
     def _initialize(self) -> None:
         with closing(self._connect()) as connection, connection:

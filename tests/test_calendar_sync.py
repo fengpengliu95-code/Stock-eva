@@ -272,6 +272,58 @@ def test_calendar_sync_connection_lock_releases_after_unexpected_error(
     assert not failures
 
 
+@pytest.mark.parametrize("reader", [False, True])
+def test_calendar_sync_connection_lock_releases_when_binding_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: bool
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    real_bind = calendar_sync_module._CalendarSyncConnection.bind_calendar_sync_lock
+    monkeypatch.setattr(
+        calendar_sync_module._CalendarSyncConnection,
+        "bind_calendar_sync_lock",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("bind injected")),
+    )
+    with pytest.raises(RuntimeError, match="bind injected"):
+        (store._connect_reader if reader else store._connect)()
+    monkeypatch.setattr(
+        calendar_sync_module._CalendarSyncConnection,
+        "bind_calendar_sync_lock",
+        real_bind,
+    )
+
+    worker = threading.Thread(
+        target=lambda: (store._connect_reader() if reader else store._connect()).close()
+    )
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
+def test_calendar_sync_reader_lock_releases_when_descriptor_close_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    real_close = calendar_sync_module.os.close
+    calls = 0
+
+    def fail_once(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("close injected")
+        real_close(descriptor)
+
+    monkeypatch.setattr(calendar_sync_module.os, "close", fail_once)
+    with pytest.raises(RuntimeError, match="close injected"):
+        store._connect_reader()
+    monkeypatch.setattr(calendar_sync_module.os, "close", real_close)
+
+    worker = threading.Thread(target=lambda: store._connect_reader().close())
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
 def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
     started = threading.Event()
     release = threading.Event()
