@@ -575,7 +575,7 @@ class CalendarSyncStore:
                 self._read_store_identity(activated)
                 activated.commit()
             except BaseException:
-                if self._activation_is_durable(identity_stat):
+                if self._activation_committed(activated, identity_stat):
                     migration_complete = True
                     return activated
                 raise
@@ -590,7 +590,13 @@ class CalendarSyncStore:
                     self._exchange_paths(temporary, self.path)
                     exchanged = False
                 except BaseException:
-                    pass
+                    if (
+                        activated is not None
+                        and identity_stat is not None
+                        and self._activation_committed(activated, identity_stat)
+                    ):
+                        migration_complete = True
+                        return activated
             raise
         finally:
             connections = (source,) if migration_complete else (activated, source)
@@ -640,6 +646,24 @@ class CalendarSyncStore:
                     os.close(descriptor)
                 except BaseException:
                     pass
+
+    def _activation_committed(
+        self,
+        connection: sqlite3.Connection,
+        expected: os.stat_result,
+    ) -> bool:
+        # A connection outside a transaction observes only durable state.  This closes
+        # the ambiguous "commit succeeded, then raised" case even when an independent
+        # pathname probe is transiently unavailable.
+        if not connection.in_transaction:
+            try:
+                identity = self._read_store_identity(connection)
+            except (CalendarSyncStoreReadError, sqlite3.Error, TypeError, ValueError):
+                pass
+            else:
+                if identity[1:] == (expected.st_dev, expected.st_ino):
+                    return True
+        return self._activation_is_durable(expected)
 
     @staticmethod
     def _exchange_paths(first: Path, second: Path) -> None:
