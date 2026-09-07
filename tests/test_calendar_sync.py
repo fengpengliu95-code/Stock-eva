@@ -283,7 +283,9 @@ def test_calendar_sync_failed_migration_rollback_removes_only_generated_canonica
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(path, initialize=False).initialize_for_write()
 
-    assert not path.exists()
+    assert path.exists()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
     assert displaced.exists()
     preserved = list(tmp_path.glob(".*.migration"))
     assert len(preserved) == 1

@@ -255,7 +255,8 @@ _IDENTITY_TABLE_SQL = """
     CREATE TABLE calendar_store_identity
     (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL,
-    inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL)
+    inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)))
 """
 _CORE_TABLES = {
     "calendar_authority_versions": """
@@ -304,6 +305,12 @@ _IDENTITY_TRIGGERS = {
     "calendar_store_identity_no_update": """
         CREATE TRIGGER calendar_store_identity_no_update
         BEFORE UPDATE ON calendar_store_identity
+        WHEN NOT (
+            OLD.active = 0 AND NEW.active = 1
+            AND NEW.singleton = OLD.singleton AND NEW.store_id = OLD.store_id
+            AND NEW.device = OLD.device AND NEW.inode = OLD.inode
+            AND NEW.identity_checksum = OLD.identity_checksum
+        )
         BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END
     """,
     "calendar_store_identity_no_delete": """
@@ -462,18 +469,24 @@ class CalendarSyncStore:
 
     @classmethod
     def _install_identity(
-        cls, connection: sqlite3.Connection, identity_stat: os.stat_result
+        cls,
+        connection: sqlite3.Connection,
+        identity_stat: os.stat_result,
+        *,
+        active: bool = True,
     ) -> None:
         store_id = uuid.uuid4().hex
         connection.execute(_IDENTITY_TABLE_SQL)
         connection.execute(
             "INSERT INTO calendar_store_identity "
-            "(singleton, store_id, device, inode, identity_checksum) VALUES (1, ?, ?, ?, ?)",
+            "(singleton, store_id, device, inode, identity_checksum, active) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
             (
                 store_id,
                 identity_stat.st_dev,
                 identity_stat.st_ino,
                 cls._identity_checksum(store_id, identity_stat.st_dev, identity_stat.st_ino),
+                int(active),
             ),
         )
         for trigger_sql in _IDENTITY_TRIGGERS.values():
@@ -483,6 +496,7 @@ class CalendarSyncStore:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.migration")
         source_descriptor: int | None = None
         temporary_descriptor: int | None = None
+        destination: sqlite3.Connection | None = None
         identity_stat: os.stat_result | None = None
         cleanup_temporary = True
         try:
@@ -502,10 +516,14 @@ class CalendarSyncStore:
                 identity_stat = os.fstat(temporary_descriptor)
                 os.close(temporary_descriptor)
                 temporary_descriptor = None
-                with closing(sqlite3.connect(temporary)) as destination, destination:
+                destination = sqlite3.connect(temporary)
+                with destination:
                     source.backup(destination)
-                    self._install_identity(destination, identity_stat)
+                    self._validate_core_schema(destination, require_identity=False)
+                    self._install_identity(destination, identity_stat, active=False)
                     self._validate_core_schema(destination, require_identity=True)
+                destination.close()
+                destination = None
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -516,16 +534,20 @@ class CalendarSyncStore:
                     self._exchange_paths(temporary, self.path)
                 except BaseException:
                     cleanup_temporary = False
-                    canonical = os.lstat(self.path)
-                    if identity_stat is not None and (canonical.st_dev, canonical.st_ino) == (
-                        identity_stat.st_dev,
-                        identity_stat.st_ino,
-                    ):
-                        os.unlink(self.path)
                     raise
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            if identity_stat is None:
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            with closing(sqlite3.connect(self.path)) as activated, activated:
+                identity = self._read_store_identity(activated, require_active=False)
+                if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
+                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
+                activated.execute(
+                    "UPDATE calendar_store_identity SET active = 1 WHERE singleton = 1"
+                )
+                self._read_store_identity(activated)
             published = self._validate_file()
-            if identity_stat is None or (published.st_dev, published.st_ino) != (
+            if (published.st_dev, published.st_ino) != (
                 identity_stat.st_dev,
                 identity_stat.st_ino,
             ):
@@ -536,6 +558,8 @@ class CalendarSyncStore:
                 os.close(source_descriptor)
             if temporary_descriptor is not None:
                 os.close(temporary_descriptor)
+            if destination is not None:
+                destination.close()
             if cleanup_temporary:
                 try:
                     os.unlink(temporary)
@@ -606,7 +630,9 @@ class CalendarSyncStore:
         ).hexdigest()
 
     @classmethod
-    def _read_store_identity(cls, connection: sqlite3.Connection) -> tuple[str, int, int]:
+    def _read_store_identity(
+        cls, connection: sqlite3.Connection, *, require_active: bool = True
+    ) -> tuple[str, int, int]:
         cls._validate_core_schema(connection, require_identity=True)
         table_row = connection.execute(
             "SELECT sql FROM sqlite_master "
@@ -627,7 +653,7 @@ class CalendarSyncStore:
         if triggers != expected_triggers:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         identity_rows = connection.execute(
-            "SELECT singleton, store_id, device, inode, identity_checksum "
+            "SELECT singleton, store_id, device, inode, identity_checksum, active "
             "FROM calendar_store_identity ORDER BY singleton"
         ).fetchall()
         if (
@@ -643,6 +669,10 @@ class CalendarSyncStore:
         if type(row[2]) is not int or type(row[3]) is not int:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         if row[4] != cls._identity_checksum(store_id, row[2], row[3]):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if type(row[5]) is not int or row[5] not in {0, 1}:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if require_active and row[5] != 1:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         return store_id, row[2], row[3]
 
