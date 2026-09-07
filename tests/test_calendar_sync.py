@@ -289,6 +289,26 @@ def test_calendar_sync_writer_rejects_copied_store_identity(tmp_path: Path) -> N
         CalendarSyncStore(copied, initialize=False).initialize_for_write()
 
 
+def test_calendar_sync_store_identity_is_immutable_and_digest_bound(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+
+    with closing(sqlite3.connect(path)) as connection, connection:
+        with pytest.raises(sqlite3.IntegrityError, match="identity is immutable"):
+            connection.execute(
+                "UPDATE calendar_store_identity SET store_id = ? WHERE singleton = 1",
+                ("f" * 32,),
+            )
+        connection.executescript(
+            "DROP TRIGGER calendar_store_identity_no_update; "
+            "UPDATE calendar_store_identity SET store_id = 'ffffffffffffffffffffffffffffffff' "
+            "WHERE singleton = 1;"
+        )
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+
 def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path)

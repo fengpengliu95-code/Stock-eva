@@ -384,16 +384,42 @@ class CalendarSyncStore:
             os.close(descriptor)
             descriptor = None
             with closing(sqlite3.connect(temporary)) as connection, connection:
+                store_id = uuid.uuid4().hex
+                identity_checksum = self._identity_checksum(
+                    store_id,
+                    identity_stat.st_dev,
+                    identity_stat.st_ino,
+                )
                 connection.execute(
                     "CREATE TABLE calendar_store_identity "
                     "(singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
                     "store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL, "
-                    "inode INTEGER NOT NULL)"
+                    "inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL)"
                 )
                 connection.execute(
                     "INSERT INTO calendar_store_identity "
-                    "(singleton, store_id, device, inode) VALUES (1, ?, ?, ?)",
-                    (uuid.uuid4().hex, identity_stat.st_dev, identity_stat.st_ino),
+                    "(singleton, store_id, device, inode, identity_checksum) "
+                    "VALUES (1, ?, ?, ?, ?)",
+                    (
+                        store_id,
+                        identity_stat.st_dev,
+                        identity_stat.st_ino,
+                        identity_checksum,
+                    ),
+                )
+                connection.executescript(
+                    """
+                    CREATE TRIGGER calendar_store_identity_no_update
+                    BEFORE UPDATE ON calendar_store_identity
+                    BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END;
+                    CREATE TRIGGER calendar_store_identity_no_delete
+                    BEFORE DELETE ON calendar_store_identity
+                    BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END;
+                    CREATE TRIGGER calendar_store_identity_single_insert
+                    BEFORE INSERT ON calendar_store_identity
+                    WHEN EXISTS (SELECT 1 FROM calendar_store_identity)
+                    BEGIN SELECT RAISE(ABORT, 'calendar store identity already exists'); END;
+                    """
                 )
             os.link(temporary, self.path, follow_symlinks=False)
         finally:
@@ -405,9 +431,16 @@ class CalendarSyncStore:
                 pass
 
     @staticmethod
-    def _read_store_identity(connection: sqlite3.Connection) -> tuple[str, int, int]:
+    def _identity_checksum(store_id: str, device: int, inode: int) -> str:
+        return hashlib.sha256(
+            f"stock-eva-calendar-store-v1\0{store_id}\0{device}\0{inode}".encode()
+        ).hexdigest()
+
+    @classmethod
+    def _read_store_identity(cls, connection: sqlite3.Connection) -> tuple[str, int, int]:
         row = connection.execute(
-            "SELECT store_id, device, inode FROM calendar_store_identity WHERE singleton = 1"
+            "SELECT store_id, device, inode, identity_checksum "
+            "FROM calendar_store_identity WHERE singleton = 1"
         ).fetchone()
         if row is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -415,6 +448,8 @@ class CalendarSyncStore:
         if re.fullmatch(r"[0-9a-f]{32}", store_id) is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         if type(row[1]) is not int or type(row[2]) is not int:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if row[3] != cls._identity_checksum(store_id, row[1], row[2]):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         return store_id, row[1], row[2]
 
