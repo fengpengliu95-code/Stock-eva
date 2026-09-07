@@ -1039,6 +1039,9 @@ def test_cli_calendar_sync_runtime_runs_once_then_rejects_stale_legacy_plan(
         def __init__(self, _path, *, initialize):
             events.append(f"legacy-store:{initialize}")
 
+        def initialize_for_write(self):
+            events.append("legacy-store-init")
+
     class NoCallProvider:
         def trading_dates(self, *_args):
             events.append("provider-request")
@@ -1240,6 +1243,9 @@ def test_cli_calendar_sync_runtime_terminal_failure_is_not_reported_success(
     class NoLegacyPlan:
         def __init__(self, *_args, **_kwargs):
             self.policy = SimpleNamespace()
+
+        def initialize_for_execution(self):
+            pass
 
         def plan(self, **_kwargs):
             return None

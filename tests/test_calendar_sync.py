@@ -212,6 +212,50 @@ def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: P
     assert backups[0].stat().st_ino == old_inode
 
 
+def test_calendar_sync_legacy_migration_blocks_commit_after_candidate_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_validate = CalendarSyncStore._validate_core_schema.__func__
+    identity_validations = 0
+    writer_outcomes: list[str] = []
+
+    def validate_with_concurrent_writer(cls, connection, *, require_identity):
+        nonlocal identity_validations
+        result = real_validate(cls, connection, require_identity=require_identity)
+        if require_identity:
+            identity_validations += 1
+            if identity_validations == 2:
+                with closing(sqlite3.connect(path, timeout=0)) as writer:
+                    try:
+                        writer.execute(
+                            "INSERT INTO calendar_authority_versions "
+                            "(checksum, payload_json, first_seen_at) VALUES (?, ?, ?)",
+                            ("b" * 64, '{"years":[2027]}', "2026-08-02T00:00:00+00:00"),
+                        )
+                        writer.commit()
+                    except sqlite3.OperationalError:
+                        writer_outcomes.append("blocked")
+                    else:
+                        writer_outcomes.append("committed")
+        return result
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_validate_core_schema",
+        classmethod(validate_with_concurrent_writer),
+    )
+
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert writer_outcomes == ["blocked"]
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+
+
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1694,6 +1738,38 @@ def test_calendar_loop_checks_startup_then_daily_slot(tmp_path: Path) -> None:
     assert store.state().last_light_slot_date == date(2026, 7, 24)
 
 
+def test_calendar_loop_migrates_legacy_store_before_auto_plan(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    old_inode = path.stat().st_ino
+    service = CalendarSyncService(
+        CalendarSyncStore(path, initialize=False),
+        synthetic_calendar(),
+        CalendarProvider([]),
+    )
+    stop = asyncio.Event()
+
+    def clock() -> datetime:
+        stop.set()
+        return datetime(2026, 7, 24, 9, 0, tzinfo=SHANGHAI)
+
+    asyncio.run(
+        run_calendar_sync_loop(
+            service,
+            stop,
+            clock=clock,
+            execute_plan=lambda _plan: None,
+            poll_seconds=0.001,
+        )
+    )
+
+    assert path.stat().st_ino != old_inode
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+
+
 def test_calendar_sync_plan_fails_closed_for_unavailable_calendar(tmp_path: Path) -> None:
     class NoCallProvider:
         def trading_dates(self, *_args) -> list[date]:
@@ -1923,6 +1999,13 @@ def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_c
         local_market_dataset_root=None,
         provider_circuit_failure_threshold=1,
     )
+    settings.local_control_dir.mkdir(mode=0o700)
+    calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
+    with closing(sqlite3.connect(calendar_path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    calendar_path.chmod(0o600)
+    legacy_inode = calendar_path.stat().st_ino
     health = SQLiteProviderHealthStore(
         settings.local_control_dir / settings.provider_health_database_name,
         failure_threshold=1,
@@ -1974,6 +2057,8 @@ def test_calendar_sync_cli_execute_uses_persistent_health_gate_before_provider_c
     assert payload["status"] == "skipped_circuit_open"
     assert payload["writes_calendar_state"] is False
     assert calls == 0
+    assert calendar_path.stat().st_ino != legacy_inode
+    assert CalendarSyncStore(calendar_path, initialize=False).state() == CalendarSyncState()
 
 
 def test_calendar_sync_cli_revalidates_result_before_publication(monkeypatch, capsys, tmp_path):
@@ -2012,6 +2097,9 @@ def test_calendar_sync_cli_revalidates_result_before_publication(monkeypatch, ca
 
         def plan(self, **_kwargs):
             return SimpleNamespace(mode="light", model_dump=lambda **_dump: {})
+
+        def initialize_for_execution(self):
+            pass
 
         def execute(self, _plan):
             return malicious

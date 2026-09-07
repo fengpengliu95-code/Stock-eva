@@ -2268,6 +2268,8 @@ def main() -> int:
             calendar_snapshot,
             None,
         )
+        if args.execute:
+            planning_service.initialize_for_execution()
         plan = planning_service.plan(
             now=now,
             mode=args.mode,

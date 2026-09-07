@@ -495,36 +495,49 @@ class CalendarSyncStore:
     def _migrate_legacy_store(self, expected: os.stat_result) -> None:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.migration")
         source_descriptor: int | None = None
+        source: sqlite3.Connection | None = None
         temporary_descriptor: int | None = None
         destination: sqlite3.Connection | None = None
         identity_stat: os.stat_result | None = None
         exchanged = False
         migration_complete = False
         try:
-            source_descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            source_descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
             bound = os.fstat(source_descriptor)
             if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            with closing(
-                sqlite3.connect(f"file:///dev/fd/{source_descriptor}?mode=ro", uri=True, timeout=0)
-            ) as source:
-                self._validate_core_schema(source, require_identity=False)
-                temporary_descriptor = os.open(
-                    temporary,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                )
-                identity_stat = os.fstat(temporary_descriptor)
-                os.close(temporary_descriptor)
-                temporary_descriptor = None
-                destination = sqlite3.connect(temporary)
-                with destination:
-                    source.backup(destination)
-                    self._validate_core_schema(destination, require_identity=False)
-                    self._install_identity(destination, identity_stat, active=False)
-                    self._validate_core_schema(destination, require_identity=True)
-                destination.close()
-                destination = None
+            source = sqlite3.connect(
+                f"file:///dev/fd/{source_descriptor}?mode=rw", uri=True, timeout=0
+            )
+            self._validate_core_schema(source, require_identity=False)
+            temporary_descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            identity_stat = os.fstat(temporary_descriptor)
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
+            destination = sqlite3.connect(temporary)
+            with destination:
+                source.backup(destination)
+                self._validate_core_schema(destination, require_identity=False)
+                self._install_identity(destination, identity_stat, active=False)
+                self._validate_core_schema(destination, require_identity=True)
+            destination.close()
+            destination = None
+            # backup() cannot run while its source connection owns an explicit SQLite
+            # transaction.  Acquire the exclusive lock immediately afterwards, compare
+            # every core row against the candidate, and retain the lock through publish.
+            # A commit before the lock changes this comparison; a commit after it blocks.
+            source.execute("BEGIN EXCLUSIVE")
+            with closing(sqlite3.connect(temporary)) as candidate:
+                self._validate_core_schema(candidate, require_identity=True)
+                for table in _CORE_TABLES:
+                    source_rows = source.execute(f'SELECT * FROM "{table}"').fetchall()
+                    candidate_rows = candidate.execute(f'SELECT * FROM "{table}"').fetchall()
+                    if sorted(source_rows, key=repr) != sorted(candidate_rows, key=repr):
+                        raise CalendarSyncStoreReadError("calendar control database is unavailable")
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -559,6 +572,8 @@ class CalendarSyncStore:
                     pass
             raise
         finally:
+            if source is not None:
+                source.close()
             if source_descriptor is not None:
                 os.close(source_descriptor)
             if temporary_descriptor is not None:
@@ -1059,6 +1074,10 @@ class CalendarSyncService:
         self.health_store = health_store
         self.policy = CalendarSyncPolicy()
 
+    def initialize_for_execution(self) -> None:
+        """Initialize or migrate control state only inside an authorized execution lane."""
+        self.store.initialize_for_write()
+
     def plan(
         self,
         *,
@@ -1397,6 +1416,9 @@ async def run_calendar_sync_loop(
 ) -> None:
     """Run runtime maintenance plus legacy monthly/daily checks without blocking the API."""
 
+    initialize = getattr(service, "initialize_for_execution", None)
+    if callable(initialize):
+        await run_blocking_drained(initialize)
     startup = True
     while not stop.is_set():
         runtime_blocked = False
