@@ -678,10 +678,10 @@ class CalendarSyncStore:
     ) -> None:
         if expected is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        quarantine = guard.with_name(f".{guard.name}.{uuid.uuid4().hex}.removing")
+        quarantine = guard.with_name(f".{guard.name}.{uuid.uuid4().hex}.removed")
         moved = False
         try:
-            os.rename(guard, quarantine)
+            CalendarSyncStore._rename_noreplace(guard, quarantine)
             moved = True
             current = os.lstat(quarantine)
             if (
@@ -692,12 +692,13 @@ class CalendarSyncStore:
                 or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
             ):
                 try:
-                    os.link(quarantine, guard, follow_symlinks=False)
-                except FileExistsError:
+                    CalendarSyncStore._rename_noreplace(quarantine, guard)
+                    moved = False
+                except (FileExistsError, OSError):
                     pass
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            os.unlink(quarantine)
-            moved = False
+            # Keep the verified inode as immutable migration evidence.  The randomly
+            # named completed marker is not a runtime blocker and is never unlinked.
         except CalendarSyncStoreReadError:
             raise
         except (OSError, TypeError, ValueError):
@@ -707,9 +708,45 @@ class CalendarSyncStore:
             # could not be restored because another object occupies it, both remain.
             if moved and not os.path.lexists(guard):
                 try:
-                    os.link(quarantine, guard, follow_symlinks=False)
+                    current = os.lstat(quarantine)
+                    if (current.st_dev, current.st_ino) != (
+                        expected.st_dev,
+                        expected.st_ino,
+                    ):
+                        CalendarSyncStore._rename_noreplace(quarantine, guard)
                 except (FileExistsError, OSError):
                     pass
+
+    @staticmethod
+    def _rename_noreplace(source: Path, destination: Path) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            rename = library.renameatx_np
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(-2, os.fsencode(source), -2, os.fsencode(destination), 0x00000004)
+        elif sys.platform.startswith("linux"):
+            rename = library.renameat2
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 0x1)
+        else:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, "calendar migration guard rename failed")
 
     def _activation_is_durable(self, expected: os.stat_result) -> bool:
         descriptor: int | None = None

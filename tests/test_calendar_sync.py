@@ -460,21 +460,43 @@ def test_calendar_sync_guard_removal_does_not_delete_replacement(
     decoy = tmp_path / "decoy"
     decoy.write_bytes(b"replacement")
     decoy.chmod(0o600)
-    real_rename = calendar_sync_module.os.rename
+    real_rename = CalendarSyncStore._rename_noreplace
+    rename_calls = 0
 
     def swap_before_rename(source, destination):
-        real_rename(source, saved)
-        real_rename(decoy, source)
+        nonlocal rename_calls
+        rename_calls += 1
+        if rename_calls == 1:
+            calendar_sync_module.os.rename(source, saved)
+            calendar_sync_module.os.rename(decoy, source)
         real_rename(source, destination)
 
-    monkeypatch.setattr(calendar_sync_module.os, "rename", swap_before_rename)
+    monkeypatch.setattr(CalendarSyncStore, "_rename_noreplace", staticmethod(swap_before_rename))
 
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore._remove_migration_guard(guard, expected)
 
     assert saved.read_bytes() == b"owned guard"
     assert guard.read_bytes() == b"replacement"
-    assert any(path.read_bytes() == b"replacement" for path in tmp_path.glob("*.removing"))
+    assert not decoy.exists()
+
+
+def test_calendar_sync_guard_removal_never_overwrites_existing_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard = tmp_path / ".calendar.sqlite3.migration-in-progress"
+    guard.write_bytes(b"owned guard")
+    guard.chmod(0o600)
+    expected = guard.stat()
+    monkeypatch.setattr(calendar_sync_module.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed"))
+    target = tmp_path / "..calendar.sqlite3.migration-in-progress.fixed.removed"
+    target.write_bytes(b"preexisting")
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore._remove_migration_guard(guard, expected)
+
+    assert guard.read_bytes() == b"owned guard"
+    assert target.read_bytes() == b"preexisting"
 
 
 def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(
