@@ -195,6 +195,7 @@ def test_calendar_sync_writer_rejects_path_swap_after_validation(
     validated = tmp_path / "validated.sqlite3"
     swapped = tmp_path / "swapped.sqlite3"
     real_connect = sqlite3.connect
+    decoys: list[int] = []
 
     def swapping_connect(database, *args, **kwargs):
         if Path(database) == path:
@@ -203,6 +204,7 @@ def test_calendar_sync_writer_rejects_path_swap_after_validation(
             connection = real_connect(database, *args, **kwargs)
             path.rename(swapped)
             validated.rename(path)
+            decoys.append(calendar_sync_module.os.open(path, calendar_sync_module.os.O_RDONLY))
             return connection
         return real_connect(database, *args, **kwargs)
 
@@ -211,7 +213,34 @@ def test_calendar_sync_writer_rejects_path_swap_after_validation(
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(path, initialize=False).initialize_for_write()
 
+    for descriptor in decoys:
+        calendar_sync_module.os.close(descriptor)
+
     assert path.stat().st_ino != swapped.stat().st_ino
+
+
+def test_calendar_sync_wrong_thread_close_does_not_leak_process_lock(tmp_path: Path) -> None:
+    store = CalendarSyncStore(tmp_path / "calendar.sqlite3")
+    connection = store._connect()
+    errors: list[Exception] = []
+
+    def close_from_wrong_thread() -> None:
+        try:
+            connection.close()
+        except Exception as error:
+            errors.append(error)
+
+    wrong_owner = threading.Thread(target=close_from_wrong_thread)
+    wrong_owner.start()
+    wrong_owner.join(timeout=1)
+    assert not wrong_owner.is_alive()
+    assert errors and isinstance(errors[0], sqlite3.ProgrammingError)
+
+    connection.close()
+    recovered = threading.Thread(target=lambda: store._connect().close())
+    recovered.start()
+    recovered.join(timeout=2)
+    assert not recovered.is_alive()
 
 
 def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:

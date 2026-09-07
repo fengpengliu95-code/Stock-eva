@@ -15,6 +15,8 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -248,7 +250,24 @@ class CalendarSyncPlanError(ValueError):
     """A caller supplied a calendar sync plan that fails the public contract."""
 
 
-_CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
+_CALENDAR_SYNC_CONNECTION_LOCK = threading.Lock()
+_LOCK_PROBE = """\
+import fcntl
+import os
+import sys
+
+try:
+    fcntl.lockf(
+        int(sys.argv[1]),
+        fcntl.LOCK_EX | fcntl.LOCK_NB,
+        1,
+        0x40000002,
+        os.SEEK_SET,
+    )
+except BlockingIOError:
+    raise SystemExit(1)
+raise SystemExit(0)
+"""
 
 
 class _CalendarSyncConnection(sqlite3.Connection):
@@ -375,9 +394,15 @@ class CalendarSyncStore:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
         lock_owned = True
         connection: sqlite3.Connection | None = None
+        descriptor: int | None = None
         try:
             expected = self._ensure_file_for_write()
-            descriptors_before = self._open_descriptor_count(expected)
+            descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
+            bound = os.fstat(descriptor)
+            if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            if not self._probe_inode_lock(descriptor, expect_locked=False):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
             connection = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
             connection.bind_calendar_sync_lock()
             lock_owned = False
@@ -385,8 +410,12 @@ class CalendarSyncStore:
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            if self._open_descriptor_count(expected) <= descriptors_before:
+            connection.execute("BEGIN EXCLUSIVE")
+            if not self._probe_inode_lock(descriptor, expect_locked=True):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            connection.rollback()
+            os.close(descriptor)
+            descriptor = None
             return connection
         except BaseException as error:
             if connection is not None:
@@ -400,27 +429,26 @@ class CalendarSyncStore:
                     "calendar control database is unavailable"
                 ) from None
             raise
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
 
     @staticmethod
-    def _open_descriptor_numbers() -> set[int]:
-        for root in (Path("/dev/fd"), Path("/proc/self/fd")):
-            try:
-                return {int(item.name) for item in root.iterdir() if item.name.isdigit()}
-            except (OSError, TypeError, ValueError):
-                continue
-        raise CalendarSyncStoreReadError("calendar control database is unavailable")
-
-    @classmethod
-    def _open_descriptor_count(cls, expected: os.stat_result) -> int:
-        count = 0
-        for descriptor in cls._open_descriptor_numbers():
-            try:
-                bound = os.fstat(descriptor)
-            except OSError:
-                continue
-            if (bound.st_dev, bound.st_ino) == (expected.st_dev, expected.st_ino):
-                count += 1
-        return count
+    def _probe_inode_lock(descriptor: int, *, expect_locked: bool) -> bool:
+        result = subprocess.run(
+            [sys.executable, "-c", _LOCK_PROBE, str(descriptor)],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(descriptor,),
+            timeout=2,
+        )
+        expected_code = 1 if expect_locked else 0
+        return result.returncode == expected_code
 
     def _connect_reader(self) -> sqlite3.Connection:
         _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
