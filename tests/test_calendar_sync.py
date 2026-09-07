@@ -586,6 +586,32 @@ def test_calendar_sync_restores_blocker_when_completed_marker_is_replaced(
         CalendarSyncStore(path, initialize=False).state()
 
 
+def test_calendar_sync_blocker_retries_disappearing_file_exists_race(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard = tmp_path / ".calendar.sqlite3.migration-in-progress"
+    real_open = calendar_sync_module.os.open
+    attempts = 0
+
+    def disappearing_occupier(path, flags, mode=0o777):
+        nonlocal attempts
+        if Path(path) == guard:
+            attempts += 1
+            if attempts == 1:
+                guard.write_bytes(b"occupier")
+                guard.unlink()
+                raise FileExistsError("disappeared")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(calendar_sync_module.os, "open", disappearing_occupier)
+
+    CalendarSyncStore._ensure_migration_guard_blocking(guard)
+
+    assert attempts == 2
+    assert guard.is_file()
+    calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+
+
 def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

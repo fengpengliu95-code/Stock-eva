@@ -251,6 +251,7 @@ class CalendarSyncPlanError(ValueError):
 
 
 _CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
+_CALENDAR_SYNC_QUARANTINED_PATHS: set[Path] = set()
 _IDENTITY_TABLE_SQL = """
     CREATE TABLE calendar_store_identity
     (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -413,8 +414,10 @@ class CalendarSyncStore:
                 except FileNotFoundError:
                     continue
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            if not allow_migration_guard and os.path.lexists(self._migration_guard_path()):
-                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            if not allow_migration_guard:
+                guard = self._migration_guard_path()
+                if guard in _CALENDAR_SYNC_QUARANTINED_PATHS or os.path.lexists(guard):
+                    raise CalendarSyncStoreReadError("calendar control database is unavailable")
         except CalendarSyncStoreReadError:
             raise
         except (OSError, TypeError, ValueError):
@@ -519,6 +522,7 @@ class CalendarSyncStore:
                 0o600,
             )
             guard_stat = os.fstat(guard_descriptor)
+            _CALENDAR_SYNC_QUARANTINED_PATHS.add(guard)
             os.close(guard_descriptor)
             guard_descriptor = None
             source_descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
@@ -598,6 +602,7 @@ class CalendarSyncStore:
                 if self._activation_committed(activated, identity_stat):
                     activation_confirmed = True
                     self._remove_migration_guard(guard, guard_stat)
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
                     migration_complete = True
                     return activated
                 raise
@@ -605,11 +610,13 @@ class CalendarSyncStore:
             # publication validation precedes it, so an adopted active candidate is
             # never reported as a failed migration.
             self._remove_migration_guard(guard, guard_stat)
+            _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
             migration_complete = True
             return activated
         except BaseException:
             if exchanged and not migration_complete:
                 if activation_confirmed and self._migration_guard_completed(guard, guard_stat):
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
                     migration_complete = True
                     return activated
                 if (
@@ -631,6 +638,7 @@ class CalendarSyncStore:
                     ):
                         if os.path.lexists(guard):
                             self._remove_migration_guard(guard, guard_stat)
+                        _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
                         migration_complete = True
                         return activated
                     self._ensure_migration_guard_blocking(guard)
@@ -645,8 +653,10 @@ class CalendarSyncStore:
                     ):
                         raise CalendarSyncStoreReadError("calendar control database is unavailable")
                     self._remove_migration_guard(guard, guard_stat)
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
             elif not exchanged:
                 self._remove_migration_guard(guard, guard_stat)
+                _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
             raise
         finally:
             connections = (source,) if migration_complete else (activated, source)
@@ -680,27 +690,33 @@ class CalendarSyncStore:
 
     @staticmethod
     def _ensure_migration_guard_blocking(guard: Path) -> None:
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(
-                guard,
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-        except FileExistsError:
-            return
-        except (OSError, TypeError, ValueError):
+        _CALENDAR_SYNC_QUARANTINED_PATHS.add(guard)
+        for _attempt in range(3):
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    guard,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                if os.path.lexists(guard):
+                    return
+                continue
+            except (OSError, TypeError, ValueError):
+                if os.path.lexists(guard):
+                    return
+                continue
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except BaseException:
+                        pass
             if os.path.lexists(guard):
                 return
-            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except BaseException:
-                    pass
-        if not os.path.lexists(guard):
-            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        # The in-process quarantine remains authoritative even if a same-UID actor
+        # repeatedly removes the durable blocker during this bounded recovery attempt.
 
     @staticmethod
     def _migration_guard_completed(
