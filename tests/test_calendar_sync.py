@@ -238,6 +238,40 @@ def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_pa
     assert all(not worker.is_alive() for worker in workers)
 
 
+@pytest.mark.parametrize("reader", [False, True])
+def test_calendar_sync_connection_lock_releases_after_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: bool
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    store = CalendarSyncStore(path)
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        calendar_sync_module.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected"):
+        (store._connect_reader if reader else store._connect)()
+
+    monkeypatch.setattr(calendar_sync_module.sqlite3, "connect", real_connect)
+    failures: list[Exception] = []
+
+    def reconnect() -> None:
+        try:
+            with closing(store._connect_reader() if reader else store._connect()):
+                pass
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=reconnect)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert not failures
+
+
 def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
     started = threading.Event()
     release = threading.Event()

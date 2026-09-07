@@ -386,18 +386,18 @@ class CalendarSyncStore:
             if self._open_descriptor_count(expected) <= descriptors_before:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             return connection
-        except CalendarSyncStoreReadError:
+        except BaseException as error:
             if connection is not None:
                 connection.close()
             else:
                 _CALENDAR_SYNC_CONNECTION_LOCK.release()
+            if isinstance(error, CalendarSyncStoreReadError):
+                raise
+            if isinstance(error, (OSError, sqlite3.Error, TypeError, ValueError)):
+                raise CalendarSyncStoreReadError(
+                    "calendar control database is unavailable"
+                ) from None
             raise
-        except (OSError, sqlite3.Error, TypeError, ValueError):
-            if connection is not None:
-                connection.close()
-            else:
-                _CALENDAR_SYNC_CONNECTION_LOCK.release()
-            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
     @staticmethod
     def _open_descriptor_numbers() -> set[int]:
@@ -439,18 +439,18 @@ class CalendarSyncStore:
             connection.bind_calendar_sync_lock()
             connection.row_factory = sqlite3.Row
             return connection
-        except CalendarSyncStoreReadError:
+        except BaseException as error:
             if connection is not None:
                 connection.close()
             else:
                 _CALENDAR_SYNC_CONNECTION_LOCK.release()
+            if isinstance(error, CalendarSyncStoreReadError):
+                raise
+            if isinstance(error, (OSError, sqlite3.Error, TypeError, ValueError)):
+                raise CalendarSyncStoreReadError(
+                    "calendar control database is unavailable"
+                ) from None
             raise
-        except (OSError, sqlite3.Error, TypeError, ValueError):
-            if connection is not None:
-                connection.close()
-            else:
-                _CALENDAR_SYNC_CONNECTION_LOCK.release()
-            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
         finally:
             if descriptor is not None:
                 os.close(descriptor)
