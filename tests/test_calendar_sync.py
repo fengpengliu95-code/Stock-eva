@@ -243,6 +243,38 @@ def test_calendar_sync_wrong_thread_close_does_not_leak_process_lock(tmp_path: P
     assert not recovered.is_alive()
 
 
+def test_calendar_sync_writer_rejects_path_swap_during_lock_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    replacement = tmp_path / "replacement.sqlite3"
+    CalendarSyncStore(replacement)
+    displaced = tmp_path / "displaced.sqlite3"
+    real_execute = calendar_sync_module._CalendarSyncConnection.execute
+    swapped = False
+
+    def swapping_execute(connection, statement, *args, **kwargs):
+        nonlocal swapped
+        if statement == "BEGIN EXCLUSIVE" and not swapped:
+            path.rename(displaced)
+            replacement.rename(path)
+            swapped = True
+        return real_execute(connection, statement, *args, **kwargs)
+
+    monkeypatch.setattr(
+        calendar_sync_module._CalendarSyncConnection,
+        "execute",
+        swapping_execute,
+    )
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert swapped
+    assert path.stat().st_ino != displaced.stat().st_ino
+
+
 def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path)

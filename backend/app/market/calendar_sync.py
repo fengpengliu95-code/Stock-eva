@@ -318,7 +318,7 @@ class CalendarSyncStore:
         except (OSError, TypeError, ValueError):
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
-    def _validate_file(self) -> os.stat_result:
+    def _validate_file(self, *, allow_transaction_sidecars: bool = False) -> os.stat_result:
         self._validate_ancestors()
         try:
             info = os.lstat(self.path)
@@ -336,7 +336,8 @@ class CalendarSyncStore:
             or info.st_mode & 0o022
         ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        self._validate_no_sidecars()
+        if not allow_transaction_sidecars:
+            self._validate_no_sidecars()
         return info
 
     def _validate_no_sidecars(self) -> None:
@@ -413,7 +414,13 @@ class CalendarSyncStore:
             connection.execute("BEGIN EXCLUSIVE")
             if not self._probe_inode_lock(descriptor, expect_locked=True):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            current = self._validate_file(allow_transaction_sidecars=True)
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
             connection.rollback()
+            current = self._validate_file()
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
             os.close(descriptor)
             descriptor = None
             return connection
