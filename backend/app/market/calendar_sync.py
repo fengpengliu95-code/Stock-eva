@@ -249,6 +249,24 @@ class CalendarSyncPlanError(ValueError):
 
 
 _CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
+_IDENTITY_TRIGGERS = {
+    "calendar_store_identity_no_update": """
+        CREATE TRIGGER calendar_store_identity_no_update
+        BEFORE UPDATE ON calendar_store_identity
+        BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END
+    """,
+    "calendar_store_identity_no_delete": """
+        CREATE TRIGGER calendar_store_identity_no_delete
+        BEFORE DELETE ON calendar_store_identity
+        BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END
+    """,
+    "calendar_store_identity_single_insert": """
+        CREATE TRIGGER calendar_store_identity_single_insert
+        BEFORE INSERT ON calendar_store_identity
+        WHEN EXISTS (SELECT 1 FROM calendar_store_identity)
+        BEGIN SELECT RAISE(ABORT, 'calendar store identity already exists'); END
+    """,
+}
 
 
 class _CalendarSyncConnection(sqlite3.Connection):
@@ -407,20 +425,8 @@ class CalendarSyncStore:
                         identity_checksum,
                     ),
                 )
-                connection.executescript(
-                    """
-                    CREATE TRIGGER calendar_store_identity_no_update
-                    BEFORE UPDATE ON calendar_store_identity
-                    BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END;
-                    CREATE TRIGGER calendar_store_identity_no_delete
-                    BEFORE DELETE ON calendar_store_identity
-                    BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END;
-                    CREATE TRIGGER calendar_store_identity_single_insert
-                    BEFORE INSERT ON calendar_store_identity
-                    WHEN EXISTS (SELECT 1 FROM calendar_store_identity)
-                    BEGIN SELECT RAISE(ABORT, 'calendar store identity already exists'); END;
-                    """
-                )
+                for trigger_sql in _IDENTITY_TRIGGERS.values():
+                    connection.execute(trigger_sql)
             os.link(temporary, self.path, follow_symlinks=False)
         finally:
             if descriptor is not None:
@@ -438,6 +444,16 @@ class CalendarSyncStore:
 
     @classmethod
     def _read_store_identity(cls, connection: sqlite3.Connection) -> tuple[str, int, int]:
+        trigger_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'calendar_store_identity'"
+        ).fetchall()
+        triggers = {str(row[0]): " ".join(str(row[1]).split()) for row in trigger_rows}
+        expected_triggers = {
+            name: " ".join(sql.split()) for name, sql in _IDENTITY_TRIGGERS.items()
+        }
+        if triggers != expected_triggers:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
         row = connection.execute(
             "SELECT store_id, device, inode, identity_checksum "
             "FROM calendar_store_identity WHERE singleton = 1"
@@ -529,6 +545,9 @@ class CalendarSyncStore:
             connection.bind_calendar_sync_lock()
             lock_owned = False
             connection.row_factory = sqlite3.Row
+            identity = self._read_store_identity(connection)
+            if identity[1:] != (info.st_dev, info.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
             os.close(descriptor)
             descriptor = None
             return connection

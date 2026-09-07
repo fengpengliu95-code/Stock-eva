@@ -134,9 +134,29 @@ def test_calendar_sync_writer_does_not_create_database_beside_sidecar(tmp_path: 
 
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(path, initialize=False).initialize_for_write()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
 
     assert not path.exists()
     assert sidecar.read_bytes() == b"untrusted sidecar"
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "calendar_store_identity_no_update",
+        "calendar_store_identity_no_delete",
+        "calendar_store_identity_single_insert",
+    ],
+)
+def test_calendar_sync_reader_rejects_missing_identity_guard(tmp_path: Path, trigger: str) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(f"DROP TRIGGER {trigger}")
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
 
 
 def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
@@ -307,6 +327,8 @@ def test_calendar_sync_store_identity_is_immutable_and_digest_bound(tmp_path: Pa
 
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(path, initialize=False).initialize_for_write()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
 
 
 def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:
