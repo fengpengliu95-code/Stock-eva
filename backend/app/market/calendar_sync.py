@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import uuid
 from collections.abc import Callable
 from contextlib import closing, nullcontext
@@ -247,6 +248,26 @@ class CalendarSyncPlanError(ValueError):
     """A caller supplied a calendar sync plan that fails the public contract."""
 
 
+_CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
+
+
+class _CalendarSyncConnection(sqlite3.Connection):
+    """A connection that owns the process-local pathname verification lock."""
+
+    _calendar_sync_lock_held = False
+
+    def bind_calendar_sync_lock(self) -> None:
+        self._calendar_sync_lock_held = True
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            if self._calendar_sync_lock_held:
+                self._calendar_sync_lock_held = False
+                _CALENDAR_SYNC_CONNECTION_LOCK.release()
+
+
 class CalendarSyncStore:
     """Local SQLite control state; no market or user data lives here."""
 
@@ -351,11 +372,13 @@ class CalendarSyncStore:
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
     def _connect(self) -> sqlite3.Connection:
-        expected = self._ensure_file_for_write()
-        descriptors_before = self._open_descriptor_count(expected)
+        _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
         connection: sqlite3.Connection | None = None
         try:
-            connection = sqlite3.connect(self.path)
+            expected = self._ensure_file_for_write()
+            descriptors_before = self._open_descriptor_count(expected)
+            connection = sqlite3.connect(self.path, factory=_CalendarSyncConnection)
+            connection.bind_calendar_sync_lock()
             connection.row_factory = sqlite3.Row
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
@@ -366,10 +389,14 @@ class CalendarSyncStore:
         except CalendarSyncStoreReadError:
             if connection is not None:
                 connection.close()
+            else:
+                _CALENDAR_SYNC_CONNECTION_LOCK.release()
             raise
         except (OSError, sqlite3.Error, TypeError, ValueError):
             if connection is not None:
                 connection.close()
+            else:
+                _CALENDAR_SYNC_CONNECTION_LOCK.release()
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
 
     @staticmethod
@@ -394,21 +421,35 @@ class CalendarSyncStore:
         return count
 
     def _connect_reader(self) -> sqlite3.Connection:
-        info = self._validate_file()
+        _CALENDAR_SYNC_CONNECTION_LOCK.acquire()
         descriptor: int | None = None
+        connection: sqlite3.Connection | None = None
         try:
+            info = self._validate_file()
             descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
             bound = os.fstat(descriptor)
             if (bound.st_dev, bound.st_ino) != (info.st_dev, info.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             connection = sqlite3.connect(
-                f"file:///dev/fd/{descriptor}?mode=ro", uri=True, timeout=0
+                f"file:///dev/fd/{descriptor}?mode=ro",
+                uri=True,
+                timeout=0,
+                factory=_CalendarSyncConnection,
             )
+            connection.bind_calendar_sync_lock()
             connection.row_factory = sqlite3.Row
             return connection
         except CalendarSyncStoreReadError:
+            if connection is not None:
+                connection.close()
+            else:
+                _CALENDAR_SYNC_CONNECTION_LOCK.release()
             raise
         except (OSError, sqlite3.Error, TypeError, ValueError):
+            if connection is not None:
+                connection.close()
+            else:
+                _CALENDAR_SYNC_CONNECTION_LOCK.release()
             raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
         finally:
             if descriptor is not None:

@@ -3,7 +3,7 @@ import json
 import sqlite3
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -212,6 +212,30 @@ def test_calendar_sync_writer_rejects_path_swap_after_validation(
         CalendarSyncStore(path, initialize=False).initialize_for_write()
 
     assert path.stat().st_ino != swapped.stat().st_ino
+
+
+def test_calendar_sync_store_serializes_concurrent_writer_identity_checks(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    store = CalendarSyncStore(path)
+    barrier = threading.Barrier(16)
+    failures: list[Exception] = []
+
+    def connect_once() -> None:
+        try:
+            barrier.wait()
+            with closing(store._connect()):
+                pass
+        except Exception as error:
+            failures.append(error)
+
+    workers = [threading.Thread(target=connect_once) for _ in range(16)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert not failures
+    assert all(not worker.is_alive() for worker in workers)
 
 
 def test_calendar_loop_cancellation_drains_started_runtime_worker() -> None:
