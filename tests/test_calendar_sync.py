@@ -323,6 +323,41 @@ def test_calendar_sync_migration_binds_lock_before_activation(
     assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
 
 
+def test_calendar_sync_migration_treats_commit_then_error_as_durable_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_commit = calendar_sync_module._CalendarSyncConnection.commit
+    injected = False
+
+    def commit_then_error(connection):
+        nonlocal injected
+        real_commit(connection)
+        if not injected:
+            injected = True
+            raise RuntimeError("post-commit injected")
+
+    monkeypatch.setattr(
+        calendar_sync_module._CalendarSyncConnection,
+        "commit",
+        commit_then_error,
+    )
+
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert injected is True
+    monkeypatch.setattr(
+        calendar_sync_module._CalendarSyncConnection,
+        "commit",
+        real_commit,
+    )
+    assert CalendarSyncStore(path, initialize=False).state() == CalendarSyncState()
+
+
 def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -559,7 +559,7 @@ class CalendarSyncStore:
             # Bind lock ownership before activation.  active=1 must remain the final
             # fallible commit point; the caller receives an already-bound connection.
             activated.bind_calendar_sync_lock()
-            with activated:
+            try:
                 identity = self._read_store_identity(activated, require_active=False)
                 if identity[1:] != (identity_stat.st_dev, identity_stat.st_ino):
                     raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -573,6 +573,12 @@ class CalendarSyncStore:
                     "UPDATE calendar_store_identity SET active = 1 WHERE singleton = 1"
                 )
                 self._read_store_identity(activated)
+                activated.commit()
+            except BaseException:
+                if self._activation_is_durable(identity_stat):
+                    migration_complete = True
+                    return activated
+                raise
             # The active=1 commit is the irreversible success point.  All fallible
             # publication validation precedes it, so an adopted active candidate is
             # never reported as a failed migration.
@@ -610,6 +616,30 @@ class CalendarSyncStore:
                 os.close(temporary_descriptor)
             if destination is not None:
                 destination.close()
+
+    def _activation_is_durable(self, expected: os.stat_result) -> bool:
+        descriptor: int | None = None
+        try:
+            published = self._validate_file()
+            if (published.st_dev, published.st_ino) != (expected.st_dev, expected.st_ino):
+                return False
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            bound = os.fstat(descriptor)
+            if (bound.st_dev, bound.st_ino) != (expected.st_dev, expected.st_ino):
+                return False
+            with closing(
+                sqlite3.connect(f"file:///dev/fd/{descriptor}?mode=ro", uri=True, timeout=0)
+            ) as connection:
+                identity = self._read_store_identity(connection)
+            return identity[1:] == (expected.st_dev, expected.st_ino)
+        except (CalendarSyncStoreReadError, OSError, sqlite3.Error, TypeError, ValueError):
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
 
     @staticmethod
     def _exchange_paths(first: Path, second: Path) -> None:
