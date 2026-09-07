@@ -210,6 +210,44 @@ def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: P
     assert not list(tmp_path.glob(".*.migration"))
 
 
+def test_calendar_sync_legacy_migration_does_not_overwrite_path_occupier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    displaced = tmp_path / "displaced.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    CalendarSyncStore(replacement)
+    replacement_bytes = replacement.read_bytes()
+    real_exchange = CalendarSyncStore._exchange_paths
+    calls = 0
+
+    def adversarial_exchange(first: Path, second: Path) -> None:
+        nonlocal calls
+        if calls == 0:
+            path.rename(displaced)
+            replacement.rename(path)
+        calls += 1
+        real_exchange(first, second)
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_exchange_paths",
+        staticmethod(adversarial_exchange),
+    )
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert path.read_bytes() == replacement_bytes
+    assert displaced.exists()
+    assert calls == 2
+    assert not list(tmp_path.glob(".*.migration"))
+
+
 def test_calendar_sync_read_helpers_do_not_create_missing_database(tmp_path: Path) -> None:
     path = tmp_path / "calendar.sqlite3"
     store = CalendarSyncStore(path, initialize=False)

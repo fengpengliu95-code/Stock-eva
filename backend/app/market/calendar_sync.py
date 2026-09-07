@@ -8,6 +8,7 @@ session.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -481,6 +483,8 @@ class CalendarSyncStore:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.migration")
         source_descriptor: int | None = None
         temporary_descriptor: int | None = None
+        identity_stat: os.stat_result | None = None
+        cleanup_temporary = True
         try:
             source_descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
             bound = os.fstat(source_descriptor)
@@ -505,16 +509,63 @@ class CalendarSyncStore:
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
-            os.replace(temporary, self.path)
+            self._exchange_paths(temporary, self.path)
+            displaced = os.lstat(temporary)
+            if (displaced.st_dev, displaced.st_ino) != (expected.st_dev, expected.st_ino):
+                try:
+                    self._exchange_paths(temporary, self.path)
+                except BaseException:
+                    cleanup_temporary = False
+                    raise
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            published = self._validate_file()
+            if identity_stat is None or (published.st_dev, published.st_ino) != (
+                identity_stat.st_dev,
+                identity_stat.st_ino,
+            ):
+                cleanup_temporary = False
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
         finally:
             if source_descriptor is not None:
                 os.close(source_descriptor)
             if temporary_descriptor is not None:
                 os.close(temporary_descriptor)
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            if cleanup_temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _exchange_paths(first: Path, second: Path) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            exchange = library.renameatx_np
+            exchange.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            exchange.restype = ctypes.c_int
+            result = exchange(-2, os.fsencode(first), -2, os.fsencode(second), 0x00000002)
+        elif sys.platform.startswith("linux"):
+            exchange = library.renameat2
+            exchange.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            exchange.restype = ctypes.c_int
+            result = exchange(-100, os.fsencode(first), -100, os.fsencode(second), 0x00000002)
+        else:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, "calendar control database exchange failed")
 
     def _publish_identity_database(self) -> None:
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.bootstrap")
