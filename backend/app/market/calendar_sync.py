@@ -264,6 +264,8 @@ _IDENTITY_TABLE_SQL = """
     store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL,
     inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL,
     migration_id TEXT CHECK (migration_id IS NULL OR length(migration_id) = 32),
+    migration_guard_device INTEGER,
+    migration_guard_inode INTEGER,
     active INTEGER NOT NULL CHECK (active IN (0, 1)))
 """
 _CORE_TABLES = {
@@ -319,6 +321,8 @@ _IDENTITY_TRIGGERS = {
             AND NEW.device = OLD.device AND NEW.inode = OLD.inode
             AND NEW.identity_checksum = OLD.identity_checksum
             AND NEW.migration_id IS OLD.migration_id
+            AND NEW.migration_guard_device IS OLD.migration_guard_device
+            AND NEW.migration_guard_inode IS OLD.migration_guard_inode
         )
         BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END
     """,
@@ -494,13 +498,15 @@ class CalendarSyncStore:
         *,
         active: bool = True,
         migration_id: str | None = None,
+        migration_guard_stat: os.stat_result | None = None,
     ) -> None:
         store_id = uuid.uuid4().hex
         connection.execute(_IDENTITY_TABLE_SQL)
         connection.execute(
             "INSERT INTO calendar_store_identity "
-            "(singleton, store_id, device, inode, identity_checksum, migration_id, active) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?)",
+            "(singleton, store_id, device, inode, identity_checksum, migration_id, "
+            "migration_guard_device, migration_guard_inode, active) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 store_id,
                 identity_stat.st_dev,
@@ -510,8 +516,12 @@ class CalendarSyncStore:
                     identity_stat.st_dev,
                     identity_stat.st_ino,
                     migration_id,
+                    migration_guard_stat.st_dev if migration_guard_stat is not None else None,
+                    migration_guard_stat.st_ino if migration_guard_stat is not None else None,
                 ),
                 migration_id,
+                migration_guard_stat.st_dev if migration_guard_stat is not None else None,
+                migration_guard_stat.st_ino if migration_guard_stat is not None else None,
                 int(active),
             ),
         )
@@ -568,6 +578,7 @@ class CalendarSyncStore:
                     identity_stat,
                     active=False,
                     migration_id=migration_id,
+                    migration_guard_stat=guard_stat,
                 )
                 self._validate_core_schema(destination, require_identity=True)
             destination.close()
@@ -626,6 +637,7 @@ class CalendarSyncStore:
                 if self._activation_committed(activated, identity_stat):
                     activation_confirmed = True
                     self._remove_migration_guard(guard, guard_stat)
+                    self._validate_migration_completion(activated)
                     _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
                     migration_complete = True
                     return activated
@@ -634,12 +646,18 @@ class CalendarSyncStore:
             # publication validation precedes it, so an adopted active candidate is
             # never reported as a failed migration.
             self._remove_migration_guard(guard, guard_stat)
+            self._validate_migration_completion(activated)
             _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
             migration_complete = True
             return activated
         except BaseException:
             if exchanged and not migration_complete:
-                if activation_confirmed and self._migration_guard_completed(guard, guard_stat):
+                if (
+                    activation_confirmed
+                    and self._migration_guard_completed(guard, guard_stat)
+                    and activated is not None
+                    and self._migration_completion_is_valid(activated)
+                ):
                     _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
                     migration_complete = True
                     return activated
@@ -648,6 +666,7 @@ class CalendarSyncStore:
                     and identity_stat is not None
                     and not os.path.lexists(guard)
                     and self._activation_committed(activated, identity_stat)
+                    and self._migration_completion_is_valid(activated)
                 ):
                     migration_complete = True
                     return activated
@@ -662,9 +681,12 @@ class CalendarSyncStore:
                     ):
                         if os.path.lexists(guard):
                             self._remove_migration_guard(guard, guard_stat)
-                        _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
-                        migration_complete = True
-                        return activated
+                        if self._migration_completion_is_valid(activated):
+                            _CALENDAR_SYNC_QUARANTINED_PATHS.discard(
+                                _calendar_quarantine_key(guard)
+                            )
+                            migration_complete = True
+                            return activated
                     try:
                         self._ensure_migration_guard_blocking(guard)
                     except CalendarSyncStoreReadError:
@@ -1011,10 +1033,14 @@ class CalendarSyncStore:
         device: int,
         inode: int,
         migration_id: str | None = None,
+        migration_guard_device: int | None = None,
+        migration_guard_inode: int | None = None,
     ) -> str:
         return hashlib.sha256(
             (
-                f"stock-eva-calendar-store-v2\0{store_id}\0{device}\0{inode}\0{migration_id or ''}"
+                f"stock-eva-calendar-store-v3\0{store_id}\0{device}\0{inode}\0"
+                f"{migration_id or ''}\0{migration_guard_device or ''}\0"
+                f"{migration_guard_inode or ''}"
             ).encode()
         ).hexdigest()
 
@@ -1042,7 +1068,8 @@ class CalendarSyncStore:
         if triggers != expected_triggers:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         identity_rows = connection.execute(
-            "SELECT singleton, store_id, device, inode, identity_checksum, migration_id, active "
+            "SELECT singleton, store_id, device, inode, identity_checksum, migration_id, "
+            "migration_guard_device, migration_guard_inode, active "
             "FROM calendar_store_identity ORDER BY singleton"
         ).fetchall()
         if (
@@ -1062,11 +1089,24 @@ class CalendarSyncStore:
             type(migration_id) is not str or re.fullmatch(r"[0-9a-f]{32}", migration_id) is None
         ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if row[4] != cls._identity_checksum(store_id, row[2], row[3], migration_id):
+        guard_device, guard_inode = row[6], row[7]
+        if migration_id is None:
+            if guard_device is not None or guard_inode is not None:
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        elif type(guard_device) is not int or type(guard_inode) is not int:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if type(row[6]) is not int or row[6] not in {0, 1}:
+        if row[4] != cls._identity_checksum(
+            store_id,
+            row[2],
+            row[3],
+            migration_id,
+            guard_device,
+            guard_inode,
+        ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if require_active and row[6] != 1:
+        if type(row[8]) is not int or row[8] not in {0, 1}:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if require_active and row[8] != 1:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         return store_id, row[2], row[3]
 
@@ -1205,13 +1245,17 @@ class CalendarSyncStore:
 
     def _validate_migration_completion(self, connection: sqlite3.Connection) -> None:
         row = connection.execute(
-            "SELECT migration_id FROM calendar_store_identity WHERE singleton = 1"
+            "SELECT migration_id, migration_guard_device, migration_guard_inode "
+            "FROM calendar_store_identity WHERE singleton = 1"
         ).fetchone()
         if row is None or row[0] is None:
             return
         migration_id = row[0]
         if type(migration_id) is not str or re.fullmatch(r"[0-9a-f]{32}", migration_id) is None:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if type(row[1]) is not int or type(row[2]) is not int:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        expected_guard_identity = (row[1], row[2])
         for candidate in self.path.parent.glob(f".{self._migration_guard_path().name}.*.removed"):
             descriptor: int | None = None
             try:
@@ -1227,6 +1271,8 @@ class CalendarSyncStore:
                 bound = os.fstat(descriptor)
                 if (bound.st_dev, bound.st_ino) != (info.st_dev, info.st_ino):
                     continue
+                if (bound.st_dev, bound.st_ino) != expected_guard_identity:
+                    continue
                 payload = os.read(descriptor, 33)
                 if payload == migration_id.encode("ascii"):
                     return
@@ -1236,6 +1282,13 @@ class CalendarSyncStore:
                 if descriptor is not None:
                     os.close(descriptor)
         raise CalendarSyncStoreReadError("calendar control database is unavailable")
+
+    def _migration_completion_is_valid(self, connection: sqlite3.Connection) -> bool:
+        try:
+            self._validate_migration_completion(connection)
+        except (CalendarSyncStoreReadError, sqlite3.Error, OSError, TypeError, ValueError):
+            return False
+        return True
 
     def _initialize(self) -> None:
         with closing(self._connect()):

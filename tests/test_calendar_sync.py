@@ -212,7 +212,7 @@ def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: P
     assert backups[0].stat().st_ino == old_inode
 
 
-@pytest.mark.parametrize("tamper", ["missing", "replaced"])
+@pytest.mark.parametrize("tamper", ["missing", "replaced", "forged_inode"])
 def test_calendar_sync_migrated_store_requires_matching_completed_evidence(
     tmp_path: Path, tamper: str
 ) -> None:
@@ -225,8 +225,15 @@ def test_calendar_sync_migrated_store_requires_matching_completed_evidence(
     completed = next(tmp_path.glob(".*.removed"))
     if tamper == "missing":
         completed.unlink()
-    else:
+    elif tamper == "replaced":
         completed.write_bytes(b"0" * 32)
+    else:
+        with closing(sqlite3.connect(path)) as connection:
+            migration_id = connection.execute(
+                "SELECT migration_id FROM calendar_store_identity WHERE singleton = 1"
+            ).fetchone()[0]
+        completed.unlink()
+        completed.write_text(migration_id)
 
     with pytest.raises(CalendarSyncStoreReadError):
         CalendarSyncStore(path, initialize=False).state()
