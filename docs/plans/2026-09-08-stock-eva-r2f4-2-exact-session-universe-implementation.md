@@ -196,8 +196,8 @@ The mode/profile matrix is normative and evaluated before any Universe provider 
 
 | Profile | `off` | `shadow` | `enforce` |
 |---|---|---|---|
-| production | legacy canonical unchanged; `NONE`, zero Universe requests | `BLOCKED_PRODUCTION_MODE_OFF`, zero Universe requests | `BLOCKED_PRODUCTION_MODE_OFF`, zero Universe requests |
-| nonproduction/staging | legacy canonical unchanged; `NONE`, zero Universe requests | read-only legacy observer only; `LEGACY_SHADOW_DRIFT` when it differs, otherwise `NONE`; no canonical block | `BLOCKED_ENFORCE_NOT_ENABLED`, zero requests |
+| production | legacy canonical unchanged; `NONE`, zero Universe requests | `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), zero Universe requests | `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), zero Universe requests |
+| nonproduction/staging | legacy canonical unchanged; `NONE`, zero Universe requests | read-only legacy observer only; `LEGACY_SHADOW_DRIFT` when it differs, otherwise `NONE`; no canonical block | `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`), zero requests |
 
 This matrix is distinct from a provider failure: a blocked cell is a deterministic configuration
 result, never a retry or a request to authenticated or secondary services. `shadow` observes only
@@ -209,6 +209,9 @@ variable enumeration), then map exactly `production` to `production`; exactly `d
 `CONTROL_STATE_UNAVAILABLE` before mode evaluation or provider construction. Thus only the first
 matrix row can produce `BLOCKED_PRODUCTION_MODE_OFF`, and only the second row can produce
 `BLOCKED_ENFORCE_NOT_ENABLED`; an invalid profile has neither production nor shadow authority.
+For compact notation, `B_P` means `BLOCKED_PRODUCTION_MODE_OFF` and `B_E` means
+`BLOCKED_ENFORCE_NOT_ENABLED`; production with any non-`off` mode is `B_P`, while nonproduction
+with `enforce` is `B_E`. No other profile/mode pair may emit either alias.
 
 - FR-25: No authority widening. R2-F4.2 MUST NOT add a secondary provider to canonical
   `ProviderId`, change R2-F4.0 failover readiness, enable TickFlow/Tushare failover, change R2-F3
@@ -254,7 +257,8 @@ matrix row can produce `BLOCKED_PRODUCTION_MODE_OFF`, and only the second row ca
 
 - **NFR-7 — Bounded work:** A status read MUST use one sidecar snapshot and no provider call. A
   maintenance tick MUST perform at most one classification acquisition and one contract promotion
-  attempt, and MUST respect the existing refresh lock and provider request budgets.
+  attempt, and MUST respect the existing refresh lock and provider request budgets. When maintenance
+  is disabled, it performs zero hook, sidecar, snapshot, observer and provider work.
 
 - **NFR-8 — Determinism:** Rebuilding the same frozen inputs MUST produce byte-identical contract,
   member-count and hash outputs regardless of Python set/dictionary iteration order.
@@ -388,8 +392,9 @@ CLI exit 2 without I/O; **Given** a syntactically valid but future `trade_date` 
 sidecar path/inode/schema, **When** the API/CLI is invoked, **Then** sidecar proof runs first and
 the result is the independent HTTP 503 / CLI exit 3 control envelope; **When** the sidecar is proven
 readable, **Then** the future semantic date returns the unique HTTP 422 / CLI exit 2
-`PIT_VISIBILITY_INVALID` before any head/source projection. This ordering is tested in combined
-storage/date cases and never depends on whether the date is a weekend.
+`PIT_VISIBILITY_INVALID` before any head/source projection. Lexical-invalid and
+sidecar-proof/future-semantic cases are separate tests; the ordering never depends on whether the
+date is a weekend.
 
 ### AC-15: Maintenance boundary (FR-22, FR-23, FR-27, NFR-7)
 
@@ -409,6 +414,11 @@ unavailable diagnostic, closes resources in `finally`, never raises, and returns
 exactly-once consumer failure independently.
 The service, not the hook, consumes the fresh sealed context exactly once after post-publish and
 shadow and passes it as the hook's `context` argument.
+
+**Given** `market_universe_maintenance_enabled=false`, **When** a scheduler tick completes,
+**Then** no Universe hook, sidecar access, UserStore snapshot, observer or provider request occurs;
+the disabled decision is `action=none`, `reason_code=NONE`, `provider_requests=0` and
+`writes_canonical=false`, while legacy behavior is unchanged.
 
 ### AC-16: Failed maintenance preserves prior authority (FR-18, FR-23, FR-26, NFR-4)
 
@@ -495,7 +505,8 @@ not call the seam; `shadow` compares after canonical success and records drift w
   prior promoted generations/head and record a sanitized terminal reason.
 - EC-21: A universe maintenance tick races a freshness/repair/shadow task, or its configured
   `lock_path` is `None` → existing nonblocking lock policy returns `DEFER` with
-  `CONTROL_STATE_UNAVAILABLE`; no provider request is duplicated.
+  `CONTROL_STATE_UNAVAILABLE`; no provider request is duplicated. When maintenance is disabled,
+  the tick returns `action=none`/`NONE` with zero hook, sidecar, snapshot and provider activity.
 - EC-22: The legacy path has no sidecar contract or has a divergent shadow comparison → `off`
   remains compatible, `shadow` reports private diagnostic drift without blocking, and `enforce`
   blocks rather than switching source.
@@ -564,60 +575,23 @@ HTTP behavior:
 The public GET has one and only one current-source input: a verified `universe_source_state` row
 from the readable sidecar. The pure date parser runs before I/O; for lexically valid input, the
 reader then verifies the sidecar and complete head chain. When a valid head exists for another date,
-it uses that head's linked source-state row and does not require
-a source-state row for the requested date. For an exact-date head, the head's linked source-state
-is the baseline. The reader selects the latest verified requested-date row by
-`(verified_at,source_state_id)` and considers it *newer* only when its ordering is strictly after
-the head-linked row; if no newer row exists, the head is ready only when its own persisted digest
-equals its own source-state digest. If a newer row exists, its digest is compared to the head
-digest; a differing digest is stale unless a corresponding durable failed/indeterminate attempt
-exists for the requested date and that newer digest, in which case it is blocked. With no head it
-consults only requested-date attempt rows. GET MUST NOT
+it uses that head's linked source-state row and does not require a source-state row for the requested
+date. For an exact-date head, the reader validates the head-linked source-state and consults only
+the sidecar's latest requested-date source-state and attempt rows. GET MUST NOT
 read external classification, calendar, UserStore, provider or environment state, and therefore
 does not claim real-time discovery. A writer-verified change is invisible to GET until it is
 persisted as a new source-state row; this is intentional PIT snapshot semantics. A required head
 source-state row that is missing or invalid is unprovable and uses the independent control-error
 boundary rather than guessing a current source.
 
-- The pure date parser runs first: lexical failure is HTTP `422` with `PIT_VISIBILITY_INVALID` and
-  zero I/O. For a lexically valid date, the reader then proves the sidecar path/inode/schema/WAL/lock;
-  failure is the independent HTTP `503` control envelope. For a readable sidecar, future semantic
-  input is HTTP `422` with `PIT_VISIBILITY_INVALID` before source/head projection. A valid head whose
-  date differs from the requested valid date is HTTP `200`, `status=stale`, and `reason_code=DATE_MISMATCH`; it includes the requested date plus
-  the verified head's safe source/count fields, never a requested-date projection. `ready` is
-  necessary but does not qualify a secondary provider or enable failover. A valid empty store with
-  no head is HTTP `200`, `status=unavailable`, with `reason_code=CONTROL_STATE_UNAVAILABLE`.
-- `503` is returned whenever sidecar path/inode/schema/hash/WAL/lock or storage state cannot be
-  proven safely as the independent `UniverseControlError` envelope
-  `{ \"code\": \"universe_control_unavailable\" }`; it contains no path or exception and is not a
-  `UniverseStatusResponse`. The CLI emits `CliUnavailableError`
-  `{ \"code\": \"universe_unavailable\", \"reason_code\": \"CONTROL_STATE_UNAVAILABLE\" }` with exit
-  `1` for a readable unavailable store, and the control-error envelope with exit `3` for
-  unprovable storage.
-
-Status is a true discriminated union; the following priority and nullability are normative for
-both HTTP and CLI. Pure lexical format parsing occurs first and returns 422 without I/O; for a
-lexically valid date, an unprovable sidecar is the independent `UniverseControlError`/HTTP 503
-envelope (never a status-union `unavailable`). Once the sidecar is proven readable, only future
-semantic input is HTTP 422. For an exact-date head, the reader compares the head-linked source-state
-with the latest requested-date source-state only when the latter is strictly newer. A corresponding
-durable failed or indeterminate attempt for that newer digest has priority and produces `blocked`
-with its closed reason and all head-derived fields null. Without that attempt, a differing newer
-digest produces `stale` with `UNIVERSE_SOURCE_VERSION_CHANGED` and the old head's complete safe
-counts/source fields; an absent newer row, or an equal digest, produces `ready`. An exact-date
-head whose own source-state cannot be verified is the independent control-error boundary.
-A valid head for another date is `stale` with `DATE_MISMATCH`. With no head and no durable attempt,
-the readable initialized store is `unavailable` (HTTP 200). A readable external control failure
-or terminal CAS result is `blocked` with `CONTROL_STATE_UNAVAILABLE` or
-`UNIVERSE_HEAD_CAS_CONFLICT`; schema/path/hash failures remain the independent 503 envelope. No
-reader may return a cached or “last verified” head. External changes not yet persisted by a writer
-cannot change this projection.
+The date/status ordering and every public result/HTTP or CLI code are defined only by the single
+matrix below. The independent storage error envelopes are not status-union values.
 
 The four interfaces above are the only public shapes. `Ready` and `Stale` carry verified head
 fields; `Blocked` and `Unavailable` carry null head fields. Implementations MUST NOT populate a
-nullable field outside its interface. After pure format parsing, sidecar/head proof runs before
-any future/PIT semantic check. The following single matrix is the complete exact-head/no-head
-decision algorithm, identical for HTTP and CLI:
+nullable field outside its interface. After pure lexical format parsing, the following single
+matrix is the complete exact-head/no-head decision algorithm and the sole status decision authority
+for HTTP and CLI; no prose rule outside this matrix may override it:
 
 | Verified state | Attempt/source condition | Public result and safe fields |
 |---|---|---|
@@ -636,10 +610,6 @@ decision algorithm, identical for HTTP and CLI:
 | no head | requested-date `blocked`, `deferred`, `failed`, `ATTEMPT_INDETERMINATE`, or `RUNNING` plan | `blocked` with the deterministic attempt reason; all head fields null |
 | no head | requested-date `succeeded` result without its exact promoted head | 503 `UNIVERSE_SCHEMA_MISMATCH`; a success without a head is not `unavailable` |
 | no head | no requested-date attempt | `unavailable/CONTROL_STATE_UNAVAILABLE`, all head fields null |
-
-`succeeded` always means a valid exact head exists; a missing/duplicate plan or result is the
-independent 503 schema-unavailable outcome. A readable external control failure or CAS result uses
-the corresponding blocked reason above. No cached prior success is inferred.
 
 ### `stock-eva market-universe --date YYYY-MM-DD`
 
@@ -796,55 +766,67 @@ The shadow-only required-symbol observer is a pure read-only function over the a
 request plan; it does not call BaoStock or rebuild the plan:
 
 ```typescript
+interface LegacyPreflightSnapshot {
+  provider_id: "baostock";
+  trade_date: string;
+  symbols: string[];
+  builder_outcome: "accepted" | "rejected";
+}
 interface LegacyShadowObservation {
   provider_id: "baostock";
   request_trade_date: string;
-  contract_sha256: string;
-  expected_symbol_count: number;
+  contract_sha256: string | null;
+  expected_symbol_count: number | null;
   observed_symbol_count: number;
-  missing_required_symbol_count: number;
-  extra_symbol_count: number;
-  duplicate_symbol_count: number;
-  drift_sha256: string;
-  reason_code: "LEGACY_SHADOW_DRIFT" | "NONE";
+  missing_required_symbol_count: number | null;
+  extra_symbol_count: number | null;
+  drift_sha256: string | null;
+  reason_code: "LEGACY_SHADOW_DRIFT" | "NONE" | "NO_COMPARISON";
+  control_reason: "CONTROL_STATE_UNAVAILABLE" | null;
 }
 function observe_legacy_request_universe(
-  request: ProviderRequest, contract: UniverseContractV1,
+  snapshot: LegacyPreflightSnapshot, contract: UniverseContractV1 | null,
 ): LegacyShadowObservation;
+interface LegacyShadowHandoff {
+  snapshot: LegacyPreflightSnapshot;
+  contract: UniverseContractV1 | null;
+  diagnostic: LegacyShadowObservation;
+}
 ```
 
-`request.session_symbols` is the exact legacy preflight observation captured before the first
-provider request. At the existing preflight boundary, the caller freezes the returned
-`ProviderRequest` (including its session-symbol sequence) into a local read-only snapshot before
-executing any provider operation, and carries that snapshot alongside the canonical result to
-`_offer_shadow`; the callback holder carries only publication context. If the legacy builder rejects
-before returning a request, no comparison is possible and the original legacy failure is returned
-unchanged. The observer defines the sets deterministically: `expected_symbols` is the
-lexicographically sorted unique symbol projection of contract members whose effective session
-state is `trading` or `suspended` (including required additions and the two required indexes);
-`observed_symbols` is the sorted unique projection of `request.session_symbols`; `missing_symbols`
-is `expected_symbols - observed_symbols`; `extra_symbols` is `observed_symbols - expected_symbols`;
-and `duplicate_symbols` is the set of symbols repeated in the raw request sequence. A malformed
-request identity or duplicate is diagnostic drift, never silently normalized. Every set uses
-the canonical `symbol` identity and UTF-8 lexical order. The observer computes set hashes with
-`domain_sha256("stock-eva/r2f4.2/legacy-shadow-symbol-set/v1", sorted_symbols)` and computes
-`drift_sha256` with
-`domain_sha256("stock-eva/r2f4.2/legacy-shadow-drift/v1", {provider_id,request_trade_date,
-contract_sha256,expected_symbols,observed_symbols,missing_symbols,extra_symbols,duplicate_symbols})`.
-The symbol lists are private hash preimage only; the returned record exposes counts and digests,
-never symbol values or payload. Equal expected/observed sets with no duplicates return `NONE`;
-any missing, extra or duplicate set returns `LEGACY_SHADOW_DRIFT`, including missing required
-ChiNext/STAR symbols.
+The legacy builder's `ProviderRequest` is already sorted-unique and its preflight rejects symbols
+outside the main-board scope. Therefore the observer does not claim to inspect duplicate provider
+rows or an unreturned request. At the pre-validation boundary the caller freezes a
+`LegacyPreflightSnapshot` of the proposed symbol sequence, before invoking the builder; this is
+the only observed input and remains reachable even when the builder rejects a non-main-board
+symbol. The canonical path and its failure result are never changed by this capture.
 
-The observer runs only after a successful canonical refresh and CandidateStore evidence readback
-in nonproduction `shadow`. The returned `LegacyShadowObservation` is handed to the existing
-bounded shadow diagnostic channel, at most once per scheduler tick; R2-F4.2 deliberately does not
-persist it in the Universe sidecar, head, attempt or public status and does not add a new source of
-authority. The caller may retain the sanitized count/hash record in its existing private shadow
-audit, while the function return is the sole typed handoff. A diagnostic-channel failure is
-sanitized and isolated; it cannot change the canonical result or the Universe hook status. The
-observer never filters, patches or changes `build_canonical_raw_request`, does not call BaoStock,
-and is not a provider acquisition seam.
+With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
+members whose effective session state is `trading` or `suspended`, including required additions
+and the two required indexes. `observed_symbols` is the sorted unique snapshot sequence;
+`missing_symbols = expected_symbols - observed_symbols` and
+`extra_symbols = observed_symbols - expected_symbols`. The sets use canonical `symbol` identity
+and UTF-8 lexical order. A preflight rejection is retained in `builder_outcome` but is not
+reinterpreted as a provider-row failure. Set hashes use
+`domain_sha256("stock-eva/r2f4.2/legacy-shadow-symbol-set/v1", sorted_symbols)` and
+`drift_sha256` uses
+`domain_sha256("stock-eva/r2f4.2/legacy-shadow-drift/v1", {provider_id,request_trade_date,
+contract_sha256,expected_symbols,observed_symbols,missing_symbols,extra_symbols})`.
+The lists are private hash preimage only; the returned record contains counts and digests, never
+symbol values or payload. Equal sets return `NONE`; any missing or extra set returns
+`LEGACY_SHADOW_DRIFT`, including required ChiNext/STAR additions absent from the legacy input.
+With no persisted contract, the typed result is `NO_COMPARISON` with
+`control_reason=CONTROL_STATE_UNAVAILABLE` and nullable expected/missing/extra/digest fields.
+
+The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
+successful canonical refresh and CandidateStore evidence readback. Its typed handoff is
+`LegacyShadowHandoff {snapshot, contract, diagnostic}` from the refresh orchestration to the
+existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
+in the Universe sidecar, head, attempt or public status. A missing contract yields the typed
+`NO_COMPARISON/CONTROL_STATE_UNAVAILABLE` result, never a blocked hook status. A diagnostic-channel
+failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
+The observer never filters, patches or changes `build_canonical_raw_request`, does not call
+BaoStock, and is not a provider acquisition seam.
 
 `universe_raw_projection_sha256` is the domain hash
 `stock-eva/r2f4.2/raw-batch-projection/v1` over the exact JSON result of
@@ -872,6 +854,14 @@ Implementation MUST realize the companion design models `UniverseContractV1`, `U
 `UniverseCountsV1`, `InstrumentEvidenceV1`, `RequiredUserSymbolSnapshotV1`,
 `UniverseStatusSnapshotV1` and `UniverseCandidateGate`. All models are strict, frozen, extra-forbid,
 finite, safe-ID/hash validated and use the exact state vocabularies in the design.
+
+`UniverseContractV1` has generated `contract_id`, `contract_sha256` and immutable `created_at`.
+`payload_json` is the canonical `contract_preimage`, containing every semantic field including
+`parent_contract_id`, sorted members, partitions, evidence and snapshot references, while
+excluding only `contract_id`, `contract_sha256` and observational `created_at`. Compute
+`contract_sha256 = domain_sha256("stock-eva/r2f4.2/universe-contract/v1", contract_preimage)` and
+then derive `contract_id` as its first 32 lowercase hex characters. A reader recomputes both and
+checks all DDL columns against the payload; generated values are never self-referential.
 
 `SourceRefsV1` is a required frozen model (calendar generation ID/hash, classification generation
 ID, its source/source-version/sequence/observed-at/source-date-semantics metadata, a newly computed exact-PIT classification snapshot digest,
@@ -964,6 +954,7 @@ Every digest is domain-separated and recomputable from persisted or existing mod
 | `stock-eva/r2f4.2/classification-snapshot/v1` | sorted exact PIT `(security_id,symbol,source_record_id,source_snapshot_date,listing_status,trade_status,st_state,exclusion_reason,source_date_semantics)` projection; never a GenerationSummary hash |
 | `stock-eva/r2f4.2/instrument-evidence/v1` | complete reviewed `InstrumentEvidenceV1`, mapping hash and exact dates included |
 | `stock-eva/r2f4.2/semantic-mapping/v1` | canonical semantic-mapping payload and identity/version/provider/schema |
+| `stock-eva/r2f4.2/universe-contract/v1` | canonical `contract_preimage` in `payload_json`, including parent ID and all semantic fields, excluding only `contract_id`, `contract_sha256` and `created_at` |
 | `stock-eva/r2f4.2/publication-lineage/v2` | exact current `_R2F2_LINEAGE_FIELDS` projection: `provider_id`, `universe_id`, `evidence_id`, `evidence_sha256`, `candidate_id`, `candidate_manifest_sha256`, `gate_report_sha256`, `adapter_version`, `source_schema_version`; no pre-existing digest is assumed |
 | `stock-eva/r2f4.2/universe-publication-context/v1` | `{run_id,trade_date,manifest_ref,evidence_refs,publication_lineage_json,publication_lineage_sha256,status,created_at}` with sorted safe references; `context_sha256` hashes exactly this object and `context_id` is derived as the first 32 lowercase hex characters of `context_sha256`, both excluded from the preimage |
 | `stock-eva/r2f4.2/universe-head/v1` | `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}` |
@@ -972,6 +963,11 @@ Every digest is domain-separated and recomputable from persisted or existing mod
 | `stock-eva/r2f4.2/universe-source-state/v1` | exact object `{trade_date,provider_id,source_version_digest,source_refs_json}` persisted in `universe_source_state`; `verified_at` is excluded from identity; `source_state_id=source_state_sha256[:32]` |
 | `stock-eva/r2f4.2/universe-attempt-plan/v1` | complete immutable attempt key, source version, operation day, budget and hook identity |
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
+| `stock-eva/r2f4.2/user-rows/v1` | exactly `{"schema_version":1,"user_rows":[sorted exact table/column/value rows]}`; this is `snapshot_token` |
+| `stock-eva/r2f4.2/required-symbol-snapshot/v1` | exactly `{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`; this is `snapshot_sha256` |
+| `stock-eva/r2f4.2/universe-partition/classification-evidence/v1` | sorted unique JSON rows `{security_id,symbol,evidence_id,exclusion_reason}` including excluded records |
+| `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique JSON rows `{security_id,symbol}` for the effective main-board base |
+| `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique JSON rows `{security_id,symbol,scope_roles,state,evidence_id}` after base-set subtraction |
 
 Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha256` excludes only
 itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
@@ -979,10 +975,9 @@ refresh_id,request_budget,classification_max_attempts,created_at,attempt_status)
 excludes only itself and includes `(attempt_id,terminal_status,classification_request_count,
 reason_code,source_state_id,finished_at)`, where `source_state_id` is null only before a source
 state can be constructed. `created_at` and `finished_at` are UTC microsecond timestamps and are
-not replaced by local time or wall-clock text. The required-symbol `snapshot_token` is the exact
-`domain_sha256("stock-eva/r2f4.2/user-rows/v1", {"schema_version":1,"user_rows":[sorted exact table/column/value rows]})`; its
-`snapshot_sha256` is the required-symbol projection hash over sorted `(symbol,scope_roles,
-snapshot_token)` and therefore proves which user-row token produced it.
+not replaced by local time or wall-clock text. The required-user snapshot preimages are defined
+only by the `user-rows/v1` and `required-symbol-snapshot/v1` registry rows above; every model and
+reader MUST use those exact objects and MUST NOT introduce a second snapshot hash formula.
 
 `attempt_id` is a generated safe identifier and `dedup_key` is the derived hash of the canonical
 attempt key; both are excluded from the plan preimage except where `attempt_id` is explicitly part
@@ -1026,19 +1021,17 @@ capture_required_symbol_snapshot_existing(): RequiredUserSymbolSnapshotRead
 Only the existing UserStore writer owner may call this API; public API/CLI has no writer
 connection or initialization permission. It opens exactly one descriptor-bound, already-initialized
 UserStore SQLite connection, verifies the allowlisted schema, issues `BEGIN IMMEDIATE` to obtain
-writer exclusion, reads positions/watchlists/items in one deterministic SQL snapshot, and computes
-the raw `snapshot_token` from the exact preimage
-`{"schema_version":1,"user_rows":[sorted table/column/value tuples]}` under domain
-`stock-eva/r2f4.2/user-rows/v1`. `captured_at` is a UTC RFC-3339 observation excluded from both
-identity hashes. Compute `snapshot_sha256` under domain
-`stock-eva/r2f4.2/required-symbol-snapshot/v1` over
-`{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`;
-`snapshot_id` is derived from that hash. The token proves the source rows, while the snapshot hash
-proves the symbol/role projection. It commits to release the exclusion. Busy/locked, unavailable,
-schema mismatch or row/hash mismatch MUST rollback and return `USER_STORE_UNAVAILABLE`, with no
-retry or second observation; close is required on commit and rollback. Capture MUST NOT initialize
-or migrate UserStore. The private sidecar stores only normalized symbols, role bitset, token digest,
-count, capture time and hash; public API/CLI stores only expose count/hash.
+writer exclusion, reads positions/watchlists/items in one deterministic SQL snapshot, and uses
+exactly the `user-rows/v1` registry preimage for `snapshot_token` and the
+`required-symbol-snapshot/v1` registry preimage for `snapshot_sha256`. `captured_at` is a UTC
+RFC-3339 observation excluded from both identity hashes. `snapshot_id` is derived from
+`snapshot_sha256`; the token proves source rows and the snapshot hash proves the symbol/role
+projection, with no alternate formula. It commits to release the exclusion. Busy/locked,
+unavailable, schema mismatch or row/hash mismatch MUST rollback and return
+`USER_STORE_UNAVAILABLE`, with no retry or second observation; close is required on commit and
+rollback. Capture MUST NOT initialize or migrate UserStore. The private sidecar stores only
+normalized symbols, role bitset, token digest, count, capture time and hash; public API/CLI stores
+only expose count/hash.
 
 ### Sidecar schema
 
@@ -1311,6 +1304,16 @@ it does not accept a free-form path. `main.py` and the automation CLI construct 
 both into `MarketAutomationService`; the read-only `market-universe` CLI uses the same
 settings/layout projection and constructs no writer/provider. Add tests for defaults/invalid range,
 basename collision, main/automation-CLI injection identity and zero-write status.
+When `market_universe_maintenance_enabled=false`, the scheduler MUST make no maintenance
+invocation: it MUST not call `_offer_universe_maintenance` or `UniversePostSuccessHook`, capture a
+required-symbol snapshot, initialize/read/write the maintenance sidecar, construct a classification
+provider, or issue an observer/provider request. Each tick returns a disabled decision with
+`action=none`, `reason_code=NONE`, `provider_requests=0` and `writes_canonical=false`; legacy
+canonical refresh and its existing post-publish/shadow behavior remain unchanged. This flag does
+not change an explicitly requested read-only status projection, which remains subject to the
+status contract above.
+The profile/mode matrix is evaluated only after this enabled check; the disabled short-circuit
+cannot emit `B_P` or `B_E`.
 
 ## Implementation Sequence
 
@@ -1493,8 +1496,8 @@ basename collision, main/automation-CLI injection identity and zero-write status
    `test_status_source_state_order_and_date_matrix` covering exact-date head, no newer row/equal
    digest (`ready`), newer differing digest (`stale`), matching failed/indeterminate attempt
    (`blocked`), and another-date head (`DATE_MISMATCH`) without a requested-date source row. Add
-   `test_status_storage_error_precedes_invalid_or_future_date` for the unique 503-before-422
-   ordering when both storage and date are invalid.
+   `test_status_lexical_invalid_zero_io` for pure parse and
+   `test_status_future_requires_sidecar_proof` for the unique 503-before-future-422 ordering.
 
 ### Step 7 — Compatibility documentation and no-migration rehearsal
 
@@ -1629,14 +1632,14 @@ range notation is used for review evidence.
 | AC-11 | Step 4 exact candidate-set gate tests |
 | AC-12 | Step 4 whole-session purity/no-stitching tests |
 | AC-13 | Step 2 immutable sidecar/restart/CAS and source-state/result lifecycle rollback tests (`test_source_state_identity_excludes_verified_at`, `test_source_state_result_transaction_rollback`) |
-| AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and combined 503/422 tests (`test_status_source_state_order_and_date_matrix`, `test_status_storage_error_precedes_invalid_or_future_date`) |
-| AC-15 | Step 5 post-success ordering/priority/callback isolation tests |
+| AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and split parse/future tests (`test_status_source_state_order_and_date_matrix`, `test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
+| AC-15 | Step 5 post-success ordering/priority/callback isolation and `test_disabled_maintenance_zero_hook_write_requests` |
 | AC-16 | Step 5 failed-maintenance prior-head preservation tests |
-| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only required-ChiNext/STAR observer tests (`test_legacy_shadow_observer_expected_missing_extra_hash`) |
+| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`) |
 | AC-18 | Step 8 protected predecessor hash/regression tests |
 | AC-19 | Step 8 offline fake/provider-boundary tests |
 | AC-20 | Step 4 pure pre-Normalize raw-batch aggregate tests |
-| EC-1 | Step 3 invalid-date/calendar fixture and Step 6 storage-error-before-invalid-date fixture (`test_status_storage_error_precedes_invalid_or_future_date`) |
+| EC-1 | Step 3 invalid-date/calendar fixture and Step 6 split lexical-invalid/future-proof fixtures (`test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
 | EC-2 | Step 2 calendar/sidecar path-inode strict-reader fixture |
 | EC-3 | Step 3 promoted-classification visibility fixture |
 | EC-4 | Step 3 PIT cutoff fixture |
@@ -1656,7 +1659,7 @@ range notation is used for review evidence.
 | EC-18 | Step 2 interrupted atomic-promotion fixture |
 | EC-19 | Step 2 tampered sidecar/inode fixture |
 | EC-20 | Step 5 failed-maintenance preservation fixture |
-| EC-21 | Step 5 lock/race priority fixture |
+| EC-21 | Step 5 lock/race priority and disabled-maintenance fixture (`test_disabled_maintenance_zero_hook_write_requests`) |
 | EC-22 | Step 4 legacy mode/shadow-drift fixture |
 | EC-23 | Step 4 tradestatus/placeholder raw gate fixture |
 | EC-24 | Step 2/Step 5 attempt-ledger/hash/restart fixture |
@@ -1689,7 +1692,7 @@ accepted as a substitute.
 | FR-19 — Canonical identity | Step 1 deterministic hash-vector and source-state identity test (`test_source_state_identity_excludes_verified_at`) |
 | FR-20 — Read-only status | Step 6 status projection test |
 | FR-21 — Sanitized diagnostics | Step 6 sanitized-output scan |
-| FR-22 — Maintenance priority | Step 5 automation priority test |
+| FR-22 — Maintenance priority | Step 5 automation priority and `test_disabled_maintenance_zero_hook_write_requests` |
 | FR-23 — Classification maintenance trigger | Step 5 cadence/daily-ceiling and source-digest-change test |
 | FR-24 — Legacy compatibility modes | Step 4 legacy compatibility test |
 | FR-25 — No authority widening | frozen predecessor/provider allowlist scan |
