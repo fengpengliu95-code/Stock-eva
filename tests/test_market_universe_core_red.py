@@ -10,7 +10,7 @@ from backend.app.market.universe import (
     UniverseStoreUnavailable,
     domain_sha256,
 )
-from tests.test_market_universe import _bundle, _contract, _evidence
+from tests.test_market_universe import _authority, _bundle, _contract, _evidence
 
 
 def test_partition_digest_excludes_member_digest_field():
@@ -83,6 +83,7 @@ def test_orphan_evidence_invalidates_global_sidecar(tmp_path):
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     orphan = _evidence(contract.members[0], contract.trade_date).model_dump()

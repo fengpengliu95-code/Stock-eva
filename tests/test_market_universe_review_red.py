@@ -17,7 +17,7 @@ from backend.app.market.universe import (
     domain_sha256,
     validate_provider_raw_batch,
 )
-from tests.test_market_universe import _bundle, _contract, _evidence, _mapping
+from tests.test_market_universe import _authority, _bundle, _contract, _evidence, _mapping
 
 
 def _rehash_evidence(values: dict) -> UniverseInstrumentEvidenceV1:
@@ -39,6 +39,14 @@ def test_missing_listing_window_evidence_is_unknown_and_unpublishable():
         source_schema="classification.instrument.v1",
         artifact_origin="production_reviewed_artifact",
     )
+    with pytest.raises(ValueError):
+        _rehash_evidence(values)
+
+
+def test_local_reviewed_fixture_cannot_enter_production_evidence():
+    contract = _contract()
+    values = _evidence(contract.members[0], contract.trade_date).model_dump()
+    values["artifact_origin"] = "local_reviewed_fixture"
     with pytest.raises(ValueError):
         _rehash_evidence(values)
 
@@ -65,6 +73,26 @@ def test_reviewed_mapping_requires_closed_schema_payload_identity():
     payload = {"tradestatus": {"unexpected": "1"}}
     values = mapping.model_dump()
     values["source_schema"] = "classification.instrument.v9"
+    values["payload_json"] = canonical_json_bytes(payload).decode()
+    values["mapping_sha256"] = domain_sha256(
+        "stock-eva/r2f4.2/semantic-mapping/v1",
+        {
+            "mapping_id": values["mapping_id"],
+            "mapping_version": values["mapping_version"],
+            "provider_id": values["provider_id"],
+            "source_schema": values["source_schema"],
+            "payload": payload,
+        },
+    )
+    with pytest.raises(ValueError):
+        UniverseSemanticMappingV1.model_validate(values)
+
+
+def test_legacy_reviewed_mapping_schema_cannot_establish_authority():
+    mapping = _mapping()
+    values = mapping.model_dump()
+    values["source_schema"] = "classification.instrument.v1"
+    payload = {"tradestatus": {"trading": "1", "suspended": "0"}}
     values["payload_json"] = canonical_json_bytes(payload).decode()
     values["mapping_sha256"] = domain_sha256(
         "stock-eva/r2f4.2/semantic-mapping/v1",
@@ -157,6 +185,7 @@ def test_classification_projection_is_bound_field_by_field_to_evidence(tmp_path)
             expected_head_sha256=None,
             mapping=mapping,
             evidence=evidence,
+            authority_bundle=_authority(mapping, evidence),
             required_snapshot=snapshot,
         )
 
@@ -178,6 +207,7 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     members = tuple(
@@ -192,6 +222,8 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
             ),
         }
     )
+    second_evidence = tuple(_evidence(member, first.trade_date) for member in members)
+    second_authority = _authority(mapping, second_evidence)
     second = build_universe_contract(
         trade_date=first.trade_date,
         calendar_generation_id=first.calendar_generation_id,
@@ -205,10 +237,11 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         exact_pit_cutoff=refs.exact_pit_cutoff,
         source_refs=refs,
         members=members,
+        classification_evidence=second_evidence,
+        authority_bundle=second_authority,
         sequence=2,
         parent_contract_id=first.contract_id,
     )
-    second_evidence = tuple(_evidence(member, second.trade_date) for member in members)
     second_snapshot = snapshot
     second_head = store.promote(
         second,
@@ -216,6 +249,7 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         expected_head_sha256=first_head.head_sha256,
         mapping=mapping,
         evidence=second_evidence,
+        authority_bundle=_authority(mapping, second_evidence),
         required_snapshot=second_snapshot,
     )
     assert second_head.sequence == 2

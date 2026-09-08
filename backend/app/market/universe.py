@@ -20,8 +20,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.market.providers.base import (
+    ExpectedLogicalRequest,
+    ExpectedLogicalRequestPlan,
+    InstrumentRole,
+    PaginationPolicy,
     ProviderEndpoint,
     ProviderRawBatch,
+    RequestRole,
     TransportOutcome,
 )
 
@@ -213,6 +218,12 @@ class UniverseSemanticMappingV1(_Frozen):
             raise ValueError("semantic mapping payload must be an object")
         if self.source_schema not in _MAPPING_SCHEMAS:
             raise ValueError("semantic mapping schema is not closed")
+        if self.authority_status == "reviewed" and (
+            self.source_schema != "classification.instrument.v2"
+            or self.mapping_id != "baostock-instrument-v2"
+            or self.mapping_version != "v2"
+        ):
+            raise ValueError("only the closed production mapping may be reviewed")
         if self.authority_status == "reviewed" and not payload:
             raise ValueError("empty semantic mapping cannot establish authority")
         if self.source_schema == "daily_astock.v1":
@@ -272,6 +283,12 @@ class UniverseSemanticMappingV1(_Frozen):
                 "unknown",
             }:
                 raise ValueError("semantic mapping trading state is not closed")
+            if self.authority_status == "reviewed" and any(
+                not isinstance(payload[key], str) or not payload[key]
+                for key in required
+                if key not in {"mapping_id", "mapping_version"}
+            ):
+                raise ValueError("reviewed semantic mapping has incomplete values")
         expected = domain_sha256(
             "stock-eva/r2f4.2/semantic-mapping/v1",
             {
@@ -352,6 +369,34 @@ class UniverseInstrumentEvidenceV1(_Frozen):
         ):
             raise ValueError("requested-unverified evidence cannot be reviewed")
         if self.source_schema == "classification.instrument.v2":
+            evidence_keys = {
+                "security_type",
+                "exchange",
+                "board",
+                "list_date",
+                "delist_date",
+                "listing_status",
+                "daily_trade_status",
+                "suspension_state",
+                "st_state",
+                "expected_trading_state",
+            }
+            if set(payload) != evidence_keys:
+                raise ValueError("instrument evidence payload field set is not closed")
+            expected_payload = {
+                "security_type": self.security_type,
+                "exchange": self.exchange,
+                "board": self.board,
+                "list_date": self.list_date.isoformat() if self.list_date else None,
+                "delist_date": self.delist_date.isoformat() if self.delist_date else None,
+                "listing_status": self.listing_status,
+                "daily_trade_status": self.daily_trade_status,
+                "suspension_state": self.suspension_state,
+                "st_state": self.st_state,
+                "expected_trading_state": self.expected_trading_state,
+            }
+            if payload != expected_payload:
+                raise ValueError("instrument evidence fields do not bind payload")
             if self.list_date is None:
                 raise ValueError("instrument listing window evidence is incomplete")
             if self.member_kind_for_evidence() == "index":
@@ -364,16 +409,32 @@ class UniverseInstrumentEvidenceV1(_Frozen):
                 ):
                     raise ValueError("required index evidence semantics are incomplete")
         if (
-            self.source_schema == "classification.instrument.v1"
-            and self.authority_status == "reviewed"
-            and self.artifact_origin == "production_reviewed_artifact"
+            self.authority_status == "reviewed"
+            and self.artifact_origin != "production_reviewed_artifact"
         ):
-            raise ValueError("legacy classification evidence cannot establish authority")
+            raise ValueError("only production closed evidence may be reviewed")
         if (
-            self.artifact_origin == "production_reviewed_artifact"
+            self.authority_status == "reviewed"
             and self.source_schema != "classification.instrument.v2"
         ):
             raise ValueError("production evidence schema is not the reviewed closed version")
+        if self.authority_status == "reviewed":
+            if any(
+                value is None or value == ""
+                for value in (
+                    self.exchange,
+                    self.board,
+                    self.list_date,
+                    self.listing_status,
+                    self.daily_trade_status,
+                    self.expected_trading_state,
+                )
+            ):
+                raise ValueError("reviewed instrument evidence is incomplete")
+            if self.daily_trade_status not in {"0", "1"}:
+                raise ValueError("reviewed daily trade status is not closed")
+            if self.listing_status not in {"listed", "delisted", "not_yet_listed"}:
+                raise ValueError("reviewed listing status is not closed")
         expected = domain_sha256("stock-eva/r2f4.2/instrument-evidence/v1", self.preimage())
         if expected != self.evidence_sha256:
             raise ValueError("instrument evidence hash mismatch")
@@ -386,6 +447,38 @@ class UniverseInstrumentEvidenceV1(_Frozen):
         value = self.model_dump(mode="json")
         value.pop("evidence_sha256", None)
         return value
+
+
+def _evidence_matches_member(
+    evidence: UniverseInstrumentEvidenceV1, member: UniverseMemberV1
+) -> bool:
+    expected_daily = {"trading": "1", "suspended": "0"}.get(member.expected_trading_state)
+    expected_suspension = {
+        "trading": "trading",
+        "suspended": "suspended",
+    }.get(member.expected_trading_state, "not_supplied")
+    return (
+        evidence.security_id == member.security_id
+        and evidence.symbol == member.symbol
+        and evidence.index_role
+        == ("required_index" if member.member_kind == "index" else "not_applicable")
+        and evidence.security_type == member.member_kind
+        and evidence.exchange == member.exchange
+        and evidence.board == member.board
+        and evidence.list_date == member.list_date
+        and evidence.delist_date == member.delist_date
+        and evidence.listing_status
+        == (
+            "listed"
+            if member.expected_trading_state not in {"delisted", "not_yet_listed"}
+            else member.expected_trading_state
+        )
+        and evidence.daily_trade_status == expected_daily
+        and evidence.suspension_state == expected_suspension
+        and evidence.st_state == member.st_state
+        and evidence.expected_trading_state == member.expected_trading_state
+        and evidence.exclusion_reason == member.exclusion_reason
+    )
 
 
 class RequiredSymbolSnapshotV1(_Frozen):
@@ -459,12 +552,12 @@ class UniverseContractV1(_Frozen):
     classification_evidence_projection: tuple[dict[str, str], ...] = ()
     payload_json: str
     publication_eligible: bool
-    classification_evidence_count: int | None = Field(default=None, ge=0)
-    classification_evidence_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    effective_main_board_count: int | None = Field(default=None, ge=0)
-    effective_main_board_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    required_additions_count: int | None = Field(default=None, ge=0)
-    required_additions_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    classification_evidence_count: int = Field(ge=0)
+    classification_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effective_main_board_count: int = Field(ge=0)
+    effective_main_board_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required_additions_count: int = Field(ge=0)
+    required_additions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_state_id: str | None = None
     source_state_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
@@ -569,31 +662,24 @@ class UniverseContractV1(_Frozen):
         )
         for actual, domain, predicate, label in partition_specs:
             if label == "classification":
-                projection = list(self.classification_evidence_projection) or [
-                    {
-                        "security_id": item.security_id,
-                        "symbol": item.symbol,
-                        "evidence_id": item.instrument_evidence_id,
-                        "exclusion_reason": item.exclusion_reason,
-                    }
-                    for item in self.members
-                ]
+                projection = list(self.classification_evidence_projection)
+                if not projection:
+                    raise ValueError("classification layer projection is required")
             else:
                 projection = [member_projection(item) for item in self.members if predicate(item)]
             if actual != domain_sha256(domain, projection):
                 raise ValueError(f"{label} partition hash mismatch")
-        if self.classification_evidence_projection:
-            projection_keys = tuple(
-                (
-                    item.get("security_id", ""),
-                    item.get("symbol", ""),
-                    item.get("evidence_id", ""),
-                    item.get("exclusion_reason", ""),
-                )
-                for item in self.classification_evidence_projection
+        projection_keys = tuple(
+            (
+                item.get("security_id", ""),
+                item.get("symbol", ""),
+                item.get("evidence_id", ""),
+                item.get("exclusion_reason", ""),
             )
-            if projection_keys != tuple(sorted(set(projection_keys))):
-                raise ValueError("classification evidence projection must be sorted and unique")
+            for item in self.classification_evidence_projection
+        )
+        if projection_keys != tuple(sorted(set(projection_keys))):
+            raise ValueError("classification evidence projection must be sorted and unique")
         layer_fields = (
             (
                 self.classification_evidence_count,
@@ -608,56 +694,45 @@ class UniverseContractV1(_Frozen):
             (self.required_additions_count, self.required_additions_sha256, "required_additions"),
         )
         for count, digest_value, label in layer_fields:
-            if count is not None or digest_value is not None:
-                if count is None or digest_value is None:
-                    raise ValueError("layer count/hash must be paired")
-                if label == "classification":
-                    rows = list(self.classification_evidence_projection) or [
-                        {
-                            "security_id": item.security_id,
-                            "symbol": item.symbol,
-                            "evidence_id": item.instrument_evidence_id,
-                            "exclusion_reason": item.exclusion_reason,
-                        }
-                        for item in self.members
-                    ]
-                else:
-                    rows = [
-                        member_projection(item)
-                        for item in self.members
-                        if (
-                            (
-                                label == "effective_main_board"
-                                and "effective_main_board" in item.scope_roles
-                            )
-                            or (
-                                label == "required_additions"
-                                and item.symbol
-                                not in {
-                                    candidate.symbol
-                                    for candidate in self.members
-                                    if "effective_main_board" in candidate.scope_roles
-                                }
-                                and (
-                                    "required_user" in item.scope_roles
-                                    or "required_index" in item.scope_roles
-                                )
+            if label == "classification":
+                rows = list(self.classification_evidence_projection)
+                if not rows:
+                    raise ValueError("classification layer projection is required")
+            else:
+                rows = [
+                    member_projection(item)
+                    for item in self.members
+                    if (
+                        (
+                            label == "effective_main_board"
+                            and "effective_main_board" in item.scope_roles
+                        )
+                        or (
+                            label == "required_additions"
+                            and item.symbol
+                            not in {
+                                candidate.symbol
+                                for candidate in self.members
+                                if "effective_main_board" in candidate.scope_roles
+                            }
+                            and (
+                                "required_user" in item.scope_roles
+                                or "required_index" in item.scope_roles
                             )
                         )
-                    ]
-                digest_domain = {
-                    "classification": (
-                        "stock-eva/r2f4.2/universe-partition/classification-evidence/v1"
-                    ),
-                    "effective_main_board": (
-                        "stock-eva/r2f4.2/universe-partition/effective-main-board/v1"
-                    ),
-                    "required_additions": (
-                        "stock-eva/r2f4.2/universe-partition/required-additions/v1"
-                    ),
-                }[label]
-                if count != len(rows) or digest_value != domain_sha256(digest_domain, rows):
-                    raise ValueError("universe layer count/hash mismatch")
+                    )
+                ]
+            digest_domain = {
+                "classification": (
+                    "stock-eva/r2f4.2/universe-partition/classification-evidence/v1"
+                ),
+                "effective_main_board": (
+                    "stock-eva/r2f4.2/universe-partition/effective-main-board/v1"
+                ),
+                "required_additions": ("stock-eva/r2f4.2/universe-partition/required-additions/v1"),
+            }[label]
+            if count != len(rows) or digest_value != domain_sha256(digest_domain, rows):
+                raise ValueError("universe layer count/hash mismatch")
         expected = domain_sha256(
             "stock-eva/r2f4.2/universe-contract/v1", json.loads(self.payload_json)
         )
@@ -976,6 +1051,7 @@ class UniverseAuthorityBundleV1(_Frozen):
             or item.mapping_id != self.mapping.mapping_id
             or item.mapping_version != self.mapping.mapping_version
             or item.mapping_sha256 != self.mapping.mapping_sha256
+            or item.source_schema != self.mapping.source_schema
             for item in self.evidence
         ):
             raise ValueError("authority bundle evidence is not reviewed")
@@ -1066,6 +1142,22 @@ def build_universe_contract(
     evidence_by_id = {item.evidence_id: item for item in classification_evidence}
     if classification_evidence and len(evidence_by_id) != len(classification_evidence):
         raise ValueError("duplicate classification evidence identity")
+    if authority_bundle is not None:
+        member_evidence_ids = {item.instrument_evidence_id for item in members}
+        if not member_evidence_ids.issubset(evidence_by_id):
+            raise ValueError("authority bundle does not cover every member evidence")
+        if any(
+            item.source_date_semantics != authority_bundle.source_date_semantics
+            or item.evidence_trade_date != trade_date
+            or item.source_snapshot_date > trade_date
+            for item in classification_evidence
+        ):
+            raise ValueError("authority evidence PIT binding is invalid")
+        if any(
+            not _evidence_matches_member(evidence_by_id[item.instrument_evidence_id], item)
+            for item in members
+        ):
+            raise ValueError("authority evidence does not bind member fields")
     natural_identity = tuple((item.security_id, item.symbol) for item in classification_evidence)
     if len(set(natural_identity)) != len(natural_identity):
         raise ValueError("UNIVERSE_IDENTITY_CONFLICT")
@@ -1213,7 +1305,7 @@ def build_universe_contract(
             counts.unknown == 0
             and counts.critical_attribute_unknown_count == 0
             and refs.source_date_semantics == "source_observed"
-            and (authority_bundle is not None or classification_source == "fixture")
+            and authority_bundle is not None
         ),
         classification_evidence_count=len(classification_rows),
         classification_evidence_sha256=layer_hashes["classification"],
@@ -1223,6 +1315,92 @@ def build_universe_contract(
         required_additions_sha256=layer_hashes["required_additions"],
         source_state_id=source_state_id,
         source_state_sha256=source_state_sha,
+    )
+
+
+def _canonical_expected_logical_plan(contract: UniverseContractV1) -> ExpectedLogicalRequestPlan:
+    """Project the only admissible six-endpoint session for a contract."""
+    stock_symbols = tuple(
+        sorted(item.symbol for item in contract.members if item.member_kind == "stock")
+    )
+    index_symbols = tuple(
+        sorted(item.symbol for item in contract.members if item.member_kind == "index")
+    )
+    requests: list[ExpectedLogicalRequest] = []
+
+    def add(
+        endpoint: ProviderEndpoint,
+        request_role: RequestRole,
+        instrument_role: InstrumentRole | None,
+        schema_variant: str,
+        shard_id: str,
+        symbols: tuple[str, ...],
+    ) -> None:
+        requests.append(
+            ExpectedLogicalRequest(
+                plan_ordinal=len(requests),
+                endpoint=endpoint,
+                request_role=request_role,
+                instrument_role=instrument_role,
+                schema_variant=schema_variant,
+                shard_id=shard_id,
+                symbols=symbols,
+                start_date=contract.trade_date,
+                end_date=contract.trade_date,
+                pagination_policy=PaginationPolicy.PROVIDER_TERMINAL,
+            )
+        )
+
+    add(ProviderEndpoint.TRADE_DATES, RequestRole.CALENDAR, None, "trade_dates.v1", "calendar", ())
+    add(
+        ProviderEndpoint.ALL_STOCK,
+        RequestRole.UNIVERSE,
+        InstrumentRole.STOCK,
+        "all_stock.market.v1",
+        "universe",
+        (),
+    )
+    add(
+        ProviderEndpoint.DAILY_ASTOCK,
+        RequestRole.DAILY_STOCK,
+        InstrumentRole.STOCK,
+        "daily_astock.v1",
+        "daily-stock",
+        stock_symbols,
+    )
+    add(
+        ProviderEndpoint.DAILY_FACTOR,
+        RequestRole.DAILY_FACTOR,
+        InstrumentRole.STOCK,
+        "daily_factor.v1",
+        "daily-factor",
+        stock_symbols,
+    )
+    for symbol in stock_symbols:
+        add(
+            ProviderEndpoint.ADJUST_FACTOR,
+            RequestRole.ADJUST_FACTOR,
+            InstrumentRole.STOCK,
+            "adjust_factor.session.v1",
+            f"adjust-{symbol}",
+            (symbol,),
+        )
+    for symbol in index_symbols:
+        add(
+            ProviderEndpoint.INDEX_HISTORY,
+            RequestRole.INDEX_HISTORY,
+            InstrumentRole.INDEX,
+            "index_history.session.v1",
+            f"index-{symbol}",
+            (symbol,),
+        )
+    draft = ExpectedLogicalRequestPlan.model_construct(
+        requests=tuple(requests), request_count=len(requests), request_plan_hash="0" * 64
+    )
+    return ExpectedLogicalRequestPlan(
+        requests=tuple(requests),
+        request_count=len(requests),
+        request_plan_hash=draft.compute_hash(),
     )
 
 
@@ -1272,6 +1450,14 @@ def validate_provider_raw_batch(
             else "UNIVERSE_COUNT_MISMATCH"
         )
     plan_by_ordinal = {item.plan_ordinal: item for item in batch.logical_request_plan.requests}
+    expected_plan = _canonical_expected_logical_plan(contract)
+    actual_plan_projection = tuple(
+        item.model_dump(mode="json") for item in batch.logical_request_plan.requests
+    )
+    expected_plan_projection = tuple(
+        item.model_dump(mode="json") for item in expected_plan.requests
+    )
+    plan_projection_mismatch = actual_plan_projection != expected_plan_projection
     completion_by_ordinal = {item.plan_ordinal: item for item in batch.request_completions}
     batches_by_ordinal: dict[int, list[Any]] = {}
     for endpoint_batch in batch.endpoint_batches:
@@ -1327,6 +1513,8 @@ def validate_provider_raw_batch(
             loaded.append(symbol)
 
     expected_ordinals = set(plan_by_ordinal)
+    if plan_projection_mismatch:
+        reason = reason or "UNIVERSE_SESSION_DRIFT"
     required_endpoints = set(ProviderEndpoint)
     observed_endpoints = {item.endpoint for item in plan_by_ordinal.values()}
     if scope_binding_invalid or observed_endpoints != required_endpoints:
@@ -2067,6 +2255,11 @@ class UniverseSidecarStore:
                 ev = evidence_rows[link[1]]
                 if tuple(link[3:]) != (ev[5], ev[6], ev[12]):
                     raise UniverseStoreUnavailable("universe evidence role identity mismatch")
+            # Re-read every reachable contract while the same transaction is
+            # open.  This closes role sets, snapshot links, mappings and all
+            # member/evidence bindings before any reader can use the sidecar.
+            for contract_id in reachable_contract_ids:
+                self._read_contract(connection, contract_id)
             snapshot_rows = connection.execute(
                 "SELECT snapshot_id,snapshot_sha256,snapshot_token_digest,schema_version,"
                 "symbol_count,snapshot_json FROM universe_required_symbol_snapshot"
@@ -2241,15 +2434,12 @@ class UniverseSidecarStore:
                 or row["layer_counts_json"]
                 != canonical_json_bytes(
                     {
-                        "classification_evidence": contract.classification_evidence_count
-                        if contract.classification_evidence_count is not None
-                        else len(contract.classification_evidence_ids),
-                        "effective_main_board": contract.effective_main_board_count
-                        if contract.effective_main_board_count is not None
-                        else len(contract.effective_main_board_ids),
-                        "required_additions": contract.required_additions_count
-                        if contract.required_additions_count is not None
-                        else len(contract.required_additions_ids),
+                        "classification_evidence": contract.classification_evidence_count,
+                        "classification_evidence_sha256": contract.classification_evidence_sha256,
+                        "effective_main_board": contract.effective_main_board_count,
+                        "effective_main_board_sha256": contract.effective_main_board_sha256,
+                        "required_additions": contract.required_additions_count,
+                        "required_additions_sha256": contract.required_additions_sha256,
                     }
                 ).decode()
                 or row["source_refs_json"]
@@ -2324,8 +2514,11 @@ class UniverseSidecarStore:
                 "layer_counts_json": canonical_json_bytes(
                     {
                         "classification_evidence": len(contract.classification_evidence_ids),
+                        "classification_evidence_sha256": contract.classification_evidence_sha256,
                         "effective_main_board": len(contract.effective_main_board_ids),
+                        "effective_main_board_sha256": contract.effective_main_board_sha256,
                         "required_additions": len(contract.required_additions_ids),
+                        "required_additions_sha256": contract.required_additions_sha256,
                     }
                 ).decode(),
                 "source_refs_json": canonical_json_bytes(refs.model_dump(mode="json")).decode(),
@@ -2386,7 +2579,7 @@ class UniverseSidecarStore:
             ).fetchone()
             if mapping is None:
                 raise UniverseStoreUnavailable("universe semantic mapping missing")
-            UniverseSemanticMappingV1.model_validate(dict(mapping), strict=False)
+            mapping_model = UniverseSemanticMappingV1.model_validate(dict(mapping), strict=False)
             evidence = connection.execute(
                 "SELECT * FROM universe_instrument_evidence WHERE evidence_id IN "
                 f"({','.join('?' for _ in contract.classification_evidence_ids)})",
@@ -2417,23 +2610,20 @@ class UniverseSidecarStore:
                 item.mapping_sha256 != refs.semantic_mapping_sha256
                 or item.mapping_id != mapping["mapping_id"]
                 or item.mapping_version != mapping["mapping_version"]
+                or item.source_schema != mapping_model.source_schema
                 or item.source_snapshot_date > contract.trade_date
                 or item.evidence_trade_date != contract.trade_date
                 for item in evidence_models.values()
             ):
                 raise UniverseStoreUnavailable("universe evidence PIT binding invalid")
-            mapping = UniverseSemanticMappingV1.model_validate(dict(mapping), strict=False)
+            mapping = mapping_model
             if mapping.authority_status != "reviewed":
                 raise UniverseStoreUnavailable("universe semantic mapping is unqualified")
             members_by_evidence = {item.instrument_evidence_id: item for item in contract.members}
             for evidence_id, item in evidence_models.items():
                 member = members_by_evidence.get(evidence_id)
                 if member is not None:
-                    if (
-                        item.symbol != member.symbol
-                        or item.security_id != member.security_id
-                        or item.exclusion_reason != member.exclusion_reason
-                    ):
+                    if not _evidence_matches_member(item, member):
                         raise UniverseStoreUnavailable("universe evidence member binding invalid")
                 elif not item.exclusion_reason:
                     raise UniverseStoreUnavailable("excluded evidence lacks exclusion reason")
@@ -2746,10 +2936,7 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe sequence invalid")
                 if not contract.publication_eligible:
                     raise UniverseStoreUnavailable("unpublishable universe contract")
-                if (
-                    contract.source_refs.classification_source != "fixture"
-                    and authority_bundle is None
-                ):
+                if authority_bundle is None:
                     raise UniverseStoreUnavailable("universe authority bundle unavailable")
                 if mapping is None or required_snapshot is None:
                     raise UniverseStoreUnavailable("universe evidence bundle unavailable")
@@ -2798,19 +2985,13 @@ class UniverseSidecarStore:
                         raise UniverseStoreUnavailable("universe evidence member identity mismatch")
                     if item.exclusion_reason != member.exclusion_reason:
                         raise UniverseStoreUnavailable("universe evidence exclusion mismatch")
-                    if (
-                        item.expected_trading_state is not None
-                        and item.expected_trading_state != member.expected_trading_state
-                    ):
-                        raise UniverseStoreUnavailable("universe evidence state mismatch")
+                    if not _evidence_matches_member(item, member):
+                        raise UniverseStoreUnavailable("universe evidence member fields mismatch")
                     if member.member_kind == "index":
                         if (
                             item.index_role != "required_index"
                             or item.symbol not in INDEX_SYMBOLS
-                            or (
-                                item.security_type not in {None, "index"}
-                                and item.source_schema != "classification.instrument.v1"
-                            )
+                            or item.security_type != "index"
                             or item.source_date_semantics != "source_observed"
                             or item.authority_status != "reviewed"
                             or (
@@ -2994,8 +3175,13 @@ class UniverseSidecarStore:
                     canonical_json_bytes(
                         {
                             "classification_evidence": len(contract.classification_evidence_ids),
+                            "classification_evidence_sha256": (
+                                contract.classification_evidence_sha256
+                            ),
                             "effective_main_board": len(contract.effective_main_board_ids),
+                            "effective_main_board_sha256": contract.effective_main_board_sha256,
                             "required_additions": len(contract.required_additions_ids),
+                            "required_additions_sha256": contract.required_additions_sha256,
                         }
                     ).decode(),
                     source_refs_json,

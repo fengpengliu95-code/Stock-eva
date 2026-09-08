@@ -7,6 +7,7 @@ import pytest
 
 from backend.app.market.universe import (
     RequiredSymbolSnapshotV1,
+    UniverseAuthorityBundleV1,
     UniverseCountsV1,
     UniverseInstrumentEvidenceV1,
     UniverseMemberV1,
@@ -59,6 +60,37 @@ def _contract(
         members += (_member("sz.399001", role="required_index"),)
     mapping = _mapping()
     snapshot = _snapshot(members)
+    evidence = (
+        tuple(_evidence(item, trade_date) for item in members)
+        if all(item.expected_trading_state in {"trading", "suspended"} for item in members)
+        else ()
+    )
+    authority_projection = [
+        {
+            "evidence_id": item.evidence_id,
+            "evidence_sha256": item.evidence_sha256,
+            "mapping_id": item.mapping_id,
+            "mapping_version": item.mapping_version,
+        }
+        for item in sorted(evidence, key=lambda value: value.evidence_id)
+    ]
+    authority = (
+        UniverseAuthorityBundleV1(
+            mapping=mapping,
+            evidence=evidence,
+            source_date_semantics="source_observed",
+            authority_sha256=domain_sha256(
+                "stock-eva/r2f4.2/universe-authority-bundle/v1",
+                {
+                    "mapping_sha256": mapping.mapping_sha256,
+                    "source_date_semantics": "source_observed",
+                    "evidence": authority_projection,
+                },
+            ),
+        )
+        if evidence
+        else None
+    )
     return build_universe_contract(
         trade_date=trade_date,
         calendar_generation_id="cal-1",
@@ -91,25 +123,40 @@ def _contract(
             "source_date_semantics": source_date_semantics,
         },
         members=members,
+        classification_evidence=evidence,
+        authority_bundle=authority,
         sequence=sequence,
         parent_contract_id=parent_contract_id,
     )
 
 
 def _mapping() -> UniverseSemanticMappingV1:
-    payload = {"tradestatus": {"trading": "1", "suspended": "0"}}
+    payload = {
+        "mapping_id": "baostock-instrument-v2",
+        "mapping_version": "v2",
+        "security_type": "stock",
+        "exchange": "SSE",
+        "board": "main",
+        "list_date": "source",
+        "delist_date": "source",
+        "listing_status": "listed",
+        "daily_trade_status": "1",
+        "suspension_state": "trading",
+        "st_state": "no",
+        "expected_trading_state": "trading",
+    }
     preimage = {
-        "mapping_id": "baostock-daily-v1",
-        "mapping_version": "v1",
+        "mapping_id": "baostock-instrument-v2",
+        "mapping_version": "v2",
         "provider_id": "baostock",
-        "source_schema": "daily_astock.v1",
+        "source_schema": "classification.instrument.v2",
         "payload": payload,
     }
     return UniverseSemanticMappingV1(
-        mapping_id="baostock-daily-v1",
-        mapping_version="v1",
+        mapping_id="baostock-instrument-v2",
+        mapping_version="v2",
         provider_id="baostock",
-        source_schema="daily_astock.v1",
+        source_schema="classification.instrument.v2",
         payload_json=canonical_json_bytes(payload).decode(),
         mapping_sha256=domain_sha256("stock-eva/r2f4.2/semantic-mapping/v1", preimage),
         authority_status="reviewed",
@@ -143,18 +190,43 @@ def _evidence(member: UniverseMemberV1, trade_date: date) -> UniverseInstrumentE
     values = {
         "provider_id": "baostock",
         "authority_status": "reviewed",
-        "artifact_origin": "local_reviewed_fixture",
+        "artifact_origin": "production_reviewed_artifact",
         "security_id": member.security_id,
         "symbol": member.symbol,
-        "mapping_id": "baostock-daily-v1",
-        "mapping_version": "v1",
+        "mapping_id": "baostock-instrument-v2",
+        "mapping_version": "v2",
         "mapping_sha256": _mapping().mapping_sha256,
-        "source_snapshot_date": date(2026, 8, 31),
+        "source_snapshot_date": min(trade_date, date(2026, 8, 31)),
         "evidence_trade_date": trade_date,
         "exclusion_reason": "",
         "index_role": "required_index" if member.member_kind == "index" else "not_applicable",
         "source_date_semantics": "source_observed",
-        "evidence_json": "{}",
+        "adapter_version": "r2f2.v1",
+        "source_schema": "classification.instrument.v2",
+        "security_type": "index" if member.member_kind == "index" else "stock",
+        "exchange": member.exchange,
+        "board": member.board,
+        "list_date": member.list_date,
+        "delist_date": member.delist_date,
+        "listing_status": "listed",
+        "daily_trade_status": ("1" if member.expected_trading_state == "trading" else "0"),
+        "suspension_state": member.expected_trading_state,
+        "st_state": member.st_state,
+        "expected_trading_state": member.expected_trading_state,
+        "evidence_json": canonical_json_bytes(
+            {
+                "security_type": "index" if member.member_kind == "index" else "stock",
+                "exchange": member.exchange,
+                "board": member.board,
+                "list_date": member.list_date.isoformat() if member.list_date else None,
+                "delist_date": member.delist_date.isoformat() if member.delist_date else None,
+                "listing_status": "listed",
+                "daily_trade_status": ("1" if member.expected_trading_state == "trading" else "0"),
+                "suspension_state": member.expected_trading_state,
+                "st_state": member.st_state,
+                "expected_trading_state": member.expected_trading_state,
+            }
+        ).decode(),
     }
     draft = UniverseInstrumentEvidenceV1.model_construct(
         evidence_id=member.instrument_evidence_id, evidence_sha256="0" * 64, **values
@@ -171,6 +243,31 @@ def _bundle(contract):
         _mapping(),
         tuple(_evidence(item, contract.trade_date) for item in contract.members),
         _snapshot(contract.members),
+    )
+
+
+def _authority(mapping, evidence):
+    projection = [
+        {
+            "evidence_id": item.evidence_id,
+            "evidence_sha256": item.evidence_sha256,
+            "mapping_id": item.mapping_id,
+            "mapping_version": item.mapping_version,
+        }
+        for item in sorted(evidence, key=lambda value: value.evidence_id)
+    ]
+    return UniverseAuthorityBundleV1(
+        mapping=mapping,
+        evidence=evidence,
+        source_date_semantics="source_observed",
+        authority_sha256=domain_sha256(
+            "stock-eva/r2f4.2/universe-authority-bundle/v1",
+            {
+                "mapping_sha256": mapping.mapping_sha256,
+                "source_date_semantics": "source_observed",
+                "evidence": projection,
+            },
+        ),
     )
 
 
@@ -276,6 +373,7 @@ def test_sidecar_reader_rejects_missing_bidirectional_role_link(tmp_path):
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     with sqlite3.connect(path) as connection:
@@ -303,6 +401,7 @@ def test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper(t
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     head = store.read_head()
@@ -326,6 +425,7 @@ def test_sidecar_cas_conflict_does_not_change_head(tmp_path):
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     with pytest.raises(UniverseStoreUnavailable):
@@ -337,6 +437,7 @@ def test_sidecar_cas_conflict_does_not_change_head(tmp_path):
             expected_head_sha256=None,
             mapping=mapping,
             evidence=evidence,
+            authority_bundle=_authority(mapping, evidence),
             required_snapshot=snapshot,
         )
     assert store.read_head().sequence == 1
@@ -366,6 +467,7 @@ def test_sidecar_schema_is_exact_and_parent_cas_is_atomic(tmp_path):
         expected_head_sha256=None,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     second = _contract(
@@ -380,6 +482,7 @@ def test_sidecar_schema_is_exact_and_parent_cas_is_atomic(tmp_path):
         expected_head_sha256=first_head.head_sha256,
         mapping=mapping,
         evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
     )
     assert second_head.sequence == 2
