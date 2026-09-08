@@ -263,6 +263,7 @@ _IDENTITY_TABLE_SQL = """
     (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     store_id TEXT NOT NULL UNIQUE, device INTEGER NOT NULL,
     inode INTEGER NOT NULL, identity_checksum TEXT NOT NULL,
+    migration_id TEXT CHECK (migration_id IS NULL OR length(migration_id) = 32),
     active INTEGER NOT NULL CHECK (active IN (0, 1)))
 """
 _CORE_TABLES = {
@@ -317,6 +318,7 @@ _IDENTITY_TRIGGERS = {
             AND NEW.singleton = OLD.singleton AND NEW.store_id = OLD.store_id
             AND NEW.device = OLD.device AND NEW.inode = OLD.inode
             AND NEW.identity_checksum = OLD.identity_checksum
+            AND NEW.migration_id IS OLD.migration_id
         )
         BEGIN SELECT RAISE(ABORT, 'calendar store identity is immutable'); END
     """,
@@ -491,18 +493,25 @@ class CalendarSyncStore:
         identity_stat: os.stat_result,
         *,
         active: bool = True,
+        migration_id: str | None = None,
     ) -> None:
         store_id = uuid.uuid4().hex
         connection.execute(_IDENTITY_TABLE_SQL)
         connection.execute(
             "INSERT INTO calendar_store_identity "
-            "(singleton, store_id, device, inode, identity_checksum, active) "
-            "VALUES (1, ?, ?, ?, ?, ?)",
+            "(singleton, store_id, device, inode, identity_checksum, migration_id, active) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?)",
             (
                 store_id,
                 identity_stat.st_dev,
                 identity_stat.st_ino,
-                cls._identity_checksum(store_id, identity_stat.st_dev, identity_stat.st_ino),
+                cls._identity_checksum(
+                    store_id,
+                    identity_stat.st_dev,
+                    identity_stat.st_ino,
+                    migration_id,
+                ),
+                migration_id,
                 int(active),
             ),
         )
@@ -520,6 +529,7 @@ class CalendarSyncStore:
         destination: sqlite3.Connection | None = None
         activated: _CalendarSyncConnection | None = None
         identity_stat: os.stat_result | None = None
+        migration_id = uuid.uuid4().hex
         exchanged = False
         activation_confirmed = False
         migration_complete = False
@@ -553,10 +563,16 @@ class CalendarSyncStore:
             with destination:
                 source.backup(destination)
                 self._validate_core_schema(destination, require_identity=False)
-                self._install_identity(destination, identity_stat, active=False)
+                self._install_identity(
+                    destination,
+                    identity_stat,
+                    active=False,
+                    migration_id=migration_id,
+                )
                 self._validate_core_schema(destination, require_identity=True)
             destination.close()
             destination = None
+            self._write_migration_guard_identity(guard, guard_stat, migration_id)
             # backup() cannot run while its source connection owns an explicit SQLite
             # transaction.  Acquire the exclusive lock immediately afterwards, compare
             # every core row against the candidate, and retain the lock through publish.
@@ -703,6 +719,33 @@ class CalendarSyncStore:
 
     def _migration_guard_path(self) -> Path:
         return self.path.with_name(f".{self.path.name}.migration-in-progress")
+
+    @staticmethod
+    def _write_migration_guard_identity(
+        guard: Path,
+        expected: os.stat_result | None,
+        migration_id: str,
+    ) -> None:
+        if expected is None or re.fullmatch(r"[0-9a-f]{32}", migration_id) is None:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(guard, os.O_WRONLY | os.O_NOFOLLOW)
+            current = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            os.ftruncate(descriptor, 0)
+            payload = migration_id.encode("ascii")
+            if os.write(descriptor, payload) != len(payload):
+                raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            os.fsync(descriptor)
+        except CalendarSyncStoreReadError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise CalendarSyncStoreReadError("calendar control database is unavailable") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @staticmethod
     def _ensure_migration_guard_blocking(guard: Path) -> None:
@@ -963,9 +1006,16 @@ class CalendarSyncStore:
                 pass
 
     @staticmethod
-    def _identity_checksum(store_id: str, device: int, inode: int) -> str:
+    def _identity_checksum(
+        store_id: str,
+        device: int,
+        inode: int,
+        migration_id: str | None = None,
+    ) -> str:
         return hashlib.sha256(
-            f"stock-eva-calendar-store-v1\0{store_id}\0{device}\0{inode}".encode()
+            (
+                f"stock-eva-calendar-store-v2\0{store_id}\0{device}\0{inode}\0{migration_id or ''}"
+            ).encode()
         ).hexdigest()
 
     @classmethod
@@ -992,7 +1042,7 @@ class CalendarSyncStore:
         if triggers != expected_triggers:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         identity_rows = connection.execute(
-            "SELECT singleton, store_id, device, inode, identity_checksum, active "
+            "SELECT singleton, store_id, device, inode, identity_checksum, migration_id, active "
             "FROM calendar_store_identity ORDER BY singleton"
         ).fetchall()
         if (
@@ -1007,11 +1057,16 @@ class CalendarSyncStore:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         if type(row[2]) is not int or type(row[3]) is not int:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if row[4] != cls._identity_checksum(store_id, row[2], row[3]):
+        migration_id = row[5]
+        if migration_id is not None and (
+            type(migration_id) is not str or re.fullmatch(r"[0-9a-f]{32}", migration_id) is None
+        ):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if type(row[5]) is not int or row[5] not in {0, 1}:
+        if row[4] != cls._identity_checksum(store_id, row[2], row[3], migration_id):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
-        if require_active and row[5] != 1:
+        if type(row[6]) is not int or row[6] not in {0, 1}:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        if require_active and row[6] != 1:
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
         return store_id, row[2], row[3]
 
@@ -1045,6 +1100,7 @@ class CalendarSyncStore:
             sqlite3.connect(f"file:///dev/fd/{descriptor}?mode=ro", uri=True, timeout=0)
         ) as connection:
             identity = self._read_store_identity(connection)
+            self._validate_migration_completion(connection)
         bound = os.fstat(descriptor)
         if identity[1:] != (bound.st_dev, bound.st_ino):
             raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -1075,6 +1131,7 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             if self._read_store_identity(connection) != expected_identity:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
+            self._validate_migration_completion(connection)
             current = self._validate_file()
             if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
@@ -1121,6 +1178,7 @@ class CalendarSyncStore:
             lock_owned = False
             connection.row_factory = sqlite3.Row
             identity = self._read_store_identity(connection)
+            self._validate_migration_completion(connection)
             if identity[1:] != (info.st_dev, info.st_ino):
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             os.close(descriptor)
@@ -1144,6 +1202,40 @@ class CalendarSyncStore:
                     os.close(descriptor)
                 except BaseException:
                     pass
+
+    def _validate_migration_completion(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT migration_id FROM calendar_store_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return
+        migration_id = row[0]
+        if type(migration_id) is not str or re.fullmatch(r"[0-9a-f]{32}", migration_id) is None:
+            raise CalendarSyncStoreReadError("calendar control database is unavailable")
+        for candidate in self.path.parent.glob(f".{self._migration_guard_path().name}.*.removed"):
+            descriptor: int | None = None
+            try:
+                info = os.lstat(candidate)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1
+                    or info.st_mode & 0o022
+                ):
+                    continue
+                descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+                bound = os.fstat(descriptor)
+                if (bound.st_dev, bound.st_ino) != (info.st_dev, info.st_ino):
+                    continue
+                payload = os.read(descriptor, 33)
+                if payload == migration_id.encode("ascii"):
+                    return
+            except (OSError, TypeError, ValueError):
+                continue
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        raise CalendarSyncStoreReadError("calendar control database is unavailable")
 
     def _initialize(self) -> None:
         with closing(self._connect()):

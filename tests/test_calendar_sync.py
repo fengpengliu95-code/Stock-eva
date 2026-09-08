@@ -212,6 +212,26 @@ def test_calendar_sync_writer_atomically_migrates_exact_legacy_store(tmp_path: P
     assert backups[0].stat().st_ino == old_inode
 
 
+@pytest.mark.parametrize("tamper", ["missing", "replaced"])
+def test_calendar_sync_migrated_store_requires_matching_completed_evidence(
+    tmp_path: Path, tamper: str
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    CalendarSyncStore(path, initialize=False).initialize_for_write()
+    completed = next(tmp_path.glob(".*.removed"))
+    if tamper == "missing":
+        completed.unlink()
+    else:
+        completed.write_bytes(b"0" * 32)
+
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
+
+
 def test_calendar_sync_legacy_migration_blocks_commit_after_candidate_copy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
