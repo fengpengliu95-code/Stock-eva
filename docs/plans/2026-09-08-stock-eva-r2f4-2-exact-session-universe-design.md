@@ -4,7 +4,7 @@
 
 **Date:** 2026-09-08 (Asia/Shanghai)
 
-**Status:** Draft / In Review / implementation blocked until this contract is independently reviewed
+**Status:** In Review / implementation blocked until this contract is independently reviewed
 
 **Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
 
@@ -72,7 +72,9 @@ publisher; no direct production switch is part of R2-F4.2.
   classification generation visible at `trade_date`, with `source_snapshot_date <= trade_date`
   and `observed_at` no later than the declared PIT cutoff. It MUST preserve the selected
   `classification_generation_id` and MUST NOT silently select a future or merely inserted,
-  degraded generation.
+  degraded generation. A generation whose `source_date_semantics=requested_unverified` MUST NOT
+  be used as authority, even when its requested date equals `trade_date`; the builder MUST return
+  `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED` until a reviewed evidence mapping is available.
 
 - FR-5: Main-board base scope. Base members MUST be derived from the selected security master
   using explicit identity rules: ordinary stock, SSE/SZSE, board `main`, and an effective listing
@@ -88,14 +90,20 @@ publisher; no direct production switch is part of R2-F4.2.
   explicit member rather than being dropped.
 
 - FR-7: Required indexes. The contract MUST include exactly the current required market index
-  obligations `sh.000001` and `sz.399001` under `required_indexes`, with explicit instrument
-  evidence and expected session state. User inclusion of either symbol MUST deduplicate against
-  this obligation. No index may be inferred from a stock count.
+  obligations `sh.000001` and `sz.399001` under `required_indexes`, with explicit reviewed
+  instrument evidence, source snapshot date at or before `trade_date`, identity mapping version,
+  and expected session state exactly `trading`. `suspended` or `unknown` for either required index
+  MUST block the contract. User inclusion of either symbol MUST deduplicate against this obligation.
+  No index may be inferred from a stock count.
 
 - FR-8: Instrument evidence binding. Every member MUST bind reviewed instrument evidence that
-  proves symbol, security type, exchange, board, listing window and source/date semantics. The
-  evidence identity MUST be retained as an ID/hash; raw provider payloads, credentials and URLs
-  MUST NOT be copied into public status or logs.
+  proves symbol, security type, exchange, board, listing window and source/date semantics. A
+  closed, versioned semantic mapping (`mapping_id`, `mapping_version`, accepted source values,
+  mapped state, and date/PIT rules) MUST be recorded as reviewed before it can establish authority.
+  The evidence identity MUST be retained as an ID/hash; raw provider payloads, credentials and
+  URLs MUST NOT be copied into public status or logs. The current BaoStock classification path is
+  `requested_unverified` and therefore can only produce a blocked result, not a qualified result;
+  this is a temporary qualification state, not a permanent claim that BaoStock is authoritative.
 
 - FR-9: Listing and delisting states. For each member, the builder MUST derive
   `not_yet_listed` when `trade_date < list_date` and `delisted` when `trade_date >= delist_date`.
@@ -127,9 +135,11 @@ publisher; no direct production switch is part of R2-F4.2.
   contract, never from a hard-coded market count.
 
 - FR-14: Unknown-zero publication gate. A contract MAY be promoted only when
-  `unknown == 0`, `critical_attribute_unknown_count == 0`, all required indexes are resolved,
-  and all source/date/hash checks pass. A candidate MAY publish only against a promoted contract.
-  A nonzero unknown state MUST preserve the previous canonical pointer.
+  `(unknown == 0 and critical_attribute_unknown_count == 0 and required_indexes_are_trading and
+  all source/date/hash checks pass)`. A candidate MAY publish only against a promoted contract
+  and only when `(loaded == session_expected and no_missing and no_extra and no_duplicate and
+  no_session_drift)`. Any nonzero unknown, including `unknown == 1` with otherwise matching
+  `loaded`, MUST reject promotion/publication and preserve the previous canonical pointer.
 
 - FR-15: Exact candidate set. For a candidate bound to a promoted contract, the expected row
   set MUST be exactly the unique symbols whose state is `trading` or `suspended`, including all
@@ -179,9 +189,13 @@ publisher; no direct production switch is part of R2-F4.2.
 
 - FR-24: Legacy compatibility modes. The legacy BaoStock `all-main-board` canonical path MUST
   remain operational and unchanged in R2-F4.2. A contract integration MUST provide explicit
-  `off`, `shadow` and `enforce` modes, default to `off`, and never enable `enforce` in production
-  or claim canonical authority in this subversion. `shadow` MAY compare exact sets and report
-  drift, but MUST NOT change the canonical result.
+  `off`, `shadow` and `enforce` reporting values, default to `off`. `shadow` MAY compare only the
+  legacy BaoStock set and report drift, but MUST NOT change the canonical result. Any `enforce`
+  execution request MUST return `BLOCKED_ENFORCE_NOT_ENABLED` immediately; there is no callable
+  future-provider seam in this subversion and no production configuration may invoke it.
+  The production profile MUST hard-fail any non-`off` Universe mode as
+  `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
+  available only to explicitly isolated offline/staging verification.
 
 - FR-25: No authority widening. R2-F4.2 MUST NOT add a secondary provider to canonical
   `ProviderId`, change R2-F4.0 failover readiness, enable TickFlow/Tushare failover, change R2-F3
@@ -298,14 +312,18 @@ unsupported/unstable symbols make the contract blocked, and public status expose
 
 **Given** user data that also contains the two summary index symbols, **When** the contract is
 built, **Then** `required_indexes` contains exactly `sh.000001` and `sz.399001` once each, their
-instrument evidence is bound, and the candidate expected set contains each exactly once.
+instrument evidence is bound to a reviewed source/date/identity mapping, each index state is
+explicitly `trading`, and the candidate expected set contains each exactly once; a suspended or
+unknown index makes the contract blocked.
 
 ### AC-9: Count equation and unknown-zero gate (FR-12, FR-13, FR-14, NFR-2)
 
 **Given** members in every expected-state category and one unknown member, **When** counts are
 computed, **Then** `total = trading + suspended + not_yet_listed + delisted + unknown` and
 `session_expected = trading + suspended`; **When** `unknown` or critical-attribute-unknown is
-nonzero, **Then** promotion and publication are rejected and the prior pointer is preserved.
+nonzero, **Then** promotion and publication are rejected and the prior pointer is preserved. **Given**
+`unknown=1` and `loaded=session_expected`, **When** publication eligibility is evaluated, **Then**
+it is rejected; **Given** `unknown=0` and `loaded != session_expected`, **Then** it is also rejected.
 
 ### AC-10: Evidence and generation binding (FR-2, FR-4, FR-8, FR-19)
 
@@ -357,8 +375,9 @@ failure is observable by an allowlisted reason, and no retry storm or canonical 
 
 **Given** a legacy BaoStock refresh and a matching or divergent exact contract, **When** mode is
 `off`, **Then** existing behavior is unchanged; **When** mode is `shadow`, **Then** the comparison
-is read-only and cannot alter publication; **When** mode is `enforce`, **Then** it is rejected by
-the default production configuration and requires a separately reviewed enablement decision.
+is read-only and compares only legacy BaoStock; **When** mode is `enforce`, **Then** execution is
+immediately `BLOCKED_ENFORCE_NOT_ENABLED` (including non-production calls), with no provider
+request and no source switch.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
 
@@ -398,8 +417,8 @@ secret is read, and no production/NAS/LaunchAgent state is touched.
   two reads into a synthetic set.
 - EC-12: The same user symbol appears in positions and multiple watchlists → one member, stable
   sorted roles, one count contribution.
-- EC-13: An index evidence object is absent, future-dated, or has an identity mismatch → the
-  required-index obligation is unresolved and publication is blocked.
+- EC-13: An index evidence object is absent, future-dated, identity-mismatched, suspended or
+  unknown → `REQUIRED_INDEX_NOT_TRADING`; the required-index obligation blocks publication.
 - EC-14: Provider returns a symbol outside the contract, including a valid but not-required
   ChiNext/STAR/BSE symbol → reject as extras; do not filter it away.
 - EC-15: Provider omits a suspended row or returns a row for a not-yet-listed/delisted member
@@ -450,6 +469,14 @@ interface UniverseStatusResponse {
     loaded: number | null;
     critical_attribute_unknown: number;
   };
+  layers: {
+    classification_evidence_count: number;
+    classification_evidence_sha256: string;
+    effective_main_board_base_count: number;
+    effective_main_board_base_sha256: string;
+    required_additions_count: number;
+    required_additions_sha256: string;
+  };
   required_indexes: ["sh.000001", "sz.399001"];
   required_user_symbol_count: number;
   publication_eligible: boolean;
@@ -480,11 +507,17 @@ The following are implementation interfaces, not public HTTP authority:
 
 ```typescript
 interface BuildUniverseRequest {
+  schema_version: 1;
+  universe_id: "all-main-board-plus-required-symbols";
+  scope: "all-main-board-plus-required-symbols";
   trade_date: string;
-  calendar_snapshot_id: string;
+  calendar_generation_id: string;
+  calendar_sha256: string;
   classification_generation_id: string;
+  exact_pit_cutoff: string;
   required_user_symbol_snapshot: RequiredUserSymbolSnapshot;
   instrument_evidence: InstrumentEvidence[];
+  provider_id: "baostock";
   mode: "off" | "shadow" | "enforce";
 }
 
@@ -498,14 +531,26 @@ interface UniverseBuildResult {
 }
 
 interface UniverseCandidateGate {
+  schema_version: 1;
+  universe_id: "all-main-board-plus-required-symbols";
+  scope: "all-main-board-plus-required-symbols";
+  trade_date: string;
+  calendar_sha256: string;
   contract_sha256: string;
-  provider_id: "baostock" | "tickflow" | "tushare";
+  provider_id: "baostock";
+  refresh_id: string;
+  provider_session_id: string;
+  request_id: string;
+  endpoint_id: string;
+  pages: number;
   adapter_version: string;
   observed_symbols: string[];
   missing_symbols: string[];
   extra_symbols: string[];
   duplicate_symbols: string[];
+  session_drift: string[];
   result: "pass" | "reject";
+  reason_code: string | null;
 }
 ```
 
@@ -513,7 +558,70 @@ interface UniverseCandidateGate {
 does not itself create a canonical candidate; the existing evidence, quality, manifest and atomic
 publish chain remains authoritative.
 
+### Pre-Normalize raw batch contract
+
+The only input accepted by `UniverseCandidateGate` is the complete, accumulated raw session batch
+below. It is an internal transport envelope, not a public response. Every page MUST carry the same
+date, provider, refresh/session/request identity, evidence identity, endpoint and contract; pages
+are sorted by contiguous page number before validation.
+
+```typescript
+interface RawSessionBatch {
+  schema_version: 1;
+  universe_id: "all-main-board-plus-required-symbols";
+  scope: "all-main-board-plus-required-symbols";
+  trade_date: string;
+  provider_id: "baostock";
+  refresh_id: string;
+  provider_session_id: string;
+  request_id: string;
+  instrument_evidence_ids: string[];
+  contract_sha256: string;
+  endpoint_id: string;
+  page: number;
+  rows: RawDailyBarRow[];
+}
+```
+
+Before Normalize, the gate MUST reject the whole batch when any row date differs from
+`trade_date`, provider/session/request/evidence/endpoint identity drifts, pages are duplicated or
+non-contiguous, a `(symbol, trade_date)` key is duplicated, a symbol is missing or extra, a row is
+for `not_yet_listed`/`delisted`, or `loaded != session_expected`. No page may be normalized before
+all pages pass these checks. In particular, `unknown=1` with an apparently matching row count is
+still rejected. A failed gate returns no partial rows.
+
 ## Data Models
+
+### Three-layer membership construction
+
+The contract is the union of three separately counted and hashed layers; no layer may be
+reconstructed from another layer's count.
+
+| Layer | Definition | Count/hash rule |
+|---|---|---|
+| `classification_evidence_universe` | Every unique promoted PIT security identity and its reviewed instrument-evidence reference, including records later excluded from product scope | `classification_evidence_count` and `classification_evidence_sha256` hash sorted `(security_id,symbol,evidence_id)` identities; duplicate natural identities or unknown identity classification block |
+| `effective_main_board_base` | The subset whose closed identity is ordinary stock on SSE/SZSE, `board=main`, and `list_date <= trade_date` and (`delist_date is null` or `trade_date < delist_date`) | `main_board_base_count` and `main_board_base_sha256` hash sorted member projections, including state/evidence; no fixed count |
+| `required_additions` | The union of valid A-share required-user symbols and exactly `sh.000001`,`sz.399001`, after deterministic deduplication against the base | `required_additions_count` and `required_additions_sha256` hash sorted symbol/role/evidence/state projections; required-index identities are retained even when not in the base |
+
+The final member set is `effective_main_board_base ∪ required_additions`. A symbol in both layers
+is one member with unioned roles and one count contribution. A required-user symbol with an
+unprovable identity, unsupported security type, or invalid symbol is not silently omitted: the
+snapshot is blocked. Listing-window rules are exact: listing date is inclusive, delist date is
+exclusive for an active base row, and `trade_date >= delist_date` derives `delisted` for a required
+addition. Missing or contradictory windows produce `unknown`/blocked rather than an inferred date.
+
+### Reviewed instrument semantic mapping
+
+`InstrumentSemanticMappingV1` is a closed, immutable registry entry with `mapping_id`,
+`mapping_version`, `provider_id`, `source_schema`, accepted raw field/value identifiers, mapped
+`security_type`/board/listing/suspension/ST states, required source date semantics, and reviewer
+status exactly `reviewed` or `unqualified`. Only `reviewed` entries can establish authority, and
+the mapping version is included in evidence and contract hashes. A raw provider value not listed in
+the mapping is `unknown`; the implementation MUST NOT infer its meaning. The current BaoStock
+classification path (`query_all_stock` with `source_date_semantics=requested_unverified`) has no
+reviewed authority mapping in this release and therefore always yields
+`BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`; it may qualify only after a future reviewed evidence
+artifact and separately reviewed contract, never merely because a request succeeded.
 
 ### UniverseContractV1
 
@@ -527,13 +635,17 @@ publish chain remains authoritative.
 | `calendar_generation_id` | safe ID | Promoted R2-F4.1 generation only |
 | `calendar_sha256` | SHA-256 | Exact pinned calendar identity |
 | `required_symbol_snapshot_sha256` | SHA-256 | Writer-owned deduplicated union identity |
+| `exact_pit_cutoff` | UTC timestamp | Inclusive evidence visibility cutoff, bound into the contract hash |
+| `classification_evidence_count` / `classification_evidence_sha256` | integer/SHA-256 | Layer 1 count/hash |
+| `effective_main_board_base_count` / `effective_main_board_base_sha256` | integer/SHA-256 | Layer 2 count/hash |
+| `required_additions_count` / `required_additions_sha256` | integer/SHA-256 | Layer 3 count/hash |
 | `instrument_evidence_ids` | sorted tuple of safe IDs | Non-empty; all source/date-bound |
 | `required_indexes` | fixed tuple | Exactly `sh.000001`, `sz.399001` |
 | `required_user_symbols` | sorted tuple of safe symbols | Private sidecar only; public status exposes count |
 | `members` | sorted tuple of UniverseMemberV1 | Unique by symbol; includes indexes |
 | `counts` | UniverseCountsV1 | Must satisfy the count equation |
 | `critical_attribute_unknown_count` | nonnegative integer | Zero required for promotion |
-| `publication_eligible` | boolean | True only when unknown and critical unknown are zero and all evidence verifies |
+| `publication_eligible` | boolean | True only when `(unknown == 0 and critical_attribute_unknown_count == 0 and required_indexes_are_trading and all evidence verifies and (loaded is null or loaded == session_expected))`; a published candidate additionally requires `loaded == session_expected` |
 | `created_at` | UTC timestamp | Immutable, after all input observations |
 | `contract_sha256` | SHA-256 | Domain-separated digest excluding itself only |
 
@@ -555,6 +667,10 @@ publish chain remains authoritative.
 | `effective_from` / `effective_to` | date or null | Evaluated at `trade_date`; no future leakage |
 | `instrument_evidence_id` | safe ID | Must exist and hash-validate |
 | `member_sha256` | SHA-256 | Digest of the complete member projection excluding itself |
+
+For `member_kind=index`, the only valid symbols are `sh.000001` and `sz.399001`; their evidence
+MUST be provider-observed (not `requested_unverified`), have `source_snapshot_date <= trade_date`,
+carry the reviewed identity/mapping version, and derive `expected_trading_state=trading`.
 
 The contract vocabulary intentionally uses `not_yet_listed`; the existing classification service
 continues to return `not_listed_yet` for backward compatibility. There is no implicit alias in
@@ -579,14 +695,21 @@ The invariant is:
 ```text
 total = trading + suspended + not_yet_listed + delisted + unknown
 session_expected = trading + suspended
-publishable = (unknown == 0
-               and critical_attribute_unknown == 0
-               and loaded is null or loaded == session_expected)
+contract_publishable = (unknown == 0
+                         and critical_attribute_unknown == 0
+                         and required_indexes_are_trading
+                         and all_source_date_hash_checks_pass)
+publication_eligible = (contract_publishable
+                        and (loaded is null or loaded == session_expected))
+candidate_publishable = (contract_publishable
+                         and loaded == session_expected
+                         and no_missing and no_extra and no_duplicate
+                         and no_session_drift)
 ```
 
-The parenthesized form is normative: a promoted contract requires the first two conditions; a
-published candidate additionally requires `loaded == session_expected`, no missing/extra/duplicate
-symbols, and every existing canonical gate.
+The parentheses are normative. A promoted contract requires `contract_publishable`; an exact
+published candidate requires `candidate_publishable`. Thus `unknown=1` with
+`loaded=session_expected` is rejected, as is `unknown=0` with a loaded-count mismatch.
 
 ### InstrumentEvidenceV1
 
@@ -620,15 +743,117 @@ symbols, and every existing canonical gate.
 | `source` | literal | `UserStore.allowlisted_positions_and_watchlists` |
 | `snapshot_sha256` | SHA-256 | Complete projection digest |
 
+The writer MUST expose one transaction-bound API:
+
+```typescript
+interface RequiredUserSymbolSnapshotRead {
+  snapshot: RequiredUserSymbolSnapshot;
+  user_store_revision: string;
+  snapshot_token: string;
+}
+
+capture_required_symbol_snapshot_once(operation_id: string): RequiredUserSymbolSnapshotRead
+```
+
+The implementation begins one read transaction under the writer lock, reads positions and all
+watchlist items through the allowlisted methods, obtains a `user_store_revision` and
+`snapshot_token`, and verifies both again before commit. Any revision/token change, second read,
+or mid-capture mutation aborts the operation with `USER_SNAPSHOT_CHANGED`; it never combines two
+observations. The private sidecar may store only the normalized symbols, role bitset, revision,
+token digest, count, capture time and snapshot hash. Public status may expose only count and hash
+(never symbol values, roles, names, or revision/token).
+
 ### UniverseControlSidecarV1
 
 The sidecar is a separate strict SQLite control store at a configured local-control basename,
-default `market_universe.sqlite3`. Its writer-owned schema contains immutable
-`universe_meta`, `universe_contract`, `universe_member`, `universe_instrument_evidence`,
-`universe_required_symbol_snapshot` and singleton `universe_head` tables, plus no unallowlisted
-tables. Update/delete triggers, safe mode/inode checks, object readback, parent/head CAS and
-atomic commit follow the R2-F4.1 calendar-generation control-store pattern. GET readers use
-descriptor-bound read-only access and never run DDL/DML/migration.
+default `market_universe.sqlite3`. This release has writer-only v1 initialization and **no legacy
+migration**: a missing sidecar may be initialized only by the writer; a non-empty unknown schema,
+schema digest mismatch, or pre-existing legacy database is blocked, not migrated. The following
+DDL is normative (whitespace-normalized and domain-hashed as `schema_digest`):
+
+```sql
+PRAGMA user_version = 1;
+CREATE TABLE universe_meta (
+  meta_key TEXT PRIMARY KEY CHECK (meta_key IN ('schema_version','schema_digest','store_id','db_inode')),
+  meta_value TEXT NOT NULL
+);
+CREATE TABLE universe_contract (
+  contract_id TEXT PRIMARY KEY,
+  sequence INTEGER NOT NULL UNIQUE CHECK (sequence > 0),
+  parent_contract_id TEXT REFERENCES universe_contract(contract_id),
+  trade_date TEXT NOT NULL, universe_id TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+  scope TEXT NOT NULL, calendar_generation_id TEXT NOT NULL,
+  calendar_sha256 TEXT NOT NULL, classification_generation_id TEXT NOT NULL,
+  exact_pit_cutoff TEXT NOT NULL, contract_sha256 TEXT NOT NULL UNIQUE,
+  counts_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE universe_member (
+  contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
+  symbol TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
+  PRIMARY KEY (contract_id, symbol)
+);
+CREATE TABLE universe_instrument_evidence (
+  evidence_id TEXT PRIMARY KEY, evidence_sha256 TEXT NOT NULL UNIQUE,
+  provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
+  mapping_id TEXT NOT NULL, mapping_version TEXT NOT NULL,
+  source_snapshot_date TEXT NOT NULL, source_date_semantics TEXT NOT NULL,
+  evidence_json TEXT NOT NULL
+);
+CREATE TABLE universe_required_symbol_snapshot (
+  snapshot_id TEXT PRIMARY KEY, snapshot_sha256 TEXT NOT NULL UNIQUE,
+  user_store_revision TEXT NOT NULL, snapshot_token_digest TEXT NOT NULL,
+  symbol_count INTEGER NOT NULL CHECK (symbol_count >= 0), snapshot_json TEXT NOT NULL
+);
+CREATE TABLE universe_head (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  sequence INTEGER NOT NULL, contract_id TEXT NOT NULL,
+  contract_sha256 TEXT NOT NULL, head_sha256 TEXT NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY (contract_id) REFERENCES universe_contract(contract_id)
+);
+CREATE TRIGGER universe_contract_no_update BEFORE UPDATE ON universe_contract BEGIN
+  SELECT RAISE(ABORT, 'immutable_contract');
+END;
+CREATE TRIGGER universe_contract_no_delete BEFORE DELETE ON universe_contract BEGIN
+  SELECT RAISE(ABORT, 'immutable_contract');
+END;
+CREATE TRIGGER universe_member_no_update BEFORE UPDATE ON universe_member BEGIN
+  SELECT RAISE(ABORT, 'immutable_member');
+END;
+CREATE TRIGGER universe_member_no_delete BEFORE DELETE ON universe_member BEGIN
+  SELECT RAISE(ABORT, 'immutable_member');
+END;
+CREATE TRIGGER universe_evidence_no_update BEFORE UPDATE ON universe_instrument_evidence BEGIN
+  SELECT RAISE(ABORT, 'immutable_evidence');
+END;
+CREATE TRIGGER universe_evidence_no_delete BEFORE DELETE ON universe_instrument_evidence BEGIN
+  SELECT RAISE(ABORT, 'immutable_evidence');
+END;
+CREATE TRIGGER universe_snapshot_no_update BEFORE UPDATE ON universe_required_symbol_snapshot BEGIN
+  SELECT RAISE(ABORT, 'immutable_snapshot');
+END;
+CREATE TRIGGER universe_snapshot_no_delete BEFORE DELETE ON universe_required_symbol_snapshot BEGIN
+  SELECT RAISE(ABORT, 'immutable_snapshot');
+END;
+CREATE TRIGGER universe_meta_no_update BEFORE UPDATE ON universe_meta BEGIN
+  SELECT RAISE(ABORT, 'immutable_meta');
+END;
+CREATE TRIGGER universe_meta_no_delete BEFORE DELETE ON universe_meta BEGIN
+  SELECT RAISE(ABORT, 'immutable_meta');
+END;
+```
+
+`store_id` is a deployment-bound constant and `db_inode` is the writer-created inode captured in
+`universe_meta`; both are checked on every open. The writer MUST hold the existing refresh/control
+lock plus an exclusive sidecar lock file, set `PRAGMA journal_mode=WAL`, `synchronous=FULL`,
+`foreign_keys=ON`, and use a bounded busy timeout. Contract/member/evidence/snapshot rows are
+append-only; only the singleton head may change, using a compare-and-swap on `(sequence,
+contract_sha256)` inside one transaction. The strict reader opens the descriptor-bound database
+read-only, verifies path/inode, `user_version`, exact schema digest, allowed table set, row hashes,
+parent sequence chain and head digest, and never runs DDL/DML or creates a WAL/SHM file. A crash
+before commit leaves the old head; a crash after rows commit but before CAS leaves unreachable
+append-only rows; a crash during CAS yields old head or a fully verified new head. CAS conflict
+aborts without retrying or changing the head.
 
 ### UniverseStatusSnapshotV1
 
@@ -657,6 +882,56 @@ The exact domains are `stock-eva/r2f4.2/universe-member/v1`,
 `stock-eva/r2f4.2/required-symbol-snapshot/v1` and
 `stock-eva/r2f4.2/universe-contract/v1`. The digest field itself is the only excluded field;
 null, false, zero, empty tuple and roles remain in the preimage.
+
+## Automation decision matrix
+
+The matrix describes the current one-shot automation flow. One operation acquires the existing
+refresh lock once, creates one request ledger, and pins one calendar snapshot. Every lane checks
+the ledger before work; an identical `(trade_date, provider_id, endpoint, operation_kind)` key is
+never requested twice in that operation.
+
+| Precondition in order | Action under the same lock | Universe effect |
+|---|---|---|
+| Continuity plan is missing/invalid or `CONTROL_STATE_UNAVAILABLE` | Return the continuity plan reason and perform no provider request | Do not read/build/publish Universe |
+| Due freshness exists | Run the existing canonical refresh and its unchanged gates | After canonical success, offer at most one read-only legacy BaoStock shadow comparison; no Universe build in this tick |
+| Due repair exists | Run the existing repair queue operation | Defer Universe; no duplicate repair/canonical/shadow request |
+| Due shadow exists | Compare one complete legacy BaoStock session | Record counts/hash/reason only; do not build or publish Universe |
+| No higher lane is due and classification/evidence or Universe maintenance is due | Read one promoted PIT classification snapshot, capture one UserStore snapshot transaction, then build sidecar | Run at most one bounded Universe attempt under the same lock; current `requested_unverified` BaoStock evidence returns blocked without provider acquisition |
+| Nothing due | Return `none` | No provider request and no write |
+
+`shadow` means legacy BaoStock only. `enforce` is a reportable configuration value but its
+execution path immediately returns `BLOCKED_ENFORCE_NOT_ENABLED`; it is not a future-provider
+callable seam. TickFlow and Tushare are not candidates in this contract. A canonical refresh that
+fails does not offer shadow, and a shadow result never triggers a canonical retry or Universe
+publication.
+
+## Closed reason set and traceability matrix
+
+The implementation MUST use only these reason codes in status, tests and sanitized logs:
+`CALENDAR_UNAVAILABLE`, `CALENDAR_CONFLICT`, `CLASSIFICATION_UNAVAILABLE`,
+`BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`, `PIT_CUTOFF_VIOLATION`, `USER_SNAPSHOT_CHANGED`,
+`REQUIRED_INDEX_NOT_TRADING`, `REQUIRED_SYMBOL_INVALID`, `UNIVERSE_UNKNOWN_NONZERO`, `UNIVERSE_COUNT_MISMATCH`,
+`UNIVERSE_MISSING_SYMBOL`, `UNIVERSE_EXTRA_SYMBOL`, `UNIVERSE_DUPLICATE_SYMBOL`,
+`UNIVERSE_SESSION_DRIFT`, `UNIVERSE_STORAGE_UNAVAILABLE`, `UNIVERSE_SCHEMA_MISMATCH`,
+`UNIVERSE_HEAD_CAS_CONFLICT`, `BLOCKED_ENFORCE_NOT_ENABLED`, `BLOCKED_PRODUCTION_MODE_OFF`, `LEGACY_SHADOW_DRIFT`,
+`NONE`. Unknown provider/exception text MUST map to `UNIVERSE_STORAGE_UNAVAILABLE` or
+`CLASSIFICATION_UNAVAILABLE` according to the failed boundary, never to a guessed semantic.
+
+| Requirement(s) | AC / EC | Required offline evidence or static check |
+|---|---|---|
+| FR-1..FR-4, FR-19, FR-27 | AC-1..AC-3, AC-10, AC-18; EC-1..EC-5 | `tests/test_market_universe.py::test_contract_identity_and_pit`; static protected-file SHA manifest |
+| FR-5, FR-9, FR-12, FR-13 | AC-4..AC-5, AC-9; EC-4, EC-6 | `test_three_layer_scope_and_effective_window`, `test_listing_and_delisting_boundary` |
+| FR-6, FR-21 | AC-7, AC-14; EC-7, EC-8, EC-11..EC-12 | `test_user_snapshot_revision_abort`; public projection schema/static privacy scan |
+| FR-7, FR-8, FR-10, FR-11 | AC-6, AC-8; EC-7, EC-9, EC-13 | `test_required_indexes_must_be_explicit_trading`, `test_reviewed_mapping_required` |
+| FR-14..FR-17 | AC-9, AC-11, AC-12; EC-10, EC-14..EC-17 | `test_unknown_one_and_loaded_match_reject`, `test_raw_batch_gate_rejects_extras_duplicates_drift` |
+| FR-18, FR-19, FR-26 | AC-13, AC-16; EC-18..EC-20 | `test_sidecar_schema_digest_parent_chain_and_cas`; static DDL digest check |
+| FR-20, FR-21 | AC-14; EC-1..EC-3, EC-13 | `tests/test_market_universe.py::test_status_zero_write`; filesystem fingerprint |
+| FR-22, FR-23 | AC-15, AC-16; EC-14, EC-20, EC-21 | `tests/test_market_automation.py::test_maintenance_priority_and_request_ledger` |
+| FR-24, FR-25 | AC-12, AC-17, AC-18; EC-11, EC-16, EC-22 | `tests/test_market_failover.py` and static provider allowlist (`baostock` only) |
+
+The final acceptance record MUST list each FR/AC/EC result, test or static trace, exact commit,
+and the two strict validator outputs. This document remains `In Review` until independent SPEC
+and QUALITY reviews of the exact implementation commit complete.
 
 ## Out of Scope
 
