@@ -302,6 +302,32 @@ class UniverseContractV1(_Frozen):
             raise ValueError("partition overlap")
         if self.counts.total != len(self.members):
             raise ValueError("contract member count mismatch")
+        partition_specs = (
+            (
+                self.classification_evidence_partition_sha256,
+                "stock-eva/r2f4.2/universe-partition/classification-evidence/v1",
+                lambda _item: True,
+                "classification",
+            ),
+            (
+                self.effective_main_board_partition_sha256,
+                "stock-eva/r2f4.2/universe-partition/effective-main-board/v1",
+                lambda item: "effective_main_board" in item.scope_roles,
+                "effective main board",
+            ),
+            (
+                self.required_additions_partition_sha256,
+                "stock-eva/r2f4.2/universe-partition/required-additions/v1",
+                lambda item: (
+                    "required_user" in item.scope_roles or "required_index" in item.scope_roles
+                ),
+                "required additions",
+            ),
+        )
+        for actual, domain, predicate, label in partition_specs:
+            projection = [item.model_dump(mode="json") for item in self.members if predicate(item)]
+            if actual != domain_sha256(domain, projection):
+                raise ValueError(f"{label} partition hash mismatch")
         expected = domain_sha256(
             "stock-eva/r2f4.2/universe-contract/v1", json.loads(self.payload_json)
         )
@@ -435,13 +461,24 @@ def build_universe_contract(
         "effective_main_board_ids": base_ids,
         "required_additions_ids": addition_ids,
         "classification_evidence_partition_sha256": domain_sha256(
-            "stock-eva/r2f4.2/universe-partition/classification-evidence/v1", classification_ids
+            "stock-eva/r2f4.2/universe-partition/classification-evidence/v1",
+            [item.model_dump(mode="json") for item in members],
         ),
         "effective_main_board_partition_sha256": domain_sha256(
-            "stock-eva/r2f4.2/universe-partition/effective-main-board/v1", base_ids
+            "stock-eva/r2f4.2/universe-partition/effective-main-board/v1",
+            [
+                item.model_dump(mode="json")
+                for item in members
+                if "effective_main_board" in item.scope_roles
+            ],
         ),
         "required_additions_partition_sha256": domain_sha256(
-            "stock-eva/r2f4.2/universe-partition/required-additions/v1", addition_ids
+            "stock-eva/r2f4.2/universe-partition/required-additions/v1",
+            [
+                item.model_dump(mode="json")
+                for item in members
+                if "required_user" in item.scope_roles or "required_index" in item.scope_roles
+            ],
         ),
         "parent_contract_id": parent_contract_id,
         "sequence": sequence,
@@ -739,6 +776,146 @@ _EXPECTED_TABLES = {
     "universe_attempt_result",
     "universe_head",
 }
+_EXPECTED_COLUMNS = {
+    "universe_meta": {"meta_key", "meta_value"},
+    "universe_source_state": {
+        "source_state_id",
+        "source_state_sha256",
+        "trade_date",
+        "provider_id",
+        "source_version_digest",
+        "source_refs_json",
+        "verified_at",
+    },
+    "universe_contract": {
+        "contract_id",
+        "sequence",
+        "parent_contract_id",
+        "trade_date",
+        "universe_id",
+        "schema_version",
+        "scope",
+        "calendar_generation_id",
+        "calendar_sha256",
+        "classification_generation_id",
+        "classification_generation_sequence",
+        "classification_source",
+        "classification_source_version",
+        "classification_source_snapshot_date",
+        "classification_observed_at",
+        "classification_snapshot_sha256",
+        "exact_pit_cutoff",
+        "provider_id",
+        "source_date_semantics",
+        "source_state_id",
+        "source_state_sha256",
+        "source_version_digest",
+        "required_symbol_snapshot_id",
+        "required_symbol_snapshot_sha256",
+        "instrument_evidence_ids_json",
+        "counts_json",
+        "layer_counts_json",
+        "source_refs_json",
+        "classification_evidence_ids_json",
+        "classification_evidence_partition_sha256",
+        "effective_main_board_ids_json",
+        "effective_main_board_partition_sha256",
+        "required_additions_ids_json",
+        "required_additions_partition_sha256",
+        "payload_json",
+        "contract_sha256",
+        "created_at",
+    },
+    "universe_member": {"contract_id", "symbol", "security_id", "member_sha256", "member_json"},
+    "universe_semantic_mapping": {
+        "mapping_id",
+        "mapping_version",
+        "provider_id",
+        "source_schema",
+        "payload_json",
+        "mapping_sha256",
+        "authority_status",
+    },
+    "universe_instrument_evidence": {
+        "evidence_id",
+        "evidence_sha256",
+        "provider_id",
+        "authority_status",
+        "artifact_origin",
+        "security_id",
+        "symbol",
+        "mapping_id",
+        "mapping_version",
+        "mapping_sha256",
+        "source_snapshot_date",
+        "evidence_trade_date",
+        "exclusion_reason",
+        "index_role",
+        "source_date_semantics",
+        "evidence_json",
+    },
+    "universe_required_symbol_snapshot": {
+        "snapshot_id",
+        "snapshot_sha256",
+        "snapshot_token_digest",
+        "schema_version",
+        "symbol_count",
+        "snapshot_json",
+    },
+    "universe_publication_context": {
+        "context_id",
+        "run_id",
+        "trade_date",
+        "manifest_ref",
+        "evidence_refs_json",
+        "publication_lineage_json",
+        "publication_lineage_sha256",
+        "context_sha256",
+        "status",
+        "created_at",
+    },
+    "contract_evidence": {
+        "contract_id",
+        "evidence_id",
+        "evidence_role",
+        "security_id",
+        "symbol",
+        "exclusion_reason",
+    },
+    "contract_required_snapshot": {"contract_id", "snapshot_id", "snapshot_sha256"},
+    "universe_attempt": {
+        "attempt_id",
+        "dedup_key",
+        "hook_kind",
+        "refresh_id",
+        "canonical_run_id",
+        "source_version_digest",
+        "trade_date",
+        "operation_day",
+        "attempt_status",
+        "request_budget",
+        "classification_max_attempts",
+        "created_at",
+        "planned_sha256",
+    },
+    "universe_attempt_result": {
+        "attempt_id",
+        "terminal_status",
+        "classification_request_count",
+        "reason_code",
+        "source_state_id",
+        "finished_at",
+        "result_sha256",
+    },
+    "universe_head": {
+        "singleton_id",
+        "sequence",
+        "contract_id",
+        "contract_sha256",
+        "head_sha256",
+        "updated_at",
+    },
+}
 
 
 def _head_digest(sequence: int, contract_id: str, contract_sha256: str) -> str:
@@ -825,11 +1002,17 @@ class UniverseSidecarStore:
             }
             if tables != _EXPECTED_TABLES:
                 raise UniverseStoreUnavailable("universe schema table set invalid")
+            for table, expected_columns in _EXPECTED_COLUMNS.items():
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if columns != expected_columns:
+                    raise UniverseStoreUnavailable(f"universe columns invalid: {table}")
             if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
                 raise UniverseStoreUnavailable("universe schema version invalid")
-            trigger_names = {
-                row[0]
-                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+            trigger_rows = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger'"
+                )
             }
             expected_triggers = {
                 "universe_meta_no_update",
@@ -857,7 +1040,9 @@ class UniverseSidecarStore:
                 "universe_attempt_result_no_update",
                 "universe_attempt_result_no_delete",
             }
-            if trigger_names != expected_triggers:
+            if set(trigger_rows) != expected_triggers or any(
+                "RAISE(ABORT" not in sql for sql in trigger_rows.values()
+            ):
                 raise UniverseStoreUnavailable("universe schema trigger set invalid")
             meta = dict(
                 connection.execute("SELECT meta_key,meta_value FROM universe_meta").fetchall()
@@ -885,12 +1070,7 @@ class UniverseSidecarStore:
         self, connection: sqlite3.Connection, contract_id: str
     ) -> UniverseContractV1:
         row = connection.execute(
-            "SELECT payload_json,contract_sha256,contract_id,sequence,parent_contract_id, "
-            "trade_date,universe_id,schema_version,scope,calendar_generation_id,calendar_sha256, "
-            "classification_generation_id,required_symbol_snapshot_id, "
-            "required_symbol_snapshot_sha256,classification_evidence_partition_sha256, "
-            "effective_main_board_partition_sha256,required_additions_partition_sha256,created_at "
-            "FROM universe_contract WHERE contract_id=?",
+            "SELECT * FROM universe_contract WHERE contract_id=?",
             (contract_id,),
         ).fetchone()
         if row is None:
@@ -958,6 +1138,63 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe member hash invalid")
             refs = contract.source_refs
             source_state_id, source_state_sha = _source_state_identity(refs)
+            expected_columns = {
+                "trade_date": contract.trade_date.isoformat(),
+                "universe_id": contract.universe_id,
+                "schema_version": contract.schema_version,
+                "scope": contract.scope,
+                "calendar_generation_id": contract.calendar_generation_id,
+                "calendar_sha256": contract.calendar_sha256,
+                "classification_generation_id": contract.classification_generation_id,
+                "classification_generation_sequence": refs.classification_generation_sequence,
+                "classification_source": refs.classification_source,
+                "classification_source_version": refs.classification_source_version,
+                "classification_source_snapshot_date": (
+                    refs.classification_source_snapshot_date.isoformat()
+                ),
+                "classification_observed_at": refs.classification_observed_at.isoformat(),
+                "classification_snapshot_sha256": refs.classification_snapshot_sha256,
+                "exact_pit_cutoff": contract.exact_pit_cutoff.isoformat(),
+                "provider_id": "baostock",
+                "source_date_semantics": refs.source_date_semantics,
+                "source_state_id": source_state_id,
+                "source_state_sha256": source_state_sha,
+                "source_version_digest": refs.source_version_digest,
+                "required_symbol_snapshot_id": refs.required_symbol_snapshot_id,
+                "required_symbol_snapshot_sha256": refs.required_symbol_snapshot_sha256,
+                "instrument_evidence_ids_json": canonical_json_bytes(
+                    refs.instrument_evidence_ids
+                ).decode(),
+                "counts_json": canonical_json_bytes(
+                    contract.counts.model_dump(mode="json")
+                ).decode(),
+                "layer_counts_json": canonical_json_bytes(
+                    {
+                        "classification_evidence": len(contract.classification_evidence_ids),
+                        "effective_main_board": len(contract.effective_main_board_ids),
+                        "required_additions": len(contract.required_additions_ids),
+                    }
+                ).decode(),
+                "source_refs_json": canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+                "classification_evidence_ids_json": canonical_json_bytes(
+                    contract.classification_evidence_ids
+                ).decode(),
+                "classification_evidence_partition_sha256": (
+                    contract.classification_evidence_partition_sha256
+                ),
+                "effective_main_board_ids_json": canonical_json_bytes(
+                    contract.effective_main_board_ids
+                ).decode(),
+                "effective_main_board_partition_sha256": (
+                    contract.effective_main_board_partition_sha256
+                ),
+                "required_additions_ids_json": canonical_json_bytes(
+                    contract.required_additions_ids
+                ).decode(),
+                "required_additions_partition_sha256": contract.required_additions_partition_sha256,
+            }
+            if any(row[key] != value for key, value in expected_columns.items()):
+                raise UniverseStoreUnavailable("universe contract explicit column mismatch")
             source_state = connection.execute(
                 "SELECT source_state_id,source_state_sha256,trade_date,provider_id, "
                 "source_version_digest,source_refs_json FROM universe_source_state "
@@ -973,6 +1210,8 @@ class UniverseSidecarStore:
                 source_state["trade_date"] != contract.trade_date.isoformat()
                 or source_state["provider_id"] != "baostock"
                 or source_state["source_version_digest"] != refs.source_version_digest
+                or source_state["source_refs_json"]
+                != canonical_json_bytes(refs.model_dump(mode="json")).decode()
             ):
                 raise UniverseStoreUnavailable("universe source state mismatch")
             mapping = connection.execute(
@@ -1031,14 +1270,32 @@ class UniverseSidecarStore:
             if link is None or link["snapshot_sha256"] != refs.required_symbol_snapshot_sha256:
                 raise UniverseStoreUnavailable("universe snapshot link missing")
             links = connection.execute(
-                "SELECT evidence_id,security_id,symbol FROM contract_evidence WHERE contract_id=? "
-                "AND evidence_role='member'",
+                "SELECT evidence_id,evidence_role,security_id,symbol "
+                "FROM contract_evidence WHERE contract_id=?",
                 (contract.contract_id,),
             ).fetchall()
-            if {(item["evidence_id"], item["security_id"], item["symbol"]) for item in links} != {
-                (item.instrument_evidence_id, item.security_id, item.symbol)
+            expected_links = {
+                (item.instrument_evidence_id, role, item.security_id, item.symbol)
                 for item in contract.members
-            }:
+                for role in (
+                    ("classification_evidence", "member")
+                    + (
+                        ("effective_main_board",)
+                        if "effective_main_board" in item.scope_roles
+                        else ()
+                    )
+                    + (
+                        ("required_additions",)
+                        if "required_user" in item.scope_roles
+                        or "required_index" in item.scope_roles
+                        else ()
+                    )
+                )
+            }
+            if {
+                (item["evidence_id"], item["evidence_role"], item["security_id"], item["symbol"])
+                for item in links
+            } != expected_links:
                 raise UniverseStoreUnavailable("universe evidence link missing")
             return contract
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
@@ -1315,7 +1572,7 @@ class UniverseSidecarStore:
                         or "required_index" in member.scope_roles
                     ):
                         roles.append("required_additions")
-                    roles.append("member")
+                    roles.extend(("classification_evidence", "member"))
                     for role in roles:
                         connection.execute(
                             "INSERT INTO contract_evidence VALUES (?,?,?,?,?,?)",
