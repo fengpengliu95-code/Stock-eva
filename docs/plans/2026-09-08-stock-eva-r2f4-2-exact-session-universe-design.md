@@ -204,6 +204,17 @@ publisher; no direct production switch is part of R2-F4.2.
   `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
   available only to explicitly isolated offline/staging verification.
 
+The mode/profile matrix is normative and evaluated before any Universe provider construction:
+
+| Profile | `off` | `shadow` | `enforce` |
+|---|---|---|---|
+| production | legacy canonical unchanged; `NONE`, zero Universe requests | `BLOCKED_PRODUCTION_MODE_OFF`, zero Universe requests | `BLOCKED_PRODUCTION_MODE_OFF`, zero Universe requests |
+| nonproduction/staging | legacy canonical unchanged; `NONE`, zero Universe requests | read-only legacy observer only; `LEGACY_SHADOW_DRIFT` when it differs, otherwise `NONE`; no canonical block | `BLOCKED_ENFORCE_NOT_ENABLED`, zero requests |
+
+This matrix is distinct from a provider failure: a blocked cell is a deterministic configuration
+result, never a retry or a request to authenticated or secondary services. `shadow` observes only
+the already-built legacy BaoStock request and never changes `build_canonical_raw_request`.
+
 - FR-25: No authority widening. R2-F4.2 MUST NOT add a secondary provider to canonical
   `ProviderId`, change R2-F4.0 failover readiness, enable TickFlow/Tushare failover, change R2-F3
   qualification, modify the promoted calendar semantics, or alter canonical normalization,
@@ -374,6 +385,12 @@ matches or differs, a durable blocking/indeterminate attempt, and an external cl
 calendar change that has not been persisted, **When** the API/CLI status is read, **Then** it uses
 only the sidecar row: it returns `ready`, `stale(UNIVERSE_SOURCE_VERSION_CHANGED)`, or
 `blocked` by the priority above, and the unpersisted external change is not discovered.
+
+**Given** an invalid or future `trade_date` and an unprovable sidecar path/inode/schema, **When** the
+API/CLI is invoked, **Then** sidecar proof runs first and the result is the independent HTTP 503 /
+CLI exit 3 control envelope; **When** the sidecar is proven readable, **Then** the same date input
+returns HTTP 422 / CLI exit 2 before any head/source projection. This ordering is tested in both
+combined-error directions and never depends on whether the date is a weekend.
 
 ### AC-15: Maintenance boundary (FR-22, FR-23, FR-27, NFR-7)
 
@@ -602,6 +619,17 @@ The four interfaces above are the only public shapes. `Ready` and `Stale` carry 
 fields; `Blocked` and `Unavailable` carry null head fields. Implementations MUST NOT populate a
 nullable field outside its interface.
 
+For an exact-date head, the newer-source decision is a complete ordered matrix: no strictly newer
+source-state, or a newer row with an equal digest, is `ready`; a newer row with a different digest
+and no matching attempt is `stale/UNIVERSE_SOURCE_VERSION_CHANGED`; a matching `blocked` result is
+`blocked` with its persisted `BlockedReason`; a matching `deferred` result is `blocked` with
+`CONTROL_STATE_UNAVAILABLE` or `UNIVERSE_HEAD_CAS_CONFLICT`; a matching `failed` result is `blocked`
+with its persisted `BlockedReason`; a matching `ATTEMPT_INDETERMINATE` result, or a committed
+`RUNNING` plan with no result, is `blocked/ATTEMPT_INDETERMINATE`. A matching `succeeded` (complete)
+result MUST have promoted an exact head in the same transaction; if it does not, the sidecar is
+schema-unavailable (503), never stale or ready. This matrix is evaluated after sidecar/head
+validation and before any fallback to an older source state.
+
 Terminal-attempt/status mapping is deterministic (and identical for the CLI):
 
 | Persisted attempt state | Required condition | Public status/reason when no exact requested-date head exists | CLI result |
@@ -784,6 +812,33 @@ only control/factor-completeness observations and never rows. The result contain
 counts, loaded/session counts and `universe_raw_projection_sha256`; request IDs, provider session
 IDs, pages and payloads are not exposed.
 
+The shadow-only required-symbol observer is a pure read-only function over the already-built legacy
+request plan; it does not call BaoStock or rebuild the plan:
+
+```typescript
+interface LegacyShadowObservation {
+  provider_id: "baostock";
+  request_trade_date: string;
+  contract_sha256: string;
+  legacy_request_symbol_count: number;
+  contract_session_expected: number;
+  missing_required_symbol_count: number;
+  extra_symbol_count: number;
+  drift_sha256: string;
+  reason_code: "LEGACY_SHADOW_DRIFT" | "NONE";
+}
+function observe_legacy_request_universe(
+  request: ProviderRequest, contract: UniverseContractV1,
+): LegacyShadowObservation;
+```
+
+`request.session_symbols` is the exact legacy preflight observation. The observer compares it with
+the contract's `session_expected` projection by symbol and reports missing required additions,
+including required ChiNext/STAR symbols, as `LEGACY_SHADOW_DRIFT`; it never filters, patches or
+changes `build_canonical_raw_request`. The observer runs only after a successful canonical refresh
+and evidence readback in nonproduction `shadow`, records counts/hash only, and cannot block or
+switch the canonical result. It is not a provider acquisition seam.
+
 `universe_raw_projection_sha256` is the domain hash
 `stock-eva/r2f4.2/raw-batch-projection/v1` over the exact JSON result of
 `batch.model_dump(mode="json", warnings="error")` after Pydantic revalidation of the complete
@@ -908,7 +963,8 @@ permitted.
 `source_state_id`, `source_state_sha256`, `trade_date`, `provider_id=baostock`,
 `source_version_digest`, `source_refs_json` and trusted UTC `verified_at`. The source-state digest
 is `domain_sha256("stock-eva/r2f4.2/universe-source-state/v1", {trade_date,provider_id,
-source_version_digest,source_refs_json,verified_at})`; `source_state_id` is its first 32 lowercase
+source_version_digest,source_refs_json})`; `verified_at` is an observation/order column excluded
+from identity; `source_state_id` is its first 32 lowercase
 hex characters. The strict reader validates the JSON as `SourceRefsV1`, recomputes the digest and
 selects the latest row for the requested date by `(verified_at,source_state_id)` from this table
 only. This is the public GET's sole current-source input; it never reads classification, calendar,
@@ -921,8 +977,9 @@ classification metadata, calendar metadata, required-snapshot identity and evide
 digests agree with the row and with the linked contract. `source_state_sha256` is recomputed from
 the exact preimage above; `source_state_id` must equal its first 32 lowercase characters. Rows are
 ordered by trusted UTC `verified_at`, with `source_state_id` as the deterministic tie-breaker.
-An identical `(trade_date,source_version_digest,source_refs_json)` hash is idempotent; a different
-hash is a new immutable row and never an update. A result may reference a source state only after
+An identical `(trade_date,source_version_digest,source_refs_json)` hash is idempotent: a later
+revalidation with a different `verified_at` reuses the existing row and cannot make the head stale;
+a different identity hash is a new immutable row and never an update. A result may reference a source state only after
 this validation; a blocked/failed/indeterminate result may leave `source_state_id` null only when
 construction was impossible, while a succeeded result must reference a verified row. This
 nullable FK is the sole permitted optional source-state link.
@@ -985,7 +1042,7 @@ no digest is an implied provider field.
 | `stock-eva/r2f4.2/universe-head/v1` | `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}` |
 | `stock-eva/r2f4.2/raw-batch-projection/v1` | exact `batch.model_dump(mode="json", warnings="error")` after Pydantic revalidation of complete `ProviderRawBatch`; no field is excluded or remapped |
 | `stock-eva/r2f4.2/universe-source-version/v1` | exact object `{provider_id,adapter_version,endpoint_contract_version,classification:{source,source_version,sequence,observed_at,source_date_semantics},classification_snapshot_sha256,semantic_mapping_sha256,instrument_evidence:[sorted {evidence_id,evidence_sha256,mapping_id,mapping_sha256,source_version,source_date_semantics,trade_date}]}`; this is `source_version_digest` |
-| `stock-eva/r2f4.2/universe-source-state/v1` | exact object `{trade_date,provider_id,source_version_digest,source_refs_json,verified_at}` persisted in `universe_source_state`; `source_state_id=source_state_sha256[:32]` |
+| `stock-eva/r2f4.2/universe-source-state/v1` | exact object `{trade_date,provider_id,source_version_digest,source_refs_json}` persisted in `universe_source_state`; `verified_at` is excluded from identity; `source_state_id=source_state_sha256[:32]` |
 | `stock-eva/r2f4.2/universe-attempt-plan/v1` | complete immutable attempt key, source version, operation day, budget and hook identity |
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
 
@@ -1008,7 +1065,8 @@ these explicitly derived identities and digest fields.
 
 For a requested trade date, let `latest_terminal` be the newest immutable attempt-result row for
 that date/source digest with terminal status `blocked`, `deferred`, `succeeded`, `failed` or
-`ATTEMPT_INDETERMINATE`, ordered by `finished_at`. Maintenance is due exactly when there is no
+`ATTEMPT_INDETERMINATE`, ordered by `(finished_at DESC,attempt_id DESC)`; the safe immutable
+`attempt_id` tie-breaker makes selection deterministic. Maintenance is due exactly when there is no
 exact-date contract, or the current source/mapping/classification digest differs from that
 contract, or the required-symbol snapshot differs from that contract, or
 UTC `now >= latest_terminal.finished_at + configured_interval_seconds`. If trusted UTC `now <
@@ -1636,8 +1694,8 @@ The mapping is deterministic and closed:
 | nonblocking refresh/control lock unavailable while the sidecar is readable | `CONTROL_STATE_UNAVAILABLE` | 200 blocked/defer / 1 |
 | sidecar head CAS conflict recorded as a terminal attempt | `UNIVERSE_HEAD_CAS_CONFLICT` | 200 blocked / 1 |
 | committed RUNNING attempt without a result on the same operation day | `ATTEMPT_INDETERMINATE` | 200 blocked / 1 |
-| mode `enforce` in any execution | `BLOCKED_ENFORCE_NOT_ENABLED` | 200 blocked / 1 |
-| non-off mode in production profile | `BLOCKED_PRODUCTION_MODE_OFF` | 200 blocked / 1 |
+| mode `enforce` in nonproduction/staging execution | `BLOCKED_ENFORCE_NOT_ENABLED` | 200 blocked / 1 |
+| mode `shadow` or `enforce` in production profile | `BLOCKED_PRODUCTION_MODE_OFF` | 200 blocked / 1 |
 | BaoStock transport/protocol failure (`CONNECT_ERROR`, `SEND_ERROR`, `RECV_TIMEOUT`, `EOF`, `SHORT_HEADER`, `BAD_COMPRESSION`, `PROTOCOL_ERROR`, `PAGINATION_STALLED`, `RATE_LIMIT`, or unknown provider code) during acquisition | `CLASSIFICATION_UNAVAILABLE` | 200 blocked / 1 |
 | read-only legacy shadow differs, including missing ChiNext/STAR from legacy request | `LEGACY_SHADOW_DRIFT` | 200 blocked/diagnostic / 1 |
 
@@ -1690,8 +1748,8 @@ range as proof.
 | FR-16 — Extras and duplicates are errors | `test_raw_batch_gate_rejects_missing_extra_duplicate_drift_before_normalize` |
 | FR-17 — Whole-session purity | `test_whole_session_provider_purity_and_no_symbol_stitching` |
 | FR-18 — Immutable sidecar authority | `test_sidecar_append_only_reachability_and_atomic_cas` |
-| FR-19 — Canonical identity | `test_contract_member_partition_hash_vectors` |
-| FR-20 — Read-only status | `test_status_api_cli_zero_write` |
+| FR-19 — Canonical identity | `test_contract_member_partition_hash_vectors`, `test_source_state_identity_excludes_verified_at` |
+| FR-20 — Read-only status | `test_status_api_cli_zero_write`, `test_status_source_state_order_and_date_matrix`, `test_status_storage_error_precedes_invalid_or_future_date` |
 | FR-21 — Sanitized diagnostics | public-schema privacy/static reason scan |
 | FR-22 — Maintenance priority | `test_automation_priority_nonrun_weekend_and_lock_busy` |
 | FR-23 — Classification maintenance trigger | `test_classification_cadence_global_daily_budget`; `test_source_digest_change_due_and_invalidates_old_head` |
