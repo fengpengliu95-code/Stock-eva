@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -19,7 +20,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from backend.app.market.calendar_generation import CalendarReadResult
+from backend.app.market.calendar_generation import (
+    CalendarAuthorityAdmission,
+    build_generation_sha256,
+)
 from backend.app.market.providers.base import (
     ExpectedLogicalRequest,
     ExpectedLogicalRequestPlan,
@@ -46,6 +50,20 @@ _SNAPSHOT_ADMISSION_SECRET = object()
 
 class UniverseStoreUnavailable(RuntimeError):
     """The sidecar cannot be proven safe for authority use."""
+
+
+class _DescriptorConnection(sqlite3.Connection):
+    """SQLite connection retaining the verified backing descriptor lifetime."""
+
+    _owned_fd: int | None = None
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            if self._owned_fd is not None:
+                os.close(self._owned_fd)
+                self._owned_fd = None
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -175,6 +193,8 @@ class SourceRefsV1(_Frozen):
     classification_generation_sequence: int = Field(ge=1)
     classification_source: str = Field(min_length=1, max_length=128)
     classification_source_version: str = Field(min_length=1, max_length=128)
+    adapter_version: str = Field(default="r2f4.2-universe.v1", min_length=1, max_length=64)
+    endpoint_contract_version: str = Field(default="r2f4-endpoints.v1", min_length=1, max_length=64)
     classification_source_snapshot_date: date
     classification_observed_at: datetime
     classification_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -547,7 +567,7 @@ def _evidence_matches_member(
     )
 
 
-def _derived_effective_main_board(member: UniverseMemberV1) -> bool:
+def _derived_effective_main_board(member: UniverseMemberV1, trade_date: date) -> bool:
     """Return base eligibility from canonical identity, never caller scope alone."""
     identity = derive_security_identity(member.symbol, "1")
     return (
@@ -555,6 +575,9 @@ def _derived_effective_main_board(member: UniverseMemberV1) -> bool:
         and identity.security_type == "stock"
         and identity.board == "main"
         and member.board == "main"
+        and member.list_date is not None
+        and member.list_date <= trade_date
+        and (member.delist_date is None or trade_date < member.delist_date)
     )
 
 
@@ -567,8 +590,7 @@ class RequiredSymbolSnapshotV1(_Frozen):
     _admission_marker: object | None = PrivateAttr(default=None)
 
     @classmethod
-    def _from_test_fixture(cls, **values: Any) -> RequiredSymbolSnapshotV1:
-        """Private offline vector factory; production callers cannot mint admission."""
+    def _admit(cls, **values: Any) -> RequiredSymbolSnapshotV1:
         result = cls.model_validate(values)
         object.__setattr__(result, "_admission_marker", _SNAPSHOT_ADMISSION_SECRET)
         return result
@@ -580,7 +602,10 @@ class RequiredSymbolSnapshotV1(_Frozen):
         if not isinstance(captured, RequiredUserSymbolSnapshotRead):
             raise ValueError("required snapshot must be a trusted user capture")
         user_snapshot = captured.snapshot
-        pairs = list(user_snapshot.roles_by_symbol)
+        # User position/watchlist roles are provenance details. The universe
+        # admission uses one closed required-user role for each such symbol;
+        # required-index roles are added canonically below.
+        pairs = [(symbol, ("required_user",)) for symbol, _roles in user_snapshot.roles_by_symbol]
         if any(symbol in INDEX_SYMBOLS for symbol, _ in pairs):
             raise ValueError("required index cannot be a user role")
         pairs.extend((symbol, ("required_index",)) for symbol in INDEX_SYMBOLS)
@@ -594,7 +619,7 @@ class RequiredSymbolSnapshotV1(_Frozen):
                 "symbols": [{"symbol": symbol, "roles": list(roles)} for symbol, roles in pairs],
             },
         )
-        result = cls._from_test_fixture(
+        result = cls._admit(
             snapshot_id=digest[:32],
             snapshot_sha256=digest,
             snapshot_token_digest=token,
@@ -637,6 +662,8 @@ class RequiredSymbolSnapshotV1(_Frozen):
         )
         if expected != self.snapshot_sha256:
             raise ValueError("required snapshot hash mismatch")
+        if self.snapshot_id != self.snapshot_sha256[:32]:
+            raise ValueError("required snapshot ID must derive from hash")
         return self
 
 
@@ -701,7 +728,11 @@ class UniverseContractV1(_Frozen):
             raise ValueError("required index set is incomplete")
         if any(item.expected_trading_state != "trading" for item in indexes):
             raise ValueError("required index must be trading")
-        base = {item.symbol for item in self.members if _derived_effective_main_board(item)}
+        base = {
+            item.symbol
+            for item in self.members
+            if _derived_effective_main_board(item, self.trade_date)
+        }
         additions = {
             item.symbol
             for item in self.members
@@ -721,7 +752,11 @@ class UniverseContractV1(_Frozen):
         if expected_classification_ids != self.classification_evidence_ids:
             raise ValueError("classification evidence IDs are not derived from projection")
         expected_effective_ids = tuple(
-            sorted(item.symbol for item in self.members if _derived_effective_main_board(item))
+            sorted(
+                item.symbol
+                for item in self.members
+                if _derived_effective_main_board(item, self.trade_date)
+            )
         )
         if expected_effective_ids != self.effective_main_board_ids:
             raise ValueError("effective main board IDs are not derived from members")
@@ -752,7 +787,7 @@ class UniverseContractV1(_Frozen):
             (
                 self.effective_main_board_partition_sha256,
                 "stock-eva/r2f4.2/universe-partition/effective-main-board/v1",
-                lambda item: _derived_effective_main_board(item),
+                lambda item: _derived_effective_main_board(item, self.trade_date),
                 "effective main board",
             ),
             (
@@ -763,7 +798,7 @@ class UniverseContractV1(_Frozen):
                     not in {
                         candidate.symbol
                         for candidate in self.members
-                        if _derived_effective_main_board(candidate)
+                        if _derived_effective_main_board(candidate, self.trade_date)
                     }
                     and (
                         "required_user" in item.scope_roles or "required_index" in item.scope_roles
@@ -815,14 +850,17 @@ class UniverseContractV1(_Frozen):
                     member_projection(item)
                     for item in self.members
                     if (
-                        (label == "effective_main_board" and _derived_effective_main_board(item))
+                        (
+                            label == "effective_main_board"
+                            and _derived_effective_main_board(item, self.trade_date)
+                        )
                         or (
                             label == "required_additions"
                             and item.symbol
                             not in {
                                 candidate.symbol
                                 for candidate in self.members
-                                if _derived_effective_main_board(candidate)
+                                if _derived_effective_main_board(candidate, self.trade_date)
                             }
                             and (
                                 "required_user" in item.scope_roles
@@ -1218,8 +1256,8 @@ def source_version_digest(
         "stock-eva/r2f4.2/universe-source-version/v1",
         {
             "provider_id": refs.provider_id,
-            "adapter_version": refs.classification_source_version,
-            "endpoint_contract_version": refs.classification_source_version,
+            "adapter_version": refs.adapter_version,
+            "endpoint_contract_version": refs.endpoint_contract_version,
             "classification": {
                 "source": refs.classification_source,
                 "source_version": refs.classification_source_version,
@@ -1246,26 +1284,36 @@ def source_version_digest(
 
 
 def validate_calendar_authority(
-    authority: CalendarReadResult,
+    authority: CalendarAuthorityAdmission,
     *,
     trade_date: date,
     calendar_generation_id: str,
     calendar_sha256: str,
+    exact_pit_cutoff: datetime | None = None,
 ) -> None:
     """Validate one pinned R2-F4.1 reader result at the universe boundary."""
-    if not isinstance(authority, CalendarReadResult) or authority.status != "ready":
+    if not isinstance(authority, CalendarAuthorityAdmission):
+        raise ValueError("calendar authority admission is not sealed")
+    read_result = authority.read_result
+    if read_result.status != "ready":
         raise ValueError("calendar authority unavailable")
-    generation = authority.generation
-    calendar = authority.calendar
+    generation = read_result.generation
+    calendar = read_result.calendar
     if generation is None or calendar is None:
         raise ValueError("calendar authority generation unavailable")
     if (
-        generation.generation_sha256 != calendar_sha256
+        build_generation_sha256(generation) != generation.generation_sha256
+        or generation.generation_sha256 != calendar_sha256
         or calendar.generation_sha256 != calendar_sha256
+        or authority.head_generation_sha256 != generation.generation_sha256
         or calendar_generation_id != generation.generation_sha256[:32]
         or generation.attempt_target_year != trade_date.year
         or trade_date.year not in calendar.configs
         or calendar.session_status(trade_date) != "open"
+        or (
+            exact_pit_cutoff is not None
+            and generation.promoted_at.astimezone(UTC) > exact_pit_cutoff.astimezone(UTC)
+        )
     ):
         raise ValueError("calendar authority does not bind open PIT session")
 
@@ -1286,21 +1334,12 @@ def build_universe_contract(
     members: tuple[UniverseMemberV1, ...],
     classification_evidence: tuple[UniverseInstrumentEvidenceV1, ...] | None = None,
     authority_bundle: UniverseAuthorityBundleV1 | None = None,
-    calendar_authority: CalendarReadResult | None = None,
+    calendar_authority: CalendarAuthorityAdmission,
     required_user_snapshot: Any | None = None,
     sequence: int = 1,
     parent_contract_id: str | None = None,
     created_at: datetime | None = None,
 ) -> UniverseContractV1:
-    if calendar_authority is not None:
-        validate_calendar_authority(
-            calendar_authority,
-            trade_date=trade_date,
-            calendar_generation_id=calendar_generation_id,
-            calendar_sha256=calendar_sha256,
-        )
-    if authority_bundle is not None and calendar_authority is None:
-        raise ValueError("verified authority requires a pinned calendar read")
     refs = _source_refs(source_refs)
     admitted_snapshot: RequiredSymbolSnapshotV1 | None = None
     if required_user_snapshot is not None:
@@ -1314,6 +1353,8 @@ def build_universe_contract(
         ):
             raise ValueError("required user snapshot does not bind source refs")
     if authority_bundle is not None:
+        if required_user_snapshot is None:
+            raise ValueError("verified authority requires a trusted user snapshot")
         if (
             classification_evidence is not None
             and classification_evidence != authority_bundle.evidence
@@ -1327,6 +1368,13 @@ def build_universe_contract(
         )
     if isinstance(exact_pit_cutoff, str):
         exact_pit_cutoff = datetime.fromisoformat(exact_pit_cutoff.replace("Z", "+00:00"))
+    validate_calendar_authority(
+        calendar_authority,
+        trade_date=trade_date,
+        calendar_generation_id=calendar_generation_id,
+        calendar_sha256=calendar_sha256,
+        exact_pit_cutoff=exact_pit_cutoff,
+    )
     if (
         refs.trade_date != trade_date
         or refs.calendar_generation_id != calendar_generation_id
@@ -1398,7 +1446,9 @@ def build_universe_contract(
     )
     if refs.instrument_evidence_ids != classification_ids:
         raise ValueError("source evidence identity does not bind classification evidence")
-    base_ids = tuple(sorted(item.symbol for item in members if _derived_effective_main_board(item)))
+    base_ids = tuple(
+        sorted(item.symbol for item in members if _derived_effective_main_board(item, trade_date))
+    )
     base_id_set = set(base_ids)
     addition_ids = tuple(
         sorted(
@@ -1434,7 +1484,9 @@ def build_universe_contract(
         return item.preimage()
 
     effective_rows = [
-        member_projection(item) for item in members if _derived_effective_main_board(item)
+        member_projection(item)
+        for item in members
+        if _derived_effective_main_board(item, trade_date)
     ]
     required_rows = [
         member_projection(item)
@@ -1480,7 +1532,11 @@ def build_universe_contract(
         ),
         "effective_main_board_partition_sha256": domain_sha256(
             "stock-eva/r2f4.2/universe-partition/effective-main-board/v1",
-            [member_projection(item) for item in members if _derived_effective_main_board(item)],
+            [
+                member_projection(item)
+                for item in members
+                if _derived_effective_main_board(item, trade_date)
+            ],
         ),
         "required_additions_partition_sha256": domain_sha256(
             "stock-eva/r2f4.2/universe-partition/required-additions/v1",
@@ -1533,6 +1589,7 @@ def build_universe_contract(
             and refs.source_date_semantics == "source_observed"
             and authority_bundle is not None
             and calendar_authority is not None
+            and admitted_snapshot is not None
         ),
         classification_evidence_count=len(classification_rows),
         classification_evidence_sha256=layer_hashes["classification"],
@@ -2296,16 +2353,49 @@ class UniverseSidecarStore:
         self.lock_path = self.path.with_name(self.path.name + ".lock")
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
+        descriptor: int | None = None
         try:
-            if self.path.is_symlink():
-                raise UniverseStoreUnavailable("universe sidecar symlink is not allowed")
-        except OSError as exc:
+            if self.path.exists():
+                flags = os.O_RDONLY if readonly else os.O_RDWR
+                descriptor = os.open(self.path, flags | os.O_NOFOLLOW | os.O_CLOEXEC)
+                descriptor_stat = os.fstat(descriptor)
+                path_stat = os.stat(self.path, follow_symlinks=False)
+                if not stat.S_ISREG(descriptor_stat.st_mode) or (
+                    descriptor_stat.st_dev,
+                    descriptor_stat.st_ino,
+                ) != (path_stat.st_dev, path_stat.st_ino):
+                    raise UniverseStoreUnavailable("universe sidecar descriptor changed")
+                # A WAL database cannot be opened through `/dev/fd/N` because
+                # SQLite then searches for its `-wal` sibling under /dev/fd.
+                # Resolve the path from the verified descriptor, while keeping
+                # that descriptor attached to the connection for its lifetime.
+                getpath = getattr(fcntl, "F_GETPATH", None)
+                if getpath is not None:
+                    opened_path = fcntl.fcntl(descriptor, getpath, b"\0" * 1024)
+                    opened_path = opened_path.split(b"\0", 1)[0].decode()
+                else:
+                    opened_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                connection = sqlite3.connect(
+                    opened_path, timeout=0.25, factory=_DescriptorConnection
+                )
+                opened_stat = os.stat(opened_path, follow_symlinks=False)
+                if (opened_stat.st_dev, opened_stat.st_ino) != (
+                    descriptor_stat.st_dev,
+                    descriptor_stat.st_ino,
+                ):
+                    raise UniverseStoreUnavailable("universe sidecar descriptor changed")
+                connection._owned_fd = descriptor
+                descriptor = None
+            else:
+                if readonly:
+                    raise UniverseStoreUnavailable("universe sidecar path unavailable")
+                connection = sqlite3.connect(self.path, timeout=0.25, factory=_DescriptorConnection)
+        except (OSError, sqlite3.Error, UniverseStoreUnavailable) as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            if isinstance(exc, UniverseStoreUnavailable):
+                raise
             raise UniverseStoreUnavailable("universe sidecar path unavailable") from exc
-        if readonly:
-            uri = f"file:{self.path.absolute()}?mode=ro"
-            connection = sqlite3.connect(uri, uri=True, timeout=0.25)
-        else:
-            connection = sqlite3.connect(self.path, timeout=0.25)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=250")
@@ -2944,7 +3034,7 @@ class UniverseSidecarStore:
                         member.exclusion_reason,
                     )
                 )
-                if _derived_effective_main_board(member):
+                if _derived_effective_main_board(member, contract.trade_date):
                     expected_links.add(
                         (
                             evidence_id,
@@ -3123,7 +3213,7 @@ class UniverseSidecarStore:
         evidence: tuple[UniverseInstrumentEvidenceV1, ...] = (),
         required_snapshot: Any | None = None,
         authority_bundle: UniverseAuthorityBundleV1 | None = None,
-        calendar_authority: CalendarReadResult | None = None,
+        calendar_authority: CalendarAuthorityAdmission,
     ) -> UniverseHeadV1:
         try:
             contract = UniverseContractV1.model_validate(
@@ -3168,16 +3258,16 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe required snapshot roles mismatch")
         except (TypeError, ValueError) as exc:
             raise UniverseStoreUnavailable("universe candidate validation unavailable") from exc
-        if calendar_authority is not None:
-            try:
-                validate_calendar_authority(
-                    calendar_authority,
-                    trade_date=contract.trade_date,
-                    calendar_generation_id=contract.calendar_generation_id,
-                    calendar_sha256=contract.calendar_sha256,
-                )
-            except (TypeError, ValueError) as exc:
-                raise UniverseStoreUnavailable("calendar authority unavailable") from exc
+        try:
+            validate_calendar_authority(
+                calendar_authority,
+                trade_date=contract.trade_date,
+                calendar_generation_id=contract.calendar_generation_id,
+                calendar_sha256=contract.calendar_sha256,
+                exact_pit_cutoff=contract.exact_pit_cutoff,
+            )
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("calendar authority unavailable") from exc
         with _file_lock(self.lock_path):
             connection = self._connect()
             try:
@@ -3474,7 +3564,7 @@ class UniverseSidecarStore:
                         ),
                     )
                     roles = []
-                    if _derived_effective_main_board(member):
+                    if _derived_effective_main_board(member, contract.trade_date):
                         roles.append("effective_main_board")
                     if (
                         "required_user" in member.scope_roles

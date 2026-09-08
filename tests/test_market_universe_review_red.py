@@ -8,6 +8,7 @@ import pytest
 
 from backend.app.market.universe import (
     RequiredSymbolSnapshotV1,
+    SourceRefsV1,
     UniverseCountsV1,
     UniverseInstrumentEvidenceV1,
     UniverseSemanticMappingV1,
@@ -175,6 +176,9 @@ def test_promote_rejects_caller_crafted_required_snapshot(tmp_path):
             evidence=evidence,
             authority_bundle=_authority(mapping, evidence),
             required_snapshot=crafted,
+            calendar_authority=__import__(
+                "tests.test_market_universe", fromlist=["_calendar_authority"]
+            )._calendar_authority(contract.trade_date),
         )
 
 
@@ -211,6 +215,9 @@ def test_classification_projection_is_bound_field_by_field_to_evidence(tmp_path)
             evidence=evidence,
             authority_bundle=_authority(mapping, evidence),
             required_snapshot=snapshot,
+            calendar_authority=__import__(
+                "tests.test_market_universe", fromlist=["_calendar_authority"]
+            )._calendar_authority(contract.trade_date),
         )
 
 
@@ -233,6 +240,9 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(first.trade_date),
     )
     members = tuple(
         _rehash_member(member, f"{member.instrument_evidence_id}-g2") for member in first.members
@@ -271,6 +281,9 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         members=members,
         classification_evidence=second_evidence,
         authority_bundle=second_authority,
+        required_user_snapshot=__import__(
+            "tests.test_market_universe", fromlist=["_user_capture"]
+        )._user_capture(members),
         calendar_authority=__import__(
             "tests.test_market_universe", fromlist=["_calendar_authority"]
         )._calendar_authority(first.trade_date),
@@ -286,6 +299,9 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         evidence=second_evidence,
         authority_bundle=_authority(mapping, second_evidence),
         required_snapshot=second_snapshot,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(second.trade_date),
     )
     assert second_head.sequence == 2
 
@@ -447,6 +463,9 @@ def test_builder_without_verified_authority_bundle_is_not_publishable():
         exact_pit_cutoff=refs.exact_pit_cutoff,
         source_refs=refs,
         members=legacy.members,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(legacy.trade_date),
     )
     assert contract.publication_eligible is False
 
@@ -496,6 +515,12 @@ def test_source_version_refs_are_derived_not_caller_selected():
             members=contract.members,
             classification_evidence=evidence,
             authority_bundle=_authority(_mapping(), evidence),
+            required_user_snapshot=__import__(
+                "tests.test_market_universe", fromlist=["_user_capture"]
+            )._user_capture(contract.members),
+            calendar_authority=__import__(
+                "tests.test_market_universe", fromlist=["_calendar_authority"]
+            )._calendar_authority(contract.trade_date),
         )
 
 
@@ -555,3 +580,165 @@ def test_reviewed_not_yet_listed_and_delisted_states_have_explicit_mapping():
     assert evidence.listing_status == "delisted"
     assert evidence.daily_trade_status == "0"
     assert evidence.suspension_state == "not_supplied"
+
+
+def test_effective_main_board_requires_point_in_time_listing_window():
+    from tests.test_market_universe import _member
+
+    future = _member("sh.600010").model_copy(
+        update={
+            "list_date": date(2026, 10, 1),
+            "expected_trading_state": "not_yet_listed",
+            "member_sha256": None,
+        }
+    )
+    assert "effective_main_board" in future.scope_roles
+    # The builder must derive this out of the base before publication.
+    candidate = _contract((future,))
+    assert future.symbol not in candidate.effective_main_board_ids
+
+
+def test_promote_calendar_authority_is_required():
+    signature = inspect.signature(UniverseSidecarStore.promote)
+    assert signature.parameters["calendar_authority"].default is inspect.Parameter.empty
+
+
+def test_calendar_authority_requires_sealed_r2f41_admission():
+    from backend.app.market.calendar_generation import CalendarReadResult
+    from tests.test_market_universe import _calendar_authority
+
+    sealed = _calendar_authority(date(2026, 9, 4))
+    authority = CalendarReadResult(
+        status=sealed.read_result.status,
+        generation=sealed.read_result.generation,
+        calendar=sealed.read_result.calendar,
+    )
+    with pytest.raises(ValueError):
+        validate_calendar_authority(
+            authority,
+            trade_date=date(2026, 9, 4),
+            calendar_generation_id=sealed.read_result.generation.generation_sha256[:32],
+            calendar_sha256=sealed.read_result.generation.generation_sha256,
+        )
+
+
+def test_publication_requires_trusted_user_store_snapshot():
+    candidate = _contract(include_user_snapshot=False)
+    assert candidate.publication_eligible is False
+
+
+def test_production_snapshot_model_has_no_fixture_factory():
+    assert not hasattr(RequiredSymbolSnapshotV1, "_from_test_fixture")
+
+
+def test_user_capture_requires_nofollow_descriptor_open():
+    assert "O_NOFOLLOW" in inspect.getsource(UserStore._connect_existing)
+
+
+def test_user_capture_rejects_b_share_identity(tmp_path):
+    store = UserStore(tmp_path / "user.sqlite3")
+    store.create_position(
+        PositionCreate(symbol="sh.900000", quantity=1, avg_cost=1, as_of_date=date(2026, 9, 1))
+    )
+    with pytest.raises(UserDataError):
+        store.capture_required_symbol_snapshot_existing()
+
+
+def test_user_capture_rejects_symlink_path_before_open(tmp_path):
+    real = tmp_path / "real.sqlite3"
+    alias = tmp_path / "user.sqlite3"
+    real_store = UserStore(real)
+    real_store.create_position(
+        PositionCreate(symbol="sh.600000", quantity=1, avg_cost=1, as_of_date=date(2026, 9, 1))
+    )
+    alias.symlink_to(real)
+    with pytest.raises(UserDataError):
+        UserStore(alias).capture_required_symbol_snapshot_existing()
+
+
+def test_user_capture_fails_closed_when_path_is_replaced_after_open(tmp_path, monkeypatch):
+    path = tmp_path / "user.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    store = UserStore(path)
+    store.create_position(
+        PositionCreate(symbol="sh.600000", quantity=1, avg_cost=1, as_of_date=date(2026, 9, 1))
+    )
+    UserStore(replacement).create_position(
+        PositionCreate(symbol="sh.600001", quantity=1, avg_cost=1, as_of_date=date(2026, 9, 1))
+    )
+    original_fcntl = __import__("backend.app.user.store", fromlist=["fcntl"]).fcntl.fcntl
+
+    def swap_after_open(fd, command, argument):
+        result = original_fcntl(fd, command, argument)
+        if command == __import__("backend.app.user.store", fromlist=["fcntl"]).fcntl.F_GETPATH:
+            replacement.replace(path)
+        return result
+
+    monkeypatch.setattr("backend.app.user.store.fcntl.fcntl", swap_after_open)
+    with pytest.raises(UserDataError):
+        store.capture_required_symbol_snapshot_existing()
+
+
+def test_universe_sidecar_uses_nofollow_descriptor_open():
+    assert "O_NOFOLLOW" in inspect.getsource(UniverseSidecarStore._connect)
+
+
+def test_universe_sidecar_rejects_symlink_path_before_open(tmp_path):
+    real = tmp_path / "real.sqlite3"
+    alias = tmp_path / "universe.sqlite3"
+    UniverseSidecarStore(real).initialize()
+    alias.symlink_to(real)
+    with pytest.raises(UniverseStoreUnavailable):
+        UniverseSidecarStore(alias).read_head()
+
+
+def test_universe_sidecar_fails_closed_when_path_is_replaced_after_open(tmp_path, monkeypatch):
+    path = tmp_path / "universe.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    UniverseSidecarStore(path).initialize()
+    UniverseSidecarStore(replacement).initialize()
+    original_fcntl = __import__("backend.app.market.universe", fromlist=["fcntl"]).fcntl.fcntl
+
+    def swap_after_open(fd, command, argument):
+        result = original_fcntl(fd, command, argument)
+        if command == __import__("backend.app.market.universe", fromlist=["fcntl"]).fcntl.F_GETPATH:
+            replacement.replace(path)
+        return result
+
+    monkeypatch.setattr("backend.app.market.universe.fcntl.fcntl", swap_after_open)
+    with pytest.raises(UniverseStoreUnavailable):
+        UniverseSidecarStore(path).read_head()
+
+
+def test_source_refs_bind_adapter_and_endpoint_contract_versions():
+    assert "adapter_version" in SourceRefsV1.model_fields
+    assert "endpoint_contract_version" in SourceRefsV1.model_fields
+
+
+def test_required_snapshot_id_is_derived_from_snapshot_sha():
+    token = "f" * 64
+    digest = domain_sha256(
+        "stock-eva/r2f4.2/required-symbol-snapshot/v1",
+        {"schema_version": 1, "snapshot_token": token, "symbols": []},
+    )
+    with pytest.raises(ValueError):
+        RequiredSymbolSnapshotV1(
+            snapshot_id="not-derived",
+            snapshot_sha256=digest,
+            snapshot_token_digest=token,
+            symbols=(),
+        )
+
+
+def test_required_snapshot_digest_has_stable_canonical_vector():
+    assert (
+        domain_sha256(
+            "stock-eva/r2f4.2/required-symbol-snapshot/v1",
+            {
+                "schema_version": 1,
+                "snapshot_token": "f" * 64,
+                "symbols": [{"symbol": "sh.000001", "roles": ["required_index"]}],
+            },
+        )
+        == "2883c41ef5aed639652a4fd89de2310df7457b3a84b5da56e03af26672f482c2"
+    )

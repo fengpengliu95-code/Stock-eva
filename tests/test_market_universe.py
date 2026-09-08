@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from datetime import UTC, date, datetime, time
 
 import pytest
-from pydantic import BaseModel
 
 from backend.app.market.calendar_generation import (
+    CalendarAuthorityAdmission,
     CalendarConfigSnapshot,
     CalendarGenerationV1,
     CalendarMachineDayV1,
     CalendarReadResult,
     ImmutableCalendarSnapshot,
+    build_generation_sha256,
     build_observation,
 )
 from backend.app.market.universe import (
@@ -31,6 +33,7 @@ from backend.app.market.universe import (
     source_version_digest,
     validate_provider_raw_batch,
 )
+from backend.app.user.store import UserStore
 
 
 def _member(symbol: str, *, state: str = "trading", role: str = "effective_main_board"):
@@ -60,6 +63,7 @@ def _contract(
     parent_contract_id: str | None = None,
     source_date_semantics: str = "source_observed",
     trade_date: date = date(2026, 9, 1),
+    include_user_snapshot: bool = True,
 ):
     members = members or (
         _member("sh.600000"),
@@ -71,7 +75,11 @@ def _contract(
     if not any(item.symbol == "sz.399001" for item in members):
         members += (_member("sz.399001", role="required_index"),)
     mapping = _mapping()
-    snapshot = _snapshot(members)
+    user_capture = _user_capture(members)
+    snapshot = RequiredSymbolSnapshotV1.from_user_capture(user_capture)
+    calendar_authority = _calendar_authority(trade_date)
+    calendar_hash = calendar_authority.read_result.generation.generation_sha256
+    calendar_id = calendar_hash[:32]
     evidence = (
         tuple(_evidence(item, trade_date) for item in members)
         if all(
@@ -107,11 +115,10 @@ def _contract(
         else None
     )
     snapshot_digest = classification_snapshot_sha256(evidence)
-    calendar_id = "a" * 32
     refs_for_digest = SourceRefsV1.model_validate(
         {
             "calendar_generation_id": calendar_id,
-            "calendar_sha256": "a" * 64,
+            "calendar_sha256": calendar_hash,
             "classification_generation_id": "cls-1",
             "classification_generation_sequence": 1,
             "classification_source": "fixture",
@@ -119,7 +126,7 @@ def _contract(
             "classification_source_snapshot_date": min(trade_date, date(2026, 8, 31)),
             "classification_observed_at": datetime.combine(trade_date, time(8), tzinfo=UTC),
             "classification_snapshot_sha256": snapshot_digest,
-            "required_symbol_snapshot_id": "snap-1",
+            "required_symbol_snapshot_id": snapshot.snapshot_id,
             "required_symbol_snapshot_sha256": snapshot.snapshot_sha256,
             "instrument_evidence_ids": tuple(
                 sorted(item.instrument_evidence_id for item in members)
@@ -136,7 +143,7 @@ def _contract(
     return build_universe_contract(
         trade_date=trade_date,
         calendar_generation_id=calendar_id,
-        calendar_sha256="a" * 64,
+        calendar_sha256=calendar_hash,
         classification_generation_id="cls-1",
         classification_generation_sequence=1,
         classification_source="fixture",
@@ -146,7 +153,7 @@ def _contract(
         exact_pit_cutoff=f"{trade_date.isoformat()}T18:00:00Z",
         source_refs={
             "calendar_generation_id": calendar_id,
-            "calendar_sha256": "a" * 64,
+            "calendar_sha256": calendar_hash,
             "classification_generation_id": "cls-1",
             "classification_generation_sequence": 1,
             "classification_source": "fixture",
@@ -154,7 +161,7 @@ def _contract(
             "classification_source_snapshot_date": min(trade_date, date(2026, 8, 31)).isoformat(),
             "classification_observed_at": f"{trade_date.isoformat()}T08:00:00Z",
             "classification_snapshot_sha256": snapshot_digest,
-            "required_symbol_snapshot_id": "snap-1",
+            "required_symbol_snapshot_id": snapshot.snapshot_id,
             "required_symbol_snapshot_sha256": snapshot.snapshot_sha256,
             "instrument_evidence_ids": sorted(item.instrument_evidence_id for item in members),
             "semantic_mapping_sha256": mapping.mapping_sha256,
@@ -166,26 +173,15 @@ def _contract(
         },
         members=members,
         classification_evidence=evidence,
-        authority_bundle=authority,
-        calendar_authority=_calendar_authority(trade_date),
+        authority_bundle=authority if include_user_snapshot else None,
+        calendar_authority=calendar_authority,
+        required_user_snapshot=user_capture if include_user_snapshot else None,
         sequence=sequence,
         parent_contract_id=parent_contract_id,
     )
 
 
-def _calendar_authority(trade_date: date) -> CalendarReadResult:
-    calendar = ImmutableCalendarSnapshot(
-        (
-            CalendarConfigSnapshot(
-                year=trade_date.year,
-                status="confirmed",
-                published_on=trade_date,
-                sources=(),
-                closed_dates=(),
-            ),
-        ),
-        generation_sha256="a" * 64,
-    )
+def _calendar_authority(trade_date: date) -> CalendarAuthorityAdmission:
     start = date(trade_date.year, 1, 1)
     end = date(trade_date.year, 12, 31)
     machine = build_observation(
@@ -201,8 +197,19 @@ def _calendar_authority(trade_date: date) -> CalendarReadResult:
             for i in range((end - start).days + 1)
         ),
     )
-    generation = BaseModel.model_construct.__func__(
-        CalendarGenerationV1,
+    calendar = ImmutableCalendarSnapshot(
+        (
+            CalendarConfigSnapshot(
+                year=trade_date.year,
+                status="confirmed",
+                published_on=trade_date,
+                sources=(),
+                closed_dates=(),
+            ),
+        ),
+        generation_sha256="0" * 64,
+    )
+    generation0 = CalendarGenerationV1(
         sequence=1,
         parent_sha256=None,
         bundled_sha256="a" * 64,
@@ -212,9 +219,28 @@ def _calendar_authority(trade_date: date) -> CalendarReadResult:
         official_body_hashes=("a" * 64, "a" * 64),
         machine=machine,
         promoted_at=datetime.combine(trade_date, time(1), tzinfo=UTC),
-        generation_sha256="a" * 64,
+        generation_sha256="0" * 64,
     )
-    return CalendarReadResult(status="ready", generation=generation, calendar=calendar)
+    generation = generation0.model_copy(
+        update={"generation_sha256": build_generation_sha256(generation0)}
+    )
+    calendar = ImmutableCalendarSnapshot(
+        (
+            CalendarConfigSnapshot(
+                year=trade_date.year,
+                status="confirmed",
+                published_on=trade_date,
+                sources=(),
+                closed_dates=(),
+            ),
+        ),
+        generation_sha256=generation.generation_sha256,
+    )
+    result = CalendarReadResult(status="ready", generation=generation, calendar=calendar)
+    admission = object.__new__(CalendarAuthorityAdmission)
+    object.__setattr__(admission, "read_result", result)
+    object.__setattr__(admission, "head_generation_sha256", generation.generation_sha256)
+    return admission
 
 
 def _mapping() -> UniverseSemanticMappingV1:
@@ -251,28 +277,37 @@ def _mapping() -> UniverseSemanticMappingV1:
 
 
 def _snapshot(members: tuple[UniverseMemberV1, ...]) -> RequiredSymbolSnapshotV1:
-    symbols = tuple(
-        sorted(
-            (item.symbol, item.scope_roles)
-            for item in members
-            if "required_user" in item.scope_roles or "required_index" in item.scope_roles
-        )
-    )
-    token = "f" * 64
-    digest = domain_sha256(
-        "stock-eva/r2f4.2/required-symbol-snapshot/v1",
-        {
-            "schema_version": 1,
-            "snapshot_token": token,
-            "symbols": [{"symbol": s, "roles": list(r)} for s, r in symbols],
-        },
-    )
-    return RequiredSymbolSnapshotV1._from_test_fixture(
-        snapshot_id="snap-1",
-        snapshot_sha256=digest,
-        snapshot_token_digest=token,
-        symbols=symbols,
-    )
+    return RequiredSymbolSnapshotV1.from_user_capture(_user_capture(members))
+
+
+def _user_capture(members: tuple[UniverseMemberV1, ...]):
+    with tempfile.TemporaryDirectory() as directory:
+        path = __import__("pathlib").Path(directory) / "user.sqlite3"
+        store = UserStore(path)
+        connection = store._connect()
+        try:
+            required = sorted(
+                item.symbol for item in members if "required_user" in item.scope_roles
+            )
+            for ordinal, symbol in enumerate(required, start=1):
+                connection.execute(
+                    "INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        f"fixture-position-{ordinal}",
+                        symbol,
+                        "1",
+                        "1",
+                        "2026-01-01",
+                        "0",
+                        1,
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return store.capture_required_symbol_snapshot_existing()
 
 
 def _evidence(member: UniverseMemberV1, trade_date: date) -> UniverseInstrumentEvidenceV1:
@@ -454,6 +489,7 @@ def test_required_index_identity_and_state_are_closed():
             exact_pit_cutoff="2026-09-01T18:00:00Z",
             source_refs=_contract().source_refs,
             members=(_member("sh.600000"),),
+            calendar_authority=_calendar_authority(date(2026, 9, 1)),
         )
 
 
@@ -462,7 +498,12 @@ def test_sidecar_refuses_promotion_without_persisted_evidence_bundle(tmp_path):
     store = UniverseSidecarStore(path)
     store.initialize()
     with pytest.raises(UniverseStoreUnavailable):
-        store.promote(_contract(), expected_sequence=0, expected_head_sha256=None)
+        store.promote(
+            _contract(),
+            expected_sequence=0,
+            expected_head_sha256=None,
+            calendar_authority=_calendar_authority(date(2026, 9, 1)),
+        )
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM universe_head").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM universe_contract").fetchone()[0] == 0
@@ -501,6 +542,7 @@ def test_sidecar_reader_rejects_missing_bidirectional_role_link(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(contract.trade_date),
     )
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TRIGGER contract_evidence_no_delete")
@@ -529,6 +571,7 @@ def test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper(t
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(contract.trade_date),
     )
     head = store.read_head()
     assert head is not None and head.sequence == 1
@@ -553,6 +596,7 @@ def test_sidecar_cas_conflict_does_not_change_head(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(first.trade_date),
     )
     with pytest.raises(UniverseStoreUnavailable):
         candidate = _contract((_member("sh.600002"),))
@@ -565,6 +609,7 @@ def test_sidecar_cas_conflict_does_not_change_head(tmp_path):
             evidence=evidence,
             authority_bundle=_authority(mapping, evidence),
             required_snapshot=snapshot,
+            calendar_authority=_calendar_authority(candidate.trade_date),
         )
     assert store.read_head().sequence == 1
 
@@ -595,6 +640,7 @@ def test_sidecar_schema_is_exact_and_parent_cas_is_atomic(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(first.trade_date),
     )
     second = _contract(
         (_member("sh.600002"), _member("sh.000001", role="required_index")),
@@ -610,6 +656,7 @@ def test_sidecar_schema_is_exact_and_parent_cas_is_atomic(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(second.trade_date),
     )
     assert second_head.sequence == 2
     with pytest.raises(UniverseStoreUnavailable):
@@ -626,6 +673,7 @@ def test_sidecar_schema_is_exact_and_parent_cas_is_atomic(tmp_path):
             mapping=mapping,
             evidence=evidence,
             required_snapshot=snapshot,
+            calendar_authority=_calendar_authority(candidate.trade_date),
         )
     assert store.read_head().head_sha256 == second_head.head_sha256
     with sqlite3.connect(path) as connection:

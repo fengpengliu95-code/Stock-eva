@@ -39,6 +39,9 @@ def test_unpublishable_contract_cannot_be_promoted(tmp_path):
             mapping=mapping,
             evidence=evidence,
             required_snapshot=snapshot,
+            calendar_authority=__import__(
+                "tests.test_market_universe", fromlist=["_calendar_authority"]
+            )._calendar_authority(contract.trade_date),
         )
 
 
@@ -68,6 +71,9 @@ def test_index_evidence_must_bind_required_index_role(tmp_path):
             mapping=mapping,
             evidence=bad,
             required_snapshot=snapshot,
+            calendar_authority=__import__(
+                "tests.test_market_universe", fromlist=["_calendar_authority"]
+            )._calendar_authority(contract.trade_date),
         )
 
 
@@ -85,6 +91,9 @@ def test_orphan_evidence_invalidates_global_sidecar(tmp_path):
         evidence=evidence,
         authority_bundle=_authority(mapping, evidence),
         required_snapshot=snapshot,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(contract.trade_date),
     )
     orphan = _evidence(contract.members[0], contract.trade_date).model_dump()
     orphan["evidence_id"] = "orphan-evidence"

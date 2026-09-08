@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.app.security_identity import derive_security_identity
 from backend.app.user.database import user_database_initialization
 from backend.app.user.models import (
     Position,
@@ -137,6 +141,7 @@ class RequiredUserSymbolSnapshotRead:
 class UserStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._descriptor_fds: dict[int, int] = {}
 
     def _connect(self) -> sqlite3.Connection:
         with user_database_initialization(self.path):
@@ -183,8 +188,42 @@ class UserStore:
         """Open only an already existing, exact user DB; never initialize it."""
         if not self.path.exists() or self.path.is_symlink() or not self.path.is_file():
             raise UserDataError("existing user database unavailable")
+        descriptor: int | None = None
+        connection: sqlite3.Connection | None = None
         try:
-            connection = sqlite3.connect(self.path, timeout=0)
+            descriptor = os.open(
+                self.path,
+                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = os.stat(self.path, follow_symlinks=False)
+            if not stat.S_ISREG(descriptor_stat.st_mode) or (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ) != (path_stat.st_dev, path_stat.st_ino):
+                raise UserDataError("existing user database descriptor changed")
+            # SQLite cannot resolve a WAL sidecar when opened through /dev/fd/N
+            # (it would look for `/dev/fd/N-wal`). Resolve the already-open
+            # descriptor to its canonical path, then keep the descriptor alive
+            # for the entire descriptor-bound transaction. The fstat/lstat
+            # checks above and below make a pathname swap fail closed while the
+            # connection is being admitted; subsequent reads use the opened
+            # inode, not a re-resolved user-supplied path.
+            getpath = getattr(fcntl, "F_GETPATH", None)
+            if getpath is not None:
+                opened_path = fcntl.fcntl(descriptor, getpath, b"\0" * 1024)
+                opened_path = opened_path.split(b"\0", 1)[0].decode()
+            else:
+                opened_path = os.readlink(f"/proc/self/fd/{descriptor}")
+            connection = sqlite3.connect(opened_path, timeout=0)
+            opened_stat = os.stat(opened_path, follow_symlinks=False)
+            if (opened_stat.st_dev, opened_stat.st_ino) != (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ):
+                raise UserDataError("existing user database descriptor changed")
+            self._descriptor_fds[id(connection)] = descriptor
+            descriptor = None
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 0")
@@ -220,11 +259,16 @@ class UserStore:
                 if found != columns:
                     raise UserDataError("user database columns are not exact")
             return connection
-        except (sqlite3.Error, UserDataError):
+        except (OSError, sqlite3.Error, UserDataError):
             try:
-                connection.close()
-            except UnboundLocalError:
-                pass
+                if connection is not None:
+                    owned = self._descriptor_fds.pop(id(connection), None)
+                    connection.close()
+                    if owned is not None:
+                        os.close(owned)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
             raise
 
     def capture_required_symbol_snapshot_existing(self) -> RequiredUserSymbolSnapshotRead:
@@ -256,6 +300,13 @@ class UserStore:
                 symbol = row["symbol"]
                 if not isinstance(symbol, str) or re.fullmatch(_USER_SYMBOL, symbol) is None:
                     raise UserDataError("user symbol is unsafe")
+                identity = derive_security_identity(symbol, "1")
+                if identity.security_type != "stock" or identity.board not in {
+                    "main",
+                    "chinext",
+                    "star",
+                }:
+                    raise UserDataError("user symbol is not an eligible A-share stock")
                 roles.setdefault(symbol, set()).add("position")
                 user_rows.append({"table": "positions", "row": dict(row)})
             for row in watchlists:
@@ -264,6 +315,13 @@ class UserStore:
                 symbol = row["symbol"]
                 if not isinstance(symbol, str) or re.fullmatch(_USER_SYMBOL, symbol) is None:
                     raise UserDataError("user symbol is unsafe")
+                identity = derive_security_identity(symbol, "1")
+                if identity.security_type != "stock" or identity.board not in {
+                    "main",
+                    "chinext",
+                    "star",
+                }:
+                    raise UserDataError("user symbol is not an eligible A-share stock")
                 roles.setdefault(symbol, set()).add("watchlist")
                 user_rows.append({"table": "watchlist_items", "row": dict(row)})
             symbols = tuple(sorted(roles))
@@ -299,7 +357,10 @@ class UserStore:
                 raise
             raise UserDataError("user snapshot capture unavailable") from exc
         finally:
+            descriptor = self._descriptor_fds.pop(id(connection), None)
             connection.close()
+            if descriptor is not None:
+                os.close(descriptor)
 
     @staticmethod
     def _position(row: sqlite3.Row) -> Position:

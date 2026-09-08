@@ -361,6 +361,29 @@ class CalendarReadResult(_Frozen):
     calendar: ImmutableCalendarSnapshot | None = None
 
 
+_CALENDAR_ADMISSION_SECRET = object()
+
+
+class CalendarAuthorityAdmission:
+    """Opaque reader-owned R2-F4.1 proof; callers cannot mint one from a model."""
+
+    __slots__ = ("read_result", "head_generation_sha256")
+
+    def __init__(
+        self,
+        read_result: CalendarReadResult,
+        *,
+        head_generation_sha256: str | None,
+        _secret: object | None = None,
+    ) -> None:
+        if _secret is not _CALENDAR_ADMISSION_SECRET:
+            raise TypeError("calendar authority admission is reader-owned")
+        if not isinstance(read_result, CalendarReadResult):
+            raise TypeError("calendar authority read result invalid")
+        self.read_result = read_result
+        self.head_generation_sha256 = head_generation_sha256
+
+
 class CalendarSourceMetadata(_Frozen):
     exchange: str
     title: str
@@ -1609,6 +1632,15 @@ class CalendarGenerationStore:
 
     def read(self) -> CalendarReadResult:
         return self.read_control().read_result
+
+    def read_authority(self) -> CalendarAuthorityAdmission:
+        control = self.read_control()
+        generation = control.read_result.generation
+        return CalendarAuthorityAdmission(
+            control.read_result,
+            head_generation_sha256=(generation.generation_sha256 if generation else None),
+            _secret=_CALENDAR_ADMISSION_SECRET,
+        )
 
     def reserve_attempt(
         self,
