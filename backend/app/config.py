@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     regime_snapshot_database_name: str = "market_regime_snapshots.sqlite3"
     provider_health_database_name: str = "provider_health.sqlite3"
     provider_registry_database_name: str = "provider_registry.sqlite3"
+    universe_contract_database_name: str = "market_universe.sqlite3"
+    market_universe_mode: str = "off"
+    market_universe_maintenance_enabled: bool = False
+    market_universe_maintenance_interval_seconds: int = Field(default=86400, ge=60, le=604800)
     daily_bar_shadow_database_name: str = "daily_bar_shadow.sqlite3"
     daily_bar_shadow_calendar_root: Path | None = None
     local_staging_dir: Path = Path("var/staging")
@@ -147,6 +151,7 @@ class Settings(BaseSettings):
         "provider_registry_database_name",
         "daily_bar_shadow_database_name",
         "calendar_generation_database_name",
+        "universe_contract_database_name",
     )
     @classmethod
     def validate_provider_registry_database_name(cls, value: str) -> str:
@@ -255,6 +260,8 @@ class Settings(BaseSettings):
     def private_database_names_are_distinct(self) -> "Settings":
         if self.user_database_name.casefold() == self.portfolio_database_name.casefold():
             raise ValueError("user and portfolio database names must be distinct")
+        if self.market_universe_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("market universe mode is unsupported")
         control_databases = (
             self.factor_cache_database_name,
             self.calendar_sync_database_name,
@@ -263,6 +270,7 @@ class Settings(BaseSettings):
             self.provider_health_database_name,
             self.provider_registry_database_name,
             self.daily_bar_shadow_database_name,
+            self.universe_contract_database_name,
         )
         if len({name.casefold() for name in control_databases}) != len(control_databases):
             raise ValueError("local control database names must be distinct")

@@ -29,6 +29,9 @@ class StorageLayout:
             provider_health_database=(
                 self.settings.local_control_dir / self.settings.provider_health_database_name
             ),
+            universe_contract_database=(
+                self.settings.local_control_dir / self.settings.universe_contract_database_name
+            ),
         )
 
     @property
@@ -50,6 +53,10 @@ class StorageLayout:
     @property
     def provider_health_database(self) -> Path:
         return self.local_paths.provider_health_database
+
+    @property
+    def universe_contract_database(self) -> Path:
+        return self.local_paths.universe_contract_database
 
     @property
     def provider_registry_database(self) -> Path:

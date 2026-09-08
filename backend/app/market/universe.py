@@ -1074,9 +1074,8 @@ class UniversePublicationContextV1(_Frozen):
         expected_refs = tuple(
             sorted(
                 {
-                    lineage["evidence_id"],
                     lineage["evidence_sha256"],
-                    lineage["candidate_id"],
+                    lineage["candidate_manifest_sha256"],
                     lineage["gate_report_sha256"],
                 }
             )
@@ -3207,6 +3206,32 @@ class UniverseSidecarStore:
             )
         except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise UniverseStoreUnavailable("universe source state unavailable") from exc
+        finally:
+            connection.close()
+
+    def read_latest_terminal_finished_at(self, trade_date: date) -> datetime | None:
+        """Read the durable terminal timestamp used by maintenance due checks."""
+        if isinstance(trade_date, str):
+            trade_date = date.fromisoformat(trade_date)
+        if not self.path.exists() or self.path.is_symlink():
+            raise UniverseStoreUnavailable("universe sidecar unavailable")
+        connection = self._connect(readonly=True)
+        try:
+            connection.execute("BEGIN DEFERRED")
+            self._validate(connection)
+            row = connection.execute(
+                "SELECT r.finished_at FROM universe_attempt_result r "
+                "JOIN universe_attempt a ON a.attempt_id=r.attempt_id "
+                "WHERE a.trade_date=? AND r.terminal_status IN "
+                "('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE') "
+                "ORDER BY r.finished_at DESC, r.attempt_id DESC LIMIT 1",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if row is None:
+                return None
+            return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise UniverseStoreUnavailable("universe terminal state unavailable") from exc
         finally:
             connection.close()
 

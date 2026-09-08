@@ -35,6 +35,7 @@ from backend.app.market.automation import (
     canonical_refresh_callback,
     collect_required_symbols,
     get_market_clock,
+    make_universe_post_success_hook,
     run_publication_refresh,
 )
 from backend.app.market.backfill import (
@@ -96,6 +97,7 @@ from backend.app.market.providers.registry import RegistryUnavailable, ShadowReg
 from backend.app.market.providers.shadow_contracts import ShadowProviderId
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
+from backend.app.market.universe import UniverseSidecarStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.regime.acceptance import (
     MINIMUM_RELEASE_ONE_SESSIONS,
@@ -2678,6 +2680,16 @@ def main() -> int:
                 repair_enabled=(repair_executor is not None),
                 repair_executor=repair_executor,
                 canonical_refresh=canonical_refresh,
+                universe_post_success_hook=make_universe_post_success_hook(
+                    environment=settings.environment,
+                    mode=settings.market_universe_mode,
+                    enabled=settings.market_universe_maintenance_enabled,
+                    interval_seconds=settings.market_universe_maintenance_interval_seconds,
+                    sidecar=UniverseSidecarStore(layout.universe_contract_database),
+                ),
+                market_universe_maintenance_enabled=settings.market_universe_maintenance_enabled,
+                market_universe_mode=settings.market_universe_mode,
+                environment=settings.environment,
             )
             outcome = service.run_due_once(now)
             provider_health = health_store.provider_health()

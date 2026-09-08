@@ -15,6 +15,7 @@ from backend.app.market.automation import (
     canonical_refresh_callback,
     collect_required_symbols,
     get_market_clock,
+    make_universe_post_success_hook,
     run_automation_loop,
 )
 from backend.app.market.baostock import BaoStockProvider
@@ -37,6 +38,7 @@ from backend.app.market.continuity import (
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore, MarketStoreReadError
+from backend.app.market.universe import UniverseSidecarStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
@@ -267,6 +269,16 @@ async def lifespan(_: FastAPI):
         repair_enabled=(repair_executor is not None),
         repair_executor=repair_executor,
         canonical_refresh=canonical_refresh,
+        universe_post_success_hook=make_universe_post_success_hook(
+            environment=settings.environment,
+            mode=settings.market_universe_mode,
+            enabled=settings.market_universe_maintenance_enabled,
+            interval_seconds=settings.market_universe_maintenance_interval_seconds,
+            sidecar=UniverseSidecarStore(layout.universe_contract_database),
+        ),
+        market_universe_maintenance_enabled=settings.market_universe_maintenance_enabled,
+        market_universe_mode=settings.market_universe_mode,
+        environment=settings.environment,
     )
     calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
     calendar_service = CalendarSyncService(
