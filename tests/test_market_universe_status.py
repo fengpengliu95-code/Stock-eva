@@ -37,7 +37,9 @@ def _record_changed_source_failure(store, contract, evidence, *, reason: str):
         trade_date=contract.trade_date,
         provider_id="baostock",
         source_version_digest=digest,
-        source_refs_json=canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+        source_refs_json=canonical_json_bytes(
+            refs.model_dump(mode="json", warnings="error")
+        ).decode(),
         verified_at=observed_at,
     )
     operation_day = date(2026, 9, 2)
@@ -55,7 +57,7 @@ def _record_changed_source_failure(store, contract, evidence, *, reason: str):
         "refresh_id": "status-test-refresh",
         "request_budget": 1,
         "classification_max_attempts": 1,
-        "created_at": created_at.isoformat(),
+        "created_at": created_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "attempt_status": "RUNNING",
     }
     plan = UniverseAttemptPlanV1(
@@ -81,7 +83,7 @@ def _record_changed_source_failure(store, contract, evidence, *, reason: str):
         "classification_request_count": 0,
         "reason_code": reason,
         "source_state_id": source_id,
-        "finished_at": finished_at.isoformat(),
+        "finished_at": finished_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
     }
     result = UniverseAttemptResultV1(
         attempt_id=plan.attempt_id,
@@ -286,7 +288,7 @@ def test_source_version_and_terminal_attempt_status_matrix(tmp_path):
                 contract.trade_date.isoformat(),
                 "baostock",
                 digest,
-                canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+                canonical_json_bytes(refs.model_dump(mode="json", warnings="error")).decode(),
                 "2026-09-02T08:00:00+00:00",
             ),
         )
@@ -316,6 +318,57 @@ def test_source_version_and_terminal_attempt_status_matrix(tmp_path):
     assert blocked["status"] == "blocked"
     assert blocked["reason_code"] == "CLASSIFICATION_UNAVAILABLE"
     assert blocked["contract_id"] is None
+
+
+def test_equal_timestamp_newer_source_state_id_is_stale(tmp_path):
+    store = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+    store.initialize()
+    contract = _contract(trade_date=date(2026, 9, 1))
+    mapping, evidence, snapshot = _bundle(contract)
+    store.promote(
+        contract,
+        expected_sequence=0,
+        expected_head_sha256=None,
+        mapping=mapping,
+        evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
+        required_snapshot=snapshot,
+        calendar_authority=_calendar_authority(contract.trade_date),
+    )
+    _head, _promoted, head_source, _source_rows, _attempts = store.read_status_snapshot(
+        contract.trade_date
+    )
+    assert head_source is not None
+    # Source state ordering is (verified_at, source_state_id), not timestamp alone.
+    for version in range(2, 100):
+        refs = contract.source_refs.model_copy(
+            update={"classification_source_version": f"v{version}"}
+        )
+        digest = source_version_digest(refs, evidence)
+        refs = refs.model_copy(update={"source_version_digest": digest})
+        source_id, source_sha = _source_state_identity(refs)
+        if source_id <= head_source.source_state_id:
+            continue
+        break
+    else:
+        raise AssertionError("fixture did not produce a lexically newer source state id")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO universe_source_state VALUES (?,?,?,?,?,?,?)",
+            (
+                source_id,
+                source_sha,
+                contract.trade_date.isoformat(),
+                "baostock",
+                digest,
+                canonical_json_bytes(refs.model_dump(mode="json", warnings="error")).decode(),
+                head_source.verified_at.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        connection.commit()
+    status = build_universe_status(contract.trade_date, store, now=datetime(2026, 9, 2, tzinfo=UTC))
+    assert status["status"] == "stale"
+    assert status["reason_code"] == "UNIVERSE_SOURCE_VERSION_CHANGED"
 
 
 def test_api_and_cli_project_the_same_promoted_snapshot(tmp_path, monkeypatch, capsys):

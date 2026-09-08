@@ -93,6 +93,7 @@ from backend.app.market.universe import (
     UniverseSourceStateV1,
     UniverseStoreUnavailable,
     _source_state_identity,
+    _utc_z,
     build_universe_contract,
     canonical_json_bytes,
     classification_snapshot_sha256,
@@ -205,8 +206,12 @@ class MainBoardInspection:
     ) -> "LegacyPreflightSnapshot":
         symbols = tuple(sorted(set(observed_symbols)))
         return LegacyPreflightSnapshot(
-            inspection=self,
-            observed_symbols=symbols,
+            trade_date=self.trade_date,
+            main_board_count=self.main_board_count,
+            shanghai_count=self.shanghai_count,
+            shenzhen_count=self.shenzhen_count,
+            total_expected_count=self.total_expected_count,
+            metadata_provider_requests=self.metadata_provider_requests,
             observed_symbol_count=len(symbols),
             observed_symbols_sha256=_symbol_set_sha256(symbols),
         )
@@ -214,8 +219,14 @@ class MainBoardInspection:
 
 @dataclass(frozen=True)
 class LegacyPreflightSnapshot:
-    inspection: MainBoardInspection
-    observed_symbols: tuple[str, ...]
+    """Bounded builder diagnostic; raw symbols never cross the callback boundary."""
+
+    trade_date: date
+    main_board_count: int
+    shanghai_count: int
+    shenzhen_count: int
+    total_expected_count: int
+    metadata_provider_requests: int
     observed_symbol_count: int
     observed_symbols_sha256: str
 
@@ -230,12 +241,12 @@ class LegacyBuilderDiagnostic:
 
 @dataclass(frozen=True)
 class CanonicalRefreshExecution:
-    """Private additive handoff; legacy callers still see RefreshResult attributes."""
+    """Bounded additive handoff; raw provider symbols stay inside the callback."""
 
     result: RefreshResult
-    legacy_shadow_input: LegacyPreflightSnapshot | None = None
     builder_outcome: Literal["accepted", "rejected"] = "rejected"
     builder_diagnostic: LegacyBuilderDiagnostic | None = None
+    legacy_shadow_observation: "LegacyShadowObservation | None" = None
 
     def __getattr__(self, name: str):
         return getattr(self.result, name)
@@ -317,61 +328,6 @@ def classify_universe_mode(environment: object, mode: object) -> UniverseMainten
     return UniverseMaintenanceDecision(action="run", reason_code=None, provider_requests=0)
 
 
-class UniverseMaintenanceRunner:
-    """Dependency-injected writer pipeline; no dependency is invoked at construction."""
-
-    def __init__(
-        self,
-        *,
-        calendar_authority_reader: Callable[..., object],
-        required_snapshot_capture: Callable[..., object],
-        classification_fetcher: Callable[..., object],
-        contract_builder: Callable[..., object],
-        sidecar_promoter: Callable[..., object],
-    ) -> None:
-        self.calendar_authority_reader = calendar_authority_reader
-        self.required_snapshot_capture = required_snapshot_capture
-        self.classification_fetcher = classification_fetcher
-        self.contract_builder = contract_builder
-        self.sidecar_promoter = sidecar_promoter
-        self._claimed_operation_days: set[tuple[str, str]] = set()
-        self._claim_lock = threading.Lock()
-
-    def __call__(self, *, trade_date: str, now: str, context: object, sidecar: object):
-        try:
-            operation_day = (
-                datetime.fromisoformat(now.replace("Z", "+00:00"))
-                .astimezone(SHANGHAI)
-                .date()
-                .isoformat()
-            )
-            key = (trade_date, operation_day)
-            with self._claim_lock:
-                if key in self._claimed_operation_days:
-                    return UniverseHookResult(
-                        status="DEFER", reason_code="NONE", provider_requests=0
-                    )
-                self._claimed_operation_days.add(key)
-            calendar = self.calendar_authority_reader(trade_date=trade_date, now=now)
-            snapshot = self.required_snapshot_capture()
-            evidence = self.classification_fetcher(trade_date=trade_date, calendar=calendar)
-            contract = self.contract_builder(
-                trade_date=trade_date,
-                calendar=calendar,
-                required_snapshot=snapshot,
-                evidence=evidence,
-                context=context,
-            )
-            promoted = self.sidecar_promoter(sidecar=sidecar, contract=contract)
-            if isinstance(promoted, UniverseHookResult):
-                return promoted
-            return UniverseHookResult(status="PROMOTED", reason_code=None, provider_requests=1)
-        except Exception:
-            return UniverseHookResult(
-                status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
-            )
-
-
 class UniverseMaintenanceService:
     """Concrete, bounded writer for the post-success Universe maintenance lane.
 
@@ -425,7 +381,7 @@ class UniverseMaintenanceService:
             "classification_request_count": request_count,
             "reason_code": reason,
             "source_state_id": source_state_id,
-            "finished_at": finished_at.isoformat(),
+            "finished_at": _utc_z(finished_at),
         }
         return UniverseAttemptResultV1(
             attempt_id=attempt_id,
@@ -452,12 +408,15 @@ class UniverseMaintenanceService:
             }
         else:
             observed_at = getattr(generation, "observed_at", None)
-            if isinstance(observed_at, datetime) and observed_at.tzinfo is not None:
-                observed_text = observed_at.astimezone(UTC).isoformat()
+            if isinstance(observed_at, datetime):
+                try:
+                    observed_text = _utc_z(observed_at)
+                except ValueError:
+                    observed_text = None
             else:
-                # This value is only a durable identity for a blocked attempt; it is
-                # never admitted into SourceRefs until the strict PIT check passes.
-                observed_text = str(observed_at)
+                # Invalid or absent timestamps are represented as an explicit null in
+                # the blocked-attempt identity; no non-canonical time enters a hash.
+                observed_text = None
             projection = {
                 "provider_id": "baostock",
                 "adapter_version": "r2f4.2-universe.v1",
@@ -659,8 +618,6 @@ class UniverseMaintenanceService:
             if not isinstance(snapshot, ClassificationSnapshot):
                 raise ProviderHealthError("universe classification snapshot is invalid")
             admit = getattr(self.reviewed_authority, "admit", None)
-            if not callable(admit) and callable(self.reviewed_authority):
-                admit = self.reviewed_authority
             if not callable(admit):
                 raise ProviderHealthError("reviewed classification authority is unavailable")
             authority = admit(snapshot, trade_date=trade_date, refresh_id=refresh_id)
@@ -865,7 +822,7 @@ class UniverseMaintenanceService:
                     "refresh_id": sealed.run_id,
                     "request_budget": 1,
                     "classification_max_attempts": 1,
-                    "created_at": current.astimezone(UTC).isoformat(),
+                    "created_at": _utc_z(current),
                     "attempt_status": "RUNNING",
                 }
                 plan_values["dedup_key"] = domain_sha256(
@@ -1131,7 +1088,9 @@ class UniverseMaintenanceService:
                     trade_date=target,
                     provider_id="baostock",
                     source_version_digest=refs.source_version_digest,
-                    source_refs_json=canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+                    source_refs_json=canonical_json_bytes(
+                        refs.model_dump(mode="json", warnings="error")
+                    ).decode(),
                     verified_at=cutoff,
                 )
                 head = self.sidecar.read_head()
@@ -1302,9 +1261,9 @@ class UniverseMaintenanceService:
 class ConcreteUniversePostSuccessHook:
     """Safe, default-closed maintenance adapter for the Universe sidecar.
 
-    The enabled shadow lane is backed by ``UniverseMaintenanceService``.  The
-    legacy callable remains accepted for old integrations, while production
-    factories construct the concrete service from strict readers.
+    The enabled shadow lane is backed exclusively by ``UniverseMaintenanceService``.
+    There is no callable runner escape hatch: a misconfigured enabled lane reports
+    an explicit control failure and cannot perform provider work.
     """
 
     def __init__(
@@ -1314,32 +1273,20 @@ class ConcreteUniversePostSuccessHook:
         mode: str,
         enabled: bool,
         interval_seconds: int = 86400,
-        sidecar: object | None = None,
-        maintenance_runner: UniverseMaintenanceRunner
-        | UniverseMaintenanceService
-        | Callable[..., UniverseHookResult]
-        | None = None,
+        maintenance_service: UniverseMaintenanceService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if maintenance_service is not None and not isinstance(
+            maintenance_service, UniverseMaintenanceService
+        ):
+            raise TypeError("maintenance_service must be UniverseMaintenanceService")
         self.environment = environment
         self.mode = mode
         self.enabled = enabled
         self.interval_seconds = interval_seconds
-        self.sidecar = sidecar
-        self.maintenance_runner = maintenance_runner
+        self.maintenance_service = maintenance_service
         self.clock = clock
         self.last_offer: tuple[str, str] | None = None
-
-    def _terminal_finished_at(self, trade_date: str) -> datetime | None:
-        reader = getattr(self.sidecar, "read_latest_terminal_finished_at", None)
-        if not callable(reader):
-            return None
-        value = reader(date.fromisoformat(trade_date))
-        if value is None:
-            return None
-        if not isinstance(value, datetime) or value.tzinfo is None:
-            raise ValueError("terminal timestamp is not trusted")
-        return value.astimezone(UTC)
 
     def offer(
         self,
@@ -1358,66 +1305,29 @@ class ConcreteUniversePostSuccessHook:
                 reason_code=decision.reason_code,
                 provider_requests=0,
             )
+        if self.maintenance_service is None:
+            return UniverseHookResult(
+                status="BLOCKED",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                provider_requests=0,
+            )
         try:
             current = (
                 self.clock()
                 if self.clock is not None
                 else datetime.fromisoformat(now.replace("Z", "+00:00"))
             )
-            if current.tzinfo is None:
+            if current.tzinfo is None or current.utcoffset() is None:
                 raise ValueError("maintenance timestamp is not timezone aware")
             if context is not None and not isinstance(context, UniversePublicationContextV1):
                 raise TypeError("publication context is not sealed")
             if context is not None and context.trade_date.isoformat() != trade_date:
                 raise ValueError("publication context date mismatch")
-            strict_service = isinstance(self.maintenance_runner, UniverseMaintenanceService)
-            first_attempt = strict_service
-            terminal = None
-            if not strict_service:
-                try:
-                    terminal = self._terminal_finished_at(trade_date)
-                except UniverseStoreUnavailable:
-                    first_attempt = bool(
-                        self.sidecar is not None
-                        and isinstance(getattr(self.sidecar, "path", None), Path)
-                        and not self.sidecar.path.exists()
-                    )
-                    if not first_attempt:
-                        raise
-                    terminal = None
-                if terminal is None and not first_attempt:
-                    head = self.sidecar.read_head()
-                    if head is not None:
-                        return UniverseHookResult(
-                            status="DEFER",
-                            reason_code="CONTROL_STATE_UNAVAILABLE",
-                            provider_requests=0,
-                        )
-                    first_attempt = True
-                if terminal is not None and current.astimezone(UTC) < terminal:
-                    return UniverseHookResult(
-                        status="DEFER",
-                        reason_code="CONTROL_STATE_UNAVAILABLE",
-                        provider_requests=0,
-                    )
-                if (
-                    not first_attempt
-                    and (current.astimezone(UTC) - terminal).total_seconds() < self.interval_seconds
-                ):
-                    return UniverseHookResult(
-                        status="DEFER", reason_code="NONE", provider_requests=0
-                    )
-            if self.sidecar is None or self.maintenance_runner is None:
-                return UniverseHookResult(
-                    status="DEFER",
-                    reason_code="CONTROL_STATE_UNAVAILABLE",
-                    provider_requests=0,
-                )
-            result = self.maintenance_runner(
+            result = self.maintenance_service(
                 trade_date=trade_date,
                 now=now,
                 context=context,
-                sidecar=self.sidecar,
+                sidecar=self.maintenance_service.sidecar,
             )
             if not isinstance(result, UniverseHookResult):
                 raise TypeError("maintenance result is not typed")
@@ -1428,15 +1338,6 @@ class ConcreteUniversePostSuccessHook:
                 reason_code="CONTROL_STATE_UNAVAILABLE",
                 provider_requests=0,
             )
-
-
-class _UnavailableUniverseMaintenanceService:
-    """Typed configuration failure for an explicitly enabled lane."""
-
-    def __call__(self, *, trade_date: str, now: str, context: object, sidecar: object):
-        return UniverseHookResult(
-            status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
-        )
 
 
 def make_universe_post_success_hook(
@@ -1457,12 +1358,12 @@ def make_universe_post_success_hook(
     reviewed_authority: object | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ConcreteUniversePostSuccessHook:
-    maintenance_runner: UniverseMaintenanceService | None = maintenance_service
+    strict_service: UniverseMaintenanceService | None = maintenance_service
     provider_is_bound = provider_factory is not None or isinstance(
         reviewed_authority, UniverseAuthorityBundleV1
     )
     if (
-        maintenance_runner is None
+        strict_service is None
         and provider_is_bound
         and all(
             item is not None
@@ -1477,7 +1378,7 @@ def make_universe_post_success_hook(
             )
         )
     ):
-        maintenance_runner = UniverseMaintenanceService(
+        strict_service = UniverseMaintenanceService(
             sidecar=sidecar,
             calendar_store=calendar_store,
             classification_store=classification_store,
@@ -1490,15 +1391,12 @@ def make_universe_post_success_hook(
             interval_seconds=interval_seconds,
             clock=clock,
         )
-    if maintenance_runner is None and enabled:
-        maintenance_runner = _UnavailableUniverseMaintenanceService()
     return ConcreteUniversePostSuccessHook(
         environment=environment,
         mode=mode,
         enabled=enabled,
         interval_seconds=interval_seconds,
-        sidecar=sidecar,
-        maintenance_runner=maintenance_runner,
+        maintenance_service=strict_service,
         clock=clock,
     )
 
@@ -1511,7 +1409,7 @@ def observe_legacy_request_universe(
 ) -> LegacyShadowObservation:
     if contract is None:
         return LegacyShadowObservation(
-            request_trade_date=snapshot.inspection.trade_date,
+            request_trade_date=snapshot.trade_date,
             contract_sha256=None,
             expected_symbol_count=None,
             observed_symbol_count=snapshot.observed_symbol_count,
@@ -1528,34 +1426,39 @@ def observe_legacy_request_universe(
             if getattr(item, "expected_trading_state", None) in {"trading", "suspended"}
         )
     )
-    observed = snapshot.observed_symbols
-    missing = tuple(item for item in expected if item not in observed)
-    extra = tuple(item for item in observed if item not in expected)
+    expected_hash = _symbol_set_sha256(expected)
+    # The observer receives only the digest/count projection.  Reconstructing
+    # or returning provider symbols here would make the callback's public
+    # execution object a second raw-universe channel.
+    drifted = (
+        snapshot.observed_symbol_count != len(expected)
+        or snapshot.observed_symbols_sha256 != expected_hash
+    )
     drift = None
-    if missing or extra:
+    if drifted:
         from backend.app.market.universe import domain_sha256
 
         drift = domain_sha256(
             "stock-eva/r2f4.2/legacy-shadow-drift/v1",
             {
                 "provider_id": "baostock",
-                "request_trade_date": snapshot.inspection.trade_date.isoformat(),
+                "request_trade_date": snapshot.trade_date.isoformat(),
                 "contract_sha256": getattr(contract, "contract_sha256", None),
-                "expected_symbols": expected,
-                "observed_symbols": observed,
-                "missing_symbols": missing,
-                "extra_symbols": extra,
+                "expected_symbol_count": len(expected),
+                "expected_symbols_sha256": expected_hash,
+                "observed_symbol_count": snapshot.observed_symbol_count,
+                "observed_symbols_sha256": snapshot.observed_symbols_sha256,
             },
         )
     return LegacyShadowObservation(
-        request_trade_date=snapshot.inspection.trade_date,
+        request_trade_date=snapshot.trade_date,
         contract_sha256=getattr(contract, "contract_sha256", None),
         expected_symbol_count=len(expected),
-        observed_symbol_count=len(observed),
-        missing_required_symbol_count=len(missing),
-        extra_symbol_count=len(extra),
+        observed_symbol_count=snapshot.observed_symbol_count,
+        missing_required_symbol_count=None if drifted else 0,
+        extra_symbol_count=None if drifted else 0,
         drift_sha256=drift,
-        reason_code="LEGACY_SHADOW_DRIFT" if missing or extra else "NONE",
+        reason_code="LEGACY_SHADOW_DRIFT" if drifted else "NONE",
         control_reason=None,
     )
 
@@ -1771,7 +1674,9 @@ def build_canonical_raw_request(
     plan = ExpectedLogicalRequestPlan(
         requests=tuple(requests),
         request_count=len(requests),
-        request_plan_hash=_digest([item.model_dump(mode="json") for item in requests]),
+        request_plan_hash=_digest(
+            [item.model_dump(mode="json", warnings="error") for item in requests]
+        ),
     )
     return ProviderRequest(
         provider_id=ProviderId.BAOSTOCK,
@@ -1839,8 +1744,11 @@ def canonical_refresh_callback(
 
         inspection: MainBoardInspection | None = None
         preflight: LegacyPreflightSnapshot | None = None
+        request: ProviderRequest | None = None
+        main_symbols: tuple[str, ...] = ()
         builder_outcome: Literal["accepted", "rejected"] = "rejected"
         builder_diagnostic: LegacyBuilderDiagnostic | None = None
+        legacy_shadow_observation: LegacyShadowObservation | None = None
         try:
             with adapter_scope():
                 inspection = inspect_legacy_main_board_input(adapter, trade_date)
@@ -1852,6 +1760,7 @@ def canonical_refresh_callback(
                     inspection=inspection,
                 )
             builder_outcome = "accepted"
+            assert request is not None
             stock_request = next(
                 item
                 for item in request.logical_request_plan.requests
@@ -1864,6 +1773,9 @@ def canonical_refresh_callback(
                 observed_symbol_count=preflight.observed_symbol_count,
                 observed_symbols_sha256=preflight.observed_symbols_sha256,
                 failure_class="NONE",
+            )
+            legacy_shadow_observation = observe_legacy_request_universe(
+                preflight, builder_outcome, builder_diagnostic, None
             )
         except Exception as error:
             if inspection is not None:
@@ -1880,12 +1792,19 @@ def canonical_refresh_callback(
                     "INPUT_REJECTED" if isinstance(error, ProviderHealthError) else "BUILDER_ERROR"
                 ),
             )
-            return CanonicalRefreshExecution(
+            if preflight is not None:
+                legacy_shadow_observation = observe_legacy_request_universe(
+                    preflight, builder_outcome, builder_diagnostic, None
+                )
+            execution = CanonicalRefreshExecution(
                 result=failure_result(error),
-                legacy_shadow_input=preflight,
                 builder_outcome="rejected",
                 builder_diagnostic=builder_diagnostic,
+                legacy_shadow_observation=legacy_shadow_observation,
             )
+            inspection = None
+            preflight = None
+            return execution
 
         def validate_universe(batch: object) -> None:
             universe = tuple(
@@ -1911,7 +1830,7 @@ def canonical_refresh_callback(
                 if item.endpoint is ContractProviderEndpoint.DAILY_FACTOR
             )
             for _ordinal, row in enumerate(rows):
-                row_data = row.model_dump(mode="python")
+                row_data = row.model_dump(mode="python", warnings="error")
                 cache = CacheFactorResolution(
                     cache_object_id=_factor_manifest.object_id,
                     cache_object_sha256=_factor_manifest.object_sha256,
@@ -1930,7 +1849,7 @@ def canonical_refresh_callback(
                     **values,
                     resolution_sha256="0" * 64,
                 )
-                serialized = candidate.model_dump(mode="json")
+                serialized = candidate.model_dump(mode="json", warnings="error")
                 serialized.pop("resolution_sha256", None)
                 bindings.append(
                     FactorResolutionBinding(
@@ -1975,7 +1894,10 @@ def canonical_refresh_callback(
                         created_at=datetime.now(UTC),
                     )
                     normalized_payload = json.dumps(
-                        [item.model_dump(mode="json") for item in normalized.bars],
+                        [
+                            item.model_dump(mode="json", warnings="error")
+                            for item in normalized.bars
+                        ],
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
@@ -2081,7 +2003,7 @@ def canonical_refresh_callback(
                             "publication_lineage_json": lineage_json,
                             "publication_lineage_sha256": lineage_sha,
                             "status": "ready",
-                            "created_at": result.completed_at.astimezone(UTC).isoformat(),
+                            "created_at": _utc_z(result.completed_at),
                         }
                         context_sha = domain_sha256(
                             "stock-eva/r2f4.2/universe-publication-context/v1",
@@ -2105,9 +2027,9 @@ def canonical_refresh_callback(
                         _log_event(logging.WARNING, "universe_context_unavailable", outcome="ready")
                     return CanonicalRefreshExecution(
                         result=result,
-                        legacy_shadow_input=preflight,
                         builder_outcome=builder_outcome,
                         builder_diagnostic=builder_diagnostic,
+                        legacy_shadow_observation=legacy_shadow_observation,
                     )
                 finally:
                     if published_selection is not None:
@@ -2116,10 +2038,17 @@ def canonical_refresh_callback(
             except Exception as error:
                 return CanonicalRefreshExecution(
                     result=failure_result(error),
-                    legacy_shadow_input=preflight,
                     builder_outcome=builder_outcome,
                     builder_diagnostic=builder_diagnostic,
+                    legacy_shadow_observation=legacy_shadow_observation,
                 )
+            finally:
+                # Raw inspection/request symbols are scoped to the callback only.  The
+                # returned execution carries counts and hashes, never this material.
+                inspection = None
+                preflight = None
+                request = None
+                main_symbols = ()
 
     locked_execute = execute
 
@@ -3016,22 +2945,23 @@ class MarketAutomationService:
         try:
             if (
                 execution is not None
-                and execution.legacy_shadow_input is not None
+                and execution.legacy_shadow_observation is not None
                 and self.market_universe_maintenance_enabled
                 and isinstance(self.environment, str)
                 and self.environment.strip().casefold() != "production"
                 and isinstance(self.market_universe_mode, str)
                 and self.market_universe_mode.strip().casefold() == "shadow"
             ):
-                snapshot = execution.legacy_shadow_input
-                self.last_legacy_shadow_observation = observe_legacy_request_universe(
-                    snapshot, execution.builder_outcome, execution.builder_diagnostic, None
-                )
+                # The canonical callback has already reduced the raw request
+                # universe to this count/hash diagnostic while its provider
+                # objects were still scoped.  Never retain or reconstruct the
+                # symbol list in the automation outcome.
+                self.last_legacy_shadow_observation = execution.legacy_shadow_observation
                 observer = getattr(self.shadow_handoff, "offer_legacy", None)
                 if self.shadow_handoff is not None and callable(observer):
                     observer(
                         LegacyShadowHandoff(
-                            trade_date=snapshot.inspection.trade_date,
+                            trade_date=execution.legacy_shadow_observation.request_trade_date,
                             builder_outcome=execution.builder_outcome,
                             diagnostic=self.last_legacy_shadow_observation,
                         )
@@ -3103,7 +3033,7 @@ class MarketAutomationService:
             if isinstance(candidate_context, UniversePublicationContextV1):
                 try:
                     validated_context = UniversePublicationContextV1.model_validate(
-                        candidate_context.model_dump(mode="python"), strict=False
+                        candidate_context.model_dump(mode="python", warnings="error"), strict=False
                     )
                     if (
                         validated_context.run_id == execution.result.run_id
@@ -3139,7 +3069,7 @@ class MarketAutomationService:
         try:
             target = outcome.decision.target_session or now.date()
             self.last_universe_result = self.universe_post_success_hook.offer(
-                target.isoformat(), now.astimezone(UTC).isoformat(), context
+                target.isoformat(), _utc_z(now), context
             )
         except Exception:
             _log_event(logging.WARNING, "universe_maintenance_dropped", outcome="deferred")

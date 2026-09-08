@@ -49,6 +49,13 @@ _MAPPING_SCHEMAS = frozenset(
 _SNAPSHOT_ADMISSION_SECRET = object()
 
 
+def _utc_z(value: datetime) -> str:
+    """Canonical UTC timestamp for every R2-F4.2 hash preimage."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("hash timestamp must be timezone aware")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 class UniverseStoreUnavailable(RuntimeError):
     """The sidecar cannot be proven safe for authority use."""
 
@@ -111,7 +118,7 @@ def classification_source_projection_sha256(
             "source": source,
             "source_version": source_version,
             "source_snapshot_date": source_snapshot_date.isoformat(),
-            "observed_at": observed_at.astimezone(UTC).isoformat(),
+            "observed_at": _utc_z(observed_at),
             "source_date_semantics": source_date_semantics,
         },
     )
@@ -194,7 +201,7 @@ class UniverseMemberV1(_Frozen):
         return self
 
     def preimage(self) -> dict[str, Any]:
-        value = self.model_dump(mode="json")
+        value = self.model_dump(mode="json", warnings="error")
         value.pop("member_sha256", None)
         return value
 
@@ -539,7 +546,7 @@ class UniverseInstrumentEvidenceV1(_Frozen):
         return "index" if self.index_role == "required_index" else (self.security_type or "stock")
 
     def preimage(self) -> dict[str, Any]:
-        value = self.model_dump(mode="json")
+        value = self.model_dump(mode="json", warnings="error")
         value.pop("evidence_sha256", None)
         return value
 
@@ -563,7 +570,7 @@ class UniverseInstrumentEvidenceV1(_Frozen):
                 "suspension_state": self.suspension_state,
                 "st_state": self.st_state,
                 "expected_trading_state": self.expected_trading_state,
-                "observed_at": self.observed_at.astimezone(UTC).isoformat(),
+                "observed_at": _utc_z(self.observed_at),
             },
         )
 
@@ -1022,7 +1029,9 @@ def _source_state_identity(refs: SourceRefsV1) -> tuple[str, str]:
         "trade_date": refs.trade_date.isoformat(),
         "provider_id": refs.provider_id,
         "source_version_digest": refs.source_version_digest,
-        "source_refs_json": canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+        "source_refs_json": canonical_json_bytes(
+            refs.model_dump(mode="json", warnings="error")
+        ).decode(),
     }
     digest = domain_sha256("stock-eva/r2f4.2/universe-source-state/v1", preimage)
     return digest[:32], digest
@@ -1134,7 +1143,7 @@ class UniversePublicationContextV1(_Frozen):
             "publication_lineage_json": canonical_json_bytes(lineage).decode(),
             "publication_lineage_sha256": self.publication_lineage_sha256,
             "status": self.status,
-            "created_at": self.created_at.astimezone(UTC).isoformat(),
+            "created_at": _utc_z(self.created_at),
         }
         expected = domain_sha256("stock-eva/r2f4.2/universe-publication-context/v1", preimage)
         if self.context_sha256 != expected or self.context_id != expected[:32]:
@@ -1178,7 +1187,7 @@ class UniverseAttemptPlanV1(_Frozen):
             "refresh_id": self.refresh_id,
             "request_budget": self.request_budget,
             "classification_max_attempts": self.classification_max_attempts,
-            "created_at": self.created_at.astimezone(UTC).isoformat(),
+            "created_at": _utc_z(self.created_at),
             "attempt_status": self.attempt_status,
         }
         if self.planned_sha256 != domain_sha256(
@@ -1212,7 +1221,7 @@ class UniverseAttemptResultV1(_Frozen):
             "classification_request_count": self.classification_request_count,
             "reason_code": self.reason_code,
             "source_state_id": self.source_state_id,
-            "finished_at": self.finished_at.astimezone(UTC).isoformat(),
+            "finished_at": _utc_z(self.finished_at),
         }
         if self.result_sha256 != domain_sha256(
             "stock-eva/r2f4.2/universe-attempt-result/v1", preimage
@@ -1297,9 +1306,7 @@ class UniverseAuthorityBundleV1(_Frozen):
                 "classification_source_snapshot_date": (
                     self.classification_source_snapshot_date.isoformat()
                 ),
-                "classification_observed_at": self.classification_observed_at.astimezone(
-                    UTC
-                ).isoformat(),
+                "classification_observed_at": _utc_z(self.classification_observed_at),
                 "classification_source_projection_sha256": (
                     self.classification_source_projection_sha256
                 ),
@@ -1347,7 +1354,7 @@ def source_version_digest(
                 "source": refs.classification_source,
                 "source_version": refs.classification_source_version,
                 "sequence": refs.classification_generation_sequence,
-                "observed_at": refs.classification_observed_at.astimezone(UTC).isoformat(),
+                "observed_at": _utc_z(refs.classification_observed_at),
                 "source_date_semantics": refs.source_date_semantics,
             },
             "classification_snapshot_sha256": refs.classification_snapshot_sha256,
@@ -1624,14 +1631,14 @@ def build_universe_contract(
         "calendar_generation_id": calendar_generation_id,
         "calendar_sha256": calendar_sha256,
         "classification_generation_id": classification_generation_id,
-        "exact_pit_cutoff": exact_pit_cutoff.isoformat()
+        "exact_pit_cutoff": _utc_z(exact_pit_cutoff)
         if isinstance(exact_pit_cutoff, datetime)
         else exact_pit_cutoff,
-        "source_refs": refs.model_dump(mode="json"),
+        "source_refs": refs.model_dump(mode="json", warnings="error"),
         "source_state_id": source_state_id,
         "source_state_sha256": source_state_sha,
-        "members": [item.model_dump(mode="json") for item in members],
-        "counts": counts.model_dump(mode="json"),
+        "members": [item.model_dump(mode="json", warnings="error") for item in members],
+        "counts": counts.model_dump(mode="json", warnings="error"),
         "classification_evidence_ids": classification_ids,
         "classification_evidence_projection": classification_rows,
         "effective_main_board_ids": base_ids,
@@ -1806,7 +1813,9 @@ def validate_provider_raw_batch(
         raise ValueError("provider raw batch must be the existing ProviderRawBatch")
     if not isinstance(contract, UniverseContractV1):
         raise ValueError("universe contract must be the strict v1 model")
-    batch = ProviderRawBatch.model_validate(batch.model_dump(mode="python"), strict=False)
+    batch = ProviderRawBatch.model_validate(
+        batch.model_dump(mode="python", warnings="error"), strict=False
+    )
     if (
         batch.provider_id.value != "baostock"
         or batch.request.provider_id.value != "baostock"
@@ -1817,7 +1826,8 @@ def validate_provider_raw_batch(
     ):
         raise ValueError("provider/session identity mismatch")
     raw_digest = domain_sha256(
-        "stock-eva/r2f4.2/raw-batch-projection/v1", batch.model_dump(mode="json")
+        "stock-eva/r2f4.2/raw-batch-projection/v1",
+        batch.model_dump(mode="json", warnings="error"),
     )
     expected_members = {
         item.symbol: item
@@ -1846,10 +1856,11 @@ def validate_provider_raw_batch(
     plan_by_ordinal = {item.plan_ordinal: item for item in batch.logical_request_plan.requests}
     expected_plan = _canonical_expected_logical_plan(contract)
     actual_plan_projection = tuple(
-        item.model_dump(mode="json") for item in batch.logical_request_plan.requests
+        item.model_dump(mode="json", warnings="error")
+        for item in batch.logical_request_plan.requests
     )
     expected_plan_projection = tuple(
-        item.model_dump(mode="json") for item in expected_plan.requests
+        item.model_dump(mode="json", warnings="error") for item in expected_plan.requests
     )
     plan_projection_mismatch = actual_plan_projection != expected_plan_projection
     completion_by_ordinal = {item.plan_ordinal: item for item in batch.request_completions}
@@ -2856,10 +2867,10 @@ class UniverseSidecarStore:
                 or row["classification_source_snapshot_date"]
                 != contract.source_refs.classification_source_snapshot_date.isoformat()
                 or row["classification_observed_at"]
-                != contract.source_refs.classification_observed_at.isoformat()
+                != _utc_z(contract.source_refs.classification_observed_at)
                 or row["classification_snapshot_sha256"]
                 != contract.source_refs.classification_snapshot_sha256
-                or row["exact_pit_cutoff"] != contract.exact_pit_cutoff.isoformat()
+                or row["exact_pit_cutoff"] != _utc_z(contract.exact_pit_cutoff)
                 or row["provider_id"] != "baostock"
                 or row["source_date_semantics"] != contract.source_refs.source_date_semantics
                 or row["source_state_id"] != contract.source_state_id
@@ -2868,7 +2879,9 @@ class UniverseSidecarStore:
                 or row["instrument_evidence_ids_json"]
                 != canonical_json_bytes(contract.source_refs.instrument_evidence_ids).decode()
                 or row["counts_json"]
-                != canonical_json_bytes(contract.counts.model_dump(mode="json")).decode()
+                != canonical_json_bytes(
+                    contract.counts.model_dump(mode="json", warnings="error")
+                ).decode()
                 or row["layer_counts_json"]
                 != canonical_json_bytes(
                     {
@@ -2881,7 +2894,9 @@ class UniverseSidecarStore:
                     }
                 ).decode()
                 or row["source_refs_json"]
-                != canonical_json_bytes(contract.source_refs.model_dump(mode="json")).decode()
+                != canonical_json_bytes(
+                    contract.source_refs.model_dump(mode="json", warnings="error")
+                ).decode()
                 or row["classification_evidence_ids_json"]
                 != canonical_json_bytes(contract.classification_evidence_ids).decode()
                 or row["effective_main_board_ids_json"]
@@ -2933,9 +2948,9 @@ class UniverseSidecarStore:
                 "classification_source_snapshot_date": (
                     refs.classification_source_snapshot_date.isoformat()
                 ),
-                "classification_observed_at": refs.classification_observed_at.isoformat(),
+                "classification_observed_at": _utc_z(refs.classification_observed_at),
                 "classification_snapshot_sha256": refs.classification_snapshot_sha256,
-                "exact_pit_cutoff": contract.exact_pit_cutoff.isoformat(),
+                "exact_pit_cutoff": _utc_z(contract.exact_pit_cutoff),
                 "provider_id": "baostock",
                 "source_date_semantics": refs.source_date_semantics,
                 "source_state_id": source_state_id,
@@ -2947,7 +2962,7 @@ class UniverseSidecarStore:
                     refs.instrument_evidence_ids
                 ).decode(),
                 "counts_json": canonical_json_bytes(
-                    contract.counts.model_dump(mode="json")
+                    contract.counts.model_dump(mode="json", warnings="error")
                 ).decode(),
                 "layer_counts_json": canonical_json_bytes(
                     {
@@ -2959,7 +2974,9 @@ class UniverseSidecarStore:
                         "required_additions_sha256": contract.required_additions_sha256,
                     }
                 ).decode(),
-                "source_refs_json": canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+                "source_refs_json": canonical_json_bytes(
+                    refs.model_dump(mode="json", warnings="error")
+                ).decode(),
                 "classification_evidence_ids_json": canonical_json_bytes(
                     contract.classification_evidence_ids
                 ).decode(),
@@ -2995,7 +3012,7 @@ class UniverseSidecarStore:
                 or source_state["provider_id"] != "baostock"
                 or source_state["source_version_digest"] != refs.source_version_digest
                 or source_state["source_refs_json"]
-                != canonical_json_bytes(refs.model_dump(mode="json")).decode()
+                != canonical_json_bytes(refs.model_dump(mode="json", warnings="error")).decode()
             ):
                 raise UniverseStoreUnavailable("universe source state mismatch")
             UniverseSourceStateV1(
@@ -3549,7 +3566,7 @@ class UniverseSidecarStore:
             plan.attempt_status,
             plan.request_budget,
             plan.classification_max_attempts,
-            plan.created_at.astimezone(UTC).isoformat(),
+            _utc_z(plan.created_at),
             plan.planned_sha256,
         )
 
@@ -3561,7 +3578,7 @@ class UniverseSidecarStore:
             result.classification_request_count,
             result.reason_code,
             result.source_state_id,
-            result.finished_at.astimezone(UTC).isoformat(),
+            _utc_z(result.finished_at),
             result.result_sha256,
         )
 
@@ -3579,7 +3596,7 @@ class UniverseSidecarStore:
             context.publication_lineage_sha256,
             context.context_sha256,
             context.status,
-            context.created_at.astimezone(UTC).isoformat(),
+            _utc_z(context.created_at),
         )
 
     @staticmethod
@@ -3622,7 +3639,7 @@ class UniverseSidecarStore:
         """
         try:
             plan = UniverseAttemptPlanV1.model_validate(
-                plan.model_dump(mode="python"), strict=False
+                plan.model_dump(mode="python", warnings="error"), strict=False
             )
         except (TypeError, ValueError) as exc:
             raise UniverseStoreUnavailable("universe attempt plan unavailable") from exc
@@ -3673,10 +3690,10 @@ class UniverseSidecarStore:
         """
         try:
             context = UniversePublicationContextV1.model_validate(
-                context.model_dump(mode="python"), strict=False
+                context.model_dump(mode="python", warnings="error"), strict=False
             )
             plan = UniverseAttemptPlanV1.model_validate(
-                plan.model_dump(mode="python"), strict=False
+                plan.model_dump(mode="python", warnings="error"), strict=False
             )
             if context.trade_date != plan.trade_date or context.run_id != plan.refresh_id:
                 raise ValueError("publication context and attempt identity mismatch")
@@ -3739,7 +3756,7 @@ class UniverseSidecarStore:
         """Append exactly one terminal result for an already claimed plan."""
         try:
             result = UniverseAttemptResultV1.model_validate(
-                result.model_dump(mode="python"), strict=False
+                result.model_dump(mode="python", warnings="error"), strict=False
             )
         except (TypeError, ValueError) as exc:
             raise UniverseStoreUnavailable("universe attempt result unavailable") from exc
@@ -3804,10 +3821,10 @@ class UniverseSidecarStore:
         """Commit a verified source state and terminal non-head result atomically."""
         try:
             source_state = UniverseSourceStateV1.model_validate(
-                source_state.model_dump(mode="python"), strict=False
+                source_state.model_dump(mode="python", warnings="error"), strict=False
             )
             result = UniverseAttemptResultV1.model_validate(
-                result.model_dump(mode="python"), strict=False
+                result.model_dump(mode="python", warnings="error"), strict=False
             )
         except (TypeError, ValueError) as exc:
             raise UniverseStoreUnavailable("universe source/result unavailable") from exc
@@ -3841,7 +3858,7 @@ class UniverseSidecarStore:
                         source_state.provider_id,
                         source_state.source_version_digest,
                         source_state.source_refs_json,
-                        source_state.verified_at.astimezone(UTC).isoformat(),
+                        _utc_z(source_state.verified_at),
                     ),
                 )
                 existing = connection.execute(
@@ -3885,27 +3902,27 @@ class UniverseSidecarStore:
     ) -> UniverseHeadV1:
         try:
             contract = UniverseContractV1.model_validate(
-                contract.model_dump(mode="python"), strict=False
+                contract.model_dump(mode="python", warnings="error"), strict=False
             )
             if mapping is not None:
                 mapping = UniverseSemanticMappingV1.model_validate(
-                    mapping.model_dump(mode="python"), strict=False
+                    mapping.model_dump(mode="python", warnings="error"), strict=False
                 )
             evidence = tuple(
                 UniverseInstrumentEvidenceV1.model_validate(
-                    item.model_dump(mode="python"), strict=False
+                    item.model_dump(mode="python", warnings="error"), strict=False
                 )
                 for item in evidence
             )
             if authority_bundle is not None:
                 authority_bundle = UniverseAuthorityBundleV1.model_validate(
-                    authority_bundle.model_dump(mode="python"), strict=False
+                    authority_bundle.model_dump(mode="python", warnings="error"), strict=False
                 )
                 if mapping != authority_bundle.mapping or evidence != authority_bundle.evidence:
                     raise UniverseStoreUnavailable("universe authority bundle mismatch")
             if attempt_result is not None:
                 attempt_result = UniverseAttemptResultV1.model_validate(
-                    attempt_result.model_dump(mode="python"), strict=False
+                    attempt_result.model_dump(mode="python", warnings="error"), strict=False
                 )
                 if attempt_result.terminal_status != "succeeded":
                     raise UniverseStoreUnavailable("promotion result must be succeeded")
@@ -3921,7 +3938,7 @@ class UniverseSidecarStore:
                 ):
                     raise UniverseStoreUnavailable("required snapshot admission is not trusted")
                 required_snapshot = RequiredSymbolSnapshotV1.model_validate(
-                    required_snapshot.model_dump(mode="python"), strict=False
+                    required_snapshot.model_dump(mode="python", warnings="error"), strict=False
                 )
                 expected_snapshot_symbols = tuple(
                     (item.symbol, item.scope_roles)
@@ -4092,7 +4109,7 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe required snapshot unavailable")
                 source_state_id, source_state_sha = _source_state_identity(contract.source_refs)
                 source_refs_json = canonical_json_bytes(
-                    contract.source_refs.model_dump(mode="json")
+                    contract.source_refs.model_dump(mode="json", warnings="error")
                 ).decode()
                 source_values = (
                     source_state_id,
@@ -4101,7 +4118,7 @@ class UniverseSidecarStore:
                     "baostock",
                     contract.source_refs.source_version_digest,
                     source_refs_json,
-                    contract.source_refs.classification_observed_at.astimezone(UTC).isoformat(),
+                    _utc_z(contract.source_refs.classification_observed_at),
                 )
                 self._insert_or_match(
                     connection,
@@ -4180,9 +4197,7 @@ class UniverseSidecarStore:
                             item.suspension_state,
                             item.st_state,
                             item.expected_trading_state,
-                            item.observed_at.astimezone(UTC).isoformat()
-                            if item.observed_at
-                            else None,
+                            _utc_z(item.observed_at) if item.observed_at else None,
                             item.lineage_hash,
                         ),
                     )
@@ -4241,9 +4256,9 @@ class UniverseSidecarStore:
                     refs.classification_source,
                     refs.classification_source_version,
                     refs.classification_source_snapshot_date.isoformat(),
-                    refs.classification_observed_at.isoformat(),
+                    _utc_z(refs.classification_observed_at),
                     refs.classification_snapshot_sha256,
-                    contract.exact_pit_cutoff.isoformat(),
+                    _utc_z(contract.exact_pit_cutoff),
                     "baostock",
                     refs.source_date_semantics,
                     source_state_id,
@@ -4252,7 +4267,9 @@ class UniverseSidecarStore:
                     refs.required_symbol_snapshot_id,
                     refs.required_symbol_snapshot_sha256,
                     canonical_json_bytes(refs.instrument_evidence_ids).decode(),
-                    canonical_json_bytes(contract.counts.model_dump(mode="json")).decode(),
+                    canonical_json_bytes(
+                        contract.counts.model_dump(mode="json", warnings="error")
+                    ).decode(),
                     canonical_json_bytes(
                         {
                             "classification_evidence": len(contract.classification_evidence_ids),
@@ -4274,7 +4291,7 @@ class UniverseSidecarStore:
                     contract.required_additions_partition_sha256,
                     contract.payload_json,
                     contract.contract_sha256,
-                    contract.created_at.isoformat(),
+                    _utc_z(contract.created_at),
                 )
                 connection.execute(
                     f"INSERT INTO universe_contract ({','.join(contract_columns)}) "
@@ -4291,7 +4308,9 @@ class UniverseSidecarStore:
                             member.symbol,
                             member.security_id,
                             member.member_sha256,
-                            canonical_json_bytes(member.model_dump(mode="json")).decode(),
+                            canonical_json_bytes(
+                                member.model_dump(mode="json", warnings="error")
+                            ).decode(),
                         ),
                     )
                     roles = []

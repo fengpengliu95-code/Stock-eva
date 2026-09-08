@@ -134,9 +134,9 @@ def _contract(
                     "classification_source_snapshot_date": min(
                         trade_date, date(2026, 8, 31)
                     ).isoformat(),
-                    "classification_observed_at": datetime.combine(
-                        trade_date, time(8), tzinfo=UTC
-                    ).isoformat(),
+                    "classification_observed_at": datetime.combine(trade_date, time(8), tzinfo=UTC)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "classification_source_projection_sha256": classification_source_projection,
                     "evidence": authority_projection,
                 },
@@ -422,7 +422,7 @@ def _evidence(member: UniverseMemberV1, trade_date: date) -> UniverseInstrumentE
             "suspension_state": values["suspension_state"],
             "st_state": values["st_state"],
             "expected_trading_state": values["expected_trading_state"],
-            "observed_at": values["observed_at"].isoformat(),
+            "observed_at": values["observed_at"].astimezone(UTC).isoformat().replace("+00:00", "Z"),
         },
     )
     draft = UniverseInstrumentEvidenceV1.model_construct(
@@ -487,9 +487,9 @@ def _authority(mapping, evidence, *, generation_id="cls-1", sequence=1):
                 "classification_source_snapshot_date": min(
                     trade_date, date(2026, 8, 31)
                 ).isoformat(),
-                "classification_observed_at": datetime.combine(
-                    trade_date, time(8), tzinfo=UTC
-                ).isoformat(),
+                "classification_observed_at": datetime.combine(trade_date, time(8), tzinfo=UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
                 "classification_source_projection_sha256": classification_source_projection_sha256(
                     generation_id=generation_id,
                     sequence=sequence,

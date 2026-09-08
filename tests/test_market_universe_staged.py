@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from backend.app.config import Settings
 from backend.app.market.automation import (
     CanonicalRefreshExecution,
     ConcreteUniversePostSuccessHook,
+    LegacyPreflightSnapshot,
     MainBoardInspection,
     MarketAutomationService,
     UniverseHookResult,
@@ -197,33 +199,23 @@ def test_shadow_maintenance_hook_is_last_and_consumes_once(tmp_path: Path):
     assert [item[0] for item in events] == ["canonical", "shadow"]
 
 
-def test_concrete_hook_uses_durable_terminal_interval_and_typed_runner():
-    terminal = datetime(2026, 8, 19, 0, tzinfo=UTC)
-
-    class Sidecar:
-        def read_latest_terminal_finished_at(self, trade_date):
-            return terminal
-
-    calls = []
-
-    def runner(**kwargs):
-        calls.append(kwargs)
-        return UniverseHookResult(
-            status="BLOCKED", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+def test_concrete_hook_rejects_non_strict_service_fallback():
+    with pytest.raises(TypeError):
+        ConcreteUniversePostSuccessHook(
+            environment="staging",
+            mode="shadow",
+            enabled=True,
+            maintenance_service=object(),
         )
 
-    hook = ConcreteUniversePostSuccessHook(
-        environment="staging",
-        mode="shadow",
-        enabled=True,
-        interval_seconds=60,
-        sidecar=Sidecar(),
-        maintenance_runner=runner,
-    )
-    result = hook.offer("2026-08-20", "2026-08-20T00:02:00+00:00", None)
-    assert result.status == "BLOCKED"
-    assert len(calls) == 1
-    assert calls[0]["trade_date"] == "2026-08-20"
+
+def test_release_candidate_removes_runner_and_raw_symbol_public_fields():
+    import backend.app.market.automation as automation
+
+    assert not hasattr(automation, "UniverseMaintenanceRunner")
+    assert "legacy_shadow_input" not in CanonicalRefreshExecution.__annotations__
+    assert "observed_symbols" not in LegacyPreflightSnapshot.__annotations__
+    assert "inspection" not in LegacyPreflightSnapshot.__annotations__
 
 
 def test_missing_context_consumer_does_not_call_universe_hook(tmp_path: Path):
@@ -311,7 +303,7 @@ def _attempt_plan(
         "refresh_id": values["refresh_id"],
         "request_budget": 1,
         "classification_max_attempts": 1,
-        "created_at": created.isoformat(),
+        "created_at": created.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "attempt_status": "RUNNING",
     }
     values["dedup_key"] = domain_sha256(
@@ -335,6 +327,64 @@ def test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete():
     second = _attempt_plan(attempt_id="attempt-2", created=datetime(2026, 8, 20, 0, 1, tzinfo=UTC))
     assert first.dedup_key == second.dedup_key
     assert first.planned_sha256 != second.planned_sha256
+
+
+def test_attempt_plan_hash_preimage_uses_canonical_utc_z_timestamp():
+    created = datetime(2026, 8, 20, 0, tzinfo=UTC)
+    values = {
+        "attempt_id": "attempt-z",
+        "hook_kind": "universe_post_success",
+        "refresh_id": "refresh-z",
+        "canonical_run_id": "refresh-z",
+        "source_version_digest": "a" * 64,
+        "trade_date": date(2026, 8, 20),
+        "operation_day": date(2026, 8, 20),
+        "attempt_status": "RUNNING",
+        "request_budget": 1,
+        "classification_max_attempts": 1,
+        "created_at": created,
+    }
+    identity = {
+        "trade_date": "2026-08-20",
+        "operation_day": "2026-08-20",
+        "canonical_run_id": "refresh-z",
+        "source_version_digest": "a" * 64,
+    }
+    planned = {
+        **identity,
+        "hook_kind": "universe_post_success",
+        "refresh_id": "refresh-z",
+        "request_budget": 1,
+        "classification_max_attempts": 1,
+        "created_at": "2026-08-20T00:00:00Z",
+        "attempt_status": "RUNNING",
+    }
+    plan = UniverseAttemptPlanV1(
+        **values,
+        dedup_key=domain_sha256("stock-eva/r2f4.2/universe-attempt-dedup/v1", identity),
+        planned_sha256=domain_sha256("stock-eva/r2f4.2/universe-attempt-plan/v1", planned),
+    )
+    assert plan.created_at.astimezone(UTC).isoformat().replace("+00:00", "Z") == (
+        "2026-08-20T00:00:00Z"
+    )
+
+
+def test_publication_context_evidence_refs_are_hash_only_three_content_refs():
+    context = _maintenance_context(date(2026, 9, 1))
+    lineage = json.loads(context.publication_lineage_json)
+    assert context.evidence_refs == tuple(
+        sorted(
+            (
+                lineage["evidence_sha256"],
+                lineage["candidate_manifest_sha256"],
+                lineage["gate_report_sha256"],
+            )
+        )
+    )
+    assert len(context.evidence_refs) == 3
+    assert all(len(value) == 64 for value in context.evidence_refs)
+    assert lineage["evidence_id"] not in context.evidence_refs
+    assert lineage["candidate_id"] not in context.evidence_refs
 
 
 def _maintenance_context(target: date, run_id: str = "run-maintenance"):
@@ -377,7 +427,7 @@ def _maintenance_context(target: date, run_id: str = "run-maintenance"):
             **values,
             "trade_date": target.isoformat(),
             "evidence_refs": list(evidence_refs),
-            "created_at": values["created_at"].astimezone(UTC).isoformat(),
+            "created_at": values["created_at"].astimezone(UTC).isoformat().replace("+00:00", "Z"),
         },
     )
     values.update(context_id=context_sha[:32], context_sha256=context_sha)

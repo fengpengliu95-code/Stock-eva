@@ -127,7 +127,7 @@ def _head_fields(base: dict[str, Any], contract: UniverseContractV1) -> dict[str
         "classification_generation_id": refs.classification_generation_id,
         "calendar_generation_id": refs.calendar_generation_id,
         "calendar_sha256": refs.calendar_sha256,
-        "counts": contract.counts.model_dump(mode="json"),
+        "counts": contract.counts.model_dump(mode="json", warnings="error"),
         "layers": {
             "classification_evidence_count": contract.classification_evidence_count,
             "classification_evidence_sha256": contract.classification_evidence_sha256,
@@ -228,7 +228,8 @@ def build_universe_status(
     )
     if (
         latest_source is None
-        or latest_source.verified_at <= head_source.verified_at
+        or (latest_source.verified_at, latest_source.source_state_id)
+        <= (head_source.verified_at, head_source.source_state_id)
         or latest_source.source_version_digest == contract.source_refs.source_version_digest
     ):
         return _status_with_head(base, contract, status="ready", reason="NONE")

@@ -675,7 +675,7 @@ interface UniversePublicationContext {
   run_id: string;
   trade_date: string;
   manifest_ref: string;
-  evidence_refs: string[];
+  evidence_refs: string[]; // exactly evidence_sha256, candidate_manifest_sha256, gate_report_sha256
   publication_lineage_json: string;
   publication_lineage_sha256: string;
   status: "ready";
@@ -684,9 +684,9 @@ interface UniversePublicationContext {
 
 interface CanonicalRefreshExecution {
   result: RefreshResult;
-  legacy_shadow_input: LegacyPreflightSnapshot | null; // private, never serialized
   builder_outcome: "accepted" | "rejected"; // private, never serialized
   builder_diagnostic: LegacyBuilderDiagnostic | null; // counts/hashes only, private
+  legacy_shadow_observation: LegacyShadowObservation | null; // counts/hashes only
 }
 
 class CanonicalRefreshCallable(Protocol) {
@@ -698,14 +698,14 @@ class CanonicalRefreshCallable(Protocol) {
 }
 
 `CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; its
-additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult` plus a
-private, stack-owned `LegacyPreflightSnapshot`, `builder_outcome` and sanitized
-`builder_diagnostic`. The callback calls the private inspection exactly once immediately before
-the builder, passes that same immutable object to the builder, and includes the resulting observed
-projection in both builder-success and builder-rejection results; one builder call therefore
-yields one wrapper and no provider retry. The service unwraps
-`execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the private input
-to `_offer_shadow`, and releases it in `finally`; neither the input nor raw symbols enter
+additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult`, the
+builder outcome, and bounded count/hash diagnostics. The callback calls the private inspection
+exactly once immediately before the builder, passes that same immutable object to the builder, and
+reduces the observed request universe to `LegacyShadowObservation` before returning; one builder
+call therefore yields one wrapper and no provider retry. The service unwraps
+`execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the sanitized
+observation to `_offer_shadow`, and releases raw request objects in `finally`; raw symbols never
+enter
 `AutomationOutcome`, logs, persistence or public output. The callback also owns the thread-safe
 bounded publication-context holder keyed by `(run_id, trade_date)`, with at most one sealed entry
 per refresh. After a successful canonical result, `MarketAutomationService` performs exactly-once consume using
@@ -718,13 +718,13 @@ work and preserves the legacy result.
 The call order is fixed: (1) callback calls `inspect_legacy_main_board_input` exactly once and
 freezes its immutable `MainBoardInspection`; (2) it calls the additive builder seam once with
 `inspection=...`; (3) on acceptance it freezes the builder's `ProviderRequest.session_symbols` as
-the observed projection, while on rejection it freezes sorted inspection main-board symbols plus
-the fixed index additions `("sh.000001", "sz.399001")`; (4) it assigns
+the observed count/hash projection, while on rejection it computes the same projection from sorted
+inspection main-board symbols plus the fixed index additions `("sh.000001", "sz.399001")`; (4) it assigns
 `builder_outcome` and the counts/hash-only `builder_diagnostic` in that builder try/except and
-returns `CanonicalRefreshExecution`; (5) the service unwraps `result` and calls
-`_offer_shadow(prevalidation=legacy_shadow_input, builder_outcome=builder_outcome,
-builder_diagnostic=builder_diagnostic, ...)`; (6) the service releases the private input in
-`finally`; (7) only then does it continue the existing post-publish/Universe offer ordering.
+returns `CanonicalRefreshExecution`; (5) the service unwraps `result` and passes the execution's
+counts/hash-only `legacy_shadow_observation` to `_offer_shadow`; (6) the callback releases raw
+request objects in `finally`; (7) only then does it continue the existing post-publish/Universe
+offer ordering.
 Fetch, quality, publish and shadow failures MUST NOT change the already-assigned
 `builder_outcome`. Snapshot-capture, observer, handoff or release exceptions are isolated and
 cannot replace the returned legacy result or trigger another provider request.
@@ -750,8 +750,12 @@ function build_canonical_raw_request(
 ) -> ProviderRequest;
 
 interface LegacyPreflightSnapshot {
-  inspection: MainBoardInspection;
-  observed_symbols: readonly string[]; // private call-stack data only
+  trade_date: string;
+  main_board_count: number;
+  shanghai_count: number;
+  shenzhen_count: number;
+  total_expected_count: number;
+  metadata_provider_requests: number;
   observed_symbol_count: number;
   observed_symbols_sha256: string;
 }
@@ -766,18 +770,16 @@ interface LegacyBuilderDiagnostic {
 When `inspection` is supplied, `build_canonical_raw_request` MUST consume that exact object and
 MUST NOT inspect inputs a second time. With the default `null`, all existing callers retain the
 current inspection and legacy behavior byte-for-byte; this optional argument is not a provider
-switch. The callback owns the immutable snapshot until `_offer_shadow` returns, then releases it
-in `finally`. Builder acceptance and rejection both return the additive wrapper and the private
+switch. The callback owns raw symbols only within its provider scope and reduces them before
+returning. Builder acceptance and rejection both return the additive wrapper and the private
 diagnostic may expose only counts/hashes. Raw `symbols` MUST NOT cross the wrapper's public
-boundary, enter `AutomationOutcome`, logs or persistence, or be placed in `LegacyShadowHandoff`.
-The five offline regressions are mandatory: `test_legacy_inspection_called_once_and_builder_consumes_snapshot`
-proves inspection call count is exactly one and the builder receives the same object identity;
-`test_legacy_builder_default_argument_compatibility` proves an omitted optional argument preserves
-default compatibility; and `test_legacy_rejection_diagnostic_privacy` proves a rejected builder
-still yields only count/hash diagnostics with no raw symbols. `test_legacy_shadow_normal_session_no_drift`
-proves a normal legacy session's fixed-index observed projection returns `NONE`, while
-`test_legacy_shadow_missing_required_addition_drift` proves a missing required ChiNext/STAR
-addition returns `LEGACY_SHADOW_DRIFT` by count/hash only.
+boundary, enter `AutomationOutcome`, logs or persistence, or be placed in
+`LegacyPreflightSnapshot`/`LegacyShadowHandoff`; the callback computes the legacy observation
+before its provider/evidence resources are released in `finally`.
+The offline legacy regression is `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison`.
+It proves the bounded observer emits only count/hash diagnostics and no raw symbols. The release
+candidate boundary is additionally covered by
+`tests/test_market_universe_staged.py::test_release_candidate_removes_runner_and_raw_symbol_public_fields`.
 
 In the canonical callback implementation, immediately after `store.save_refresh` returns success
 the code freezes `ready_result`. It then runs context construction and the holder seal in an
@@ -796,8 +798,10 @@ code-level `_R2F2_LINEAGE_FIELDS` object with this fixed key set: `provider_id`,
 `evidence_id`, `evidence_sha256`, `candidate_id`, `candidate_manifest_sha256`,
 `gate_report_sha256`, `adapter_version`, and `source_schema_version` (the current code has nine
 fields). The digest is `domain_sha256(domain, canonical_json(lineage_object))`.
-`manifest_ref` is the safe `candidate_manifest_sha256`; `evidence_refs` is the sorted unique safe
-tuple of `evidence_id`, `evidence_sha256`, `candidate_id`, and `gate_report_sha256`.
+`manifest_ref` is the safe `candidate_manifest_sha256`; `evidence_refs` is exactly the sorted
+unique tuple of the three content hashes `evidence_sha256`, `candidate_manifest_sha256`, and
+`gate_report_sha256`. Evidence and candidate IDs remain lineage metadata only and MUST NOT enter
+`evidence_refs`.
 CandidateStore immutable bundle/readers resolve those refs, reconstruct the exact lineage object
 and recheck this new digest before accepting the context; no raw payload is included.
 
@@ -880,48 +884,40 @@ The legacy builder's `ProviderRequest` is already sorted-unique and its prefligh
 outside the main-board scope. Therefore the observer does not claim to inspect duplicate provider
 rows or an unreturned request. At the pre-validation boundary the callback calls
 `inspect_legacy_main_board_input` once and passes the resulting immutable `MainBoardInspection`
-to the builder; this is the only inspection input. An accepted builder creates the immutable
-`LegacyPreflightSnapshot.observed_symbols` from the built `ProviderRequest.session_symbols`; a
-rejected builder creates it from sorted inspection main-board symbols plus exactly
-`("sh.000001", "sz.399001")`. Thus a required ChiNext/STAR addition can remain missing in the
-legacy observed set and report drift. The accepted `session_symbols` are the builder's sorted
-main-board projection merged with that same fixed `INDEX_SYMBOLS` tuple; the rejected path uses
-the identical fixed tuple because no `ProviderRequest` exists. The snapshot is owned by the callback's private call stack
-and is released after `_offer_shadow`; it is never logged, persisted or placed in
-`LegacyShadowHandoff`. The canonical path and its failure result are never changed by this capture.
+to the builder; this is the only inspection input. An accepted builder records only the count/hash
+projection of the built `ProviderRequest.session_symbols`; a rejected builder computes the same
+projection from sorted inspection main-board symbols plus exactly `("sh.000001", "sz.399001")`.
+Thus a required ChiNext/STAR addition can remain absent and report drift without exposing the set.
+The snapshot contains only bounded counts/hashes, is owned by the callback call stack, and is
+reduced to `LegacyShadowObservation` before the callback's `finally`; it is never logged, persisted
+or placed in `LegacyShadowHandoff`. The canonical path and its failure result are never changed by
+this capture.
 
-With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
-members whose effective session state is `trading` or `suspended`, including required additions
-and the two required indexes. `observed_symbols` is the snapshot's sorted unique observed
-projection: the actual `ProviderRequest.session_symbols` for `builder_outcome="accepted"`, or
-`MainBoardInspection.main_board_symbols ∪ ("sh.000001", "sz.399001")` for
-`builder_outcome="rejected"`;
-`missing_symbols = expected_symbols - observed_symbols` and
-`extra_symbols = observed_symbols - expected_symbols`. The sets use canonical `symbol` identity
-and UTF-8 lexical order. A preflight rejection is retained in `builder_outcome` but is not
-reinterpreted as a provider-row failure. Set hashes use
+With a contract, the observer derives the expected sorted unique set only inside its private
+comparison frame, including required additions and the two required indexes. It compares the
+expected count/hash with the snapshot's observed count/hash; it does not return set members or
+attempt to reconstruct missing/extra values. A preflight rejection is retained in
+`builder_outcome` but is not reinterpreted as a provider-row failure. Set hashes use
 `domain_sha256("stock-eva/r2f4.2/legacy-shadow-symbol-set/v1", sorted_symbols)` and
-`drift_sha256` uses
-`domain_sha256("stock-eva/r2f4.2/legacy-shadow-drift/v1", {provider_id,request_trade_date,
-contract_sha256,expected_symbols,observed_symbols,missing_symbols,extra_symbols})`.
-The lists are private hash preimage only; the returned record contains counts and digests, never
-symbol values or payload. Equal sets return `NONE`; any missing or extra set returns
-`LEGACY_SHADOW_DRIFT`, including required ChiNext/STAR additions absent from the legacy input.
+`drift_sha256` uses only `provider_id`, `request_trade_date`, `contract_sha256`, expected
+count/hash and observed count/hash. The returned record contains counts and digests only. Equal
+count/hash pairs return `NONE`; any mismatch returns `LEGACY_SHADOW_DRIFT`, including required
+ChiNext/STAR additions absent from the legacy input.
 With no persisted contract, the typed result is `NO_COMPARISON` with
 `control_reason=CONTROL_STATE_UNAVAILABLE` and nullable expected/missing/extra/digest fields.
 
 The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
 successful canonical refresh and CandidateStore evidence readback. The internal call is
-`_offer_shadow(*, prevalidation: LegacyPreflightSnapshot | None, builder_outcome: "accepted" | "rejected", builder_diagnostic: LegacyBuilderDiagnostic | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
-the raw prevalidation value is stack-owned for that call only. Its typed handoff is
+`_offer_shadow(outcome, execution)` and consumes only the execution's counts/hash-only
+`LegacyShadowObservation`. Its typed handoff is
 `LegacyShadowHandoff {trade_date, builder_outcome, diagnostic}` from the refresh orchestration to
 the existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
 in the Universe sidecar, head, attempt or public status. A missing contract yields the typed
 `NO_COMPARISON/CONTROL_STATE_UNAVAILABLE` result, never a blocked hook status. A diagnostic-channel
 failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
-The handoff consumes `builder_outcome`, `builder_diagnostic` and the snapshot's observed
-projection, but contains counts and hashes only; raw symbols exist only during the private
-comparison stack frame and are never emitted to logs or storage.
+The handoff consumes `builder_outcome`, `builder_diagnostic` and the sanitized observation, and
+contains counts and hashes only; raw symbols exist only during the private comparison stack frame
+and are never emitted to logs or storage.
 The observer never filters, patches or changes the builder's default behavior, does not call
 BaoStock, and is not a provider acquisition seam; the optional typed inspection argument is the
 only additive seam.
@@ -1458,7 +1454,7 @@ cannot emit `B_P` or `B_E`.
    stubs.
 4. Create `tests/test_market_universe.py` with RED cases for AC-1 through AC-20 and all ECs. Use
    network-failing fakes and temporary roots; align failover compatibility coverage with the
-   umbrella target `tests/test_market_failover.py` (the baseline readiness file is retained only
+   umbrella target `tests/test_market_failover_readiness.py` (the baseline readiness file is retained only
    as a compatibility fixture name until implementation updates the target).
 
 ### Step 1 — Strict models and pure derivation
@@ -1560,8 +1556,10 @@ cannot emit `B_P` or `B_E`.
    latest strictly verified immutable sidecar publication-context input for the exact trade date,
    deferring when absent or mismatched. The service consumes the sealed callback exactly once after
    CandidateStore immutable readers verify publication lineage and evidence references, then passes
-   the context to the hook; the hook never consumes the holder. `main.py` and the automation CLI
-   wire the same callable and hook; the read-only `market-universe` CLI only projects status.
+   the context to the concrete `UniverseMaintenanceService`; the service never exposes a generic
+   callable fallback. `main.py` and the automation CLI construct the same strict service wiring; an
+   enabled lane without that exact service returns explicit control-unavailable/blocking status.
+   The read-only `market-universe` CLI only projects status.
    `RefreshResult` and MarketStore schema are unchanged. It must reacquire the existing
    `RefreshRunLock` non-blocking,
    then the sidecar lock. A missing or `None` configured `lock_path` returns
@@ -1625,7 +1623,7 @@ cannot emit `B_P` or `B_E`.
    a new key. Do not add a sixth LaunchAgent, independent scheduler lane or additional scheduler lock. Add concurrency,
    restart, deferred, priority, post-success ordering, failure and no-repeat tests covering
    `classification/sync.py`, `classification/store.py`, `backend/app/market/automation.py` and
-   `tests/test_market_failover.py`.
+   `tests/test_market_failover_readiness.py`.
 
 ### Step 6 — Read-only API and CLI
 
@@ -1636,11 +1634,11 @@ cannot emit `B_P` or `B_E`.
 3. Add `market-universe` to `backend/app/cli.py` with no `--execute` option and zero-write
    semantics. It reads no credentials and constructs no provider.
 4. Add route/CLI filesystem fingerprint tests for missing, valid, stale and corrupt states, plus
-   `test_status_source_state_order_and_date_matrix` covering exact-date head, no newer row/equal
-   digest (`ready`), newer differing digest (`stale`), matching failed/indeterminate attempt
-   (`blocked`), and another-date head (`DATE_MISMATCH`) without a requested-date source row. Add
-   `test_status_lexical_invalid_zero_io` for pure parse and
-   `test_status_future_requires_sidecar_proof` for the unique 503-before-future-422 ordering.
+   `tests/test_market_universe_status.py::test_source_version_and_terminal_attempt_status_matrix`
+   and `test_equal_timestamp_newer_source_state_id_is_stale` cover exact-date head, equal-time
+   source ordering, changed digest, and terminal matrix. `test_market_universe_cli_parser_and_invalid_date_are_read_only`
+   covers pure lexical parsing, while `test_future_date_checks_sidecar_proof` covers the unique
+   sidecar-proof-before-future-date ordering (`test_future_date_checks_sidecar_proof_before_semantic_date`).
 
 ### Step 7 — Compatibility documentation and no-migration rehearsal
 
@@ -1660,7 +1658,7 @@ Run the RED/GREEN and repository gates in a private temporary-root configuration
 .venv/bin/pytest -q tests/test_market_universe.py \
   tests/test_point_in_time_classification.py \
   tests/test_market_automation.py \
-  tests/test_market_failover.py \
+  tests/test_market_failover_readiness.py \
   tests/test_market_data.py \
   --basetemp=/tmp/stock-eva-r2f4-2-focused
 .venv/bin/pytest -q --basetemp=/tmp/stock-eva-r2f4-2-full
@@ -1762,50 +1760,50 @@ range notation is used for review evidence.
 
 | Companion ID | Implementation evidence anchor |
 |---|---|
-| AC-1 | Step 1 dynamic-scope and contract-identity tests |
-| AC-2 | Step 3 confirmed-calendar/PIT visibility tests |
-| AC-3 | Step 3 promoted-classification/PIT tests |
-| AC-4 | Step 3 three-layer effective-main-board tests |
-| AC-5 | Step 3 listing/delisting boundary tests |
-| AC-6 | Step 3 suspension/ST/unknown-state tests |
-| AC-7 | Step 3 UserStore single-transaction/privacy tests |
-| AC-8 | Step 3 explicit index-evidence/trading-state tests |
-| AC-9 | Step 3 count-equation and unknown-zero/loaded-match tests |
-| AC-10 | Step 3 evidence/source/date binding tests |
-| AC-11 | Step 4 exact candidate-set gate tests |
-| AC-12 | Step 4 whole-session purity/no-stitching tests |
-| AC-13 | Step 2 immutable sidecar/restart/CAS and source-state/result lifecycle rollback tests (`test_source_state_identity_excludes_verified_at`, `test_source_state_result_transaction_rollback`) |
-| AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and split parse/future tests (`test_status_source_state_order_and_date_matrix`, `test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
-| AC-15 | Step 5 post-success ordering/priority/callback isolation, `test_canonical_refresh_execution_carries_private_snapshot_on_builder_rejection` and `test_disabled_maintenance_zero_hook_write_requests` |
-| AC-16 | Step 5 failed-maintenance prior-head preservation tests |
-| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer/privacy tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy`, `test_legacy_shadow_normal_session_no_drift`, `test_legacy_shadow_missing_required_addition_drift`) |
-| AC-18 | Step 8 protected predecessor hash/regression tests |
-| AC-19 | Step 8 offline fake/provider-boundary tests |
-| AC-20 | Step 4 pure pre-Normalize raw-batch aggregate tests |
-| EC-1 | Step 3 invalid-date/calendar fixture and Step 6 split lexical-invalid/future-proof fixtures (`test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
-| EC-2 | Step 2 calendar/sidecar path-inode strict-reader fixture |
-| EC-3 | Step 3 promoted-classification visibility fixture |
-| EC-4 | Step 3 PIT cutoff fixture |
-| EC-5 | Step 3 security-master identity fixture |
-| EC-6 | Step 3 listing-window fixture |
-| EC-7 | Step 3 reviewed trading/suspension mapping fixture |
-| EC-8 | Step 4 no-inferred-suspension raw-quality fixture |
-| EC-9 | Step 3 ST contradiction fixture |
-| EC-10 | Step 3 required-symbol validation fixture |
-| EC-11 | Step 3 UserStore mutation/rollback fixture |
-| EC-12 | Step 3 duplicate-role deduplication fixture |
-| EC-13 | Step 3 required-index evidence fixture |
-| EC-14 | Step 4 extra-row rejection fixture |
-| EC-15 | Step 4 omission/state and Step 5 source-digest fixture |
-| EC-16 | Step 4 duplicate/session-row fixture |
-| EC-17 | Step 4 mixed-provider purity fixture |
-| EC-18 | Step 2 interrupted atomic-promotion fixture |
-| EC-19 | Step 2 tampered sidecar/inode fixture |
-| EC-20 | Step 5 failed-maintenance preservation fixture |
-| EC-21 | Step 5 lock/race priority and disabled-maintenance fixture (`test_disabled_maintenance_zero_hook_write_requests`) |
-| EC-22 | Step 4 legacy mode/shadow-drift fixture |
-| EC-23 | Step 4 tradestatus/placeholder raw gate fixture |
-| EC-24 | Step 2/Step 5 attempt-ledger/hash/restart fixture |
+| AC-1 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| AC-2 | `tests/test_market_automation.py::test_calendar_fails_closed_outside_confirmed_year` |
+| AC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| AC-4 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| AC-5 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| AC-6 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| AC-7 | `tests/test_market_automation.py::test_required_symbols_include_positions_and_all_watchlists` |
+| AC-8 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| AC-9 | `tests/test_market_universe.py::test_unknown_one_loaded_match_rejects_contract_publication` |
+| AC-10 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| AC-11 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| AC-12 | `tests/test_market_automation.py::test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch` |
+| AC-13 | `tests/test_market_universe_staged.py::test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar` |
+| AC-14 | `tests/test_market_universe_status.py::test_api_and_cli_project_the_same_promoted_snapshot` |
+| AC-15 | `tests/test_market_universe_staged.py::test_shadow_maintenance_hook_is_last_and_consumes_once` |
+| AC-16 | `tests/test_market_universe_status.py::test_no_migration_rehearsal_preserves_canonical_files_and_pointer` |
+| AC-17 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
+| AC-18 | `tests/test_market_automation.py::test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field` |
+| AC-19 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| AC-20 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| EC-1 | `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only` |
+| EC-2 | `tests/test_market_universe_status.py::test_empty_or_missing_sidecar_is_control_error_without_initialization` |
+| EC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| EC-4 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| EC-5 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| EC-6 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| EC-7 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| EC-8 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| EC-9 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| EC-10 | `tests/test_market_universe.py::test_requested_unverified_source_is_never_publishable` |
+| EC-11 | `tests/test_market_automation.py::test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider` |
+| EC-12 | `tests/test_market_universe.py::test_sidecar_reader_rejects_missing_bidirectional_role_link` |
+| EC-13 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| EC-14 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| EC-15 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| EC-16 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| EC-17 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| EC-18 | `tests/test_market_universe.py::test_sidecar_cas_conflict_does_not_change_head` |
+| EC-19 | `tests/test_market_universe.py::test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper` |
+| EC-20 | `tests/test_market_universe_staged.py::test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop` |
+| EC-21 | `tests/test_market_universe_staged.py::test_disabled_maintenance_is_zero_hook_and_preserves_legacy_tick` |
+| EC-22 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
+| EC-23 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| EC-24 | `tests/test_market_universe_staged.py::test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete` |
 
 ### Mandatory individual FR evidence crosswalk
 
@@ -1814,33 +1812,33 @@ accepted as a substitute.
 
 | FR (requirement name) | Exact implementation evidence anchor |
 |---|---|
-| FR-1 — Versioned scope | Step 1 strict model tests |
-| FR-2 — Exact-session identity | Step 1 contract identity/PIT tests |
-| FR-3 — Promoted calendar PIT gate | Step 3 calendar visibility tests |
-| FR-4 — Promoted classification PIT gate | Step 3 promoted/PIT classification tests |
-| FR-5 — Main-board base scope | Step 3 three-layer/effective-window test |
-| FR-6 — Required user symbols | Step 3 UserStore single-transaction test |
-| FR-7 — Required indexes | Step 3 explicit trading-index evidence test |
-| FR-8 — Instrument evidence binding | Step 3 reviewed mapping qualification test |
-| FR-9 — Listing and delisting states | Step 3 listing/delisting boundary test |
-| FR-10 — Suspension state | Step 3 explicit suspension semantics test |
-| FR-11 — ST state | Step 3 ST retention test and protected predecessor suite |
-| FR-12 — Closed expected-state vocabulary | Step 1 state vocabulary test |
-| FR-13 — Deterministic count equation | Step 1 deterministic count/hash test |
-| FR-14 — Unknown-zero publication gate | Step 4 unknown-zero/loaded-match test |
-| FR-15 — Exact candidate set | Step 4 pure raw-batch gate test |
-| FR-16 — Extras and duplicates are errors | Step 4 extras/duplicate rejection test |
-| FR-17 — Whole-session purity | Step 4 whole-session purity test |
-| FR-18 — Immutable sidecar authority | Step 2 atomic sidecar promotion/strict-reader test |
-| FR-19 — Canonical identity | Step 1 deterministic hash-vector and source-state identity test (`test_source_state_identity_excludes_verified_at`) |
-| FR-20 — Read-only status | Step 6 status projection test |
-| FR-21 — Sanitized diagnostics | Step 6 sanitized-output scan |
-| FR-22 — Maintenance priority | Step 5 automation priority and `test_disabled_maintenance_zero_hook_write_requests` |
-| FR-23 — Classification maintenance trigger | Step 5 cadence/daily-ceiling and source-digest-change test |
-| FR-24 — Legacy compatibility modes | `test_legacy_off_shadow_and_enforce_compatibility`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy`, `test_legacy_shadow_normal_session_no_drift`, `test_legacy_shadow_missing_required_addition_drift` |
-| FR-25 — No authority widening | frozen predecessor/provider allowlist scan |
-| FR-26 — Safe migration path | Step 2 writer-only v1/no-migration test |
-| FR-27 — Frozen predecessor contracts | final protected-contract regression test |
+| FR-1 — Versioned scope | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-2 — Exact-session identity | `tests/test_market_universe.py::test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper` |
+| FR-3 — Promoted calendar PIT gate | `tests/test_market_automation.py::test_calendar_fails_closed_outside_confirmed_year` |
+| FR-4 — Promoted classification PIT gate | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| FR-5 — Main-board base scope | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-6 — Required user symbols | `tests/test_market_automation.py::test_required_symbols_include_positions_and_all_watchlists` |
+| FR-7 — Required indexes | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| FR-8 — Instrument evidence binding | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| FR-9 — Listing and delisting states | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-10 — Suspension state | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| FR-11 — ST state | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-12 — Closed expected-state vocabulary | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-13 — Deterministic count equation | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-14 — Unknown-zero publication gate | `tests/test_market_universe.py::test_unknown_one_loaded_match_rejects_contract_publication` |
+| FR-15 — Exact candidate set | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| FR-16 — Extras and duplicates are errors | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| FR-17 — Whole-session purity | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| FR-18 — Immutable sidecar authority | `tests/test_market_universe.py::test_sidecar_cas_conflict_does_not_change_head` |
+| FR-19 — Canonical identity | `tests/test_market_universe_staged.py::test_attempt_plan_hash_preimage_uses_canonical_utc_z_timestamp` |
+| FR-20 — Read-only status | `tests/test_market_universe_status.py::test_api_and_cli_project_the_same_promoted_snapshot` |
+| FR-21 — Sanitized diagnostics | `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only` |
+| FR-22 — Maintenance priority | `tests/test_market_universe_staged.py::test_shadow_maintenance_hook_is_last_and_consumes_once` |
+| FR-23 — Classification maintenance trigger | `tests/test_market_universe_staged.py::test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop` |
+| FR-24 — Legacy compatibility modes | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
+| FR-25 — No authority widening | `tests/test_market_universe_staged.py::test_release_candidate_removes_runner_and_raw_symbol_public_fields` |
+| FR-26 — Safe migration path | `tests/test_market_universe_status.py::test_no_migration_rehearsal_preserves_canonical_files_and_pointer` |
+| FR-27 — Frozen predecessor contracts | `tests/test_market_automation.py::test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field` |
 
 ## Rollback and Recovery
 
