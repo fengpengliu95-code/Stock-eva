@@ -353,7 +353,9 @@ does not make any provider failover eligible.
 or a replaced database inode, **When** a reader reopens the sidecar, **Then** it returns the prior
 valid head only when it is still the atomically committed, fully verified on-disk head; any
 tampered/corrupt state returns `unavailable` (never a historical cached projection); writer recovery
-does not run from a public GET.
+does not run from a public GET. Contract, evidence, required-snapshot, member, role-link and head
+CAS rows are committed in one SQLite transaction; an interrupted write or failed CAS rolls back all
+of them, leaving no unreachable rows or orphan sequence.
 
 ### AC-14: Read-only status/API/CLI (FR-20, FR-21, NFR-3, NFR-6)
 
@@ -442,8 +444,8 @@ not call the seam; `shadow` compares after canonical success and records drift w
   before Normalize; no first-row-wins behavior.
 - EC-17: Candidate contains BaoStock rows plus a TickFlow/Tushare row → reject whole-session
   purity; no symbol-level failover.
-- EC-18: Sidecar transaction is interrupted after a member/evidence insert but before head
-  commit → reader sees prior head or unavailable, never the staged partial contract.
+- EC-18: Sidecar transaction is interrupted after any contract/evidence/snapshot/member/link insert
+  but before head commit → reader sees prior head or unavailable, never a staged partial contract.
 - EC-19: Sidecar has a valid-looking row with a changed digest, extra table, unsafe mode,
   symlink or replaced inode → strict reader returns unavailable; GET does not repair it.
 - EC-20: Classification maintenance fails after acquiring a candidate generation → preserve all
@@ -521,6 +523,19 @@ HTTP behavior:
   proven safely; its exact body is `{ "code": "universe_control_unavailable" }` and contains
   no path or exception. The same status maps to CLI exit `3`.
 
+Status field matrix (also normative for the CLI):
+
+| Status | Condition | Nullable fields and source |
+|---|---|---|
+| `ready` | verified head exists and `head.trade_date == requested trade_date` | contract IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
+| `stale` | verified head is valid but `head.trade_date != requested confirmed date` | all populated contract/source/count fields are explicitly the verified head's values, `trade_date` is the request, `verified_head_trade_date` is head date, reason is `UNIVERSE_DATE_MISMATCH`; no requested-date projection is implied |
+| `blocked` | durable latest attempt for requested date is terminal blocked, with no verified head for that date | contract/source/count/layer fields are null; `verified_head_trade_date` is null; reason is the durable attempt reason |
+| `unavailable` | safe store read has no head, or storage/state cannot be proven | all contract/source/count/layer fields and `verified_head_trade_date` are null; no cached prior head is used; unprovable storage is HTTP 503 |
+
+The single public TypeScript shape uses nullable fields, with this matrix as its discriminated
+runtime constraint; implementations MUST NOT populate a nullable field outside the row's stated
+status/source rule.
+
 ### `stock-eva market-universe --date YYYY-MM-DD`
 
 The CLI prints the same canonical JSON projection and has no `--execute` option. It exits `0` for
@@ -567,6 +582,15 @@ interface UniverseHookResult {
   writes_canonical: false;
 }
 
+interface UniversePublicationContext {
+  run_id: string;
+  trade_date: string;
+  manifest_ref: string;
+  evidence_refs: string[];
+  publication_lineage_sha256: string;
+  status: "ready";
+}
+
 interface UniverseMaintenanceDecision {
   lane: "freshness" | "repair" | "shadow" | null;
   action: "run" | "defer" | "none";
@@ -593,10 +617,13 @@ interface UniverseCandidateGate {
   contract_sha256: string;
   provider_id: "baostock";
   refresh_id: string;
-  provider_session_id: string;
-  request_id: string;
-  endpoint_id: string;
-  pages: number;
+  request_aggregates: Array<{request_id: string; trade_date: string; refresh_id: string;
+    provider_session_id: string; pages: number; batch_digest: string}>;
+  endpoint_aggregates: Array<{endpoint_id: string; request_id: string; pages: number;
+    row_count: number; batch_digest: string}>;
+  page_aggregates: Array<{endpoint_id: string; request_id: string; page: number;
+    row_count: number; page_digest: string}>;
+  batch_digest: string;
   adapter_version: string;
   observed_symbols: string[];
   missing_symbols: string[];
@@ -615,9 +642,11 @@ publish chain remains authoritative.
 ### Pre-Normalize raw batch contract
 
 The only input accepted by `UniverseCandidateGate` is the complete, accumulated existing provider
-raw batch. It is an internal transport envelope, not a public response. Every page MUST carry the
-same date, provider, refresh/session/request identity, evidence identity, endpoint and contract;
-pages are sorted by contiguous page number before validation.
+raw batch plus an independent `UniverseContractV1` argument. It is an internal transport envelope,
+not a public response. The raw batch MUST NOT be required to contain invented contract/evidence
+fields: existing `ProviderRawBatch` request, endpoint, page and transport lineage are validated
+first, then the independent contract identity is checked against the aggregate. Pages are sorted
+by contiguous page number before validation.
 
 The gate MUST consume the existing `ProviderRawBatch` directly and MUST NOT introduce a parallel
 raw-batch type. `ProviderRawBatch.request`, `provider_id`, `adapter_version`,
@@ -629,11 +658,18 @@ fields. Each `RawEndpointBatch` supplies `endpoint`, `schema_variant`, `request_
 
 The pure function is exactly
 `validate_provider_raw_batch(batch: ProviderRawBatch, contract: UniverseContractV1) -> UniverseCandidateGate`.
-It aggregates every existing `endpoint_batches`, `request_completions`, transport lineage and
-page, and binds provider=`baostock`, `request.trade_date`, `refresh_id`,
-`provider_session_id`, `request_id`, evidence identity and the legacy request universe. It
-checks contiguous pages, duplicate/extra/missing symbols, exact session, `tradestatus`/legal
+It first validates every existing `request_completion`, transport observation, request plan and
+endpoint/page lineage using the existing model validators, then aggregates each logical request,
+endpoint batch and page into deterministic tuples and a batch digest. Only after that does it bind
+provider=`baostock`, `request.trade_date`, `refresh_id`, `provider_session_id`,
+`request_id`, endpoint and the legacy request universe from existing model fields; no nonexistent
+contract/evidence field is demanded from `ProviderRawBatch`. It checks contiguous pages,
+duplicate/extra/missing symbols, exact session, `tradestatus`/legal
 suspended placeholders and loaded count before returning a pass; no partial rows are returned.
+The loaded candidate is the union of `DAILY_ASTOCK` stock rows and `INDEX_HISTORY` index rows;
+`ALL_STOCK` contributes only an observed-universe cross-check, while factor endpoints contribute
+only control/factor-completeness observations and never rows. The result contains request-,
+endpoint- and page-aggregate tuples plus `batch_digest`, not a single endpoint/page scalar.
 The existing `run_canonical_raw_refresh(validate_batch=...)` callback is only a future/offline
 enforce seam. Mode `off` MUST NOT call it. Mode `shadow` MUST NOT pass it into canonical refresh
 or block canonical: after successful canonical/evidence publish, a read-only observer compares
@@ -647,6 +683,14 @@ missing/unknown status, illegal placeholder or state mismatch rejects the comple
 `UNIVERSE_STATE_MISMATCH`. Required indexes must have explicit reviewed `trading` evidence; later
 Quality Gate checks remain mandatory and are not replaced by this raw gate.
 
+The legacy callback `validate_universe` in the current automation remains wired exactly as-is in
+the canonical path; mode `off` is byte/behavior unchanged. The new pure gate is never supplied to
+that callback. In `shadow`, after canonical `ready`, the observer obtains a read-only
+`UniversePublicationContext` from `MarketStore.published_refresh` plus its
+`publication_lineage` and CandidateStore evidence references. It accepts the observation only when
+`run_id`, `trade_date`, manifest reference, evidence references and their lineage digest match the
+published readback; mismatch records `UNIVERSE_SESSION_DRIFT` and cannot block or mutate canonical.
+
 ## Data Models
 
 ### Three-layer membership construction
@@ -658,10 +702,11 @@ reconstructed from another layer's count.
 |---|---|---|
 | `classification_evidence` | Every unique promoted PIT security identity and its reviewed instrument-evidence reference, including records later excluded from product scope | `classification_evidence_count` and `classification_evidence_sha256` hash sorted `(security_id,symbol,evidence_id,exclusion_reason)` identities; duplicate natural identities or unknown identity classification block |
 | `effective_main_board` | The subset whose closed identity is ordinary stock on SSE/SZSE, `board=main`, and `list_date <= trade_date` and (`delist_date is null` or `trade_date < delist_date`) | `effective_main_board_count` and `effective_main_board_sha256` hash sorted member projections, including state/evidence; no fixed count |
-| `required_additions` | The union of valid A-share required-user symbols and exactly `sh.000001`,`sz.399001`, after deterministic deduplication against the base | `required_additions_count` and `required_additions_sha256` hash sorted symbol/role/evidence/state projections; required-index identities are retained even when not in the base |
+| `required_additions` | Valid A-share required-user symbols not already in `effective_main_board`, plus exactly `sh.000001`,`sz.399001` | `required_additions_count` and `required_additions_sha256` hash the sorted non-overlapping partition projection; required-index identities are retained |
 
-The final member set is `effective_main_board ∪ required_additions`. A symbol in both layers
-is one member with unioned roles and one count contribution. A required-user symbol with an
+The final member set is `effective_main_board ∪ required_additions`; these two partition identity
+sets do not overlap. Source evidence may carry multiple roles, but those role overlaps are retained
+only in `UniverseMemberV1.scope_roles` and do not change partition counts. A required-user symbol with an
 unprovable identity, unsupported security type, or invalid symbol is not silently omitted: the
 snapshot is blocked. Listing-window rules are exact: listing date is inclusive, delist date is
 exclusive for an active base row, and `trade_date >= delist_date` derives `delisted` for a required
@@ -693,11 +738,16 @@ qualified index or silently made available by a fixture.
 
 `SourceRefsV1` is a closed, immutable model and is part of the contract payload and contract
 hash. It contains exactly `calendar_generation_id`, `calendar_sha256`,
-`classification_generation_id`, `required_symbol_snapshot_id`,
-`required_symbol_snapshot_sha256`, `instrument_evidence_ids`, `provider_id=baostock`,
+`classification_generation_id`, `classification_generation_sequence`,
+`classification_source_snapshot_date`, `classification_snapshot_sha256`,
+`required_symbol_snapshot_id`, `required_symbol_snapshot_sha256`, `instrument_evidence_ids`,
+`provider_id=baostock`,
 `trade_date`, `exact_pit_cutoff`, and `source_date_semantics`. IDs are safe-format values and
 every list is sorted, unique, and non-empty where its obligation exists; no URL, token or raw
-payload is allowed. The reader compares this model to the explicit columns and linked rows.
+payload is allowed. If `GenerationSummary` has no source hash, the contract records only its ID,
+sequence and source-date metadata and computes `classification_snapshot_sha256` from the selected
+exact PIT snapshot; no fictitious generation hash is allowed. The reader compares this model to
+the explicit columns and linked rows.
 
 The contract persists three role-partitioned identity sets (a symbol may be represented in more
 than one set, but each set itself is sorted and unique):
@@ -706,7 +756,19 @@ than one set, but each set itself is sorted and unique):
 |---|---|
 | `classification_evidence_ids` | All promoted PIT classification evidence identities, including excluded records; sorted IDs and `classification_evidence_sha256` over canonical `(security_id,symbol,evidence_id,exclusion_reason)` projections |
 | `effective_main_board_ids` | The effective ordinary SSE/SZSE main-board stock identities at `trade_date`; sorted security IDs and `effective_main_board_sha256` over complete member projections |
-| `required_addition_ids` | Sorted identities for valid required-user additions and the two required indexes; `required_addition_sha256` over complete symbol/role/state/evidence projections |
+| `required_additions_ids` | Sorted identities for valid required-user additions not already in the effective main-board set, plus the two required indexes; `required_additions_partition_sha256` over the canonical partition projection |
+
+Partition hashes use separate domains and canonical projections: `classification_evidence_ids`
+hashes sorted `{security_id,symbol,evidence_id,exclusion_reason}` rows under
+`stock-eva/r2f4.2/universe-partition/classification-evidence/v1`; `effective_main_board_ids`
+hashes sorted complete security/member projections under
+`stock-eva/r2f4.2/universe-partition/effective-main-board/v1`; and
+`required_additions_ids` hashes sorted `{symbol,security_id,scope_roles,state,evidence_id}`
+projections under `stock-eva/r2f4.2/universe-partition/required-additions/v1`. The latter is
+formed after removing every identity already in `effective_main_board`; required-index identities
+remain obligations and are included exactly once. Original overlapping roles remain in
+`universe_member.scope_roles`, not in the partition identity sets. Each count equals its sorted
+unique projection length.
 
 Each partition has an explicit JSON column and SHA-256 column in `universe_contract`, and the
 same IDs are present in `payload_json`. `universe_instrument_evidence` stores every classification
@@ -725,6 +787,8 @@ the final member set is `UNIVERSE_SCHEMA_MISMATCH`.
 | `scope` | literal | Same as `universe_id`; no fixed count |
 | `trade_date` | date | One confirmed open session |
 | `classification_generation_id` | safe ID | Promoted PIT generation only |
+| `classification_generation_sequence` / `classification_source_snapshot_date` | integer/date | Explicit GenerationSummary metadata; no fictitious source hash |
+| `classification_snapshot_sha256` | SHA-256 | Newly computed digest of the selected exact PIT classification snapshot |
 | `calendar_generation_id` | safe ID | Promoted R2-F4.1 generation only |
 | `calendar_sha256` | SHA-256 | Exact pinned calendar identity |
 | `required_symbol_snapshot_sha256` | SHA-256 | Writer-owned deduplicated union identity |
@@ -734,7 +798,7 @@ the final member set is `UNIVERSE_SCHEMA_MISMATCH`.
 | `required_symbol_snapshot_id` / `instrument_evidence_ids_json` | safe ID/JSON IDs | Explicit source reference columns, cross-checked with links and payload |
 | `classification_evidence_ids` / `classification_evidence_partition_sha256` | sorted IDs/SHA-256 | Layer 1 persisted identity partition, including excluded evidence |
 | `effective_main_board_ids` / `effective_main_board_partition_sha256` | sorted IDs/SHA-256 | Layer 2 persisted identity partition |
-| `required_addition_ids` / `required_addition_partition_sha256` | sorted IDs/SHA-256 | Layer 3 persisted identity partition |
+| `required_additions_ids` / `required_additions_partition_sha256` | sorted IDs/SHA-256 | Layer 3 persisted identity partition |
 | `classification_evidence_count` / `classification_evidence_sha256` | integer/SHA-256 | Layer 1 count/hash |
 | `effective_main_board_count` / `effective_main_board_sha256` | integer/SHA-256 | Layer 2 count/hash (same digest as the partition) |
 | `required_additions_count` / `required_additions_sha256` | integer/SHA-256 | Layer 3 count/hash (same digest as the partition) |
@@ -904,6 +968,9 @@ CREATE TABLE universe_contract (
   schema_version INTEGER NOT NULL CHECK (schema_version = 1),
   scope TEXT NOT NULL, calendar_generation_id TEXT NOT NULL,
   calendar_sha256 TEXT NOT NULL, classification_generation_id TEXT NOT NULL,
+  classification_generation_sequence INTEGER NOT NULL,
+  classification_source_snapshot_date TEXT NOT NULL,
+  classification_snapshot_sha256 TEXT NOT NULL,
   exact_pit_cutoff TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
   source_date_semantics TEXT NOT NULL, required_symbol_snapshot_id TEXT NOT NULL,
   required_symbol_snapshot_sha256 TEXT NOT NULL, instrument_evidence_ids_json TEXT NOT NULL,
@@ -912,8 +979,8 @@ CREATE TABLE universe_contract (
   classification_evidence_partition_sha256 TEXT NOT NULL,
   effective_main_board_ids_json TEXT NOT NULL,
   effective_main_board_partition_sha256 TEXT NOT NULL,
-  required_addition_ids_json TEXT NOT NULL,
-  required_addition_partition_sha256 TEXT NOT NULL,
+  required_additions_ids_json TEXT NOT NULL,
+  required_additions_partition_sha256 TEXT NOT NULL,
   payload_json TEXT NOT NULL, contract_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
 );
 CREATE TABLE universe_member (
@@ -1032,8 +1099,9 @@ END;
 `universe_meta`; both are checked on every open. The writer MUST hold the existing refresh/control
 lock plus an exclusive sidecar lock file, set `PRAGMA journal_mode=WAL`, `synchronous=FULL`,
 `foreign_keys=ON`, and use a bounded busy timeout. Contract/member/evidence/snapshot/link rows are
-append-only; only the singleton head may change, using a compare-and-swap on `(sequence,
-contract_sha256)` inside one transaction. An empty initialized store has **no** `universe_head`
+append-only; contract, evidence, snapshot, member, role-link and head CAS rows MUST be inserted or
+updated in one SQLite transaction. A failed CAS rolls back that entire transaction; there are no
+pre-committed unreachable rows or orphan sequence. An empty initialized store has **no** `universe_head`
 row; the first promotion inserts sequence 1 with a null parent.
 
 The canonical contract preimage is `payload_json` decoded as strict JSON and re-encoded by the
@@ -1045,11 +1113,16 @@ of that preimage; explicit columns (`contract_id`, schema/scope/date, calendar/c
 source refs, PIT cutoff, required-snapshot hash, counts, layer counts and partition ID/hash
 fields) MUST equal the corresponding payload fields. The reader reconstructs `UniverseContractV1`
 from `payload_json`, sorts and re-hashes every
-`universe_member` row, then verifies the member set/hash and all bidirectional links: every payload
-evidence ID has exactly one `contract_evidence` link and existing evidence row, every link belongs
-to the contract, exactly one `contract_required_snapshot` link matches the payload snapshot/hash,
-and no evidence/member/snapshot/link row is orphaned from a referenced contract. It also verifies
-that each classification evidence row (including excluded rows) has a role-bearing link, every
+`universe_member` row, then verifies the member set/hash and all bidirectional links. The exact
+role-set is: excluded classification evidence = `{classification_evidence}`; effective main-board
+member = `{classification_evidence,effective_main_board,member}`; required non-index addition =
+`{classification_evidence,required_addition,member}`; required index =
+`{required_addition,member}`. For every link, `security_id`, `symbol` and `exclusion_reason` MUST
+equal the referenced evidence payload; no one-link shortcut is permitted. Every payload evidence
+ID has exactly its role-set and existing evidence row, every link belongs to the contract, exactly
+one `contract_required_snapshot` link matches the payload snapshot/hash, and no
+evidence/member/snapshot/link row is orphaned from a referenced contract. It also verifies that
+each classification evidence row (including excluded rows) has a role-bearing link, every
 attempt dedup key has exactly one immutable plan and at most one immutable terminal result, and
 the recorded request count never exceeds the budget. Missing or duplicate attempt state is
 `UNIVERSE_SCHEMA_MISMATCH`, never a cached prior success.
@@ -1060,7 +1133,8 @@ the recorded request count never exceeds the budget. Missing or duplicate attemp
 `head.contract_sha256 == contract.contract_sha256`, sequence 1 to have no parent, and every later
 contract to have `sequence = parent.sequence + 1` with matching parent hash. CAS is
 `UPDATE universe_head ... WHERE singleton_id=1 AND sequence=expected_sequence AND
-contract_sha256=expected_hash`; insert is allowed only for an empty head and expected sequence 0.
+contract_sha256=expected_hash`; insert is allowed only for an empty head and expected sequence 0,
+and a zero-row CAS is a transaction rollback.
 
 The ordered schema digest preimage is the newline-joined, in-DLL order of the normalized `PRAGMA`,
 `CREATE TABLE`, `CREATE INDEX` (none), and `CREATE TRIGGER` statements. Normalization removes SQL
@@ -1070,9 +1144,10 @@ formatter. `schema_digest = domain_sha256("stock-eva/r2f4.2/
 universe-schema/v1", normalized_ddl)`. The strict reader opens the descriptor-bound database
 read-only, verifies path/inode, store identity, `user_version`, exact schema digest, allowed table
 set, payload/member/link/evidence hashes, parent chain and head digest, and never runs DDL/DML or
-creates a WAL/SHM file. A crash before commit leaves the prior head; rows committed before CAS are
-unreachable and ignored; a crash during CAS yields either old or fully verified new head. CAS
-conflict aborts without retrying or changing the head. Any corruption returns `unavailable`, never
+creates a WAL/SHM file. A crash before commit leaves the prior head; a crash during CAS yields
+either old or fully verified new head. CAS
+conflict aborts and rolls back all contract/evidence/snapshot/member/link/head changes without
+retrying or changing the head. Any corruption returns `unavailable`, never
 a historical cached projection.
 
 ### UniverseStatusSnapshotV1
@@ -1133,12 +1208,18 @@ evidence_ref, now)` is invoked only after canonical `ready`, post-publish comple
 existing shadow offer have returned. It first reacquires the existing `RefreshRunLock` in
 non-blocking mode and then the exclusive sidecar lock; lock failure returns `DEFER` with
 `CONTROL_STATE_UNAVAILABLE` and makes no provider request. Under the sidecar lock it inserts the
-immutable `universe_attempt` plan before any classification request. Its deterministic
+immutable `universe_attempt` plan before any classification request. The dedup lookup and plan
+insert occur in one `BEGIN IMMEDIATE` transaction and commit before the request; its deterministic
 `dedup_key` is the hash of `{hook_kind, refresh_id, trade_date, operation_day}`; budget and
 `classification_max_attempts` are both exactly 1. The terminal immutable result records status,
 reason and actual request count. A duplicate key is a no-op/defer, never a resend. If the current
 classification evidence is unqualified, the hook records stable `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`
-with zero requests. No independent lane or unbounded retry exists.
+with zero requests. `operation_day` is the `Asia/Shanghai` calendar date captured at attempt start
+and remains fixed across midnight. `planned_sha256` is the domain hash
+`stock-eva/r2f4.2/universe-attempt-plan/v1` over the complete canonical plan preimage; result
+hashing uses `stock-eva/r2f4.2/universe-attempt-result/v1` over status, request count, closed
+reason and finish time. The reader recomputes both and treats absent, altered or duplicate result
+events as unavailable. No independent lane or unbounded retry exists.
 
 ## Closed reason set and traceability matrix
 
@@ -1202,6 +1283,9 @@ internal variants but map to the control row above.
 | FR-20, FR-21 | AC-14; EC-1..EC-3, EC-13 | `tests/test_market_universe.py::test_status_zero_write`; filesystem fingerprint |
 | FR-22, FR-23 | AC-15, AC-16; EC-14, EC-20, EC-21 | `tests/test_market_automation.py::test_post_success_universe_offer_order` |
 | FR-24, FR-25 | AC-12, AC-17, AC-18; EC-11, EC-16, EC-22 | `tests/test_market_failover.py` and static provider allowlist (`baostock` only) |
+| FR-15..FR-17 | AC-20; EC-23 | pure raw-batch gate fixtures for request/endpoint/page aggregation, state and whole-session rejection |
+| FR-18, FR-19, FR-23, FR-26 | AC-13, AC-16; EC-24 | sidecar attempt/hash/transaction rollback and strict-reader tests |
+| NFR-1..NFR-12 | AC-1..AC-20; EC-1..EC-24 | offline-only fakes, zero-write fingerprint, deterministic hash, privacy scan, protected SHA and validator outputs |
 
 The final acceptance record MUST list each FR/AC/EC result, test or static trace, exact commit,
 and the two strict validator outputs. This document remains `In Review` until independent SPEC

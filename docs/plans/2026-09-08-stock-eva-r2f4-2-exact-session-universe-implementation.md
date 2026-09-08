@@ -223,6 +223,10 @@ settings and singleton head, **When** a writer commits rows and performs sequenc
 **Then** the strict reader verifies the full chain read-only; **Given** a legacy or unknown schema,
 **Then** writer-only initialization refuses migration and status is unavailable.
 
+All contract, evidence, required-snapshot, member, role-link and head-CAS writes MUST share one
+SQLite transaction. A failed CAS or crash rolls back all of them; no unreachable contract rows,
+orphan links or sequence can be committed.
+
 ### AC-9: Read-only API and CLI (FR-10, FR-12, NFR-2, NFR-6)
 
 **Given** missing, valid, stale and corrupt sidecar roots, **When** the API or CLI status is
@@ -383,6 +387,19 @@ with `CONTROL_STATE_UNAVAILABLE`. Blocked/ready/stale are HTTP `200` (CLI exit `
 inode, schema, WAL, lock or hashes cannot be proven, return HTTP `503` with the fixed body
 `{"code":"universe_control_unavailable"}` (CLI exit `3`). Neither operation initializes or
 migrates sidecar state.
+
+Status field matrix (identical to the design and normative for the CLI):
+
+| Status | Condition | Nullable fields and source |
+|---|---|---|
+| `ready` | verified head exists and `head.trade_date == requested trade_date` | contract IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
+| `stale` | verified head is valid but `head.trade_date != requested confirmed date` | all populated contract/source/count fields are explicitly the verified head's values, `trade_date` is the request, `verified_head_trade_date` is head date, reason is `UNIVERSE_DATE_MISMATCH`; no requested-date projection is implied |
+| `blocked` | durable latest attempt for requested date is terminal blocked, with no verified head for that date | contract/source/count/layer fields are null; `verified_head_trade_date` is null; reason is the durable attempt reason |
+| `unavailable` | safe store read has no head, or storage/state cannot be proven | all contract/source/count/layer fields and `verified_head_trade_date` are null; no cached prior head is used; unprovable storage is HTTP 503 |
+
+The single public TypeScript shape uses nullable fields, with this matrix as its discriminated
+runtime constraint; implementations MUST NOT populate a nullable field outside the row's stated
+status/source rule.
 `publication_eligible` means exactly `(unknown == 0 and critical_attribute_unknown == 0 and
 required_indexes_are_trading and all_evidence_checks_pass and (loaded is null or
 loaded == session_expected))`; candidate publication additionally requires
@@ -415,6 +432,15 @@ interface UniverseHookResult {
   reason_code: string | null;
   provider_requests: number;
   writes_canonical: false;
+}
+
+interface UniversePublicationContext {
+  run_id: string;
+  trade_date: string;
+  manifest_ref: string;
+  evidence_refs: string[];
+  publication_lineage_sha256: string;
+  status: "ready";
 }
 
 interface LegacyUniverseIntegration {
@@ -455,10 +481,13 @@ interface UniverseCandidateGate {
   contract_sha256: string;
   provider_id: "baostock";
   refresh_id: string;
-  provider_session_id: string;
-  request_id: string;
-  endpoint_id: string;
-  pages: number;
+  request_aggregates: Array<{request_id: string; trade_date: string; refresh_id: string;
+    provider_session_id: string; pages: number; batch_digest: string}>;
+  endpoint_aggregates: Array<{endpoint_id: string; request_id: string; pages: number;
+    row_count: number; batch_digest: string}>;
+  page_aggregates: Array<{endpoint_id: string; request_id: string; page: number;
+    row_count: number; page_digest: string}>;
+  batch_digest: string;
   adapter_version: string;
   observed_symbols: string[];
   missing_symbols: string[];
@@ -480,6 +509,23 @@ reject any date/provider/session/request/evidence/endpoint drift, duplicate page
 `loaded != session_expected`. It MUST reject `unknown=1` even if the loaded count matches. No
 provider other than BaoStock may enter this interface.
 
+`validate_provider_raw_batch(batch, contract)` receives the complete existing batch and an
+independent contract identity; it does not require contract/evidence fields absent from
+`ProviderRawBatch`. It first validates existing request completions, transport observations,
+request plan and endpoint/page lineage using existing model validators, then emits deterministic
+request-, endpoint- and page-aggregate tuples plus `batch_digest`; only afterward does it bind the
+independent contract date/provider/refresh identity.
+The loaded candidate is `DAILY_ASTOCK` stock rows plus `INDEX_HISTORY` index rows; `ALL_STOCK` is
+only an observed-universe cross-check and factor endpoints are control/factor-completeness only,
+never loaded rows. The result is aggregate tuples, not a single endpoint/page scalar.
+
+The current legacy `validate_universe` callback remains wired exactly as-is; mode `off` is
+unchanged and the new pure gate is not passed to it. In `shadow`, after canonical `ready`, build a
+read-only `UniversePublicationContext` from `MarketStore.published_refresh`, its
+`publication_lineage`, and CandidateStore evidence references. Require matching `run_id`,
+`trade_date`, manifest/evidence references and lineage digest; mismatch is
+`UNIVERSE_SESSION_DRIFT`, never a canonical block or mutation.
+
 ## Data Models
 
 ### Code-level models
@@ -489,10 +535,12 @@ Implementation MUST realize the companion design models `UniverseContractV1`, `U
 `UniverseStatusSnapshotV1` and `UniverseCandidateGate`. All models are strict, frozen, extra-forbid,
 finite, safe-ID/hash validated and use the exact state vocabularies in the design.
 
-`SourceRefsV1` is a required frozen model (calendar/classification generation IDs and hashes,
+`SourceRefsV1` is a required frozen model (calendar generation ID/hash, classification generation
+ID, its sequence/source metadata, a newly computed exact-PIT classification snapshot digest,
 required snapshot ID/hash, sorted instrument evidence IDs, provider, trade date, exact PIT cutoff
-and source-date semantics). `UniverseContractV1` MUST persist and hash sorted-unique
-`classification_evidence_ids`, `effective_main_board_ids` and `required_addition_ids`, with a
+and source-date semantics). If the existing `GenerationSummary` lacks a source hash, the
+implementation MUST NOT invent one. `UniverseContractV1` MUST persist and hash sorted-unique
+`classification_evidence_ids`, `effective_main_board_ids` and `required_additions_ids`, with a
 partition digest for each. Excluded classification evidence is durable and linked with an explicit
 exclusion reason; the strict reader recomputes all three partitions from evidence links and member
 roles rather than trusting only final members or counts.
@@ -500,13 +548,22 @@ roles rather than trusting only final members or counts.
 The builder MUST retain three separately accounted layers: (1) every unique promoted PIT
 `classification_evidence` identity, including excluded records; (2) the
 `effective_main_board` subset using `list_date <= trade_date < delist_date` (or no delist
-date); and (3) `required_additions`, the valid user A-share union plus the two required indexes.
+date); and (3) `required_additions`, the valid user A-share union after removing effective
+main-board identities, plus the two required indexes.
 Each layer has its own sorted identity list, count and SHA-256: the strict fields are
-`classification_evidence_ids`, `effective_main_board_ids` and `required_addition_ids`, each with
+`classification_evidence_ids`, `effective_main_board_ids` and `required_additions_ids`, each with
 its partition SHA-256 in the payload and explicit sidecar columns. Excluded classification
 evidence is persisted with role/exclusion links and is rehashed by the reader. The final member hash is computed
-from the union, with overlap contributing one member and unioned roles. `not_yet_listed` and
+from the union, with source-role overlap retained only in `UniverseMemberV1.scope_roles`.
+`not_yet_listed` and
 `delisted` required additions remain visible but never enter `session_expected`.
+
+Use the exact design domains/projections: classification evidence is sorted
+`{security_id,symbol,evidence_id,exclusion_reason}`; effective main-board is sorted complete
+security/member projections; required additions are sorted `{symbol,security_id,scope_roles,state,
+evidence_id}` after removing identities already in the effective main-board partition. Required
+indexes remain exactly once. Roles that overlap are retained only in `universe_member.scope_roles`,
+and each partition count is the length of its sorted unique projection.
 
 The implementation MUST add the reviewed semantic mapping registry described by the design. A
 mapping has closed provider/source-schema values, `mapping_id`, `mapping_version`, date/PIT rules
@@ -570,13 +627,16 @@ CLI stores only expose count/hash.
 The exact DDL is the design's normative v1 DDL; implementation MUST checksum its canonical DDL as
 `schema_digest`, set `PRAGMA user_version=1`, `journal_mode=WAL`, `synchronous=FULL` and
 `foreign_keys=ON`, and use a bounded busy timeout. It MUST hold an exclusive sidecar lock plus the
-existing refresh/control lock. Only `universe_head` updates, and only by CAS on sequence and
-contract hash; all other tables are append-only with update/delete rejection. The strict reader
+existing refresh/control lock. Contract, evidence, snapshot, member, role-link and head CAS rows
+are inserted/updated in one SQLite transaction; CAS failure rolls back all of them, so there are
+no pre-committed unreachable rows or orphan sequences. Only `universe_head` updates, and only by
+CAS on sequence and contract hash; all other tables are append-only with update/delete rejection.
+The strict reader
 checks descriptor-bound path/inode, store identity, schema/table allowlist, schema digest, all row
 hashes, sequence-parent chain and head hash in one read transaction without DDL/DML. v1 writer
 initialization is the only initialization path; there is no legacy migration in this release.
-Crash before commit leaves the old head, rows committed before a crash remain unreachable, and a
-CAS conflict returns unavailable without retry or head mutation.
+Crash before commit leaves the old head and rolls back the transaction, and a CAS conflict returns
+unavailable without retry or head mutation.
 
 The implementation MUST use this normative v1 DDL (the canonical whitespace-normalized text is
 the schema-digest preimage):
@@ -590,6 +650,9 @@ CREATE TABLE universe_contract (contract_id TEXT PRIMARY KEY, sequence INTEGER N
  trade_date TEXT NOT NULL, universe_id TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK
  (schema_version = 1), scope TEXT NOT NULL, calendar_generation_id TEXT NOT NULL,
  calendar_sha256 TEXT NOT NULL, classification_generation_id TEXT NOT NULL,
+ classification_generation_sequence INTEGER NOT NULL,
+ classification_source_snapshot_date TEXT NOT NULL,
+ classification_snapshot_sha256 TEXT NOT NULL,
  exact_pit_cutoff TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
  source_date_semantics TEXT NOT NULL, required_symbol_snapshot_id TEXT NOT NULL,
  required_symbol_snapshot_sha256 TEXT NOT NULL, instrument_evidence_ids_json TEXT NOT NULL,
@@ -598,8 +661,8 @@ CREATE TABLE universe_contract (contract_id TEXT PRIMARY KEY, sequence INTEGER N
  classification_evidence_partition_sha256 TEXT NOT NULL,
  effective_main_board_ids_json TEXT NOT NULL,
  effective_main_board_partition_sha256 TEXT NOT NULL,
- required_addition_ids_json TEXT NOT NULL,
- required_addition_partition_sha256 TEXT NOT NULL,
+ required_additions_ids_json TEXT NOT NULL,
+ required_additions_partition_sha256 TEXT NOT NULL,
  payload_json TEXT NOT NULL, contract_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE universe_member (contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
  symbol TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
@@ -685,13 +748,20 @@ sorted members, required indexes, evidence IDs, snapshot hash, all counts/layer 
 refs, PIT fields and all three partition IDs/hashes. Its digest and all explicit identity/source/
 count/partition columns must match the decoded payload. The strict reader reconstructs the
 contract from payload, re-hashes every member row and every persisted excluded evidence row,
-checks exact role-bearing bidirectional `contract_evidence` and `contract_required_snapshot` links,
+checks exact role sets in bidirectional `contract_evidence`: excluded classification evidence is
+`{classification_evidence}`; effective main-board member is
+`{classification_evidence,effective_main_board,member}`; required non-index addition is
+`{classification_evidence,required_addition,member}`; required index is
+`{required_addition,member}`. For every role link, `security_id`, `symbol` and `exclusion_reason`
+must equal the evidence payload. It also checks exact `contract_required_snapshot` links,
 and rejects every orphan. Explicit provider, source-date, required-snapshot and evidence-ID
 columns must equal `SourceRefsV1` and their payload counterparts. It verifies
 `head.sequence == contract.sequence`, `sequence=1` parent null, later sequence = parent+1, and
 `head_sha256` over canonical `{"singleton_id":1,"sequence":N,"contract_id":"...",
 "contract_sha256":"..."}`. CAS is conditional on the expected sequence/hash, with insert only
-on empty head. DDL normalization is the ordered statement text from the DDL block (comments
+on empty head. All contract/evidence/snapshot/member/link/head changes share this transaction;
+a failed CAS rolls it back, so no unreachable candidate rows or orphan sequence can commit. DDL
+normalization is the ordered statement text from the DDL block (comments
 removed, whitespace collapsed outside quoted literals, whitespace removed immediately inside/around
 `(`, `)` and `,`, quoted content preserved); the exact digest
 is `domain_sha256("stock-eva/r2f4.2/universe-schema/v1", normalized_ddl)` and is stored as
@@ -810,11 +880,16 @@ control layout centralized.
 5. Implement typed `UniversePostSuccessHook.offer(canonical_result, refresh_id, trade_date,
    manifest_ref, evidence_ref, now)`. It must reacquire the existing `RefreshRunLock` non-blocking,
    then the sidecar lock; failure returns `DEFER/CONTROL_STATE_UNAVAILABLE`. Under the sidecar
-   lock insert the immutable `universe_attempt` plan before any classification request. Use
+   lock insert the immutable `universe_attempt` plan before any classification request. The dedup
+   lookup and insert share one `BEGIN IMMEDIATE` transaction that commits before the request. Use
    `dedup_key=sha256(canonical {hook_kind, refresh_id, trade_date, operation_day})`,
    `request_budget=1`, `classification_max_attempts=1`, and one immutable terminal result. A
    duplicate key is no-op/defer, not a resend; unqualified evidence records stable blocked with
-   zero requests. Do not add a sixth LaunchAgent, independent scheduler lane or additional scheduler lock. Add concurrency,
+   zero requests. `operation_day` is the `Asia/Shanghai` clock date captured at attempt start and
+   remains fixed across midnight. Hash the complete plan with domain
+   `stock-eva/r2f4.2/universe-attempt-plan/v1` and the terminal result with
+   `stock-eva/r2f4.2/universe-attempt-result/v1`; the reader recomputes both and rejects altered,
+   missing or duplicate events. Do not add a sixth LaunchAgent, independent scheduler lane or additional scheduler lock. Add concurrency,
    restart, deferred, priority, post-success ordering, failure and no-repeat tests covering
    `classification/sync.py`, `classification/store.py`, `backend/app/market/automation.py` and
    `tests/test_market_failover.py`.
