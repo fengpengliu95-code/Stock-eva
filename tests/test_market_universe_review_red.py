@@ -593,9 +593,10 @@ def test_effective_main_board_requires_point_in_time_listing_window():
         }
     )
     assert "effective_main_board" in future.scope_roles
-    # The builder must derive this out of the base before publication.
-    candidate = _contract((future,))
-    assert future.symbol not in candidate.effective_main_board_ids
+    # A member that belongs to neither canonical partition is blocked rather
+    # than silently accepted as a partition gap.
+    with pytest.raises(ValueError):
+        _contract((future,))
 
 
 def test_promote_calendar_authority_is_required():
@@ -713,6 +714,43 @@ def test_universe_sidecar_fails_closed_when_path_is_replaced_after_open(tmp_path
 def test_source_refs_bind_adapter_and_endpoint_contract_versions():
     assert "adapter_version" in SourceRefsV1.model_fields
     assert "endpoint_contract_version" in SourceRefsV1.model_fields
+
+
+def test_calendar_admission_is_frozen_and_reader_digest_bound():
+    from tests.test_market_universe import _calendar_authority
+
+    authority = _calendar_authority(date(2026, 9, 4))
+    with pytest.raises((AttributeError, TypeError)):
+        authority.head_generation_sha256 = "f" * 64
+    with pytest.raises((AttributeError, TypeError)):
+        authority.read_result = authority.read_result
+
+
+def test_partition_members_cannot_fall_between_layers():
+    from tests.test_market_universe import _member
+
+    future = _member("sh.600010").model_copy(
+        update={
+            "list_date": date(2026, 10, 1),
+            "expected_trading_state": "not_yet_listed",
+            "member_sha256": None,
+        }
+    )
+    with pytest.raises(ValueError):
+        _contract((future,))
+
+
+def test_snapshot_has_no_callable_marker_admission_factory():
+    assert not hasattr(RequiredSymbolSnapshotV1, "_admit")
+
+
+def test_mapping_payload_json_must_be_byte_canonical():
+    mapping = _mapping()
+    values = mapping.model_dump()
+    payload = json.loads(mapping.payload_json)
+    values["payload_json"] = json.dumps(payload, sort_keys=True)
+    with pytest.raises(ValueError):
+        UniverseSemanticMappingV1.model_validate(values)
 
 
 def test_required_snapshot_id_is_derived_from_snapshot_sha():

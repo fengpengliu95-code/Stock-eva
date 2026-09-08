@@ -358,9 +358,11 @@ class UserStore:
             raise UserDataError("user snapshot capture unavailable") from exc
         finally:
             descriptor = self._descriptor_fds.pop(id(connection), None)
-            connection.close()
-            if descriptor is not None:
-                os.close(descriptor)
+            try:
+                connection.close()
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
 
     @staticmethod
     def _position(row: sqlite3.Row) -> Position:

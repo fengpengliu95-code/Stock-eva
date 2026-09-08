@@ -251,6 +251,8 @@ class UniverseSemanticMappingV1(_Frozen):
         payload = json.loads(self.payload_json)
         if not isinstance(payload, dict):
             raise ValueError("semantic mapping payload must be an object")
+        if self.payload_json != canonical_json_bytes(payload).decode("utf-8"):
+            raise ValueError("semantic mapping payload JSON is not canonical")
         if self.source_schema not in _MAPPING_SCHEMAS:
             raise ValueError("semantic mapping schema is not closed")
         if self.authority_status == "reviewed" and (
@@ -590,12 +592,6 @@ class RequiredSymbolSnapshotV1(_Frozen):
     _admission_marker: object | None = PrivateAttr(default=None)
 
     @classmethod
-    def _admit(cls, **values: Any) -> RequiredSymbolSnapshotV1:
-        result = cls.model_validate(values)
-        object.__setattr__(result, "_admission_marker", _SNAPSHOT_ADMISSION_SECRET)
-        return result
-
-    @classmethod
     def from_user_capture(cls, captured: Any) -> RequiredSymbolSnapshotV1:
         from backend.app.user.store import RequiredUserSymbolSnapshotRead
 
@@ -619,12 +615,15 @@ class RequiredSymbolSnapshotV1(_Frozen):
                 "symbols": [{"symbol": symbol, "roles": list(roles)} for symbol, roles in pairs],
             },
         )
-        result = cls._admit(
-            snapshot_id=digest[:32],
-            snapshot_sha256=digest,
-            snapshot_token_digest=token,
-            symbols=tuple((symbol, tuple(roles)) for symbol, roles in pairs),
+        result = cls.model_validate(
+            {
+                "snapshot_id": digest[:32],
+                "snapshot_sha256": digest,
+                "snapshot_token_digest": token,
+                "symbols": tuple((symbol, tuple(roles)) for symbol, roles in pairs),
+            }
         )
+        object.__setattr__(result, "_admission_marker", _SNAPSHOT_ADMISSION_SECRET)
         return result
 
     @model_validator(mode="after")
@@ -770,6 +769,8 @@ class UniverseContractV1(_Frozen):
         )
         if expected_required_ids != self.required_additions_ids:
             raise ValueError("required additions IDs are not derived from members")
+        if set(symbols) != set(expected_effective_ids) | set(expected_required_ids):
+            raise ValueError("contract member is not assigned to a canonical partition")
 
         # Partition digests are over the normative projections, never over the
         # generated member digest.  The latter is a verification result and is
@@ -2354,6 +2355,7 @@ class UniverseSidecarStore:
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
         descriptor: int | None = None
+        connection: sqlite3.Connection | None = None
         try:
             if self.path.exists():
                 flags = os.O_RDONLY if readonly else os.O_RDWR
@@ -2390,16 +2392,21 @@ class UniverseSidecarStore:
                 if readonly:
                     raise UniverseStoreUnavailable("universe sidecar path unavailable")
                 connection = sqlite3.connect(self.path, timeout=0.25, factory=_DescriptorConnection)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=250")
+            return connection
         except (OSError, sqlite3.Error, UniverseStoreUnavailable) as exc:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
             if descriptor is not None:
                 os.close(descriptor)
             if isinstance(exc, UniverseStoreUnavailable):
                 raise
             raise UniverseStoreUnavailable("universe sidecar path unavailable") from exc
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=250")
-        return connection
 
     def initialize(self) -> None:
         if self.path.exists() and self.path.is_symlink():

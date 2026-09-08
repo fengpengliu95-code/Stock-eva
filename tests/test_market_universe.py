@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time
 import pytest
 
 from backend.app.market.calendar_generation import (
+    _CALENDAR_ADMISSION_SECRET,
     CalendarAuthorityAdmission,
     CalendarConfigSnapshot,
     CalendarGenerationV1,
@@ -237,10 +238,11 @@ def _calendar_authority(trade_date: date) -> CalendarAuthorityAdmission:
         generation_sha256=generation.generation_sha256,
     )
     result = CalendarReadResult(status="ready", generation=generation, calendar=calendar)
-    admission = object.__new__(CalendarAuthorityAdmission)
-    object.__setattr__(admission, "read_result", result)
-    object.__setattr__(admission, "head_generation_sha256", generation.generation_sha256)
-    return admission
+    return CalendarAuthorityAdmission(
+        result,
+        head_generation_sha256=generation.generation_sha256,
+        _secret=_CALENDAR_ADMISSION_SECRET,
+    )
 
 
 def _mapping() -> UniverseSemanticMappingV1:

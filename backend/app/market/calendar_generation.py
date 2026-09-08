@@ -16,6 +16,7 @@ import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -364,10 +365,12 @@ class CalendarReadResult(_Frozen):
 _CALENDAR_ADMISSION_SECRET = object()
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class CalendarAuthorityAdmission:
     """Opaque reader-owned R2-F4.1 proof; callers cannot mint one from a model."""
 
-    __slots__ = ("read_result", "head_generation_sha256")
+    read_result: CalendarReadResult
+    head_generation_sha256: str | None
 
     def __init__(
         self,
@@ -380,8 +383,21 @@ class CalendarAuthorityAdmission:
             raise TypeError("calendar authority admission is reader-owned")
         if not isinstance(read_result, CalendarReadResult):
             raise TypeError("calendar authority read result invalid")
-        self.read_result = read_result
-        self.head_generation_sha256 = head_generation_sha256
+        if read_result.status == "ready":
+            generation = read_result.generation
+            calendar = read_result.calendar
+            if (
+                generation is None
+                or calendar is None
+                or build_generation_sha256(generation) != generation.generation_sha256
+                or calendar.generation_sha256 != generation.generation_sha256
+                or head_generation_sha256 != generation.generation_sha256
+            ):
+                raise ValueError("calendar authority digest is not reader-verified")
+        elif head_generation_sha256 is not None:
+            raise ValueError("unavailable calendar authority has a head digest")
+        object.__setattr__(self, "read_result", read_result)
+        object.__setattr__(self, "head_generation_sha256", head_generation_sha256)
 
 
 class CalendarSourceMetadata(_Frozen):
