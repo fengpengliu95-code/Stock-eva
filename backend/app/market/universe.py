@@ -84,6 +84,7 @@ class UniverseMemberV1(_Frozen):
                 self.symbol not in INDEX_SYMBOLS
                 or self.board != "index"
                 or self.scope_roles != ("required_index",)
+                or self.expected_trading_state != "trading"
             ):
                 raise ValueError("index member identity invalid")
         if self.exchange != ("SSE" if self.symbol.startswith("sh.") else "SZSE"):
@@ -156,6 +157,90 @@ class SourceRefsV1(_Frozen):
         return self
 
 
+class UniverseSemanticMappingV1(_Frozen):
+    mapping_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    mapping_version: str = Field(min_length=1, max_length=64)
+    provider_id: Literal["baostock"]
+    source_schema: str = Field(min_length=1, max_length=128)
+    payload_json: str
+    mapping_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authority_status: Literal["reviewed", "unqualified"]
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> UniverseSemanticMappingV1:
+        payload = json.loads(self.payload_json)
+        expected = domain_sha256(
+            "stock-eva/r2f4.2/semantic-mapping/v1",
+            {
+                "mapping_id": self.mapping_id,
+                "mapping_version": self.mapping_version,
+                "provider_id": self.provider_id,
+                "source_schema": self.source_schema,
+                "payload": payload,
+            },
+        )
+        if expected != self.mapping_sha256:
+            raise ValueError("semantic mapping hash mismatch")
+        return self
+
+
+class UniverseInstrumentEvidenceV1(_Frozen):
+    evidence_id: str = Field(min_length=1, max_length=128)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_id: Literal["baostock"]
+    authority_status: Literal["reviewed", "unqualified"]
+    artifact_origin: Literal["local_reviewed_fixture", "production_reviewed_artifact"]
+    security_id: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(pattern=r"^(sh|sz)\.[0-9]{6}$")
+    mapping_id: str
+    mapping_version: str
+    mapping_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_snapshot_date: date
+    evidence_trade_date: date
+    exclusion_reason: str
+    index_role: Literal["required_index", "not_applicable"]
+    source_date_semantics: Literal["source_observed", "requested_unverified"]
+    evidence_json: str
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> UniverseInstrumentEvidenceV1:
+        expected = domain_sha256("stock-eva/r2f4.2/instrument-evidence/v1", self.preimage())
+        if expected != self.evidence_sha256:
+            raise ValueError("instrument evidence hash mismatch")
+        return self
+
+    def preimage(self) -> dict[str, Any]:
+        value = self.model_dump(mode="json")
+        value.pop("evidence_sha256", None)
+        return value
+
+
+class RequiredSymbolSnapshotV1(_Frozen):
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    snapshot_token_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_version: Literal[1] = 1
+    symbols: tuple[tuple[str, tuple[str, ...]], ...]
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> RequiredSymbolSnapshotV1:
+        if self.symbols != tuple(sorted(self.symbols)):
+            raise ValueError("required snapshot symbols must be sorted")
+        expected = domain_sha256(
+            "stock-eva/r2f4.2/required-symbol-snapshot/v1",
+            {
+                "schema_version": 1,
+                "snapshot_token": self.snapshot_token_digest,
+                "symbols": [
+                    {"symbol": symbol, "roles": list(roles)} for symbol, roles in self.symbols
+                ],
+            },
+        )
+        if expected != self.snapshot_sha256:
+            raise ValueError("required snapshot hash mismatch")
+        return self
+
+
 class UniverseContractV1(_Frozen):
     contract_id: str = Field(min_length=1)
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -196,6 +281,15 @@ class UniverseContractV1(_Frozen):
             raise ValueError("first contract cannot have a parent")
         if self.sequence > 1 and self.parent_contract_id is None:
             raise ValueError("non-first contract requires a parent")
+        indexes = tuple(
+            item
+            for item in self.members
+            if item.member_kind == "index" or "required_index" in item.scope_roles
+        )
+        if tuple(item.symbol for item in indexes) != INDEX_SYMBOLS:
+            raise ValueError("required index set is incomplete")
+        if any(item.expected_trading_state != "trading" for item in indexes):
+            raise ValueError("required index must be trading")
         base = {item.symbol for item in self.members if "effective_main_board" in item.scope_roles}
         additions = {
             item.symbol
@@ -213,6 +307,11 @@ class UniverseContractV1(_Frozen):
         )
         if expected != self.contract_sha256 or self.contract_id != expected[:32]:
             raise ValueError("contract hash mismatch")
+        if (
+            self.source_refs.source_date_semantics == "requested_unverified"
+            and self.publication_eligible
+        ):
+            raise ValueError("requested-unverified source cannot be publication eligible")
         if self.counts.unknown or self.counts.critical_attribute_unknown_count:
             if self.publication_eligible:
                 raise ValueError("unknown contract cannot be publication eligible")
@@ -373,7 +472,11 @@ def build_universe_contract(
         effective_main_board_partition_sha256=payload["effective_main_board_partition_sha256"],
         required_additions_partition_sha256=payload["required_additions_partition_sha256"],
         payload_json=canonical_json_bytes(payload).decode(),
-        publication_eligible=(counts.unknown == 0 and counts.critical_attribute_unknown_count == 0),
+        publication_eligible=(
+            counts.unknown == 0
+            and counts.critical_attribute_unknown_count == 0
+            and refs.source_date_semantics == "source_observed"
+        ),
     )
 
 
@@ -389,14 +492,14 @@ def validate_provider_raw_batch(
     raw_digest = domain_sha256(
         "stock-eva/r2f4.2/raw-batch-projection/v1", batch.model_dump(mode="json")
     )
-    expected = {
-        item.symbol
+    expected_members = {
+        item.symbol: item
         for item in contract.members
         if item.expected_trading_state in {"trading", "suspended"}
     }
     loaded: list[str] = []
     counts: list[tuple[str, int]] = []
-    reason: str | None = None
+    reason: str | None = "UNIVERSE_UNKNOWN_NONZERO" if contract.counts.unknown else None
     for endpoint_batch in batch.endpoint_batches:
         counts.append((endpoint_batch.endpoint.value, endpoint_batch.row_count))
         if endpoint_batch.endpoint.value in {"daily_astock", "index_history"}:
@@ -405,15 +508,35 @@ def validate_provider_raw_batch(
                 row_date = getattr(row, "date", None)
                 if symbol is None or row_date != contract.trade_date:
                     reason = "UNIVERSE_SESSION_DRIFT"
-                elif symbol in loaded:
+                member = expected_members.get(symbol)
+                if member is None:
+                    reason = reason or "UNIVERSE_EXTRA_SYMBOL"
+                elif endpoint_batch.endpoint.value == "index_history":
+                    if member.member_kind != "index" or row.tradestatus != "1":
+                        reason = reason or "REQUIRED_INDEX_NOT_TRADING"
+                elif member.member_kind != "stock":
+                    reason = reason or "UNIVERSE_STATE_MISMATCH"
+                elif member.expected_trading_state == "trading" and row.tradestatus != "1":
+                    reason = reason or "UNIVERSE_STATE_MISMATCH"
+                elif member.expected_trading_state == "suspended" and row.tradestatus not in {
+                    "",
+                    "0",
+                }:
+                    reason = reason or "UNIVERSE_STATE_MISMATCH"
+                if symbol in loaded:
                     reason = "UNIVERSE_DUPLICATE_SYMBOL"
                 loaded.append(symbol)
     observed = set(loaded)
-    missing = len(expected - observed)
-    extra = len(observed - expected)
+    missing = len(set(expected_members) - observed)
+    extra = len(observed - set(expected_members))
     duplicate = len(loaded) - len(observed)
+    missing_indexes = {
+        item.symbol
+        for item in contract.members
+        if item.member_kind == "index" and item.symbol not in observed
+    }
     if reason is None and missing:
-        reason = "UNIVERSE_MISSING_SYMBOL"
+        reason = "REQUIRED_INDEX_NOT_TRADING" if missing_indexes else "UNIVERSE_MISSING_SYMBOL"
     if reason is None and extra:
         reason = "UNIVERSE_EXTRA_SYMBOL"
     if reason is None and duplicate:
@@ -751,6 +874,10 @@ class UniverseSidecarStore:
                 or connection.execute("PRAGMA foreign_key_check").fetchall()
             ):
                 raise UniverseStoreUnavailable("universe sidecar integrity invalid")
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
+            if str(journal_mode).lower() != "wal" or synchronous != 2:
+                raise UniverseStoreUnavailable("universe durability mode invalid")
         except (OSError, sqlite3.Error, KeyError) as exc:
             raise UniverseStoreUnavailable("universe sidecar unreadable") from exc
 
@@ -759,7 +886,10 @@ class UniverseSidecarStore:
     ) -> UniverseContractV1:
         row = connection.execute(
             "SELECT payload_json,contract_sha256,contract_id,sequence,parent_contract_id, "
-            "created_at "
+            "trade_date,universe_id,schema_version,scope,calendar_generation_id,calendar_sha256, "
+            "classification_generation_id,required_symbol_snapshot_id, "
+            "required_symbol_snapshot_sha256,classification_evidence_partition_sha256, "
+            "effective_main_board_partition_sha256,required_additions_partition_sha256,created_at "
             "FROM universe_contract WHERE contract_id=?",
             (contract_id,),
         ).fetchone()
@@ -785,11 +915,32 @@ class UniverseSidecarStore:
                 publication_eligible=(
                     payload["counts"]["unknown"] == 0
                     and payload["counts"]["critical_attribute_unknown_count"] == 0
+                    and payload["source_refs"]["source_date_semantics"] == "source_observed"
                 ),
             )
             contract = UniverseContractV1.model_validate(values, strict=False)
+            if (
+                row["trade_date"] != contract.trade_date.isoformat()
+                or row["universe_id"] != contract.universe_id
+                or row["schema_version"] != contract.schema_version
+                or row["scope"] != contract.scope
+                or row["calendar_generation_id"] != contract.calendar_generation_id
+                or row["calendar_sha256"] != contract.calendar_sha256
+                or row["classification_generation_id"] != contract.classification_generation_id
+                or row["required_symbol_snapshot_id"]
+                != contract.source_refs.required_symbol_snapshot_id
+                or row["required_symbol_snapshot_sha256"]
+                != contract.source_refs.required_symbol_snapshot_sha256
+                or row["classification_evidence_partition_sha256"]
+                != contract.classification_evidence_partition_sha256
+                or row["effective_main_board_partition_sha256"]
+                != contract.effective_main_board_partition_sha256
+                or row["required_additions_partition_sha256"]
+                != contract.required_additions_partition_sha256
+            ):
+                raise UniverseStoreUnavailable("universe contract column mismatch")
             members = connection.execute(
-                "SELECT symbol,member_sha256,member_json FROM universe_member "
+                "SELECT symbol,security_id,member_sha256,member_json FROM universe_member "
                 "WHERE contract_id=? ORDER BY symbol",
                 (contract_id,),
             ).fetchall()
@@ -799,8 +950,96 @@ class UniverseSidecarStore:
                 raise UniverseStoreUnavailable("universe member rows mismatch")
             for item in members:
                 member = UniverseMemberV1.model_validate_json(item["member_json"])
-                if member.symbol != item["symbol"] or member.member_sha256 != item["member_sha256"]:
+                if (
+                    member.symbol != item["symbol"]
+                    or member.security_id != item["security_id"]
+                    or member.member_sha256 != item["member_sha256"]
+                ):
                     raise UniverseStoreUnavailable("universe member hash invalid")
+            refs = contract.source_refs
+            source_state_id, source_state_sha = _source_state_identity(refs)
+            source_state = connection.execute(
+                "SELECT source_state_id,source_state_sha256,trade_date,provider_id, "
+                "source_version_digest,source_refs_json FROM universe_source_state "
+                "WHERE source_state_id=?",
+                (source_state_id,),
+            ).fetchone()
+            if source_state is None or tuple(source_state[:2]) != (
+                source_state_id,
+                source_state_sha,
+            ):
+                raise UniverseStoreUnavailable("universe source state missing")
+            if (
+                source_state["trade_date"] != contract.trade_date.isoformat()
+                or source_state["provider_id"] != "baostock"
+                or source_state["source_version_digest"] != refs.source_version_digest
+            ):
+                raise UniverseStoreUnavailable("universe source state mismatch")
+            mapping = connection.execute(
+                "SELECT mapping_id,mapping_version,provider_id,source_schema,payload_json, "
+                "mapping_sha256,authority_status FROM universe_semantic_mapping "
+                "WHERE mapping_sha256=?",
+                (refs.semantic_mapping_sha256,),
+            ).fetchone()
+            if mapping is None:
+                raise UniverseStoreUnavailable("universe semantic mapping missing")
+            UniverseSemanticMappingV1.model_validate(dict(mapping), strict=False)
+            evidence = connection.execute(
+                "SELECT * FROM universe_instrument_evidence WHERE evidence_id IN "
+                f"({','.join('?' for _ in contract.classification_evidence_ids)})",
+                contract.classification_evidence_ids,
+            ).fetchall()
+            if {item["evidence_id"] for item in evidence} != set(
+                contract.classification_evidence_ids
+            ):
+                raise UniverseStoreUnavailable("universe evidence set incomplete")
+            for item in evidence:
+                UniverseInstrumentEvidenceV1.model_validate(dict(item), strict=False)
+            snapshot = connection.execute(
+                "SELECT snapshot_id,snapshot_sha256,snapshot_token_digest,schema_version, "
+                "symbol_count,snapshot_json "
+                "FROM universe_required_symbol_snapshot WHERE snapshot_id=?",
+                (refs.required_symbol_snapshot_id,),
+            ).fetchone()
+            if (
+                snapshot is None
+                or snapshot["snapshot_sha256"] != refs.required_symbol_snapshot_sha256
+            ):
+                raise UniverseStoreUnavailable("universe required snapshot missing")
+            snapshot_payload = json.loads(snapshot["snapshot_json"])
+            snapshot_digest = domain_sha256(
+                "stock-eva/r2f4.2/required-symbol-snapshot/v1",
+                {
+                    "schema_version": snapshot["schema_version"],
+                    "snapshot_token": snapshot["snapshot_token_digest"],
+                    "symbols": snapshot_payload["symbols"],
+                },
+            )
+            if (
+                snapshot["schema_version"] != 1
+                or snapshot_digest != snapshot["snapshot_sha256"]
+                or snapshot["symbol_count"] != len(contract.required_additions_ids)
+                or tuple(item["symbol"] for item in snapshot_payload["symbols"])
+                != contract.required_additions_ids
+            ):
+                raise UniverseStoreUnavailable("universe required snapshot mismatch")
+            link = connection.execute(
+                "SELECT snapshot_sha256 FROM contract_required_snapshot WHERE contract_id=? "
+                "AND snapshot_id=?",
+                (contract.contract_id, refs.required_symbol_snapshot_id),
+            ).fetchone()
+            if link is None or link["snapshot_sha256"] != refs.required_symbol_snapshot_sha256:
+                raise UniverseStoreUnavailable("universe snapshot link missing")
+            links = connection.execute(
+                "SELECT evidence_id,security_id,symbol FROM contract_evidence WHERE contract_id=? "
+                "AND evidence_role='member'",
+                (contract.contract_id,),
+            ).fetchall()
+            if {(item["evidence_id"], item["security_id"], item["symbol"]) for item in links} != {
+                (item.instrument_evidence_id, item.security_id, item.symbol)
+                for item in contract.members
+            }:
+                raise UniverseStoreUnavailable("universe evidence link missing")
             return contract
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
             raise UniverseStoreUnavailable("universe contract unavailable") from exc
@@ -852,11 +1091,15 @@ class UniverseSidecarStore:
         *,
         expected_sequence: int,
         expected_head_sha256: str | None,
+        mapping: UniverseSemanticMappingV1 | None = None,
+        evidence: tuple[UniverseInstrumentEvidenceV1, ...] = (),
+        required_snapshot: RequiredSymbolSnapshotV1 | None = None,
     ) -> UniverseHeadV1:
         with _file_lock(self.lock_path):
             connection = self._connect()
             try:
                 self._validate(connection)
+                connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     "SELECT sequence,contract_sha256 FROM universe_head WHERE singleton_id=1"
                 ).fetchone()
@@ -868,7 +1111,29 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe head CAS conflict")
                 if contract.sequence != expected_sequence + 1:
                     raise UniverseStoreUnavailable("universe sequence invalid")
-                connection.execute("BEGIN IMMEDIATE")
+                if mapping is None or required_snapshot is None:
+                    raise UniverseStoreUnavailable("universe evidence bundle unavailable")
+                if (
+                    mapping.authority_status != "reviewed"
+                    or mapping.mapping_sha256 != contract.source_refs.semantic_mapping_sha256
+                ):
+                    raise UniverseStoreUnavailable("universe semantic mapping unavailable")
+                expected_evidence = {item.instrument_evidence_id for item in contract.members}
+                actual_evidence = {item.evidence_id for item in evidence}
+                if actual_evidence != expected_evidence or any(
+                    item.authority_status != "reviewed"
+                    or item.mapping_sha256 != mapping.mapping_sha256
+                    or item.symbol not in {member.symbol for member in contract.members}
+                    for item in evidence
+                ):
+                    raise UniverseStoreUnavailable("universe instrument evidence unavailable")
+                if (
+                    required_snapshot.snapshot_id
+                    != contract.source_refs.required_symbol_snapshot_id
+                    or required_snapshot.snapshot_sha256
+                    != contract.source_refs.required_symbol_snapshot_sha256
+                ):
+                    raise UniverseStoreUnavailable("universe required snapshot unavailable")
                 source_state_id, source_state_sha = _source_state_identity(contract.source_refs)
                 source_refs_json = canonical_json_bytes(
                     contract.source_refs.model_dump(mode="json")
@@ -885,23 +1150,60 @@ class UniverseSidecarStore:
                         contract.source_refs.classification_observed_at.isoformat(),
                     ),
                 )
-                snapshot_json = canonical_json_bytes(
-                    {
-                        "schema_version": 1,
-                        "symbols": list(contract.required_additions_ids),
-                    }
-                ).decode()
                 connection.execute(
                     "INSERT OR IGNORE INTO universe_required_symbol_snapshot VALUES (?,?,?,?,?,?)",
                     (
                         contract.source_refs.required_symbol_snapshot_id,
                         contract.source_refs.required_symbol_snapshot_sha256,
-                        contract.source_refs.required_symbol_snapshot_sha256,
+                        required_snapshot.snapshot_token_digest,
                         1,
                         len(contract.required_additions_ids),
-                        snapshot_json,
+                        canonical_json_bytes(
+                            {
+                                "schema_version": required_snapshot.schema_version,
+                                "symbols": [
+                                    {"symbol": symbol, "roles": list(roles)}
+                                    for symbol, roles in required_snapshot.symbols
+                                ],
+                            }
+                        ).decode(),
                     ),
                 )
+                connection.execute(
+                    "INSERT OR IGNORE INTO universe_semantic_mapping VALUES (?,?,?,?,?,?,?)",
+                    (
+                        mapping.mapping_id,
+                        mapping.mapping_version,
+                        mapping.provider_id,
+                        mapping.source_schema,
+                        mapping.payload_json,
+                        mapping.mapping_sha256,
+                        mapping.authority_status,
+                    ),
+                )
+                for item in evidence:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO universe_instrument_evidence "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            item.evidence_id,
+                            item.evidence_sha256,
+                            item.provider_id,
+                            item.authority_status,
+                            item.artifact_origin,
+                            item.security_id,
+                            item.symbol,
+                            item.mapping_id,
+                            item.mapping_version,
+                            item.mapping_sha256,
+                            item.source_snapshot_date.isoformat(),
+                            item.evidence_trade_date.isoformat(),
+                            item.exclusion_reason,
+                            item.index_role,
+                            item.source_date_semantics,
+                            item.evidence_json,
+                        ),
+                    )
                 refs = contract.source_refs
                 contract_columns = (
                     "contract_id",
@@ -1005,6 +1307,27 @@ class UniverseSidecarStore:
                             canonical_json_bytes(member.model_dump(mode="json")).decode(),
                         ),
                     )
+                    roles = []
+                    if "effective_main_board" in member.scope_roles:
+                        roles.append("effective_main_board")
+                    if (
+                        "required_user" in member.scope_roles
+                        or "required_index" in member.scope_roles
+                    ):
+                        roles.append("required_additions")
+                    roles.append("member")
+                    for role in roles:
+                        connection.execute(
+                            "INSERT INTO contract_evidence VALUES (?,?,?,?,?,?)",
+                            (
+                                contract.contract_id,
+                                member.instrument_evidence_id,
+                                role,
+                                member.security_id,
+                                member.symbol,
+                                "",
+                            ),
+                        )
                 connection.execute(
                     "INSERT INTO contract_required_snapshot VALUES (?,?,?)",
                     (
