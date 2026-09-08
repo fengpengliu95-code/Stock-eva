@@ -235,6 +235,20 @@ runtime/generation/calendar-sync tests and 2535/2535 full repository tests; comp
 3c CLI/API/existing-calendar-job integration and the complete Task 3 independent reviews remain
 pending; this is not Task 3 or R2-F4.1 GO.
 
+**Task 3 final gate:** Exact clean HEAD
+`5a07dd3df704532055718c3adb74a195f08d4824` passed serial independent SPEC review at
+H=0/M=0/L=0 and QUALITY review at H=0/M=0/L=1. The final implementation adds standalone
+status/stage/maintenance CLI and API integration, the existing calendar job hook, strict writer-only
+legacy control-store migration, persistent identity and completion evidence, and fail-closed runtime
+reader validation. The reviewers replayed missing/replaced/forged completion markers, restart,
+commit/rename failures, rollback and quarantine failures, schema/trigger/checksum changes, lock/resource
+cleanup, zero-write planning and frozen canonical boundaries. Accepted gates were 897 SPEC-scoped,
+774 QUALITY-scoped and 2641 full-repository tests; Ruff, format, compile and diff checks passed.
+The remaining L1 is documentation semantics: `writes_calendar_state=false` means no business sync
+run/state was added, not that an execute-time legacy control-store migration changed no bytes.
+Task 3 is CODE GO. Final Task 4 documentation, repository gates and exact-HEAD reviews remain;
+R2-F4.1 and production enablement are not yet claimed.
+
 **Task 1 historical progress:** The specification extractor produced 14 private
 scratch stubs (all expected failures); these are traceability aids, not implementation acceptance.
 D1 completed with 45 focused cases passing (60 including 15 independent private-root probes).

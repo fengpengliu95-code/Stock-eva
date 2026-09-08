@@ -1120,6 +1120,13 @@ The next blocking subversion is **R2-F4.1 promoted runtime calendar generations 
 fail-closed maintenance**. It must be implemented and independently reviewed before the parked
 legacy Task 14 may be rewritten. R2-F4.1 does not grant canonical secondary authority by itself.
 
+**2026-09-08 checkpoint:** R2-F4.1 Tasks 1-3 are CODE GO at exact reviewed implementation HEAD
+`5a07dd3df704532055718c3adb74a195f08d4824` after serial SPEC H0/M0/L0 and QUALITY
+H0/M0/L1 reviews. Immutable runtime generations, bounded maintenance, live snapshot pinning,
+public CLI/API/job integration and fail-closed legacy control-store migration are implemented.
+Task 4 documentation and final exact-HEAD reviews remain in progress; this is not R2-F4.1 GO,
+does not enable production runtime and does not unblock secondary selection or publication.
+
 ### PARKED LEGACY Task 14 — DO NOT EXECUTE
 
 The former executable Task 14 sketch was removed from the current plan because its prerequisite —

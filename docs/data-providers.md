@@ -8,6 +8,7 @@ the R2-F4.0 effective failover setting remains false.
 
 | Provider | Official records | Disposition |
 | --- | --- | --- |
+| SSE / SZSE calendar notices | Exact reviewed official notice URLs and body SHA-256 are staged per year; allowed hosts are `www.sse.com.cn`, `www.szse.cn` and `investor.szse.cn` | R2-F4.1 calendar authority only. Exactly one reviewed SSE and one reviewed SZSE complete-year schedule must agree. Retrieval is bounded to the staged locations and cannot grant market-data or secondary-provider capability. |
 | TickFlow | [OpenAPI](https://docs.tickflow.org/zh-Hans/api-reference/openapi.json), server `https://api.tickflow.org`, [API overview](https://docs.tickflow.org/zh-Hans/api-reference/introduction), [FAQ](https://docs.tickflow.org/zh-Hans/faq), [SDK practices](https://docs.tickflow.org/zh-Hans/sdk/python-best-practices), [terms](https://tickflow.org/legal/terms-of-service.md) | `DAILY_BAR_SHADOW_QUALIFIED` only for credentialless Free historical unadjusted 1d OHLC, bound to the reviewed R2-F3 sidecar. It is not canonical capability or failover qualification: `adjustment_factor=UNQUALIFIED`; `activity_units=UNKNOWN`; `suspension=UNKNOWN`; exact-session universe, promoted calendar and raw-retention contract remain `UNKNOWN`; `canonical_session_failover=UNQUALIFIED`; publication and failover remain `false`. The pinned four-request discovery contract remains documented for future separately authorized work, but no R2-F4.0 request or promotion is implied. |
 | Tushare Pro | [HTTP](https://tushare.pro/document/1?doc_id=40), [daily](https://tushare.pro/document/1?doc_id=27), [adj_factor](https://tushare.pro/document/2?doc_id=28), [suspend_d](https://tushare.pro/document/2?doc_id=214), [trade_cal](https://tushare.pro/document/2?doc_id=26), [index_daily](https://tushare.pro/document/1?doc_id=95), [stock_basic](https://tushare.pro/document/1?doc_id=25), [points](https://tushare.pro/document/1?doc_id=108), [service terms](https://tushare.pro/document/1?doc_id=405), [user agreement](https://tushare.pro/document/1?doc_id=409) | `discovered`; official transport record documents HTTP only, so HTTPS token use is prohibited until separately proven. |
 
@@ -24,6 +25,20 @@ leaves `discovered`; missing terms, intended-use, retention, quota, schema, unit
 or transport proof fail closed before client construction. Task10 performs no
 provider request, credential acquisition, NAS access, production mutation, or
 canonical publication.
+
+## R2-F4.1 calendar observation capability
+
+BaoStock remains the canonical market provider and gains one isolated calendar-maintenance method:
+`calendar_days(start, end)`. It uses the pinned transport endpoint `trade_dates`, one dedicated
+session and `max_attempts=1`, and accepts only exact chronological, unique, inclusive civil-day
+coverage with flags `0/1`. It does not change `trading_dates()` or canonical ingestion. Runtime
+maintenance may call it only after an existing CLOSED health snapshot and after both official
+objects have verified. Missing, partial, duplicate or invalid machine rows fail closed and cannot
+promote.
+
+This does not mark TickFlow's `promoted_calendar_state` qualified. TickFlow exact-session universe,
+calendar authority, factors, suspension, units and raw-retention remain `UNKNOWN`/`UNQUALIFIED`;
+publication and automatic failover remain false.
 
 ## TickFlow canonical-capability blockers
 

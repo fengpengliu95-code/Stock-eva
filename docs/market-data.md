@@ -192,6 +192,24 @@ false。`--execute` 只在同一锁内再次完整扫描并显式迁移本机连
 `published`。真正的 provider repair、生产/NAS/LaunchAgent 操作不属于 R2-F1 离线交付，
 必须另行授权和验收。
 
+## R2-F4.1 promoted runtime calendar 边界
+
+R2-F4.1 在 `calendar_generations.sqlite3` 中保存不可变 reviewed source、官方 body evidence、
+BaoStock 全年 civil-day observation、promotion lineage 和 calendar-only head。默认关闭时仍只
+使用 bundled calendar，且不访问 runtime control；启用后若 store 缺失、损坏、被锁、路径
+不安全或证据不可证明，则返回 unavailable/empty calendar，不回退 bundled 或旧 generation。
+
+年度 promotion 要求 SSE/SZSE 完整年度规则一致、两份固定官方 body 与 reviewed hash 一致、
+BaoStock `trade_dates` 返回每个 civil day 且逐日一致，并通过 parent CAS、history protection、
+对象 hash/readback 后才原子推进 calendar head。官方公告是 authority，BaoStock 只是机器
+交叉验证。它不改变 canonical `Normalize -> Quality Gate -> Immutable Parquet -> SHA-256 ->
+Manifest -> Atomic Publish`，也不扩大任何 secondary provider 能力。
+
+连续性、automation、calendar-sync、market status、fund-flow、portfolio 与 supplement 操作均在
+入口 pin 一次 concrete calendar snapshot；同一操作不混用 generation，下一次操作无需重启即可
+看到新 promotion。详情和恢复边界见 [交易日历持续维护](calendar-maintenance.md)。本交付只完成
+离线代码与 synthetic 验证，未启用生产 runtime、未请求真实官方/BaoStock、未推进真实年度 head。
+
 ## 历史查询与导出
 
 - `GET /api/v1/market/history/dates` 返回本地已有交易日。

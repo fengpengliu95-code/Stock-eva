@@ -2,14 +2,11 @@
 
 **Author:** Codex root architecture lead
 **Date:** 2026-08-12 (Asia/Shanghai)
-**Status:** R2-F1 offline code gate complete at exact reviewed code HEAD 336107b; R2-F2
-architecture amendment is **Approved** at reviewed authority `52039a0` plus this approval metadata
-commit. The third-round independent IDENTITY SPEC REVIEW returned **GO (H0/M0/L1)**, and the user
-explicitly approved the breaking contract in the current conversation and authorized Task 7 to
-start. Exact code HEAD `fea5678059f5b2955dbd1b3b8c570d94ad9c87e9` remains non-delivery; the three
-Task 7 rounds `6390366`, `c977a40`, `fea5678` remain NO-GO history. The dedicated R2-F2
-design/implementation documents are the only contract authority; deployment and the R2-F0
-production gate remain closed.
+**Status:** R2-F4.0 selection shield is delivered; R2-F4.1 Tasks 1-3 are CODE GO at the latest
+reviewed implementation HEAD `5a07dd3df704532055718c3adb74a195f08d4824`. Final R2-F4.1
+documentation, repository verification and exact-HEAD independent review are in progress.
+Production calendar runtime, secondary publication and automatic failover remain disabled;
+R2-F4 and R2-F remain NO-GO.
 
 **Decision authority:** User approved the revised data-reliability priority on 2026-08-12
 **Scope:** R2-F0 through R2-F5
