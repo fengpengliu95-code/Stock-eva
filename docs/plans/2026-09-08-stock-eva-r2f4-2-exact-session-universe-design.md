@@ -358,8 +358,8 @@ does not make any provider failover eligible.
 or a replaced database inode, **When** a reader reopens the sidecar, **Then** it returns the prior
 valid head only when it is still the atomically committed, fully verified on-disk head; any
 tampered/corrupt state returns `unavailable` (never a historical cached projection); writer recovery
-does not run from a public GET. Contract, evidence, required-snapshot, member, role-link and head
-CAS rows are committed in one SQLite transaction; an interrupted write or failed CAS rolls back the
+does not run from a public GET. Source-state, contract, evidence, required-snapshot, member,
+role-link and head CAS rows are committed in one SQLite transaction; an interrupted write or failed CAS rolls back the
 entire promotion, so readers see only the old head or a fully verified new head.
 
 ### AC-14: Read-only status/API/CLI (FR-20, FR-21, NFR-3, NFR-6)
@@ -368,6 +368,12 @@ entire promotion, so readers see only the old head or a fully verified new head.
 or `market-universe` is invoked, **Then** it returns a bounded status with `provider_requests=0`
 and `writes=false`, performs no initialization/DDL/DML/user-store access, and omits paths,
 payloads, tokens, URLs, exceptions and symbol lists.
+
+**Given** a readable sidecar with a latest source-state row, an exact head whose source digest
+matches or differs, a durable blocking/indeterminate attempt, and an external classification or
+calendar change that has not been persisted, **When** the API/CLI status is read, **Then** it uses
+only the sidecar row: it returns `ready`, `stale(UNIVERSE_SOURCE_VERSION_CHANGED)`, or
+`blocked` by the priority above, and the unpersisted external change is not discovered.
 
 ### AC-15: Maintenance boundary (FR-22, FR-23, FR-27, NFR-7)
 
@@ -487,10 +493,10 @@ source parameters. It reads an already-created strict sidecar snapshot and never
 user store or constructs a provider.
 
 ```typescript
-type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_SOURCE_VERSION_CHANGED" | "STALE_CONTRACT_DATE" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT" | "NONE";
+type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_SOURCE_VERSION_CHANGED" | "DATE_MISMATCH" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT" | "NONE";
 type BlockedReason = "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_SOURCE_VERSION_CHANGED" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT" | "CONTROL_STATE_UNAVAILABLE" | "UNIVERSE_HEAD_CAS_CONFLICT";
 type ReadyReason = "NONE";
-type StaleReason = "STALE_CONTRACT_DATE";
+type StaleReason = "UNIVERSE_SOURCE_VERSION_CHANGED" | "DATE_MISMATCH";
 interface UniverseControlError { code: "universe_control_unavailable"; }
 interface CliUnavailableError { code: "universe_unavailable"; reason_code: "CONTROL_STATE_UNAVAILABLE"; }
 interface UniverseStatusCounts { total: number; trading: number; suspended: number;
@@ -505,23 +511,27 @@ interface UniverseStatusBase { trade_date: string; universe_id: "all-main-board-
   writes: false; }
 interface UniverseStatusReady extends UniverseStatusBase { status: "ready";
   verified_head_trade_date: string; contract_id: string; contract_sha256: string;
+  source_state_id: string; source_state_sha256: string; source_version_digest: string;
   classification_generation_id: string; calendar_generation_id: string; calendar_sha256: string;
   counts: UniverseStatusCounts; layers: UniverseStatusLayers;
   required_indexes: ["sh.000001", "sz.399001"]; required_user_symbol_count: number;
   publication_eligible: true; reason_code: ReadyReason; }
 interface UniverseStatusStale extends UniverseStatusBase { status: "stale";
   verified_head_trade_date: string; contract_id: string; contract_sha256: string;
+  source_state_id: string; source_state_sha256: string; source_version_digest: string;
   classification_generation_id: string; calendar_generation_id: string; calendar_sha256: string;
   counts: UniverseStatusCounts; layers: UniverseStatusLayers;
   required_indexes: ["sh.000001", "sz.399001"]; required_user_symbol_count: number;
   publication_eligible: false; reason_code: StaleReason; }
 interface UniverseStatusBlocked extends UniverseStatusBase { status: "blocked";
   verified_head_trade_date: null; contract_id: null; contract_sha256: null;
+  source_state_id: null; source_state_sha256: null; source_version_digest: null;
   classification_generation_id: null; calendar_generation_id: null; calendar_sha256: null;
   counts: null; layers: null; required_indexes: null; required_user_symbol_count: null;
   publication_eligible: false; reason_code: BlockedReason; }
 interface UniverseStatusUnavailable extends UniverseStatusBase { status: "unavailable";
   verified_head_trade_date: null; contract_id: null; contract_sha256: null;
+  source_state_id: null; source_state_sha256: null; source_version_digest: null;
   classification_generation_id: null; calendar_generation_id: null; calendar_sha256: null;
   counts: null; layers: null; required_indexes: null; required_user_symbol_count: null;
   publication_eligible: false; reason_code: "CONTROL_STATE_UNAVAILABLE"; }
@@ -530,14 +540,22 @@ type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | Univer
 
 HTTP behavior:
 
-- A strict read first verifies the current head. If a valid head exists but its `trade_date` is
-  not the requested valid date, the response is HTTP `200`, `status=stale`, and
-  `reason_code=STALE_CONTRACT_DATE`; it includes the requested date plus the verified head's
-  safe source/count fields, never a requested-date projection. `ready` is necessary but does not qualify a secondary provider or
-  enable failover. A valid empty store with no head is HTTP `200`, `status=unavailable`, with
-  `reason_code=CONTROL_STATE_UNAVAILABLE`.
-- `422` returns `{ "code": "invalid_trade_date" }` for malformed/future query input before any
-  store access.
+The public GET has one and only one current-source input: the latest verified
+`universe_source_state` row for the requested date, selected from the readable sidecar by
+`(verified_at,source_state_id)`. Its persisted `source_version_digest` is the source identity used
+below. GET MUST NOT read external classification, calendar, UserStore, provider or environment
+state, and therefore does not claim real-time discovery. A writer-verified change is invisible to
+GET until it is persisted as a new source-state row; this is intentional PIT snapshot semantics.
+If a non-empty head has no valid source-state row for its date, source authority is unprovable and
+the API/CLI uses the independent control-error boundary rather than guessing a current source.
+
+- The reader first proves the sidecar path/inode/schema/WAL/lock; failure is the independent HTTP
+  `503` control envelope. For a readable sidecar, malformed or future query input is HTTP `422`
+  before source/head projection. A valid head whose date differs from the requested valid date is
+  HTTP `200`, `status=stale`, and `reason_code=DATE_MISMATCH`; it includes the requested date plus
+  the verified head's safe source/count fields, never a requested-date projection. `ready` is
+  necessary but does not qualify a secondary provider or enable failover. A valid empty store with
+  no head is HTTP `200`, `status=unavailable`, with `reason_code=CONTROL_STATE_UNAVAILABLE`.
 - `503` is returned whenever sidecar path/inode/schema/hash/WAL/lock or storage state cannot be
   proven safely as the independent `UniverseControlError` envelope
   `{ "code": "universe_control_unavailable" }`; it contains no path or exception and is not a
@@ -547,29 +565,29 @@ HTTP behavior:
   unprovable storage.
 
 Status is a true discriminated union; the following priority and nullability are normative for
-both HTTP and CLI. Invalid input is evaluated first. Then storage that cannot be proven is the
-independent `UniverseControlError`/HTTP 503 envelope (never a status-union `unavailable`). For a
-readable sidecar, an exact verified head is `ready`; a valid
-nonmatching head is `blocked` when a durable latest blocked attempt exists for the requested date,
-otherwise `stale`. With no head, a durable blocked attempt is `blocked`; without one the result is
-`unavailable` (HTTP 200). A blocked response uses only `BlockedReason`; storage/schema failures
-never enter that interface. A readable sidecar with an external control failure or terminal CAS
-conflict is `blocked` with `CONTROL_STATE_UNAVAILABLE` or `UNIVERSE_HEAD_CAS_CONFLICT`; storage
-that cannot be proven is still the independent 503 envelope. No reader may return a cached or
-“last verified” head.
-When the current source-version, classification snapshot or semantic mapping digest differs from
-the head, that head is internally stale/non-publishable and the due hook is immediate. It records
-the durable plan before a new request; until a new exact head succeeds, public status cannot present
-the old contract as ready and reports the durable blocked/source-change reason (or
-`ATTEMPT_INDETERMINATE` while that plan is still `RUNNING`).
+both HTTP and CLI. First, an unprovable sidecar is the independent `UniverseControlError`/HTTP 503
+envelope (never a status-union `unavailable`). Once the sidecar is proven readable, malformed or
+future input is HTTP 422. The reader then uses only the latest persisted source-state row: if that
+row has a durable blocking or indeterminate attempt with the requested date and that row's
+`source_version_digest`, status is `blocked`
+with its closed reason and all head-derived fields remain null. Otherwise, an exact-date verified
+head whose `source_version_digest` differs from that latest row is `stale` with
+`UNIVERSE_SOURCE_VERSION_CHANGED`; it returns the old head's complete safe counts/source fields
+and `publication_eligible=false`. An exact-date head whose source digest matches is `ready`.
+A valid head for another date is `stale` with `DATE_MISMATCH`. With no head and no durable attempt,
+the readable initialized store is `unavailable` (HTTP 200). A readable external control failure
+or terminal CAS result is `blocked` with `CONTROL_STATE_UNAVAILABLE` or
+`UNIVERSE_HEAD_CAS_CONFLICT`; schema/path/hash failures remain the independent 503 envelope. No
+reader may return a cached or “last verified” head. External changes not yet persisted by a writer
+cannot change this projection.
 
 Status field matrix (also normative for the CLI):
 
 | Status | Condition | Nullable fields and source |
 |---|---|---|
-| `ready` | verified head exists and `head.trade_date == requested trade_date` | contract IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
-| `stale` | verified head is valid but `head.trade_date != requested confirmed date` | all populated contract/source/count fields are explicitly the verified head's values, `trade_date` is the request, `verified_head_trade_date` is head date, reason is `STALE_CONTRACT_DATE`; no requested-date projection is implied |
-| `blocked` | durable latest attempt for requested date is blocked, and no exact head exists | every head-derived field is null; `verified_head_trade_date` is null; reason is a `BlockedReason` from the durable attempt |
+| `ready` | verified head exists, exact requested date and `head.source_version_digest == latest_source_state.source_version_digest` | contract/source-state IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
+| `stale` | exact-date verified head has a different latest persisted source digest, or a valid head has another date | source-digest mismatch returns the old head's complete safe fields and `UNIVERSE_SOURCE_VERSION_CHANGED`; date mismatch returns the same head fields with `DATE_MISMATCH`; publication is false and no requested-date projection is implied |
+| `blocked` | latest source state has a durable blocked/indeterminate attempt for requested date | every head-derived field is null (including when another-date head exists); reason is a `BlockedReason` from that durable attempt |
 | `unavailable` | readable store has no head and no durable blocked attempt | every head-derived field is null; reason is `CONTROL_STATE_UNAVAILABLE`; unprovable storage uses `UniverseControlError`, not this interface |
 
 The four interfaces above are the only public shapes. `Ready` and `Stale` carry verified head
@@ -841,7 +859,7 @@ hash. It contains exactly `calendar_generation_id`, `calendar_sha256`,
   `classification_source`, `classification_source_version`, `classification_source_snapshot_date`,
   `classification_observed_at`, `classification_snapshot_sha256`,
 `required_symbol_snapshot_id`, `required_symbol_snapshot_sha256`, `instrument_evidence_ids`,
-`semantic_mapping_sha256`,
+`semantic_mapping_sha256`, `source_version_digest`,
 `provider_id=baostock`,
 `trade_date`, `exact_pit_cutoff`, and `source_date_semantics`. IDs are safe-format values and
 every list is sorted, unique, and non-empty where its obligation exists; no URL, token or raw
@@ -878,6 +896,17 @@ one-to-one to it within a contract (the DDL unique constraint and reader both en
 Conflicting mappings are `UNIVERSE_IDENTITY_CONFLICT` and block; no merge or silent discard is
 permitted.
 
+`UniverseSourceStateV1` is an immutable writer-produced sidecar row. It contains exactly
+`source_state_id`, `source_state_sha256`, `trade_date`, `provider_id=baostock`,
+`source_version_digest`, `source_refs_json` and trusted UTC `verified_at`. The source-state digest
+is `domain_sha256("stock-eva/r2f4.2/universe-source-state/v1", {trade_date,provider_id,
+source_version_digest,source_refs_json,verified_at})`; `source_state_id` is its first 32 lowercase
+hex characters. The strict reader validates the JSON as `SourceRefsV1`, recomputes the digest and
+selects the latest row for the requested date by `(verified_at,source_state_id)` from this table
+only. This is the public GET's sole current-source input; it never reads classification, calendar,
+UserStore or a provider directly. A source change is invisible to GET until a writer verifies and
+persists a new source-state row, preserving PIT snapshot semantics.
+
 Each partition has an explicit JSON column and SHA-256 column in `universe_contract`, and the
 same IDs are present in `payload_json`. `universe_instrument_evidence` stores every classification
 record, including excluded records with a closed `exclusion_reason`; link rows identify its
@@ -904,6 +933,7 @@ the final member set is `UNIVERSE_SCHEMA_MISMATCH`.
 | `required_symbol_snapshot_sha256` | SHA-256 | Writer-owned deduplicated union identity |
 | `exact_pit_cutoff` | UTC timestamp | Inclusive evidence visibility cutoff, bound into the contract hash |
 | `source_refs` | SourceRefsV1 | Complete source identity object, included in payload/hash |
+| `source_state_id` / `source_state_sha256` / `source_version_digest` | safe ID/SHA-256/SHA-256 | Latest persisted writer-verified source-state identity; cross-checked with the sidecar row and `source_refs` |
 | `provider_id` / `source_date_semantics` | `baostock` / closed semantics | Explicit source reference columns, cross-checked with `source_refs` |
 | `required_symbol_snapshot_id` / `instrument_evidence_ids_json` | safe ID/JSON IDs | Explicit source reference columns, cross-checked with links and payload |
 | `classification_evidence_ids` / `classification_evidence_partition_sha256` | sorted IDs/SHA-256 | Layer 1 persisted identity partition, including excluded evidence |
@@ -935,6 +965,7 @@ no digest is an implied provider field.
 | `stock-eva/r2f4.2/universe-head/v1` | `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}` |
 | `stock-eva/r2f4.2/raw-batch-projection/v1` | exact `batch.model_dump(mode="json", warnings="error")` after Pydantic revalidation of complete `ProviderRawBatch`; no field is excluded or remapped |
 | `stock-eva/r2f4.2/universe-source-version/v1` | exact object `{provider_id,adapter_version,endpoint_contract_version,classification:{source,source_version,sequence,observed_at,source_date_semantics},classification_snapshot_sha256,semantic_mapping_sha256,instrument_evidence:[sorted {evidence_id,evidence_sha256,mapping_id,mapping_sha256,source_version,source_date_semantics,trade_date}]}`; this is `source_version_digest` |
+| `stock-eva/r2f4.2/universe-source-state/v1` | exact object `{trade_date,provider_id,source_version_digest,source_refs_json,verified_at}` persisted in `universe_source_state`; `source_state_id=source_state_sha256[:32]` |
 | `stock-eva/r2f4.2/universe-attempt-plan/v1` | complete immutable attempt key, source version, operation day, budget and hook identity |
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
 
@@ -1121,6 +1152,11 @@ CREATE TABLE universe_meta (
   meta_key TEXT PRIMARY KEY CHECK (meta_key IN ('schema_version','schema_digest','store_id','db_inode')),
   meta_value TEXT NOT NULL
 );
+CREATE TABLE universe_source_state (
+  source_state_id TEXT PRIMARY KEY, source_state_sha256 TEXT NOT NULL UNIQUE,
+  trade_date TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
+  source_version_digest TEXT NOT NULL, source_refs_json TEXT NOT NULL, verified_at TEXT NOT NULL
+);
 CREATE TABLE universe_contract (
   contract_id TEXT PRIMARY KEY,
   sequence INTEGER NOT NULL UNIQUE CHECK (sequence > 0),
@@ -1134,7 +1170,9 @@ CREATE TABLE universe_contract (
  classification_source_snapshot_date TEXT NOT NULL, classification_observed_at TEXT NOT NULL,
   classification_snapshot_sha256 TEXT NOT NULL,
   exact_pit_cutoff TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
-  source_date_semantics TEXT NOT NULL, required_symbol_snapshot_id TEXT NOT NULL,
+  source_date_semantics TEXT NOT NULL, source_state_id TEXT NOT NULL REFERENCES universe_source_state(source_state_id),
+  source_state_sha256 TEXT NOT NULL, source_version_digest TEXT NOT NULL,
+  required_symbol_snapshot_id TEXT NOT NULL,
   required_symbol_snapshot_sha256 TEXT NOT NULL, instrument_evidence_ids_json TEXT NOT NULL,
   counts_json TEXT NOT NULL, layer_counts_json TEXT NOT NULL, source_refs_json TEXT NOT NULL,
   classification_evidence_ids_json TEXT NOT NULL,
@@ -1211,7 +1249,7 @@ CREATE TABLE universe_attempt_result (
   attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
   terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
   classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
- reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','STALE_CONTRACT_DATE','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
+ reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
 );
 CREATE TABLE universe_head (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -1219,6 +1257,12 @@ CREATE TABLE universe_head (
   contract_sha256 TEXT NOT NULL, head_sha256 TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY (contract_id) REFERENCES universe_contract(contract_id)
 );
+CREATE TRIGGER universe_source_state_no_update BEFORE UPDATE ON universe_source_state BEGIN
+  SELECT RAISE(ABORT, 'immutable_source_state');
+END;
+CREATE TRIGGER universe_source_state_no_delete BEFORE DELETE ON universe_source_state BEGIN
+  SELECT RAISE(ABORT, 'immutable_source_state');
+END;
 CREATE TRIGGER universe_contract_no_update BEFORE UPDATE ON universe_contract BEGIN
   SELECT RAISE(ABORT, 'immutable_contract');
 END;
@@ -1322,7 +1366,8 @@ inferred.
 Reachability is strict: every contract, member, evidence, role-link and required-snapshot row
 must be reachable from the current `universe_head` parent chain and verified in that chain. The
 semantic-mapping registry, publication-context input, and attempt/attempt-result rows are explicit
-allowed global sets, not head-chain rows; every mapping/context payload/hash and every attempt
+allowed global sets, not head-chain rows; source-state rows are another explicit immutable global
+set selected by requested trade date; every source-state payload/digest, mapping/context payload/hash and every attempt
 key/plan/result reference is still validated bidirectionally, and any invalid global row makes the
 store unavailable. A context is accepted only when its run/date, safe refs, lineage projection and
 `context_sha256` rehash exactly; `context_id` must equal `context_sha256[:32]` (first 32 lowercase hex characters); no
@@ -1513,7 +1558,7 @@ The implementation MUST use only these reason codes in status, tests and sanitiz
 `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`, `PIT_CUTOFF_VIOLATION`, `USER_SNAPSHOT_CHANGED`,
 `REQUIRED_INDEX_NOT_TRADING`, `REQUIRED_SYMBOL_INVALID`, `UNIVERSE_UNKNOWN_NONZERO`, `UNIVERSE_COUNT_MISMATCH`,
 `UNIVERSE_MISSING_SYMBOL`, `UNIVERSE_EXTRA_SYMBOL`, `UNIVERSE_DUPLICATE_SYMBOL`,
-`UNIVERSE_SESSION_DRIFT`, `UNIVERSE_STATE_MISMATCH`, `STALE_CONTRACT_DATE`, `UNIVERSE_STORAGE_UNAVAILABLE`, `UNIVERSE_SCHEMA_MISMATCH`,
+`UNIVERSE_SESSION_DRIFT`, `UNIVERSE_STATE_MISMATCH`, `DATE_MISMATCH`, `UNIVERSE_STORAGE_UNAVAILABLE`, `UNIVERSE_SCHEMA_MISMATCH`,
 `UNIVERSE_SOURCE_VERSION_CHANGED`,
 `UNIVERSE_HEAD_CAS_CONFLICT`, `BLOCKED_ENFORCE_NOT_ENABLED`, `BLOCKED_PRODUCTION_MODE_OFF`, `LEGACY_SHADOW_DRIFT`,
 `ATTEMPT_INDETERMINATE`, `UNIVERSE_IDENTITY_CONFLICT`, `NONE`. Unknown provider/exception text MUST map to `UNIVERSE_STORAGE_UNAVAILABLE` or
@@ -1544,7 +1589,7 @@ The mapping is deterministic and closed:
 | endpoint/page/session/request/date drift | `UNIVERSE_SESSION_DRIFT` | 200 blocked / 1 |
 | DAILY_ASTOCK `tradestatus` or suspended placeholder disagrees with contract | `UNIVERSE_STATE_MISMATCH` | 200 blocked / 1 |
 | classification snapshot, source version, semantic mapping or instrument-evidence digest changed since the head | `UNIVERSE_SOURCE_VERSION_CHANGED` | 200 blocked / 1 |
-| valid head trade date differs from requested date | `STALE_CONTRACT_DATE` | 200 stale / 1 |
+| valid head trade date differs from requested date | `DATE_MISMATCH` | 200 stale / 1 |
 | sidecar path/inode/schema/hash/WAL/lock cannot be proven | `UNIVERSE_STORAGE_UNAVAILABLE` | 503 fixed body / 3 |
 | sidecar payload, partition, link, parent, head or attempt validation fails | `UNIVERSE_SCHEMA_MISMATCH` | 503 fixed body / 3 |
 | nonblocking refresh/control lock unavailable while the sidecar is readable | `CONTROL_STATE_UNAVAILABLE` | 200 blocked/defer / 1 |
