@@ -197,12 +197,12 @@ publisher; no direct production switch is part of R2-F4.2.
 - FR-24: Legacy compatibility modes. The legacy BaoStock `all-main-board` canonical path MUST
   remain operational and unchanged in R2-F4.2. A contract integration MUST provide explicit
   `off`, `shadow` and `enforce` reporting values, default to `off`. `shadow` MAY compare only the
-  legacy BaoStock set and report drift, but MUST NOT change the canonical result. Any `enforce`
-  execution request MUST return `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) immediately; there is no callable
-  provider seam in this subversion; no production configuration may invoke an enforce path.
-  The production profile MUST hard-fail any non-`off` Universe mode as
-  `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
-  available only to explicitly isolated offline/staging verification.
+  legacy BaoStock set and report drift, but MUST NOT change the canonical result. The sole
+  production/nonproduction decision is the mode/profile matrix below: production with any
+  non-`off` mode returns `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), while nonproduction/staging with
+  `enforce` returns `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`). Blocked cells perform no provider request;
+  there is no callable provider seam in this subversion. `shadow` is available only to explicitly
+  isolated offline/staging verification.
 
 The mode/profile matrix is normative and evaluated before any Universe provider construction:
 
@@ -213,7 +213,7 @@ The mode/profile matrix is normative and evaluated before any Universe provider 
 
 This matrix is distinct from a provider failure: a blocked cell is a deterministic configuration
 result, never a retry or a request to authenticated or secondary services. `shadow` observes only
-the already-built legacy BaoStock request and never changes `build_canonical_raw_request`.
+the already-built legacy BaoStock request and never changes the builder's default behavior.
 The profile discriminator is exact: take the existing `Settings.environment`, require a string,
 apply Unicode whitespace trim and Unicode `casefold()` (no aliases, substring tests or environment
 variable enumeration), then map exactly `production` to `production`; exactly `development`,
@@ -443,9 +443,9 @@ failure is observable by an allowlisted reason, and no retry storm or canonical 
 **Given** a legacy BaoStock refresh and a matching or divergent exact contract, **When** mode is
 `off`, **Then** existing behavior is unchanged; **When** mode is `shadow`, **Then** the comparison
 is read-only, compares only legacy BaoStock and returns private diagnostic drift without blocking;
-**When** mode is `enforce`, **Then** execution is
-immediately `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) (including non-production calls), with no provider
-request and no source switch.
+**When** mode/profile is evaluated, **Then** production with any non-`off` mode is
+`B_P` (`BLOCKED_PRODUCTION_MODE_OFF`) and nonproduction/staging `enforce` is
+`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`), with no provider request and no source switch.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
 
@@ -692,7 +692,7 @@ interface UniversePublicationContext {
 
 interface CanonicalRefreshExecution {
   result: RefreshResult;
-  legacy_shadow_input: LegacyPreflightSnapshot | null; // private, never serialized
+  legacy_shadow_input: MainBoardInspection | null; // private, never serialized
 }
 
 class CanonicalRefreshCallable(Protocol) {
@@ -705,9 +705,10 @@ class CanonicalRefreshCallable(Protocol) {
 
 `CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; its
 additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult` plus a
-private, stack-owned `legacy_shadow_input`. The callback freezes that input immediately before
-calling the existing builder, and includes it in both builder-success and builder-rejection
-results; one builder call therefore yields one wrapper and no provider retry. The service unwraps
+private, stack-owned `MainBoardInspection`. The callback calls the private inspection exactly once
+immediately before the builder, passes that same immutable object to the builder, and includes it
+in both builder-success and builder-rejection results; one builder call therefore yields one
+wrapper and no provider retry. The service unwraps
 `execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the private input
 to `_offer_shadow`, and releases it in `finally`; neither the input nor raw symbols enter
 `AutomationOutcome`, logs, persistence or public output. The callback also owns the thread-safe
@@ -719,12 +720,47 @@ consumes the holder. `main.py` and the automation CLI use the same factory to in
 and one hook; the read-only `market-universe` CLI uses the same settings/layout projection but
 constructs neither writer nor provider. A missing/non-callable consume method skips only Universe
 work and preserves the legacy result.
-The call order is fixed: (1) callback freezes `legacy_shadow_input`; (2) it calls the unchanged
-builder once; (3) it returns `CanonicalRefreshExecution`; (4) the service unwraps `result` and
+The call order is fixed: (1) callback calls `inspect_legacy_main_board_input` exactly once and
+freezes its immutable `MainBoardInspection`; (2) it calls the additive builder seam once with
+`inspection=...`; (3) it returns `CanonicalRefreshExecution`; (4) the service unwraps `result` and
 calls `_offer_shadow(prevalidation=legacy_shadow_input, ...)`; (5) the service releases the
 private input in `finally`; (6) only then does it continue the existing post-publish/Universe
 offer ordering. Snapshot-capture, observer, handoff or release exceptions are isolated and cannot
 replace the returned legacy result or trigger another provider request.
+
+The internal legacy request seam is deliberately additive and optional:
+
+```typescript
+interface MainBoardInspection {
+  trade_date: string;
+  main_board_count: number;
+  shanghai_count: number;
+  shenzhen_count: number;
+  total_expected_count: number;
+  metadata_provider_requests: number;
+  main_board_symbols: readonly string[]; // private call-stack data only
+}
+function inspect_legacy_main_board_input(
+  adapter: BaoStockAdapter, trade_date: string,
+) -> MainBoardInspection;
+function build_canonical_raw_request(
+  adapter: BaoStockAdapter, *, trade_date: string, refresh_id: string,
+  required_symbols: Set<string>, inspection: MainBoardInspection | null = null,
+) -> ProviderRequest;
+```
+
+When `inspection` is supplied, `build_canonical_raw_request` MUST consume that exact object and
+MUST NOT inspect inputs a second time. With the default `null`, all existing callers retain the
+current inspection and legacy behavior byte-for-byte; this optional argument is not a provider
+switch. The callback owns the immutable snapshot until `_offer_shadow` returns, then releases it
+in `finally`. Builder acceptance and rejection both return the additive wrapper and the private
+diagnostic may expose only counts/hashes. Raw `symbols` MUST NOT cross the wrapper's public
+boundary, enter `AutomationOutcome`, logs or persistence, or be placed in `LegacyShadowHandoff`.
+The three offline regressions are mandatory: `test_legacy_inspection_called_once_and_builder_consumes_snapshot`
+proves inspection call count is exactly one and the builder receives the same object identity;
+`test_legacy_builder_default_argument_compatibility` proves an omitted optional argument preserves
+default compatibility; and `test_legacy_rejection_diagnostic_privacy` proves a rejected builder
+still yields only count/hash diagnostics with no raw symbols.
 
 In the canonical callback implementation, immediately after `store.save_refresh` returns success
 the code freezes `ready_result`. It then runs context construction and the holder seal in an
@@ -817,12 +853,6 @@ The shadow-only required-symbol observer is a pure read-only function over the a
 request plan; it does not call BaoStock or rebuild the plan:
 
 ```typescript
-interface LegacyPreflightSnapshot {
-  provider_id: "baostock";
-  trade_date: string;
-  symbols: string[];
-  builder_outcome: "accepted" | "rejected";
-}
 interface LegacyShadowObservation {
   provider_id: "baostock";
   request_trade_date: string;
@@ -836,7 +866,7 @@ interface LegacyShadowObservation {
   control_reason: "CONTROL_STATE_UNAVAILABLE" | null;
 }
 function observe_legacy_request_universe(
-  snapshot: LegacyPreflightSnapshot, contract: UniverseContractV1 | null,
+  snapshot: MainBoardInspection, contract: UniverseContractV1 | null,
 ): LegacyShadowObservation;
 interface LegacyShadowHandoff {
   trade_date: string;
@@ -847,16 +877,17 @@ interface LegacyShadowHandoff {
 
 The legacy builder's `ProviderRequest` is already sorted-unique and its preflight rejects symbols
 outside the main-board scope. Therefore the observer does not claim to inspect duplicate provider
-rows or an unreturned request. At the pre-validation boundary the caller freezes a
-`LegacyPreflightSnapshot` of the proposed symbol sequence, before invoking the builder; this is
-the only observed input and remains reachable even when the builder rejects a non-main-board
-symbol. The snapshot is owned by the callback's private call stack and is released after
-`_offer_shadow`; it is never logged, persisted or placed in `LegacyShadowHandoff`. The canonical
-path and its failure result are never changed by this capture.
+rows or an unreturned request. At the pre-validation boundary the callback calls
+`inspect_legacy_main_board_input` once and passes the resulting immutable `MainBoardInspection`
+to the builder; this is the only observed input and remains available even when the builder
+rejects a non-main-board symbol. The snapshot is owned by the callback's private call stack and is
+released after `_offer_shadow`; it is never logged, persisted or placed in `LegacyShadowHandoff`.
+The canonical path and its failure result are never changed by this capture.
 
 With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
 members whose effective session state is `trading` or `suspended`, including required additions
-and the two required indexes. `observed_symbols` is the sorted unique snapshot sequence;
+and the two required indexes. `observed_symbols` is the sorted unique
+`MainBoardInspection.main_board_symbols` sequence;
 `missing_symbols = expected_symbols - observed_symbols` and
 `extra_symbols = observed_symbols - expected_symbols`. The sets use canonical `symbol` identity
 and UTF-8 lexical order. A preflight rejection is retained in `builder_outcome` but is not
@@ -873,7 +904,7 @@ With no persisted contract, the typed result is `NO_COMPARISON` with
 
 The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
 successful canonical refresh and CandidateStore evidence readback. The internal call is
-`_offer_shadow(*, prevalidation: LegacyPreflightSnapshot | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
+`_offer_shadow(*, prevalidation: MainBoardInspection | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
 the raw prevalidation value is stack-owned for that call only. Its typed handoff is
 `LegacyShadowHandoff {trade_date, builder_outcome, diagnostic}` from the refresh orchestration to
 the existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
@@ -882,8 +913,9 @@ in the Universe sidecar, head, attempt or public status. A missing contract yiel
 failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
 The handoff contains counts and hashes only; raw symbols exist only during the private comparison
 stack frame and are never emitted to logs or storage.
-The observer never filters, patches or changes `build_canonical_raw_request`, does not call
-BaoStock, and is not a provider acquisition seam.
+The observer never filters, patches or changes the builder's default behavior, does not call
+BaoStock, and is not a provider acquisition seam; the optional typed inspection argument is the
+only additive seam.
 
 `universe_raw_projection_sha256` is the domain hash
 `stock-eva/r2f4.2/raw-batch-projection/v1` over the exact JSON result of
@@ -895,12 +927,13 @@ returns only safe endpoint counts, loaded/session counts and this digest. A non-
 identity or raw row is exposed by the gate.
 The existing `run_canonical_raw_refresh(validate_batch=...)` callback is not a production enforce
 seam. Mode `off` MUST NOT call it. Mode `shadow` MUST NOT pass it into canonical refresh or block
-canonical: the callback captures the prevalidation snapshot before invoking the builder, and
+canonical: the callback captures the prevalidation snapshot through the single inspection seam,
+passes that object to the builder, and
 `_offer_shadow` invokes the pure observer on that snapshot after builder rejection or after
 successful canonical/evidence publish, recording `LEGACY_SHADOW_DRIFT` (including missing required
 ChiNext/STAR) by count/hash only. This diagnostic has no `UniversePostSuccessHook` status and is
-never mapped to `BlockedReason`. Mode `enforce` is always blocked and cannot route production.
-`build_canonical_raw_request` is unchanged.
+never mapped to `BlockedReason`. Mode/profile handling follows the normative matrix: production
+non-`off` is `B_P`, and nonproduction/staging `enforce` is `B_E`; neither cell routes a provider.
 
 For DAILY_ASTOCK rows, the raw gate requires `tradestatus=1` for a `trading` member and the
 existing legal OHLCV/placeholder shape for a `suspended` member with explicit `tradestatus=0`;
@@ -1655,8 +1688,9 @@ the Universe sidecar and may perform classification cadence/source-version plann
 invent a new canonical publication context. It may read already-pinned calendar/classification
 evidence and capture the UserStore snapshot. Current BaoStock classification with
 `requested_unverified` evidence returns blocked without acquisition. `shadow` means legacy BaoStock
-only. `enforce` immediately returns `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`); TickFlow and Tushare are not
-candidates. This preserves R2-F1, R2-F4.1 and existing `_plan_continuity`/repair lock boundaries.
+only. Mode/profile handling follows the normative matrix: production non-`off` returns `B_P`, and
+nonproduction/staging `enforce` returns `B_E`; TickFlow and Tushare are not candidates. This
+preserves R2-F1, R2-F4.1 and existing `_plan_continuity`/repair lock boundaries.
 
 `_offer_universe_maintenance(trade_date, now, context)` invokes
 `UniversePostSuccessHook.offer` at most once per eligible tick. A fresh sealed context is supplied
@@ -1839,7 +1873,7 @@ range as proof.
 | FR-21 — Sanitized diagnostics | public-schema privacy/static reason scan |
 | FR-22 — Maintenance priority | `test_automation_priority_nonrun_weekend_and_lock_busy` |
 | FR-23 — Classification maintenance trigger | `test_classification_cadence_global_daily_budget`; `test_source_digest_change_due_and_invalidates_old_head` |
-| FR-24 — Legacy compatibility modes | `test_legacy_off_shadow_and_enforce_compatibility` |
+| FR-24 — Legacy compatibility modes | `test_legacy_off_shadow_and_enforce_compatibility`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy` |
 | FR-25 — No authority widening | provider allowlist and frozen predecessor static scan |
 | FR-26 — Safe migration path | `test_staged_sidecar_bootstrap_has_no_legacy_migration` |
 | FR-27 — Frozen predecessor contracts | protected predecessor contract SHA/regression evidence |
