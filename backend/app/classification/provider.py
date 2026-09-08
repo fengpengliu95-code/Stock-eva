@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from importlib.metadata import version
 from time import monotonic
@@ -106,17 +107,33 @@ class BaoStockClassificationProvider:
         min_request_interval_seconds: float | None = None,
         socket_timeout_seconds: float = 30.0,
         monotonic_fn=monotonic,
+        session_factory: Callable[..., BaoStockProvider] | None = None,
+        max_attempts: int = 2,
     ) -> None:
         self.clock = clock
         self._monotonic = monotonic_fn
         self.source_version = version("baostock")
         self.last_request_count = 0
         self._metadata_operation_count = 0
-        self.session = BaoStockProvider(
-            client=client,
-            min_request_interval_seconds=min_request_interval_seconds,
-            socket_timeout_seconds=socket_timeout_seconds,
-        )
+        self.max_attempts = max_attempts
+        if max_attempts < 1:
+            raise ValueError("classification max_attempts must be positive")
+        if session_factory is None:
+            self.session = BaoStockProvider(
+                client=client,
+                max_attempts=max_attempts,
+                min_request_interval_seconds=min_request_interval_seconds,
+                socket_timeout_seconds=socket_timeout_seconds,
+            )
+        else:
+            self.session = session_factory(
+                client=client,
+                max_attempts=max_attempts,
+                min_request_interval_seconds=min_request_interval_seconds,
+                socket_timeout_seconds=socket_timeout_seconds,
+            )
+            if not isinstance(self.session, BaoStockProvider):
+                raise TypeError("classification session factory returned an invalid session")
 
     def _error(
         self,
@@ -536,3 +553,28 @@ class BaoStockClassificationProvider:
             source_record_id=f"{INDEX_CATALOG[index_id].component_source}:{snapshot_date}:{row['code']}",
             lineage_hash=_hash(raw),
         )
+
+
+def make_baostock_classification_provider(
+    *,
+    client: Any | None = None,
+    session_factory: Callable[..., BaoStockProvider] | None = None,
+    max_attempts: int = 1,
+    **kwargs: Any,
+) -> BaoStockClassificationProvider:
+    """Construct a fresh, bounded classification session.
+
+    Universe maintenance owns a one-fetch budget.  It is intentionally
+    impossible for this factory to widen that budget through a retry override.
+    ``client`` and ``session_factory`` are injection points for offline fakes;
+    the default path constructs a new BaoStock session only when the maintenance
+    service has already admitted reviewed evidence.
+    """
+    if max_attempts != 1:
+        raise ValueError("classification maintenance requires max_attempts=1")
+    return BaoStockClassificationProvider(
+        client=client,
+        session_factory=session_factory,
+        max_attempts=1,
+        **kwargs,
+    )

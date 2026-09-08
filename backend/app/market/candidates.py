@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from backend.app.market.baostock import _is_main_board
 from backend.app.market.evidence import (
     EvidenceError,
+    EvidenceReader,
     PublishedEvidence,
     _factor_value_semantic_hash,
 )
@@ -989,6 +990,116 @@ class CandidateStore:
                     self._remove_owned_stage(staging, stage_name)
                 os.close(bundles)
                 os.close(staging)
+
+    def verify_publication_context(
+        self,
+        context: object,
+        *,
+        expected_run_id: str | None = None,
+        expected_trade_date: date | None = None,
+    ) -> object:
+        """Revalidate a sealed canonical context against immutable evidence bytes.
+
+        This is deliberately a reader operation.  It resolves the candidate, gate,
+        selection and evidence manifest from one descriptor-bound root and checks
+        the exact lineage projection before a maintenance writer can consume the
+        context.  It returns the original opaque context only after every binding
+        succeeds; no caller-supplied truthy marker is accepted.
+        """
+        required = (
+            "run_id",
+            "trade_date",
+            "manifest_ref",
+            "evidence_refs",
+            "publication_lineage_json",
+            "publication_lineage_sha256",
+            "status",
+            "context_sha256",
+        )
+        if any(not hasattr(context, field) for field in required):
+            raise EvidenceError("publication context is incomplete", "EVIDENCE_MANIFEST_INVALID")
+        if context.status != "ready":
+            raise EvidenceError(
+                "publication context status is invalid", "EVIDENCE_MANIFEST_INVALID"
+            )
+        if expected_run_id is not None and context.run_id != expected_run_id:
+            raise EvidenceError(
+                "publication context run identity mismatch", "EVIDENCE_HASH_MISMATCH"
+            )
+        if expected_trade_date is not None and context.trade_date != expected_trade_date:
+            raise EvidenceError("publication context date mismatch", "EVIDENCE_HASH_MISMATCH")
+        try:
+            lineage = json.loads(context.publication_lineage_json)
+            candidate_id = lineage["candidate_id"]
+            manifest_ref = context.manifest_ref
+            evidence_refs = tuple(context.evidence_refs)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EvidenceError(
+                "publication context lineage is invalid", "EVIDENCE_MANIFEST_INVALID"
+            ) from exc
+        if not isinstance(candidate_id, str) or "/" in candidate_id or ".." in candidate_id:
+            raise EvidenceError(
+                "publication context candidate identity is unsafe", "EVIDENCE_UNSAFE_PATH"
+            )
+        with self._bound_root() as (root_fd, root_identity):
+            candidate_raw = self._readback(root_fd, f"bundles/{candidate_id}/candidate.json")
+            gate_raw = self._readback(root_fd, f"bundles/{candidate_id}/gate.json")
+            selection_raw = self._readback(root_fd, f"bundles/{candidate_id}/selection.json")
+            try:
+                candidate = CandidateManifest.model_validate_json(candidate_raw)
+                report = CandidateGateReport.model_validate_json(gate_raw)
+                selection = SessionSelection.model_validate_json(selection_raw)
+            except (TypeError, ValueError) as exc:
+                raise EvidenceError(
+                    "publication candidate bundle is invalid", "EVIDENCE_MANIFEST_INVALID"
+                ) from exc
+            if (
+                candidate.status != "accepted"
+                or candidate.candidate_id != candidate_id
+                or candidate.trade_date != context.trade_date
+                or candidate.manifest_sha256 != manifest_ref
+                or candidate.gate_report_sha256 != report.aggregate_sha256
+                or candidate.gate_report_sha256 != lineage.get("gate_report_sha256")
+                or candidate.evidence_sha256 != lineage.get("evidence_sha256")
+                or candidate.candidate_id != selection.selected_candidate_id
+                or selection.candidate_manifest_sha256 != candidate.manifest_sha256
+                or selection.gate_report_sha256 != report.aggregate_sha256
+                or selection.evidence_sha256 != candidate.evidence_sha256
+            ):
+                raise EvidenceError(
+                    "publication lineage binding mismatch", "EVIDENCE_HASH_MISMATCH"
+                )
+            try:
+                evidence_reader = EvidenceReader(self.root)
+                evidence = evidence_reader.read(candidate.evidence_id)
+            except EvidenceError:
+                raise
+            except Exception as exc:
+                raise EvidenceError(
+                    "publication evidence unavailable", "EVIDENCE_ROOT_UNAVAILABLE"
+                ) from exc
+            try:
+                if evidence.manifest.manifest_sha256 != candidate.evidence_sha256:
+                    raise EvidenceError(
+                        "publication evidence identity mismatch", "EVIDENCE_HASH_MISMATCH"
+                    )
+                validate_candidate_lineage(candidate, evidence, report)
+                expected_refs = tuple(
+                    sorted(
+                        {
+                            candidate.evidence_sha256,
+                            candidate.manifest_sha256,
+                            candidate.gate_report_sha256,
+                        }
+                    )
+                )
+                if evidence_refs != expected_refs:
+                    raise EvidenceError(
+                        "publication evidence references mismatch", "EVIDENCE_HASH_MISMATCH"
+                    )
+            finally:
+                evidence.close()
+        return context
 
 
 def build_gate_report(

@@ -19,9 +19,12 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.blocking import run_blocking_drained
+from backend.app.classification.models import ClassificationSnapshot
+from backend.app.classification.store import ClassificationReadSnapshot, ClassificationStore
 from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
+from backend.app.market.calendar_generation import CalendarGenerationStore
 from backend.app.market.candidates import (
     CandidateStore,
     PublishedSelection,
@@ -72,9 +75,38 @@ from backend.app.market.providers.base import (
     ProviderEndpoint as ContractProviderEndpoint,
 )
 from backend.app.market.store import MarketStore
-from backend.app.market.universe import UniversePublicationContextV1
+from backend.app.market.universe import (
+    RequiredSymbolSnapshotV1,
+    SourceRefsV1,
+    UniverseAttemptPlanV1,
+    UniverseAttemptResultV1,
+    UniverseAuthorityBundleV1,
+    UniverseHeadV1,
+    UniverseInstrumentEvidenceV1,
+    UniverseMemberV1,
+    UniversePublicationContextV1,
+    UniverseSidecarStore,
+    UniverseSourceStateV1,
+    UniverseStoreUnavailable,
+    _source_state_identity,
+    build_universe_contract,
+    canonical_json_bytes,
+    classification_snapshot_sha256,
+    domain_sha256,
+    source_version_digest,
+    validate_calendar_authority,
+)
+from backend.app.user.store import UserStore
 
 logger = logging.getLogger("stock_eva.market.automation")
+
+
+class _UniverseProviderAcquisitionFailure(ProviderHealthError):
+    """Sanitized acquisition failure carrying the logical request count."""
+
+    def __init__(self, message: str, *, request_count: int) -> None:
+        super().__init__(message)
+        self.request_count = request_count
 
 
 def _safe_outcome_id(outcome: "AutomationOutcome") -> str:
@@ -319,12 +351,720 @@ class UniverseMaintenanceRunner:
             )
 
 
+class UniverseMaintenanceService:
+    """Concrete, bounded writer for the post-success Universe maintenance lane.
+
+    All authority inputs are supplied by strict readers.  The service owns the
+    sidecar claim/result/promotion lifecycle; it intentionally has no generic
+    promoter callback, which prevents a truthy or partially-built object from
+    becoming Universe authority.
+    """
+
+    def __init__(
+        self,
+        *,
+        sidecar: UniverseSidecarStore,
+        calendar_store: CalendarGenerationStore,
+        classification_store: ClassificationStore,
+        user_store: UserStore,
+        lock_path: Path | None,
+        provider_factory: Callable[..., object] | None,
+        evidence_root: Path | None = None,
+        context_validator: Callable[..., object] | None = None,
+        reviewed_authority: object | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.sidecar = sidecar
+        self.calendar_store = calendar_store
+        self.classification_store = classification_store
+        self.user_store = user_store
+        self.lock_path = lock_path
+        self.provider_factory = provider_factory
+        self.evidence_root = Path(evidence_root) if evidence_root is not None else None
+        self.context_validator = context_validator
+        self.reviewed_authority = reviewed_authority
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    @staticmethod
+    def _result(
+        *,
+        attempt_id: str,
+        status: Literal["blocked", "deferred", "failed", "succeeded", "ATTEMPT_INDETERMINATE"],
+        reason: str,
+        request_count: int,
+        source_state_id: str | None,
+        finished_at: datetime,
+    ) -> UniverseAttemptResultV1:
+        finished_at = finished_at.astimezone(UTC)
+        preimage = {
+            "attempt_id": attempt_id,
+            "terminal_status": status,
+            "classification_request_count": request_count,
+            "reason_code": reason,
+            "source_state_id": source_state_id,
+            "finished_at": finished_at.isoformat(),
+        }
+        return UniverseAttemptResultV1(
+            attempt_id=attempt_id,
+            terminal_status=status,
+            classification_request_count=request_count,
+            reason_code=reason,
+            source_state_id=source_state_id,
+            finished_at=finished_at,
+            result_sha256=domain_sha256("stock-eva/r2f4.2/universe-attempt-result/v1", preimage),
+        )
+
+    @staticmethod
+    def _preflight_digest(snapshot: ClassificationReadSnapshot) -> str:
+        generation = snapshot.generation
+        if generation is None:
+            projection = {
+                "provider_id": "baostock",
+                "adapter_version": "r2f4.2-universe.v1",
+                "endpoint_contract_version": "r2f4-endpoints.v1",
+                "classification": None,
+                "classification_snapshot_sha256": None,
+                "semantic_mapping_sha256": None,
+                "instrument_evidence": [],
+            }
+        else:
+            projection = {
+                "provider_id": "baostock",
+                "adapter_version": "r2f4.2-universe.v1",
+                "endpoint_contract_version": "r2f4-endpoints.v1",
+                "classification": {
+                    "source": generation.source,
+                    "source_version": generation.source_version,
+                    "sequence": generation.sequence,
+                    "observed_at": generation.observed_at.astimezone(UTC).isoformat(),
+                    "source_date_semantics": generation.source_date_semantics,
+                },
+                "classification_snapshot_sha256": None,
+                "semantic_mapping_sha256": None,
+                "instrument_evidence": [],
+            }
+        return domain_sha256("stock-eva/r2f4.2/universe-source-version/v1", projection)
+
+    @staticmethod
+    def _reviewed_preflight_digest(
+        snapshot: ClassificationReadSnapshot,
+        authority: UniverseAuthorityBundleV1,
+    ) -> str:
+        generation = snapshot.generation
+        if generation is None:
+            return UniverseMaintenanceService._preflight_digest(snapshot)
+        evidence = authority.evidence
+        observed_at = max(item.observed_at for item in evidence if item.observed_at)
+        refs = SourceRefsV1(
+            calendar_generation_id="0" * 32,
+            calendar_sha256="0" * 64,
+            classification_generation_id=generation.generation_id,
+            classification_generation_sequence=generation.sequence,
+            classification_source=generation.source,
+            classification_source_version=generation.source_version,
+            classification_source_snapshot_date=generation.source_snapshot_date,
+            classification_observed_at=observed_at,
+            classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+            required_symbol_snapshot_id="0" * 32,
+            required_symbol_snapshot_sha256="0" * 64,
+            instrument_evidence_ids=tuple(sorted(item.evidence_id for item in evidence)),
+            semantic_mapping_sha256=authority.mapping.mapping_sha256,
+            source_version_digest="0" * 64,
+            provider_id="baostock",
+            trade_date=generation.source_snapshot_date,
+            exact_pit_cutoff=observed_at,
+            source_date_semantics="source_observed",
+        )
+        return source_version_digest(refs, evidence)
+
+    def _source_digest_for_plan(self, snapshot: ClassificationReadSnapshot) -> str:
+        """Return the source identity that can be proven before acquisition.
+
+        A dynamic reviewed authority must publish the same digest from its
+        immutable mapping/evidence registry before it is allowed to acquire a
+        provider snapshot.  Falling back to a made-up digest would let a
+        request run and only fail after the network call, defeating the
+        durable preflight contract.
+        """
+        authority = self.reviewed_authority
+        if isinstance(authority, UniverseAuthorityBundleV1):
+            return self._reviewed_preflight_digest(snapshot, authority)
+        if authority is None:
+            return self._preflight_digest(snapshot)
+        value = getattr(authority, "preflight_source_version_digest", None)
+        if callable(value):
+            value = value(snapshot=snapshot)
+        if value is None:
+            value = getattr(authority, "source_version_digest", None)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ProviderHealthError("reviewed source preflight is unavailable")
+        return value
+
+    @staticmethod
+    def _operation_day(now: datetime) -> date:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("maintenance timestamp is not timezone aware")
+        return now.astimezone(SHANGHAI).date()
+
+    def _validated_context(
+        self,
+        trade_date: date,
+        context: UniversePublicationContextV1 | None,
+    ) -> UniversePublicationContextV1 | None:
+        if context is None:
+            context = self.sidecar.read_latest_publication_context(trade_date)
+            if context is None:
+                return None
+        if not isinstance(context, UniversePublicationContextV1):
+            raise UniverseStoreUnavailable("publication context is not sealed")
+        if context.trade_date != trade_date:
+            raise UniverseStoreUnavailable("publication context date mismatch")
+        if not callable(self.context_validator):
+            raise UniverseStoreUnavailable("publication context validator is unavailable")
+        checked = self.context_validator(
+            context,
+            expected_run_id=context.run_id,
+            expected_trade_date=trade_date,
+        )
+        if checked is not context and not isinstance(checked, UniversePublicationContextV1):
+            raise UniverseStoreUnavailable("publication context validation failed")
+        return context
+
+    def _authority_from_provider(
+        self,
+        *,
+        trade_date: date,
+        refresh_id: str,
+    ) -> tuple[UniverseAuthorityBundleV1 | None, int]:
+        """Acquire one reviewed bundle, returning the exact logical request count."""
+        if isinstance(self.reviewed_authority, UniverseAuthorityBundleV1):
+            return self.reviewed_authority, 0
+        if self.provider_factory is None or self.reviewed_authority is None:
+            return None, 0
+        request_count = 0
+        try:
+            provider = self.provider_factory(max_attempts=1)
+            provider_attempts = getattr(provider, "max_attempts", None)
+            if provider_attempts is None:
+                provider_attempts = getattr(
+                    getattr(provider, "session", None), "max_attempts", None
+                )
+            if provider_attempts != 1:
+                raise ProviderHealthError("universe classification retry policy is invalid")
+            fetch = getattr(provider, "fetch", None)
+            if not callable(fetch):
+                raise ProviderHealthError("universe classification provider is unavailable")
+            request_count = 1
+            snapshot = fetch(trade_date)
+            if not isinstance(snapshot, ClassificationSnapshot):
+                raise ProviderHealthError("universe classification snapshot is invalid")
+            admit = getattr(self.reviewed_authority, "admit", None)
+            if not callable(admit) and callable(self.reviewed_authority):
+                admit = self.reviewed_authority
+            if not callable(admit):
+                raise ProviderHealthError("reviewed classification authority is unavailable")
+            authority = admit(snapshot, trade_date=trade_date, refresh_id=refresh_id)
+            if not isinstance(authority, UniverseAuthorityBundleV1):
+                raise ProviderHealthError("reviewed classification authority is invalid")
+            return authority, request_count
+        except Exception as error:
+            if isinstance(error, _UniverseProviderAcquisitionFailure):
+                raise
+            raise _UniverseProviderAcquisitionFailure(
+                "universe classification acquisition failed", request_count=request_count
+            ) from error
+
+    @staticmethod
+    def _members(
+        evidence: tuple[UniverseInstrumentEvidenceV1, ...],
+        required: RequiredSymbolSnapshotV1,
+        trade_date: date,
+    ) -> tuple[UniverseMemberV1, ...]:
+        required_roles = dict(required.symbols)
+        members: list[UniverseMemberV1] = []
+        seen_symbols: set[str] = set()
+        seen_security_ids: set[str] = set()
+        for item in evidence:
+            if item.symbol in seen_symbols or item.security_id in seen_security_ids:
+                raise ValueError("UNIVERSE_IDENTITY_CONFLICT")
+            seen_symbols.add(item.symbol)
+            seen_security_ids.add(item.security_id)
+            roles: set[str] = set()
+            if (
+                item.security_type == "stock"
+                and item.board == "main"
+                and item.list_date is not None
+                and item.list_date <= trade_date
+                and (item.delist_date is None or trade_date < item.delist_date)
+            ):
+                roles.add("effective_main_board")
+            roles.update(required_roles.get(item.symbol, ()))
+            if item.index_role == "required_index":
+                roles.add("required_index")
+            if not roles:
+                if item.exclusion_reason:
+                    continue
+                raise ValueError("UNIVERSE_MISSING_SYMBOL")
+            if item.index_role == "required_index" and item.expected_trading_state != "trading":
+                raise ValueError("REQUIRED_INDEX_NOT_TRADING")
+            members.append(
+                UniverseMemberV1(
+                    symbol=item.symbol,
+                    security_id=item.security_id,
+                    member_kind=item.member_kind_for_evidence(),
+                    scope_roles=tuple(sorted(roles)),
+                    exchange=item.exchange,
+                    board=item.board,
+                    list_date=item.list_date,
+                    delist_date=item.delist_date,
+                    expected_trading_state=item.expected_trading_state or "unknown",
+                    st_state=item.st_state,
+                    state_source=item.source_schema,
+                    effective_from=item.list_date,
+                    effective_to=item.delist_date,
+                    instrument_evidence_id=item.evidence_id,
+                    exclusion_reason=item.exclusion_reason,
+                )
+            )
+        required_symbols = set(required_roles)
+        if not required_symbols.issubset(seen_symbols):
+            raise ValueError("REQUIRED_SYMBOL_INVALID")
+        if set(INDEX_SYMBOLS) - seen_symbols:
+            raise ValueError("REQUIRED_INDEX_NOT_TRADING")
+        return tuple(sorted(members, key=lambda value: value.symbol))
+
+    def __call__(
+        self,
+        *,
+        trade_date: str,
+        now: str,
+        context: UniversePublicationContextV1 | None,
+        sidecar: object,
+    ) -> UniverseHookResult:
+        request_count = 0
+        try:
+            target = date.fromisoformat(trade_date)
+            current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if current.tzinfo is None or current.utcoffset() is None:
+                raise ValueError("maintenance timestamp is not timezone aware")
+            if sidecar is not self.sidecar:
+                raise UniverseStoreUnavailable("universe sidecar binding mismatch")
+            if self.lock_path is None or not isinstance(self.lock_path, Path):
+                return UniverseHookResult(
+                    status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+                )
+            with RefreshRunLock(self.lock_path):
+                sealed = self._validated_context(target, context)
+                if sealed is None:
+                    return UniverseHookResult(
+                        status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+                    )
+                classification = self.classification_store.read_snapshot(
+                    target, include_securities=True
+                )
+                if not isinstance(classification, ClassificationReadSnapshot):
+                    raise UniverseStoreUnavailable("classification snapshot is unavailable")
+                if (
+                    classification.generation is None
+                    or classification.generation.source_date_semantics != "source_observed"
+                ):
+                    source_digest = self._preflight_digest(classification)
+                else:
+                    source_digest = self._source_digest_for_plan(classification)
+                operation_day = self._operation_day(current)
+                plan_values = {
+                    "attempt_id": domain_sha256(
+                        "stock-eva/r2f4.2/universe-attempt-id/v1",
+                        {
+                            "trade_date": target.isoformat(),
+                            "operation_day": operation_day.isoformat(),
+                            "refresh_id": sealed.run_id,
+                            "source_version_digest": source_digest,
+                        },
+                    )[:32],
+                    "hook_kind": "universe_post_success",
+                    "refresh_id": sealed.run_id,
+                    "canonical_run_id": sealed.run_id,
+                    "source_version_digest": source_digest,
+                    "trade_date": target,
+                    "operation_day": operation_day,
+                    "attempt_status": "RUNNING",
+                    "request_budget": 1,
+                    "classification_max_attempts": 1,
+                    "created_at": current.astimezone(UTC),
+                }
+                dedup_preimage = {
+                    "trade_date": target.isoformat(),
+                    "operation_day": operation_day.isoformat(),
+                    "canonical_run_id": sealed.run_id,
+                    "source_version_digest": source_digest,
+                    "hook_kind": "universe_post_success",
+                    "refresh_id": sealed.run_id,
+                    "request_budget": 1,
+                    "classification_max_attempts": 1,
+                    "created_at": current.astimezone(UTC).isoformat(),
+                    "attempt_status": "RUNNING",
+                }
+                plan_values["dedup_key"] = domain_sha256(
+                    "stock-eva/r2f4.2/universe-attempt-dedup/v1", dedup_preimage
+                )
+                plan_values["planned_sha256"] = domain_sha256(
+                    "stock-eva/r2f4.2/universe-attempt-plan/v1", dedup_preimage
+                )
+                plan = UniverseAttemptPlanV1(**plan_values)
+                claim = self.sidecar.record_publication_context_and_claim(sealed, plan)
+                if not claim.claimed:
+                    return UniverseHookResult(
+                        status="DEFER", reason_code="NONE", provider_requests=0
+                    )
+                try:
+                    calendar_authority = self.calendar_store.read_authority()
+                except Exception:
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="CALENDAR_UNAVAILABLE",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                try:
+                    calendar_generation = calendar_authority.read_result.generation
+                    calendar_hash = (
+                        calendar_generation.generation_sha256
+                        if calendar_generation is not None
+                        else ""
+                    )
+                    validate_calendar_authority(
+                        calendar_authority,
+                        trade_date=target,
+                        calendar_generation_id=calendar_hash[:32],
+                        calendar_sha256=calendar_hash,
+                        exact_pit_cutoff=current,
+                    )
+                except Exception:
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="CALENDAR_UNAVAILABLE",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                if (
+                    classification.generation is None
+                    or classification.generation.source_date_semantics != "source_observed"
+                ):
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="CLASSIFICATION_UNAVAILABLE",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                if self.reviewed_authority is None:
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                try:
+                    authority, request_count = self._authority_from_provider(
+                        trade_date=target, refresh_id=sealed.run_id
+                    )
+                except _UniverseProviderAcquisitionFailure as error:
+                    request_count = error.request_count
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="CLASSIFICATION_UNAVAILABLE",
+                        request_count=request_count,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED",
+                        reason_code=failed.reason_code,
+                        provider_requests=request_count,
+                    )
+                except Exception:
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="CLASSIFICATION_UNAVAILABLE",
+                        request_count=request_count,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED",
+                        reason_code=failed.reason_code,
+                        provider_requests=request_count,
+                    )
+                if authority is None:
+                    raise ProviderHealthError("reviewed authority is unavailable")
+                try:
+                    captured = self.user_store.capture_required_symbol_snapshot_existing()
+                except Exception:
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="USER_STORE_UNAVAILABLE",
+                        request_count=request_count,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED",
+                        reason_code=failed.reason_code,
+                        provider_requests=request_count,
+                    )
+                required = RequiredSymbolSnapshotV1.from_user_capture(captured)
+                members = self._members(authority.evidence, required, target)
+                generation = classification.generation
+                cutoff = current.astimezone(UTC)
+                observed_at = max(
+                    item.observed_at for item in authority.evidence if item.observed_at
+                )
+                refs = SourceRefsV1(
+                    calendar_generation_id=calendar_authority.head_generation_sha256[:32]
+                    if calendar_authority.head_generation_sha256
+                    else "",
+                    calendar_sha256=calendar_authority.head_generation_sha256 or "0" * 64,
+                    classification_generation_id=generation.generation_id,
+                    classification_generation_sequence=generation.sequence,
+                    classification_source=generation.source,
+                    classification_source_version=generation.source_version,
+                    classification_source_snapshot_date=generation.source_snapshot_date,
+                    classification_observed_at=observed_at,
+                    classification_snapshot_sha256=classification_snapshot_sha256(
+                        authority.evidence
+                    ),
+                    required_symbol_snapshot_id=required.snapshot_id,
+                    required_symbol_snapshot_sha256=required.snapshot_sha256,
+                    instrument_evidence_ids=tuple(
+                        sorted(item.evidence_id for item in authority.evidence)
+                    ),
+                    semantic_mapping_sha256=authority.mapping.mapping_sha256,
+                    source_version_digest="0" * 64,
+                    provider_id="baostock",
+                    trade_date=target,
+                    exact_pit_cutoff=cutoff,
+                    source_date_semantics=authority.source_date_semantics,
+                )
+                refs = refs.model_copy(
+                    update={
+                        "source_version_digest": source_version_digest(refs, authority.evidence)
+                    }
+                )
+                source_state_id, source_state_sha = _source_state_identity(refs)
+                source_state = UniverseSourceStateV1(
+                    source_state_id=source_state_id,
+                    source_state_sha256=source_state_sha,
+                    trade_date=target,
+                    provider_id="baostock",
+                    source_version_digest=refs.source_version_digest,
+                    source_refs_json=canonical_json_bytes(refs.model_dump(mode="json")).decode(),
+                    verified_at=cutoff,
+                )
+                head = self.sidecar.read_head()
+                next_sequence = head.sequence + 1 if head is not None else 1
+                parent_contract_id = head.contract_id if head is not None else None
+                contract = build_universe_contract(
+                    trade_date=target,
+                    calendar_generation_id=refs.calendar_generation_id,
+                    calendar_sha256=refs.calendar_sha256,
+                    classification_generation_id=generation.generation_id,
+                    classification_generation_sequence=generation.sequence,
+                    classification_source=generation.source,
+                    classification_source_version=generation.source_version,
+                    classification_source_snapshot_date=generation.source_snapshot_date,
+                    classification_observed_at=observed_at,
+                    exact_pit_cutoff=cutoff,
+                    source_refs=refs,
+                    members=members,
+                    authority_bundle=authority,
+                    calendar_authority=calendar_authority,
+                    required_user_snapshot=captured,
+                    sequence=next_sequence,
+                    parent_contract_id=parent_contract_id,
+                    created_at=cutoff,
+                )
+                if (
+                    contract.source_state_id != source_state_id
+                    or contract.source_state_sha256 != source_state_sha
+                ):
+                    raise UniverseStoreUnavailable("universe source state identity mismatch")
+                result = self._result(
+                    attempt_id=plan.attempt_id,
+                    status="succeeded",
+                    reason="NONE",
+                    request_count=request_count,
+                    source_state_id=source_state_id,
+                    finished_at=cutoff,
+                )
+                expected_sequence = head.sequence if head is not None else 0
+                expected_hash = head.head_sha256 if head is not None else None
+                try:
+                    promoted = self.sidecar.promote(
+                        contract,
+                        expected_sequence=expected_sequence,
+                        expected_head_sha256=expected_hash,
+                        mapping=authority.mapping,
+                        evidence=authority.evidence,
+                        required_snapshot=captured,
+                        authority_bundle=authority,
+                        calendar_authority=calendar_authority,
+                        attempt_result=result,
+                    )
+                except UniverseStoreUnavailable as error:
+                    reason = (
+                        "UNIVERSE_HEAD_CAS_CONFLICT"
+                        if "head CAS conflict" in str(error) or "sequence invalid" in str(error)
+                        else "UNIVERSE_SOURCE_VERSION_CHANGED"
+                        if "attempt lineage mismatch" in str(error)
+                        else "CONTROL_STATE_UNAVAILABLE"
+                    )
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason=reason,
+                        request_count=request_count,
+                        source_state_id=None,
+                        finished_at=cutoff,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED" if reason != "CONTROL_STATE_UNAVAILABLE" else "DEFER",
+                        reason_code=reason,
+                        provider_requests=request_count,
+                    )
+                if (
+                    not isinstance(promoted, UniverseHeadV1)
+                    or promoted.sequence != contract.sequence
+                ):
+                    raise UniverseStoreUnavailable("universe promotion result is invalid")
+                return UniverseHookResult(
+                    status="PROMOTED", reason_code=None, provider_requests=request_count
+                )
+        except UniverseStoreUnavailable:
+            try:
+                if "plan" in locals():
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="CONTROL_STATE_UNAVAILABLE",
+                        request_count=request_count,
+                        source_state_id=(
+                            source_state.source_state_id if "source_state" in locals() else None
+                        ),
+                        finished_at=current,
+                    )
+                    if "source_state" in locals():
+                        self.sidecar.record_source_state_and_result(source_state, failed)
+                    else:
+                        self.sidecar.record_attempt_result(failed)
+            except Exception:
+                pass
+            return UniverseHookResult(
+                status="DEFER",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                provider_requests=request_count,
+            )
+        except ValueError as error:
+            reason = str(error)
+            if reason not in {
+                "REQUIRED_INDEX_NOT_TRADING",
+                "REQUIRED_SYMBOL_INVALID",
+                "UNIVERSE_IDENTITY_CONFLICT",
+                "UNIVERSE_MISSING_SYMBOL",
+            }:
+                reason = "CONTROL_STATE_UNAVAILABLE"
+            result = None
+            try:
+                # A malformed plan or sidecar is intentionally not repaired here;
+                # only an already durable claim may receive a terminal result.
+                if "plan" in locals():
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason=reason,
+                        request_count=request_count,
+                        source_state_id=(
+                            source_state.source_state_id if "source_state" in locals() else None
+                        ),
+                        finished_at=current,
+                    )
+                    if "source_state" in locals():
+                        self.sidecar.record_source_state_and_result(source_state, result)
+                    else:
+                        self.sidecar.record_attempt_result(result)
+            except Exception:
+                pass
+            return UniverseHookResult(
+                status="BLOCKED" if reason != "CONTROL_STATE_UNAVAILABLE" else "DEFER",
+                reason_code=reason,
+                provider_requests=request_count,
+            )
+        except Exception:
+            try:
+                if "plan" in locals():
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="CONTROL_STATE_UNAVAILABLE",
+                        request_count=request_count,
+                        source_state_id=(
+                            source_state.source_state_id if "source_state" in locals() else None
+                        ),
+                        finished_at=current,
+                    )
+                    if "source_state" in locals():
+                        self.sidecar.record_source_state_and_result(source_state, result)
+                    else:
+                        self.sidecar.record_attempt_result(result)
+            except Exception:
+                pass
+            return UniverseHookResult(
+                status="DEFER",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                provider_requests=request_count,
+            )
+
+
 class ConcreteUniversePostSuccessHook:
     """Safe, default-closed maintenance adapter for the Universe sidecar.
 
-    The actual writer is injected as a bounded callable.  This keeps the legacy
-    refresh path independent while making the enabled shadow lane concrete and
-    testable without constructing a provider in this module.
+    The enabled shadow lane is backed by ``UniverseMaintenanceService``.  The
+    legacy callable remains accepted for old integrations, while production
+    factories construct the concrete service from strict readers.
     """
 
     def __init__(
@@ -336,6 +1076,7 @@ class ConcreteUniversePostSuccessHook:
         interval_seconds: int = 86400,
         sidecar: object | None = None,
         maintenance_runner: UniverseMaintenanceRunner
+        | UniverseMaintenanceService
         | Callable[..., UniverseHookResult]
         | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -389,20 +1130,37 @@ class ConcreteUniversePostSuccessHook:
                 raise TypeError("publication context is not sealed")
             if context is not None and context.trade_date.isoformat() != trade_date:
                 raise ValueError("publication context date mismatch")
-            terminal = self._terminal_finished_at(trade_date)
-            if terminal is None:
+            first_attempt = False
+            try:
+                terminal = self._terminal_finished_at(trade_date)
+            except UniverseStoreUnavailable:
+                first_attempt = bool(
+                    self.sidecar is not None
+                    and isinstance(getattr(self.sidecar, "path", None), Path)
+                    and not self.sidecar.path.exists()
+                )
+                if not first_attempt:
+                    raise
+                terminal = None
+            if terminal is None and not first_attempt:
+                head = self.sidecar.read_head()
+                if head is not None:
+                    return UniverseHookResult(
+                        status="DEFER",
+                        reason_code="CONTROL_STATE_UNAVAILABLE",
+                        provider_requests=0,
+                    )
+                first_attempt = True
+            if terminal is not None and current.astimezone(UTC) < terminal:
                 return UniverseHookResult(
                     status="DEFER",
                     reason_code="CONTROL_STATE_UNAVAILABLE",
                     provider_requests=0,
                 )
-            if current.astimezone(UTC) < terminal:
-                return UniverseHookResult(
-                    status="DEFER",
-                    reason_code="CONTROL_STATE_UNAVAILABLE",
-                    provider_requests=0,
-                )
-            if (current.astimezone(UTC) - terminal).total_seconds() < self.interval_seconds:
+            if (
+                not first_attempt
+                and (current.astimezone(UTC) - terminal).total_seconds() < self.interval_seconds
+            ):
                 return UniverseHookResult(status="DEFER", reason_code="NONE", provider_requests=0)
             if self.sidecar is None or self.maintenance_runner is None:
                 return UniverseHookResult(
@@ -427,6 +1185,15 @@ class ConcreteUniversePostSuccessHook:
             )
 
 
+class _UnavailableUniverseMaintenanceService:
+    """Typed configuration failure for an explicitly enabled lane."""
+
+    def __call__(self, *, trade_date: str, now: str, context: object, sidecar: object):
+        return UniverseHookResult(
+            status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+        )
+
+
 def make_universe_post_success_hook(
     *,
     environment: str,
@@ -434,31 +1201,51 @@ def make_universe_post_success_hook(
     enabled: bool,
     interval_seconds: int = 86400,
     sidecar: object | None = None,
-    maintenance_runner: Callable[..., UniverseHookResult] | None = None,
-    calendar_authority_reader: Callable[..., object] | None = None,
-    required_snapshot_capture: Callable[..., object] | None = None,
-    classification_fetcher: Callable[..., object] | None = None,
-    contract_builder: Callable[..., object] | None = None,
-    sidecar_promoter: Callable[..., object] | None = None,
+    maintenance_service: UniverseMaintenanceService | None = None,
+    calendar_store: CalendarGenerationStore | None = None,
+    classification_store: ClassificationStore | None = None,
+    user_store: UserStore | None = None,
+    lock_path: Path | None = None,
+    provider_factory: Callable[..., object] | None = None,
+    evidence_root: Path | None = None,
+    context_validator: Callable[..., object] | None = None,
+    reviewed_authority: object | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ConcreteUniversePostSuccessHook:
-    if maintenance_runner is None and all(
-        item is not None
-        for item in (
-            calendar_authority_reader,
-            required_snapshot_capture,
-            classification_fetcher,
-            contract_builder,
-            sidecar_promoter,
+    maintenance_runner: UniverseMaintenanceService | None = maintenance_service
+    provider_is_bound = provider_factory is not None or isinstance(
+        reviewed_authority, UniverseAuthorityBundleV1
+    )
+    if (
+        maintenance_runner is None
+        and provider_is_bound
+        and all(
+            item is not None
+            for item in (
+                sidecar,
+                calendar_store,
+                classification_store,
+                user_store,
+                lock_path,
+                evidence_root,
+                context_validator,
+            )
         )
     ):
-        maintenance_runner = UniverseMaintenanceRunner(
-            calendar_authority_reader=calendar_authority_reader,
-            required_snapshot_capture=required_snapshot_capture,
-            classification_fetcher=classification_fetcher,
-            contract_builder=contract_builder,
-            sidecar_promoter=sidecar_promoter,
+        maintenance_runner = UniverseMaintenanceService(
+            sidecar=sidecar,
+            calendar_store=calendar_store,
+            classification_store=classification_store,
+            user_store=user_store,
+            lock_path=lock_path,
+            provider_factory=provider_factory,
+            evidence_root=evidence_root,
+            context_validator=context_validator,
+            reviewed_authority=reviewed_authority,
+            clock=clock,
         )
+    if maintenance_runner is None and enabled:
+        maintenance_runner = _UnavailableUniverseMaintenanceService()
     return ConcreteUniversePostSuccessHook(
         environment=environment,
         mode=mode,
@@ -1644,6 +2431,7 @@ class MarketAutomationService:
         market_universe_maintenance_enabled: bool = False,
         market_universe_mode: str = "off",
         environment: str = "development",
+        universe_context_validator: Callable[..., object] | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -1662,6 +2450,7 @@ class MarketAutomationService:
         self.market_universe_maintenance_enabled = market_universe_maintenance_enabled
         self.market_universe_mode = market_universe_mode
         self.environment = environment
+        self.universe_context_validator = universe_context_validator
         self.last_universe_decision: UniverseMaintenanceDecision | None = None
         self.last_universe_result: UniverseHookResult | None = None
         self.last_legacy_shadow_observation: LegacyShadowObservation | None = None
@@ -1672,6 +2461,11 @@ class MarketAutomationService:
 
     def run_due_once(self, now: datetime) -> AutomationOutcome:
         self._last_canonical_execution = None
+        if not self.market_universe_maintenance_enabled:
+            self.last_universe_result = None
+            self.last_universe_decision = UniverseMaintenanceDecision(
+                action="none", reason_code="NONE", provider_requests=0
+            )
         local = now.astimezone(SHANGHAI)
         operation_policy = self.policy.for_snapshot(_calendar_snapshot(self.calendar))
         published = self.store.published_refresh()
@@ -1724,7 +2518,8 @@ class MarketAutomationService:
             ):
                 self._run_post_publish(published)
             self._offer_shadow(outcome)
-            self._offer_universe_maintenance(outcome, local)
+            if self.market_universe_maintenance_enabled:
+                self._offer_universe_maintenance(outcome, local)
             self._last_canonical_execution = None
             return outcome
 
@@ -1761,7 +2556,8 @@ class MarketAutomationService:
             if outcome.result is not None and outcome.result.status == "ready":
                 self._run_post_publish(outcome.result)
             self._offer_shadow(outcome, self._last_canonical_execution)
-            self._offer_universe_maintenance(outcome, local)
+            if self.market_universe_maintenance_enabled:
+                self._offer_universe_maintenance(outcome, local)
         finally:
             self._last_canonical_execution = None
         return outcome
@@ -1975,6 +2771,9 @@ class MarketAutomationService:
             if (
                 execution is not None
                 and execution.legacy_shadow_input is not None
+                and self.market_universe_maintenance_enabled
+                and isinstance(self.environment, str)
+                and self.environment.strip().casefold() != "production"
                 and isinstance(self.market_universe_mode, str)
                 and self.market_universe_mode.strip().casefold() == "shadow"
             ):
@@ -2010,6 +2809,15 @@ class MarketAutomationService:
                 action="none", reason_code="NONE", provider_requests=0
             )
             return
+        # The concrete Universe lane is downstream of the additive canonical
+        # context handoff.  A caller that did not provide that callable cannot
+        # safely offer maintenance, even on a non-run tick with an old result.
+        if self.canonical_refresh is None:
+            self.last_universe_decision = UniverseMaintenanceDecision(
+                action="defer", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+            )
+            self.last_universe_result = None
+            return
         if outcome.continuity_result is not None or outcome.state.refresh_state in {
             "error",
             "retry_wait",
@@ -2026,11 +2834,16 @@ class MarketAutomationService:
             return
         context = None
         execution = self._last_canonical_execution
-        if (
-            outcome.result is not None
-            and outcome.result.status == "ready"
-            and execution is not None
-        ):
+        if outcome.result is not None and outcome.result.status == "ready":
+            # A plain legacy RefreshResult has no sealed publication context.  It
+            # must never be treated as equivalent to the additive execution
+            # wrapper: doing so would allow Universe work after a caller bypassed
+            # the immutable CandidateStore/evidence handoff.
+            if execution is None:
+                self.last_universe_decision = UniverseMaintenanceDecision(
+                    action="defer", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
+                )
+                return
             consumer = getattr(self.canonical_refresh, "consume_universe_publication_context", None)
             if not callable(consumer):
                 self.last_universe_decision = UniverseMaintenanceDecision(
@@ -2058,6 +2871,25 @@ class MarketAutomationService:
                     action="defer", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
                 )
                 return
+            validator = self.universe_context_validator
+            if callable(validator):
+                try:
+                    checked = validator(
+                        context,
+                        expected_run_id=execution.result.run_id,
+                        expected_trade_date=execution.result.requested_date,
+                    )
+                    if checked is not context and not isinstance(
+                        checked, UniversePublicationContextV1
+                    ):
+                        raise TypeError("publication context immutable readback failed")
+                except Exception:
+                    self.last_universe_decision = UniverseMaintenanceDecision(
+                        action="defer",
+                        reason_code="CONTROL_STATE_UNAVAILABLE",
+                        provider_requests=0,
+                    )
+                    return
         try:
             target = outcome.decision.target_session or now.date()
             self.last_universe_result = self.universe_post_success_hook.offer(

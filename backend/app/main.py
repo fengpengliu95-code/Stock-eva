@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.app.api.router import api_router
+from backend.app.classification.provider import make_baostock_classification_provider
+from backend.app.classification.store import ClassificationStore
 from backend.app.config import CalendarRuntimeSettings, get_settings
 from backend.app.market.automation import (
     BaoStockProbeRunner,
@@ -29,6 +31,7 @@ from backend.app.market.calendar_sync import (
     read_calendar_conflict,
     run_calendar_sync_loop,
 )
+from backend.app.market.candidates import CandidateStore
 from backend.app.market.continuity import (
     ContinuityInventory,
     ContinuityRepairExecutor,
@@ -275,10 +278,25 @@ async def lifespan(_: FastAPI):
             enabled=settings.market_universe_maintenance_enabled,
             interval_seconds=settings.market_universe_maintenance_interval_seconds,
             sidecar=UniverseSidecarStore(layout.universe_contract_database),
+            calendar_store=CalendarGenerationStore(layout.calendar_generation_database),
+            classification_store=ClassificationStore(
+                layout.settings.market_data_dir / settings.classification_database_name,
+                temp_directory=settings.local_temp_dir / "classification-duckdb",
+            ),
+            user_store=user_store,
+            lock_path=layout.market_refresh_lock,
+            provider_factory=make_baostock_classification_provider,
+            evidence_root=layout.provider_evidence_root,
+            context_validator=CandidateStore(
+                layout.provider_evidence_root
+            ).verify_publication_context,
         ),
         market_universe_maintenance_enabled=settings.market_universe_maintenance_enabled,
         market_universe_mode=settings.market_universe_mode,
         environment=settings.environment,
+        universe_context_validator=CandidateStore(
+            layout.provider_evidence_root
+        ).verify_publication_context,
     )
     calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
     calendar_service = CalendarSyncService(

@@ -14,6 +14,7 @@ import re
 import sqlite3
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -50,6 +51,14 @@ _SNAPSHOT_ADMISSION_SECRET = object()
 
 class UniverseStoreUnavailable(RuntimeError):
     """The sidecar cannot be proven safe for authority use."""
+
+
+@dataclass(frozen=True)
+class UniverseAttemptClaim:
+    """Result of the durable once-per-operation-day claim."""
+
+    claimed: bool
+    plan: UniverseAttemptPlanV1 | None = None
 
 
 class _DescriptorConnection(sqlite3.Connection):
@@ -2632,9 +2641,12 @@ class UniverseSidecarStore:
     @staticmethod
     def _validate_attempts(connection: sqlite3.Connection) -> None:
         rows = connection.execute("SELECT * FROM universe_attempt").fetchall()
-        results = {
-            row[0]: row for row in connection.execute("SELECT * FROM universe_attempt_result")
-        }
+        result_rows = connection.execute("SELECT * FROM universe_attempt_result").fetchall()
+        if len({row[0] for row in rows}) != len(rows) or len({row[1] for row in rows}) != len(rows):
+            raise UniverseStoreUnavailable("universe duplicate attempt identity")
+        if len({row[0] for row in result_rows}) != len(result_rows):
+            raise UniverseStoreUnavailable("universe duplicate attempt result")
+        results = {row[0]: row for row in result_rows}
         for row in rows:
             plan = UniverseAttemptPlanV1(
                 attempt_id=row[0],
@@ -2662,6 +2674,8 @@ class UniverseSidecarStore:
                     finished_at=datetime.fromisoformat(result[5].replace("Z", "+00:00")),
                     result_sha256=result[6],
                 )
+                if result_model.classification_request_count > plan.request_budget:
+                    raise UniverseStoreUnavailable("universe attempt request budget exceeded")
                 if result_model.source_state_id is not None:
                     source_state = connection.execute(
                         "SELECT trade_date,source_version_digest FROM universe_source_state "
@@ -2687,9 +2701,9 @@ class UniverseSidecarStore:
                 evidence_refs=tuple(json.loads(row[4])),
                 publication_lineage_json=row[5],
                 publication_lineage_sha256=row[6],
-                context_sha256=row[8],
-                status=row[9],
-                created_at=datetime.fromisoformat(row[10].replace("Z", "+00:00")),
+                context_sha256=row[7],
+                status=row[8],
+                created_at=datetime.fromisoformat(str(row[9]).replace("Z", "+00:00")),
             )
 
     def _read_contract(
@@ -3082,6 +3096,7 @@ class UniverseSidecarStore:
         try:
             connection.execute("BEGIN DEFERRED")
             self._validate(connection)
+            self._validate_global(connection, self._reachable_contract_ids(connection))
             row = connection.execute(
                 "SELECT sequence,contract_id,contract_sha256,head_sha256,updated_at "
                 "FROM universe_head WHERE singleton_id=1"
@@ -3219,6 +3234,7 @@ class UniverseSidecarStore:
         try:
             connection.execute("BEGIN DEFERRED")
             self._validate(connection)
+            self._validate_global(connection, self._reachable_contract_ids(connection))
             row = connection.execute(
                 "SELECT r.finished_at FROM universe_attempt_result r "
                 "JOIN universe_attempt a ON a.attempt_id=r.attempt_id "
@@ -3235,6 +3251,383 @@ class UniverseSidecarStore:
         finally:
             connection.close()
 
+    def read_latest_publication_context(
+        self, trade_date: date
+    ) -> UniversePublicationContextV1 | None:
+        """Read the newest immutable canonical handoff for one exact date.
+
+        This is a strict reader: unlike :meth:`initialize`, it never creates the
+        sidecar or its parent directories.  A missing sidecar is therefore
+        distinguishable from a readable sidecar with no context.
+        """
+        if isinstance(trade_date, str):
+            trade_date = date.fromisoformat(trade_date)
+        if not self.path.exists() or self.path.is_symlink():
+            raise UniverseStoreUnavailable("universe sidecar unavailable")
+        connection = self._connect(readonly=True)
+        try:
+            connection.execute("BEGIN DEFERRED")
+            self._validate(connection)
+            self._validate_global(connection, self._reachable_contract_ids(connection))
+            row = connection.execute(
+                "SELECT * FROM universe_publication_context WHERE trade_date=? "
+                "ORDER BY created_at DESC, context_id DESC LIMIT 1",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if row is None:
+                return None
+            return UniversePublicationContextV1(
+                context_id=row[0],
+                run_id=row[1],
+                trade_date=date.fromisoformat(row[2]),
+                manifest_ref=row[3],
+                evidence_refs=tuple(json.loads(row[4])),
+                publication_lineage_json=row[5],
+                publication_lineage_sha256=row[6],
+                context_sha256=row[7],
+                status=row[8],
+                created_at=datetime.fromisoformat(str(row[9]).replace("Z", "+00:00")),
+            )
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise UniverseStoreUnavailable("universe publication context unavailable") from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _attempt_plan_values(plan: UniverseAttemptPlanV1) -> tuple[Any, ...]:
+        return (
+            plan.attempt_id,
+            plan.dedup_key,
+            plan.hook_kind,
+            plan.refresh_id,
+            plan.canonical_run_id,
+            plan.source_version_digest,
+            plan.trade_date.isoformat(),
+            plan.operation_day.isoformat(),
+            plan.attempt_status,
+            plan.request_budget,
+            plan.classification_max_attempts,
+            plan.created_at.astimezone(UTC).isoformat(),
+            plan.planned_sha256,
+        )
+
+    @staticmethod
+    def _attempt_result_values(result: UniverseAttemptResultV1) -> tuple[Any, ...]:
+        return (
+            result.attempt_id,
+            result.terminal_status,
+            result.classification_request_count,
+            result.reason_code,
+            result.source_state_id,
+            result.finished_at.astimezone(UTC).isoformat(),
+            result.result_sha256,
+        )
+
+    @staticmethod
+    def _publication_context_values(
+        context: UniversePublicationContextV1,
+    ) -> tuple[Any, ...]:
+        return (
+            context.context_id,
+            context.run_id,
+            context.trade_date.isoformat(),
+            context.manifest_ref,
+            canonical_json_bytes(context.evidence_refs).decode(),
+            context.publication_lineage_json,
+            context.publication_lineage_sha256,
+            context.context_sha256,
+            context.status,
+            context.created_at.astimezone(UTC).isoformat(),
+        )
+
+    @staticmethod
+    def _read_attempt_plan(row: sqlite3.Row) -> UniverseAttemptPlanV1:
+        return UniverseAttemptPlanV1(
+            attempt_id=row[0],
+            dedup_key=row[1],
+            hook_kind=row[2],
+            refresh_id=row[3],
+            canonical_run_id=row[4],
+            source_version_digest=row[5],
+            trade_date=date.fromisoformat(row[6]),
+            operation_day=date.fromisoformat(row[7]),
+            attempt_status=row[8],
+            request_budget=row[9],
+            classification_max_attempts=row[10],
+            created_at=datetime.fromisoformat(str(row[11]).replace("Z", "+00:00")),
+            planned_sha256=row[12],
+        )
+
+    @staticmethod
+    def _read_attempt_result(row: sqlite3.Row) -> UniverseAttemptResultV1:
+        return UniverseAttemptResultV1(
+            attempt_id=row[0],
+            terminal_status=row[1],
+            classification_request_count=row[2],
+            reason_code=row[3],
+            source_state_id=row[4],
+            finished_at=datetime.fromisoformat(str(row[5]).replace("Z", "+00:00")),
+            result_sha256=row[6],
+        )
+
+    def claim_attempt(self, plan: UniverseAttemptPlanV1) -> UniverseAttemptClaim:
+        """Durably occupy one ``(trade_date, operation_day)`` slot.
+
+        The plan is committed before any provider acquisition.  A duplicate slot is a
+        typed no-op, including after a process restart; it is never turned into a
+        second provider request.  Only this writer method may initialise an absent
+        sidecar.
+        """
+        try:
+            plan = UniverseAttemptPlanV1.model_validate(
+                plan.model_dump(mode="python"), strict=False
+            )
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("universe attempt plan unavailable") from exc
+        self.initialize()
+        with _file_lock(self.lock_path):
+            connection = self._connect()
+            try:
+                self._validate(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                existing_row = connection.execute(
+                    "SELECT * FROM universe_attempt WHERE trade_date=? AND operation_day=?",
+                    (plan.trade_date.isoformat(), plan.operation_day.isoformat()),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._read_attempt_plan(existing_row)
+                    if existing.dedup_key != plan.dedup_key:
+                        raise UniverseStoreUnavailable("universe attempt slot identity conflict")
+                    connection.rollback()
+                    return UniverseAttemptClaim(claimed=False, plan=existing)
+                connection.execute(
+                    "INSERT INTO universe_attempt ("
+                    "attempt_id,dedup_key,hook_kind,refresh_id,canonical_run_id,"
+                    "source_version_digest,trade_date,operation_day,attempt_status,"
+                    "request_budget,classification_max_attempts,created_at,planned_sha256"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    self._attempt_plan_values(plan),
+                )
+                connection.commit()
+                return UniverseAttemptClaim(claimed=True, plan=plan)
+            except (sqlite3.Error, OSError, ValueError, UniverseStoreUnavailable) as exc:
+                connection.rollback()
+                if isinstance(exc, UniverseStoreUnavailable):
+                    raise
+                raise UniverseStoreUnavailable("universe attempt claim unavailable") from exc
+            finally:
+                connection.close()
+
+    def record_publication_context_and_claim(
+        self,
+        context: UniversePublicationContextV1,
+        plan: UniverseAttemptPlanV1,
+    ) -> UniverseAttemptClaim:
+        """Persist a fresh canonical handoff and claim its attempt atomically.
+
+        The context and plan share one ``BEGIN IMMEDIATE`` transaction.  This is
+        the only production entry point that admits a callback context into the
+        sidecar and guarantees that the plan is durable before acquisition.
+        """
+        try:
+            context = UniversePublicationContextV1.model_validate(
+                context.model_dump(mode="python"), strict=False
+            )
+            plan = UniverseAttemptPlanV1.model_validate(
+                plan.model_dump(mode="python"), strict=False
+            )
+            if context.trade_date != plan.trade_date or context.run_id != plan.refresh_id:
+                raise ValueError("publication context and attempt identity mismatch")
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("universe context admission unavailable") from exc
+        self.initialize()
+        with _file_lock(self.lock_path):
+            connection = self._connect()
+            try:
+                self._validate(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                existing_context = connection.execute(
+                    "SELECT * FROM universe_publication_context WHERE run_id=? AND trade_date=?",
+                    (context.run_id, context.trade_date.isoformat()),
+                ).fetchone()
+                if existing_context is not None:
+                    if tuple(existing_context) != self._publication_context_values(context):
+                        raise UniverseStoreUnavailable("publication context identity conflict")
+                else:
+                    connection.execute(
+                        "INSERT INTO universe_publication_context ("
+                        "context_id,run_id,trade_date,manifest_ref,evidence_refs_json,"
+                        "publication_lineage_json,publication_lineage_sha256,context_sha256,"
+                        "status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        self._publication_context_values(context),
+                    )
+                existing_plan = connection.execute(
+                    "SELECT * FROM universe_attempt WHERE trade_date=? AND operation_day=?",
+                    (plan.trade_date.isoformat(), plan.operation_day.isoformat()),
+                ).fetchone()
+                if existing_plan is not None:
+                    existing = self._read_attempt_plan(existing_plan)
+                    if existing.dedup_key != plan.dedup_key:
+                        raise UniverseStoreUnavailable("universe attempt slot identity conflict")
+                    connection.commit()
+                    return UniverseAttemptClaim(claimed=False, plan=existing)
+                connection.execute(
+                    "INSERT INTO universe_attempt ("
+                    "attempt_id,dedup_key,hook_kind,refresh_id,canonical_run_id,"
+                    "source_version_digest,trade_date,operation_day,attempt_status,"
+                    "request_budget,classification_max_attempts,created_at,planned_sha256"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    self._attempt_plan_values(plan),
+                )
+                self._validate_global(connection, self._reachable_contract_ids(connection))
+                connection.commit()
+                return UniverseAttemptClaim(claimed=True, plan=plan)
+            except (sqlite3.Error, OSError, ValueError, UniverseStoreUnavailable) as exc:
+                connection.rollback()
+                if isinstance(exc, UniverseStoreUnavailable):
+                    raise
+                raise UniverseStoreUnavailable("universe context/attempt unavailable") from exc
+            finally:
+                connection.close()
+
+    # Explicit writer-facing spelling used by maintenance integrations.
+    reserve_attempt = claim_attempt
+
+    def record_attempt_result(self, result: UniverseAttemptResultV1) -> bool:
+        """Append exactly one terminal result for an already claimed plan."""
+        try:
+            result = UniverseAttemptResultV1.model_validate(
+                result.model_dump(mode="python"), strict=False
+            )
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("universe attempt result unavailable") from exc
+        if not self.path.exists() or self.path.is_symlink():
+            raise UniverseStoreUnavailable("universe sidecar unavailable")
+        with _file_lock(self.lock_path):
+            connection = self._connect()
+            try:
+                self._validate(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                plan_row = connection.execute(
+                    "SELECT * FROM universe_attempt WHERE attempt_id=?", (result.attempt_id,)
+                ).fetchone()
+                if plan_row is None:
+                    raise UniverseStoreUnavailable("universe attempt plan missing")
+                plan = self._read_attempt_plan(plan_row)
+                if result.classification_request_count > plan.request_budget:
+                    raise UniverseStoreUnavailable("universe attempt request budget exceeded")
+                state = None
+                if result.source_state_id is not None:
+                    state = connection.execute(
+                        "SELECT trade_date,source_version_digest FROM universe_source_state "
+                        "WHERE source_state_id=?",
+                        (result.source_state_id,),
+                    ).fetchone()
+                    if state is None or tuple(state) != (
+                        plan.trade_date.isoformat(),
+                        plan.source_version_digest,
+                    ):
+                        raise UniverseStoreUnavailable("universe attempt source lineage mismatch")
+                existing = connection.execute(
+                    "SELECT * FROM universe_attempt_result WHERE attempt_id=?",
+                    (result.attempt_id,),
+                ).fetchone()
+                if existing is not None:
+                    if tuple(existing) != self._attempt_result_values(result):
+                        raise UniverseStoreUnavailable("universe attempt result conflict")
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    "INSERT INTO universe_attempt_result ("
+                    "attempt_id,terminal_status,classification_request_count,reason_code,"
+                    "source_state_id,finished_at,result_sha256"
+                    ") VALUES (?,?,?,?,?,?,?)",
+                    self._attempt_result_values(result),
+                )
+                connection.commit()
+                return True
+            except (sqlite3.Error, OSError, ValueError, UniverseStoreUnavailable) as exc:
+                connection.rollback()
+                if isinstance(exc, UniverseStoreUnavailable):
+                    raise
+                raise UniverseStoreUnavailable("universe attempt result unavailable") from exc
+            finally:
+                connection.close()
+
+    def record_source_state_and_result(
+        self,
+        source_state: UniverseSourceStateV1,
+        result: UniverseAttemptResultV1,
+    ) -> bool:
+        """Commit a verified source state and terminal non-head result atomically."""
+        try:
+            source_state = UniverseSourceStateV1.model_validate(
+                source_state.model_dump(mode="python"), strict=False
+            )
+            result = UniverseAttemptResultV1.model_validate(
+                result.model_dump(mode="python"), strict=False
+            )
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("universe source/result unavailable") from exc
+        if result.source_state_id != source_state.source_state_id:
+            raise UniverseStoreUnavailable("universe source/result identity mismatch")
+        with _file_lock(self.lock_path):
+            connection = self._connect()
+            try:
+                self._validate(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                plan_row = connection.execute(
+                    "SELECT * FROM universe_attempt WHERE attempt_id=?", (result.attempt_id,)
+                ).fetchone()
+                if plan_row is None:
+                    raise UniverseStoreUnavailable("universe attempt plan missing")
+                plan = self._read_attempt_plan(plan_row)
+                if (
+                    source_state.trade_date != plan.trade_date
+                    or source_state.source_version_digest != plan.source_version_digest
+                    or result.classification_request_count > plan.request_budget
+                ):
+                    raise UniverseStoreUnavailable("universe source/result lineage mismatch")
+                self._insert_or_match(
+                    connection,
+                    "universe_source_state",
+                    "source_state_id",
+                    (
+                        source_state.source_state_id,
+                        source_state.source_state_sha256,
+                        source_state.trade_date.isoformat(),
+                        source_state.provider_id,
+                        source_state.source_version_digest,
+                        source_state.source_refs_json,
+                        source_state.verified_at.astimezone(UTC).isoformat(),
+                    ),
+                )
+                existing = connection.execute(
+                    "SELECT * FROM universe_attempt_result WHERE attempt_id=?",
+                    (result.attempt_id,),
+                ).fetchone()
+                if existing is not None:
+                    if tuple(existing) != self._attempt_result_values(result):
+                        raise UniverseStoreUnavailable("universe attempt result conflict")
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    "INSERT INTO universe_attempt_result ("
+                    "attempt_id,terminal_status,classification_request_count,reason_code,"
+                    "source_state_id,finished_at,result_sha256"
+                    ") VALUES (?,?,?,?,?,?,?)",
+                    self._attempt_result_values(result),
+                )
+                connection.commit()
+                return True
+            except (sqlite3.Error, OSError, ValueError, UniverseStoreUnavailable) as exc:
+                connection.rollback()
+                if isinstance(exc, UniverseStoreUnavailable):
+                    raise
+                raise UniverseStoreUnavailable("universe source/result unavailable") from exc
+            finally:
+                connection.close()
+
     def promote(
         self,
         contract: UniverseContractV1,
@@ -3246,6 +3639,7 @@ class UniverseSidecarStore:
         required_snapshot: Any | None = None,
         authority_bundle: UniverseAuthorityBundleV1 | None = None,
         calendar_authority: CalendarAuthorityAdmission,
+        attempt_result: UniverseAttemptResultV1 | None = None,
     ) -> UniverseHeadV1:
         try:
             contract = UniverseContractV1.model_validate(
@@ -3267,6 +3661,12 @@ class UniverseSidecarStore:
                 )
                 if mapping != authority_bundle.mapping or evidence != authority_bundle.evidence:
                     raise UniverseStoreUnavailable("universe authority bundle mismatch")
+            if attempt_result is not None:
+                attempt_result = UniverseAttemptResultV1.model_validate(
+                    attempt_result.model_dump(mode="python"), strict=False
+                )
+                if attempt_result.terminal_status != "succeeded":
+                    raise UniverseStoreUnavailable("promotion result must be succeeded")
             if required_snapshot is not None:
                 from backend.app.user.store import RequiredUserSymbolSnapshotRead
 
@@ -3318,6 +3718,34 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe sequence invalid")
                 if not contract.publication_eligible:
                     raise UniverseStoreUnavailable("unpublishable universe contract")
+                if attempt_result is not None:
+                    plan_row = connection.execute(
+                        "SELECT * FROM universe_attempt WHERE attempt_id=?",
+                        (attempt_result.attempt_id,),
+                    ).fetchone()
+                    if plan_row is None:
+                        raise UniverseStoreUnavailable("universe attempt plan missing")
+                    plan = self._read_attempt_plan(plan_row)
+                    source_state_id, _source_state_sha = _source_state_identity(
+                        contract.source_refs
+                    )
+                    if (
+                        attempt_result.source_state_id != source_state_id
+                        or attempt_result.classification_request_count > plan.request_budget
+                        or plan.trade_date != contract.trade_date
+                        or plan.source_version_digest != contract.source_refs.source_version_digest
+                    ):
+                        raise UniverseStoreUnavailable(
+                            "universe promotion attempt lineage mismatch"
+                        )
+                    if (
+                        connection.execute(
+                            "SELECT 1 FROM universe_attempt_result WHERE attempt_id=?",
+                            (attempt_result.attempt_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise UniverseStoreUnavailable("universe attempt already terminal")
                 if authority_bundle is None:
                     raise UniverseStoreUnavailable("universe authority bundle unavailable")
                 if mapping is None or required_snapshot is None:
@@ -3669,6 +4097,14 @@ class UniverseSidecarStore:
                     ).rowcount
                     if updated != 1:
                         raise UniverseStoreUnavailable("universe head CAS conflict")
+                if attempt_result is not None:
+                    connection.execute(
+                        "INSERT INTO universe_attempt_result ("
+                        "attempt_id,terminal_status,classification_request_count,reason_code,"
+                        "source_state_id,finished_at,result_sha256"
+                        ") VALUES (?,?,?,?,?,?,?)",
+                        self._attempt_result_values(attempt_result),
+                    )
                 # Re-open the candidate through the same transaction and
                 # verify global reachability before the commit becomes
                 # visible.  A malformed link can therefore never advance the
@@ -3702,6 +4138,29 @@ class UniverseSidecarStore:
             "SELECT head_sha256 FROM universe_head WHERE singleton_id=1"
         ).fetchone()
         return None if row is None else row[0]
+
+    def _reachable_contract_ids(self, connection: sqlite3.Connection) -> set[str]:
+        """Resolve the complete head chain for global immutable validation."""
+        row = connection.execute(
+            "SELECT sequence,contract_id FROM universe_head WHERE singleton_id=1"
+        ).fetchone()
+        if row is None:
+            return set()
+        current_id = row[1]
+        current_sequence = row[0]
+        reachable: set[str] = set()
+        while current_id is not None:
+            if current_id in reachable or current_sequence < 1:
+                raise UniverseStoreUnavailable("universe head chain invalid")
+            contract = self._read_contract(connection, current_id)
+            if contract.sequence != current_sequence:
+                raise UniverseStoreUnavailable("universe head chain sequence invalid")
+            reachable.add(current_id)
+            current_id = contract.parent_contract_id
+            current_sequence -= 1
+        if current_sequence != 0:
+            raise UniverseStoreUnavailable("universe head chain incomplete")
+        return reachable
 
     @staticmethod
     def _insert_or_match(

@@ -16,6 +16,11 @@ from backend.app.market.automation import (
 )
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.market.universe import (
+    UniverseAttemptPlanV1,
+    UniverseSidecarStore,
+    domain_sha256,
+)
 from tests.test_market_automation import synthetic_calendar
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -146,7 +151,9 @@ def test_shadow_maintenance_hook_is_last_and_consumes_once(tmp_path: Path):
         environment="staging",
     )
     service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
-    assert [item[0] for item in events] == ["canonical", "shadow", "universe"]
+    # An ordinary RefreshResult carries no sealed CandidateStore context and
+    # therefore cannot enter the production-wired Universe service.
+    assert [item[0] for item in events] == ["canonical", "shadow"]
 
 
 def test_concrete_hook_uses_durable_terminal_interval_and_typed_runner():
@@ -204,3 +211,72 @@ def test_missing_context_consumer_does_not_call_universe_hook(tmp_path: Path):
     )
     service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
     assert calls == []
+
+
+def test_ordinary_refresh_result_never_enters_universe_service(tmp_path: Path):
+    calls = []
+
+    class Hook:
+        def offer(self, *args):
+            calls.append(args)
+            return UniverseHookResult(status="DEFER", reason_code=None, provider_requests=0)
+
+    def canonical(**kwargs):
+        return _ready_result(kwargs["run_id"], kwargs["trade_date"])
+
+    service = MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        _NoopProvider(),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        canonical_refresh=canonical,
+        universe_post_success_hook=Hook(),
+        market_universe_maintenance_enabled=True,
+        market_universe_mode="shadow",
+        environment="staging",
+    )
+    service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+    assert calls == []
+
+
+def _attempt_plan(*, operation_day: date = date(2026, 8, 20), attempt_id: str = "attempt-1"):
+    created = datetime(2026, 8, 20, 0, tzinfo=UTC)
+    values = {
+        "attempt_id": attempt_id,
+        "hook_kind": "universe_post_success",
+        "refresh_id": "refresh-1",
+        "canonical_run_id": "refresh-1",
+        "source_version_digest": "a" * 64,
+        "trade_date": date(2026, 8, 20),
+        "operation_day": operation_day,
+        "attempt_status": "RUNNING",
+        "request_budget": 1,
+        "classification_max_attempts": 1,
+        "created_at": created,
+    }
+    dedup_preimage = {
+        "trade_date": values["trade_date"].isoformat(),
+        "operation_day": values["operation_day"].isoformat(),
+        "canonical_run_id": values["canonical_run_id"],
+        "source_version_digest": values["source_version_digest"],
+        "hook_kind": values["hook_kind"],
+        "refresh_id": values["refresh_id"],
+        "request_budget": 1,
+        "classification_max_attempts": 1,
+        "created_at": created.isoformat(),
+        "attempt_status": "RUNNING",
+    }
+    values["dedup_key"] = domain_sha256(
+        "stock-eva/r2f4.2/universe-attempt-dedup/v1", dedup_preimage
+    )
+    values["planned_sha256"] = domain_sha256(
+        "stock-eva/r2f4.2/universe-attempt-plan/v1", dedup_preimage
+    )
+    return UniverseAttemptPlanV1(**values)
+
+
+def test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar(tmp_path: Path):
+    store = UniverseSidecarStore(tmp_path / "market_universe.sqlite3")
+    plan = _attempt_plan()
+    assert store.claim_attempt(plan).claimed is True
+    assert store.claim_attempt(plan).claimed is False
