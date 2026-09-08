@@ -453,7 +453,9 @@ secret is read, and no production/NAS/LaunchAgent state is touched.
 `validate_provider_raw_batch(batch, contract)` is an offline fixture-only pure function that evaluates all endpoint
 pages, **Then** request/date/refresh/session/lineage, duplicate/extra/missing, page continuity and
 `tradestatus`/suspended-placeholder violations reject the whole batch before Normalize. `off` does
-not call the seam; `shadow` compares after canonical success and records drift without blocking.
+not call the seam; `shadow` compares the callback-captured prevalidation snapshot at the existing
+`_offer_shadow` boundary (including builder rejection), and after canonical success also records
+drift without blocking.
 
 ## Edge Cases
 
@@ -788,8 +790,8 @@ function observe_legacy_request_universe(
   snapshot: LegacyPreflightSnapshot, contract: UniverseContractV1 | null,
 ): LegacyShadowObservation;
 interface LegacyShadowHandoff {
-  snapshot: LegacyPreflightSnapshot;
-  contract: UniverseContractV1 | null;
+  trade_date: string;
+  builder_outcome: "accepted" | "rejected";
   diagnostic: LegacyShadowObservation;
 }
 ```
@@ -799,7 +801,9 @@ outside the main-board scope. Therefore the observer does not claim to inspect d
 rows or an unreturned request. At the pre-validation boundary the caller freezes a
 `LegacyPreflightSnapshot` of the proposed symbol sequence, before invoking the builder; this is
 the only observed input and remains reachable even when the builder rejects a non-main-board
-symbol. The canonical path and its failure result are never changed by this capture.
+symbol. The snapshot is owned by the callback's private call stack and is released after
+`_offer_shadow`; it is never logged, persisted or placed in `LegacyShadowHandoff`. The canonical
+path and its failure result are never changed by this capture.
 
 With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
 members whose effective session state is `trading` or `suspended`, including required additions
@@ -819,12 +823,16 @@ With no persisted contract, the typed result is `NO_COMPARISON` with
 `control_reason=CONTROL_STATE_UNAVAILABLE` and nullable expected/missing/extra/digest fields.
 
 The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
-successful canonical refresh and CandidateStore evidence readback. Its typed handoff is
-`LegacyShadowHandoff {snapshot, contract, diagnostic}` from the refresh orchestration to the
-existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
+successful canonical refresh and CandidateStore evidence readback. The internal call is
+`_offer_shadow(*, prevalidation: LegacyPreflightSnapshot | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
+the raw prevalidation value is stack-owned for that call only. Its typed handoff is
+`LegacyShadowHandoff {trade_date, builder_outcome, diagnostic}` from the refresh orchestration to
+the existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
 in the Universe sidecar, head, attempt or public status. A missing contract yields the typed
 `NO_COMPARISON/CONTROL_STATE_UNAVAILABLE` result, never a blocked hook status. A diagnostic-channel
 failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
+The handoff contains counts and hashes only; raw symbols exist only during the private comparison
+stack frame and are never emitted to logs or storage.
 The observer never filters, patches or changes `build_canonical_raw_request`, does not call
 BaoStock, and is not a provider acquisition seam.
 
@@ -838,7 +846,8 @@ returns only safe endpoint counts, loaded/session counts and this digest. A non-
 identity or raw row is exposed by the gate.
 
 The current legacy `validate_universe` callback remains wired exactly as-is; mode `off` is
-unchanged and the new pure gate is not passed to it. In `shadow`, after canonical `ready`,
+unchanged and the new pure gate is not passed to it. In `shadow`, the callback captures the
+prevalidation snapshot before invoking the builder; after builder rejection or canonical `ready`,
 `_offer_shadow` invokes the pure observer on the frozen preflight snapshot, then the service
 consumes the sealed callback holder once and uses CandidateStore immutable bundle/readers to verify
 `run_id`, `trade_date`, manifest/evidence references and lineage digest. Observer drift is a
@@ -923,6 +932,30 @@ the DDL unique constraint and strict reader enforce this. Conflicting mappings a
 `not_yet_listed` and
 `delisted` required additions remain visible but never enter `session_expected`.
 
+`UniverseMemberV1` is hashed as a complete canonical projection with the digest field excluded:
+
+| Field | Required projection value |
+|---|---|
+| `symbol` | canonical safe symbol; the sole member identity key |
+| `security_id` | one-to-one security-master identity |
+| `member_kind` | `stock` or `index`; index only for the two required indexes |
+| `scope_roles` | sorted unique roles: `effective_main_board`, `required_user`, `required_index` |
+| `exchange` / `board` | derived exchange and board identity, never caller-selected |
+| `list_date` / `delist_date` | exact PIT listing window values, including nulls |
+| `expected_trading_state` | `trading`, `suspended`, `not_yet_listed`, `delisted` or `unknown` |
+| `st_state` | `yes`, `no`, `not_applicable` or `unknown` |
+| `state_source` | safe source/semantic evidence identity |
+| `effective_from` / `effective_to` | PIT effective window values, including nulls |
+| `instrument_evidence_id` | reviewed evidence identity referenced by the member |
+| `member_sha256` | `domain_sha256("stock-eva/r2f4.2/universe-member/v1", member_preimage)`; excluded from `member_preimage` |
+
+The exact `member_preimage` is the JSON object of every row above except `member_sha256`, with
+sorted `scope_roles`, explicit null values and canonical key ordering. The vector fixture MUST
+include one effective main-board stock, one required user addition and the two required indexes,
+and MUST assert that changing any state, role, evidence identity, listing boundary or null changes
+the digest while reordering roles does not. The member digest is recomputed from `member_json` by
+the strict reader; no abbreviated symbol-only digest is valid.
+
 Use the exact design domains/projections: classification evidence is sorted
 `{security_id,symbol,evidence_id,exclusion_reason}`; effective main-board is sorted complete
 security/member projections; required additions are sorted `{symbol,security_id,scope_roles,state,
@@ -965,6 +998,7 @@ Every digest is domain-separated and recomputable from persisted or existing mod
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
 | `stock-eva/r2f4.2/user-rows/v1` | exactly `{"schema_version":1,"user_rows":[sorted exact table/column/value rows]}`; this is `snapshot_token` |
 | `stock-eva/r2f4.2/required-symbol-snapshot/v1` | exactly `{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`; this is `snapshot_sha256` |
+| `stock-eva/r2f4.2/universe-member/v1` | complete `UniverseMemberV1` JSON projection with `member_sha256` excluded; this is the member vector digest |
 | `stock-eva/r2f4.2/universe-partition/classification-evidence/v1` | sorted unique JSON rows `{security_id,symbol,evidence_id,exclusion_reason}` including excluded records |
 | `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique JSON rows `{security_id,symbol}` for the effective main-board base |
 | `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique JSON rows `{security_id,symbol,scope_roles,state,evidence_id}` after base-set subtraction |
@@ -978,6 +1012,12 @@ state can be constructed. `created_at` and `finished_at` are UTC microsecond tim
 not replaced by local time or wall-clock text. The required-user snapshot preimages are defined
 only by the `user-rows/v1` and `required-symbol-snapshot/v1` registry rows above; every model and
 reader MUST use those exact objects and MUST NOT introduce a second snapshot hash formula.
+The field mapping is exact: `snapshot_token` and the persisted
+`snapshot_token_digest` are the same 64-hex value
+`domain_sha256("stock-eva/r2f4.2/user-rows/v1", {"schema_version":1,"user_rows":[sorted exact table/column/value rows]})`;
+`required_symbol_snapshot_sha256`/`snapshot_sha256` is the projection digest
+`domain_sha256("stock-eva/r2f4.2/required-symbol-snapshot/v1", {"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]})`.
+There is no hash-of-hash or alternate field naming.
 
 `attempt_id` is a generated safe identifier and `dedup_key` is the derived hash of the canonical
 attempt key; both are excluded from the plan preimage except where `attempt_id` is explicitly part
@@ -1401,8 +1441,10 @@ cannot emit `B_P` or `B_E`.
    refresh lease; `_execute_due` owns only the existing refresh lease; post-publish and shadow hooks
    run after that lease. Repair execution, refresh-running/lock-busy state or an active error
    suppresses the maintenance call; a non-run/no-error tick may still evaluate cadence.
-3. Offer one read-only legacy BaoStock shadow comparison only after a canonical refresh succeeds;
-   it is never a retry and never runs alongside Universe construction. Reuse existing refresh,
+3. Offer one read-only legacy BaoStock shadow comparison from the callback-captured prevalidation
+   snapshot at the existing `_offer_shadow` boundary, including builder rejection; after a
+   canonical refresh succeeds it is still read-only, never a retry and never runs alongside
+   Universe construction. Reuse existing refresh,
    shadow and evidence identities for deduplication; do not invent an all-lane request ledger.
    On non-run ticks the maintenance hook reads only the strictly verified immutable sidecar
    publication-context input, never a MarketStore reader or cached head.
@@ -1635,7 +1677,7 @@ range notation is used for review evidence.
 | AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and split parse/future tests (`test_status_source_state_order_and_date_matrix`, `test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
 | AC-15 | Step 5 post-success ordering/priority/callback isolation and `test_disabled_maintenance_zero_hook_write_requests` |
 | AC-16 | Step 5 failed-maintenance prior-head preservation tests |
-| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`) |
+| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer/privacy tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols`) |
 | AC-18 | Step 8 protected predecessor hash/regression tests |
 | AC-19 | Step 8 offline fake/provider-boundary tests |
 | AC-20 | Step 4 pure pre-Normalize raw-batch aggregate tests |

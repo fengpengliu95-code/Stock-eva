@@ -465,7 +465,9 @@ secret is read, and no production/NAS/LaunchAgent state is touched.
 `validate_provider_raw_batch(batch, contract)` is an offline fixture-only pure function that evaluates all endpoint
 pages, **Then** request/date/refresh/session/lineage, duplicate/extra/missing, page continuity and
 `tradestatus`/suspended-placeholder violations reject the whole batch before Normalize. `off` does
-not call the seam; `shadow` compares after canonical success and records drift without blocking.
+not call the seam; `shadow` compares the callback-captured prevalidation snapshot at the existing
+`_offer_shadow` boundary (including builder rejection), and after canonical success also records
+drift without blocking.
 
 ## Edge Cases
 
@@ -817,8 +819,8 @@ function observe_legacy_request_universe(
   snapshot: LegacyPreflightSnapshot, contract: UniverseContractV1 | null,
 ): LegacyShadowObservation;
 interface LegacyShadowHandoff {
-  snapshot: LegacyPreflightSnapshot;
-  contract: UniverseContractV1 | null;
+  trade_date: string;
+  builder_outcome: "accepted" | "rejected";
   diagnostic: LegacyShadowObservation;
 }
 ```
@@ -828,7 +830,9 @@ outside the main-board scope. Therefore the observer does not claim to inspect d
 rows or an unreturned request. At the pre-validation boundary the caller freezes a
 `LegacyPreflightSnapshot` of the proposed symbol sequence, before invoking the builder; this is
 the only observed input and remains reachable even when the builder rejects a non-main-board
-symbol. The canonical path and its failure result are never changed by this capture.
+symbol. The snapshot is owned by the callback's private call stack and is released after
+`_offer_shadow`; it is never logged, persisted or placed in `LegacyShadowHandoff`. The canonical
+path and its failure result are never changed by this capture.
 
 With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
 members whose effective session state is `trading` or `suspended`, including required additions
@@ -848,12 +852,16 @@ With no persisted contract, the typed result is `NO_COMPARISON` with
 `control_reason=CONTROL_STATE_UNAVAILABLE` and nullable expected/missing/extra/digest fields.
 
 The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
-successful canonical refresh and CandidateStore evidence readback. Its typed handoff is
-`LegacyShadowHandoff {snapshot, contract, diagnostic}` from the refresh orchestration to the
-existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
+successful canonical refresh and CandidateStore evidence readback. The internal call is
+`_offer_shadow(*, prevalidation: LegacyPreflightSnapshot | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
+the raw prevalidation value is stack-owned for that call only. Its typed handoff is
+`LegacyShadowHandoff {trade_date, builder_outcome, diagnostic}` from the refresh orchestration to
+the existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
 in the Universe sidecar, head, attempt or public status. A missing contract yields the typed
 `NO_COMPARISON/CONTROL_STATE_UNAVAILABLE` result, never a blocked hook status. A diagnostic-channel
 failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
+The handoff contains counts and hashes only; raw symbols exist only during the private comparison
+stack frame and are never emitted to logs or storage.
 The observer never filters, patches or changes `build_canonical_raw_request`, does not call
 BaoStock, and is not a provider acquisition seam.
 
@@ -867,8 +875,9 @@ returns only safe endpoint counts, loaded/session counts and this digest. A non-
 identity or raw row is exposed by the gate.
 The existing `run_canonical_raw_refresh(validate_batch=...)` callback is not a production enforce
 seam. Mode `off` MUST NOT call it. Mode `shadow` MUST NOT pass it into canonical refresh or block
-canonical: after successful canonical/evidence publish, `_offer_shadow` invokes the pure observer
-on the frozen preflight snapshot and records `LEGACY_SHADOW_DRIFT` (including missing required
+canonical: the callback captures the prevalidation snapshot before invoking the builder, and
+`_offer_shadow` invokes the pure observer on that snapshot after builder rejection or after
+successful canonical/evidence publish, recording `LEGACY_SHADOW_DRIFT` (including missing required
 ChiNext/STAR) by count/hash only. This diagnostic has no `UniversePostSuccessHook` status and is
 never mapped to `BlockedReason`. Mode `enforce` is always blocked and cannot route production.
 `build_canonical_raw_request` is unchanged.
@@ -1078,6 +1087,7 @@ no digest is an implied provider field.
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
 | `stock-eva/r2f4.2/user-rows/v1` | exactly `{"schema_version":1,"user_rows":[sorted exact table/column/value rows]}`; this is `snapshot_token` |
 | `stock-eva/r2f4.2/required-symbol-snapshot/v1` | exactly `{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`; this is `snapshot_sha256` |
+| `stock-eva/r2f4.2/universe-member/v1` | complete `UniverseMemberV1` JSON projection with `member_sha256` excluded; this is the member vector digest |
 | `stock-eva/r2f4.2/universe-partition/classification-evidence/v1` | sorted unique JSON rows `{security_id,symbol,evidence_id,exclusion_reason}` including excluded records |
 | `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique JSON rows `{security_id,symbol}` for the effective main-board base |
 | `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique JSON rows `{security_id,symbol,scope_roles,state,evidence_id}` after base-set subtraction |
@@ -1091,6 +1101,12 @@ state can be constructed. `created_at` and `finished_at` are UTC microsecond tim
 not replaced by local time or wall-clock text. The required-user snapshot preimages are defined
 only by the `user-rows/v1` and `required-symbol-snapshot/v1` registry rows above; every model and
 reader MUST use those exact objects and MUST NOT introduce a second snapshot hash formula.
+The field mapping is exact: `snapshot_token` and the persisted
+`snapshot_token_digest` are the same 64-hex value
+`domain_sha256("stock-eva/r2f4.2/user-rows/v1", {"schema_version":1,"user_rows":[sorted exact table/column/value rows]})`;
+`required_symbol_snapshot_sha256`/`snapshot_sha256` is the projection digest
+`domain_sha256("stock-eva/r2f4.2/required-symbol-snapshot/v1", {"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]})`.
+There is no hash-of-hash or alternate field naming.
 
 `attempt_id` is a generated safe identifier and `dedup_key` is the derived hash of the canonical
 attempt key; both are excluded from the plan preimage except where `attempt_id` is explicitly part
@@ -1757,7 +1773,7 @@ internal variants but map to the control row above.
 | FR-18, FR-19, FR-26 | AC-13, AC-16; EC-18, EC-19, EC-20 | `test_sidecar_schema_digest_parent_chain_links_and_cas`; static DDL digest check |
 | FR-20, FR-21 | AC-14; EC-1, EC-2, EC-3, EC-13 | `tests/test_market_universe.py::test_status_zero_write`; filesystem fingerprint |
 | FR-22, FR-23 | AC-15, AC-16; EC-14, EC-20, EC-21 | `tests/test_market_automation.py::test_post_success_universe_offer_order`, `test_disabled_maintenance_zero_hook_write_requests` |
-| FR-24, FR-25 | AC-12, AC-17, AC-18; EC-11, EC-16, EC-22 | `tests/test_market_failover.py::test_legacy_shadow_prevalidation_no_comparison_and_drift` and static provider allowlist (`baostock` only) |
+| FR-24, FR-25 | AC-12, AC-17, AC-18; EC-11, EC-16, EC-22 | `tests/test_market_failover.py::test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols` and static provider allowlist (`baostock` only) |
 | FR-15, FR-16, FR-17 | AC-20; EC-23 | pure raw-batch gate fixtures for request/endpoint/page aggregation, state and whole-session rejection |
 | FR-18, FR-19, FR-23, FR-26 | AC-13, AC-16; EC-24 | sidecar attempt/hash/transaction rollback and strict-reader tests |
 | NFR-1, NFR-2, NFR-3, NFR-4, NFR-5, NFR-6, NFR-7, NFR-8, NFR-9, NFR-10, NFR-11, NFR-12 | AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-9, AC-10, AC-11, AC-12, AC-13, AC-14, AC-15, AC-16, AC-17, AC-18, AC-19, AC-20; EC-1, EC-2, EC-3, EC-4, EC-5, EC-6, EC-7, EC-8, EC-9, EC-10, EC-11, EC-12, EC-13, EC-14, EC-15, EC-16, EC-17, EC-18, EC-19, EC-20, EC-21, EC-22, EC-23, EC-24 | offline-only fakes, zero-write fingerprint, deterministic hash, privacy scan, protected SHA and validator outputs |
