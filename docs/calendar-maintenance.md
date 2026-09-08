@@ -137,9 +137,10 @@ fail closed。CLI 字段 `writes_calendar_state=false` 仅表示没有新增业�
 
 不要删除 control store、guard、`.removed` evidence、backup 或直接编辑 SQLite 来“恢复”，
 也不要回退 head。先停用 runtime，保留整个 control/lock 目录的只读副本和权限/mtime，
-记录安全 outcome；用只读 status 判断是 source、health、slot、parent、history 还是 migration
-evidence 问题。恢复必须从已核验 authority 在独立临时根重放并完成复核，再经单独受控窗口
-替换；本版本不自动 rebase、repair 或清理证据。
+记录安全 outcome。现有只读 status 只能确认 control unavailable；它不暴露或分类 legacy
+migration guard/completed evidence，不能据此判断具体迁移故障。该证据的诊断必须在停机保全
+后通过另行审核的只读取证流程进行。恢复必须从已核验 authority 在独立临时根重放并完成
+复核，再经单独受控窗口替换；本版本不自动 rebase、repair 或清理证据。
 
 `GET /api/v1/market/status` 只读暴露最近尝试、最近成功、冲突时间和下一次
 计划；它不触发同步，也不接受客户端日期。
