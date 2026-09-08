@@ -41,213 +41,321 @@ TickFlow and Tushare are excluded from this subversion.
 
 ## Functional Requirements
 
-- FR-1: Versioned scope. Implementation MUST create `backend/app/market/universe.py`
-  with strict immutable models, state derivation, count validation, canonical hashing, evidence
-  binding and complete-candidate validation from the design.
+- FR-1: Versioned scope. The system MUST identify every contract as
+  `universe_id=all-main-board-plus-required-symbols`, `schema_version=1`, a single
+  `trade_date`, and a content hash. It MUST NOT use a fixed expected row count as the identity or
+  publication gate.
 
-- FR-2: Exact-session identity. Implementation MUST bind one complete session to the promoted
-  calendar/classification/PIT/source references, three disjoint partitions, required snapshot and
-  evidence identities; ranges and unbounded provider universes are invalid substitutes.
+- FR-2: Exact-session identity. A contract MUST represent one complete session and MUST bind
+  `trade_date`, the promoted calendar generation/hash, the promoted classification generation,
+  strict source references, three identity partitions, the required-symbol snapshot and every
+  instrument-evidence identity. A range or a provider's
+  unbounded universe MUST NOT substitute for the exact session.
 
-- FR-3: Promoted calendar PIT gate. Implementation MUST consume one pinned R2-F4.1 calendar snapshot,
-  one promoted classification `read_snapshot(trade_date)` result and one explicit
-  `exact_pit_cutoff`. It MUST reject future, degraded, unpromoted or
-  `source_date_semantics=requested_unverified` inputs before promotion, mapping control/PIT
-  failures to `CONTROL_STATE_UNAVAILABLE` or `PIT_VISIBILITY_INVALID`.
+- FR-3: Promoted calendar PIT gate. A contract builder MUST select one verified R2-F4.1
+  calendar snapshot for the operation. The date MUST be a confirmed open session in that snapshot;
+  weekend, holiday, unknown year, conflict, missing generation or calendar identity drift MUST
+  make the contract unavailable or blocked with `CONTROL_STATE_UNAVAILABLE` or
+  `PIT_VISIBILITY_INVALID`.
 
-- FR-4: Promoted classification PIT gate. Implementation MUST select only a promoted classification
-  generation visible at the requested date; `requested_unverified` source semantics are never
-  authority and must stably block until reviewed evidence exists.
+- FR-4: Promoted classification PIT gate. The builder MUST select only a `promoted=true`
+  classification generation visible at `trade_date`, with `source_snapshot_date <= trade_date`
+  and `observed_at` no later than the declared PIT cutoff. It MUST preserve the selected
+  `classification_generation_id` and MUST NOT silently select a future or merely inserted,
+  degraded generation. A generation whose `source_date_semantics=requested_unverified` MUST NOT
+  be used as authority, even when its requested date equals `trade_date`; the builder MUST return
+  `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED` until a reviewed evidence mapping is available.
 
-- FR-5: Main-board base scope. Implementation MUST materialize and count/hash
-  `classification_evidence`, `effective_main_board` and `required_additions`, apply listing/type/
-  exchange rules, and never use 3,195/5,205 as a gate.
+- FR-5: Main-board base scope. Base members MUST be derived from the selected security master
+  using explicit identity rules: ordinary stock, SSE/SZSE, board `main`, and an effective listing
+  window containing `trade_date`. ChiNext, STAR, BSE, B shares, funds, ETFs, bonds, indexes and
+  other types MUST NOT enter the base set.
 
-- FR-6: Required user symbols. Implementation MUST invoke the UserStore-owned
-  `capture_required_symbol_snapshot_existing()` exactly once in one existing-connection transaction,
-  preserve valid out-of-base-board additions, and expose only private rows plus public count/hash.
+- FR-6: Required user symbols. The writer pipeline MUST invoke the UserStore-owned
+  `capture_required_symbol_snapshot_existing()` exactly once per operation; that API performs the
+  allowlisted positions/watchlists/items read in one SQLite transaction. It MUST normalize and
+  deduplicate the union, persist only a bounded snapshot hash/count plus the contract's member
+  roles, and MUST NOT read the private user database from a public GET. A valid A-share user symbol
+  outside main board (for example, an explicitly required ChiNext or STAR stock) MUST remain an
+  explicit member rather than being dropped.
 
-- FR-7: Required indexes. Implementation MUST include exactly `sh.000001` and `sz.399001`, each
-  with reviewed, date-valid, explicit `trading` evidence; suspended/unknown blocks and user
-  inclusion deduplicates.
+- FR-7: Required indexes. The contract MUST include exactly the current required market index
+  obligations `sh.000001` and `sz.399001` under `required_indexes`, with explicit reviewed
+  instrument evidence, source snapshot date at or before `trade_date`, identity mapping version,
+  and expected session state exactly `trading`. `suspended` or `unknown` for either required index
+  MUST block the contract. User inclusion of either symbol MUST deduplicate against this obligation.
+  No index may be inferred from a stock count.
 
-- FR-8: Instrument evidence binding. Implementation MUST require immutable reviewed
-  `InstrumentEvidenceV1` and semantic mapping identity for every member, and preserve the contract
-  `not_yet_listed` vocabulary without silently renaming legacy `not_listed_yet`.
+- FR-8: Instrument evidence binding. Every member MUST bind reviewed instrument evidence that
+  proves symbol, security type, exchange, board, listing window and source/date semantics. A
+  closed, versioned semantic mapping (`mapping_id`, `mapping_version`, accepted source values,
+  mapped state, and date/PIT rules) MUST be recorded as reviewed before it can establish authority.
+  The evidence identity MUST be retained as an ID/hash; raw provider payloads, credentials and
+  URLs MUST NOT be copied into public status or logs. The current BaoStock classification path is
+  `requested_unverified` and therefore can only produce a blocked result, not a qualified result;
+  this is a temporary qualification state, not a permanent claim that BaoStock is authoritative.
 
-- FR-9: Listing and delisting states. Implementation MUST derive versioned
-  `not_yet_listed`/`delisted` boundaries from the effective window; malformed, contradictory or
-  missing windows become `unknown` and block.
+- FR-9: Listing and delisting states. For each member, the builder MUST derive
+  `not_yet_listed` when `trade_date < list_date` and `delisted` when `trade_date >= delist_date`.
+  Missing, contradictory, malformed or out-of-envelope listing windows MUST derive `unknown` and
+  MUST block promotion. The new contract vocabulary `not_yet_listed` MUST NOT silently rename the
+  existing classification API exclusion reason `not_listed_yet`; a mapping is required at the
+  contract boundary.
 
-- FR-10: Suspension state. Implementation MUST use only reviewed explicit suspension/trading
-  semantics, never infer suspension from zero volume or missing bars, and reject unknown/conflicting
-  state.
+- FR-10: Suspension state. A member whose reviewed source explicitly says suspended for the
+  session MUST be `suspended`; a reviewed explicit trading state MUST be `trading`. The builder
+  MUST NOT infer suspension from zero volume, blank activity, missing bars or an unverified source
+  code. Missing or conflicting suspension semantics MUST be `unknown`.
 
-- FR-11: ST state. Implementation MUST retain ST state without removing members; critical unknowns
-  remain non-publishable, and protected predecessor behavior remains unchanged.
+- FR-11: ST state. The contract MUST retain `st_state` as `yes`, `no`, `not_applicable` or
+  `unknown`. ST MUST NOT remove a valid main-board member from scope. `unknown` MUST remain visible
+  and MUST NOT be coerced to `no`; a publishable candidate MUST have no unknown critical
+  instrument attribute, including ST, for members expected in the session.
 
-- FR-12: Closed expected-state vocabulary. Implementation MUST accept only
-  `trading`, `suspended`, `not_yet_listed`, `delisted` or `unknown`; all other values fail closed.
+- FR-12: Closed expected-state vocabulary. Every member MUST have exactly one
+  `expected_trading_state` in `trading`, `suspended`, `not_yet_listed`, `delisted` or `unknown`.
+  Any unknown or unrecognized value MUST fail closed; it MUST NOT be treated as trading, absent,
+  or a zero-row success.
 
-- FR-13: Deterministic count equation. Implementation MUST calculate
-  `total = trading + suspended + not_yet_listed + delisted + unknown`, unique-member total,
-  `critical_attribute_unknown_count` and `session_expected` from persisted contract members.
+- FR-13: Deterministic count equation. The contract MUST satisfy
+  `total = trading + suspended + not_yet_listed + delisted + unknown` over all stock and index
+  members, with `total` equal to the number of unique members. It MUST expose
+  `critical_attribute_unknown_count` separately. `session_expected = trading + suspended` is the
+  exact number of rows a candidate must contain. The equation MUST be calculated from the
+  contract, never from a hard-coded market count.
 
-- FR-14: Unknown-zero publication gate. Implementation MUST require
+- FR-14: Unknown-zero publication gate. A contract MAY be promoted only when
   `(unknown == 0 and critical_attribute_unknown_count == 0 and required_indexes_are_trading and
-  all source/date/hash checks pass)` plus loaded/session equality and no missing/extra/duplicate/
-  drift; `unknown=1` with matching loaded still rejects.
+  all source/date/hash checks pass)`. A candidate MAY publish only against a promoted contract
+  and only when `(loaded == session_expected and no_missing and no_extra and no_duplicate and
+  no_session_drift)`. Any nonzero unknown, including `unknown == 1` with otherwise matching
+  `loaded`, MUST reject promotion/publication and preserve the previous canonical pointer.
 
-- FR-15: Exact candidate set. Implementation MUST validate the complete existing
-  `ProviderRawBatch` before Normalize and require exactly the promoted contract's trading/suspended
-  symbols, including indexes; any missing or extra invalidates the whole candidate.
+- FR-15: Exact candidate set. For a candidate bound to a promoted contract, the expected row
+  set MUST be exactly the unique symbols whose state is `trading` or `suspended`, including all
+  required indexes. Rows for `not_yet_listed` or `delisted` members are not expected. A provider
+  response missing any expected symbol, or returning a row for any symbol outside the contract,
+  MUST invalidate the entire candidate.
 
-- FR-16: Extras and duplicates are errors. Implementation MUST reject duplicate symbols/session
-  points, board/index mismatches, non-contiguous pages and extras, never filter or silently repair
-  a candidate.
+- FR-16: Extras and duplicates are errors. Provider rows outside the contract are `universe
+  extras`, not ignorable data. Duplicate symbol rows, duplicate session points, mismatched board or
+  index identity, and an extra provider row MUST be rejected before normalization or publication.
 
-- FR-17: Whole-session purity. Implementation MUST require one BaoStock provider, adapter/contract
-  version and exact-session contract; symbol-level mixing, carry-forward, averaging and fallback
-  substitution are forbidden.
+- FR-17: Whole-session purity. A candidate MUST have one provider ID, one adapter/contract
+  version and one exact-session contract for the complete set. Symbol-level mixing, fallback rows,
+  averaging, carry-forward from an older date and silent provider substitution MUST NOT be allowed.
 
-- FR-18: Immutable sidecar authority. Implementation MUST add writer-only v1 SQLite initialization,
-  append-only contract/member/evidence rows, strict path/inode/schema/WAL checks and atomic head
-  publication; status MUST never repair or serve a cached last-verified head.
-- FR-19: Canonical identity. Implementation MUST use documented domain-separated canonical JSON
-  hashes with explicit null/false/zero/empty retention and digest exclusions for contract/member/
-  context/head/attempt projections.
-- FR-20: Read-only status. Implementation MUST add bounded API/CLI status with zero provider calls,
-  writes, initialization or migration, expose `provider_requests=0` and `writes=false`, and return
-  only the four proven discriminated states.
-- FR-21: Sanitized diagnostics. Implementation MUST expose only allowlisted reasons, counts, safe IDs
-  and hashes; payloads, private symbols, paths, SQL, URLs, tokens, exceptions and stacks are banned.
-- FR-22: Maintenance priority. Implementation MUST add only the lowest-priority post-success/non-run
-  hook, preserve `_plan_continuity` and refresh lock boundaries, and suppress work on repair/refresh
-  failure or lock contention.
-- FR-23: Classification maintenance trigger. Implementation MUST use
-  `market_universe_maintenance_interval_seconds` with durable UTC `finished_at` for the persisted
-  due calculation (an injected monotonic clock is only a same-tick guard), at most one six-endpoint
-  BaoStock fetch per trade-date/operation-day budget, durable dedup before request, and no same-key
-  retry after indeterminate execution.
-- FR-24: Legacy compatibility modes. Implementation MUST keep legacy BaoStock canonical behavior
-  unchanged in `off`, permit read-only legacy-only shadow comparison, and block enforce/production
-  non-off deterministically without a provider call or source switch.
-- FR-25: No authority widening. Implementation MUST exclude TickFlow, Tushare and every secondary
-  provider and leave R2-F2/R2-F3/R2-F4.0/R2-F4.1, Normalize, Quality Gate, Parquet, manifests and
-  pointers frozen.
-- FR-26: Safe migration path. Implementation MUST use staged writer-only sidecar bootstrap and
-  legacy shadow comparison with no v1 legacy migration, canonical reinterpretation, old-date
-  carry-forward or production switch.
-- FR-27: Frozen predecessor contracts. Implementation MUST prove protected predecessor hashes,
-  readers, defaults and behavior remain compatible; any breaking change requires a separately
-  reviewed contract.
+- FR-18: Immutable sidecar authority. The sidecar MUST use writer-only initialization and
+  append-only contract/member/evidence rows, a singleton head, strict path/inode checks and
+  atomic head publication. Existing promoted contracts MUST remain readable and immutable.
+  Missing, corrupt, locked, path-substituted or hash-inconsistent sidecar state MUST be unavailable,
+  not repaired by a GET.
+
+- FR-19: Canonical identity. Contract and member hashes MUST use a documented canonical JSON
+  encoding with sorted keys, no omitted null/false/zero/empty fields, a domain-separated SHA-256,
+  and explicit digest-field exclusion. A changed date, generation, evidence, required-symbol
+  snapshot, state or member set MUST change the contract identity.
+
+- FR-20: Read-only status. `GET /api/v1/market/universe` and the `market-universe` CLI MUST
+  return a bounded status for one requested date, perform zero provider requests, perform zero
+  database/Parquet/manifest/pointer/user-store writes, and never initialize or migrate the sidecar.
+  They MUST expose `provider_requests=0` and `writes=false`.
+
+- FR-21: Sanitized diagnostics. Public status, CLI output and operational logs MUST expose only
+  allowlisted reason codes, counts, safe IDs and hashes. They MUST NOT expose payload rows, user
+  symbol lists, local paths, SQL, URLs, tokens, raw provider exceptions or stack traces.
+
+- FR-22: Maintenance priority. Universe/classification maintenance MUST use the existing
+  one-shot automation orchestration and no sixth LaunchAgent or independent scheduler lane.
+  `_offer_universe_maintenance` is the one lowest-priority hook after all higher-priority
+  continuity/repair, refresh, post-publish and shadow work for that tick. R2-F4.2 MUST NOT claim
+  that every flow shares one lock: `_plan_continuity` and repair retain their existing boundary,
+  while the hook reacquires `RefreshRunLock` non-blocking. A maintenance failure MUST not erase the
+  previous head or cause an unbounded retry loop.
+
+- FR-23: Classification maintenance trigger. Existing classification/sync cadence and writer
+  contract remain unchanged. After higher-priority work, `_offer_universe_maintenance` MUST run at
+  most once per scheduler tick when no repair is active and no refresh is running, including a
+  non-freshness/holiday/weekend tick. A fresh canonical success supplies the sealed context after
+  post-publish and shadow; otherwise the hook uses only the last verified immutable context input
+  persisted in the Universe sidecar and performs bounded classification cadence/source-version
+  planning. It MUST preserve previous promoted generations and build/promote only after all PIT
+  and unknown-zero checks pass.
+
+- FR-24: Legacy compatibility modes. The legacy BaoStock `all-main-board` canonical path MUST
+  remain operational and unchanged in R2-F4.2. A contract integration MUST provide explicit
+  `off`, `shadow` and `enforce` reporting values, default to `off`. `shadow` MAY compare only the
+  legacy BaoStock set and report drift, but MUST NOT change the canonical result. Any `enforce`
+  execution request MUST return `BLOCKED_ENFORCE_NOT_ENABLED` immediately; there is no callable
+  provider seam in this subversion; no production configuration may invoke an enforce path.
+  The production profile MUST hard-fail any non-`off` Universe mode as
+  `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
+  available only to explicitly isolated offline/staging verification.
+
+- FR-25: No authority widening. R2-F4.2 MUST NOT add a secondary provider to canonical
+  `ProviderId`, change R2-F4.0 failover readiness, enable TickFlow/Tushare failover, change R2-F3
+  qualification, modify the promoted calendar semantics, or alter canonical normalization,
+  quality gates, Parquet, manifests or pointers.
+
+- FR-26: Safe migration path. The new sidecar MUST be populated from a staged writer-only
+  flow and compared against the legacy BaoStock observed set; enforce remains permanently blocked in
+  this subversion.
+  No migration may reinterpret an old canonical partition, use an old date as a new date, or
+  switch production by merely finding a sidecar file.
+
+- FR-27: Frozen predecessor contracts. R2-F2 golden evidence, R2-F3 Daily Bar shadow
+  qualification, R2-F4.0 capability shield and R2-F4.1 promoted calendar/runtime contracts MUST
+  remain byte/hash/behavior compatible at their protected surfaces. Any required breaking change
+  MUST be a separately reviewed contract, not an incidental Task 16 edit.
 
 ## Non-Functional Requirements
 
-- **NFR-1 — Offline-only:** The implementation and all acceptance tests MUST use local fixtures or
-  fakes that fail on unexpected network access. No real provider, production, NAS, deployment or
-  LaunchAgent operation is permitted.
+- **NFR-1 — Offline delivery boundary:** All R2-F4.2 implementation, tests and acceptance
+  evidence MUST use injected fakes or local fixtures. The delivery MUST contain zero real provider
+  requests, credential reads, production state access, NAS access, deployment or LaunchAgent run.
 
-- **NFR-2 — Read-only status:** Missing/corrupt/stale status reads MUST leave a fingerprinted
-  temporary control, market, user, staging and data tree unchanged, including parent directories.
+- **NFR-2 — Fail-closed default:** Missing, stale, ambiguous, unknown, malformed, tampered or
+  locked universe/classification/calendar state MUST result in `unavailable` or `blocked`; no
+  weekday, count, status, factor, suspension or symbol set may be guessed.
 
-- **NFR-3 — Atomic persistence:** A kill or injected failure at each sidecar insert/commit/head
-  boundary MUST yield the old valid head or an unavailable status, never a partial promoted
-  contract.
+- **NFR-3 — Read isolation:** The read-only API/CLI MUST leave a fingerprinted temporary control,
+  market, user, staging and data tree byte-for-byte unchanged, including when the sidecar is
+  missing or corrupt.
 
-- **NFR-4 — Deterministic output:** Identical frozen inputs MUST produce byte-identical members,
-  counts, status and SHA-256 values independent of set or dictionary order.
+- **NFR-4 — Atomicity and restart safety:** A process interruption at every sidecar write boundary
+  MUST leave either the prior valid head or a fully verifiable new head. A reader MUST never accept
+  a partially inserted contract as promoted authority.
 
-- **NFR-5 — Bounded work:** One status call MUST use one bounded sidecar read and zero provider
-  calls. The post-success Universe hook MUST perform at most one bounded classification/evidence
-  read, one UserStore snapshot and one sidecar promotion attempt; it MUST inherit existing
-  orchestration boundaries without widening `_plan_continuity` or refresh locking.
+- **NFR-5 — PIT integrity:** No record with source snapshot, observation or effective semantics
+  after the requested session may enter a contract. A contract must identify its PIT cutoff and
+  source-date semantics.
 
-- **NFR-6 — Privacy:** Public output MUST contain no user symbols, watchlist names, positions,
-  private DB paths, raw evidence or exception text; it MAY expose counts, safe IDs, hashes and
-  allowlisted reason codes.
+- **NFR-6 — Bounded public surface:** Status responses MUST contain at most 32 reason codes and
+  no member payloads or user symbol values. All IDs and hashes MUST match their safe-format
+  validators; diagnostics MUST be allowlisted.
 
-- **NFR-7 — Compatibility:** Existing public classification and market responses, legacy source
-  literals, normalization, quality gates, manifests, pointers and default scheduler behavior
-  MUST retain their current meaning when universe mode is `off`.
+- **NFR-7 — Bounded work:** A status read MUST use one sidecar snapshot and no provider call. A
+  maintenance tick MUST perform at most one classification acquisition and one contract promotion
+  attempt, and MUST respect the existing refresh lock and provider request budgets.
 
-- **NFR-8 — Traceability:** Each FR and edge case MUST have an offline regression or static
-  evidence entry in the final acceptance record. Focused/full pytest, Ruff, format, compile and
-  diff checks MUST pass before review.
+- **NFR-8 — Determinism:** Rebuilding the same frozen inputs MUST produce byte-identical contract,
+  member-count and hash outputs regardless of Python set/dictionary iteration order.
+
+- **NFR-9 — Privacy:** Required user symbols MAY exist only in private writer-owned evidence and
+  immutable local member rows. Public status/logging MUST expose count/hash/role aggregates only;
+  no positions, watchlist names or user-store paths may leak.
+
+- **NFR-10 — Compatibility:** Existing market/classification/failover/calendar APIs retain their
+  response meanings and defaults. New fields are additive, and legacy BaoStock readers remain
+  usable when no UniverseContract is available.
+
+- **NFR-11 — Test completeness:** Every FR and EC MUST map to an automated offline regression or a
+  documented static check. The focused suite, full repository suite, Ruff, format, compile and
+  diff checks MUST pass before independent review.
+
+- **NFR-12 — No false qualification:** A green status or a complete-looking count MUST NOT imply
+  provider qualification, secondary failover readiness, production enablement or Release 2 GO.
 
 ## Acceptance Criteria
 
 ### AC-1: Dynamic scope and identity (FR-1, FR-2, FR-13, FR-19)
 
-**Given** a clean baseline and the approved design, **When** implementation begins, **Then** the
-new module and sidecar schema are added without modifying protected predecessor bytes, and an
-interrupted transaction is read as old-head-or-unavailable after restart.
+**Given** two frozen security snapshots with different valid member sets and no fixed expected
+count, **When** contracts are built for the same session, **Then** each contract's total and hash
+are derived from its unique members and the hashes differ when the member set differs.
 
 ### AC-2: Confirmed calendar PIT (FR-2, FR-3, NFR-2, NFR-5)
 
-**Given** fake promoted calendar/classification generations with valid, future, degraded, unknown
-and conflicting variants, **When** a contract is built, **Then** only the valid visible generation
-with an explicit `exact_pit_cutoff` is accepted and every invalid or
-`requested_unverified` variant makes no provider request and no canonical write.
+**Given** a confirmed promoted calendar and a requested open session, **When** the builder pins one
+calendar snapshot, **Then** the contract binds its calendar generation/hash and accepts the date;
+**When** the date is weekend, holiday, unknown-year, conflicting or future, **Then** no contract is
+promoted and the result is `CALENDAR_UNAVAILABLE` or `CALENDAR_CONFLICT` with zero provider calls.
 
 ### AC-3: Promoted classification visibility (FR-4, FR-27, NFR-5)
 
-**Given** duplicate symbols across positions and all watchlists plus one valid out-of-base-board
-symbol, **When** the writer captures the allowlisted sources, **Then** one deterministic private
-snapshot and role map is produced; public status reveals only its count/hash, and a mid-capture
-change blocks the contract.
+**Given** a promoted generation visible at `trade_date`, a newer future generation and a degraded
+candidate, **When** the builder reads PIT classification, **Then** it binds only the visible
+promoted generation; a future/degraded-only store returns unavailable and never leaks its rows.
 
 ### AC-4: Main-board scope (FR-5, FR-27)
 
-**Given** changing main-board membership, excluded boards/types, and user data containing both
-required indexes, **When** the builder runs, **Then** the three layer counts/hashes are derived
-from unique members, the two indexes appear once each with explicit `trading` state and reviewed
-source/date/identity evidence, and no fixed count is used; suspended or unknown index evidence
-blocks the build.
+**Given** SSE/SZSE main-board stocks, ChiNext, STAR, BSE, B shares, funds, ETFs, bonds and index
+records, **When** the base set is derived, **Then** only effective SSE/SZSE ordinary main-board
+stocks enter the base set and every excluded record has a deterministic exclusion reason.
 
 ### AC-5: Listing and delisting (FR-9, FR-12, NFR-2)
 
-**Given** before-listing, listing-date, delisting-date, explicitly suspended, explicitly trading,
-ST and contradictory records, **When** states are derived, **Then** the new contract vocabulary is
-used exactly, ST remains an attribute, explicit suspension is honored, and critical ambiguity is
-`unknown` and non-promotable while the legacy classification spelling remains unchanged.
+**Given** securities before listing, on a listing date, on a delisting date and with contradictory
+listing windows, **When** expected states are derived, **Then** they are respectively
+`not_yet_listed`, an eligible state, `delisted` and `unknown`; the contradictory contract cannot
+be promoted. The API's legacy `not_listed_yet` spelling remains unchanged.
 
 ### AC-6: Suspension and ST truthfulness (FR-8, FR-10, FR-11, FR-12)
 
-**Given** one member in each state category and one critical unknown, **When** counts are
-validated, **Then** the equation and `session_expected` hold, `unknown > 0` blocks promotion and
-the old head remains unchanged; a fully resolved contract reports `unknown == 0`. **Given**
-`unknown=1` and `loaded=session_expected`, **When** publication is evaluated, **Then** it is
-rejected; **Given** `unknown=0` and `loaded != session_expected`, **Then** it is rejected.
+**Given** explicit reviewed trading, suspension, zero-volume, blank-activity and ST evidence,
+**When** the contract is built, **Then** only explicit suspension yields `suspended`, zero volume
+does not imply suspension, ST is retained without changing scope, and absent/conflicting critical
+attributes remain `unknown` rather than being guessed.
 
 ### AC-7: Required user symbols are preserved (FR-6, FR-9, FR-12, FR-21, NFR-9)
 
-**Given** a promoted contract, **When** a fake provider omits an expected row, returns an extra,
-duplicates a symbol, returns a non-session row or mixes provider IDs, **Then** the complete
-candidate is rejected before Normalize and the previous canonical pointer remains unchanged.
+**Given** positions and all watchlists containing duplicate main-board symbols, a valid non-main-
+board A-share, an unsupported BSE symbol and a symbol removed between reads, **When** the writer
+captures one allowlisted snapshot, **Then** valid symbols are deduplicated and retained with roles,
+unsupported/unstable symbols make the contract blocked, and public status exposes no symbol value.
 
 ### AC-8: Required indexes are explicit (FR-7, FR-8, FR-13, FR-15)
 
-**Given** a valid sidecar, **When** a member, hash, head, inode, mode, schema or lock is changed,
-**Then** the strict reader returns `unavailable` (it MUST NOT serve a historical cached projection)
-and never repairs state from a GET or accepts a partial contract.
+**Given** user data that also contains the two summary index symbols, **When** the contract is
+built, **Then** `required_indexes` contains exactly `sh.000001` and `sz.399001` once each, their
+instrument evidence is bound to a reviewed source/date/identity mapping, each index state is
+explicitly `trading`, and the candidate expected set contains each exactly once; a suspended or
+unknown index makes the contract blocked.
 
 ### AC-9: Count equation and unknown-zero gate (FR-12, FR-13, FR-14, NFR-2)
 
-**Given** a v1 sidecar with the exact DDL, schema digest, store identity, inode, WAL/full-sync
-settings and singleton head, **When** a writer commits rows and performs sequence/parent CAS,
-**Then** the strict reader verifies the full chain read-only; **Given** a legacy or unknown schema,
-**Then** writer-only initialization refuses migration and status is unavailable.
-
-All source-state, contract, evidence, required-snapshot, member, role-link and head-CAS writes MUST share one
-SQLite transaction. A failed CAS or crash rolls back the entire promotion; only old or fully
-verified new state is readable.
+**Given** members in every expected-state category and one unknown member, **When** counts are
+computed, **Then** `total = trading + suspended + not_yet_listed + delisted + unknown` and
+`session_expected = trading + suspended`; **When** `unknown` or critical-attribute-unknown is
+nonzero, **Then** promotion and publication are rejected and the prior pointer is preserved. **Given**
+`unknown=1` and `loaded=session_expected`, **When** publication eligibility is evaluated, **Then**
+it is rejected; **Given** `unknown=0` and `loaded != session_expected`, **Then** it is also rejected.
 
 ### AC-10: Evidence and generation binding (FR-2, FR-4, FR-8, FR-19)
 
-**Given** missing, valid, stale and corrupt sidecar roots, **When** the API or CLI status is
-requested, **Then** output contains zero provider requests and false writes, has no path/payload/
-symbol/token/exception text, and the complete filesystem fingerprint is unchanged.
+**Given** an instrument evidence object whose source/date/hash does not match the selected
+classification or requested session, **When** promotion is attempted, **Then** the entire contract
+is rejected with a sanitized lineage reason; matching evidence produces a deterministic identity.
+
+### AC-11: Exact candidate set (FR-14, FR-15, FR-16, FR-17)
+
+**Given** a promoted contract with trading and suspended members plus not-listed/delisted members,
+**When** a provider candidate omits one expected symbol, returns an extra, duplicates a symbol,
+returns a row for a non-session member or supplies rows from two providers, **Then** the complete
+candidate is invalidated before normalization/publication; no partial candidate is returned.
+
+### AC-12: Whole-session purity (FR-17, FR-25, NFR-12)
+
+**Given** a primary candidate missing one symbol and a secondary row for that symbol, **When** the
+selection seam is evaluated, **Then** it rejects symbol-level stitching, preserves the pointer and
+does not make any provider failover eligible.
+
+### AC-13: Immutable sidecar and restart (FR-18, FR-19, FR-26, NFR-4)
+
+**Given** a valid contract promotion, an interrupted write, a missing head, a changed member row,
+or a replaced database inode, **When** a reader reopens the sidecar, **Then** it returns the prior
+valid head only when it is still the atomically committed, fully verified on-disk head; any
+tampered/corrupt state returns `unavailable` (never a historical cached projection); writer recovery
+does not run from a public GET. Source-state, contract, evidence, required-snapshot, member,
+role-link and head CAS rows are committed in one SQLite transaction; an interrupted write or failed CAS rolls back the
+entire promotion, so readers see only the old head or a fully verified new head.
+
+### AC-14: Read-only status/API/CLI (FR-20, FR-21, NFR-3, NFR-6)
+
+**Given** missing, valid, stale and corrupt sidecar states, **When** `GET /api/v1/market/universe`
+or `market-universe` is invoked, **Then** it returns a bounded status with `provider_requests=0`
+and `writes=false`, performs no initialization/DDL/DML/user-store access, and omits paths,
+payloads, tokens, URLs, exceptions and symbol lists.
 
 **Given** a readable sidecar with a latest source-state row, an exact head whose source digest
 matches or differs, a durable blocking/indeterminate attempt, and an external classification or
@@ -255,15 +363,16 @@ calendar change that has not been persisted, **When** the API/CLI status is read
 only the sidecar row: it returns `ready`, `stale(UNIVERSE_SOURCE_VERSION_CHANGED)`, or
 `blocked` by the priority above, and the unpersisted external change is not discovered.
 
-### AC-11: Exact candidate set (FR-14, FR-15, FR-16, FR-17)
+### AC-15: Maintenance boundary (FR-22, FR-23, FR-27, NFR-7)
 
 **Given** the real `run_due_once` flow, **When** `_plan_continuity` reports repair/control work,
-**Then** its existing repair lease/lock and return behavior are unchanged and no Universe offer
-runs; **Given** a successful canonical refresh, **Then** existing post-publish and shadow hooks
-complete first and only then may one bounded `_offer_universe_maintenance` call run; **Given** a
-non-run tick with no active repair/error, **Then** that same lowest-priority call may use persisted
-sidecar context for cadence; **Given** canonical/repair work fails or a lock is busy, **Then** no
-provider request or independent lane is created.
+repair is active, refresh is running, or the refresh lock is busy, **Then** the existing boundary
+remains unchanged and no Universe hook runs; **Given** a successful freshness refresh, **Then**
+post-publish and shadow complete first and `_offer_universe_maintenance` runs once with the fresh
+context; **Given** the decision is non-run and no repair/error is active, **Then** the existing
+shadow boundary completes and the lowest-priority hook evaluates cadence using the persisted
+sidecar context, including weekend/non-freshness ticks. No independent lane or repeated provider
+request is created.
 
 **Given** `store.save_refresh` has succeeded and context construction, validation or holder sealing
 raises `RuntimeError`, **When** the callback exits, **Then** it records only a sealed-holder-
@@ -273,134 +382,103 @@ exactly-once consumer failure independently.
 The service, not the hook, consumes the fresh sealed context exactly once after post-publish and
 shadow and passes it as the hook's `context` argument.
 
-### AC-12: Whole-session purity (FR-17, FR-25, NFR-12)
-
-**Given** a previous valid classification/universe head and a fake provider, storage, clock or
-  CAS failure, **When** maintenance executes, **Then** the prior heads and canonical data remain
-  unchanged, the failure is sanitized, and repeated ticks do not create an unbounded request loop.
-
-### AC-13: Immutable sidecar and restart (FR-18, FR-19, FR-26, NFR-4)
-
-**Given** a legacy BaoStock refresh with a matching or divergent contract, **When** mode is `off`,
-**Then** legacy behavior and output are unchanged; **When** mode is `shadow`, **Then** only a
-read-only comparison of legacy BaoStock is recorded after canonical success; **When** mode is
-`enforce`, **Then** every execution returns `BLOCKED_ENFORCE_NOT_ENABLED`, performs no provider
-request and no source switch; **Given** a production profile with `shadow` or `enforce`, **Then**
-configuration is rejected as `BLOCKED_PRODUCTION_MODE_OFF` and legacy `off` behavior remains.
-
-### AC-14: Read-only status/API/CLI (FR-20, FR-21, NFR-3, NFR-6)
-
-**Given** the R2-F2 golden files, R2-F3 qualification evidence, R2-F4.0 frozen digest vectors and
-R2-F4.1 calendar/runtime fixtures, **When** all focused and full gates run, **Then** every protected
-hash, reader, default and behavior remains compatible.
-
-### AC-15: Maintenance boundary (FR-22, FR-23, FR-27, NFR-7)
-
-**Given** network-failing fakes and private temporary roots, **When** the implementation suite,
-strict spec validator, static checks and independent reviews run, **Then** no real provider,
-production, NAS, deployment or LaunchAgent state is accessed and every result is traceable to an
-FR/AC/EC.
-
 ### AC-16: Failed maintenance preserves prior authority (FR-18, FR-23, FR-26, NFR-4)
 
-**Given** continuity planning, freshness, repair, shadow and Universe/classification work are
-due, **When** the existing one-shot automation runs, **Then** `_plan_continuity` and its repair
-lock boundary remain first, `_execute_due` uses only its existing refresh lease, and no claim is
-made that all lanes share one lock; **Given** canonical refresh succeeds, **Then** existing
-post-publish and shadow offer complete before at most one `_offer_universe_maintenance` call;
-**Given** no canonical refresh is due and no repair/error is active, **Then** that call evaluates
-cadence from the immutable sidecar context, including weekend ticks; **Given** work fails or a
-lock is busy, **Then** it does not run. The hook reacquires the existing refresh lock non-blocking,
-then the sidecar lock, and durably records its dedup plan before any classification request; a
-duplicate plan is not retried.
+**Given** a previous promoted contract and a classification/instrument acquisition failure,
+**When** maintenance executes, **Then** the previous head and contract remain byte-identical, the
+failure is observable by an allowlisted reason, and no retry storm or canonical write occurs.
 
 ### AC-17: Legacy staged migration (FR-24, FR-26, FR-27, NFR-10)
 
-**Given** an accumulated existing `ProviderRawBatch` containing its existing endpoint/page rows
-with date/provider/refresh/session/request/endpoint/page and transport fields, **When** the
-`validate_provider_raw_batch(batch, contract)` runs only as an offline fixture pure function, **Then**
-duplicate, extra, missing, non-contiguous page, invalid `tradestatus`, illegal suspended
-placeholder and session-drift cases reject the entire batch before Normalize;
-`provider_id` other than `baostock` is rejected and no partial page is returned. Mode `off` does
-not call it; mode `shadow` observes after canonical success and cannot block canonical.
+**Given** a legacy BaoStock refresh and a matching or divergent exact contract, **When** mode is
+`off`, **Then** existing behavior is unchanged; **When** mode is `shadow`, **Then** the comparison
+is read-only and compares only legacy BaoStock; **When** mode is `enforce`, **Then** execution is
+immediately `BLOCKED_ENFORCE_NOT_ENABLED` (including non-production calls), with no provider
+request and no source switch.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
 
-**Given** R2-F2/R2-F3/R2-F4.0/R2-F4.1 protected fixtures at the baseline, **When** focused and
-full checks run, **Then** every protected hash, reader, default and behavior remains unchanged.
+**Given** R2-F2 golden objects, R2-F3 evidence/qualification files, R2-F4.0 digest vectors and
+R2-F4.1 calendar/runtime files at the baseline commit, **When** R2-F4.2 tests and static checks
+run, **Then** all protected hashes, readers, defaults and behavior remain unchanged.
 
 ### AC-19: Offline boundary (NFR-1, NFR-12)
 
-**Given** network-failing fakes and private temporary roots, **When** the implementation checks run,
-**Then** no provider, production, NAS, deployment or LaunchAgent state is accessed and zero-write
-fingerprints remain unchanged.
+**Given** fake providers that fail loudly on unexpected access and private temporary roots, **When**
+the focused and full suites run, **Then** all evidence is offline, no credential/environment
+secret is read, and no production/NAS/LaunchAgent state is touched.
 
 ### AC-20: Provider raw batch gate (FR-15, FR-16, FR-17, NFR-4)
 
-**Given** a complete existing raw batch, **When** the pure gate runs, **Then** request/endpoint/page/
-transport validation and exact-session checks finish before Normalize and reject any incomplete or
-mixed session.
+**Given** a complete existing `ProviderRawBatch` for BaoStock, **When** the pure
+`validate_provider_raw_batch(batch, contract)` is an offline fixture-only pure function that evaluates all endpoint
+pages, **Then** request/date/refresh/session/lineage, duplicate/extra/missing, page continuity and
+`tradestatus`/suspended-placeholder violations reject the whole batch before Normalize. `off` does
+not call the seam; `shadow` compares after canonical success and records drift without blocking.
 
 ## Edge Cases
 
-- EC-1: Calendar is missing, unknown, conflicting, locked, swapped or hash-invalid → no
-  provider call; status is unavailable with `CONTROL_STATE_UNAVAILABLE`,
-  `PIT_VISIBILITY_INVALID`, `CALENDAR_UNAVAILABLE` or `CALENDAR_CONFLICT`.
-- EC-2: Classification DB has no promoted PIT generation, only a future/degraded generation,
-  or changed snapshot during build → no contract promotion.
-- EC-3: Instrument evidence uses `requested_unverified` for a state that requires an observed
-  date → state is unknown; publication is blocked.
-- EC-4: Listing/delisting windows are absent, contradictory or malformed → unknown; no guessed
-  state or inferred end date.
-- EC-5: Suspension status is represented only by zero volume/blank activity → do not infer
-  suspended; existing quality gate handles the row.
-- EC-6: ST is missing or contradictory → `st_state=unknown`; never map it to `no`.
-- EC-7: User symbol is malformed, unsupported or changes between reads → block the complete
-  snapshot; do not drop it.
-- EC-8: User symbol duplicates an index or appears in multiple lists → one member and stable
-  roles, one count contribution.
-- EC-9: Required index evidence is missing, future-dated, identity-mismatched, suspended or
-  unknown → `REQUIRED_INDEX_NOT_TRADING`; the contract blocks and no index row is accepted.
-- EC-10: Provider returns an extra, missing, duplicate, not-listed, delisted or suspended row
-  contrary to the exact contract → reject the complete candidate.
-- EC-11: A candidate declares any provider other than BaoStock → reject whole-session purity; no
-  TickFlow/Tushare construction or symbol-level fallback is permitted.
-- EC-12: Sidecar fails after one table insert, commit, head update or inode replacement → old
-  head or unavailable after restart.
-- EC-13: Public GET is invoked on a missing sidecar → no directory/schema initialization and
-  no user-store access.
-- EC-14: Maintenance competes with freshness, repair, shadow or another process → priority and
-  existing lock defer it without duplicate provider work.
-- EC-15: A changed classification generation has lower quality or older effective date → old
-  promoted contract remains authoritative; a changed classification/source/mapping digest makes
-  it stale/non-publishable and due immediately, with `UNIVERSE_SOURCE_VERSION_CHANGED` until a
-  new verified contract exists.
-- EC-16: Configuration requests `enforce` or contains an unsafe mode → status is blocked and
-  legacy canonical behavior remains unchanged.
-- EC-17: A raw DAILY_ASTOCK row has missing/unknown `tradestatus`, an illegal suspended
+- EC-1: The requested date is a weekend, exchange holiday, unknown calendar year or calendar
+  conflict → return `CONTROL_STATE_UNAVAILABLE`, `PIT_VISIBILITY_INVALID`,
+  `CALENDAR_UNAVAILABLE` or `CALENDAR_CONFLICT`; do not query a provider.
+- EC-2: Calendar generation disappears, is locked, has a changed path/inode or fails hash
+  readback → return unavailable and do not fall back to bundled/stale calendar authority.
+- EC-3: No promoted classification generation is visible at the requested date → return
+  `CLASSIFICATION_UNAVAILABLE`; do not use a future or degraded generation.
+- EC-4: Classification source date or observation is after the PIT cutoff → reject the whole
+  contract as `PIT_VISIBILITY_INVALID`.
+- EC-5: Security master is empty, has duplicate natural identities, or references an unknown
+  security from an index/membership record → reject the contract.
+- EC-6: A listing date is missing, after a delisting date, or contains an invalid timezone/date
+  envelope → derive `unknown` and block publication.
+- EC-7: `daily_trade_status=0` appears without a reviewed source semantic saying it means
+  suspended → do not infer; derive `unknown`.
+- EC-8: A row has zero volume, blank amount, blank factor or no price but no explicit
+  suspension evidence → do not turn the row into `suspended`; let the existing quality gate fail.
+- EC-9: ST is absent or contradictory → retain `st_state=unknown`; do not relabel it `no` or
+  remove the member.
+- EC-10: A position/watchlist symbol is malformed, BSE, B share, fund, ETF, bond or index other
+  than the two required indexes → block the contract and expose only `REQUIRED_SYMBOL_INVALID`.
+- EC-11: UserStore changes during a capture → abort the snapshot and contract; never combine
+  two reads into a synthetic set.
+- EC-12: The same user symbol appears in positions and multiple watchlists → one member, stable
+  sorted roles, one count contribution.
+- EC-13: An index evidence object is absent, future-dated, identity-mismatched, suspended or
+  unknown → `REQUIRED_INDEX_NOT_TRADING`; the required-index obligation blocks publication.
+- EC-14: Provider returns a symbol outside the contract, including a valid but not-required
+  ChiNext/STAR/BSE symbol → reject as extras; do not filter it away.
+- EC-15: Provider omits a suspended row or returns a row for a not-yet-listed/delisted member
+  → reject the entire candidate; do not treat the omission/row as legal zero coverage. A changed
+  classification/source/mapping digest makes the old contract stale/non-publishable and due
+  immediately, with `UNIVERSE_SOURCE_VERSION_CHANGED` until a new verified contract exists.
+- EC-16: Duplicate symbol/session rows or conflicting rows from the same provider → reject
+  before Normalize; no first-row-wins behavior.
+- EC-17: Candidate contains BaoStock rows plus a TickFlow/Tushare row → reject whole-session
+  purity; no symbol-level failover.
+- EC-18: Sidecar transaction is interrupted after any contract/evidence/snapshot/member/link insert
+  but before head commit → reader sees prior head or unavailable, never a staged partial contract.
+- EC-19: Sidecar has a valid-looking row with a changed digest, extra table, unsafe mode,
+  symlink or replaced inode → strict reader returns unavailable; GET does not repair it.
+- EC-20: Classification maintenance fails after acquiring a candidate generation → preserve all
+  prior promoted generations/head and record a sanitized terminal reason.
+- EC-21: A universe maintenance tick races a freshness/repair/shadow task, or its configured
+  `lock_path` is `None` → existing nonblocking lock policy returns `DEFER` with
+  `CONTROL_STATE_UNAVAILABLE`; no provider request is duplicated.
+- EC-22: The legacy path has no sidecar contract or has a divergent shadow comparison → `off`
+  remains compatible, `shadow` reports drift, and `enforce` blocks rather than switching source.
+- EC-23: The raw DAILY_ASTOCK row has missing/unknown `tradestatus`, an illegal suspended
   placeholder or a state mismatch → `UNIVERSE_STATE_MISMATCH`; reject the whole batch before
   Normalize and retain the later Quality Gate.
-- EC-18: An attempt plan is absent, duplicated, terminal twice, or exceeds its request budget →
+- EC-24: An attempt plan is absent, duplicated, terminal twice, or exceeds its request budget →
   `UNIVERSE_SCHEMA_MISMATCH`; do not infer a previous success or resend a request.
-- EC-19: A semantic mapping row is altered, deleted, or has a digest mismatch → strict reader
-  returns `UNIVERSE_SCHEMA_MISMATCH` and no contract is promoted.
-- EC-20: Classification acquisition fails after a plan commit → prior promoted generation/head
-  remains authoritative and the terminal reason is durable; no second request is sent.
-- EC-21: A post-success hook races an existing refresh/repair operation, or its configured
-  `lock_path` is `None` → nonblocking lock acquisition returns `DEFER` with
-  `CONTROL_STATE_UNAVAILABLE` and zero provider requests.
-- EC-22: Legacy BaoStock lacks required ChiNext/STAR rows → shadow records `LEGACY_SHADOW_DRIFT`
-  only; canonical request and pointer remain unchanged.
-- EC-23: A raw state disagrees with contract or legal suspended placeholder → complete batch rejects
-  with `UNIVERSE_STATE_MISMATCH` before Normalize.
-- EC-24: A committed `RUNNING` attempt has no result after crash → reader derives
-  `ATTEMPT_INDETERMINATE` and does not retry on that operation day.
 
 ## API Contracts
 
-### API/CLI implementation contract
+### `GET /api/v1/market/universe?trade_date=YYYY-MM-DD`
 
-The implementation MUST expose the design's status shape without member payloads:
+This endpoint is read-only and status-only. It does not accept `execute`, provider, symbol, or
+source parameters. It reads an already-created strict sidecar snapshot and never opens the private
+user store or constructs a provider.
 
 ```typescript
 type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_SOURCE_VERSION_CHANGED" | "DATE_MISMATCH" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT" | "NONE";
@@ -448,40 +526,67 @@ interface UniverseStatusUnavailable extends UniverseStatusBase { status: "unavai
 type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | UniverseStatusBlocked | UniverseStatusUnavailable;
 ```
 
-`GET /api/v1/market/universe?trade_date=YYYY-MM-DD` and
-`stock-eva market-universe --date YYYY-MM-DD` use this projection. Unprovable sidecar state takes
-precedence as the independent HTTP `503`/CLI exit `3` control envelope; once readable, HTTP `422`
-and CLI exit `2` represent invalid date input before source/head projection; mode/configuration
-blocks remain HTTP 200. A verified head whose date differs from the requested date is HTTP `200`, `status=stale`,
-`reason_code=DATE_MISMATCH`, and exposes the requested date plus verified head source/count
-fields. A readable empty store with no head is HTTP 200 unavailable with
-`CONTROL_STATE_UNAVAILABLE`. Blocked/ready/stale are HTTP `200` (CLI exit `1`). If path, inode,
-schema, WAL, lock or hashes cannot be proven, the API returns independent HTTP `503`
-`UniverseControlError` envelope `{\"code\":\"universe_control_unavailable\"}`; this is not a
-`UniverseStatusResponse`. The CLI emits independent `CliUnavailableError` JSON
-`{\"code\":\"universe_unavailable\",\"reason_code\":\"CONTROL_STATE_UNAVAILABLE\"}`
-with exit `1` for a readable unavailable store, and the control-error envelope with exit `3` for
-unprovable storage. Neither operation initializes or migrates sidecar state.
+HTTP behavior:
 
-The public GET has one and only one current-source input: the latest verified
-`universe_source_state` row for the requested date, selected from the readable sidecar by
-`(verified_at,source_state_id)`. Its persisted `source_version_digest` is the source identity used
-below. GET MUST NOT read external classification, calendar, UserStore, provider or environment
-state, and therefore does not claim real-time discovery. A writer-verified change is invisible to
-GET until it is persisted as a new source-state row; this is intentional PIT snapshot semantics.
-If a non-empty head has no valid source-state row for its date, source authority is unprovable and
-the API/CLI uses the independent control-error boundary rather than guessing a current source.
+The public GET has one and only one current-source input: a verified `universe_source_state` row
+from the readable sidecar. The reader first verifies the sidecar and complete head chain. When a
+valid head exists for another date, it uses that head's linked source-state row and does not require
+a source-state row for the requested date. For an exact-date head, the head's linked source-state
+is the baseline. The reader selects the latest verified requested-date row by
+`(verified_at,source_state_id)` and considers it *newer* only when its ordering is strictly after
+the head-linked row; if no newer row exists, the head is ready only when its own persisted digest
+equals its own source-state digest. If a newer row exists, its digest is compared to the head
+digest; a differing digest is stale unless a corresponding durable failed/indeterminate attempt
+exists for the requested date and that newer digest, in which case it is blocked. With no head it
+consults only requested-date attempt rows. GET MUST NOT
+read external classification, calendar, UserStore, provider or environment state, and therefore
+does not claim real-time discovery. A writer-verified change is invisible to GET until it is
+persisted as a new source-state row; this is intentional PIT snapshot semantics. A required head
+source-state row that is missing or invalid is unprovable and uses the independent control-error
+boundary rather than guessing a current source.
 
-Status is a true discriminated union; both HTTP and CLI apply this priority: first an unprovable
-sidecar is the independent `UniverseControlError`/HTTP 503 envelope (never a status-union
-`unavailable`). Once the sidecar is proven readable, malformed or future input is HTTP 422. The
-reader then uses only the latest persisted source-state row: if that row has a durable blocking or
-indeterminate attempt with the requested date and that row's `source_version_digest`, status is
-`blocked` with its closed reason and all
-head-derived fields remain null. Otherwise, an exact-date verified head whose
-`source_version_digest` differs from that latest row is `stale` with
-`UNIVERSE_SOURCE_VERSION_CHANGED`; it returns the old head's complete safe counts/source fields
-and `publication_eligible=false`. An exact-date head whose source digest matches is `ready`.
+- The reader first proves the sidecar path/inode/schema/WAL/lock; failure is the independent HTTP
+  `503` control envelope. For a readable sidecar, malformed or future query input is HTTP `422`
+  before source/head projection. A valid head whose date differs from the requested valid date is
+  HTTP `200`, `status=stale`, and `reason_code=DATE_MISMATCH`; it includes the requested date plus
+  the verified head's safe source/count fields, never a requested-date projection. `ready` is
+  necessary but does not qualify a secondary provider or enable failover. A valid empty store with
+  no head is HTTP `200`, `status=unavailable`, with `reason_code=CONTROL_STATE_UNAVAILABLE`.
+- `503` is returned whenever sidecar path/inode/schema/hash/WAL/lock or storage state cannot be
+  proven safely as the independent `UniverseControlError` envelope
+  `{ \"code\": \"universe_control_unavailable\" }`; it contains no path or exception and is not a
+  `UniverseStatusResponse`. The CLI emits `CliUnavailableError`
+  `{ \"code\": \"universe_unavailable\", \"reason_code\": \"CONTROL_STATE_UNAVAILABLE\" }` with exit
+  `1` for a readable unavailable store, and the control-error envelope with exit `3` for
+  unprovable storage.
+
+The public GET has one and only one current-source input: a verified `universe_source_state` row
+from the readable sidecar. The reader first verifies the sidecar and complete head chain. When a
+valid head exists for another date, it uses that head's linked source-state row and does not require
+a source-state row for the requested date. For an exact-date head, the head's linked source-state
+is the baseline. The reader selects the latest verified requested-date row by
+`(verified_at,source_state_id)` and considers it *newer* only when its ordering is strictly after
+the head-linked row; if no newer row exists, the head is ready only when its own persisted digest
+equals its own source-state digest. If a newer row exists, its digest is compared to the head
+digest; a differing digest is stale unless a corresponding durable failed/indeterminate attempt
+exists for the requested date and that newer digest, in which case it is blocked. With no head it
+consults only requested-date attempt rows. GET MUST NOT
+read external classification, calendar, UserStore, provider or environment state, and therefore
+does not claim real-time discovery. A writer-verified change is invisible to GET until it is
+persisted as a new source-state row; this is intentional PIT snapshot semantics. A required head
+source-state row that is missing or invalid is unprovable and uses the independent control-error
+boundary rather than guessing a current source.
+
+Status is a true discriminated union; the following priority and nullability are normative for
+both HTTP and CLI. First, an unprovable sidecar is the independent `UniverseControlError`/HTTP 503
+envelope (never a status-union `unavailable`). Once the sidecar is proven readable, malformed or
+future input is HTTP 422. For an exact-date head, the reader compares the head-linked source-state
+with the latest requested-date source-state only when the latter is strictly newer. A corresponding
+durable failed or indeterminate attempt for that newer digest has priority and produces `blocked`
+with its closed reason and all head-derived fields null. Without that attempt, a differing newer
+digest produces `stale` with `UNIVERSE_SOURCE_VERSION_CHANGED` and the old head's complete safe
+counts/source fields; an absent newer row, or an equal digest, produces `ready`. An exact-date
+head whose own source-state cannot be verified is the independent control-error boundary.
 A valid head for another date is `stale` with `DATE_MISMATCH`. With no head and no durable attempt,
 the readable initialized store is `unavailable` (HTTP 200). A readable external control failure
 or terminal CAS result is `blocked` with `CONTROL_STATE_UNAVAILABLE` or
@@ -489,24 +594,20 @@ or terminal CAS result is `blocked` with `CONTROL_STATE_UNAVAILABLE` or
 reader may return a cached or “last verified” head. External changes not yet persisted by a writer
 cannot change this projection.
 
-Status field matrix (identical to the design and normative for the CLI):
+Status field matrix (also normative for the CLI):
 
 | Status | Condition | Nullable fields and source |
 |---|---|---|
-| `ready` | verified head exists, exact requested date and `head.source_version_digest == latest_source_state.source_version_digest` | contract/source-state IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
-| `stale` | exact-date verified head has a different latest persisted source digest, or a valid head has another date | source-digest mismatch returns the old head's complete safe fields and `UNIVERSE_SOURCE_VERSION_CHANGED`; date mismatch returns the same head fields with `DATE_MISMATCH`; publication is false and no requested-date projection is implied |
-| `blocked` | latest source state has a durable blocked/indeterminate attempt for requested date | every head-derived field is null (including when another-date head exists); reason is a `BlockedReason` from that durable attempt |
+| `ready` | verified head exists for the exact requested date, its linked source-state verifies, and no strictly newer requested-date source-state exists or the newest one has an equal digest | contract/source-state IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
+| `stale` | a strictly newer requested-date source-state has a different digest and no corresponding failed/indeterminate attempt, or a valid head has another date | source-digest mismatch returns the old head's complete safe fields and `UNIVERSE_SOURCE_VERSION_CHANGED`; date mismatch returns the same head fields with `DATE_MISMATCH`; publication is false and no requested-date projection is implied |
+| `blocked` | a strictly newer requested-date source-state has a corresponding durable failed/indeterminate attempt, or no head has a requested-date durable blocked/indeterminate attempt | every head-derived field is null (including when another-date head exists); reason is a `BlockedReason` from that durable attempt |
 | `unavailable` | readable store has no head and no durable blocked attempt | every head-derived field is null; reason is `CONTROL_STATE_UNAVAILABLE`; unprovable storage uses `UniverseControlError`, not this interface |
 
 The four interfaces above are the only public shapes. `Ready` and `Stale` carry verified head
 fields; `Blocked` and `Unavailable` carry null head fields. Implementations MUST NOT populate a
 nullable field outside its interface.
-`publication_eligible` means exactly `(unknown == 0 and critical_attribute_unknown_count == 0 and
-required_indexes_are_trading and all_evidence_checks_pass and (loaded is null or
-loaded == session_expected))`; candidate publication additionally requires
-`loaded == session_expected` with no missing/extra/duplicate/session-drift condition.
 
-Terminal-attempt/status mapping is deterministic and identical to the design (and CLI):
+Terminal-attempt/status mapping is deterministic (and identical for the CLI):
 
 | Persisted attempt state | Required condition | Public status/reason when no exact requested-date head exists | CLI result |
 |---|---|---|---|
@@ -520,7 +621,16 @@ a business `BlockedReason`; `unavailable` is reserved for an initialized, readab
 no head and no durable attempt (or an equivalent proven empty control state), and is HTTP 200/CLI
 exit `1`.
 
-### Internal writer/automation contract
+### `stock-eva market-universe --date YYYY-MM-DD`
+
+The CLI prints the same canonical JSON projection and has no `--execute` option. It exits `0` for
+`ready`, `1` for safe `unavailable`, `stale` or `blocked`, `2` for invalid date, and `3` for
+sidecar/storage-unverifiable (the HTTP-503 case). It must not initialize a missing control
+directory.
+
+### Internal writer contract
+
+The following are implementation interfaces, not public HTTP authority:
 
 ```typescript
 interface UniverseMaintenanceDecision {
@@ -712,6 +822,18 @@ this sidecar table only. Public GET never reads external classification, calenda
 provider state; changes are invisible until a writer verifies and persists a new row, preserving
 PIT snapshot semantics.
 
+The source-state reader parses `source_refs_json` as the exact `SourceRefsV1` object and checks, field
+by field, that its `provider_id`, `trade_date`, `source_version_digest`, `source_date_semantics`,
+classification metadata, calendar metadata, required-snapshot identity and evidence/mapping
+digests agree with the row and with the linked contract. `source_state_sha256` is recomputed from
+the exact preimage above; `source_state_id` must equal its first 32 lowercase characters. Rows are
+ordered by trusted UTC `verified_at`, with `source_state_id` as the deterministic tie-breaker.
+An identical `(trade_date,source_version_digest,source_refs_json)` hash is idempotent; a different
+hash is a new immutable row and never an update. A result may reference a source state only after
+this validation; a blocked/failed/indeterminate result may leave `source_state_id` null only when
+construction was impossible, while a succeeded result must reference a verified row. This
+nullable FK is the sole permitted optional source-state link.
+
 The builder MUST retain three separately accounted layers: (1) every unique promoted PIT
 `classification_evidence` identity, including excluded records; (2) the
 `effective_main_board` subset using `list_date <= trade_date < delist_date` (or no delist
@@ -776,7 +898,8 @@ Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha2
 itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
 refresh_id,request_budget,classification_max_attempts,created_at,attempt_status)`. `result_sha256`
 excludes only itself and includes `(attempt_id,terminal_status,classification_request_count,
-reason_code,finished_at)`. `created_at` and `finished_at` are UTC microsecond timestamps and are
+reason_code,source_state_id,finished_at)`, where `source_state_id` is null only before a source
+state can be constructed. `created_at` and `finished_at` are UTC microsecond timestamps and are
 not replaced by local time or wall-clock text. The required-symbol `snapshot_token` is the exact
 `domain_sha256("stock-eva/r2f4.2/user-rows/v1", {"schema_version":1,"user_rows":[sorted exact table/column/value rows]})`; its
 `snapshot_sha256` is the required-symbol projection hash over sorted `(symbol,scope_roles,
@@ -955,7 +1078,7 @@ CREATE TABLE universe_attempt (attempt_id TEXT PRIMARY KEY, dedup_key TEXT NOT N
 CREATE TABLE universe_attempt_result (attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
  terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
  classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
- reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE);
+ reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), source_state_id TEXT REFERENCES universe_source_state(source_state_id), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE);
 CREATE TABLE universe_head (singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
  sequence INTEGER NOT NULL, contract_id TEXT NOT NULL, contract_sha256 TEXT NOT NULL,
  head_sha256 TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -1060,9 +1183,18 @@ all payload/member/link/evidence hashes and parent chain in one read-only transa
 creates a directory, DDL, DML, WAL/SHM file or migration. A crash leaves the old head or no new
 state; corruption is `unavailable`, never a historical cached projection. It also validates
 one immutable `universe_attempt` plan per dedup key, at most one terminal result, and actual
-classification requests not exceeding one. A valid `RUNNING` plan without a result derives
-`blocked/ATTEMPT_INDETERMINATE`; only a missing/duplicate plan, altered plan/result hash or illegal
-state is `UNIVERSE_SCHEMA_MISMATCH`/unavailable.
+classification requests not exceeding one. A successful result MUST have a non-null
+`source_state_id` whose row and digest verify; blocked/deferred/failed or
+`ATTEMPT_INDETERMINATE` results may have null `source_state_id` only when no source state was
+constructible and remain bound to the immutable plan's source digest. A valid `RUNNING` plan
+without a result derives `blocked/ATTEMPT_INDETERMINATE`; only a missing/duplicate plan, altered
+plan/result hash or illegal state is `UNIVERSE_SCHEMA_MISMATCH`/unavailable.
+
+Result-state invariants are closed: `succeeded` requires `reason_code=NONE` and a verified non-null
+`source_state_id`; `ATTEMPT_INDETERMINATE` requires the same reason; `blocked`, `deferred` and
+`failed` require a non-`NONE` reason from the applicable mapping. A source-state FK on a non-success
+result is permitted only when the state was successfully constructed for that attempt and its
+provider/trade-date/source-version fields equal the immutable plan; otherwise it MUST be null.
 An initialized empty store with no head row is also `unavailable`; no historical cached status is
 retained.
 
@@ -1137,7 +1269,10 @@ basename collision, main/automation-CLI injection identity and zero-write status
    state. GET readers MUST avoid schema initialization.
 4. Add RED/GREEN tests for interrupted commit, head CAS, duplicate rows, digest mismatch,
    sidecar replacement, empty-head behavior, bidirectional link validation, safe-mode checks and
-   restart behavior.
+   restart behavior. Include source-state/result lifecycle regressions for nullable blocked
+   results, successful-result non-null enforcement, same-hash idempotence, verified-at tie
+   ordering, source-ref column equality and rollback of source-state/result/contract/head as one
+   transaction.
 
 ### Step 3 — PIT builder and evidence binding
 
@@ -1225,8 +1360,18 @@ basename collision, main/automation-CLI injection identity and zero-write status
    `market_universe_maintenance_interval_seconds`. A global ceiling permits only one classification fetch per
    `(trade_date,operation_day)`, so a version change cannot bypass same-day budget; the same key is
    never retried that day. `request_budget=1`, `classification_max_attempts=1`, and one immutable
-   terminal result. A
-   duplicate key is no-op/defer, not a resend; unqualified evidence records stable blocked with
+   terminal result. The lifecycle is strict: before any provider request, preflight computes the source digest from
+   the existing mapping/instrument/classification contract and the writer transaction inserts the
+   immutable attempt plan and occupies the `(trade_date,operation_day)` slot. After the six-call
+   fetch, validated classification evidence constructs `UniverseSourceStateV1`. If construction
+   fails before a source state exists, a second transaction preserves the attempt result with
+   `source_state_id=NULL` and no head change. If source state construction succeeds but contract
+   build fails, that state and the terminal result commit together without changing the head. Only
+   a successful contract commits source state, result, complete contract/evidence/member/link rows
+   and head CAS in one transaction. Duplicate identical source-state hash rows are idempotent;
+   `verified_at` ties are ordered by `source_state_id`, and every source-state column must equal the
+   validated `SourceRefsV1` provider/trade-date/digest fields.
+   A duplicate key is no-op/defer, not a resend; unqualified evidence records stable blocked with
    zero requests. The dedicated classification provider factory is constructed with
    `max_attempts=1`. In `backend/app/classification/provider.py`, implement
    `make_baostock_classification_provider` for this hook; each due attempt calls it once and it
@@ -1264,7 +1409,10 @@ basename collision, main/automation-CLI injection identity and zero-write status
    allowlist and hide paths/errors/symbols.
 3. Add `market-universe` to `backend/app/cli.py` with no `--execute` option and zero-write
    semantics. It reads no credentials and constructs no provider.
-4. Add route/CLI filesystem fingerprint tests for missing, valid, stale and corrupt states.
+4. Add route/CLI filesystem fingerprint tests for missing, valid, stale and corrupt states, plus
+   `test_status_source_state_order_and_date_matrix` covering exact-date head, no newer row/equal
+   digest (`ready`), newer differing digest (`stale`), matching failed/indeterminate attempt
+   (`blocked`), and another-date head (`DATE_MISMATCH`) without a requested-date source row.
 
 ### Step 7 — Compatibility documentation and no-migration rehearsal
 
@@ -1355,7 +1503,7 @@ remain identical):
 | duplicate expected row | `UNIVERSE_DUPLICATE_SYMBOL` | 200 blocked / 1 |
 | endpoint/page/session/request/date drift | `UNIVERSE_SESSION_DRIFT` | 200 blocked / 1 |
 | DAILY_ASTOCK `tradestatus` or suspended placeholder disagrees with contract | `UNIVERSE_STATE_MISMATCH` | 200 blocked / 1 |
-| classification snapshot, source version, semantic mapping or instrument-evidence digest changed since the head | `UNIVERSE_SOURCE_VERSION_CHANGED` | 200 blocked / 1 |
+| strictly newer requested-date source-state digest differs from the head, with no corresponding failed/indeterminate attempt | `UNIVERSE_SOURCE_VERSION_CHANGED` | 200 stale / 1; a matching failed/indeterminate attempt instead maps to blocked |
 | valid head trade date differs from requested date | `DATE_MISMATCH` | 200 stale / 1 |
 | sidecar path/inode/schema/hash/WAL/lock cannot be proven | `UNIVERSE_STORAGE_UNAVAILABLE` | 503 fixed body / 3 |
 | sidecar payload, partition, link, parent, head or attempt validation fails | `UNIVERSE_SCHEMA_MISMATCH` | 503 fixed body / 3 |
@@ -1386,50 +1534,50 @@ range notation is used for review evidence.
 
 | Companion ID | Implementation evidence anchor |
 |---|---|
-| AC-1 | Step 1/Step 2 sidecar schema and crash test |
-| AC-2 | Step 3 PIT fixture test |
-| AC-3 | Step 3 UserStore snapshot test |
-| AC-4 | Step 3 three-layer/count test |
-| AC-5 | Step 4 unknown-zero/loaded-match test |
-| AC-6 | Step 4 raw gate test |
-| AC-7 | Step 4 whole-session purity test |
-| AC-8 | Step 2 sidecar DDL/digest test |
-| AC-9 | Step 6 API/CLI zero-write test |
-| AC-10 | Step 5 post-success ordering test |
-| AC-11 | Step 6 stale/blocked status test |
-| AC-12 | Step 4 extras and symbol-stitching test |
-| AC-13 | Step 2 restart/inode test |
-| AC-14 | Step 6 filesystem fingerprint test |
-| AC-15 | Step 5 continuity/repair priority test |
-| AC-16 | Step 5 enforce blocked test |
-| AC-17 | Step 4 legacy shadow-only test |
-| AC-18 | Step 3 identity/listing-window test |
-| AC-19 | Step 3 semantic mapping/index evidence test |
-| AC-20 | Step 4 pre-Normalize aggregate test |
-| EC-1 | invalid input and storage read fixture |
-| EC-2 | PIT visibility fixture |
-| EC-3 | UserStore busy fixture |
-| EC-4 | listing/delisting fixture |
-| EC-5 | unknown-state fixture |
-| EC-6 | required-index evidence fixture |
-| EC-7 | duplicate identity fixture |
-| EC-8 | required-symbol validation fixture |
-| EC-9 | loaded mismatch fixture |
-| EC-10 | raw missing/extra fixture |
-| EC-11 | raw duplicate/session fixture |
-| EC-12 | CAS rollback fixture |
-| EC-13 | read-only missing-sidecar fixture |
-| EC-14 | lock priority fixture |
-| EC-15 | stale generation fixture |
-| EC-16 | enforce configuration fixture |
-| EC-17 | tradestatus/placeholder fixture |
-| EC-18 | attempt ledger fixture |
-| EC-19 | mapping registry immutability fixture |
-| EC-20 | classification failure preservation fixture |
-| EC-21 | post-success race fixture |
-| EC-22 | legacy shadow drift fixture |
-| EC-23 | raw state mismatch fixture |
-| EC-24 | indeterminate RUNNING-attempt fixture |
+| AC-1 | Step 1 dynamic-scope and contract-identity tests |
+| AC-2 | Step 3 confirmed-calendar/PIT visibility tests |
+| AC-3 | Step 3 promoted-classification/PIT tests |
+| AC-4 | Step 3 three-layer effective-main-board tests |
+| AC-5 | Step 3 listing/delisting boundary tests |
+| AC-6 | Step 3 suspension/ST/unknown-state tests |
+| AC-7 | Step 3 UserStore single-transaction/privacy tests |
+| AC-8 | Step 3 explicit index-evidence/trading-state tests |
+| AC-9 | Step 3 count-equation and unknown-zero/loaded-match tests |
+| AC-10 | Step 3 evidence/source/date binding tests |
+| AC-11 | Step 4 exact candidate-set gate tests |
+| AC-12 | Step 4 whole-session purity/no-stitching tests |
+| AC-13 | Step 2 immutable sidecar/restart/CAS and source-state/result lifecycle rollback tests |
+| AC-14 | Step 6 read-only API/CLI zero-write and source-state ordering/date-matrix tests (`test_status_source_state_order_and_date_matrix`) |
+| AC-15 | Step 5 post-success ordering/priority/callback isolation tests |
+| AC-16 | Step 5 failed-maintenance prior-head preservation tests |
+| AC-17 | Step 4 legacy off/shadow/enforce compatibility tests |
+| AC-18 | Step 8 protected predecessor hash/regression tests |
+| AC-19 | Step 8 offline fake/provider-boundary tests |
+| AC-20 | Step 4 pure pre-Normalize raw-batch aggregate tests |
+| EC-1 | Step 3 invalid-date/calendar fixture |
+| EC-2 | Step 2 calendar/sidecar path-inode strict-reader fixture |
+| EC-3 | Step 3 promoted-classification visibility fixture |
+| EC-4 | Step 3 PIT cutoff fixture |
+| EC-5 | Step 3 security-master identity fixture |
+| EC-6 | Step 3 listing-window fixture |
+| EC-7 | Step 3 reviewed trading/suspension mapping fixture |
+| EC-8 | Step 4 no-inferred-suspension raw-quality fixture |
+| EC-9 | Step 3 ST contradiction fixture |
+| EC-10 | Step 3 required-symbol validation fixture |
+| EC-11 | Step 3 UserStore mutation/rollback fixture |
+| EC-12 | Step 3 duplicate-role deduplication fixture |
+| EC-13 | Step 3 required-index evidence fixture |
+| EC-14 | Step 4 extra-row rejection fixture |
+| EC-15 | Step 4 omission/state and Step 5 source-digest fixture |
+| EC-16 | Step 4 duplicate/session-row fixture |
+| EC-17 | Step 4 mixed-provider purity fixture |
+| EC-18 | Step 2 interrupted atomic-promotion fixture |
+| EC-19 | Step 2 tampered sidecar/inode fixture |
+| EC-20 | Step 5 failed-maintenance preservation fixture |
+| EC-21 | Step 5 lock/race priority fixture |
+| EC-22 | Step 4 legacy mode/shadow-drift fixture |
+| EC-23 | Step 4 tradestatus/placeholder raw gate fixture |
+| EC-24 | Step 2/Step 5 attempt-ledger/hash/restart fixture |
 
 ### Mandatory individual FR evidence crosswalk
 

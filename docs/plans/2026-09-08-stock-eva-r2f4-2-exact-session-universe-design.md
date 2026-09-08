@@ -540,14 +540,22 @@ type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | Univer
 
 HTTP behavior:
 
-The public GET has one and only one current-source input: the latest verified
-`universe_source_state` row for the requested date, selected from the readable sidecar by
-`(verified_at,source_state_id)`. Its persisted `source_version_digest` is the source identity used
-below. GET MUST NOT read external classification, calendar, UserStore, provider or environment
-state, and therefore does not claim real-time discovery. A writer-verified change is invisible to
-GET until it is persisted as a new source-state row; this is intentional PIT snapshot semantics.
-If a non-empty head has no valid source-state row for its date, source authority is unprovable and
-the API/CLI uses the independent control-error boundary rather than guessing a current source.
+The public GET has one and only one current-source input: a verified `universe_source_state` row
+from the readable sidecar. The reader first verifies the sidecar and complete head chain. When a
+valid head exists for another date, it uses that head's linked source-state row and does not require
+a source-state row for the requested date. For an exact-date head, the head's linked source-state
+is the baseline. The reader selects the latest verified requested-date row by
+`(verified_at,source_state_id)` and considers it *newer* only when its ordering is strictly after
+the head-linked row; if no newer row exists, the head is ready only when its own persisted digest
+equals its own source-state digest. If a newer row exists, its digest is compared to the head
+digest; a differing digest is stale unless a corresponding durable failed/indeterminate attempt
+exists for the requested date and that newer digest, in which case it is blocked. With no head it
+consults only requested-date attempt rows. GET MUST NOT
+read external classification, calendar, UserStore, provider or environment state, and therefore
+does not claim real-time discovery. A writer-verified change is invisible to GET until it is
+persisted as a new source-state row; this is intentional PIT snapshot semantics. A required head
+source-state row that is missing or invalid is unprovable and uses the independent control-error
+boundary rather than guessing a current source.
 
 - The reader first proves the sidecar path/inode/schema/WAL/lock; failure is the independent HTTP
   `503` control envelope. For a readable sidecar, malformed or future query input is HTTP `422`
@@ -567,13 +575,13 @@ the API/CLI uses the independent control-error boundary rather than guessing a c
 Status is a true discriminated union; the following priority and nullability are normative for
 both HTTP and CLI. First, an unprovable sidecar is the independent `UniverseControlError`/HTTP 503
 envelope (never a status-union `unavailable`). Once the sidecar is proven readable, malformed or
-future input is HTTP 422. The reader then uses only the latest persisted source-state row: if that
-row has a durable blocking or indeterminate attempt with the requested date and that row's
-`source_version_digest`, status is `blocked`
-with its closed reason and all head-derived fields remain null. Otherwise, an exact-date verified
-head whose `source_version_digest` differs from that latest row is `stale` with
-`UNIVERSE_SOURCE_VERSION_CHANGED`; it returns the old head's complete safe counts/source fields
-and `publication_eligible=false`. An exact-date head whose source digest matches is `ready`.
+future input is HTTP 422. For an exact-date head, the reader compares the head-linked source-state
+with the latest requested-date source-state only when the latter is strictly newer. A corresponding
+durable failed or indeterminate attempt for that newer digest has priority and produces `blocked`
+with its closed reason and all head-derived fields null. Without that attempt, a differing newer
+digest produces `stale` with `UNIVERSE_SOURCE_VERSION_CHANGED` and the old head's complete safe
+counts/source fields; an absent newer row, or an equal digest, produces `ready`. An exact-date
+head whose own source-state cannot be verified is the independent control-error boundary.
 A valid head for another date is `stale` with `DATE_MISMATCH`. With no head and no durable attempt,
 the readable initialized store is `unavailable` (HTTP 200). A readable external control failure
 or terminal CAS result is `blocked` with `CONTROL_STATE_UNAVAILABLE` or
@@ -585,9 +593,9 @@ Status field matrix (also normative for the CLI):
 
 | Status | Condition | Nullable fields and source |
 |---|---|---|
-| `ready` | verified head exists, exact requested date and `head.source_version_digest == latest_source_state.source_version_digest` | contract/source-state IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
-| `stale` | exact-date verified head has a different latest persisted source digest, or a valid head has another date | source-digest mismatch returns the old head's complete safe fields and `UNIVERSE_SOURCE_VERSION_CHANGED`; date mismatch returns the same head fields with `DATE_MISMATCH`; publication is false and no requested-date projection is implied |
-| `blocked` | latest source state has a durable blocked/indeterminate attempt for requested date | every head-derived field is null (including when another-date head exists); reason is a `BlockedReason` from that durable attempt |
+| `ready` | verified head exists for the exact requested date, its linked source-state verifies, and no strictly newer requested-date source-state exists or the newest one has an equal digest | contract/source-state IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
+| `stale` | a strictly newer requested-date source-state has a different digest and no corresponding failed/indeterminate attempt, or a valid head has another date | source-digest mismatch returns the old head's complete safe fields and `UNIVERSE_SOURCE_VERSION_CHANGED`; date mismatch returns the same head fields with `DATE_MISMATCH`; publication is false and no requested-date projection is implied |
+| `blocked` | a strictly newer requested-date source-state has a corresponding durable failed/indeterminate attempt, or no head has a requested-date durable blocked/indeterminate attempt | every head-derived field is null (including when another-date head exists); reason is a `BlockedReason` from that durable attempt |
 | `unavailable` | readable store has no head and no durable blocked attempt | every head-derived field is null; reason is `CONTROL_STATE_UNAVAILABLE`; unprovable storage uses `UniverseControlError`, not this interface |
 
 The four interfaces above are the only public shapes. `Ready` and `Stale` carry verified head
@@ -907,6 +915,18 @@ only. This is the public GET's sole current-source input; it never reads classif
 UserStore or a provider directly. A source change is invisible to GET until a writer verifies and
 persists a new source-state row, preserving PIT snapshot semantics.
 
+The source-state reader parses `source_refs_json` as the exact `SourceRefsV1` object and checks, field
+by field, that its `provider_id`, `trade_date`, `source_version_digest`, `source_date_semantics`,
+classification metadata, calendar metadata, required-snapshot identity and evidence/mapping
+digests agree with the row and with the linked contract. `source_state_sha256` is recomputed from
+the exact preimage above; `source_state_id` must equal its first 32 lowercase characters. Rows are
+ordered by trusted UTC `verified_at`, with `source_state_id` as the deterministic tie-breaker.
+An identical `(trade_date,source_version_digest,source_refs_json)` hash is idempotent; a different
+hash is a new immutable row and never an update. A result may reference a source state only after
+this validation; a blocked/failed/indeterminate result may leave `source_state_id` null only when
+construction was impossible, while a succeeded result must reference a verified row. This
+nullable FK is the sole permitted optional source-state link.
+
 Each partition has an explicit JSON column and SHA-256 column in `universe_contract`, and the
 same IDs are present in `payload_json`. `universe_instrument_evidence` stores every classification
 record, including excluded records with a closed `exclusion_reason`; link rows identify its
@@ -973,7 +993,8 @@ Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha2
 itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
 refresh_id,request_budget,classification_max_attempts,created_at,attempt_status)`. `result_sha256`
 excludes only itself and includes `(attempt_id,terminal_status,classification_request_count,
-reason_code,finished_at)`. `created_at` and `finished_at` are UTC microsecond timestamps and are
+reason_code,source_state_id,finished_at)`, where `source_state_id` is null only before a source
+state can be constructed. `created_at` and `finished_at` are UTC microsecond timestamps and are
 not replaced by local time or wall-clock text. The required-symbol `snapshot_token` is the exact
 `domain_sha256("stock-eva/r2f4.2/user-rows/v1", {"schema_version":1,"user_rows":[sorted exact table/column/value rows]})`; its
 `snapshot_sha256` is the required-symbol projection hash over sorted `(symbol,scope_roles,
@@ -1249,7 +1270,7 @@ CREATE TABLE universe_attempt_result (
   attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
   terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
   classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
- reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
+ reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), source_state_id TEXT REFERENCES universe_source_state(source_state_id), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
 );
 CREATE TABLE universe_head (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -1358,10 +1379,19 @@ ID has exactly its role-set and existing evidence row, every link belongs to the
 one `contract_required_snapshot` link matches the payload snapshot/hash. It also verifies that
 each classification evidence row (including excluded rows) has a role-bearing link, every
 attempt dedup key has exactly one immutable plan and at most one immutable terminal result, and
-the recorded request count never exceeds the budget. A valid `RUNNING` plan without a result is
+the recorded request count never exceeds the budget. A successful result MUST have a non-null
+`source_state_id` whose row and digest verify; blocked/deferred/failed or
+`ATTEMPT_INDETERMINATE` results may have null `source_state_id` only when no source state was
+constructible and remain bound to the immutable plan's source digest. A valid `RUNNING` plan without a result is
 durable and derives `blocked/ATTEMPT_INDETERMINATE`; only a missing/duplicate plan, altered plan or
 result hash, or illegal state is `UNIVERSE_SCHEMA_MISMATCH`/unavailable. No cached prior success is
 inferred.
+
+Result-state invariants are closed: `succeeded` requires `reason_code=NONE` and a verified non-null
+`source_state_id`; `ATTEMPT_INDETERMINATE` requires the same reason; `blocked`, `deferred` and
+`failed` require a non-`NONE` reason from the applicable mapping. A source-state FK on a non-success
+result is permitted only when the state was successfully constructed for that attempt and its
+provider/trade-date/source-version fields equal the immutable plan; otherwise it MUST be null.
 
 Reachability is strict: every contract, member, evidence, role-link and required-snapshot row
 must be reachable from the current `universe_head` parent chain and verified in that chain. The
@@ -1519,7 +1549,18 @@ least the latest terminal `finished_at` plus the configured
 global ceiling is one classification fetch for each `(trade_date,operation_day)`, so a changed
 source version cannot bypass the same-day budget; the same key is never retried on that day. Budget and
 `classification_max_attempts` are both exactly 1. The terminal immutable result records status,
-reason and actual request count. A duplicate key is a no-op/defer, never a resend. If the current
+reason and actual request count. The lifecycle is strict: before any provider request, preflight
+computes the source digest from the existing mapping/instrument/classification contract and the
+writer transaction inserts the immutable attempt plan and occupies the `(trade_date,operation_day)`
+slot. After the six-call fetch, validated classification evidence constructs `UniverseSourceStateV1`.
+If construction fails before a source state exists, a second transaction preserves the attempt
+result with `source_state_id=NULL` and no head change. If source state construction succeeds but
+contract build fails, that state and the terminal result commit together without changing the head.
+Only a successful contract commits source state, result, complete contract/evidence/member/link
+rows and head CAS in one transaction. Duplicate identical source-state hash rows are idempotent;
+`verified_at` ties are ordered by `source_state_id`, and every source-state column must equal the
+validated `SourceRefsV1` provider/trade-date/digest fields.
+A duplicate key is a no-op/defer, never a resend. If the current
 classification evidence is unqualified, the hook records stable `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`
 with zero requests. `operation_day` is the `Asia/Shanghai` calendar date captured at attempt start
 and remains fixed across midnight. `planned_sha256` is the domain hash
@@ -1588,7 +1629,7 @@ The mapping is deterministic and closed:
 | duplicate expected row | `UNIVERSE_DUPLICATE_SYMBOL` | 200 blocked / 1 |
 | endpoint/page/session/request/date drift | `UNIVERSE_SESSION_DRIFT` | 200 blocked / 1 |
 | DAILY_ASTOCK `tradestatus` or suspended placeholder disagrees with contract | `UNIVERSE_STATE_MISMATCH` | 200 blocked / 1 |
-| classification snapshot, source version, semantic mapping or instrument-evidence digest changed since the head | `UNIVERSE_SOURCE_VERSION_CHANGED` | 200 blocked / 1 |
+| strictly newer requested-date source-state digest differs from the head, with no corresponding failed/indeterminate attempt | `UNIVERSE_SOURCE_VERSION_CHANGED` | 200 stale / 1; a matching failed/indeterminate attempt instead maps to blocked |
 | valid head trade date differs from requested date | `DATE_MISMATCH` | 200 stale / 1 |
 | sidecar path/inode/schema/hash/WAL/lock cannot be proven | `UNIVERSE_STORAGE_UNAVAILABLE` | 503 fixed body / 3 |
 | sidecar payload, partition, link, parent, head or attempt validation fails | `UNIVERSE_SCHEMA_MISMATCH` | 503 fixed body / 3 |
