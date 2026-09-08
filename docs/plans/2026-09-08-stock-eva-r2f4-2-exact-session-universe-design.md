@@ -451,8 +451,9 @@ not call the seam; `shadow` compares after canonical success and records drift w
   symlink or replaced inode → strict reader returns unavailable; GET does not repair it.
 - EC-20: Classification maintenance fails after acquiring a candidate generation → preserve all
   prior promoted generations/head and record a sanitized terminal reason.
-- EC-21: A universe maintenance tick races a freshness/repair/shadow task → existing lock and
-  priority policy prevent a second operation; no provider request is duplicated.
+- EC-21: A universe maintenance tick races a freshness/repair/shadow task, or its configured
+  `lock_path` is `None` → existing nonblocking lock policy returns `DEFER` with
+  `CONTROL_STATE_UNAVAILABLE`; no provider request is duplicated.
 - EC-22: The legacy path has no sidecar contract or has a divergent shadow comparison → `off`
   remains compatible, `shadow` reports drift, and `enforce` blocks rather than switching source.
 - EC-23: The raw DAILY_ASTOCK row has missing/unknown `tradestatus`, an illegal suspended
@@ -470,7 +471,7 @@ source parameters. It reads an already-created strict sidecar snapshot and never
 user store or constructs a provider.
 
 ```typescript
-type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_DATE_MISMATCH" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT";
+type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_DATE_MISMATCH" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT" | "NONE";
 interface UniverseStatusCounts { total: number; trading: number; suspended: number;
   not_yet_listed: number; delisted: number; unknown: number; session_expected: number;
   loaded: number | null; critical_attribute_unknown: number; }
@@ -579,7 +580,7 @@ interface UniversePostSuccessHook {
 
 interface UniverseHookResult {
   status: "PROMOTED" | "BLOCKED" | "DEFER";
-  reason_code: string | null;
+  reason_code: UniverseReasonCode | null;
   provider_requests: number;
   writes_canonical: false;
 }
@@ -593,21 +594,31 @@ interface UniversePublicationContext {
   status: "ready";
 }
 
-interface MarketStorePublicationReader {
-  read_publication_context(run_id: string, trade_date: string): UniversePublicationContext;
+interface PublicationContextSink {
+  publish_once(context: UniversePublicationContext): void;
+}
+interface PublicationContextHolder {
+  consume_once(run_id: string, trade_date: string): UniversePublicationContext | null;
+}
+interface CanonicalRefreshCallback {
+  publication_context_sink?: PublicationContextSink;
+  publication_context_holder?: PublicationContextHolder;
 }
 
-`MarketStore.read_publication_context(run_id, trade_date)` is an internal read-only method. In one
-SQLite read transaction it selects the published refresh and its `publication_lineage` JSON plus
-selection/evidence references, then strictly checks safe IDs, exact run/date, referenced digest
-and lineage hash. Missing, malformed, mismatched or unreadable rows return
-`CONTROL_STATE_UNAVAILABLE`; the method never writes, initializes, migrates, changes
-`RefreshResult`, or accepts caller-supplied manifest/evidence references.
+`canonical_refresh_callback` optionally receives a sealed one-shot holder only after
+`store.save_refresh` succeeds and evidence/selection validation still passes. The holder stores
+the safe `UniversePublicationContext` in process memory for one consume operation; a sink/holder
+failure is isolated and cannot turn an already-published canonical result into failure. After
+`_run_post_publish` and `_offer_shadow`, automation consumes it once by run/date and then asks the
+immutable CandidateStore bundle/readers to revalidate manifest/evidence refs and lineage digest.
+There is no `MarketStore` reader or new MarketStore schema/lineage dependency; a crash before
+consume leaves no Universe attempt/head and the next successful canonical refresh may offer again.
+An absent holder or sink is a bounded `CONTROL_STATE_UNAVAILABLE`/`DEFER`, never a canonical failure.
 
 interface UniverseMaintenanceDecision {
   priority_order: number | null;
   action: "run" | "defer" | "none";
-  reason_code: string | null;
+  reason_code: UniverseReasonCode | null;
   provider_requests: number;
   writes_canonical: false;
 }
@@ -615,7 +626,7 @@ interface UniverseMaintenanceDecision {
 interface UniverseBuildResult {
   status: "candidate" | "promoted" | "blocked" | "unavailable";
   contract: UniverseContract | null;
-  reason_code: string | null;
+  reason_code: UniverseReasonCode | null;
   provider_requests: number;
   writes_sidecar: boolean;
   writes_canonical: false;
@@ -630,21 +641,19 @@ interface UniverseCandidateGate {
   contract_sha256: string;
   provider_id: "baostock";
   refresh_id: string;
-  request_aggregates: Array<{request_id: string; trade_date: string; refresh_id: string;
-    provider_session_id: string; pages: number; batch_digest: string}>;
-  endpoint_aggregates: Array<{endpoint_id: string; request_id: string; pages: number;
-    row_count: number; batch_digest: string}>;
-  page_aggregates: Array<{endpoint_id: string; request_id: string; page: number;
-    row_count: number; page_digest: string}>;
-  batch_digest: string;
+  request_aggregates: Array<{plan_ordinal: number; request_id: string; provider_session_id: string;
+    final_outcome: string; successful_root_request_id: string | null; row_count: number;
+    observed_pages: number[]; completion_hash: string}>;
+  endpoint_aggregates: Array<{plan_ordinal: number; endpoint_id: string; schema_variant: string;
+    shard_id: string; observation_digest: string; row_count: number;
+    provider_row_order_digest: string}>;
+  page_aggregates: Array<{plan_ordinal: number; endpoint_id: string; page: number;
+    observation_digest: string}>;
+  transport_aggregate_digest: string;
+  universe_raw_projection_sha256: string;
   adapter_version: string;
-  observed_symbols: string[];
-  missing_symbols: string[];
-  extra_symbols: string[];
-  duplicate_symbols: string[];
-  session_drift: string[];
   result: "pass" | "reject";
-  reason_code: string | null;
+  reason_code: UniverseReasonCode | null;
 }
 ```
 
@@ -673,7 +682,7 @@ The pure function is exactly
 `validate_provider_raw_batch(batch: ProviderRawBatch, contract: UniverseContractV1) -> UniverseCandidateGate`.
 It first validates every existing `request_completion`, transport observation, request plan and
 endpoint/page lineage using the existing model validators, then aggregates each logical request,
-endpoint batch and page into deterministic tuples and a batch digest. Only after that does it bind
+endpoint batch and page into deterministic tuples and `universe_raw_projection_sha256`. Only after that does it bind
 provider=`baostock`, `request.trade_date`, `refresh_id`, `provider_session_id`,
 `request_id`, endpoint and the legacy request universe from existing model fields; no nonexistent
 contract/evidence field is demanded from `ProviderRawBatch`. It checks contiguous pages,
@@ -682,7 +691,21 @@ suspended placeholders and loaded count before returning a pass; no partial rows
 The loaded candidate is the union of `DAILY_ASTOCK` stock rows and `INDEX_HISTORY` index rows;
 `ALL_STOCK` contributes only an observed-universe cross-check, while factor endpoints contribute
 only control/factor-completeness observations and never rows. The result contains request-,
-endpoint- and page-aggregate tuples plus `batch_digest`, not a single endpoint/page scalar.
+endpoint- and page-aggregate tuples, the existing transport aggregate digest, and
+`universe_raw_projection_sha256`, not a single endpoint/page scalar.
+
+`universe_raw_projection_sha256` is the domain hash
+`stock-eva/r2f4.2/universe-raw-projection/v1` over canonical JSON containing only existing
+`ProviderRawBatch` fields: `provider_id`, complete `request`, adapter/endpoint-contract versions,
+UTC clocks, `request_plan_hash`, `completion_hash`, each endpoint batch's
+`(plan_ordinal,endpoint,schema_variant,shard_id,lineage.observation_digest,row_count,
+provider_row_order_digest)`, `RequestCompletion` fields `(plan_ordinal,attempts,successful_attempt,
+successful_root_request_id,final_outcome,row_count,observed_pages)` and nested attempt identity/
+digest fields,
+`transport_observations.aggregate_digest`, and endpoint summaries. Raw rows are bound by
+`provider_row_order_digest`; page identity is the existing `transport_lineage` tuple
+`(plan_ordinal,attempt,page,page_request_id,observation_digest)`. No `page_digest` or invented
+endpoint/batch digest is defined.
 The existing `run_canonical_raw_refresh(validate_batch=...)` callback is not a production enforce
 seam. Mode `off` MUST NOT call it. Mode `shadow` MUST NOT pass it into canonical refresh
 or block canonical: after successful canonical/evidence publish, a read-only observer compares
@@ -698,11 +721,10 @@ Quality Gate checks remain mandatory and are not replaced by this raw gate.
 
 The legacy callback `validate_universe` in the current automation remains wired exactly as-is in
 the canonical path; mode `off` is byte/behavior unchanged. The new pure gate is never supplied to
-that callback. In `shadow`, after canonical `ready`, the observer obtains a read-only
-`UniversePublicationContext` from `MarketStore.published_refresh` plus its
-`publication_lineage` and CandidateStore evidence references. It accepts the observation only when
-`run_id`, `trade_date`, manifest reference, evidence references and their lineage digest match the
-published readback; mismatch records `UNIVERSE_SESSION_DRIFT` and cannot block or mutate canonical.
+that callback. In `shadow`, after canonical `ready`, the observer consumes the sealed callback
+holder once and asks CandidateStore immutable bundle/readers to verify the manifest/evidence
+references and lineage digest against `run_id` and `trade_date`; mismatch records
+`UNIVERSE_SESSION_DRIFT` and cannot block or mutate canonical.
 
 ## Data Models
 
@@ -731,8 +753,11 @@ addition. Missing or contradictory windows produce `unknown`/blocked rather than
 `mapping_id`,
 `mapping_version`, `provider_id`, `source_schema`, accepted raw field/value identifiers, mapped
 `security_type`/board/listing/suspension/ST states, required source date semantics, and reviewer
-status exactly `reviewed` or `unqualified`. Only `reviewed` entries can establish authority, and
-the mapping version is included in evidence and contract hashes. A raw provider value not listed in
+status exactly `reviewed` or `unqualified`. `mapping_id` is the versioned unique identity
+`baostock-<source_schema>-<mapping_version>` (each component uses the safe identifier alphabet);
+the `mapping_id` and `mapping_version` columns MUST equal the same fields in `payload_json`, and
+the evidence values MUST equal the registry row. Only `reviewed` entries can establish authority,
+and the mapping version is included in evidence and contract hashes. A raw provider value not listed in
 the mapping is `unknown`; the implementation MUST NOT infer its meaning. The current BaoStock
 classification path (`query_all_stock` with `source_date_semantics=requested_unverified`) has no
 reviewed authority mapping in this release and therefore always yields
@@ -793,7 +818,8 @@ Each partition has an explicit JSON column and SHA-256 column in `universe_contr
 same IDs are present in `payload_json`. `universe_instrument_evidence` stores every classification
 record, including excluded records with a closed `exclusion_reason`; link rows identify its
 partition and member role. A strict reader verifies each evidence `mapping_id`, `mapping_version`
-and `mapping_sha256` against the immutable semantic registry, then recomputes each partition from persisted evidence/link
+and `mapping_sha256` against the immutable semantic registry (including the versioned `mapping_id`
+format and payload/column equality), then recomputes each partition from persisted evidence/link
 rows and `universe_member.scope_roles`, then compares count and hash. Missing excluded evidence,
 an invalid link, an ID in the wrong partition, or a partition that can only be reconstructed from
 the final member set is `UNIVERSE_SCHEMA_MISMATCH`.
@@ -842,9 +868,19 @@ no digest is an implied provider field.
 | `stock-eva/r2f4.2/semantic-mapping/v1` | canonical `universe_semantic_mapping.payload_json` plus mapping identity/version/provider/schema |
 | `stock-eva/r2f4.2/publication-lineage/v1` | existing `publication_lineage` selected fields and existing lineage digest computation; do not redefine raw payload |
 | `stock-eva/r2f4.2/universe-head/v1` | `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}` |
-| existing ProviderRawBatch aggregate domains | existing `ProviderRawBatch`/`RawEndpointBatch` `compute_*_sha256` fields for request, endpoint, page, transport and batch; R2-F4.2 references these hashes and does not redefine them |
+| `stock-eva/r2f4.2/universe-raw-projection/v1` | `ProviderRawBatch` projection of provider/request/version/UTC clock/plan/completion/endpoint/transport-summary fields; endpoint row content is bound by existing `provider_row_order_digest`, and page identity by existing lineage observation digests |
+| `stock-eva/r2f4.2/universe-source-version/v1` | sorted `{provider_id,adapter_version,endpoint_contract_version,classification_snapshot_sha256,semantic_mapping_sha256}`; this is `source_version_digest` and changes when source, mapping or selected classification snapshot changes |
 | `stock-eva/r2f4.2/universe-attempt-plan/v1` | complete immutable attempt key, source version, operation day, budget and hook identity |
 | `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
+
+Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha256` excludes only
+itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
+refresh_id,request_budget,classification_max_attempts,created_at,attempt_status)`. `result_sha256`
+excludes only itself and includes `(attempt_id,terminal_status,classification_request_count,
+reason_code,finished_at)`. The required-symbol `snapshot_token` is the exact
+`domain_sha256("stock-eva/r2f4.2/user-rows/v1", sorted_table_column_value_rows)`; its
+`snapshot_sha256` is the required-symbol projection hash over sorted `(symbol,scope_roles,
+snapshot_token)` and therefore proves which user-row token produced it.
 | `created_at` | UTC timestamp | Immutable, after all input observations |
 | `contract_sha256` | SHA-256 | Domain-separated digest excluding itself only |
 
@@ -1067,13 +1103,14 @@ CREATE TABLE universe_attempt (
   attempt_status TEXT NOT NULL CHECK (attempt_status = 'RUNNING'),
   request_budget INTEGER NOT NULL CHECK (request_budget = 1),
   classification_max_attempts INTEGER NOT NULL CHECK (classification_max_attempts = 1),
-  created_at TEXT NOT NULL, planned_sha256 TEXT NOT NULL UNIQUE
+  created_at TEXT NOT NULL, planned_sha256 TEXT NOT NULL UNIQUE,
+  UNIQUE (trade_date, operation_day)
 );
 CREATE TABLE universe_attempt_result (
   attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
   terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
   classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
-  reason_code TEXT NOT NULL, finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
+  reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
 );
 CREATE TABLE universe_head (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -1170,8 +1207,16 @@ ID has exactly its role-set and existing evidence row, every link belongs to the
 one `contract_required_snapshot` link matches the payload snapshot/hash. It also verifies that
 each classification evidence row (including excluded rows) has a role-bearing link, every
 attempt dedup key has exactly one immutable plan and at most one immutable terminal result, and
-the recorded request count never exceeds the budget. Missing or duplicate attempt state is
-`UNIVERSE_SCHEMA_MISMATCH`, never a cached prior success.
+the recorded request count never exceeds the budget. A valid `RUNNING` plan without a result is
+durable and derives `blocked/ATTEMPT_INDETERMINATE`; only a missing/duplicate plan, altered plan or
+result hash, or illegal state is `UNIVERSE_SCHEMA_MISMATCH`/unavailable. No cached prior success is
+inferred.
+
+Reachability is strict: every contract, member, evidence, role-link and required-snapshot row
+must be reachable from the current `universe_head` parent chain and verified in that chain. The
+semantic-mapping registry and attempt/attempt-result rows are explicit allowed global sets, not
+head-chain rows; every mapping payload/hash and every attempt key/plan/result reference is still
+validated, and any invalid global row makes the store unavailable.
 
 `head_preimage` is the canonical JSON object
 `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}`;
@@ -1251,17 +1296,25 @@ and Tushare are not candidates. This bounded choice preserves R2-F1, R2-F4.1 and
 
 `UniversePostSuccessHook.offer(canonical_result, run_id, trade_date, now)` is invoked only after
 canonical `ready`, post-publish completion, and the existing shadow offer have returned. The hook
-receives only `run_id` and `trade_date` as publication identity; it calls the new read-only
-`MarketStore.read_publication_context(run_id, trade_date)` in one transaction to obtain and verify
-manifest/evidence references. `main.py` constructs this hook and injects it into
-`MarketAutomationService`; `RefreshResult` is unchanged. It first reacquires the existing `RefreshRunLock` in
-non-blocking mode and then the exclusive sidecar lock; lock failure returns `DEFER` with
-`CONTROL_STATE_UNAVAILABLE` and makes no provider request. Under the sidecar lock it inserts the
+receives only `run_id` and `trade_date` as publication identity; it consumes the sealed callback
+holder once and revalidates refs through CandidateStore immutable readers. `main.py`
+constructs/injects the callback holder into `MarketAutomationService`; `RefreshResult` and
+MarketStore schema are unchanged. It first reacquires the existing `RefreshRunLock` in
+non-blocking mode and then the exclusive sidecar lock. A missing or `None` configured `lock_path`
+returns `DEFER` with `CONTROL_STATE_UNAVAILABLE` before any path synthesis or provider construction;
+any other lock failure also returns `DEFER` with `CONTROL_STATE_UNAVAILABLE` and makes no provider
+request. Under the sidecar lock it inserts the
 immutable `universe_attempt` plan before any classification request. The dedup lookup and plan
 insert occur in one `BEGIN IMMEDIATE` transaction and commit before the request; its deterministic
 `dedup_key` is the hash of `{trade_date, operation_day, canonical_run_id, source_version_digest}`;
-the hook is due only when no attempt has that key and either no exact contract exists or its
-classification snapshot digest, mapping hash or source-version digest changed. Budget and
+`source_version_digest` is the domain hash
+`stock-eva/r2f4.2/universe-source-version/v1` over the provider/adapter/endpoint-contract
+versions plus the exact classification snapshot and semantic-mapping digests. The hook is due
+only when no attempt has that key and either no exact contract exists, its
+classification snapshot digest/mapping hash/source-version digest changed, or at least 86400
+seconds elapsed since the latest terminal attempt for the same trade date/source digest. The
+global ceiling is one classification fetch for each `(trade_date,operation_day)`, so a changed
+source version cannot bypass the same-day budget; the same key is never retried on that day. Budget and
 `classification_max_attempts` are both exactly 1. The terminal immutable result records status,
 reason and actual request count. A duplicate key is a no-op/defer, never a resend. If the current
 classification evidence is unqualified, the hook records stable `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`
@@ -1270,11 +1323,18 @@ and remains fixed across midnight. `planned_sha256` is the domain hash
 `stock-eva/r2f4.2/universe-attempt-plan/v1` over the complete canonical plan preimage; result
 hashing uses `stock-eva/r2f4.2/universe-attempt-result/v1` over status, request count, closed
 reason and finish time. A dedicated classification provider factory is constructed with
-`max_attempts=1`; one budget unit is one logical `provider.fetch`, whose six logical calls are
+`max_attempts=1`. In `backend/app/classification/provider.py`, the hook MUST obtain that factory
+(`make_baostock_classification_provider`) for each due attempt; it MUST construct a fresh
+`BaoStockClassificationProvider`/`BaoStockProvider` with `client=None` and a new provider session,
+so it cannot share the canonical refresh session or a prior classification session. The factory
+MUST pass `max_attempts=1` through to the BaoStock session; consequently every one of the six data
+endpoints is attempted at most once within this fetch. One budget unit is one logical
+`provider.fetch`, whose six logical calls are
 `query_all_stock`, `query_stock_basic`, `query_stock_industry`, `query_hs300_stocks`,
 `query_sz50_stocks`, and `query_zz500_stocks` (login is transport setup, not a fetch unit). The
-logical acquisition budget is at most six fetch calls; actual endpoint/transport request counts
-are independently bounded and audited by the existing provider contract. A crash
+logical acquisition budget is exactly one `provider.fetch` comprising those six endpoint calls;
+actual endpoint/transport request counts are independently bounded and audited by the existing
+provider contract. A crash
 leaving `RUNNING` without a result is read as `ATTEMPT_INDETERMINATE`; it is not retried on the
 same operation day and is eligible only under the next Shanghai operation day key. The reader
 recomputes both hashes and treats absent, altered or duplicate result events as unavailable. No
