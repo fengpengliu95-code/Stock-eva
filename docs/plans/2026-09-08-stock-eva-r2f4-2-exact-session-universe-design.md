@@ -198,7 +198,7 @@ publisher; no direct production switch is part of R2-F4.2.
   remain operational and unchanged in R2-F4.2. A contract integration MUST provide explicit
   `off`, `shadow` and `enforce` reporting values, default to `off`. `shadow` MAY compare only the
   legacy BaoStock set and report drift, but MUST NOT change the canonical result. Any `enforce`
-  execution request MUST return `BLOCKED_ENFORCE_NOT_ENABLED` immediately; there is no callable
+  execution request MUST return `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) immediately; there is no callable
   provider seam in this subversion; no production configuration may invoke an enforce path.
   The production profile MUST hard-fail any non-`off` Universe mode as
   `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
@@ -219,8 +219,8 @@ apply Unicode whitespace trim and Unicode `casefold()` (no aliases, substring te
 variable enumeration), then map exactly `production` to `production`; exactly `development`,
 `test` or `staging` to `nonproduction`; any other value is an invalid profile and returns
 `CONTROL_STATE_UNAVAILABLE` before mode evaluation or provider construction. Thus only the first
-matrix row can produce `BLOCKED_PRODUCTION_MODE_OFF`, and only the second row can produce
-`BLOCKED_ENFORCE_NOT_ENABLED`; an invalid profile has neither production nor shadow authority.
+matrix row can produce `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), and only the second row can produce
+`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`); an invalid profile has neither production nor shadow authority.
 For compact notation, `B_P` means `BLOCKED_PRODUCTION_MODE_OFF` and `B_E` means
 `BLOCKED_ENFORCE_NOT_ENABLED`; production with any non-`off` mode is `B_P`, while nonproduction
 with `enforce` is `B_E`. No other profile/mode pair may emit either alias.
@@ -444,7 +444,7 @@ failure is observable by an allowlisted reason, and no retry storm or canonical 
 `off`, **Then** existing behavior is unchanged; **When** mode is `shadow`, **Then** the comparison
 is read-only, compares only legacy BaoStock and returns private diagnostic drift without blocking;
 **When** mode is `enforce`, **Then** execution is
-immediately `BLOCKED_ENFORCE_NOT_ENABLED` (including non-production calls), with no provider
+immediately `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) (including non-production calls), with no provider
 request and no source switch.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
@@ -586,6 +586,9 @@ type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | Univer
 
 HTTP behavior:
 
+Only lexical format validation occurs before store I/O; future-date semantic validation occurs
+after strict sidecar proof.
+
 The public GET has one and only one current-source input: a verified `universe_source_state` row
 from the readable sidecar. The pure date parser runs before I/O; for lexically valid input, the
 reader then verifies the sidecar and complete head chain. When a valid head exists for another date,
@@ -687,24 +690,41 @@ interface UniversePublicationContext {
   created_at: string;
 }
 
+interface CanonicalRefreshExecution {
+  result: RefreshResult;
+  legacy_shadow_input: LegacyPreflightSnapshot | null; // private, never serialized
+}
+
 class CanonicalRefreshCallable(Protocol) {
   _refresh_lock_held: boolean;
-  __call__(**kwargs: object): RefreshResult;
+  __call__(**kwargs: object): CanonicalRefreshExecution;
   consume_universe_publication_context(
     run_id: string, trade_date: string,
   ): UniversePublicationContext | null;
 }
 
-`CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; it owns
-the thread-safe bounded holder keyed by `(run_id, trade_date)`, with at most one sealed entry per
-refresh. The callback only builds and seals context. After a successful canonical result,
-`MarketAutomationService` performs exactly-once consume using
+`CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; its
+additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult` plus a
+private, stack-owned `legacy_shadow_input`. The callback freezes that input immediately before
+calling the existing builder, and includes it in both builder-success and builder-rejection
+results; one builder call therefore yields one wrapper and no provider retry. The service unwraps
+`execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the private input
+to `_offer_shadow`, and releases it in `finally`; neither the input nor raw symbols enter
+`AutomationOutcome`, logs, persistence or public output. The callback also owns the thread-safe
+bounded publication-context holder keyed by `(run_id, trade_date)`, with at most one sealed entry
+per refresh. After a successful canonical result, `MarketAutomationService` performs exactly-once consume using
 `consume_universe_publication_context(run_id, trade_date)` after post-publish and the existing
 shadow offer, then passes the consumed context to `UniversePostSuccessHook.offer`. The hook never
 consumes the holder. `main.py` and the automation CLI use the same factory to inject one callable
 and one hook; the read-only `market-universe` CLI uses the same settings/layout projection but
 constructs neither writer nor provider. A missing/non-callable consume method skips only Universe
 work and preserves the legacy result.
+The call order is fixed: (1) callback freezes `legacy_shadow_input`; (2) it calls the unchanged
+builder once; (3) it returns `CanonicalRefreshExecution`; (4) the service unwraps `result` and
+calls `_offer_shadow(prevalidation=legacy_shadow_input, ...)`; (5) the service releases the
+private input in `finally`; (6) only then does it continue the existing post-publish/Universe
+offer ordering. Snapshot-capture, observer, handoff or release exceptions are isolated and cannot
+replace the returned legacy result or trigger another provider request.
 
 In the canonical callback implementation, immediately after `store.save_refresh` returns success
 the code freezes `ready_result`. It then runs context construction and the holder seal in an
@@ -905,7 +925,7 @@ reconstructed from another layer's count.
 | Layer | Definition | Count/hash rule |
 |---|---|---|
 | `classification_evidence` | Every unique promoted PIT security identity and its reviewed instrument-evidence reference, including records later excluded from product scope | `classification_evidence_count` and `classification_evidence_sha256` hash sorted `(security_id,symbol,evidence_id,exclusion_reason)` identities; duplicate natural identities or unknown identity classification block |
-| `effective_main_board` | The subset whose closed identity is ordinary stock on SSE/SZSE, `board=main`, and `list_date <= trade_date` and (`delist_date is null` or `trade_date < delist_date`) | `effective_main_board_count` and `effective_main_board_sha256` hash sorted member projections, including state/evidence; no fixed count |
+| `effective_main_board` | The subset whose closed identity is ordinary stock on SSE/SZSE, `board=main`, and `list_date <= trade_date` and (`delist_date is null` or `trade_date < delist_date`) | `effective_main_board_count` and `effective_main_board_sha256` hash sorted complete member projections, including `expected_trading_state` and `instrument_evidence_id`; no fixed count |
 | `required_additions` | Valid A-share required-user symbols not already in `effective_main_board`, plus each required index only when its identity is not already in that base | `required_additions_count` and `required_additions_sha256` hash the sorted non-overlapping partition projection; index obligations remain explicit |
 
 The final member set is `effective_main_board ∪ required_additions`; these two partition identity
@@ -968,16 +988,16 @@ unique:
 | Partition | Contents and hash |
 |---|---|
 | `classification_evidence_ids` | All promoted PIT classification evidence identities, including excluded records; sorted IDs and `classification_evidence_sha256` over canonical `(security_id,symbol,evidence_id,exclusion_reason)` projections |
-| `effective_main_board_ids` | The effective ordinary SSE/SZSE main-board stock identities at `trade_date`; sorted security IDs and `effective_main_board_sha256` over complete member projections |
-| `required_additions_ids` | Sorted identities for valid required-user additions not already in the effective main-board set, plus the two required indexes; `required_additions_partition_sha256` over the canonical partition projection |
+| `effective_main_board_ids` | The effective ordinary SSE/SZSE main-board stock identities at `trade_date`; sorted complete `UniverseMemberV1` projections and `effective_main_board_sha256` |
+| `required_additions_ids` | Sorted complete `UniverseMemberV1` projections for valid required-user additions not already in the effective main-board set, plus the two required indexes; `required_additions_partition_sha256` |
 
 Partition hashes use separate domains and canonical projections: `classification_evidence_ids`
 hashes sorted `{security_id,symbol,evidence_id,exclusion_reason}` rows under
 `stock-eva/r2f4.2/universe-partition/classification-evidence/v1`; `effective_main_board_ids`
 hashes sorted complete security/member projections under
 `stock-eva/r2f4.2/universe-partition/effective-main-board/v1`; and
-`required_additions_ids` hashes sorted `{symbol,security_id,scope_roles,state,evidence_id}`
-projections under `stock-eva/r2f4.2/universe-partition/required-additions/v1`. The latter is
+`required_additions_ids` hashes sorted complete `UniverseMemberV1` projections (all fields except
+`member_sha256`) under `stock-eva/r2f4.2/universe-partition/required-additions/v1`. The latter is
 formed after removing every identity already in `effective_main_board`; required-index identities
 are likewise included at most once and remain explicit obligations even when already in the base.
 Original overlapping roles remain in
@@ -1089,8 +1109,8 @@ no digest is an implied provider field.
 | `stock-eva/r2f4.2/required-symbol-snapshot/v1` | exactly `{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`; this is `snapshot_sha256` |
 | `stock-eva/r2f4.2/universe-member/v1` | complete `UniverseMemberV1` JSON projection with `member_sha256` excluded; this is the member vector digest |
 | `stock-eva/r2f4.2/universe-partition/classification-evidence/v1` | sorted unique JSON rows `{security_id,symbol,evidence_id,exclusion_reason}` including excluded records |
-| `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique JSON rows `{security_id,symbol}` for the effective main-board base |
-| `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique JSON rows `{security_id,symbol,scope_roles,state,evidence_id}` after base-set subtraction |
+| `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique complete `UniverseMemberV1` JSON projections (excluding `member_sha256`) filtered to the effective main-board base |
+| `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique complete `UniverseMemberV1` JSON projections (excluding `member_sha256`) after base-set subtraction |
 
 Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha256` excludes only
 itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
@@ -1148,6 +1168,13 @@ across midnight.
 | `effective_from` / `effective_to` | date or null | Evaluated at `trade_date`; no future leakage |
 | `instrument_evidence_id` | safe ID | Must exist and hash-validate |
 | `member_sha256` | SHA-256 | Digest of the complete member projection excluding itself |
+
+The exact `member_preimage` is the JSON object of every row above except `member_sha256`, with
+sorted `scope_roles`, explicit null values and canonical key ordering. The vector fixture MUST
+include one effective main-board stock, one required user addition and the two required indexes,
+and MUST assert that changing any state, role, evidence identity, listing boundary or null changes
+the digest while reordering roles does not. The member digest is recomputed from `member_json` by
+the strict reader; no abbreviated symbol-only digest is valid.
 
 For `member_kind=index`, the only valid symbols are `sh.000001` and `sz.399001`; their evidence
 MUST be provider-observed (not `requested_unverified`), have `source_snapshot_date <= trade_date`,
@@ -1628,7 +1655,7 @@ the Universe sidecar and may perform classification cadence/source-version plann
 invent a new canonical publication context. It may read already-pinned calendar/classification
 evidence and capture the UserStore snapshot. Current BaoStock classification with
 `requested_unverified` evidence returns blocked without acquisition. `shadow` means legacy BaoStock
-only. `enforce` immediately returns `BLOCKED_ENFORCE_NOT_ENABLED`; TickFlow and Tushare are not
+only. `enforce` immediately returns `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`); TickFlow and Tushare are not
 candidates. This preserves R2-F1, R2-F4.1 and existing `_plan_continuity`/repair lock boundaries.
 
 `_offer_universe_maintenance(trade_date, now, context)` invokes
@@ -1753,8 +1780,8 @@ The mapping is deterministic and closed:
 | nonblocking refresh/control lock unavailable while the sidecar is readable | `CONTROL_STATE_UNAVAILABLE` | 200 blocked/defer / 1 |
 | sidecar head CAS conflict recorded as a terminal attempt | `UNIVERSE_HEAD_CAS_CONFLICT` | 200 blocked / 1 |
 | committed RUNNING attempt without a result on the same operation day | `ATTEMPT_INDETERMINATE` | 200 blocked / 1 |
-| mode `enforce` in nonproduction/staging execution | `BLOCKED_ENFORCE_NOT_ENABLED` | 200 blocked / 1 |
-| mode `shadow` or `enforce` in production profile | `BLOCKED_PRODUCTION_MODE_OFF` | 200 blocked / 1 |
+| mode `enforce` in nonproduction/staging execution | `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) | 200 blocked / 1 |
+| mode `shadow` or `enforce` in production profile | `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`) | 200 blocked / 1 |
 | BaoStock transport/protocol failure (`CONNECT_ERROR`, `SEND_ERROR`, `RECV_TIMEOUT`, `EOF`, `SHORT_HEADER`, `BAD_COMPRESSION`, `PROTOCOL_ERROR`, `PAGINATION_STALLED`, `RATE_LIMIT`, or unknown provider code) during acquisition | `CLASSIFICATION_UNAVAILABLE` | 200 blocked / 1 |
 | read-only legacy shadow differs, including missing ChiNext/STAR from legacy request | `LEGACY_SHADOW_DRIFT` | private diagnostic only; never a Universe blocked status or HTTP/CLI error |
 
@@ -1772,7 +1799,7 @@ internal variants but map to the control row above.
 | FR-14, FR-15, FR-16, FR-17 | AC-9, AC-11, AC-12; EC-10, EC-14, EC-15, EC-16, EC-17 | `test_unknown_one_and_loaded_match_reject`, `test_raw_batch_gate_rejects_extras_duplicates_drift` |
 | FR-18, FR-19, FR-26 | AC-13, AC-16; EC-18, EC-19, EC-20 | `test_sidecar_schema_digest_parent_chain_links_and_cas`; static DDL digest check |
 | FR-20, FR-21 | AC-14; EC-1, EC-2, EC-3, EC-13 | `tests/test_market_universe.py::test_status_zero_write`; filesystem fingerprint |
-| FR-22, FR-23 | AC-15, AC-16; EC-14, EC-20, EC-21 | `tests/test_market_automation.py::test_post_success_universe_offer_order`, `test_disabled_maintenance_zero_hook_write_requests` |
+| FR-22, FR-23 | AC-15, AC-16; EC-14, EC-20, EC-21 | `tests/test_market_automation.py::test_post_success_universe_offer_order`, `test_canonical_refresh_execution_carries_private_snapshot_on_builder_rejection`, `test_disabled_maintenance_zero_hook_write_requests` |
 | FR-24, FR-25 | AC-12, AC-17, AC-18; EC-11, EC-16, EC-22 | `tests/test_market_failover.py::test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols` and static provider allowlist (`baostock` only) |
 | FR-15, FR-16, FR-17 | AC-20; EC-23 | pure raw-batch gate fixtures for request/endpoint/page aggregation, state and whole-session rejection |
 | FR-18, FR-19, FR-23, FR-26 | AC-13, AC-16; EC-24 | sidecar attempt/hash/transaction rollback and strict-reader tests |

@@ -36,7 +36,7 @@ changing the existing canonical data chain.
 The implementation therefore proceeds as an additive sidecar and staged compatibility migration.
 The legacy BaoStock path remains the canonical path in `off` and `shadow` modes. `enforce` remains
 an enum value for status/configuration compatibility only: every execution request returns
-`BLOCKED_ENFORCE_NOT_ENABLED`, including tests, and there is no callable future-provider seam.
+`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`), including tests, and there is no callable future-provider seam.
 TickFlow and Tushare are excluded from this subversion.
 
 ## Functional Requirements
@@ -186,7 +186,7 @@ TickFlow and Tushare are excluded from this subversion.
   remain operational and unchanged in R2-F4.2. A contract integration MUST provide explicit
   `off`, `shadow` and `enforce` reporting values, default to `off`. `shadow` MAY compare only the
   legacy BaoStock set and report drift, but MUST NOT change the canonical result. Any `enforce`
-  execution request MUST return `BLOCKED_ENFORCE_NOT_ENABLED` immediately; there is no callable
+  execution request MUST return `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) immediately; there is no callable
   provider seam in this subversion; no production configuration may invoke an enforce path.
   The production profile MUST hard-fail any non-`off` Universe mode as
   `BLOCKED_PRODUCTION_MODE_OFF`, preserving the existing BaoStock canonical behavior; `shadow` is
@@ -207,8 +207,8 @@ apply Unicode whitespace trim and Unicode `casefold()` (no aliases, substring te
 variable enumeration), then map exactly `production` to `production`; exactly `development`,
 `test` or `staging` to `nonproduction`; any other value is an invalid profile and returns
 `CONTROL_STATE_UNAVAILABLE` before mode evaluation or provider construction. Thus only the first
-matrix row can produce `BLOCKED_PRODUCTION_MODE_OFF`, and only the second row can produce
-`BLOCKED_ENFORCE_NOT_ENABLED`; an invalid profile has neither production nor shadow authority.
+matrix row can produce `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), and only the second row can produce
+`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`); an invalid profile has neither production nor shadow authority.
 For compact notation, `B_P` means `BLOCKED_PRODUCTION_MODE_OFF` and `B_E` means
 `BLOCKED_ENFORCE_NOT_ENABLED`; production with any non-`off` mode is `B_P`, while nonproduction
 with `enforce` is `B_E`. No other profile/mode pair may emit either alias.
@@ -432,7 +432,7 @@ failure is observable by an allowlisted reason, and no retry storm or canonical 
 `off`, **Then** existing behavior is unchanged; **When** mode is `shadow`, **Then** the comparison
 is read-only, compares only legacy BaoStock and returns private diagnostic drift without blocking;
 **When** mode is `enforce`, **Then** execution is
-immediately `BLOCKED_ENFORCE_NOT_ENABLED` (including non-production calls), with no provider
+immediately `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) (including non-production calls), with no provider
 request and no source switch.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
@@ -574,6 +574,9 @@ type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | Univer
 
 HTTP behavior:
 
+Only lexical format validation occurs before store I/O; future-date semantic validation occurs
+after strict sidecar proof.
+
 The public GET has one and only one current-source input: a verified `universe_source_state` row
 from the readable sidecar. The pure date parser runs before I/O; for lexically valid input, the
 reader then verifies the sidecar and complete head chain. When a valid head exists for another date,
@@ -675,24 +678,41 @@ interface UniversePublicationContext {
   created_at: string;
 }
 
+interface CanonicalRefreshExecution {
+  result: RefreshResult;
+  legacy_shadow_input: LegacyPreflightSnapshot | null; // private, never serialized
+}
+
 class CanonicalRefreshCallable(Protocol) {
   _refresh_lock_held: boolean;
-  __call__(**kwargs: object): RefreshResult;
+  __call__(**kwargs: object): CanonicalRefreshExecution;
   consume_universe_publication_context(
     run_id: string, trade_date: string,
   ): UniversePublicationContext | null;
 }
 
-`CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; it owns
-the thread-safe bounded holder keyed by `(run_id, trade_date)`, with at most one sealed entry per
-refresh. The callback only builds and seals context. After a successful canonical result,
-`MarketAutomationService` performs exactly-once consume using
+`CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; its
+additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult` plus a
+private, stack-owned `legacy_shadow_input`. The callback freezes that input immediately before
+calling the existing builder, and includes it in both builder-success and builder-rejection
+results; one builder call therefore yields one wrapper and no provider retry. The service unwraps
+`execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the private input
+to `_offer_shadow`, and releases it in `finally`; neither the input nor raw symbols enter
+`AutomationOutcome`, logs, persistence or public output. The callback also owns the thread-safe
+bounded publication-context holder keyed by `(run_id, trade_date)`, with at most one sealed entry
+per refresh. After a successful canonical result, `MarketAutomationService` performs exactly-once consume using
 `consume_universe_publication_context(run_id, trade_date)` after post-publish and the existing
 shadow offer, then passes the consumed context to `UniversePostSuccessHook.offer`. The hook never
 consumes the holder. `main.py` and the automation CLI use the same factory to inject one callable
 and one hook; the read-only `market-universe` CLI uses the same settings/layout projection but
 constructs neither writer nor provider. A missing/non-callable consume method skips only Universe
 work and preserves the legacy result.
+The call order is fixed: (1) callback freezes `legacy_shadow_input`; (2) it calls the unchanged
+builder once; (3) it returns `CanonicalRefreshExecution`; (4) the service unwraps `result` and
+calls `_offer_shadow(prevalidation=legacy_shadow_input, ...)`; (5) the service releases the
+private input in `finally`; (6) only then does it continue the existing post-publish/Universe
+offer ordering. Snapshot-capture, observer, handoff or release exceptions are isolated and cannot
+replace the returned legacy result or trigger another provider request.
 
 In the canonical callback implementation, immediately after `store.save_refresh` returns success
 the code freezes `ready_result`. It then runs context construction and the holder seal in an
@@ -958,8 +978,9 @@ the strict reader; no abbreviated symbol-only digest is valid.
 
 Use the exact design domains/projections: classification evidence is sorted
 `{security_id,symbol,evidence_id,exclusion_reason}`; effective main-board is sorted complete
-security/member projections; required additions are sorted `{symbol,security_id,scope_roles,state,
-evidence_id}` after removing identities already in the effective main-board partition. Required
+security/member projections; effective main-board and required additions both hash sorted complete
+`UniverseMemberV1` projections (all fields except `member_sha256`) after applying their partition
+filter, with required additions removing identities already in the effective main-board partition. Required
 indexes are included at most once. Roles that overlap are retained only in `universe_member.scope_roles`,
 and each partition count is the length of its sorted unique projection.
 
@@ -1000,8 +1021,8 @@ Every digest is domain-separated and recomputable from persisted or existing mod
 | `stock-eva/r2f4.2/required-symbol-snapshot/v1` | exactly `{"schema_version":1,"snapshot_token":snapshot_token,"symbols":[sorted {symbol,roles}]}`; this is `snapshot_sha256` |
 | `stock-eva/r2f4.2/universe-member/v1` | complete `UniverseMemberV1` JSON projection with `member_sha256` excluded; this is the member vector digest |
 | `stock-eva/r2f4.2/universe-partition/classification-evidence/v1` | sorted unique JSON rows `{security_id,symbol,evidence_id,exclusion_reason}` including excluded records |
-| `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique JSON rows `{security_id,symbol}` for the effective main-board base |
-| `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique JSON rows `{security_id,symbol,scope_roles,state,evidence_id}` after base-set subtraction |
+| `stock-eva/r2f4.2/universe-partition/effective-main-board/v1` | sorted unique complete `UniverseMemberV1` JSON projections (excluding `member_sha256`) filtered to the effective main-board base |
+| `stock-eva/r2f4.2/universe-partition/required-additions/v1` | sorted unique complete `UniverseMemberV1` JSON projections (excluding `member_sha256`) after base-set subtraction |
 
 Plan/result preimages use strict UTC RFC-3339 timestamps with `Z`; `planned_sha256` excludes only
 itself and includes `(trade_date,operation_day,canonical_run_id,source_version_digest,hook_kind,
@@ -1424,7 +1445,7 @@ cannot emit `B_P` or `B_E`.
    legacy BaoStock counts/hash/reason and record drift without blocking or mutating canonical.
    Missing required ChiNext/STAR in the legacy request is drift only; do not change
    `build_canonical_raw_request`.
-4. Make `enforce` execution an unconditional `BLOCKED_ENFORCE_NOT_ENABLED` result (zero provider
+4. Make `enforce` execution an unconditional `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) result (zero provider
    requests). The callback is not an enforce seam in this release; no production path may route
    through it and no secondary provider is accepted.
 5. Add tests proving missing/extra/duplicate/non-session/mixed-provider batches, invalid
@@ -1637,8 +1658,8 @@ remain identical):
 | nonblocking refresh/control lock unavailable while the sidecar is readable | `CONTROL_STATE_UNAVAILABLE` | 200 blocked/defer / 1 |
 | sidecar head CAS conflict recorded as a terminal attempt | `UNIVERSE_HEAD_CAS_CONFLICT` | 200 blocked / 1 |
 | committed RUNNING attempt without a result on the same operation day | `ATTEMPT_INDETERMINATE` | 200 blocked / 1 |
-| mode `enforce` in nonproduction/staging execution | `BLOCKED_ENFORCE_NOT_ENABLED` | 200 blocked / 1 |
-| mode `shadow` or `enforce` in production profile | `BLOCKED_PRODUCTION_MODE_OFF` | 200 blocked / 1 |
+| mode `enforce` in nonproduction/staging execution | `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`) | 200 blocked / 1 |
+| mode `shadow` or `enforce` in production profile | `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`) | 200 blocked / 1 |
 | BaoStock transport/protocol failure (`CONNECT_ERROR`, `SEND_ERROR`, `RECV_TIMEOUT`, `EOF`, `SHORT_HEADER`, `BAD_COMPRESSION`, `PROTOCOL_ERROR`, `PAGINATION_STALLED`, `RATE_LIMIT`, or unknown provider code) during acquisition | `CLASSIFICATION_UNAVAILABLE` | 200 blocked / 1 |
 | read-only legacy shadow differs, including missing ChiNext/STAR from legacy request | `LEGACY_SHADOW_DRIFT` | private diagnostic only; never a Universe blocked status or HTTP/CLI error |
 
@@ -1675,7 +1696,7 @@ range notation is used for review evidence.
 | AC-12 | Step 4 whole-session purity/no-stitching tests |
 | AC-13 | Step 2 immutable sidecar/restart/CAS and source-state/result lifecycle rollback tests (`test_source_state_identity_excludes_verified_at`, `test_source_state_result_transaction_rollback`) |
 | AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and split parse/future tests (`test_status_source_state_order_and_date_matrix`, `test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
-| AC-15 | Step 5 post-success ordering/priority/callback isolation and `test_disabled_maintenance_zero_hook_write_requests` |
+| AC-15 | Step 5 post-success ordering/priority/callback isolation, `test_canonical_refresh_execution_carries_private_snapshot_on_builder_rejection` and `test_disabled_maintenance_zero_hook_write_requests` |
 | AC-16 | Step 5 failed-maintenance prior-head preservation tests |
 | AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer/privacy tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols`) |
 | AC-18 | Step 8 protected predecessor hash/regression tests |
