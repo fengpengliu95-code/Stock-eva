@@ -57,7 +57,7 @@ TickFlow and Tushare are excluded from this subversion.
   failures to `CONTROL_STATE_UNAVAILABLE` or `PIT_VISIBILITY_INVALID`.
 
 - FR-4: Capture required symbols once. Implementation MUST invoke the UserStore-owned
-  `capture_required_symbol_snapshot_once` once, whose single SQLite transaction reads positions,
+  `capture_required_symbol_snapshot_existing()` once, whose single SQLite transaction reads positions,
   watchlists and items, deduplicates deterministically, binds roles and hashes the snapshot.
   Public reads MUST NOT open the user database.
 
@@ -105,13 +105,13 @@ TickFlow and Tushare are excluded from this subversion.
   may unblock it without changing this release's frozen canonical path.
 
 - FR-14: User snapshot transaction. Implementation MUST add a writer-only single-transaction
-  `capture_required_symbol_snapshot_once(operation_id)` returning symbols privately plus
-  `user_store_revision` and `snapshot_token`; a revision/token change before commit MUST abort
-  with `USER_SNAPSHOT_CHANGED`. Public status MUST expose only count/hash.
+  `capture_required_symbol_snapshot_existing()` using one existing connection and `BEGIN IMMEDIATE`;
+  it returns symbols privately and the canonical snapshot token hash. Busy/unavailable/schema/hash
+  failure MUST rollback as `USER_STORE_UNAVAILABLE`. Public status MUST expose only count/hash.
 
 - FR-15: Exact raw-batch gate. Implementation MUST validate the complete existing
   `ProviderRawBatch` and its `RawEndpointBatch` pages carrying date/provider/refresh/session/
-  request/evidence/endpoint/page metadata before any Normalize call. It MUST reject duplicate,
+  request/endpoint/page and transport fields before any Normalize call. It MUST reject duplicate,
   extra, missing, non-contiguous-page and session-drift conditions as a whole batch, with provider
   allowlist exactly `baostock`.
 
@@ -224,8 +224,8 @@ settings and singleton head, **When** a writer commits rows and performs sequenc
 **Then** writer-only initialization refuses migration and status is unavailable.
 
 All contract, evidence, required-snapshot, member, role-link and head-CAS writes MUST share one
-SQLite transaction. A failed CAS or crash rolls back all of them; no unreachable contract rows,
-orphan links or sequence can be committed.
+SQLite transaction. A failed CAS or crash rolls back the entire promotion; only old or fully
+verified new state is readable.
 
 ### AC-9: Read-only API and CLI (FR-10, FR-12, NFR-2, NFR-6)
 
@@ -247,7 +247,7 @@ fails, **Then** no independent Universe lane or repeated provider request is cre
   CAS failure, **When** maintenance executes, **Then** the prior heads and canonical data remain
   unchanged, the failure is sanitized, and repeated ticks do not create an unbounded request loop.
 
-### AC-12: Legacy migration modes (FR-8, FR-11, NFR-7)
+### AC-12: Legacy compatibility modes (FR-8, FR-11, NFR-7)
 
 **Given** a legacy BaoStock refresh with a matching or divergent contract, **When** mode is `off`,
 **Then** legacy behavior and output are unchanged; **When** mode is `shadow`, **Then** only a
@@ -284,12 +284,24 @@ plan is not retried.
 ### AC-16: Pre-Normalize raw interface (FR-15, NFR-4)
 
 **Given** an accumulated existing `ProviderRawBatch` containing `RawEndpointBatch` rows with
-date/provider/refresh/session/request/evidence/endpoint/page metadata, **When** the
-`validate_provider_raw_batch(batch, contract)` runs in the offline/future enforce seam, **Then**
+date/provider/refresh/session/request/endpoint/page and transport fields, **When** the
+`validate_provider_raw_batch(batch, contract)` runs only as an offline fixture pure function, **Then**
 duplicate, extra, missing, non-contiguous page, invalid `tradestatus`, illegal suspended
 placeholder and session-drift cases reject the entire batch before Normalize;
 `provider_id` other than `baostock` is rejected and no partial page is returned. Mode `off` does
 not call it; mode `shadow` observes after canonical success and cannot block canonical.
+
+### Companion acceptance criteria AC-17 through AC-20
+
+- AC-17 (FR-8, FR-11): **Given** legacy `off` and `shadow`, **When** the existing refresh runs,
+  **Then** canonical behavior is byte/behavior unchanged and shadow is read-only.
+- AC-18 (FR-6, FR-19): **Given** listing windows or identity mappings change, **When** the builder
+  derives members, **Then** state and hashes change deterministically or block on unknown.
+- AC-19 (NFR-1, NFR-2): **Given** any fixture or fake, **When** status/build tests run, **Then** no
+  provider, production, NAS or network access occurs and zero-write fingerprints remain unchanged.
+- AC-20 (FR-15, FR-16): **Given** a complete existing raw batch, **When** the pure gate runs,
+  **Then** request/endpoint/page/transport validation and exact-session checks finish before
+  Normalize and reject any incomplete or mixed session.
 
 ## Edge Cases
 
@@ -330,6 +342,18 @@ not call it; mode `shadow` observes after canonical success and cannot block can
   Normalize and retain the later Quality Gate.
 - EC-18: An attempt plan is absent, duplicated, terminal twice, or exceeds its request budget →
   `UNIVERSE_SCHEMA_MISMATCH`; do not infer a previous success or resend a request.
+- EC-19: A semantic mapping row is altered, deleted, or has a digest mismatch → strict reader
+  returns `UNIVERSE_SCHEMA_MISMATCH` and no contract is promoted.
+- EC-20: Classification acquisition fails after a plan commit → prior promoted generation/head
+  remains authoritative and the terminal reason is durable; no second request is sent.
+- EC-21: A post-success hook races an existing refresh/repair operation → nonblocking lock
+  acquisition returns `DEFER` with `CONTROL_STATE_UNAVAILABLE` and zero provider requests.
+- EC-22: Legacy BaoStock lacks required ChiNext/STAR rows → shadow records `LEGACY_SHADOW_DRIFT`
+  only; canonical request and pointer remain unchanged.
+- EC-23: A raw state disagrees with contract or legal suspended placeholder → complete batch rejects
+  with `UNIVERSE_STATE_MISMATCH` before Normalize.
+- EC-24: A committed `RUNNING` attempt has no result after crash → reader derives
+  `ATTEMPT_INDETERMINATE` and does not retry on that operation day.
 
 ## API Contracts
 
@@ -338,55 +362,57 @@ not call it; mode `shadow` observes after canonical success and cannot block can
 The implementation MUST expose the design's status shape without member payloads:
 
 ```typescript
-interface UniverseStatusResponse {
-  status: "ready" | "unavailable" | "stale" | "blocked";
-  trade_date: string;
-  verified_head_trade_date: string | null;
-  universe_id: "all-main-board-plus-required-symbols";
-  schema_version: 1;
-  scope: "all-main-board-plus-required-symbols";
-  contract_id: string | null;
-  contract_sha256: string | null;
-  classification_generation_id: string | null;
-  calendar_generation_id: string | null;
-  calendar_sha256: string | null;
-  counts: {
-    total: number;
-    trading: number;
-    suspended: number;
-    not_yet_listed: number;
-    delisted: number;
-    unknown: number;
-    session_expected: number;
-    loaded: number | null;
-    critical_attribute_unknown: number;
-  };
-  layers: {
-    classification_evidence_count: number;
-    classification_evidence_sha256: string;
-    effective_main_board_count: number;
-    effective_main_board_sha256: string;
-    required_additions_count: number;
-    required_additions_sha256: string;
-  };
-  required_indexes: ["sh.000001", "sz.399001"];
-  required_user_symbol_count: number;
-  publication_eligible: boolean;
-  reason_code: string | null;
-  provider_requests: 0;
-  writes: false;
-}
+type UniverseReasonCode = "CONTROL_STATE_UNAVAILABLE" | "PIT_VISIBILITY_INVALID" | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "CLASSIFICATION_UNAVAILABLE" | "USER_STORE_UNAVAILABLE" | "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED" | "PIT_CUTOFF_VIOLATION" | "USER_SNAPSHOT_CHANGED" | "REQUIRED_INDEX_NOT_TRADING" | "REQUIRED_SYMBOL_INVALID" | "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "UNIVERSE_MISSING_SYMBOL" | "UNIVERSE_EXTRA_SYMBOL" | "UNIVERSE_DUPLICATE_SYMBOL" | "UNIVERSE_SESSION_DRIFT" | "UNIVERSE_STATE_MISMATCH" | "UNIVERSE_DATE_MISMATCH" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH" | "UNIVERSE_HEAD_CAS_CONFLICT" | "BLOCKED_ENFORCE_NOT_ENABLED" | "BLOCKED_PRODUCTION_MODE_OFF" | "LEGACY_SHADOW_DRIFT" | "ATTEMPT_INDETERMINATE" | "UNIVERSE_IDENTITY_CONFLICT";
+interface UniverseStatusCounts { total: number; trading: number; suspended: number;
+  not_yet_listed: number; delisted: number; unknown: number; session_expected: number;
+  loaded: number | null; critical_attribute_unknown: number; }
+interface UniverseStatusLayers { classification_evidence_count: number;
+  classification_evidence_sha256: string; effective_main_board_count: number;
+  effective_main_board_sha256: string; required_additions_count: number;
+  required_additions_sha256: string; }
+interface UniverseStatusBase { trade_date: string; universe_id: "all-main-board-plus-required-symbols";
+  schema_version: 1; scope: "all-main-board-plus-required-symbols"; provider_requests: 0;
+  writes: false; }
+interface UniverseStatusReady extends UniverseStatusBase { status: "ready";
+  verified_head_trade_date: string; contract_id: string; contract_sha256: string;
+  classification_generation_id: string; calendar_generation_id: string; calendar_sha256: string;
+  counts: UniverseStatusCounts; layers: UniverseStatusLayers;
+  required_indexes: ["sh.000001", "sz.399001"]; required_user_symbol_count: number;
+  publication_eligible: true; reason_code: null; }
+interface UniverseStatusStale extends UniverseStatusBase { status: "stale";
+  verified_head_trade_date: string; contract_id: string; contract_sha256: string;
+  classification_generation_id: string; calendar_generation_id: string; calendar_sha256: string;
+  counts: UniverseStatusCounts; layers: UniverseStatusLayers;
+  required_indexes: ["sh.000001", "sz.399001"]; required_user_symbol_count: number;
+  publication_eligible: false; reason_code: "UNIVERSE_DATE_MISMATCH"; }
+interface UniverseStatusBlocked extends UniverseStatusBase { status: "blocked";
+  verified_head_trade_date: null; contract_id: null; contract_sha256: null;
+  classification_generation_id: null; calendar_generation_id: null; calendar_sha256: null;
+  counts: null; layers: null; required_indexes: null; required_user_symbol_count: null;
+  publication_eligible: false; reason_code: UniverseReasonCode; }
+interface UniverseStatusUnavailable extends UniverseStatusBase { status: "unavailable";
+  verified_head_trade_date: null; contract_id: null; contract_sha256: null;
+  classification_generation_id: null; calendar_generation_id: null; calendar_sha256: null;
+  counts: null; layers: null; required_indexes: null; required_user_symbol_count: null;
+  publication_eligible: false; reason_code: "CONTROL_STATE_UNAVAILABLE" | "UNIVERSE_STORAGE_UNAVAILABLE" | "UNIVERSE_SCHEMA_MISMATCH"; }
+type UniverseStatusResponse = UniverseStatusReady | UniverseStatusStale | UniverseStatusBlocked | UniverseStatusUnavailable;
 ```
 
 `GET /api/v1/market/universe?trade_date=YYYY-MM-DD` and
 `stock-eva market-universe --date YYYY-MM-DD` use this projection. HTTP `422` and CLI exit `2`
-represent invalid date/configuration before sidecar access. A verified head whose date differs from
+represent invalid date input before sidecar access; mode/configuration blocks remain HTTP 200. A verified head whose date differs from
 the requested date is HTTP `200`, `status=stale`, `reason_code=UNIVERSE_DATE_MISMATCH`, and
-exposes only `verified_head_trade_date`; a valid empty store with no head is HTTP `200` unavailable
+exposes the requested date plus verified head source/count fields; a valid empty store with no head is HTTP `200` unavailable
 with `CONTROL_STATE_UNAVAILABLE`. Blocked/ready/stale are HTTP `200` (CLI exit `1`). If path,
 inode, schema, WAL, lock or hashes cannot be proven, return HTTP `503` with the fixed body
 `{"code":"universe_control_unavailable"}` (CLI exit `3`). Neither operation initializes or
 migrates sidecar state.
+
+Status is a true discriminated union; both HTTP and CLI apply this priority: invalid input first;
+unprovable storage becomes `unavailable`/HTTP 503; a readable exact head is `ready`; a readable
+nonmatching head is `blocked` when a durable latest blocked attempt exists for the requested date,
+otherwise `stale`; no head is `blocked` only with such a durable blocked attempt, otherwise
+`unavailable` (HTTP 200). No “last verified head” cache is permitted.
 
 Status field matrix (identical to the design and normative for the CLI):
 
@@ -394,12 +420,12 @@ Status field matrix (identical to the design and normative for the CLI):
 |---|---|---|
 | `ready` | verified head exists and `head.trade_date == requested trade_date` | contract IDs, source refs, counts and layers are populated from that head; `verified_head_trade_date` equals requested date |
 | `stale` | verified head is valid but `head.trade_date != requested confirmed date` | all populated contract/source/count fields are explicitly the verified head's values, `trade_date` is the request, `verified_head_trade_date` is head date, reason is `UNIVERSE_DATE_MISMATCH`; no requested-date projection is implied |
-| `blocked` | durable latest attempt for requested date is terminal blocked, with no verified head for that date | contract/source/count/layer fields are null; `verified_head_trade_date` is null; reason is the durable attempt reason |
-| `unavailable` | safe store read has no head, or storage/state cannot be proven | all contract/source/count/layer fields and `verified_head_trade_date` are null; no cached prior head is used; unprovable storage is HTTP 503 |
+| `blocked` | durable latest attempt for requested date is blocked, and no exact head exists | every head-derived field is null; `verified_head_trade_date` is null; reason is the durable attempt reason |
+| `unavailable` | readable store has no head and no durable blocked attempt, or storage/state cannot be proven | every head-derived field is null; no cached head is used; unprovable storage is HTTP 503 |
 
-The single public TypeScript shape uses nullable fields, with this matrix as its discriminated
-runtime constraint; implementations MUST NOT populate a nullable field outside the row's stated
-status/source rule.
+The four interfaces above are the only public shapes. `Ready` and `Stale` carry verified head
+fields; `Blocked` and `Unavailable` carry null head fields. Implementations MUST NOT populate a
+nullable field outside its interface.
 `publication_eligible` means exactly `(unknown == 0 and critical_attribute_unknown == 0 and
 required_indexes_are_trading and all_evidence_checks_pass and (loaded is null or
 loaded == session_expected))`; candidate publication additionally requires
@@ -409,7 +435,7 @@ loaded == session_expected))`; candidate publication additionally requires
 
 ```typescript
 interface UniverseMaintenanceDecision {
-  lane: "freshness" | "repair" | "shadow" | null;
+  priority_order: number | null;
   action: "run" | "defer" | "none";
   reason_code: string | null;
   provider_requests: number;
@@ -419,10 +445,8 @@ interface UniverseMaintenanceDecision {
 interface UniversePostSuccessHook {
   offer(
     canonical_result: RefreshResult,
-    refresh_id: string,
+    run_id: string,
     trade_date: string,
-    manifest_ref: string | null,
-    evidence_ref: string | null,
     now: string,
   ): UniverseHookResult;
 }
@@ -443,9 +467,16 @@ interface UniversePublicationContext {
   status: "ready";
 }
 
-interface LegacyUniverseIntegration {
-  mode: "off" | "shadow" | "enforce";
+interface MarketStorePublicationReader {
+  read_publication_context(run_id: string, trade_date: string): UniversePublicationContext;
 }
+
+`MarketStore.read_publication_context(run_id, trade_date)` is an internal read-only method. In one
+SQLite read transaction it selects the published refresh and `publication_lineage` JSON plus
+selection/evidence references, and strictly checks safe IDs, exact run/date, referenced digest and
+lineage hash. Missing, malformed, mismatched or unreadable rows return
+`CONTROL_STATE_UNAVAILABLE`; it never writes, initializes, migrates or changes `RefreshResult`,
+and callers cannot supply manifest/evidence references.
 
 interface BuildUniverseRequest {
   schema_version: 1;
@@ -504,7 +535,7 @@ The internal writer may write classification/universe control evidence under its
 never change a canonical market pointer merely by creating a contract. The candidate gate MUST
 consume the existing `ProviderRawBatch` and its `RawEndpointBatch` endpoint/page rows; it MUST NOT
 introduce a parallel raw-batch type. It MUST validate the complete batch before Normalize and
-reject any date/provider/session/request/evidence/endpoint drift, duplicate page or
+reject any date/provider/session/request/endpoint/transport drift, duplicate page or
 `(symbol, trade_date)` key, missing/extra symbol, non-contiguous page, or
 `loaded != session_expected`. It MUST reject `unknown=1` even if the loaded count matches. No
 provider other than BaoStock may enter this interface.
@@ -537,7 +568,7 @@ finite, safe-ID/hash validated and use the exact state vocabularies in the desig
 
 `SourceRefsV1` is a required frozen model (calendar generation ID/hash, classification generation
 ID, its sequence/source metadata, a newly computed exact-PIT classification snapshot digest,
-required snapshot ID/hash, sorted instrument evidence IDs, provider, trade date, exact PIT cutoff
+required snapshot ID/hash, sorted instrument evidence IDs, semantic mapping hash, provider, trade date, exact PIT cutoff
 and source-date semantics). If the existing `GenerationSummary` lacks a source hash, the
 implementation MUST NOT invent one. `UniverseContractV1` MUST persist and hash sorted-unique
 `classification_evidence_ids`, `effective_main_board_ids` and `required_additions_ids`, with a
@@ -549,12 +580,16 @@ The builder MUST retain three separately accounted layers: (1) every unique prom
 `classification_evidence` identity, including excluded records; (2) the
 `effective_main_board` subset using `list_date <= trade_date < delist_date` (or no delist
 date); and (3) `required_additions`, the valid user A-share union after removing effective
-main-board identities, plus the two required indexes.
+main-board identities, plus each required index only when absent from that base; index obligations
+remain explicit even when already represented.
 Each layer has its own sorted identity list, count and SHA-256: the strict fields are
 `classification_evidence_ids`, `effective_main_board_ids` and `required_additions_ids`, each with
 its partition SHA-256 in the payload and explicit sidecar columns. Excluded classification
 evidence is persisted with role/exclusion links and is rehashed by the reader. The final member hash is computed
 from the union, with source-role overlap retained only in `UniverseMemberV1.scope_roles`.
+`symbol` is the sole member identity key and `security_id` maps one-to-one to it within a contract;
+the DDL unique constraint and strict reader enforce this. Conflicting mappings are
+`UNIVERSE_IDENTITY_CONFLICT` and block without merging or omission.
 `not_yet_listed` and
 `delisted` required additions remain visible but never enter `session_expected`.
 
@@ -562,7 +597,7 @@ Use the exact design domains/projections: classification evidence is sorted
 `{security_id,symbol,evidence_id,exclusion_reason}`; effective main-board is sorted complete
 security/member projections; required additions are sorted `{symbol,security_id,scope_roles,state,
 evidence_id}` after removing identities already in the effective main-board partition. Required
-indexes remain exactly once. Roles that overlap are retained only in `universe_member.scope_roles`,
+indexes are included at most once. Roles that overlap are retained only in `universe_member.scope_roles`,
 and each partition count is the length of its sorted unique projection.
 
 The implementation MUST add the reviewed semantic mapping registry described by the design. A
@@ -573,10 +608,25 @@ qualify this contract.
 
 Required-index tests MUST use only a versioned local `InstrumentEvidenceV1` fixture/input with
 `authority_status=reviewed`, `artifact_origin=local_reviewed_fixture`, provider `baostock`, closed
-`mapping_id`/`mapping_version`, exact `trade_date`, `index_role=required_index`, identity and
+`mapping_id`/`mapping_version`/`mapping_sha256` referencing the immutable semantic registry, exact `trade_date`, `index_role=required_index`, identity and
 explicit `expected_trading_state=trading`. This fixture proves only derivation logic; it is not a
 provider qualification claim. Production has no qualified artifact in this subversion and must
 remain stably `BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED`.
+
+### Hash preimage registry
+
+Every digest is domain-separated and recomputable from persisted or existing model fields.
+
+| Domain | Canonical preimage |
+|---|---|
+| `stock-eva/r2f4.2/classification-snapshot/v1` | sorted exact PIT `(security_id,symbol,source_record_id,source_snapshot_date,listing_status,trade_status,st_state,exclusion_reason)` projection; never a GenerationSummary hash |
+| `stock-eva/r2f4.2/instrument-evidence/v1` | complete reviewed `InstrumentEvidenceV1`, mapping hash and exact dates included |
+| `stock-eva/r2f4.2/semantic-mapping/v1` | canonical semantic-mapping payload and identity/version/provider/schema |
+| `stock-eva/r2f4.2/publication-lineage/v1` | existing `publication_lineage` selected fields and existing lineage digest computation |
+| `stock-eva/r2f4.2/universe-head/v1` | `{"singleton_id":1,"sequence":N,"contract_id":"...","contract_sha256":"..."}` |
+| Existing ProviderRawBatch aggregate | existing `compute_*_sha256` request/endpoint/page/transport/batch fields; this release references, not redefines, them |
+| `stock-eva/r2f4.2/universe-attempt-plan/v1` | complete immutable attempt key, source version, operation day, budget and hook identity |
+| `stock-eva/r2f4.2/universe-attempt-result/v1` | terminal status, actual request count, closed reason and finish timestamp |
 
 `InstrumentEvidenceV1` for each required index MUST persist/validate
 `evidence_id`, `evidence_sha256`, `provider_id=baostock`, `authority_status`,
@@ -591,23 +641,22 @@ Universe module MUST NOT chain the existing public list methods or open addition
 ```typescript
 interface RequiredUserSymbolSnapshotRead {
   snapshot: RequiredUserSymbolSnapshot;
-  user_store_revision: string;
   snapshot_token: string;
 }
 
-capture_required_symbol_snapshot_once(operation_id: string): RequiredUserSymbolSnapshotRead
+capture_required_symbol_snapshot_existing(): RequiredUserSymbolSnapshotRead
 ```
 
 Only the existing UserStore writer owner may call this API; public API/CLI has no writer
-connection or initialization permission. It opens exactly one already-initialized UserStore SQLite connection, issues `BEGIN` read
-transaction, reads positions/watchlists/items in one deterministic SQL snapshot, and computes the
-snapshot token as the domain SHA-256 of sorted canonical rows. It verifies the writer revision or
-SQLite `data_version` before and after on the same connection. Busy/locked, mutation/revision
-mismatch, schema mismatch or hash mismatch MUST rollback and return `USER_SNAPSHOT_CHANGED` or
+connection or initialization permission. It opens exactly one descriptor-bound, already-initialized
+UserStore SQLite connection, verifies the allowlisted schema, issues `BEGIN IMMEDIATE` to obtain
+writer exclusion, reads positions/watchlists/items in one deterministic SQL snapshot, and computes
+the snapshot token as the domain SHA-256 of sorted canonical rows. It commits to release the
+exclusion. Busy/locked, unavailable, schema mismatch or row/hash mismatch MUST rollback and return
 `USER_STORE_UNAVAILABLE`, with no retry or second observation; close is required on commit and
 rollback. Capture MUST NOT initialize or migrate UserStore. The private sidecar stores only
-normalized symbols, role bitset, revision/token digest, count, capture time and hash. Public API/
-CLI stores only expose count/hash.
+normalized symbols, role bitset, token digest, count, capture time and hash; `snapshot_token` is
+the canonical snapshot hash. Public API/CLI stores only expose count/hash.
 
 ### Sidecar schema
 
@@ -617,8 +666,9 @@ CLI stores only expose count/hash.
 | `universe_contract` | complete canonical `payload_json`, explicit identity/sequence/parent/hash/source refs/counts, partition IDs/hashes, trade date and PIT cutoff | insert-only |
 | `universe_member` | contract hash, unique symbol, member payload/hash | insert-only |
 | `universe_instrument_evidence` | evidence ID/hash, BaoStock mapping/source/date projection | insert-only |
-| `universe_required_symbol_snapshot` | snapshot ID/hash, revision/token digest, count, private role projection | insert-only |
-| `contract_evidence` | bidirectional contract-to-evidence links | insert-only; no orphan links |
+| `universe_required_symbol_snapshot` | snapshot ID/hash, canonical token digest, count, private role projection | insert-only |
+| `universe_semantic_mapping` | immutable BaoStock semantic mapping payload/hash and review status | insert-only |
+| `contract_evidence` | bidirectional contract-to-evidence links | insert-only; every link is transactionally validated |
 | `contract_required_snapshot` | one bidirectional contract-to-required-snapshot link and hash | insert-only; exactly one per contract |
 | `universe_attempt` | immutable post-success dedup plan, refresh/date identity and request budget | insert-only; one per dedup key |
 | `universe_attempt_result` | immutable terminal status/reason and actual request count | insert-only; zero or one per plan |
@@ -628,8 +678,7 @@ The exact DDL is the design's normative v1 DDL; implementation MUST checksum its
 `schema_digest`, set `PRAGMA user_version=1`, `journal_mode=WAL`, `synchronous=FULL` and
 `foreign_keys=ON`, and use a bounded busy timeout. It MUST hold an exclusive sidecar lock plus the
 existing refresh/control lock. Contract, evidence, snapshot, member, role-link and head CAS rows
-are inserted/updated in one SQLite transaction; CAS failure rolls back all of them, so there are
-no pre-committed unreachable rows or orphan sequences. Only `universe_head` updates, and only by
+are inserted/updated in one SQLite transaction; CAS failure rolls back the entire promotion. Only `universe_head` updates, and only by
 CAS on sequence and contract hash; all other tables are append-only with update/delete rejection.
 The strict reader
 checks descriptor-bound path/inode, store identity, schema/table allowlist, schema digest, all row
@@ -665,25 +714,31 @@ CREATE TABLE universe_contract (contract_id TEXT PRIMARY KEY, sequence INTEGER N
  required_additions_partition_sha256 TEXT NOT NULL,
  payload_json TEXT NOT NULL, contract_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE universe_member (contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
- symbol TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
- PRIMARY KEY (contract_id, symbol));
+ symbol TEXT NOT NULL, security_id TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
+ PRIMARY KEY (contract_id, symbol), UNIQUE (contract_id, security_id));
+CREATE TABLE universe_semantic_mapping (
+ mapping_id TEXT PRIMARY KEY, mapping_version TEXT NOT NULL,
+ provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'), source_schema TEXT NOT NULL,
+ payload_json TEXT NOT NULL, mapping_sha256 TEXT NOT NULL UNIQUE,
+ authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified')));
 CREATE TABLE universe_instrument_evidence (evidence_id TEXT PRIMARY KEY,
  evidence_sha256 TEXT NOT NULL UNIQUE, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
  authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified')),
  artifact_origin TEXT NOT NULL CHECK (artifact_origin IN ('local_reviewed_fixture','production_reviewed_artifact')),
  security_id TEXT NOT NULL, symbol TEXT NOT NULL,
- mapping_id TEXT NOT NULL, mapping_version TEXT NOT NULL, source_snapshot_date TEXT NOT NULL,
+ mapping_id TEXT NOT NULL, mapping_version TEXT NOT NULL, mapping_sha256 TEXT NOT NULL
+ REFERENCES universe_semantic_mapping(mapping_sha256), source_snapshot_date TEXT NOT NULL,
  evidence_trade_date TEXT NOT NULL, exclusion_reason TEXT NOT NULL, index_role TEXT NOT NULL CHECK
  (index_role IN ('required_index','not_applicable')), source_date_semantics TEXT NOT NULL,
  evidence_json TEXT NOT NULL);
 CREATE TABLE universe_required_symbol_snapshot (snapshot_id TEXT PRIMARY KEY,
- snapshot_sha256 TEXT NOT NULL UNIQUE, user_store_revision TEXT NOT NULL,
- snapshot_token_digest TEXT NOT NULL, symbol_count INTEGER NOT NULL CHECK (symbol_count >= 0),
+ snapshot_sha256 TEXT NOT NULL UNIQUE, snapshot_token_digest TEXT NOT NULL,
+ symbol_count INTEGER NOT NULL CHECK (symbol_count >= 0),
  snapshot_json TEXT NOT NULL);
 CREATE TABLE contract_evidence (contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
  evidence_id TEXT NOT NULL REFERENCES universe_instrument_evidence(evidence_id),
  evidence_role TEXT NOT NULL CHECK (evidence_role IN
- ('classification_evidence','effective_main_board','required_addition','member')),
+ ('classification_evidence','effective_main_board','required_additions','member')),
  security_id TEXT NOT NULL, symbol TEXT NOT NULL, exclusion_reason TEXT NOT NULL,
  PRIMARY KEY (contract_id, evidence_id, evidence_role));
 CREATE TABLE contract_required_snapshot (contract_id TEXT PRIMARY KEY
@@ -691,12 +746,14 @@ CREATE TABLE contract_required_snapshot (contract_id TEXT PRIMARY KEY
  REFERENCES universe_required_symbol_snapshot(snapshot_id), snapshot_sha256 TEXT NOT NULL);
 CREATE TABLE universe_attempt (attempt_id TEXT PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE,
  hook_kind TEXT NOT NULL CHECK (hook_kind = 'universe_post_success'), refresh_id TEXT NOT NULL,
+ canonical_run_id TEXT NOT NULL, source_version_digest TEXT NOT NULL,
  trade_date TEXT NOT NULL, operation_day TEXT NOT NULL,
+ attempt_status TEXT NOT NULL CHECK (attempt_status = 'RUNNING'),
  request_budget INTEGER NOT NULL CHECK (request_budget = 1),
  classification_max_attempts INTEGER NOT NULL CHECK (classification_max_attempts = 1),
  created_at TEXT NOT NULL, planned_sha256 TEXT NOT NULL UNIQUE);
 CREATE TABLE universe_attempt_result (attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
- terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed')),
+ terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
  classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
  reason_code TEXT NOT NULL, finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE);
 CREATE TABLE universe_head (singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -715,6 +772,10 @@ CREATE TRIGGER universe_evidence_no_update BEFORE UPDATE ON universe_instrument_
  SELECT RAISE(ABORT, 'immutable_evidence'); END;
 CREATE TRIGGER universe_evidence_no_delete BEFORE DELETE ON universe_instrument_evidence BEGIN
  SELECT RAISE(ABORT, 'immutable_evidence'); END;
+CREATE TRIGGER universe_mapping_no_update BEFORE UPDATE ON universe_semantic_mapping BEGIN
+ SELECT RAISE(ABORT, 'immutable_mapping'); END;
+CREATE TRIGGER universe_mapping_no_delete BEFORE DELETE ON universe_semantic_mapping BEGIN
+ SELECT RAISE(ABORT, 'immutable_mapping'); END;
 CREATE TRIGGER universe_snapshot_no_update BEFORE UPDATE ON universe_required_symbol_snapshot BEGIN
  SELECT RAISE(ABORT, 'immutable_snapshot'); END;
 CREATE TRIGGER universe_snapshot_no_delete BEFORE DELETE ON universe_required_symbol_snapshot BEGIN
@@ -746,21 +807,22 @@ An empty initialized store has no `universe_head` row; first promotion inserts s
 null parent. `payload_json` is the complete canonical UniverseContractV1 preimage, including
 sorted members, required indexes, evidence IDs, snapshot hash, all counts/layer counts, source
 refs, PIT fields and all three partition IDs/hashes. Its digest and all explicit identity/source/
-count/partition columns must match the decoded payload. The strict reader reconstructs the
-contract from payload, re-hashes every member row and every persisted excluded evidence row,
+count/partition columns must match the decoded payload. The strict reader verifies each evidence
+mapping ID/version/hash against the immutable semantic registry, then reconstructs the contract
+from payload and re-hashes every member row and every persisted excluded evidence row,
 checks exact role sets in bidirectional `contract_evidence`: excluded classification evidence is
 `{classification_evidence}`; effective main-board member is
 `{classification_evidence,effective_main_board,member}`; required non-index addition is
-`{classification_evidence,required_addition,member}`; required index is
-`{required_addition,member}`. For every role link, `security_id`, `symbol` and `exclusion_reason`
+`{classification_evidence,required_additions,member}`; required index is
+`{required_additions,member}`. For every role link, `security_id`, `symbol` and `exclusion_reason`
 must equal the evidence payload. It also checks exact `contract_required_snapshot` links,
-and rejects every orphan. Explicit provider, source-date, required-snapshot and evidence-ID
+and rejects every invalid link. Explicit provider, source-date, required-snapshot and evidence-ID
 columns must equal `SourceRefsV1` and their payload counterparts. It verifies
 `head.sequence == contract.sequence`, `sequence=1` parent null, later sequence = parent+1, and
 `head_sha256` over canonical `{"singleton_id":1,"sequence":N,"contract_id":"...",
 "contract_sha256":"..."}`. CAS is conditional on the expected sequence/hash, with insert only
 on empty head. All contract/evidence/snapshot/member/link/head changes share this transaction;
-a failed CAS rolls it back, so no unreachable candidate rows or orphan sequence can commit. DDL
+a failed CAS rolls back the complete transaction. DDL
 normalization is the ordered statement text from the DDL block (comments
 removed, whitespace collapsed outside quoted literals, whitespace removed immediately inside/around
 `(`, `)` and `,`, quoted content preserved); the exact digest
@@ -768,8 +830,8 @@ is `domain_sha256("stock-eva/r2f4.2/universe-schema/v1", normalized_ddl)` and is
 `schema_digest`.
 The strict reader verifies path/inode, store identity, schema/table allowlist, WAL/full-sync mode,
 all payload/member/link/evidence hashes and parent chain in one read-only transaction. It never
-creates a directory, DDL, DML, WAL/SHM file or migration. A crash leaves old head or an unreferenced
-candidate; corruption is `unavailable`, never a historical cached projection. It also validates
+creates a directory, DDL, DML, WAL/SHM file or migration. A crash leaves the old head or no new
+state; corruption is `unavailable`, never a historical cached projection. It also validates
 one immutable `universe_attempt` plan per dedup key, at most one terminal result, and actual
 classification requests not exceeding one; missing or duplicate attempt state is unavailable.
 An initialized empty store with no head row is also `unavailable`; no historical cached status is
@@ -826,16 +888,16 @@ control layout centralized.
 3. Implement one verified snapshot read and unavailable mapping for missing/corrupt/locked/tampered
    state. GET readers MUST avoid schema initialization.
 4. Add RED/GREEN tests for interrupted commit, head CAS, duplicate rows, digest mismatch,
-   sidecar replacement, empty-head behavior, bidirectional/orphan links, safe-mode checks and
+   sidecar replacement, empty-head behavior, bidirectional link validation, safe-mode checks and
    restart behavior.
 
 ### Step 3 — PIT builder and evidence binding
 
 1. Add a writer-only builder that pins one calendar snapshot and one classification snapshot at the
    operation boundary.
-2. Add the exact writer-only `capture_required_symbol_snapshot_once(operation_id)` transaction
-   using only the allowlisted UserStore position/watchlist methods. Verify revision/token before
-   commit, record roles/count/hash privately, and do not put names in public output.
+2. Add the exact writer-only `capture_required_symbol_snapshot_existing()` transaction using one
+   existing connection, `BEGIN IMMEDIATE`, and only the allowlisted UserStore position/watchlist
+   tables. Commit to release writer exclusion, record roles/count/hash privately, and do not put names in public output.
 3. Bind promoted classification generation, instrument evidence IDs, source-date semantics and
    R2-F4.1 calendar generation/hash. Reject future/degraded/requested-unverified critical evidence.
 4. Build stock and index members, calculate states/counts and promote only with unknown-zero and
@@ -857,7 +919,7 @@ control layout centralized.
    Missing required ChiNext/STAR in the legacy request is drift only; do not change
    `build_canonical_raw_request`.
 4. Make `enforce` execution an unconditional `BLOCKED_ENFORCE_NOT_ENABLED` result (zero provider
-   requests). The callback is an offline/future enforce seam only; no production path may route
+   requests). The callback is not an enforce seam in this release; no production path may route
    through it and no secondary provider is accepted.
 5. Add tests proving missing/extra/duplicate/non-session/mixed-provider batches, invalid
    `tradestatus`/suspended placeholders and session drift reject as a whole before Normalize, and
@@ -877,19 +939,31 @@ control layout centralized.
 4. Only after existing post-publish and shadow hooks return may the bounded Universe hook read
    promoted evidence, capture the UserStore snapshot once, and attempt one sidecar promotion.
    Current BaoStock `requested_unverified` evidence blocks before provider acquisition.
-5. Implement typed `UniversePostSuccessHook.offer(canonical_result, refresh_id, trade_date,
-   manifest_ref, evidence_ref, now)`. It must reacquire the existing `RefreshRunLock` non-blocking,
+5. Implement typed `UniversePostSuccessHook.offer(canonical_result, run_id, trade_date, now)`.
+   The hook receives only run/date identity, then calls
+   `MarketStore.read_publication_context(run_id, trade_date)` in one read transaction to obtain
+   and verify publication lineage and evidence references; `main.py` constructs/injects it and
+   `RefreshResult` is unchanged. It must reacquire the existing `RefreshRunLock` non-blocking,
    then the sidecar lock; failure returns `DEFER/CONTROL_STATE_UNAVAILABLE`. Under the sidecar
    lock insert the immutable `universe_attempt` plan before any classification request. The dedup
    lookup and insert share one `BEGIN IMMEDIATE` transaction that commits before the request. Use
-   `dedup_key=sha256(canonical {hook_kind, refresh_id, trade_date, operation_day})`,
+   `dedup_key=sha256(canonical {trade_date, operation_day, canonical_run_id, source_version_digest})`,
+   due only when no row has that key and no exact contract exists or its classification snapshot,
+   mapping or source-version digest changed,
    `request_budget=1`, `classification_max_attempts=1`, and one immutable terminal result. A
    duplicate key is no-op/defer, not a resend; unqualified evidence records stable blocked with
-   zero requests. `operation_day` is the `Asia/Shanghai` clock date captured at attempt start and
+   zero requests. The dedicated classification provider factory is constructed with
+   `max_attempts=1`; one budget unit is one logical provider.fetch. Its fixed six logical calls are
+   `query_all_stock`, `query_stock_basic`, `query_stock_industry`, `query_hs300_stocks`,
+`query_sz50_stocks` and `query_zz500_stocks`; login is setup, the logical acquisition budget is at
+most six fetch calls, and actual endpoint/transport requests remain bounded and audited by the
+existing contract. `operation_day` is the `Asia/Shanghai` clock date captured at attempt start and
    remains fixed across midnight. Hash the complete plan with domain
    `stock-eva/r2f4.2/universe-attempt-plan/v1` and the terminal result with
    `stock-eva/r2f4.2/universe-attempt-result/v1`; the reader recomputes both and rejects altered,
-   missing or duplicate events. Do not add a sixth LaunchAgent, independent scheduler lane or additional scheduler lock. Add concurrency,
+   missing or duplicate events. A committed `RUNNING` plan with no result is
+   `ATTEMPT_INDETERMINATE`, not retried on that Shanghai operation day; the next Shanghai day has
+   a new key. Do not add a sixth LaunchAgent, independent scheduler lane or additional scheduler lock. Add concurrency,
    restart, deferred, priority, post-success ordering, failure and no-repeat tests covering
    `classification/sync.py`, `classification/store.py`, `backend/app/market/automation.py` and
    `tests/test_market_failover.py`.
@@ -904,7 +978,7 @@ control layout centralized.
    semantics. It reads no credentials and constructs no provider.
 4. Add route/CLI filesystem fingerprint tests for missing, valid, stale and corrupt states.
 
-### Step 7 — Compatibility documentation and migration rehearsal
+### Step 7 — Compatibility documentation and no-migration rehearsal
 
 1. Update `docs/classification.md`, `docs/market-data.md`, `docs/data-providers.md` and the
    R2-F4.2 acceptance draft with the sidecar, PIT, state vocabulary, count equation and mode
@@ -964,7 +1038,7 @@ The implementation MUST use only the following public/sanitized reason set:
 `UNIVERSE_MISSING_SYMBOL`, `UNIVERSE_EXTRA_SYMBOL`, `UNIVERSE_DUPLICATE_SYMBOL`,
 `UNIVERSE_SESSION_DRIFT`, `UNIVERSE_STATE_MISMATCH`, `UNIVERSE_DATE_MISMATCH`, `UNIVERSE_STORAGE_UNAVAILABLE`, `UNIVERSE_SCHEMA_MISMATCH`,
 `UNIVERSE_HEAD_CAS_CONFLICT`, `BLOCKED_ENFORCE_NOT_ENABLED`, `BLOCKED_PRODUCTION_MODE_OFF`,
-`LEGACY_SHADOW_DRIFT`, `NONE`.
+`LEGACY_SHADOW_DRIFT`, `ATTEMPT_INDETERMINATE`, `UNIVERSE_IDENTITY_CONFLICT`, `NONE`.
 Unmapped provider/exception text MUST map to a closed boundary reason and MUST NOT be surfaced.
 
 The implementation MUST use this deterministic mapping (the design table is normative and must
@@ -982,6 +1056,7 @@ remain identical):
 | no promoted classification visible at PIT | `CLASSIFICATION_UNAVAILABLE` | 200 blocked / 1 |
 | required index absent, identity/date mismatch, suspended or unknown | `REQUIRED_INDEX_NOT_TRADING` | 200 blocked / 1 |
 | malformed/unsupported required user symbol | `REQUIRED_SYMBOL_INVALID` | 200 blocked / 1 |
+| symbol/security_id conflict or duplicate natural identity | `UNIVERSE_IDENTITY_CONFLICT` | 200 blocked / 1 |
 | user snapshot mutation during capture | `USER_SNAPSHOT_CHANGED` | 200 blocked / 1 |
 | user store busy/locked/unreadable | `USER_STORE_UNAVAILABLE` | 200 blocked / 1 |
 | nonzero unknown member/state attribute | `UNIVERSE_UNKNOWN_NONZERO` | 200 blocked / 1 |
@@ -996,6 +1071,7 @@ remain identical):
 | sidecar payload, partition, link, parent, head or attempt validation fails | `UNIVERSE_SCHEMA_MISMATCH` | 503 fixed body / 3 |
 | nonblocking refresh/sidecar lock unavailable | `CONTROL_STATE_UNAVAILABLE` | 200 blocked/defer / 1 |
 | sidecar head CAS conflict | `UNIVERSE_HEAD_CAS_CONFLICT` | 200 blocked/defer / 1 |
+| committed RUNNING attempt without a result on the same operation day | `ATTEMPT_INDETERMINATE` | 200 blocked / 1 |
 | mode `enforce` in any execution | `BLOCKED_ENFORCE_NOT_ENABLED` | 200 blocked / 1 |
 | non-off mode in production profile | `BLOCKED_PRODUCTION_MODE_OFF` | 200 blocked / 1 |
 | BaoStock transport/protocol failure (`CONNECT_ERROR`, `SEND_ERROR`, `RECV_TIMEOUT`, `EOF`, `SHORT_HEADER`, `BAD_COMPRESSION`, `PROTOCOL_ERROR`, `PAGINATION_STALLED`, `RATE_LIMIT`, or unknown provider code) during acquisition | `CLASSIFICATION_UNAVAILABLE` | 200 blocked / 1 |
@@ -1007,18 +1083,70 @@ never guessed or exposed. `USER_STORE_UNAVAILABLE` is used for writer-store read
 
 | FRs | ACs | ECs | Offline test/static trace |
 |---|---|---|---|
-| FR-1..FR-3 | AC-1, AC-2 | EC-1..EC-4 | `tests/test_market_universe.py::test_contract_identity_and_pit`; calendar/classification protected SHA check |
-| FR-4..FR-6, FR-13, FR-14 | AC-3..AC-5 | EC-2, EC-4, EC-6..EC-8, EC-11 | `test_three_layers_and_effective_window`, `test_reviewed_mapping_blocks_requested_unverified`, `test_user_snapshot_single_connection_busy_rollback` |
+| FR-1, FR-2, FR-3 | AC-1, AC-2 | EC-1, EC-2, EC-3, EC-4 | `tests/test_market_universe.py::test_contract_identity_and_pit`; calendar/classification protected SHA check |
+| FR-4, FR-5, FR-6, FR-13, FR-14 | AC-3, AC-4, AC-5 | EC-2, EC-4, EC-6, EC-7, EC-8, EC-11 | `test_three_layers_and_effective_window`, `test_reviewed_mapping_blocks_requested_unverified`, `test_user_snapshot_single_connection_busy_rollback` |
 | FR-7, FR-14 | AC-4, AC-6 | EC-9 | `test_required_indexes_must_be_explicit_trading`, `test_unknown_one_loaded_match_rejects` |
-| FR-8..FR-12, FR-15 | AC-5..AC-7, AC-16 | EC-5, EC-10, EC-11, EC-17 | `test_raw_batch_gate_rejects_missing_extra_duplicate_drift_before_normalize` |
+| FR-8, FR-9, FR-10, FR-11, FR-12, FR-15 | AC-5, AC-6, AC-7, AC-16 | EC-5, EC-10, EC-11, EC-17 | `test_raw_batch_gate_rejects_missing_extra_duplicate_drift_before_normalize` |
 | FR-16 | AC-8, AC-8a, AC-15 | EC-12, EC-13, EC-18 | `test_sidecar_schema_digest_inode_wal_cas_links_attempts_and_crash`; normative DDL/static digest |
-| FR-9, FR-17 | AC-10, AC-15 | EC-14..EC-16 | `tests/test_market_automation.py::test_decision_matrix_and_post_success_order` |
+| FR-9, FR-17 | AC-10, AC-15 | EC-14, EC-15, EC-16 | `tests/test_market_automation.py::test_decision_matrix_and_post_success_order` |
 | FR-10, FR-12 | AC-9, AC-11, AC-14 | EC-1, EC-13 | API/CLI zero-write filesystem fingerprint and public-schema static scan |
 
-The evidence record MUST list every individual FR-1..FR-17 and EC-1..EC-18, not merely the ranges
+The evidence record MUST list every individual FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8, FR-9, FR-10, FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17 and EC-1, EC-2, EC-3, EC-4, EC-5, EC-6, EC-7, EC-8, EC-9, EC-10, EC-11, EC-12, EC-13, EC-14, EC-15, EC-16, EC-17, EC-18, not merely grouped ranges
 shown above, with its exact test/static line and result. It MUST include both strict validator
 commands (design and implementation), `git diff --check`, and the exact reviewed commit. Status
 remains `In Review`; no implementation or specification check may label this plan SPEC GO.
+
+### Individual companion crosswalk
+
+The implementation checklist is intentionally keyed one-for-one to the companion design; no
+range notation is used for review evidence.
+
+| Companion ID | Implementation evidence anchor |
+|---|---|
+| AC-1 | Step 1/Step 2 sidecar schema and crash test |
+| AC-2 | Step 3 PIT fixture test |
+| AC-3 | Step 3 UserStore snapshot test |
+| AC-4 | Step 3 three-layer/count test |
+| AC-5 | Step 4 unknown-zero/loaded-match test |
+| AC-6 | Step 4 raw gate test |
+| AC-7 | Step 4 whole-session purity test |
+| AC-8 | Step 2 sidecar DDL/digest test |
+| AC-9 | Step 6 API/CLI zero-write test |
+| AC-10 | Step 5 post-success ordering test |
+| AC-11 | Step 6 stale/blocked status test |
+| AC-12 | Step 4 extras and symbol-stitching test |
+| AC-13 | Step 2 restart/inode test |
+| AC-14 | Step 6 filesystem fingerprint test |
+| AC-15 | Step 5 continuity/repair priority test |
+| AC-16 | Step 5 enforce blocked test |
+| AC-17 | Step 4 legacy shadow-only test |
+| AC-18 | Step 3 identity/listing-window test |
+| AC-19 | Step 3 semantic mapping/index evidence test |
+| AC-20 | Step 4 pre-Normalize aggregate test |
+| EC-1 | invalid input and storage read fixture |
+| EC-2 | PIT visibility fixture |
+| EC-3 | UserStore busy fixture |
+| EC-4 | listing/delisting fixture |
+| EC-5 | unknown-state fixture |
+| EC-6 | required-index evidence fixture |
+| EC-7 | duplicate identity fixture |
+| EC-8 | required-symbol validation fixture |
+| EC-9 | loaded mismatch fixture |
+| EC-10 | raw missing/extra fixture |
+| EC-11 | raw duplicate/session fixture |
+| EC-12 | CAS rollback fixture |
+| EC-13 | read-only missing-sidecar fixture |
+| EC-14 | lock priority fixture |
+| EC-15 | stale generation fixture |
+| EC-16 | enforce configuration fixture |
+| EC-17 | tradestatus/placeholder fixture |
+| EC-18 | attempt ledger fixture |
+| EC-19 | mapping registry immutability fixture |
+| EC-20 | classification failure preservation fixture |
+| EC-21 | post-success race fixture |
+| EC-22 | legacy shadow drift fixture |
+| EC-23 | raw state mismatch fixture |
+| EC-24 | indeterminate RUNNING-attempt fixture |
 
 ## Rollback and Recovery
 
