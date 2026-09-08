@@ -36,7 +36,8 @@ def test_missing_listing_window_evidence_is_unknown_and_unpublishable():
     values.update(
         list_date=None,
         delist_date=None,
-        source_schema="classification.instrument.v2",
+        source_schema="classification.instrument.v1",
+        artifact_origin="production_reviewed_artifact",
     )
     with pytest.raises(ValueError):
         _rehash_evidence(values)
@@ -308,6 +309,73 @@ def test_reader_rejects_unallowlisted_view(tmp_path):
         connection.commit()
     with pytest.raises(UniverseStoreUnavailable):
         store.read_head()
+
+
+def test_read_latest_source_state_uses_explicit_deferred_snapshot():
+    source = inspect.getsource(UniverseSidecarStore.read_latest_source_state)
+    assert "BEGIN DEFERRED" in source
+
+
+def test_empty_head_still_rejects_orphan_evidence(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "market_universe.sqlite3"
+    store = UniverseSidecarStore(path)
+    store.initialize()
+    contract = _contract()
+    mapping, evidence, _ = _bundle(contract)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO universe_semantic_mapping VALUES (?,?,?,?,?,?,?)",
+            (
+                mapping.mapping_id,
+                mapping.mapping_version,
+                mapping.provider_id,
+                mapping.source_schema,
+                mapping.payload_json,
+                mapping.mapping_sha256,
+                mapping.authority_status,
+            ),
+        )
+        item = evidence[0]
+        connection.execute(
+            "INSERT INTO universe_instrument_evidence VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(item.model_dump(mode="json").values()),
+        )
+        connection.commit()
+    with pytest.raises(UniverseStoreUnavailable):
+        store.read_head()
+
+
+def test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection():
+    from tests.test_market_provider_contract import _provider_raw_batch
+
+    batch = _provider_raw_batch()
+    endpoint = batch.endpoint_batches[0]
+    bad_endpoint = endpoint.model_copy(update={"shard_id": "different-shard"})
+    with pytest.raises(ValueError):
+        batch.model_copy(update={"endpoint_batches": (bad_endpoint,)})
+
+
+def test_builder_without_verified_authority_bundle_is_not_publishable():
+    legacy = _contract()
+    refs = legacy.source_refs.model_copy(update={"classification_source": "production"})
+    contract = build_universe_contract(
+        trade_date=legacy.trade_date,
+        calendar_generation_id=legacy.calendar_generation_id,
+        calendar_sha256=legacy.calendar_sha256,
+        classification_generation_id=legacy.classification_generation_id,
+        classification_generation_sequence=refs.classification_generation_sequence,
+        classification_source="production",
+        classification_source_version=refs.classification_source_version,
+        classification_source_snapshot_date=refs.classification_source_snapshot_date,
+        classification_observed_at=refs.classification_observed_at,
+        exact_pit_cutoff=refs.exact_pit_cutoff,
+        source_refs=refs,
+        members=legacy.members,
+    )
+    assert contract.publication_eligible is False
 
 
 def _rehash_member(member, evidence_id: str):

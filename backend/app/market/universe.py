@@ -213,6 +213,16 @@ class UniverseSemanticMappingV1(_Frozen):
             raise ValueError("semantic mapping payload must be an object")
         if self.source_schema not in _MAPPING_SCHEMAS:
             raise ValueError("semantic mapping schema is not closed")
+        if self.authority_status == "reviewed" and not payload:
+            raise ValueError("empty semantic mapping cannot establish authority")
+        if self.source_schema == "daily_astock.v1":
+            tradestatus = payload.get("tradestatus")
+            if (
+                not isinstance(tradestatus, dict)
+                or tradestatus.get("trading") != "1"
+                or tradestatus.get("suspended") != "0"
+            ):
+                raise ValueError("daily semantic mapping does not close tradestatus")
         if payload.get("mapping_id") not in (None, self.mapping_id):
             raise ValueError("semantic mapping ID mismatch")
         if payload.get("mapping_version") not in (None, self.mapping_version):
@@ -353,6 +363,17 @@ class UniverseInstrumentEvidenceV1(_Frozen):
                     or self.st_state != "not_applicable"
                 ):
                     raise ValueError("required index evidence semantics are incomplete")
+        if (
+            self.source_schema == "classification.instrument.v1"
+            and self.authority_status == "reviewed"
+            and self.artifact_origin == "production_reviewed_artifact"
+        ):
+            raise ValueError("legacy classification evidence cannot establish authority")
+        if (
+            self.artifact_origin == "production_reviewed_artifact"
+            and self.source_schema != "classification.instrument.v2"
+        ):
+            raise ValueError("production evidence schema is not the reviewed closed version")
         expected = domain_sha256("stock-eva/r2f4.2/instrument-evidence/v1", self.preimage())
         if expected != self.evidence_sha256:
             raise ValueError("instrument evidence hash mismatch")
@@ -487,6 +508,28 @@ class UniverseContractV1(_Frozen):
         expected_counts = _member_counts(self.members)
         if self.counts.model_copy(update={"loaded": None}) != expected_counts:
             raise ValueError("contract counts are not derived from member states")
+        expected_classification_ids = tuple(
+            sorted(item.get("evidence_id", "") for item in self.classification_evidence_projection)
+        )
+        if expected_classification_ids != self.classification_evidence_ids:
+            raise ValueError("classification evidence IDs are not derived from projection")
+        expected_effective_ids = tuple(
+            sorted(
+                item.symbol for item in self.members if "effective_main_board" in item.scope_roles
+            )
+        )
+        if expected_effective_ids != self.effective_main_board_ids:
+            raise ValueError("effective main board IDs are not derived from members")
+        expected_required_ids = tuple(
+            sorted(
+                item.symbol
+                for item in self.members
+                if item.symbol not in set(expected_effective_ids)
+                and ("required_user" in item.scope_roles or "required_index" in item.scope_roles)
+            )
+        )
+        if expected_required_ids != self.required_additions_ids:
+            raise ValueError("required additions IDs are not derived from members")
 
         # Partition digests are over the normative projections, never over the
         # generated member digest.  The latter is a verification result and is
@@ -915,6 +958,49 @@ class UniverseAttemptResultV1(_Frozen):
         return self
 
 
+class UniverseAuthorityBundleV1(_Frozen):
+    """Writer-verified classification authority admitted to contract building."""
+
+    mapping: UniverseSemanticMappingV1
+    evidence: tuple[UniverseInstrumentEvidenceV1, ...]
+    source_date_semantics: Literal["source_observed"]
+    authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> UniverseAuthorityBundleV1:
+        if self.mapping.authority_status != "reviewed" or not self.evidence:
+            raise ValueError("authority bundle is not reviewed")
+        if any(
+            item.authority_status != "reviewed"
+            or item.source_date_semantics != "source_observed"
+            or item.mapping_id != self.mapping.mapping_id
+            or item.mapping_version != self.mapping.mapping_version
+            or item.mapping_sha256 != self.mapping.mapping_sha256
+            for item in self.evidence
+        ):
+            raise ValueError("authority bundle evidence is not reviewed")
+        evidence_projection = [
+            {
+                "evidence_id": item.evidence_id,
+                "evidence_sha256": item.evidence_sha256,
+                "mapping_id": item.mapping_id,
+                "mapping_version": item.mapping_version,
+            }
+            for item in sorted(self.evidence, key=lambda value: value.evidence_id)
+        ]
+        expected = domain_sha256(
+            "stock-eva/r2f4.2/universe-authority-bundle/v1",
+            {
+                "mapping_sha256": self.mapping.mapping_sha256,
+                "source_date_semantics": self.source_date_semantics,
+                "evidence": evidence_projection,
+            },
+        )
+        if self.authority_sha256 != expected:
+            raise ValueError("authority bundle hash mismatch")
+        return self
+
+
 def build_universe_contract(
     *,
     trade_date: date,
@@ -929,12 +1015,21 @@ def build_universe_contract(
     exact_pit_cutoff: str | datetime,
     source_refs: SourceRefsV1 | dict[str, Any],
     members: tuple[UniverseMemberV1, ...],
-    classification_evidence: tuple[UniverseInstrumentEvidenceV1, ...] = (),
+    classification_evidence: tuple[UniverseInstrumentEvidenceV1, ...] | None = None,
+    authority_bundle: UniverseAuthorityBundleV1 | None = None,
     sequence: int = 1,
     parent_contract_id: str | None = None,
     created_at: datetime | None = None,
 ) -> UniverseContractV1:
     refs = _source_refs(source_refs)
+    if authority_bundle is not None:
+        if (
+            classification_evidence is not None
+            and classification_evidence != authority_bundle.evidence
+        ):
+            raise ValueError("classification evidence does not match authority bundle")
+        classification_evidence = authority_bundle.evidence
+    classification_evidence = classification_evidence or ()
     if isinstance(classification_observed_at, str):
         classification_observed_at = datetime.fromisoformat(
             classification_observed_at.replace("Z", "+00:00")
@@ -1118,6 +1213,7 @@ def build_universe_contract(
             counts.unknown == 0
             and counts.critical_attribute_unknown_count == 0
             and refs.source_date_semantics == "source_observed"
+            and (authority_bundle is not None or classification_source == "fixture")
         ),
         classification_evidence_count=len(classification_rows),
         classification_evidence_sha256=layer_hashes["classification"],
@@ -1158,6 +1254,7 @@ def validate_provider_raw_batch(
     }
     loaded: list[str] = []
     counts: list[tuple[str, int]] = []
+    raw_row_identities: set[tuple[str, str, str]] = set()
     reason: str | None = "UNIVERSE_UNKNOWN_NONZERO" if contract.counts.unknown else None
     expected_session_symbols = {
         item.symbol
@@ -1181,8 +1278,33 @@ def validate_provider_raw_batch(
         counts.append((endpoint_batch.endpoint.value, endpoint_batch.row_count))
         batches_by_ordinal.setdefault(endpoint_batch.plan_ordinal, []).append(endpoint_batch)
         if endpoint_batch.endpoint.value not in {"daily_astock", "index_history"}:
+            for row in endpoint_batch.rows:
+                if endpoint_batch.endpoint is ProviderEndpoint.ALL_STOCK and getattr(
+                    row, "tradeStatus", None
+                ) not in {"0", "1"}:
+                    reason = reason or "UNIVERSE_STATE_MISMATCH"
+                identity_value = getattr(row, "code", None) or getattr(row, "calendar_date", None)
+                if hasattr(row, "dividOperateDate"):
+                    identity_key = (
+                        endpoint_batch.endpoint.value,
+                        str(identity_value),
+                        str(row.dividOperateDate),
+                    )
+                else:
+                    identity_key = (endpoint_batch.endpoint.value, str(identity_value), "")
+                if identity_key in raw_row_identities:
+                    reason = reason or "UNIVERSE_SESSION_DRIFT"
+                raw_row_identities.add(identity_key)
             continue
         for row in endpoint_batch.rows:
+            identity_key = (
+                endpoint_batch.endpoint.value,
+                str(getattr(row, "code", "")),
+                str(getattr(row, "date", "")),
+            )
+            if identity_key in raw_row_identities:
+                reason = reason or "UNIVERSE_SESSION_DRIFT"
+            raw_row_identities.add(identity_key)
             symbol = getattr(row, "code", None)
             row_date = getattr(row, "date", None)
             if symbol is None or row_date != contract.trade_date:
@@ -1198,7 +1320,7 @@ def validate_provider_raw_batch(
                 reason = reason or "UNIVERSE_STATE_MISMATCH"
             elif member.expected_trading_state == "trading" and row.tradestatus != "1":
                 reason = reason or "UNIVERSE_STATE_MISMATCH"
-            elif member.expected_trading_state == "suspended" and row.tradestatus not in {"0", ""}:
+            elif member.expected_trading_state == "suspended" and row.tradestatus != "0":
                 reason = reason or "UNIVERSE_STATE_MISMATCH"
             if symbol in loaded:
                 reason = reason or "UNIVERSE_DUPLICATE_SYMBOL"
@@ -2293,6 +2415,8 @@ class UniverseSidecarStore:
                 raise UniverseStoreUnavailable("universe classification projection mismatch")
             if any(
                 item.mapping_sha256 != refs.semantic_mapping_sha256
+                or item.mapping_id != mapping["mapping_id"]
+                or item.mapping_version != mapping["mapping_version"]
                 or item.source_snapshot_date > contract.trade_date
                 or item.evidence_trade_date != contract.trade_date
                 for item in evidence_models.values()
@@ -2337,8 +2461,14 @@ class UniverseSidecarStore:
                 snapshot["schema_version"] != 1
                 or snapshot_digest != snapshot["snapshot_sha256"]
                 or snapshot["symbol_count"] != len(snapshot_payload["symbols"])
-                or tuple(item["symbol"] for item in snapshot_payload["symbols"])
-                != contract.required_additions_ids
+                or tuple(
+                    (item["symbol"], tuple(item["roles"])) for item in snapshot_payload["symbols"]
+                )
+                != tuple(
+                    (item.symbol, item.scope_roles)
+                    for item in contract.members
+                    if "required_user" in item.scope_roles or "required_index" in item.scope_roles
+                )
             ):
                 raise UniverseStoreUnavailable("universe required snapshot mismatch")
             link = connection.execute(
@@ -2432,6 +2562,7 @@ class UniverseSidecarStore:
                 "FROM universe_head WHERE singleton_id=1"
             ).fetchone()
             if row is None:
+                self._validate_global(connection, set())
                 return None
             expected = _head_digest(row["sequence"], row["contract_id"], row["contract_sha256"])
             if expected != row["head_sha256"]:
@@ -2512,6 +2643,7 @@ class UniverseSidecarStore:
             raise UniverseStoreUnavailable("universe sidecar unavailable")
         connection = self._connect(readonly=True)
         try:
+            connection.execute("BEGIN DEFERRED")
             self._validate(connection)
             rows = connection.execute(
                 "SELECT * FROM universe_source_state WHERE trade_date=? "
@@ -2561,6 +2693,7 @@ class UniverseSidecarStore:
         mapping: UniverseSemanticMappingV1 | None = None,
         evidence: tuple[UniverseInstrumentEvidenceV1, ...] = (),
         required_snapshot: RequiredSymbolSnapshotV1 | None = None,
+        authority_bundle: UniverseAuthorityBundleV1 | None = None,
     ) -> UniverseHeadV1:
         try:
             contract = UniverseContractV1.model_validate(
@@ -2576,6 +2709,12 @@ class UniverseSidecarStore:
                 )
                 for item in evidence
             )
+            if authority_bundle is not None:
+                authority_bundle = UniverseAuthorityBundleV1.model_validate(
+                    authority_bundle.model_dump(mode="python"), strict=False
+                )
+                if mapping != authority_bundle.mapping or evidence != authority_bundle.evidence:
+                    raise UniverseStoreUnavailable("universe authority bundle mismatch")
             if required_snapshot is not None:
                 required_snapshot = RequiredSymbolSnapshotV1.model_validate(
                     required_snapshot.model_dump(mode="python"), strict=False
@@ -2607,6 +2746,11 @@ class UniverseSidecarStore:
                     raise UniverseStoreUnavailable("universe sequence invalid")
                 if not contract.publication_eligible:
                     raise UniverseStoreUnavailable("unpublishable universe contract")
+                if (
+                    contract.source_refs.classification_source != "fixture"
+                    and authority_bundle is None
+                ):
+                    raise UniverseStoreUnavailable("universe authority bundle unavailable")
                 if mapping is None or required_snapshot is None:
                     raise UniverseStoreUnavailable("universe evidence bundle unavailable")
                 if (
