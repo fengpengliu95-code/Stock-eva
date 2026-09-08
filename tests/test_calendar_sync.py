@@ -609,7 +609,77 @@ def test_calendar_sync_blocker_retries_disappearing_file_exists_race(
 
     assert attempts == 2
     assert guard.is_file()
-    calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+    calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard.absolute())
+
+
+def test_calendar_sync_quarantine_normalizes_relative_alias(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    CalendarSyncStore(path)
+    guard = path.with_name(f".{path.name}.migration-in-progress")
+    key = Path(calendar_sync_module.os.path.abspath(guard))
+    calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.add(key)
+    relative = Path(calendar_sync_module.os.path.relpath(path, Path.cwd()))
+    try:
+        with pytest.raises(CalendarSyncStoreReadError):
+            CalendarSyncStore(relative, initialize=False).state()
+    finally:
+        calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.discard(key)
+
+
+def test_calendar_sync_deactivates_candidate_when_blocker_cannot_be_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "calendar.sqlite3"
+    guard = tmp_path / ".calendar.sqlite3.migration-in-progress"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for table_sql in calendar_sync_module._CORE_TABLES.values():
+            connection.execute(table_sql)
+    path.chmod(0o600)
+    real_remove = CalendarSyncStore._remove_migration_guard
+    real_exchange = CalendarSyncStore._exchange_paths
+    real_open = calendar_sync_module.os.open
+    exchanges = 0
+    guard_creates = 0
+
+    def replace_completed_then_error(guard_path, expected):
+        real_remove(guard_path, expected)
+        completed = next(guard_path.parent.glob(f".{guard_path.name}.*.removed"))
+        completed.unlink()
+        completed.write_bytes(b"replacement")
+        raise RuntimeError("completed marker replaced")
+
+    def fail_rollback(first, second):
+        nonlocal exchanges
+        exchanges += 1
+        if exchanges == 2:
+            raise OSError("rollback injected")
+        return real_exchange(first, second)
+
+    def fail_rebuilt_guard(file, flags, mode=0o777):
+        nonlocal guard_creates
+        if Path(file) == guard and flags & calendar_sync_module.os.O_CREAT:
+            guard_creates += 1
+            if guard_creates > 1:
+                raise OSError("guard storage unavailable")
+        return real_open(file, flags, mode)
+
+    monkeypatch.setattr(
+        CalendarSyncStore,
+        "_remove_migration_guard",
+        staticmethod(replace_completed_then_error),
+    )
+    monkeypatch.setattr(CalendarSyncStore, "_activation_committed", lambda *_args: False)
+    monkeypatch.setattr(CalendarSyncStore, "_exchange_paths", staticmethod(fail_rollback))
+    monkeypatch.setattr(calendar_sync_module.os, "open", fail_rebuilt_guard)
+
+    with pytest.raises(RuntimeError, match="completed marker replaced"):
+        CalendarSyncStore(path, initialize=False).initialize_for_write()
+
+    assert not guard.exists()
+    monkeypatch.undo()
+    calendar_sync_module._CALENDAR_SYNC_QUARANTINED_PATHS.clear()
+    with pytest.raises(CalendarSyncStoreReadError):
+        CalendarSyncStore(path, initialize=False).state()
 
 
 def test_calendar_sync_guard_remains_when_rollback_does_not_restore_legacy(

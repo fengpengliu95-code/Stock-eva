@@ -252,6 +252,12 @@ class CalendarSyncPlanError(ValueError):
 
 _CALENDAR_SYNC_CONNECTION_LOCK = threading.RLock()
 _CALENDAR_SYNC_QUARANTINED_PATHS: set[Path] = set()
+
+
+def _calendar_quarantine_key(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
 _IDENTITY_TABLE_SQL = """
     CREATE TABLE calendar_store_identity
     (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -416,7 +422,9 @@ class CalendarSyncStore:
                 raise CalendarSyncStoreReadError("calendar control database is unavailable")
             if not allow_migration_guard:
                 guard = self._migration_guard_path()
-                if guard in _CALENDAR_SYNC_QUARANTINED_PATHS or os.path.lexists(guard):
+                if _calendar_quarantine_key(
+                    guard
+                ) in _CALENDAR_SYNC_QUARANTINED_PATHS or os.path.lexists(guard):
                     raise CalendarSyncStoreReadError("calendar control database is unavailable")
         except CalendarSyncStoreReadError:
             raise
@@ -522,7 +530,7 @@ class CalendarSyncStore:
                 0o600,
             )
             guard_stat = os.fstat(guard_descriptor)
-            _CALENDAR_SYNC_QUARANTINED_PATHS.add(guard)
+            _CALENDAR_SYNC_QUARANTINED_PATHS.add(_calendar_quarantine_key(guard))
             os.close(guard_descriptor)
             guard_descriptor = None
             source_descriptor = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
@@ -602,7 +610,7 @@ class CalendarSyncStore:
                 if self._activation_committed(activated, identity_stat):
                     activation_confirmed = True
                     self._remove_migration_guard(guard, guard_stat)
-                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
                     migration_complete = True
                     return activated
                 raise
@@ -610,13 +618,13 @@ class CalendarSyncStore:
             # publication validation precedes it, so an adopted active candidate is
             # never reported as a failed migration.
             self._remove_migration_guard(guard, guard_stat)
-            _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+            _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
             migration_complete = True
             return activated
         except BaseException:
             if exchanged and not migration_complete:
                 if activation_confirmed and self._migration_guard_completed(guard, guard_stat):
-                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
                     migration_complete = True
                     return activated
                 if (
@@ -638,10 +646,18 @@ class CalendarSyncStore:
                     ):
                         if os.path.lexists(guard):
                             self._remove_migration_guard(guard, guard_stat)
-                        _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+                        _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
                         migration_complete = True
                         return activated
-                    self._ensure_migration_guard_blocking(guard)
+                    try:
+                        self._ensure_migration_guard_blocking(guard)
+                    except CalendarSyncStoreReadError:
+                        if (
+                            activated is None
+                            or identity_stat is None
+                            or not self._deactivate_candidate(activated, identity_stat)
+                        ):
+                            raise
                 else:
                     restored = self._validate_file(allow_migration_guard=True)
                     displaced_candidate = os.lstat(temporary)
@@ -653,10 +669,10 @@ class CalendarSyncStore:
                     ):
                         raise CalendarSyncStoreReadError("calendar control database is unavailable")
                     self._remove_migration_guard(guard, guard_stat)
-                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+                    _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
             elif not exchanged:
                 self._remove_migration_guard(guard, guard_stat)
-                _CALENDAR_SYNC_QUARANTINED_PATHS.discard(guard)
+                _CALENDAR_SYNC_QUARANTINED_PATHS.discard(_calendar_quarantine_key(guard))
             raise
         finally:
             connections = (source,) if migration_complete else (activated, source)
@@ -690,7 +706,7 @@ class CalendarSyncStore:
 
     @staticmethod
     def _ensure_migration_guard_blocking(guard: Path) -> None:
-        _CALENDAR_SYNC_QUARANTINED_PATHS.add(guard)
+        _CALENDAR_SYNC_QUARANTINED_PATHS.add(_calendar_quarantine_key(guard))
         for _attempt in range(3):
             descriptor: int | None = None
             try:
@@ -715,8 +731,38 @@ class CalendarSyncStore:
                         pass
             if os.path.lexists(guard):
                 return
-        # The in-process quarantine remains authoritative even if a same-UID actor
-        # repeatedly removes the durable blocker during this bounded recovery attempt.
+        raise CalendarSyncStoreReadError("calendar control database is unavailable")
+
+    def _deactivate_candidate(
+        self,
+        connection: sqlite3.Connection,
+        expected: os.stat_result,
+    ) -> bool:
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.execute(
+                "CREATE TABLE calendar_store_quarantine ("
+                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1))"
+            )
+            connection.execute("INSERT INTO calendar_store_quarantine VALUES (1)")
+            connection.commit()
+            if connection.in_transaction:
+                return False
+            quarantine = connection.execute(
+                "SELECT singleton FROM calendar_store_quarantine"
+            ).fetchone()
+            identity = connection.execute(
+                "SELECT device, inode FROM calendar_store_identity WHERE singleton = 1"
+            ).fetchone()
+            return (
+                quarantine is not None
+                and quarantine[0] == 1
+                and identity is not None
+                and tuple(identity) == (expected.st_dev, expected.st_ino)
+            )
+        except (CalendarSyncStoreReadError, sqlite3.Error, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _migration_guard_completed(
