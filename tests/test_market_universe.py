@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime, time
 
 import pytest
+from pydantic import BaseModel
 
+from backend.app.market.calendar_generation import (
+    CalendarConfigSnapshot,
+    CalendarGenerationV1,
+    CalendarMachineDayV1,
+    CalendarReadResult,
+    ImmutableCalendarSnapshot,
+    build_observation,
+)
 from backend.app.market.universe import (
     RequiredSymbolSnapshotV1,
+    SourceRefsV1,
     UniverseAuthorityBundleV1,
     UniverseCountsV1,
     UniverseInstrumentEvidenceV1,
@@ -16,7 +26,9 @@ from backend.app.market.universe import (
     UniverseStoreUnavailable,
     build_universe_contract,
     canonical_json_bytes,
+    classification_snapshot_sha256,
     domain_sha256,
+    source_version_digest,
     validate_provider_raw_batch,
 )
 
@@ -62,7 +74,10 @@ def _contract(
     snapshot = _snapshot(members)
     evidence = (
         tuple(_evidence(item, trade_date) for item in members)
-        if all(item.expected_trading_state in {"trading", "suspended"} for item in members)
+        if all(
+            item.expected_trading_state in {"trading", "suspended", "not_yet_listed", "delisted"}
+            for item in members
+        )
         else ()
     )
     authority_projection = [
@@ -91,9 +106,36 @@ def _contract(
         if evidence
         else None
     )
+    snapshot_digest = classification_snapshot_sha256(evidence)
+    calendar_id = "a" * 32
+    refs_for_digest = SourceRefsV1.model_validate(
+        {
+            "calendar_generation_id": calendar_id,
+            "calendar_sha256": "a" * 64,
+            "classification_generation_id": "cls-1",
+            "classification_generation_sequence": 1,
+            "classification_source": "fixture",
+            "classification_source_version": "v1",
+            "classification_source_snapshot_date": min(trade_date, date(2026, 8, 31)),
+            "classification_observed_at": datetime.combine(trade_date, time(8), tzinfo=UTC),
+            "classification_snapshot_sha256": snapshot_digest,
+            "required_symbol_snapshot_id": "snap-1",
+            "required_symbol_snapshot_sha256": snapshot.snapshot_sha256,
+            "instrument_evidence_ids": tuple(
+                sorted(item.instrument_evidence_id for item in members)
+            ),
+            "semantic_mapping_sha256": mapping.mapping_sha256,
+            "source_version_digest": "e" * 64,
+            "provider_id": "baostock",
+            "trade_date": trade_date,
+            "exact_pit_cutoff": datetime.combine(trade_date, time(18), tzinfo=UTC),
+            "source_date_semantics": source_date_semantics,
+        }
+    )
+    source_digest = source_version_digest(refs_for_digest, evidence)
     return build_universe_contract(
         trade_date=trade_date,
-        calendar_generation_id="cal-1",
+        calendar_generation_id=calendar_id,
         calendar_sha256="a" * 64,
         classification_generation_id="cls-1",
         classification_generation_sequence=1,
@@ -103,7 +145,7 @@ def _contract(
         classification_observed_at=f"{trade_date.isoformat()}T08:00:00Z",
         exact_pit_cutoff=f"{trade_date.isoformat()}T18:00:00Z",
         source_refs={
-            "calendar_generation_id": "cal-1",
+            "calendar_generation_id": calendar_id,
             "calendar_sha256": "a" * 64,
             "classification_generation_id": "cls-1",
             "classification_generation_sequence": 1,
@@ -111,12 +153,12 @@ def _contract(
             "classification_source_version": "v1",
             "classification_source_snapshot_date": min(trade_date, date(2026, 8, 31)).isoformat(),
             "classification_observed_at": f"{trade_date.isoformat()}T08:00:00Z",
-            "classification_snapshot_sha256": "b" * 64,
+            "classification_snapshot_sha256": snapshot_digest,
             "required_symbol_snapshot_id": "snap-1",
             "required_symbol_snapshot_sha256": snapshot.snapshot_sha256,
             "instrument_evidence_ids": sorted(item.instrument_evidence_id for item in members),
             "semantic_mapping_sha256": mapping.mapping_sha256,
-            "source_version_digest": "e" * 64,
+            "source_version_digest": source_digest,
             "provider_id": "baostock",
             "trade_date": trade_date.isoformat(),
             "exact_pit_cutoff": f"{trade_date.isoformat()}T18:00:00Z",
@@ -125,9 +167,54 @@ def _contract(
         members=members,
         classification_evidence=evidence,
         authority_bundle=authority,
+        calendar_authority=_calendar_authority(trade_date),
         sequence=sequence,
         parent_contract_id=parent_contract_id,
     )
+
+
+def _calendar_authority(trade_date: date) -> CalendarReadResult:
+    calendar = ImmutableCalendarSnapshot(
+        (
+            CalendarConfigSnapshot(
+                year=trade_date.year,
+                status="confirmed",
+                published_on=trade_date,
+                sources=(),
+                closed_dates=(),
+            ),
+        ),
+        generation_sha256="a" * 64,
+    )
+    start = date(trade_date.year, 1, 1)
+    end = date(trade_date.year, 12, 31)
+    machine = build_observation(
+        provider="baostock",
+        contract_version="r2f4.1-baostock-calendar-days-v1",
+        range_start=start,
+        range_end=end,
+        observed_at=datetime.combine(trade_date, time(0), tzinfo=UTC),
+        days=tuple(
+            CalendarMachineDayV1(
+                date=start + __import__("datetime").timedelta(days=i), is_open=True
+            )
+            for i in range((end - start).days + 1)
+        ),
+    )
+    generation = BaseModel.model_construct.__func__(
+        CalendarGenerationV1,
+        sequence=1,
+        parent_sha256=None,
+        bundled_sha256="a" * 64,
+        source_sha256="a" * 64,
+        attempt_target_year=trade_date.year,
+        attempt_slot_date=trade_date,
+        official_body_hashes=("a" * 64, "a" * 64),
+        machine=machine,
+        promoted_at=datetime.combine(trade_date, time(1), tzinfo=UTC),
+        generation_sha256="a" * 64,
+    )
+    return CalendarReadResult(status="ready", generation=generation, calendar=calendar)
 
 
 def _mapping() -> UniverseSemanticMappingV1:
@@ -165,9 +252,11 @@ def _mapping() -> UniverseSemanticMappingV1:
 
 def _snapshot(members: tuple[UniverseMemberV1, ...]) -> RequiredSymbolSnapshotV1:
     symbols = tuple(
-        (item.symbol, item.scope_roles)
-        for item in members
-        if "required_user" in item.scope_roles or "required_index" in item.scope_roles
+        sorted(
+            (item.symbol, item.scope_roles)
+            for item in members
+            if "required_user" in item.scope_roles or "required_index" in item.scope_roles
+        )
     )
     token = "f" * 64
     digest = domain_sha256(
@@ -178,7 +267,7 @@ def _snapshot(members: tuple[UniverseMemberV1, ...]) -> RequiredSymbolSnapshotV1
             "symbols": [{"symbol": s, "roles": list(r)} for s, r in symbols],
         },
     )
-    return RequiredSymbolSnapshotV1(
+    return RequiredSymbolSnapshotV1._from_test_fixture(
         snapshot_id="snap-1",
         snapshot_sha256=digest,
         snapshot_token_digest=token,
@@ -208,11 +297,20 @@ def _evidence(member: UniverseMemberV1, trade_date: date) -> UniverseInstrumentE
         "board": member.board,
         "list_date": member.list_date,
         "delist_date": member.delist_date,
-        "listing_status": "listed",
+        "listing_status": (
+            member.expected_trading_state
+            if member.expected_trading_state in {"not_yet_listed", "delisted"}
+            else "listed"
+        ),
         "daily_trade_status": ("1" if member.expected_trading_state == "trading" else "0"),
-        "suspension_state": member.expected_trading_state,
+        "suspension_state": (
+            member.expected_trading_state
+            if member.expected_trading_state in {"trading", "suspended"}
+            else "not_supplied"
+        ),
         "st_state": member.st_state,
         "expected_trading_state": member.expected_trading_state,
+        "observed_at": datetime.combine(trade_date, time(8), tzinfo=UTC),
         "evidence_json": canonical_json_bytes(
             {
                 "security_type": "index" if member.member_kind == "index" else "stock",
@@ -220,14 +318,42 @@ def _evidence(member: UniverseMemberV1, trade_date: date) -> UniverseInstrumentE
                 "board": member.board,
                 "list_date": member.list_date.isoformat() if member.list_date else None,
                 "delist_date": member.delist_date.isoformat() if member.delist_date else None,
-                "listing_status": "listed",
+                "listing_status": (
+                    member.expected_trading_state
+                    if member.expected_trading_state in {"not_yet_listed", "delisted"}
+                    else "listed"
+                ),
                 "daily_trade_status": ("1" if member.expected_trading_state == "trading" else "0"),
-                "suspension_state": member.expected_trading_state,
+                "suspension_state": (
+                    member.expected_trading_state
+                    if member.expected_trading_state in {"trading", "suspended"}
+                    else "not_supplied"
+                ),
                 "st_state": member.st_state,
                 "expected_trading_state": member.expected_trading_state,
             }
         ).decode(),
     }
+    values["lineage_hash"] = domain_sha256(
+        "stock-eva/r2f4.2/instrument-lineage/v1",
+        {
+            "provider_id": values["provider_id"],
+            "security_id": values["security_id"],
+            "symbol": values["symbol"],
+            "mapping_id": values["mapping_id"],
+            "mapping_version": values["mapping_version"],
+            "mapping_sha256": values["mapping_sha256"],
+            "source_schema": values["source_schema"],
+            "source_snapshot_date": values["source_snapshot_date"].isoformat(),
+            "evidence_trade_date": values["evidence_trade_date"].isoformat(),
+            "listing_status": values["listing_status"],
+            "daily_trade_status": values["daily_trade_status"],
+            "suspension_state": values["suspension_state"],
+            "st_state": values["st_state"],
+            "expected_trading_state": values["expected_trading_state"],
+            "observed_at": values["observed_at"].isoformat(),
+        },
+    )
     draft = UniverseInstrumentEvidenceV1.model_construct(
         evidence_id=member.instrument_evidence_id, evidence_sha256="0" * 64, **values
     )

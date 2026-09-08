@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import date
 
 import pytest
 
@@ -14,9 +15,14 @@ from backend.app.market.universe import (
     UniverseStoreUnavailable,
     build_universe_contract,
     canonical_json_bytes,
+    classification_snapshot_sha256,
     domain_sha256,
+    source_version_digest,
+    validate_calendar_authority,
     validate_provider_raw_batch,
 )
+from backend.app.user.models import PositionCreate
+from backend.app.user.store import UserDataError, UserStore
 from tests.test_market_universe import _authority, _bundle, _contract, _evidence, _mapping
 
 
@@ -154,6 +160,24 @@ def test_cas_rejects_bad_snapshot_roles_before_head_change(tmp_path):
     assert source.index("RequiredSymbolSnapshotV1.model_validate") < source.index("BEGIN IMMEDIATE")
 
 
+def test_promote_rejects_caller_crafted_required_snapshot(tmp_path):
+    contract = _contract()
+    mapping, evidence, trusted = _bundle(contract)
+    crafted = RequiredSymbolSnapshotV1.model_validate(trusted.model_dump(mode="python"))
+    store = UniverseSidecarStore(tmp_path / "market_universe.sqlite3")
+    store.initialize()
+    with pytest.raises(UniverseStoreUnavailable):
+        store.promote(
+            contract,
+            expected_sequence=0,
+            expected_head_sha256=None,
+            mapping=mapping,
+            evidence=evidence,
+            authority_bundle=_authority(mapping, evidence),
+            required_snapshot=crafted,
+        )
+
+
 def test_classification_projection_is_bound_field_by_field_to_evidence(tmp_path):
     contract = _contract()
     values = contract.model_dump()
@@ -223,6 +247,14 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         }
     )
     second_evidence = tuple(_evidence(member, first.trade_date) for member in members)
+    refs = refs.model_copy(
+        update={
+            "classification_snapshot_sha256": classification_snapshot_sha256(second_evidence),
+        }
+    )
+    refs = refs.model_copy(
+        update={"source_version_digest": source_version_digest(refs, second_evidence)}
+    )
     second_authority = _authority(mapping, second_evidence)
     second = build_universe_contract(
         trade_date=first.trade_date,
@@ -239,6 +271,9 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         members=members,
         classification_evidence=second_evidence,
         authority_bundle=second_authority,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(first.trade_date),
         sequence=2,
         parent_contract_id=first.contract_id,
     )
@@ -395,6 +430,10 @@ def test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection
 def test_builder_without_verified_authority_bundle_is_not_publishable():
     legacy = _contract()
     refs = legacy.source_refs.model_copy(update={"classification_source": "production"})
+    refs = refs.model_copy(
+        update={"classification_snapshot_sha256": classification_snapshot_sha256(())}
+    )
+    refs = refs.model_copy(update={"source_version_digest": source_version_digest(refs, ())})
     contract = build_universe_contract(
         trade_date=legacy.trade_date,
         calendar_generation_id=legacy.calendar_generation_id,
@@ -419,3 +458,100 @@ def _rehash_member(member, evidence_id: str):
     draft = type(member).model_construct(**values)
     values["member_sha256"] = domain_sha256("stock-eva/r2f4.2/universe-member/v1", draft.preimage())
     return type(member).model_validate(values)
+
+
+def test_non_main_board_cannot_enter_effective_base_from_caller_role():
+    """Fourth-review RED: scope_role must not override derived identity."""
+    from tests.test_market_universe import _member
+
+    with pytest.raises(ValueError):
+        _member("sh.688000", role="effective_main_board")
+
+
+def test_reviewed_evidence_requires_observed_at_at_or_before_cutoff():
+    contract = _contract()
+    values = _evidence(contract.members[0], contract.trade_date).model_dump()
+    values["observed_at"] = None
+    with pytest.raises(ValueError):
+        _rehash_evidence(values)
+
+
+def test_source_version_refs_are_derived_not_caller_selected():
+    contract = _contract()
+    refs = contract.source_refs.model_copy(update={"classification_snapshot_sha256": "c" * 64})
+    evidence = tuple(_evidence(item, contract.trade_date) for item in contract.members)
+    with pytest.raises(ValueError):
+        build_universe_contract(
+            trade_date=contract.trade_date,
+            calendar_generation_id=contract.calendar_generation_id,
+            calendar_sha256=contract.calendar_sha256,
+            classification_generation_id=refs.classification_generation_id,
+            classification_generation_sequence=refs.classification_generation_sequence,
+            classification_source=refs.classification_source,
+            classification_source_version=refs.classification_source_version,
+            classification_source_snapshot_date=refs.classification_source_snapshot_date,
+            classification_observed_at=refs.classification_observed_at,
+            exact_pit_cutoff=refs.exact_pit_cutoff,
+            source_refs=refs,
+            members=contract.members,
+            classification_evidence=evidence,
+            authority_bundle=_authority(_mapping(), evidence),
+        )
+
+
+def test_user_snapshot_capture_is_existing_descriptor_bound_and_atomic(tmp_path):
+    store = UserStore(tmp_path / "user.sqlite3")
+    position = store.create_position(
+        PositionCreate(
+            symbol="sh.600000",
+            quantity=1,
+            avg_cost=1,
+            as_of_date=date(2026, 9, 1),
+        )
+    )
+    result = store.capture_required_symbol_snapshot_existing()
+    assert result.snapshot.symbols == (position.symbol,)
+    assert result.snapshot.roles_by_symbol == ((position.symbol, ("position",)),)
+    assert len(result.snapshot_token) == 64
+
+
+def test_user_snapshot_capture_does_not_initialize_missing_database(tmp_path):
+    path = tmp_path / "missing.sqlite3"
+    with pytest.raises(UserDataError):
+        UserStore(path).capture_required_symbol_snapshot_existing()
+    assert not path.exists()
+
+
+def test_calendar_authority_rejects_weekend_and_unavailable_read_result():
+    from backend.app.market.calendar_generation import CalendarReadResult
+    from tests.test_market_universe import _calendar_authority
+
+    authority = _calendar_authority(date(2026, 9, 5))
+    with pytest.raises(ValueError):
+        validate_calendar_authority(
+            authority,
+            trade_date=date(2026, 9, 5),
+            calendar_generation_id="a" * 32,
+            calendar_sha256="a" * 64,
+        )
+    unavailable = CalendarReadResult(status="unavailable")
+    with pytest.raises(ValueError):
+        validate_calendar_authority(
+            unavailable,
+            trade_date=date(2026, 9, 4),
+            calendar_generation_id="a" * 32,
+            calendar_sha256="a" * 64,
+        )
+
+
+def test_reviewed_not_yet_listed_and_delisted_states_have_explicit_mapping():
+    from tests.test_market_universe import _member
+
+    delisted = _member("sh.600010", state="delisted", role="required_user").model_copy(
+        update={"delist_date": date(2026, 9, 1), "member_sha256": None}
+    )
+    contract = _contract((delisted,))
+    evidence = next(item for item in _bundle(contract)[1] if item.symbol == delisted.symbol)
+    assert evidence.listing_status == "delisted"
+    assert evidence.daily_trade_status == "0"
+    assert evidence.suspension_state == "not_supplied"

@@ -1,8 +1,16 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.user.database import user_database_initialization
 from backend.app.user.models import (
@@ -28,6 +36,102 @@ class ConflictError(UserDataError):
 
 class DuplicateError(UserDataError):
     pass
+
+
+_USER_SNAPSHOT_DOMAIN = "stock-eva/r2f4.2/"
+_USER_SYMBOL = r"^(sh|sz)\.[0-9]{6}$"
+_ADMISSION_SECRET = object()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _user_digest(domain: str, value: object) -> str:
+    return hashlib.sha256(
+        (_USER_SNAPSHOT_DOMAIN + domain).encode("ascii")
+        + b"\n"
+        + _canonical_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+class RequiredUserSymbolSnapshot(BaseModel):
+    """The single writer-owned user-symbol observation used by universe admission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[1] = 1
+    snapshot_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    symbols: tuple[str, ...]
+    roles_by_symbol: tuple[tuple[str, tuple[Literal["position", "watchlist"], ...]], ...]
+    captured_at: datetime
+    source: Literal["UserStore.capture_required_symbol_snapshot_existing"]
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("captured_at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("user snapshot timestamp must be timezone aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _identity(self) -> RequiredUserSymbolSnapshot:
+        import re
+
+        if self.symbols != tuple(sorted(set(self.symbols))):
+            raise ValueError("user snapshot symbols must be sorted and unique")
+        if tuple(symbol for symbol, _ in self.roles_by_symbol) != self.symbols:
+            raise ValueError("user snapshot roles must cover symbols exactly")
+        if any(
+            re.fullmatch(_USER_SYMBOL, symbol) is None
+            or not roles
+            or roles != tuple(sorted(set(roles)))
+            for symbol, roles in self.roles_by_symbol
+        ):
+            raise ValueError("user snapshot role identity invalid")
+        # The token is intentionally supplied by the private read wrapper; the
+        # model's digest is checked there using the exact required-symbol preimage.
+        if self.snapshot_id != self.snapshot_sha256[:32]:
+            raise ValueError("user snapshot id is not digest-derived")
+        if not self.snapshot_sha256:
+            raise ValueError("user snapshot digest is empty")
+        return self
+
+
+class RequiredUserSymbolSnapshotRead:
+    """Opaque trusted admission produced only by the existing-store capture."""
+
+    __slots__ = ("snapshot", "snapshot_token")
+
+    def __init__(
+        self,
+        snapshot: RequiredUserSymbolSnapshot,
+        snapshot_token: str,
+        *,
+        _secret: object | None = None,
+    ) -> None:
+        if _secret is not _ADMISSION_SECRET:
+            raise TypeError("user snapshot admission is writer-owned")
+        if not isinstance(snapshot, RequiredUserSymbolSnapshot):
+            raise TypeError("invalid user snapshot")
+        if not isinstance(snapshot_token, str) or len(snapshot_token) != 64:
+            raise TypeError("invalid user snapshot token")
+        expected = _user_digest(
+            "required-symbol-snapshot/v1",
+            {
+                "schema_version": 1,
+                "snapshot_token": snapshot_token,
+                "symbols": [
+                    {"symbol": symbol, "roles": list(roles)}
+                    for symbol, roles in snapshot.roles_by_symbol
+                ],
+            },
+        )
+        if snapshot.snapshot_sha256 != expected:
+            raise TypeError("user snapshot digest mismatch")
+        self.snapshot = snapshot
+        self.snapshot_token = snapshot_token
 
 
 class UserStore:
@@ -74,6 +178,128 @@ class UserStore:
                 """
             )
         return connection
+
+    def _connect_existing(self) -> sqlite3.Connection:
+        """Open only an already existing, exact user DB; never initialize it."""
+        if not self.path.exists() or self.path.is_symlink() or not self.path.is_file():
+            raise UserDataError("existing user database unavailable")
+        try:
+            connection = sqlite3.connect(self.path, timeout=0)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 0")
+            objects = connection.execute(
+                "SELECT type,name,tbl_name FROM sqlite_master "
+                "WHERE type IN ('table','view','trigger') ORDER BY type,name"
+            ).fetchall()
+            if {(row[0], row[1]) for row in objects} != {
+                ("table", "positions"),
+                ("table", "watchlists"),
+                ("table", "watchlist_items"),
+            }:
+                raise UserDataError("user database schema is not exact")
+            expected = {
+                "positions": {
+                    "id",
+                    "symbol",
+                    "quantity",
+                    "avg_cost",
+                    "as_of_date",
+                    "today_buy_qty",
+                    "version",
+                    "created_at",
+                    "updated_at",
+                },
+                "watchlists": {"id", "name", "version", "created_at", "updated_at"},
+                "watchlist_items": {"id", "watchlist_id", "symbol", "created_at"},
+            }
+            for table, columns in expected.items():
+                found = {
+                    row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if found != columns:
+                    raise UserDataError("user database columns are not exact")
+            return connection
+        except (sqlite3.Error, UserDataError):
+            try:
+                connection.close()
+            except UnboundLocalError:
+                pass
+            raise
+
+    def capture_required_symbol_snapshot_existing(self) -> RequiredUserSymbolSnapshotRead:
+        """Capture holdings/watchlist symbols in one existing-DB transaction.
+
+        This is deliberately separate from ``_connect``: a missing or malformed
+        DB must be unavailable, never initialized or migrated as a side effect.
+        """
+        connection = self._connect_existing()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            positions = connection.execute(
+                "SELECT id,symbol,quantity,avg_cost,as_of_date,today_buy_qty,version,"
+                "created_at,updated_at FROM positions ORDER BY id"
+            ).fetchall()
+            watchlists = connection.execute(
+                "SELECT id,name,version,created_at,updated_at FROM watchlists ORDER BY id"
+            ).fetchall()
+            watchlist_ids = tuple(row["id"] for row in watchlists)
+            items = connection.execute(
+                "SELECT id,watchlist_id,symbol,created_at FROM watchlist_items ORDER BY id"
+            ).fetchall()
+            if any(row["watchlist_id"] not in watchlist_ids for row in items):
+                raise UserDataError("watchlist item has no parent")
+
+            roles: dict[str, set[str]] = {}
+            user_rows: list[dict[str, object]] = []
+            for row in positions:
+                symbol = row["symbol"]
+                if not isinstance(symbol, str) or re.fullmatch(_USER_SYMBOL, symbol) is None:
+                    raise UserDataError("user symbol is unsafe")
+                roles.setdefault(symbol, set()).add("position")
+                user_rows.append({"table": "positions", "row": dict(row)})
+            for row in watchlists:
+                user_rows.append({"table": "watchlists", "row": dict(row)})
+            for row in items:
+                symbol = row["symbol"]
+                if not isinstance(symbol, str) or re.fullmatch(_USER_SYMBOL, symbol) is None:
+                    raise UserDataError("user symbol is unsafe")
+                roles.setdefault(symbol, set()).add("watchlist")
+                user_rows.append({"table": "watchlist_items", "row": dict(row)})
+            symbols = tuple(sorted(roles))
+            roles_by_symbol = tuple((symbol, tuple(sorted(roles[symbol]))) for symbol in symbols)
+            token = _user_digest("user-rows/v1", {"schema_version": 1, "user_rows": user_rows})
+            snapshot_sha = _user_digest(
+                "required-symbol-snapshot/v1",
+                {
+                    "schema_version": 1,
+                    "snapshot_token": token,
+                    "symbols": [
+                        {"symbol": symbol, "roles": list(role_values)}
+                        for symbol, role_values in roles_by_symbol
+                    ],
+                },
+            )
+            snapshot = RequiredUserSymbolSnapshot(
+                snapshot_id=snapshot_sha[:32],
+                symbols=symbols,
+                roles_by_symbol=roles_by_symbol,
+                captured_at=datetime.now(UTC),
+                source="UserStore.capture_required_symbol_snapshot_existing",
+                snapshot_sha256=snapshot_sha,
+            )
+            connection.commit()
+            return RequiredUserSymbolSnapshotRead(snapshot, token, _secret=_ADMISSION_SECRET)
+        except Exception as exc:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            if isinstance(exc, UserDataError):
+                raise
+            raise UserDataError("user snapshot capture unavailable") from exc
+        finally:
+            connection.close()
 
     @staticmethod
     def _position(row: sqlite3.Row) -> Position:
