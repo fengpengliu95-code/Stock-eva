@@ -31,6 +31,9 @@ STORE_ID = "stock-eva-universe-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SYMBOL = re.compile(r"^(sh|sz)\.[0-9]{6}$")
 INDEX_SYMBOLS = ("sh.000001", "sz.399001")
+_MAPPING_SCHEMAS = frozenset(
+    {"daily_astock.v1", "classification.instrument.v1", "classification.instrument.v2"}
+)
 
 
 class UniverseStoreUnavailable(RuntimeError):
@@ -208,10 +211,57 @@ class UniverseSemanticMappingV1(_Frozen):
         payload = json.loads(self.payload_json)
         if not isinstance(payload, dict):
             raise ValueError("semantic mapping payload must be an object")
+        if self.source_schema not in _MAPPING_SCHEMAS:
+            raise ValueError("semantic mapping schema is not closed")
         if payload.get("mapping_id") not in (None, self.mapping_id):
             raise ValueError("semantic mapping ID mismatch")
         if payload.get("mapping_version") not in (None, self.mapping_version):
             raise ValueError("semantic mapping version mismatch")
+        if self.source_schema == "classification.instrument.v2":
+            required = {
+                "mapping_id",
+                "mapping_version",
+                "security_type",
+                "exchange",
+                "board",
+                "list_date",
+                "delist_date",
+                "listing_status",
+                "daily_trade_status",
+                "suspension_state",
+                "st_state",
+                "expected_trading_state",
+            }
+            if set(payload) != required:
+                raise ValueError("reviewed instrument mapping payload is incomplete")
+            if (
+                payload["mapping_id"] != self.mapping_id
+                or payload["mapping_version"] != self.mapping_version
+            ):
+                raise ValueError("semantic mapping identity is not authoritative")
+            if payload["security_type"] not in {"stock", "index"}:
+                raise ValueError("semantic mapping security type is not closed")
+            if payload["exchange"] not in {"SSE", "SZSE"}:
+                raise ValueError("semantic mapping exchange is not closed")
+            if payload["board"] not in {"main", "chinext", "star", "bse", "index", "other"}:
+                raise ValueError("semantic mapping board is not closed")
+            if payload["suspension_state"] not in {
+                "trading",
+                "suspended",
+                "not_supplied",
+                "unknown",
+            }:
+                raise ValueError("semantic mapping suspension state is not closed")
+            if payload["st_state"] not in {"yes", "no", "not_applicable", "unknown"}:
+                raise ValueError("semantic mapping ST state is not closed")
+            if payload["expected_trading_state"] not in {
+                "trading",
+                "suspended",
+                "not_yet_listed",
+                "delisted",
+                "unknown",
+            }:
+                raise ValueError("semantic mapping trading state is not closed")
         expected = domain_sha256(
             "stock-eva/r2f4.2/semantic-mapping/v1",
             {
@@ -291,6 +341,18 @@ class UniverseInstrumentEvidenceV1(_Frozen):
             and self.authority_status == "reviewed"
         ):
             raise ValueError("requested-unverified evidence cannot be reviewed")
+        if self.source_schema == "classification.instrument.v2":
+            if self.list_date is None:
+                raise ValueError("instrument listing window evidence is incomplete")
+            if self.member_kind_for_evidence() == "index":
+                if (
+                    self.security_type != "index"
+                    or self.board != "index"
+                    or self.expected_trading_state != "trading"
+                    or self.suspension_state != "trading"
+                    or self.st_state != "not_applicable"
+                ):
+                    raise ValueError("required index evidence semantics are incomplete")
         expected = domain_sha256("stock-eva/r2f4.2/instrument-evidence/v1", self.preimage())
         if expected != self.evidence_sha256:
             raise ValueError("instrument evidence hash mismatch")
@@ -330,6 +392,11 @@ class RequiredSymbolSnapshotV1(_Frozen):
             for symbol, roles in self.symbols
         ):
             raise ValueError("required snapshot identity invalid")
+        if any(
+            ("required_index" in roles) != (symbol in INDEX_SYMBOLS)
+            for symbol, roles in self.symbols
+        ):
+            raise ValueError("required snapshot index role mismatch")
         expected = domain_sha256(
             "stock-eva/r2f4.2/required-symbol-snapshot/v1",
             {
@@ -417,6 +484,9 @@ class UniverseContractV1(_Frozen):
             raise ValueError("partition identity overlap")
         if self.counts.total != len(self.members):
             raise ValueError("contract member count mismatch")
+        expected_counts = _member_counts(self.members)
+        if self.counts.model_copy(update={"loaded": None}) != expected_counts:
+            raise ValueError("contract counts are not derived from member states")
 
         # Partition digests are over the normative projections, never over the
         # generated member digest.  The latter is a verification result and is
@@ -578,13 +648,15 @@ class UniverseHeadV1(_Frozen):
 class UniverseCandidateGate(_Frozen):
     schema_version: Literal[1] = 1
     universe_id: Literal["all-main-board-plus-required-symbols"]
+    scope: Literal["all-main-board-plus-required-symbols"]
     trade_date: date
+    calendar_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_id: Literal["baostock"]
     refresh_id: str
-    contract_sha256: str = Field(default="0" * 64, pattern=r"^[0-9a-f]{64}$")
-    adapter_version: str = Field(default="", max_length=64)
-    endpoint_contract_version: str = Field(default="", max_length=64)
-    calendar_generation_id: str = Field(default="", max_length=128)
+    contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_version: str = Field(min_length=1, max_length=64)
+    endpoint_contract_version: str = Field(min_length=1, max_length=64)
+    calendar_generation_id: str = Field(min_length=1, max_length=128)
     endpoint_counts: tuple[tuple[str, int], ...]
     loaded: int | None
     session_expected: int
@@ -716,10 +788,38 @@ class UniversePublicationContextV1(_Frozen):
         lineage = json.loads(self.publication_lineage_json)
         if not isinstance(lineage, dict):
             raise ValueError("publication lineage must be an object")
+        expected_lineage_keys = {
+            "provider_id",
+            "universe_id",
+            "evidence_id",
+            "evidence_sha256",
+            "candidate_id",
+            "candidate_manifest_sha256",
+            "gate_report_sha256",
+            "adapter_version",
+            "source_schema_version",
+        }
+        if set(lineage) != expected_lineage_keys:
+            raise ValueError("publication lineage field set invalid")
         if canonical_json_bytes(lineage).decode() != self.publication_lineage_json:
             raise ValueError("publication lineage JSON is not canonical")
         if any(not _SHA256.fullmatch(value) for value in self.evidence_refs):
             raise ValueError("publication evidence reference is unsafe")
+        expected_refs = tuple(
+            sorted(
+                {
+                    lineage["evidence_id"],
+                    lineage["evidence_sha256"],
+                    lineage["candidate_id"],
+                    lineage["gate_report_sha256"],
+                }
+            )
+        )
+        if (
+            self.manifest_ref != lineage["candidate_manifest_sha256"]
+            or self.evidence_refs != expected_refs
+        ):
+            raise ValueError("publication context lineage references mismatch")
         if (
             domain_sha256("stock-eva/r2f4.2/publication-lineage/v2", lineage)
             != self.publication_lineage_sha256
@@ -1059,6 +1159,15 @@ def validate_provider_raw_batch(
     loaded: list[str] = []
     counts: list[tuple[str, int]] = []
     reason: str | None = "UNIVERSE_UNKNOWN_NONZERO" if contract.counts.unknown else None
+    expected_session_symbols = {
+        item.symbol
+        for item in contract.members
+        if item.expected_trading_state in {"trading", "suspended"}
+    }
+    scope_binding_invalid = (
+        batch.request.universe_id != contract.universe_id
+        or set(batch.request.session_symbols) != expected_session_symbols
+    )
     if reason is None and not contract.publication_eligible:
         reason = (
             "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED"
@@ -1096,6 +1205,10 @@ def validate_provider_raw_batch(
             loaded.append(symbol)
 
     expected_ordinals = set(plan_by_ordinal)
+    required_endpoints = set(ProviderEndpoint)
+    observed_endpoints = {item.endpoint for item in plan_by_ordinal.values()}
+    if scope_binding_invalid or observed_endpoints != required_endpoints:
+        reason = reason or "UNIVERSE_SESSION_DRIFT"
     successful_ordinals = {
         ordinal
         for ordinal, completion in completion_by_ordinal.items()
@@ -1142,7 +1255,9 @@ def validate_provider_raw_batch(
         for row in item.rows
     }
     if any(plan.endpoint is ProviderEndpoint.ALL_STOCK for plan in plan_by_ordinal.values()):
-        if all_stock_codes != set(item.symbol for item in contract.members):
+        if all_stock_codes != {
+            item.symbol for item in contract.members if item.member_kind == "stock"
+        }:
             reason = reason or "UNIVERSE_SESSION_DRIFT"
     observed = set(loaded)
     missing = len(set(expected_members) - observed)
@@ -1166,7 +1281,9 @@ def validate_provider_raw_batch(
         reason = "UNIVERSE_COUNT_MISMATCH"
     return UniverseCandidateGate(
         universe_id=contract.universe_id,
+        scope=contract.scope,
         trade_date=contract.trade_date,
+        calendar_sha256=contract.calendar_sha256,
         provider_id="baostock",
         refresh_id=batch.request.refresh_id,
         contract_sha256=contract.contract_sha256,
@@ -1323,6 +1440,12 @@ CREATE TABLE universe_head (
     contract_id TEXT NOT NULL, contract_sha256 TEXT NOT NULL, head_sha256 TEXT NOT NULL,
     updated_at TEXT NOT NULL, FOREIGN KEY (contract_id) REFERENCES universe_contract(contract_id)
 );
+CREATE TRIGGER universe_head_no_delete BEFORE DELETE ON universe_head
+BEGIN SELECT RAISE(ABORT,'immutable_head'); END;
+CREATE TRIGGER universe_head_update_guard BEFORE UPDATE ON universe_head
+WHEN NEW.singleton_id != OLD.singleton_id OR NEW.sequence != OLD.sequence + 1
+     OR NEW.contract_id = OLD.contract_id
+BEGIN SELECT RAISE(ABORT,'invalid_head_transition'); END;
 CREATE TRIGGER universe_meta_no_update BEFORE UPDATE ON universe_meta
 BEGIN SELECT RAISE(ABORT,'immutable_meta'); END;
 CREATE TRIGGER universe_meta_no_delete BEFORE DELETE ON universe_meta
@@ -1701,7 +1824,7 @@ class UniverseSidecarStore:
                 (str(row[0]).upper(), str(row[1])): _normalize_sql(row[2])
                 for row in connection.execute(
                     "SELECT type,name,sql FROM sqlite_master "
-                    "WHERE sql IS NOT NULL AND type IN ('table','trigger','index') "
+                    "WHERE sql IS NOT NULL AND type IN ('table','trigger','index','view') "
                     "AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
                 )
             }
@@ -1723,6 +1846,8 @@ class UniverseSidecarStore:
                 )
             }
             expected_triggers = {
+                "universe_head_no_delete",
+                "universe_head_update_guard",
                 "universe_meta_no_update",
                 "universe_meta_no_delete",
                 "universe_source_state_no_update",
@@ -1806,10 +1931,16 @@ class UniverseSidecarStore:
                 row[0]: row
                 for row in connection.execute("SELECT * FROM universe_instrument_evidence")
             }
-            if len({(row[5], row[6]) for row in evidence_rows.values()}) != len(evidence_rows):
-                raise UniverseStoreUnavailable("universe evidence identity conflict")
             for row in evidence_rows.values():
                 UniverseInstrumentEvidenceV1.model_validate(dict(row), strict=False)
+            for contract_id in reachable_contract_ids:
+                contract_evidence_ids = {row[1] for row in links if row[0] == contract_id}
+                contract_identities = [
+                    (evidence_rows[evidence_id][5], evidence_rows[evidence_id][6])
+                    for evidence_id in contract_evidence_ids
+                ]
+                if len(set(contract_identities)) != len(contract_identities):
+                    raise UniverseStoreUnavailable("universe evidence identity conflict")
             for link in links:
                 ev = evidence_rows[link[1]]
                 if tuple(link[3:]) != (ev[5], ev[6], ev[12]):
@@ -1884,7 +2015,7 @@ class UniverseSidecarStore:
             )
             result = results.get(plan.attempt_id)
             if result is not None:
-                UniverseAttemptResultV1(
+                result_model = UniverseAttemptResultV1(
                     attempt_id=result[0],
                     terminal_status=result[1],
                     classification_request_count=result[2],
@@ -1893,6 +2024,17 @@ class UniverseSidecarStore:
                     finished_at=datetime.fromisoformat(result[5].replace("Z", "+00:00")),
                     result_sha256=result[6],
                 )
+                if result_model.source_state_id is not None:
+                    source_state = connection.execute(
+                        "SELECT trade_date,source_version_digest FROM universe_source_state "
+                        "WHERE source_state_id=?",
+                        (result_model.source_state_id,),
+                    ).fetchone()
+                    if source_state is None or (
+                        source_state[0] != plan.trade_date.isoformat()
+                        or source_state[1] != plan.source_version_digest
+                    ):
+                        raise UniverseStoreUnavailable("universe attempt source lineage mismatch")
         if set(results) - {row[0] for row in rows}:
             raise UniverseStoreUnavailable("universe orphan attempt result")
 
@@ -2138,6 +2280,17 @@ class UniverseSidecarStore:
                 )
                 for item in evidence
             }
+            expected_projection = tuple(
+                {
+                    "security_id": item.security_id,
+                    "symbol": item.symbol,
+                    "evidence_id": item.evidence_id,
+                    "exclusion_reason": item.exclusion_reason,
+                }
+                for item in sorted(evidence_models.values(), key=lambda value: value.evidence_id)
+            )
+            if tuple(contract.classification_evidence_projection) != expected_projection:
+                raise UniverseStoreUnavailable("universe classification projection mismatch")
             if any(
                 item.mapping_sha256 != refs.semantic_mapping_sha256
                 or item.source_snapshot_date > contract.trade_date
@@ -2272,6 +2425,7 @@ class UniverseSidecarStore:
             raise UniverseStoreUnavailable("universe sidecar missing")
         connection = self._connect(readonly=True)
         try:
+            connection.execute("BEGIN DEFERRED")
             self._validate(connection)
             row = connection.execute(
                 "SELECT sequence,contract_id,contract_sha256,head_sha256,updated_at "
@@ -2315,6 +2469,7 @@ class UniverseSidecarStore:
             raise UniverseStoreUnavailable("universe sidecar unavailable")
         connection = self._connect(readonly=True)
         try:
+            connection.execute("BEGIN DEFERRED")
             self._validate(connection)
             row = connection.execute(
                 "SELECT sequence,contract_id,contract_sha256,head_sha256,updated_at "
@@ -2407,6 +2562,33 @@ class UniverseSidecarStore:
         evidence: tuple[UniverseInstrumentEvidenceV1, ...] = (),
         required_snapshot: RequiredSymbolSnapshotV1 | None = None,
     ) -> UniverseHeadV1:
+        try:
+            contract = UniverseContractV1.model_validate(
+                contract.model_dump(mode="python"), strict=False
+            )
+            if mapping is not None:
+                mapping = UniverseSemanticMappingV1.model_validate(
+                    mapping.model_dump(mode="python"), strict=False
+                )
+            evidence = tuple(
+                UniverseInstrumentEvidenceV1.model_validate(
+                    item.model_dump(mode="python"), strict=False
+                )
+                for item in evidence
+            )
+            if required_snapshot is not None:
+                required_snapshot = RequiredSymbolSnapshotV1.model_validate(
+                    required_snapshot.model_dump(mode="python"), strict=False
+                )
+                expected_snapshot_symbols = tuple(
+                    (item.symbol, item.scope_roles)
+                    for item in contract.members
+                    if "required_user" in item.scope_roles or "required_index" in item.scope_roles
+                )
+                if required_snapshot.symbols != expected_snapshot_symbols:
+                    raise UniverseStoreUnavailable("universe required snapshot roles mismatch")
+        except (TypeError, ValueError) as exc:
+            raise UniverseStoreUnavailable("universe candidate validation unavailable") from exc
         with _file_lock(self.lock_path):
             connection = self._connect()
             try:
@@ -2451,6 +2633,17 @@ class UniverseSidecarStore:
                 ):
                     raise UniverseStoreUnavailable("excluded evidence lacks exclusion reason")
                 evidence_by_id = {item.evidence_id: item for item in evidence}
+                expected_projection = tuple(
+                    {
+                        "security_id": item.security_id,
+                        "symbol": item.symbol,
+                        "evidence_id": item.evidence_id,
+                        "exclusion_reason": item.exclusion_reason,
+                    }
+                    for item in sorted(evidence, key=lambda value: value.evidence_id)
+                )
+                if tuple(contract.classification_evidence_projection) != expected_projection:
+                    raise UniverseStoreUnavailable("universe classification projection mismatch")
                 for member in contract.members:
                     item = evidence_by_id.get(member.instrument_evidence_id)
                     if (
