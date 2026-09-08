@@ -37,8 +37,9 @@ The implementation therefore proceeds as an additive sidecar and staged compatib
 The legacy BaoStock path remains the canonical path in `off` and `shadow` modes. Mode/profile
 handling follows one matrix: production with any non-`off` mode returns `B_P`
 (`BLOCKED_PRODUCTION_MODE_OFF`), while nonproduction/staging with `enforce` returns `B_E`
-(`BLOCKED_ENFORCE_NOT_ENABLED`); both blocked cells perform zero provider requests. There is no
-callable future-provider seam. TickFlow and Tushare are excluded from this subversion.
+(`BLOCKED_ENFORCE_NOT_ENABLED`); both blocked cells perform zero Universe-provider requests and
+leave the legacy canonical path unchanged. There is no callable future-provider seam. TickFlow and
+Tushare are excluded from this subversion.
 
 ## Functional Requirements
 
@@ -189,8 +190,9 @@ callable future-provider seam. TickFlow and Tushare are excluded from this subve
   legacy BaoStock set and report drift, but MUST NOT change the canonical result. The sole
   production/nonproduction decision is the mode/profile matrix below: production with any
   non-`off` mode returns `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`), while nonproduction/staging with
-  `enforce` returns `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`). Blocked cells perform no provider request;
-  there is no callable provider seam in this subversion. `shadow` is available only to explicitly
+  `enforce` returns `B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`). Blocked cells perform no
+  Universe-provider request; the legacy canonical path remains unchanged. There is no callable
+  provider seam in this subversion. `shadow` is available only to explicitly
   isolated offline/staging verification.
 
 The mode/profile matrix is normative and evaluated before any Universe provider construction:
@@ -434,7 +436,8 @@ failure is observable by an allowlisted reason, and no retry storm or canonical 
 is read-only, compares only legacy BaoStock and returns private diagnostic drift without blocking;
 **When** mode/profile is evaluated, **Then** production with any non-`off` mode is
 `B_P` (`BLOCKED_PRODUCTION_MODE_OFF`) and nonproduction/staging `enforce` is
-`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`), with no provider request and no source switch.
+`B_E` (`BLOCKED_ENFORCE_NOT_ENABLED`), with no Universe-provider request and no source switch;
+the legacy canonical path remains unchanged.
 
 ### AC-18: Frozen predecessor surfaces (FR-25, FR-27, NFR-10, NFR-12)
 
@@ -681,7 +684,9 @@ interface UniversePublicationContext {
 
 interface CanonicalRefreshExecution {
   result: RefreshResult;
-  legacy_shadow_input: MainBoardInspection | null; // private, never serialized
+  legacy_shadow_input: LegacyPreflightSnapshot | null; // private, never serialized
+  builder_outcome: "accepted" | "rejected"; // private, never serialized
+  builder_diagnostic: LegacyBuilderDiagnostic | null; // counts/hashes only, private
 }
 
 class CanonicalRefreshCallable(Protocol) {
@@ -694,10 +699,11 @@ class CanonicalRefreshCallable(Protocol) {
 
 `CanonicalRefreshCallable` is the direct callable returned by `canonical_refresh_callback`; its
 additive `CanonicalRefreshExecution` wrapper carries the unchanged legacy `RefreshResult` plus a
-private, stack-owned `MainBoardInspection`. The callback calls the private inspection exactly once
-immediately before the builder, passes that same immutable object to the builder, and includes it
-in both builder-success and builder-rejection results; one builder call therefore yields one
-wrapper and no provider retry. The service unwraps
+private, stack-owned `LegacyPreflightSnapshot`, `builder_outcome` and sanitized
+`builder_diagnostic`. The callback calls the private inspection exactly once immediately before
+the builder, passes that same immutable object to the builder, and includes the resulting observed
+projection in both builder-success and builder-rejection results; one builder call therefore
+yields one wrapper and no provider retry. The service unwraps
 `execution.result` for the existing `AutomationOutcome`/legacy flow, passes only the private input
 to `_offer_shadow`, and releases it in `finally`; neither the input nor raw symbols enter
 `AutomationOutcome`, logs, persistence or public output. The callback also owns the thread-safe
@@ -711,11 +717,17 @@ constructs neither writer nor provider. A missing/non-callable consume method sk
 work and preserves the legacy result.
 The call order is fixed: (1) callback calls `inspect_legacy_main_board_input` exactly once and
 freezes its immutable `MainBoardInspection`; (2) it calls the additive builder seam once with
-`inspection=...`; (3) it returns `CanonicalRefreshExecution`; (4) the service unwraps `result` and
-calls `_offer_shadow(prevalidation=legacy_shadow_input, ...)`; (5) the service releases the
-private input in `finally`; (6) only then does it continue the existing post-publish/Universe
-offer ordering. Snapshot-capture, observer, handoff or release exceptions are isolated and cannot
-replace the returned legacy result or trigger another provider request.
+`inspection=...`; (3) on acceptance it freezes the builder's `ProviderRequest.session_symbols` as
+the observed projection, while on rejection it freezes sorted inspection main-board symbols plus
+the fixed index additions `("sh.000001", "sz.399001")`; (4) it assigns
+`builder_outcome` and the counts/hash-only `builder_diagnostic` in that builder try/except and
+returns `CanonicalRefreshExecution`; (5) the service unwraps `result` and calls
+`_offer_shadow(prevalidation=legacy_shadow_input, builder_outcome=builder_outcome,
+builder_diagnostic=builder_diagnostic, ...)`; (6) the service releases the private input in
+`finally`; (7) only then does it continue the existing post-publish/Universe offer ordering.
+Fetch, quality, publish and shadow failures MUST NOT change the already-assigned
+`builder_outcome`. Snapshot-capture, observer, handoff or release exceptions are isolated and
+cannot replace the returned legacy result or trigger another provider request.
 
 The internal legacy request seam is deliberately additive and optional:
 
@@ -736,6 +748,19 @@ function build_canonical_raw_request(
   adapter: BaoStockAdapter, *, trade_date: string, refresh_id: string,
   required_symbols: Set<string>, inspection: MainBoardInspection | null = null,
 ) -> ProviderRequest;
+
+interface LegacyPreflightSnapshot {
+  inspection: MainBoardInspection;
+  observed_symbols: readonly string[]; // private call-stack data only
+  observed_symbol_count: number;
+  observed_symbols_sha256: string;
+}
+interface LegacyBuilderDiagnostic {
+  outcome: "accepted" | "rejected";
+  observed_symbol_count: number;
+  observed_symbols_sha256: string;
+  failure_class: "NONE" | "INPUT_REJECTED" | "BUILDER_ERROR";
+}
 ```
 
 When `inspection` is supplied, `build_canonical_raw_request` MUST consume that exact object and
@@ -745,11 +770,14 @@ switch. The callback owns the immutable snapshot until `_offer_shadow` returns, 
 in `finally`. Builder acceptance and rejection both return the additive wrapper and the private
 diagnostic may expose only counts/hashes. Raw `symbols` MUST NOT cross the wrapper's public
 boundary, enter `AutomationOutcome`, logs or persistence, or be placed in `LegacyShadowHandoff`.
-The three offline regressions are mandatory: `test_legacy_inspection_called_once_and_builder_consumes_snapshot`
+The five offline regressions are mandatory: `test_legacy_inspection_called_once_and_builder_consumes_snapshot`
 proves inspection call count is exactly one and the builder receives the same object identity;
 `test_legacy_builder_default_argument_compatibility` proves an omitted optional argument preserves
 default compatibility; and `test_legacy_rejection_diagnostic_privacy` proves a rejected builder
-still yields only count/hash diagnostics with no raw symbols.
+still yields only count/hash diagnostics with no raw symbols. `test_legacy_shadow_normal_session_no_drift`
+proves a normal legacy session's fixed-index observed projection returns `NONE`, while
+`test_legacy_shadow_missing_required_addition_drift` proves a missing required ChiNext/STAR
+addition returns `LEGACY_SHADOW_DRIFT` by count/hash only.
 
 In the canonical callback implementation, immediately after `store.save_refresh` returns success
 the code freezes `ready_result`. It then runs context construction and the holder seal in an
@@ -838,7 +866,8 @@ interface LegacyShadowObservation {
   control_reason: "CONTROL_STATE_UNAVAILABLE" | null;
 }
 function observe_legacy_request_universe(
-  snapshot: MainBoardInspection, contract: UniverseContractV1 | null,
+  snapshot: LegacyPreflightSnapshot, builder_outcome: "accepted" | "rejected",
+  builder_diagnostic: LegacyBuilderDiagnostic | null, contract: UniverseContractV1 | null,
 ): LegacyShadowObservation;
 interface LegacyShadowHandoff {
   trade_date: string;
@@ -851,15 +880,22 @@ The legacy builder's `ProviderRequest` is already sorted-unique and its prefligh
 outside the main-board scope. Therefore the observer does not claim to inspect duplicate provider
 rows or an unreturned request. At the pre-validation boundary the callback calls
 `inspect_legacy_main_board_input` once and passes the resulting immutable `MainBoardInspection`
-to the builder; this is the only observed input and remains available even when the builder
-rejects a non-main-board symbol. The snapshot is owned by the callback's private call stack and is
-released after `_offer_shadow`; it is never logged, persisted or placed in `LegacyShadowHandoff`.
-The canonical path and its failure result are never changed by this capture.
+to the builder; this is the only inspection input. An accepted builder creates the immutable
+`LegacyPreflightSnapshot.observed_symbols` from the built `ProviderRequest.session_symbols`; a
+rejected builder creates it from sorted inspection main-board symbols plus exactly
+`("sh.000001", "sz.399001")`. Thus a required ChiNext/STAR addition can remain missing in the
+legacy observed set and report drift. The accepted `session_symbols` are the builder's sorted
+main-board projection merged with that same fixed `INDEX_SYMBOLS` tuple; the rejected path uses
+the identical fixed tuple because no `ProviderRequest` exists. The snapshot is owned by the callback's private call stack
+and is released after `_offer_shadow`; it is never logged, persisted or placed in
+`LegacyShadowHandoff`. The canonical path and its failure result are never changed by this capture.
 
 With a contract, `expected_symbols` is the lexicographically sorted unique projection of contract
 members whose effective session state is `trading` or `suspended`, including required additions
-and the two required indexes. `observed_symbols` is the sorted unique
-`MainBoardInspection.main_board_symbols` sequence;
+and the two required indexes. `observed_symbols` is the snapshot's sorted unique observed
+projection: the actual `ProviderRequest.session_symbols` for `builder_outcome="accepted"`, or
+`MainBoardInspection.main_board_symbols ∪ ("sh.000001", "sz.399001")` for
+`builder_outcome="rejected"`;
 `missing_symbols = expected_symbols - observed_symbols` and
 `extra_symbols = observed_symbols - expected_symbols`. The sets use canonical `symbol` identity
 and UTF-8 lexical order. A preflight rejection is retained in `builder_outcome` but is not
@@ -876,15 +912,16 @@ With no persisted contract, the typed result is `NO_COMPARISON` with
 
 The observer is invoked in nonproduction `shadow` either at preflight rejection or after a
 successful canonical refresh and CandidateStore evidence readback. The internal call is
-`_offer_shadow(*, prevalidation: MainBoardInspection | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
+`_offer_shadow(*, prevalidation: LegacyPreflightSnapshot | None, builder_outcome: "accepted" | "rejected", builder_diagnostic: LegacyBuilderDiagnostic | None, contract: UniverseContractV1 | None) -> LegacyShadowHandoff | None`;
 the raw prevalidation value is stack-owned for that call only. Its typed handoff is
 `LegacyShadowHandoff {trade_date, builder_outcome, diagnostic}` from the refresh orchestration to
 the existing bounded shadow diagnostic channel, at most once per scheduler tick. It is not persisted
 in the Universe sidecar, head, attempt or public status. A missing contract yields the typed
 `NO_COMPARISON/CONTROL_STATE_UNAVAILABLE` result, never a blocked hook status. A diagnostic-channel
 failure is sanitized and isolated; it cannot change the canonical result or `UniverseHookResult`.
-The handoff contains counts and hashes only; raw symbols exist only during the private comparison
-stack frame and are never emitted to logs or storage.
+The handoff consumes `builder_outcome`, `builder_diagnostic` and the snapshot's observed
+projection, but contains counts and hashes only; raw symbols exist only during the private
+comparison stack frame and are never emitted to logs or storage.
 The observer never filters, patches or changes the builder's default behavior, does not call
 BaoStock, and is not a provider acquisition seam; the optional typed inspection argument is the
 only additive seam.
@@ -1480,12 +1517,14 @@ cannot emit `B_P` or `B_E`.
    inspection input and preserve the builder's default `build_canonical_raw_request` behavior.
 4. Add the private optional `MainBoardInspection` argument to `build_canonical_raw_request` and
    have the callback call `inspect_legacy_main_board_input` exactly once, passing the same object
-   to the builder; keep the omitted-argument path byte/behavior compatible and keep raw symbols
-   stack-private.
+   to the builder; on acceptance snapshot the built `ProviderRequest.session_symbols`, and on
+   rejection snapshot inspection main-board symbols plus `("sh.000001", "sz.399001")`. Assign
+   `builder_outcome` and sanitized counts/hash `builder_diagnostic` in the builder try/except;
+   keep the omitted-argument path byte/behavior compatible and keep raw symbols stack-private.
 5. Apply the mode/profile matrix before any provider construction: production non-`off` returns
-   `B_P` and nonproduction/staging `enforce` returns `B_E`, both with zero provider requests. The
-   callback is not an enforce seam in this release; no production path may route through it and no
-   secondary provider is accepted.
+   `B_P` and nonproduction/staging `enforce` returns `B_E`, both with zero Universe-provider
+   requests while the legacy canonical path remains unchanged. The callback is not an enforce seam
+   in this release; no production path may route through it and no secondary provider is accepted.
 6. Add tests proving missing/extra/duplicate/non-session/mixed-provider batches, invalid
    `tradestatus`/suspended placeholders and session drift reject as a whole before Normalize, and
    that no symbol-level source stitching is possible.
@@ -1739,7 +1778,7 @@ range notation is used for review evidence.
 | AC-14 | Step 6 read-only API/CLI zero-write, source-state ordering/date-matrix and split parse/future tests (`test_status_source_state_order_and_date_matrix`, `test_status_lexical_invalid_zero_io`, `test_status_future_requires_sidecar_proof`) |
 | AC-15 | Step 5 post-success ordering/priority/callback isolation, `test_canonical_refresh_execution_carries_private_snapshot_on_builder_rejection` and `test_disabled_maintenance_zero_hook_write_requests` |
 | AC-16 | Step 5 failed-maintenance prior-head preservation tests |
-| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer/privacy tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy`) |
+| AC-17 | Step 4 legacy off/shadow/enforce compatibility and read-only pre-validation observer/privacy tests (`test_legacy_shadow_prevalidation_no_comparison_and_drift`, `test_legacy_shadow_handoff_excludes_raw_symbols`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy`, `test_legacy_shadow_normal_session_no_drift`, `test_legacy_shadow_missing_required_addition_drift`) |
 | AC-18 | Step 8 protected predecessor hash/regression tests |
 | AC-19 | Step 8 offline fake/provider-boundary tests |
 | AC-20 | Step 4 pure pre-Normalize raw-batch aggregate tests |
@@ -1798,7 +1837,7 @@ accepted as a substitute.
 | FR-21 — Sanitized diagnostics | Step 6 sanitized-output scan |
 | FR-22 — Maintenance priority | Step 5 automation priority and `test_disabled_maintenance_zero_hook_write_requests` |
 | FR-23 — Classification maintenance trigger | Step 5 cadence/daily-ceiling and source-digest-change test |
-| FR-24 — Legacy compatibility modes | `test_legacy_off_shadow_and_enforce_compatibility`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy` |
+| FR-24 — Legacy compatibility modes | `test_legacy_off_shadow_and_enforce_compatibility`, `test_legacy_inspection_called_once_and_builder_consumes_snapshot`, `test_legacy_builder_default_argument_compatibility`, `test_legacy_rejection_diagnostic_privacy`, `test_legacy_shadow_normal_session_no_drift`, `test_legacy_shadow_missing_required_addition_drift` |
 | FR-25 — No authority widening | frozen predecessor/provider allowlist scan |
 | FR-26 — Safe migration path | Step 2 writer-only v1/no-migration test |
 | FR-27 — Frozen predecessor contracts | final protected-contract regression test |
