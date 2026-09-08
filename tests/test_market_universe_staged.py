@@ -1,9 +1,12 @@
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from backend.app.classification.models import ClassificationSnapshot
+from backend.app.classification.store import ClassificationReadSnapshot
 from backend.app.config import Settings
 from backend.app.market.automation import (
     CanonicalRefreshExecution,
@@ -11,19 +14,57 @@ from backend.app.market.automation import (
     MainBoardInspection,
     MarketAutomationService,
     UniverseHookResult,
+    UniverseMaintenanceService,
+    _calendar_failure_reason,
     classify_universe_mode,
     observe_legacy_request_universe,
+)
+from backend.app.market.calendar_generation import (
+    CalendarGenerationError,
+    CalendarStoreUnavailable,
 )
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
 from backend.app.market.universe import (
+    SourceRefsV1,
     UniverseAttemptPlanV1,
+    UniversePublicationContextV1,
     UniverseSidecarStore,
+    canonical_json_bytes,
+    classification_snapshot_sha256,
     domain_sha256,
+    source_version_digest,
 )
 from tests.test_market_automation import synthetic_calendar
+from tests.test_market_universe import (
+    _authority,
+    _bundle,
+    _calendar_authority,
+    _contract,
+    _user_capture,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def test_calendar_failure_reason_preserves_control_conflict_and_unavailable_classes():
+    assert _calendar_failure_reason(CalendarStoreUnavailable("locked")) == (
+        "CONTROL_STATE_UNAVAILABLE"
+    )
+    assert _calendar_failure_reason(CalendarGenerationError("source conflict")) == (
+        "CALENDAR_CONFLICT"
+    )
+    assert _calendar_failure_reason(CalendarGenerationError("missing generation")) == (
+        "CALENDAR_UNAVAILABLE"
+    )
+    assert (
+        _calendar_failure_reason(
+            authority=SimpleNamespace(
+                read_result=SimpleNamespace(reason="CALENDAR_CONFLICT_SOURCE_UNAVAILABLE")
+            )
+        )
+        == "CALENDAR_CONFLICT"
+    )
 
 
 def test_settings_expose_closed_universe_maintenance_matrix():
@@ -239,8 +280,12 @@ def test_ordinary_refresh_result_never_enters_universe_service(tmp_path: Path):
     assert calls == []
 
 
-def _attempt_plan(*, operation_day: date = date(2026, 8, 20), attempt_id: str = "attempt-1"):
-    created = datetime(2026, 8, 20, 0, tzinfo=UTC)
+def _attempt_plan(
+    *,
+    operation_day: date = date(2026, 8, 20),
+    attempt_id: str = "attempt-1",
+    created: datetime = datetime(2026, 8, 20, 0, tzinfo=UTC),
+):
     values = {
         "attempt_id": attempt_id,
         "hook_kind": "universe_post_success",
@@ -259,6 +304,9 @@ def _attempt_plan(*, operation_day: date = date(2026, 8, 20), attempt_id: str = 
         "operation_day": values["operation_day"].isoformat(),
         "canonical_run_id": values["canonical_run_id"],
         "source_version_digest": values["source_version_digest"],
+    }
+    plan_preimage = {
+        **dedup_preimage,
         "hook_kind": values["hook_kind"],
         "refresh_id": values["refresh_id"],
         "request_budget": 1,
@@ -270,7 +318,7 @@ def _attempt_plan(*, operation_day: date = date(2026, 8, 20), attempt_id: str = 
         "stock-eva/r2f4.2/universe-attempt-dedup/v1", dedup_preimage
     )
     values["planned_sha256"] = domain_sha256(
-        "stock-eva/r2f4.2/universe-attempt-plan/v1", dedup_preimage
+        "stock-eva/r2f4.2/universe-attempt-plan/v1", plan_preimage
     )
     return UniverseAttemptPlanV1(**values)
 
@@ -280,3 +328,246 @@ def test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar(tm
     plan = _attempt_plan()
     assert store.claim_attempt(plan).claimed is True
     assert store.claim_attempt(plan).claimed is False
+
+
+def test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete():
+    first = _attempt_plan()
+    second = _attempt_plan(attempt_id="attempt-2", created=datetime(2026, 8, 20, 0, 1, tzinfo=UTC))
+    assert first.dedup_key == second.dedup_key
+    assert first.planned_sha256 != second.planned_sha256
+
+
+def _maintenance_context(target: date, run_id: str = "run-maintenance"):
+    lineage = {
+        "provider_id": "baostock",
+        "universe_id": "all-main-board-plus-required-symbols",
+        "evidence_id": "a" * 64,
+        "evidence_sha256": "b" * 64,
+        "candidate_id": "c" * 64,
+        "candidate_manifest_sha256": "d" * 64,
+        "gate_report_sha256": "e" * 64,
+        "adapter_version": "r2f2.v1",
+        "source_schema_version": "daily_astock.v1",
+    }
+    lineage_json = canonical_json_bytes(lineage).decode()
+    evidence_refs = tuple(
+        sorted(
+            {
+                lineage["evidence_sha256"],
+                lineage["candidate_manifest_sha256"],
+                lineage["gate_report_sha256"],
+            }
+        )
+    )
+    values = {
+        "run_id": run_id,
+        "trade_date": target,
+        "manifest_ref": lineage["candidate_manifest_sha256"],
+        "evidence_refs": evidence_refs,
+        "publication_lineage_json": lineage_json,
+        "publication_lineage_sha256": domain_sha256(
+            "stock-eva/r2f4.2/publication-lineage/v2", lineage
+        ),
+        "status": "ready",
+        "created_at": datetime(2026, 9, 1, 18, tzinfo=UTC),
+    }
+    context_sha = domain_sha256(
+        "stock-eva/r2f4.2/universe-publication-context/v1",
+        {
+            **values,
+            "trade_date": target.isoformat(),
+            "evidence_refs": list(evidence_refs),
+            "created_at": values["created_at"].astimezone(UTC).isoformat(),
+        },
+    )
+    values.update(context_id=context_sha[:32], context_sha256=context_sha)
+    return UniversePublicationContextV1.model_validate(values)
+
+
+@pytest.mark.parametrize("generation", [None, "requested_unverified", "future"])
+def test_maintenance_unqualified_classification_is_durable_and_never_calls_provider(
+    tmp_path: Path, generation
+):
+    target = date(2026, 9, 1)
+    context = _maintenance_context(target)
+    classification_calls = []
+    provider_calls = []
+    generation_value = (
+        None
+        if generation is None
+        else SimpleNamespace(
+            generation_id="classification-1",
+            sequence=1,
+            source="baostock",
+            source_version="v1",
+            source_snapshot_date=date(2026, 8, 31),
+            source_date_semantics=(
+                "source_observed" if generation == "future" else "requested_unverified"
+            ),
+            observed_at=datetime(2026, 9, 1, 20 if generation == "future" else 8, tzinfo=UTC),
+        )
+    )
+
+    class ClassificationReader:
+        def read_snapshot(self, as_of, *, known_at, include_securities):
+            classification_calls.append((as_of, known_at, include_securities))
+            return ClassificationReadSnapshot(
+                ready_generation_id=None,
+                generation=generation_value,
+                securities=[],
+                security_snapshot_date=None,
+                index_components=[],
+                index_snapshot_date=None,
+                sector_memberships=[],
+                sector_snapshot_date=None,
+            )
+
+    class UserReader:
+        def capture_required_symbol_snapshot_existing(self):
+            raise AssertionError("unqualified classification must not read UserStore")
+
+    def provider_factory(**_kwargs):
+        provider_calls.append(True)
+        raise AssertionError("unqualified classification must not construct provider")
+
+    sidecar = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+    service = UniverseMaintenanceService(
+        sidecar=sidecar,
+        calendar_store=SimpleNamespace(read_authority=lambda: _calendar_authority(target)),
+        classification_store=ClassificationReader(),
+        user_store=UserReader(),
+        lock_path=tmp_path / "refresh.lock",
+        provider_factory=provider_factory,
+        context_validator=lambda value, **_kwargs: value,
+        clock=lambda: datetime(2026, 9, 1, 19, tzinfo=UTC),
+    )
+
+    result = service(
+        trade_date=target.isoformat(),
+        now="2026-09-01T19:00:00+00:00",
+        context=context,
+        sidecar=sidecar,
+    )
+    expected_reason = {
+        None: "CLASSIFICATION_UNAVAILABLE",
+        "requested_unverified": "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED",
+        "future": "PIT_CUTOFF_VIOLATION",
+    }[generation]
+    assert result.status == "BLOCKED"
+    assert result.reason_code == expected_reason
+    assert result.provider_requests == 0
+    assert provider_calls == []
+    assert classification_calls[0][0] == target
+    assert classification_calls[0][1] == datetime(2026, 9, 1, 19, tzinfo=UTC)
+    assert classification_calls[0][2] is True
+    assert sidecar.read_latest_terminal_finished_at(target) is not None
+
+
+def test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop(tmp_path: Path):
+    target = date(2026, 9, 1)
+    contract_fixture = _contract(trade_date=target)
+    mapping, evidence, _snapshot = _bundle(contract_fixture)
+    authority = _authority(mapping, evidence)
+    provider_calls = []
+
+    class ReviewedAuthority:
+        def preflight_source_version_digest(self, *, snapshot):
+            refs = SourceRefsV1(
+                calendar_generation_id="0" * 32,
+                calendar_sha256="0" * 64,
+                classification_generation_id="cls-1",
+                classification_generation_sequence=1,
+                classification_source="fixture",
+                classification_source_version="v1",
+                classification_source_snapshot_date=date(2026, 8, 31),
+                classification_observed_at=datetime(2026, 9, 1, 8, tzinfo=UTC),
+                classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+                required_symbol_snapshot_id="0" * 32,
+                required_symbol_snapshot_sha256="0" * 64,
+                instrument_evidence_ids=tuple(item.evidence_id for item in evidence),
+                semantic_mapping_sha256=mapping.mapping_sha256,
+                source_version_digest="0" * 64,
+                provider_id="baostock",
+                trade_date=target,
+                exact_pit_cutoff=datetime(2026, 9, 1, 19, tzinfo=UTC),
+                source_date_semantics="source_observed",
+            )
+            return source_version_digest(refs, evidence)
+
+        def admit(self, snapshot, *, trade_date, refresh_id):
+            return authority
+
+    class Provider:
+        max_attempts = 1
+
+        def fetch(self, trade_date):
+            provider_calls.append(trade_date)
+            return ClassificationSnapshot(
+                source="baostock",
+                source_version="fixture",
+                source_snapshot_date=trade_date,
+                source_date_semantics="source_observed",
+                observed_at=datetime(2026, 9, 1, 18, tzinfo=UTC),
+            )
+
+    def provider_factory(**kwargs):
+        assert kwargs == {"max_attempts": 1}
+        return Provider()
+
+    sidecar = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+    service = UniverseMaintenanceService(
+        sidecar=sidecar,
+        calendar_store=SimpleNamespace(read_authority=lambda: _calendar_authority(target)),
+        classification_store=SimpleNamespace(
+            read_snapshot=lambda as_of, **kwargs: ClassificationReadSnapshot(
+                ready_generation_id="cls-1",
+                generation=SimpleNamespace(
+                    generation_id="cls-1",
+                    sequence=1,
+                    source="fixture",
+                    source_version="v1",
+                    source_snapshot_date=date(2026, 8, 31),
+                    source_date_semantics="source_observed",
+                    observed_at=datetime(2026, 9, 1, 8, tzinfo=UTC),
+                ),
+                securities=[],
+                security_snapshot_date=None,
+                index_components=[],
+                index_snapshot_date=None,
+                sector_memberships=[],
+                sector_snapshot_date=None,
+            )
+        ),
+        user_store=SimpleNamespace(
+            capture_required_symbol_snapshot_existing=lambda: _user_capture(
+                contract_fixture.members
+            )
+        ),
+        lock_path=tmp_path / "refresh.lock",
+        provider_factory=provider_factory,
+        context_validator=lambda value, **_kwargs: value,
+        reviewed_authority=ReviewedAuthority(),
+        clock=lambda: datetime(2026, 9, 1, 19, tzinfo=UTC),
+    )
+    context = _maintenance_context(target)
+    first = service(
+        trade_date=target.isoformat(),
+        now="2026-09-01T19:00:00+00:00",
+        context=context,
+        sidecar=sidecar,
+    )
+    second = service(
+        trade_date=target.isoformat(),
+        now="2026-09-01T19:30:00+00:00",
+        context=context,
+        sidecar=sidecar,
+    )
+    assert first.status == "PROMOTED", first
+    assert first.provider_requests == 1
+    assert second.status == "DEFER"
+    assert second.reason_code == "NONE"
+    assert second.provider_requests == 0
+    assert provider_calls == [target]
+    head, promoted = sidecar.read_verified_snapshot()
+    assert head.sequence == 1
+    assert promoted.trade_date == target

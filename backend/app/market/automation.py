@@ -24,7 +24,11 @@ from backend.app.classification.store import ClassificationReadSnapshot, Classif
 from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.calendar import SHANGHAI, TradingCalendar
-from backend.app.market.calendar_generation import CalendarGenerationStore
+from backend.app.market.calendar_generation import (
+    CalendarGenerationError,
+    CalendarGenerationStore,
+    CalendarStoreUnavailable,
+)
 from backend.app.market.candidates import (
     CandidateStore,
     PublishedSelection,
@@ -107,6 +111,23 @@ class _UniverseProviderAcquisitionFailure(ProviderHealthError):
     def __init__(self, message: str, *, request_count: int) -> None:
         super().__init__(message)
         self.request_count = request_count
+
+
+def _calendar_failure_reason(
+    error: BaseException | None = None,
+    authority: object | None = None,
+) -> str:
+    """Map calendar control failures without exposing source exception text."""
+    if isinstance(error, CalendarStoreUnavailable):
+        return "CONTROL_STATE_UNAVAILABLE"
+    if isinstance(error, CalendarGenerationError):
+        return (
+            "CALENDAR_CONFLICT" if "conflict" in str(error).casefold() else "CALENDAR_UNAVAILABLE"
+        )
+    reason = getattr(getattr(authority, "read_result", None), "reason", None)
+    if isinstance(reason, str) and "conflict" in reason.casefold():
+        return "CALENDAR_CONFLICT"
+    return "CALENDAR_UNAVAILABLE"
 
 
 def _safe_outcome_id(outcome: "AutomationOutcome") -> str:
@@ -372,6 +393,7 @@ class UniverseMaintenanceService:
         evidence_root: Path | None = None,
         context_validator: Callable[..., object] | None = None,
         reviewed_authority: object | None = None,
+        interval_seconds: int = 86400,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.sidecar = sidecar
@@ -383,6 +405,7 @@ class UniverseMaintenanceService:
         self.evidence_root = Path(evidence_root) if evidence_root is not None else None
         self.context_validator = context_validator
         self.reviewed_authority = reviewed_authority
+        self.interval_seconds = interval_seconds
         self.clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
@@ -428,16 +451,23 @@ class UniverseMaintenanceService:
                 "instrument_evidence": [],
             }
         else:
+            observed_at = getattr(generation, "observed_at", None)
+            if isinstance(observed_at, datetime) and observed_at.tzinfo is not None:
+                observed_text = observed_at.astimezone(UTC).isoformat()
+            else:
+                # This value is only a durable identity for a blocked attempt; it is
+                # never admitted into SourceRefs until the strict PIT check passes.
+                observed_text = str(observed_at)
             projection = {
                 "provider_id": "baostock",
                 "adapter_version": "r2f4.2-universe.v1",
                 "endpoint_contract_version": "r2f4-endpoints.v1",
                 "classification": {
-                    "source": generation.source,
-                    "source_version": generation.source_version,
-                    "sequence": generation.sequence,
-                    "observed_at": generation.observed_at.astimezone(UTC).isoformat(),
-                    "source_date_semantics": generation.source_date_semantics,
+                    "source": getattr(generation, "source", None),
+                    "source_version": getattr(generation, "source_version", None),
+                    "sequence": getattr(generation, "sequence", None),
+                    "observed_at": observed_text,
+                    "source_date_semantics": getattr(generation, "source_date_semantics", None),
                 },
                 "classification_snapshot_sha256": None,
                 "semantic_mapping_sha256": None,
@@ -454,17 +484,16 @@ class UniverseMaintenanceService:
         if generation is None:
             return UniverseMaintenanceService._preflight_digest(snapshot)
         evidence = authority.evidence
-        observed_at = max(item.observed_at for item in evidence if item.observed_at)
         refs = SourceRefsV1(
             calendar_generation_id="0" * 32,
             calendar_sha256="0" * 64,
-            classification_generation_id=generation.generation_id,
-            classification_generation_sequence=generation.sequence,
-            classification_source=generation.source,
-            classification_source_version=generation.source_version,
-            classification_source_snapshot_date=generation.source_snapshot_date,
-            classification_observed_at=observed_at,
-            classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+            classification_generation_id=authority.classification_generation_id,
+            classification_generation_sequence=authority.classification_generation_sequence,
+            classification_source=authority.classification_source,
+            classification_source_version=authority.classification_source_version,
+            classification_source_snapshot_date=authority.classification_source_snapshot_date,
+            classification_observed_at=authority.classification_observed_at,
+            classification_snapshot_sha256=authority.classification_snapshot_sha256,
             required_symbol_snapshot_id="0" * 32,
             required_symbol_snapshot_sha256="0" * 64,
             instrument_evidence_ids=tuple(sorted(item.evidence_id for item in evidence)),
@@ -472,10 +501,77 @@ class UniverseMaintenanceService:
             source_version_digest="0" * 64,
             provider_id="baostock",
             trade_date=generation.source_snapshot_date,
-            exact_pit_cutoff=observed_at,
+            exact_pit_cutoff=generation.observed_at,
             source_date_semantics="source_observed",
         )
         return source_version_digest(refs, evidence)
+
+    @staticmethod
+    def _authority_binds_generation(
+        authority: UniverseAuthorityBundleV1,
+        generation: object,
+    ) -> bool:
+        return (
+            authority.classification_generation_id == getattr(generation, "generation_id", None)
+            and authority.classification_generation_sequence
+            == getattr(generation, "sequence", None)
+            and authority.classification_source == getattr(generation, "source", None)
+            and authority.classification_source_version
+            == getattr(generation, "source_version", None)
+            and authority.classification_source_snapshot_date
+            == getattr(generation, "source_snapshot_date", None)
+            and authority.classification_observed_at == getattr(generation, "observed_at", None)
+            and authority.source_date_semantics
+            == getattr(generation, "source_date_semantics", None)
+            and authority.classification_snapshot_sha256
+            == classification_snapshot_sha256(authority.evidence)
+        )
+
+    def _current_head_contract(self) -> tuple[UniverseHeadV1 | None, object | None]:
+        """Read one strict current head; permit only a proven empty sidecar."""
+        try:
+            return self.sidecar.read_verified_snapshot()
+        except UniverseStoreUnavailable:
+            path = getattr(self.sidecar, "path", None)
+            if isinstance(path, Path) and not path.exists():
+                return None, None
+            try:
+                if self.sidecar.read_head() is None:
+                    return None, None
+            except UniverseStoreUnavailable:
+                raise
+            raise
+
+    def _is_due(
+        self,
+        *,
+        trade_date: date,
+        now: datetime,
+        source_digest: str,
+        required_snapshot: RequiredSymbolSnapshotV1,
+    ) -> bool:
+        """Apply source/user/cadence preflight before claiming or acquiring."""
+        _head, contract = self._current_head_contract()
+        if contract is None or contract.trade_date != trade_date:
+            return True
+        latest_source = self.sidecar.read_latest_source_state(trade_date)
+        if latest_source is None:
+            raise UniverseStoreUnavailable("universe source state is missing")
+        if (
+            latest_source.source_version_digest != source_digest
+            or contract.source_refs.source_version_digest != source_digest
+            or contract.source_refs.required_symbol_snapshot_sha256
+            != required_snapshot.snapshot_sha256
+        ):
+            return True
+        terminal = self.sidecar.read_latest_terminal_finished_at(trade_date)
+        if terminal is None:
+            return True
+        terminal = terminal.astimezone(UTC)
+        current = now.astimezone(UTC)
+        if current < terminal:
+            raise UniverseStoreUnavailable("universe terminal time is in the future")
+        return (current - terminal).total_seconds() >= self.interval_seconds
 
     def _source_digest_for_plan(self, snapshot: ClassificationReadSnapshot) -> str:
         """Return the source identity that can be proven before acquisition.
@@ -663,18 +759,78 @@ class UniverseMaintenanceService:
                     return UniverseHookResult(
                         status="DEFER", reason_code="CONTROL_STATE_UNAVAILABLE", provider_requests=0
                     )
+                cutoff = current.astimezone(UTC)
                 classification = self.classification_store.read_snapshot(
-                    target, include_securities=True
+                    target, known_at=cutoff, include_securities=True
                 )
                 if not isinstance(classification, ClassificationReadSnapshot):
                     raise UniverseStoreUnavailable("classification snapshot is unavailable")
+                generation = classification.generation
+                observed_at = getattr(generation, "observed_at", None)
+                generation_after_cutoff = bool(
+                    generation is not None
+                    and (
+                        not isinstance(observed_at, datetime)
+                        or observed_at.tzinfo is None
+                        or observed_at.utcoffset() is None
+                        or observed_at.astimezone(UTC) > cutoff
+                        or not isinstance(getattr(generation, "source_snapshot_date", None), date)
+                        or getattr(generation, "source_snapshot_date", target) > target
+                    )
+                )
+                source_preflight_valid = True
+                authority_preflight_valid = True
                 if (
-                    classification.generation is None
-                    or classification.generation.source_date_semantics != "source_observed"
+                    isinstance(self.reviewed_authority, UniverseAuthorityBundleV1)
+                    and generation is not None
+                    and not generation_after_cutoff
+                ):
+                    authority_preflight_valid = self._authority_binds_generation(
+                        self.reviewed_authority, generation
+                    )
+                if (
+                    generation is None
+                    or generation.source_date_semantics != "source_observed"
+                    or generation_after_cutoff
                 ):
                     source_digest = self._preflight_digest(classification)
                 else:
-                    source_digest = self._source_digest_for_plan(classification)
+                    try:
+                        source_digest = self._source_digest_for_plan(classification)
+                    except Exception:
+                        # Reserve and close the operation-day slot even when the
+                        # reviewed mapping/source projection cannot be proven.  The
+                        # fallback identity is never used for acquisition or publish.
+                        source_digest = self._preflight_digest(classification)
+                        source_preflight_valid = False
+                required = None
+                if (
+                    generation is not None
+                    and generation.source_date_semantics == "source_observed"
+                    and not generation_after_cutoff
+                ):
+                    try:
+                        captured = self.user_store.capture_required_symbol_snapshot_existing()
+                        required = RequiredSymbolSnapshotV1.from_user_capture(captured)
+                    except Exception:
+                        return UniverseHookResult(
+                            status="DEFER",
+                            reason_code="CONTROL_STATE_UNAVAILABLE",
+                            provider_requests=0,
+                        )
+                    if (
+                        source_preflight_valid
+                        and authority_preflight_valid
+                        and not self._is_due(
+                            trade_date=target,
+                            now=current,
+                            source_digest=source_digest,
+                            required_snapshot=required,
+                        )
+                    ):
+                        return UniverseHookResult(
+                            status="DEFER", reason_code="NONE", provider_requests=0
+                        )
                 operation_day = self._operation_day(current)
                 plan_values = {
                     "attempt_id": domain_sha256(
@@ -702,6 +858,9 @@ class UniverseMaintenanceService:
                     "operation_day": operation_day.isoformat(),
                     "canonical_run_id": sealed.run_id,
                     "source_version_digest": source_digest,
+                }
+                plan_preimage = {
+                    **dedup_preimage,
                     "hook_kind": "universe_post_success",
                     "refresh_id": sealed.run_id,
                     "request_budget": 1,
@@ -713,7 +872,7 @@ class UniverseMaintenanceService:
                     "stock-eva/r2f4.2/universe-attempt-dedup/v1", dedup_preimage
                 )
                 plan_values["planned_sha256"] = domain_sha256(
-                    "stock-eva/r2f4.2/universe-attempt-plan/v1", dedup_preimage
+                    "stock-eva/r2f4.2/universe-attempt-plan/v1", plan_preimage
                 )
                 plan = UniverseAttemptPlanV1(**plan_values)
                 claim = self.sidecar.record_publication_context_and_claim(sealed, plan)
@@ -721,13 +880,11 @@ class UniverseMaintenanceService:
                     return UniverseHookResult(
                         status="DEFER", reason_code="NONE", provider_requests=0
                     )
-                try:
-                    calendar_authority = self.calendar_store.read_authority()
-                except Exception:
+                if generation_after_cutoff:
                     result = self._result(
                         attempt_id=plan.attempt_id,
                         status="blocked",
-                        reason="CALENDAR_UNAVAILABLE",
+                        reason="PIT_CUTOFF_VIOLATION",
                         request_count=0,
                         source_state_id=None,
                         finished_at=current,
@@ -735,6 +892,50 @@ class UniverseMaintenanceService:
                     self.sidecar.record_attempt_result(result)
                     return UniverseHookResult(
                         status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                if not source_preflight_valid:
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="blocked",
+                        reason="BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                if not authority_preflight_valid:
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="UNIVERSE_SOURCE_VERSION_CHANGED",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                try:
+                    calendar_authority = self.calendar_store.read_authority()
+                except Exception as error:
+                    reason = _calendar_failure_reason(error)
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed" if reason == "CONTROL_STATE_UNAVAILABLE" else "blocked",
+                        reason=reason,
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="DEFER" if reason == "CONTROL_STATE_UNAVAILABLE" else "BLOCKED",
+                        reason_code=result.reason_code,
+                        provider_requests=0,
                     )
                 try:
                     calendar_generation = calendar_authority.read_result.generation
@@ -750,11 +951,27 @@ class UniverseMaintenanceService:
                         calendar_sha256=calendar_hash,
                         exact_pit_cutoff=current,
                     )
-                except Exception:
+                except Exception as error:
+                    reason = _calendar_failure_reason(error, calendar_authority)
+                    result = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed" if reason == "CONTROL_STATE_UNAVAILABLE" else "blocked",
+                        reason=reason,
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(result)
+                    return UniverseHookResult(
+                        status="DEFER" if reason == "CONTROL_STATE_UNAVAILABLE" else "BLOCKED",
+                        reason_code=result.reason_code,
+                        provider_requests=0,
+                    )
+                if generation is None:
                     result = self._result(
                         attempt_id=plan.attempt_id,
                         status="blocked",
-                        reason="CALENDAR_UNAVAILABLE",
+                        reason="CLASSIFICATION_UNAVAILABLE",
                         request_count=0,
                         source_state_id=None,
                         finished_at=current,
@@ -763,14 +980,11 @@ class UniverseMaintenanceService:
                     return UniverseHookResult(
                         status="BLOCKED", reason_code=result.reason_code, provider_requests=0
                     )
-                if (
-                    classification.generation is None
-                    or classification.generation.source_date_semantics != "source_observed"
-                ):
+                if generation.source_date_semantics != "source_observed":
                     result = self._result(
                         attempt_id=plan.attempt_id,
                         status="blocked",
-                        reason="CLASSIFICATION_UNAVAILABLE",
+                        reason="BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED",
                         request_count=0,
                         source_state_id=None,
                         finished_at=current,
@@ -791,6 +1005,23 @@ class UniverseMaintenanceService:
                     self.sidecar.record_attempt_result(result)
                     return UniverseHookResult(
                         status="BLOCKED", reason_code=result.reason_code, provider_requests=0
+                    )
+                if isinstance(
+                    self.reviewed_authority, UniverseAuthorityBundleV1
+                ) and not self._authority_binds_generation(self.reviewed_authority, generation):
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="UNIVERSE_SOURCE_VERSION_CHANGED",
+                        request_count=0,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED",
+                        reason_code=failed.reason_code,
+                        provider_requests=0,
                     )
                 try:
                     authority, request_count = self._authority_from_provider(
@@ -829,9 +1060,22 @@ class UniverseMaintenanceService:
                     )
                 if authority is None:
                     raise ProviderHealthError("reviewed authority is unavailable")
-                try:
-                    captured = self.user_store.capture_required_symbol_snapshot_existing()
-                except Exception:
+                if not self._authority_binds_generation(authority, generation):
+                    failed = self._result(
+                        attempt_id=plan.attempt_id,
+                        status="failed",
+                        reason="UNIVERSE_SOURCE_VERSION_CHANGED",
+                        request_count=request_count,
+                        source_state_id=None,
+                        finished_at=current,
+                    )
+                    self.sidecar.record_attempt_result(failed)
+                    return UniverseHookResult(
+                        status="BLOCKED",
+                        reason_code=failed.reason_code,
+                        provider_requests=request_count,
+                    )
+                if required is None:
                     failed = self._result(
                         attempt_id=plan.attempt_id,
                         status="blocked",
@@ -846,13 +1090,9 @@ class UniverseMaintenanceService:
                         reason_code=failed.reason_code,
                         provider_requests=request_count,
                     )
-                required = RequiredSymbolSnapshotV1.from_user_capture(captured)
                 members = self._members(authority.evidence, required, target)
                 generation = classification.generation
                 cutoff = current.astimezone(UTC)
-                observed_at = max(
-                    item.observed_at for item in authority.evidence if item.observed_at
-                )
                 refs = SourceRefsV1(
                     calendar_generation_id=calendar_authority.head_generation_sha256[:32]
                     if calendar_authority.head_generation_sha256
@@ -863,7 +1103,7 @@ class UniverseMaintenanceService:
                     classification_source=generation.source,
                     classification_source_version=generation.source_version,
                     classification_source_snapshot_date=generation.source_snapshot_date,
-                    classification_observed_at=observed_at,
+                    classification_observed_at=generation.observed_at,
                     classification_snapshot_sha256=classification_snapshot_sha256(
                         authority.evidence
                     ),
@@ -906,7 +1146,7 @@ class UniverseMaintenanceService:
                     classification_source=generation.source,
                     classification_source_version=generation.source_version,
                     classification_source_snapshot_date=generation.source_snapshot_date,
-                    classification_observed_at=observed_at,
+                    classification_observed_at=generation.observed_at,
                     exact_pit_cutoff=cutoff,
                     source_refs=refs,
                     members=members,
@@ -1130,38 +1370,43 @@ class ConcreteUniversePostSuccessHook:
                 raise TypeError("publication context is not sealed")
             if context is not None and context.trade_date.isoformat() != trade_date:
                 raise ValueError("publication context date mismatch")
-            first_attempt = False
-            try:
-                terminal = self._terminal_finished_at(trade_date)
-            except UniverseStoreUnavailable:
-                first_attempt = bool(
-                    self.sidecar is not None
-                    and isinstance(getattr(self.sidecar, "path", None), Path)
-                    and not self.sidecar.path.exists()
-                )
-                if not first_attempt:
-                    raise
-                terminal = None
-            if terminal is None and not first_attempt:
-                head = self.sidecar.read_head()
-                if head is not None:
+            strict_service = isinstance(self.maintenance_runner, UniverseMaintenanceService)
+            first_attempt = strict_service
+            terminal = None
+            if not strict_service:
+                try:
+                    terminal = self._terminal_finished_at(trade_date)
+                except UniverseStoreUnavailable:
+                    first_attempt = bool(
+                        self.sidecar is not None
+                        and isinstance(getattr(self.sidecar, "path", None), Path)
+                        and not self.sidecar.path.exists()
+                    )
+                    if not first_attempt:
+                        raise
+                    terminal = None
+                if terminal is None and not first_attempt:
+                    head = self.sidecar.read_head()
+                    if head is not None:
+                        return UniverseHookResult(
+                            status="DEFER",
+                            reason_code="CONTROL_STATE_UNAVAILABLE",
+                            provider_requests=0,
+                        )
+                    first_attempt = True
+                if terminal is not None and current.astimezone(UTC) < terminal:
                     return UniverseHookResult(
                         status="DEFER",
                         reason_code="CONTROL_STATE_UNAVAILABLE",
                         provider_requests=0,
                     )
-                first_attempt = True
-            if terminal is not None and current.astimezone(UTC) < terminal:
-                return UniverseHookResult(
-                    status="DEFER",
-                    reason_code="CONTROL_STATE_UNAVAILABLE",
-                    provider_requests=0,
-                )
-            if (
-                not first_attempt
-                and (current.astimezone(UTC) - terminal).total_seconds() < self.interval_seconds
-            ):
-                return UniverseHookResult(status="DEFER", reason_code="NONE", provider_requests=0)
+                if (
+                    not first_attempt
+                    and (current.astimezone(UTC) - terminal).total_seconds() < self.interval_seconds
+                ):
+                    return UniverseHookResult(
+                        status="DEFER", reason_code="NONE", provider_requests=0
+                    )
             if self.sidecar is None or self.maintenance_runner is None:
                 return UniverseHookResult(
                     status="DEFER",
@@ -1242,6 +1487,7 @@ def make_universe_post_success_hook(
             evidence_root=evidence_root,
             context_validator=context_validator,
             reviewed_authority=reviewed_authority,
+            interval_seconds=interval_seconds,
             clock=clock,
         )
     if maintenance_runner is None and enabled:

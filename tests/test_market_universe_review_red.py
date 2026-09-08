@@ -265,7 +265,7 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
     refs = refs.model_copy(
         update={"source_version_digest": source_version_digest(refs, second_evidence)}
     )
-    second_authority = _authority(mapping, second_evidence)
+    second_authority = _authority(mapping, second_evidence, generation_id="cls-2", sequence=2)
     second = build_universe_contract(
         trade_date=first.trade_date,
         calendar_generation_id=first.calendar_generation_id,
@@ -297,7 +297,7 @@ def test_cross_generation_new_evidence_identity_is_allowed(tmp_path):
         expected_head_sha256=first_head.head_sha256,
         mapping=mapping,
         evidence=second_evidence,
-        authority_bundle=_authority(mapping, second_evidence),
+        authority_bundle=_authority(mapping, second_evidence, generation_id="cls-2", sequence=2),
         required_snapshot=second_snapshot,
         calendar_authority=__import__(
             "tests.test_market_universe", fromlist=["_calendar_authority"]

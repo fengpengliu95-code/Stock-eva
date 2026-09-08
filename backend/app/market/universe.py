@@ -90,6 +90,33 @@ def domain_sha256(domain: str, value: Any) -> str:
     return hashlib.sha256(domain.encode("ascii") + b"\n" + canonical_json_bytes(value)).hexdigest()
 
 
+def classification_source_projection_sha256(
+    *,
+    generation_id: str,
+    sequence: int,
+    source: str,
+    source_version: str,
+    source_snapshot_date: date,
+    observed_at: datetime,
+    source_date_semantics: str,
+) -> str:
+    """Hash the selected classification generation identity before acquisition."""
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("classification source observation must be timezone aware")
+    return domain_sha256(
+        "stock-eva/r2f4.2/classification-source-projection/v1",
+        {
+            "generation_id": generation_id,
+            "sequence": sequence,
+            "source": source,
+            "source_version": source_version,
+            "source_snapshot_date": source_snapshot_date.isoformat(),
+            "observed_at": observed_at.astimezone(UTC).isoformat(),
+            "source_date_semantics": source_date_semantics,
+        },
+    )
+
+
 class _Frozen(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False)
 
@@ -1139,6 +1166,14 @@ class UniverseAttemptPlanV1(_Frozen):
             "operation_day": self.operation_day.isoformat(),
             "canonical_run_id": self.canonical_run_id,
             "source_version_digest": self.source_version_digest,
+        }
+        if self.dedup_key != domain_sha256("stock-eva/r2f4.2/universe-attempt-dedup/v1", key):
+            raise ValueError("attempt dedup key mismatch")
+        planned = {
+            "trade_date": self.trade_date.isoformat(),
+            "operation_day": self.operation_day.isoformat(),
+            "canonical_run_id": self.canonical_run_id,
+            "source_version_digest": self.source_version_digest,
             "hook_kind": self.hook_kind,
             "refresh_id": self.refresh_id,
             "request_budget": self.request_budget,
@@ -1146,9 +1181,6 @@ class UniverseAttemptPlanV1(_Frozen):
             "created_at": self.created_at.astimezone(UTC).isoformat(),
             "attempt_status": self.attempt_status,
         }
-        if self.dedup_key != domain_sha256("stock-eva/r2f4.2/universe-attempt-dedup/v1", key):
-            raise ValueError("attempt dedup key mismatch")
-        planned = dict(key)
         if self.planned_sha256 != domain_sha256(
             "stock-eva/r2f4.2/universe-attempt-plan/v1", planned
         ):
@@ -1194,6 +1226,14 @@ class UniverseAuthorityBundleV1(_Frozen):
 
     mapping: UniverseSemanticMappingV1
     evidence: tuple[UniverseInstrumentEvidenceV1, ...]
+    classification_generation_id: str = Field(min_length=1, max_length=128)
+    classification_generation_sequence: int = Field(ge=1)
+    classification_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    classification_source: str = Field(min_length=1, max_length=128)
+    classification_source_version: str = Field(min_length=1, max_length=128)
+    classification_source_snapshot_date: date
+    classification_observed_at: datetime
+    classification_source_projection_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_date_semantics: Literal["source_observed"]
     authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -1213,6 +1253,28 @@ class UniverseAuthorityBundleV1(_Frozen):
             for item in self.evidence
         ):
             raise ValueError("authority bundle evidence is not reviewed")
+        if (
+            self.classification_observed_at.tzinfo is None
+            or self.classification_observed_at.utcoffset() is None
+        ):
+            raise ValueError("authority classification observation is not timezone aware")
+        object.__setattr__(
+            self,
+            "classification_observed_at",
+            self.classification_observed_at.astimezone(UTC),
+        )
+        if self.classification_source_projection_sha256 != classification_source_projection_sha256(
+            generation_id=self.classification_generation_id,
+            sequence=self.classification_generation_sequence,
+            source=self.classification_source,
+            source_version=self.classification_source_version,
+            source_snapshot_date=self.classification_source_snapshot_date,
+            observed_at=self.classification_observed_at,
+            source_date_semantics=self.source_date_semantics,
+        ):
+            raise ValueError("authority classification source identity mismatch")
+        if self.classification_snapshot_sha256 != classification_snapshot_sha256(self.evidence):
+            raise ValueError("authority classification snapshot identity mismatch")
         evidence_projection = [
             {
                 "evidence_id": item.evidence_id,
@@ -1227,6 +1289,20 @@ class UniverseAuthorityBundleV1(_Frozen):
             {
                 "mapping_sha256": self.mapping.mapping_sha256,
                 "source_date_semantics": self.source_date_semantics,
+                "classification_generation_id": self.classification_generation_id,
+                "classification_generation_sequence": self.classification_generation_sequence,
+                "classification_snapshot_sha256": self.classification_snapshot_sha256,
+                "classification_source": self.classification_source,
+                "classification_source_version": self.classification_source_version,
+                "classification_source_snapshot_date": (
+                    self.classification_source_snapshot_date.isoformat()
+                ),
+                "classification_observed_at": self.classification_observed_at.astimezone(
+                    UTC
+                ).isoformat(),
+                "classification_source_projection_sha256": (
+                    self.classification_source_projection_sha256
+                ),
                 "evidence": evidence_projection,
             },
         )
@@ -1361,6 +1437,12 @@ def build_universe_contract(
             or refs.required_symbol_snapshot_sha256 != admitted_snapshot.snapshot_sha256
         ):
             raise ValueError("required user snapshot does not bind source refs")
+    if isinstance(classification_observed_at, str):
+        classification_observed_at = datetime.fromisoformat(
+            classification_observed_at.replace("Z", "+00:00")
+        )
+    if isinstance(exact_pit_cutoff, str):
+        exact_pit_cutoff = datetime.fromisoformat(exact_pit_cutoff.replace("Z", "+00:00"))
     if authority_bundle is not None:
         if required_user_snapshot is None:
             raise ValueError("verified authority requires a trusted user snapshot")
@@ -1369,14 +1451,19 @@ def build_universe_contract(
             and classification_evidence != authority_bundle.evidence
         ):
             raise ValueError("classification evidence does not match authority bundle")
+        if (
+            authority_bundle.classification_generation_id != classification_generation_id
+            or authority_bundle.classification_generation_sequence
+            != classification_generation_sequence
+            or authority_bundle.classification_source != classification_source
+            or authority_bundle.classification_source_version != classification_source_version
+            or authority_bundle.classification_source_snapshot_date
+            != classification_source_snapshot_date
+            or authority_bundle.classification_observed_at != classification_observed_at
+        ):
+            raise ValueError("authority classification generation does not bind builder")
         classification_evidence = authority_bundle.evidence
     classification_evidence = classification_evidence or ()
-    if isinstance(classification_observed_at, str):
-        classification_observed_at = datetime.fromisoformat(
-            classification_observed_at.replace("Z", "+00:00")
-        )
-    if isinstance(exact_pit_cutoff, str):
-        exact_pit_cutoff = datetime.fromisoformat(exact_pit_cutoff.replace("Z", "+00:00"))
     validate_calendar_authority(
         calendar_authority,
         trade_date=trade_date,
@@ -1445,6 +1532,20 @@ def build_universe_contract(
         classification_evidence
     ):
         raise ValueError("classification snapshot digest is not evidence-derived")
+    if authority_bundle is not None and (
+        authority_bundle.classification_snapshot_sha256 != refs.classification_snapshot_sha256
+        or authority_bundle.classification_source_projection_sha256
+        != classification_source_projection_sha256(
+            generation_id=refs.classification_generation_id,
+            sequence=refs.classification_generation_sequence,
+            source=refs.classification_source,
+            source_version=refs.classification_source_version,
+            source_snapshot_date=refs.classification_source_snapshot_date,
+            observed_at=refs.classification_observed_at,
+            source_date_semantics=refs.source_date_semantics,
+        )
+    ):
+        raise ValueError("authority classification source projection does not bind refs")
     if refs.source_version_digest != source_version_digest(refs, classification_evidence):
         raise ValueError("source version digest is not evidence-derived")
     natural_identity = tuple((item.security_id, item.symbol) for item in classification_evidence)
@@ -3748,6 +3849,35 @@ class UniverseSidecarStore:
                         raise UniverseStoreUnavailable("universe attempt already terminal")
                 if authority_bundle is None:
                     raise UniverseStoreUnavailable("universe authority bundle unavailable")
+                if (
+                    authority_bundle.classification_generation_id
+                    != contract.classification_generation_id
+                    or authority_bundle.classification_generation_sequence
+                    != contract.source_refs.classification_generation_sequence
+                    or authority_bundle.classification_source
+                    != contract.source_refs.classification_source
+                    or authority_bundle.classification_source_version
+                    != contract.source_refs.classification_source_version
+                    or authority_bundle.classification_source_snapshot_date
+                    != contract.source_refs.classification_source_snapshot_date
+                    or authority_bundle.classification_observed_at
+                    != contract.source_refs.classification_observed_at
+                    or authority_bundle.classification_snapshot_sha256
+                    != contract.source_refs.classification_snapshot_sha256
+                    or authority_bundle.classification_source_projection_sha256
+                    != classification_source_projection_sha256(
+                        generation_id=contract.source_refs.classification_generation_id,
+                        sequence=contract.source_refs.classification_generation_sequence,
+                        source=contract.source_refs.classification_source,
+                        source_version=contract.source_refs.classification_source_version,
+                        source_snapshot_date=contract.source_refs.classification_source_snapshot_date,
+                        observed_at=contract.source_refs.classification_observed_at,
+                        source_date_semantics=contract.source_refs.source_date_semantics,
+                    )
+                ):
+                    raise UniverseStoreUnavailable(
+                        "universe authority classification generation mismatch"
+                    )
                 if mapping is None or required_snapshot is None:
                     raise UniverseStoreUnavailable("universe evidence bundle unavailable")
                 if (

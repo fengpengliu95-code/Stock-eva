@@ -30,6 +30,7 @@ from backend.app.market.universe import (
     build_universe_contract,
     canonical_json_bytes,
     classification_snapshot_sha256,
+    classification_source_projection_sha256,
     domain_sha256,
     source_version_digest,
     validate_provider_raw_batch,
@@ -98,16 +99,45 @@ def _contract(
         }
         for item in sorted(evidence, key=lambda value: value.evidence_id)
     ]
+    classification_source_projection = classification_source_projection_sha256(
+        generation_id="cls-1",
+        sequence=1,
+        source="fixture",
+        source_version="v1",
+        source_snapshot_date=min(trade_date, date(2026, 8, 31)),
+        observed_at=datetime.combine(trade_date, time(8), tzinfo=UTC),
+        source_date_semantics="source_observed",
+    )
     authority = (
         UniverseAuthorityBundleV1(
             mapping=mapping,
             evidence=evidence,
+            classification_generation_id="cls-1",
+            classification_generation_sequence=1,
+            classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+            classification_source="fixture",
+            classification_source_version="v1",
+            classification_source_snapshot_date=min(trade_date, date(2026, 8, 31)),
+            classification_observed_at=datetime.combine(trade_date, time(8), tzinfo=UTC),
+            classification_source_projection_sha256=classification_source_projection,
             source_date_semantics="source_observed",
             authority_sha256=domain_sha256(
                 "stock-eva/r2f4.2/universe-authority-bundle/v1",
                 {
                     "mapping_sha256": mapping.mapping_sha256,
                     "source_date_semantics": "source_observed",
+                    "classification_generation_id": "cls-1",
+                    "classification_generation_sequence": 1,
+                    "classification_snapshot_sha256": classification_snapshot_sha256(evidence),
+                    "classification_source": "fixture",
+                    "classification_source_version": "v1",
+                    "classification_source_snapshot_date": min(
+                        trade_date, date(2026, 8, 31)
+                    ).isoformat(),
+                    "classification_observed_at": datetime.combine(
+                        trade_date, time(8), tzinfo=UTC
+                    ).isoformat(),
+                    "classification_source_projection_sha256": classification_source_projection,
                     "evidence": authority_projection,
                 },
             ),
@@ -174,7 +204,11 @@ def _contract(
         },
         members=members,
         classification_evidence=evidence,
-        authority_bundle=authority if include_user_snapshot else None,
+        authority_bundle=(
+            authority
+            if include_user_snapshot and source_date_semantics == "source_observed"
+            else None
+        ),
         calendar_authority=calendar_authority,
         required_user_snapshot=user_capture if include_user_snapshot else None,
         sequence=sequence,
@@ -409,7 +443,8 @@ def _bundle(contract):
     )
 
 
-def _authority(mapping, evidence):
+def _authority(mapping, evidence, *, generation_id="cls-1", sequence=1):
+    trade_date = evidence[0].evidence_trade_date
     projection = [
         {
             "evidence_id": item.evidence_id,
@@ -422,12 +457,48 @@ def _authority(mapping, evidence):
     return UniverseAuthorityBundleV1(
         mapping=mapping,
         evidence=evidence,
+        classification_generation_id=generation_id,
+        classification_generation_sequence=sequence,
+        classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+        classification_source="fixture",
+        classification_source_version="v1",
+        classification_source_snapshot_date=min(trade_date, date(2026, 8, 31)),
+        classification_observed_at=datetime.combine(trade_date, time(8), tzinfo=UTC),
+        classification_source_projection_sha256=classification_source_projection_sha256(
+            generation_id=generation_id,
+            sequence=sequence,
+            source="fixture",
+            source_version="v1",
+            source_snapshot_date=min(trade_date, date(2026, 8, 31)),
+            observed_at=datetime.combine(trade_date, time(8), tzinfo=UTC),
+            source_date_semantics="source_observed",
+        ),
         source_date_semantics="source_observed",
         authority_sha256=domain_sha256(
             "stock-eva/r2f4.2/universe-authority-bundle/v1",
             {
                 "mapping_sha256": mapping.mapping_sha256,
                 "source_date_semantics": "source_observed",
+                "classification_generation_id": generation_id,
+                "classification_generation_sequence": sequence,
+                "classification_snapshot_sha256": classification_snapshot_sha256(evidence),
+                "classification_source": "fixture",
+                "classification_source_version": "v1",
+                "classification_source_snapshot_date": min(
+                    trade_date, date(2026, 8, 31)
+                ).isoformat(),
+                "classification_observed_at": datetime.combine(
+                    trade_date, time(8), tzinfo=UTC
+                ).isoformat(),
+                "classification_source_projection_sha256": classification_source_projection_sha256(
+                    generation_id=generation_id,
+                    sequence=sequence,
+                    source="fixture",
+                    source_version="v1",
+                    source_snapshot_date=min(trade_date, date(2026, 8, 31)),
+                    observed_at=datetime.combine(trade_date, time(8), tzinfo=UTC),
+                    source_date_semantics="source_observed",
+                ),
                 "evidence": projection,
             },
         ),
@@ -556,6 +627,37 @@ def test_sidecar_reader_rejects_missing_bidirectional_role_link(tmp_path):
         connection.commit()
     with pytest.raises(UniverseStoreUnavailable):
         store.read_head()
+
+
+def test_builder_rejects_authority_bundle_from_wrong_classification_generation():
+    contract = _contract()
+    mapping, evidence, snapshot = _bundle(contract)
+    wrong_generation = _authority(mapping, evidence, generation_id="cls-2", sequence=2)
+    with pytest.raises(ValueError, match="authority classification generation"):
+        build_universe_contract(
+            trade_date=contract.trade_date,
+            calendar_generation_id=contract.calendar_generation_id,
+            calendar_sha256=contract.calendar_sha256,
+            classification_generation_id=contract.source_refs.classification_generation_id,
+            classification_generation_sequence=(
+                contract.source_refs.classification_generation_sequence
+            ),
+            classification_source=contract.source_refs.classification_source,
+            classification_source_version=contract.source_refs.classification_source_version,
+            classification_source_snapshot_date=(
+                contract.source_refs.classification_source_snapshot_date
+            ),
+            classification_observed_at=contract.source_refs.classification_observed_at,
+            exact_pit_cutoff=contract.exact_pit_cutoff,
+            source_refs=contract.source_refs,
+            members=contract.members,
+            classification_evidence=evidence,
+            authority_bundle=wrong_generation,
+            calendar_authority=_calendar_authority(contract.trade_date),
+            required_user_snapshot=_user_capture(contract.members),
+            sequence=contract.sequence,
+            parent_contract_id=contract.parent_contract_id,
+        )
 
 
 def test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper(tmp_path):
