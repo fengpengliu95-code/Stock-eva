@@ -1201,136 +1201,195 @@ the schema-digest preimage):
 
 ```sql
 PRAGMA user_version = 1;
-CREATE TABLE universe_meta (meta_key TEXT PRIMARY KEY CHECK
- (meta_key IN ('schema_version','schema_digest','store_id','db_inode')), meta_value TEXT NOT NULL);
-CREATE TABLE universe_source_state (source_state_id TEXT PRIMARY KEY,
- source_state_sha256 TEXT NOT NULL UNIQUE, trade_date TEXT NOT NULL,
- provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'), source_version_digest TEXT NOT NULL,
- source_refs_json TEXT NOT NULL, verified_at TEXT NOT NULL);
-CREATE TABLE universe_contract (contract_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE
- CHECK (sequence > 0), parent_contract_id TEXT REFERENCES universe_contract(contract_id),
- trade_date TEXT NOT NULL, universe_id TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK
- (schema_version = 1), scope TEXT NOT NULL, calendar_generation_id TEXT NOT NULL,
- calendar_sha256 TEXT NOT NULL, classification_generation_id TEXT NOT NULL,
- classification_generation_sequence INTEGER NOT NULL,
- classification_source TEXT NOT NULL, classification_source_version TEXT NOT NULL,
- classification_source_snapshot_date TEXT NOT NULL, classification_observed_at TEXT NOT NULL,
- classification_snapshot_sha256 TEXT NOT NULL,
- exact_pit_cutoff TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
- source_date_semantics TEXT NOT NULL, source_state_id TEXT NOT NULL
- REFERENCES universe_source_state(source_state_id), source_state_sha256 TEXT NOT NULL,
- source_version_digest TEXT NOT NULL, required_symbol_snapshot_id TEXT NOT NULL,
- required_symbol_snapshot_sha256 TEXT NOT NULL, instrument_evidence_ids_json TEXT NOT NULL,
- counts_json TEXT NOT NULL, layer_counts_json TEXT NOT NULL, source_refs_json TEXT NOT NULL,
- classification_evidence_ids_json TEXT NOT NULL,
- classification_evidence_partition_sha256 TEXT NOT NULL,
- effective_main_board_ids_json TEXT NOT NULL,
- effective_main_board_partition_sha256 TEXT NOT NULL,
- required_additions_ids_json TEXT NOT NULL,
- required_additions_partition_sha256 TEXT NOT NULL,
- payload_json TEXT NOT NULL, contract_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
-CREATE TABLE universe_member (contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
- symbol TEXT NOT NULL, security_id TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
- PRIMARY KEY (contract_id, symbol), UNIQUE (contract_id, security_id));
+CREATE TABLE universe_meta (
+    meta_key TEXT PRIMARY KEY CHECK
+    (meta_key IN ('schema_version','schema_digest','store_id','db_inode')),
+    meta_value TEXT NOT NULL
+);
+CREATE TABLE universe_source_state (
+    source_state_id TEXT PRIMARY KEY, source_state_sha256 TEXT NOT NULL UNIQUE,
+    trade_date TEXT NOT NULL, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
+    source_version_digest TEXT NOT NULL, source_refs_json TEXT NOT NULL, verified_at TEXT NOT NULL
+);
+CREATE TABLE universe_contract (
+    contract_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE CHECK (sequence > 0),
+    parent_contract_id TEXT REFERENCES universe_contract(contract_id), trade_date TEXT NOT NULL,
+    universe_id TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    scope TEXT NOT NULL, calendar_generation_id TEXT NOT NULL, calendar_sha256 TEXT NOT NULL,
+    classification_generation_id TEXT NOT NULL, classification_generation_sequence INTEGER NOT NULL,
+    classification_source TEXT NOT NULL, classification_source_version TEXT NOT NULL,
+    classification_source_snapshot_date TEXT NOT NULL, classification_observed_at TEXT NOT NULL,
+    classification_snapshot_sha256 TEXT NOT NULL, exact_pit_cutoff TEXT NOT NULL,
+    provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
+    source_date_semantics TEXT NOT NULL CHECK
+    (source_date_semantics IN ('source_observed','requested_unverified')),
+    source_state_id TEXT NOT NULL REFERENCES universe_source_state(source_state_id),
+    source_state_sha256 TEXT NOT NULL, source_version_digest TEXT NOT NULL,
+    required_symbol_snapshot_id TEXT NOT NULL, required_symbol_snapshot_sha256 TEXT NOT NULL,
+    instrument_evidence_ids_json TEXT NOT NULL, counts_json TEXT NOT NULL,
+    layer_counts_json TEXT NOT NULL, source_refs_json TEXT NOT NULL,
+    classification_evidence_ids_json TEXT NOT NULL,
+    classification_evidence_partition_sha256 TEXT NOT NULL,
+    effective_main_board_ids_json TEXT NOT NULL,
+    effective_main_board_partition_sha256 TEXT NOT NULL, required_additions_ids_json TEXT NOT NULL,
+    required_additions_partition_sha256 TEXT NOT NULL, payload_json TEXT NOT NULL,
+    contract_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+);
+CREATE TABLE universe_member (
+    contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id), symbol TEXT NOT NULL,
+    security_id TEXT NOT NULL, member_sha256 TEXT NOT NULL, member_json TEXT NOT NULL,
+    PRIMARY KEY (contract_id, symbol), UNIQUE (contract_id, security_id)
+);
 CREATE TABLE universe_semantic_mapping (
- mapping_id TEXT PRIMARY KEY, mapping_version TEXT NOT NULL,
- provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'), source_schema TEXT NOT NULL,
- payload_json TEXT NOT NULL, mapping_sha256 TEXT NOT NULL UNIQUE,
- authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified')));
-CREATE TABLE universe_instrument_evidence (evidence_id TEXT PRIMARY KEY,
- evidence_sha256 TEXT NOT NULL UNIQUE, provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
- authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified')),
- artifact_origin TEXT NOT NULL CHECK (artifact_origin IN ('local_reviewed_fixture','production_reviewed_artifact')),
- security_id TEXT NOT NULL, symbol TEXT NOT NULL,
- mapping_id TEXT NOT NULL, mapping_version TEXT NOT NULL, mapping_sha256 TEXT NOT NULL
- REFERENCES universe_semantic_mapping(mapping_sha256), source_snapshot_date TEXT NOT NULL,
- evidence_trade_date TEXT NOT NULL, exclusion_reason TEXT NOT NULL, index_role TEXT NOT NULL CHECK
- (index_role IN ('required_index','not_applicable')), source_date_semantics TEXT NOT NULL,
- evidence_json TEXT NOT NULL);
-CREATE TABLE universe_required_symbol_snapshot (snapshot_id TEXT PRIMARY KEY,
- snapshot_sha256 TEXT NOT NULL UNIQUE, snapshot_token_digest TEXT NOT NULL,
- schema_version INTEGER NOT NULL CHECK (schema_version = 1),
- symbol_count INTEGER NOT NULL CHECK (symbol_count >= 0),
- snapshot_json TEXT NOT NULL);
-CREATE TABLE universe_publication_context (context_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
- trade_date TEXT NOT NULL, manifest_ref TEXT NOT NULL, evidence_refs_json TEXT NOT NULL,
- publication_lineage_json TEXT NOT NULL, publication_lineage_sha256 TEXT NOT NULL,
- context_sha256 TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK (status = 'ready'),
- created_at TEXT NOT NULL, UNIQUE (run_id, trade_date));
-CREATE TABLE contract_evidence (contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
- evidence_id TEXT NOT NULL REFERENCES universe_instrument_evidence(evidence_id),
- evidence_role TEXT NOT NULL CHECK (evidence_role IN
- ('classification_evidence','effective_main_board','required_additions','member')),
- security_id TEXT NOT NULL, symbol TEXT NOT NULL, exclusion_reason TEXT NOT NULL,
- PRIMARY KEY (contract_id, evidence_id, evidence_role));
-CREATE TABLE contract_required_snapshot (contract_id TEXT PRIMARY KEY
- REFERENCES universe_contract(contract_id), snapshot_id TEXT NOT NULL
- REFERENCES universe_required_symbol_snapshot(snapshot_id), snapshot_sha256 TEXT NOT NULL);
-CREATE TABLE universe_attempt (attempt_id TEXT PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE,
- hook_kind TEXT NOT NULL CHECK (hook_kind = 'universe_post_success'), refresh_id TEXT NOT NULL,
- canonical_run_id TEXT NOT NULL, source_version_digest TEXT NOT NULL,
- trade_date TEXT NOT NULL, operation_day TEXT NOT NULL,
- attempt_status TEXT NOT NULL CHECK (attempt_status = 'RUNNING'),
- request_budget INTEGER NOT NULL CHECK (request_budget = 1),
- classification_max_attempts INTEGER NOT NULL CHECK (classification_max_attempts = 1),
- created_at TEXT NOT NULL, planned_sha256 TEXT NOT NULL UNIQUE,
- UNIQUE (trade_date, operation_day));
-CREATE TABLE universe_attempt_result (attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
- terminal_status TEXT NOT NULL CHECK (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
- classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
- reason_code TEXT NOT NULL CHECK (reason_code IN ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE','CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE','BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED','REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO','UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL','UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH','UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE','UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED','BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE','UNIVERSE_IDENTITY_CONFLICT','NONE')), source_state_id TEXT REFERENCES universe_source_state(source_state_id), finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE);
-CREATE TABLE universe_head (singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
- sequence INTEGER NOT NULL, contract_id TEXT NOT NULL, contract_sha256 TEXT NOT NULL,
- head_sha256 TEXT NOT NULL, updated_at TEXT NOT NULL,
- FOREIGN KEY (contract_id) REFERENCES universe_contract(contract_id));
-CREATE TRIGGER universe_source_state_no_update BEFORE UPDATE ON universe_source_state BEGIN
- SELECT RAISE(ABORT, 'immutable_source_state'); END;
-CREATE TRIGGER universe_source_state_no_delete BEFORE DELETE ON universe_source_state BEGIN
- SELECT RAISE(ABORT, 'immutable_source_state'); END;
-CREATE TRIGGER universe_contract_no_update BEFORE UPDATE ON universe_contract BEGIN
- SELECT RAISE(ABORT, 'immutable_contract'); END;
-CREATE TRIGGER universe_contract_no_delete BEFORE DELETE ON universe_contract BEGIN
- SELECT RAISE(ABORT, 'immutable_contract'); END;
-CREATE TRIGGER universe_member_no_update BEFORE UPDATE ON universe_member BEGIN
- SELECT RAISE(ABORT, 'immutable_member'); END;
-CREATE TRIGGER universe_member_no_delete BEFORE DELETE ON universe_member BEGIN
- SELECT RAISE(ABORT, 'immutable_member'); END;
-CREATE TRIGGER universe_evidence_no_update BEFORE UPDATE ON universe_instrument_evidence BEGIN
- SELECT RAISE(ABORT, 'immutable_evidence'); END;
-CREATE TRIGGER universe_evidence_no_delete BEFORE DELETE ON universe_instrument_evidence BEGIN
- SELECT RAISE(ABORT, 'immutable_evidence'); END;
-CREATE TRIGGER universe_mapping_no_update BEFORE UPDATE ON universe_semantic_mapping BEGIN
- SELECT RAISE(ABORT, 'immutable_mapping'); END;
-CREATE TRIGGER universe_mapping_no_delete BEFORE DELETE ON universe_semantic_mapping BEGIN
- SELECT RAISE(ABORT, 'immutable_mapping'); END;
-CREATE TRIGGER universe_snapshot_no_update BEFORE UPDATE ON universe_required_symbol_snapshot BEGIN
- SELECT RAISE(ABORT, 'immutable_snapshot'); END;
-CREATE TRIGGER universe_snapshot_no_delete BEFORE DELETE ON universe_required_symbol_snapshot BEGIN
- SELECT RAISE(ABORT, 'immutable_snapshot'); END;
-CREATE TRIGGER universe_publication_context_no_update BEFORE UPDATE ON universe_publication_context BEGIN
- SELECT RAISE(ABORT, 'immutable_publication_context'); END;
-CREATE TRIGGER universe_publication_context_no_delete BEFORE DELETE ON universe_publication_context BEGIN
- SELECT RAISE(ABORT, 'immutable_publication_context'); END;
-CREATE TRIGGER universe_meta_no_update BEFORE UPDATE ON universe_meta BEGIN
- SELECT RAISE(ABORT, 'immutable_meta'); END;
-CREATE TRIGGER universe_meta_no_delete BEFORE DELETE ON universe_meta BEGIN
- SELECT RAISE(ABORT, 'immutable_meta'); END;
-CREATE TRIGGER contract_evidence_no_update BEFORE UPDATE ON contract_evidence BEGIN
- SELECT RAISE(ABORT, 'immutable_contract_evidence'); END;
-CREATE TRIGGER contract_evidence_no_delete BEFORE DELETE ON contract_evidence BEGIN
- SELECT RAISE(ABORT, 'immutable_contract_evidence'); END;
-CREATE TRIGGER contract_snapshot_no_update BEFORE UPDATE ON contract_required_snapshot BEGIN
- SELECT RAISE(ABORT, 'immutable_contract_snapshot'); END;
-CREATE TRIGGER contract_snapshot_no_delete BEFORE DELETE ON contract_required_snapshot BEGIN
- SELECT RAISE(ABORT, 'immutable_contract_snapshot'); END;
-CREATE TRIGGER universe_attempt_no_update BEFORE UPDATE ON universe_attempt BEGIN
- SELECT RAISE(ABORT, 'immutable_attempt'); END;
-CREATE TRIGGER universe_attempt_no_delete BEFORE DELETE ON universe_attempt BEGIN
- SELECT RAISE(ABORT, 'immutable_attempt'); END;
-CREATE TRIGGER universe_attempt_result_no_update BEFORE UPDATE ON universe_attempt_result BEGIN
- SELECT RAISE(ABORT, 'immutable_attempt_result'); END;
-CREATE TRIGGER universe_attempt_result_no_delete BEFORE DELETE ON universe_attempt_result BEGIN
- SELECT RAISE(ABORT, 'immutable_attempt_result'); END;
+    mapping_id TEXT PRIMARY KEY, mapping_version TEXT NOT NULL,
+    provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'), source_schema TEXT NOT NULL,
+    payload_json TEXT NOT NULL, mapping_sha256 TEXT NOT NULL UNIQUE,
+    authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified'))
+);
+CREATE TABLE universe_instrument_evidence (
+    evidence_id TEXT PRIMARY KEY, evidence_sha256 TEXT NOT NULL UNIQUE,
+    provider_id TEXT NOT NULL CHECK (provider_id = 'baostock'),
+    authority_status TEXT NOT NULL CHECK (authority_status IN ('reviewed','unqualified')),
+    artifact_origin TEXT NOT NULL CHECK
+    (artifact_origin IN ('local_reviewed_fixture','production_reviewed_artifact')),
+    security_id TEXT NOT NULL, symbol TEXT NOT NULL, mapping_id TEXT NOT NULL,
+    mapping_version TEXT NOT NULL,
+    mapping_sha256 TEXT NOT NULL REFERENCES universe_semantic_mapping(mapping_sha256),
+    source_snapshot_date TEXT NOT NULL, evidence_trade_date TEXT NOT NULL,
+    exclusion_reason TEXT NOT NULL,
+    index_role TEXT NOT NULL CHECK (index_role IN ('required_index','not_applicable')),
+    source_date_semantics TEXT NOT NULL CHECK
+    (source_date_semantics IN ('source_observed','requested_unverified')),
+    evidence_json TEXT NOT NULL, adapter_version TEXT NOT NULL,
+    source_schema TEXT NOT NULL, security_type TEXT NOT NULL CHECK
+    (security_type IN ('stock','index','fund','etf','bond','other')),
+    exchange TEXT, board TEXT, list_date TEXT, delist_date TEXT,
+    listing_status TEXT NOT NULL, daily_trade_status TEXT,
+    suspension_state TEXT NOT NULL CHECK
+    (suspension_state IN ('trading','suspended','not_supplied','unknown')),
+    st_state TEXT NOT NULL CHECK (st_state IN ('yes','no','not_applicable','unknown')),
+    expected_trading_state TEXT CHECK
+    (expected_trading_state IS NULL OR expected_trading_state IN
+    ('trading','suspended','not_yet_listed','delisted','unknown')),
+    observed_at TEXT, lineage_hash TEXT
+);
+CREATE TABLE universe_required_symbol_snapshot (
+    snapshot_id TEXT PRIMARY KEY, snapshot_sha256 TEXT NOT NULL UNIQUE,
+    snapshot_token_digest TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    symbol_count INTEGER NOT NULL CHECK (symbol_count >= 0), snapshot_json TEXT NOT NULL
+);
+CREATE TABLE universe_publication_context (
+    context_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, trade_date TEXT NOT NULL,
+    manifest_ref TEXT NOT NULL, evidence_refs_json TEXT NOT NULL,
+    publication_lineage_json TEXT NOT NULL,
+    publication_lineage_sha256 TEXT NOT NULL, context_sha256 TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status = 'ready'), created_at TEXT NOT NULL,
+    UNIQUE (run_id, trade_date)
+);
+CREATE TABLE contract_evidence (
+    contract_id TEXT NOT NULL REFERENCES universe_contract(contract_id),
+    evidence_id TEXT NOT NULL REFERENCES universe_instrument_evidence(evidence_id),
+    evidence_role TEXT NOT NULL CHECK
+    (evidence_role IN ('classification_evidence','effective_main_board',
+                       'required_additions','member')),
+    security_id TEXT NOT NULL, symbol TEXT NOT NULL, exclusion_reason TEXT NOT NULL,
+    PRIMARY KEY (contract_id, evidence_id, evidence_role)
+);
+CREATE TABLE contract_required_snapshot (
+    contract_id TEXT PRIMARY KEY REFERENCES universe_contract(contract_id),
+    snapshot_id TEXT NOT NULL REFERENCES universe_required_symbol_snapshot(snapshot_id),
+    snapshot_sha256 TEXT NOT NULL
+);
+CREATE TABLE universe_attempt (
+    attempt_id TEXT PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE,
+    hook_kind TEXT NOT NULL CHECK (hook_kind = 'universe_post_success'), refresh_id TEXT NOT NULL,
+    canonical_run_id TEXT NOT NULL, source_version_digest TEXT NOT NULL, trade_date TEXT NOT NULL,
+    operation_day TEXT NOT NULL,
+    attempt_status TEXT NOT NULL CHECK (attempt_status = 'RUNNING'),
+    request_budget INTEGER NOT NULL CHECK (request_budget = 1),
+    classification_max_attempts INTEGER NOT NULL CHECK (classification_max_attempts = 1),
+    created_at TEXT NOT NULL, planned_sha256 TEXT NOT NULL UNIQUE,
+    UNIQUE (trade_date, operation_day)
+);
+CREATE TABLE universe_attempt_result (
+    attempt_id TEXT PRIMARY KEY REFERENCES universe_attempt(attempt_id),
+    terminal_status TEXT NOT NULL CHECK
+    (terminal_status IN ('blocked','deferred','succeeded','failed','ATTEMPT_INDETERMINATE')),
+    classification_request_count INTEGER NOT NULL CHECK (classification_request_count IN (0,1)),
+    reason_code TEXT NOT NULL CHECK (reason_code IN
+    ('CONTROL_STATE_UNAVAILABLE','PIT_VISIBILITY_INVALID','CALENDAR_UNAVAILABLE',
+     'CALENDAR_CONFLICT','CLASSIFICATION_UNAVAILABLE','USER_STORE_UNAVAILABLE',
+     'BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED','PIT_CUTOFF_VIOLATION','USER_SNAPSHOT_CHANGED',
+     'REQUIRED_INDEX_NOT_TRADING','REQUIRED_SYMBOL_INVALID','UNIVERSE_UNKNOWN_NONZERO',
+     'UNIVERSE_COUNT_MISMATCH','UNIVERSE_MISSING_SYMBOL','UNIVERSE_EXTRA_SYMBOL',
+     'UNIVERSE_DUPLICATE_SYMBOL','UNIVERSE_SESSION_DRIFT','UNIVERSE_STATE_MISMATCH',
+     'UNIVERSE_SOURCE_VERSION_CHANGED','DATE_MISMATCH','UNIVERSE_STORAGE_UNAVAILABLE',
+     'UNIVERSE_SCHEMA_MISMATCH','UNIVERSE_HEAD_CAS_CONFLICT','BLOCKED_ENFORCE_NOT_ENABLED',
+     'BLOCKED_PRODUCTION_MODE_OFF','LEGACY_SHADOW_DRIFT','ATTEMPT_INDETERMINATE',
+     'UNIVERSE_IDENTITY_CONFLICT','NONE')),
+    source_state_id TEXT REFERENCES universe_source_state(source_state_id),
+    finished_at TEXT NOT NULL, result_sha256 TEXT NOT NULL UNIQUE
+);
+CREATE TABLE universe_head (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), sequence INTEGER NOT NULL,
+    contract_id TEXT NOT NULL, contract_sha256 TEXT NOT NULL, head_sha256 TEXT NOT NULL,
+    updated_at TEXT NOT NULL, FOREIGN KEY (contract_id) REFERENCES universe_contract(contract_id)
+);
+CREATE TRIGGER universe_head_no_delete BEFORE DELETE ON universe_head
+BEGIN SELECT RAISE(ABORT,'immutable_head'); END;
+CREATE TRIGGER universe_head_update_guard BEFORE UPDATE ON universe_head
+WHEN NEW.singleton_id != OLD.singleton_id OR NEW.sequence != OLD.sequence + 1
+     OR NEW.contract_id = OLD.contract_id
+BEGIN SELECT RAISE(ABORT,'invalid_head_transition'); END;
+CREATE TRIGGER universe_meta_no_update BEFORE UPDATE ON universe_meta
+BEGIN SELECT RAISE(ABORT,'immutable_meta'); END;
+CREATE TRIGGER universe_meta_no_delete BEFORE DELETE ON universe_meta
+BEGIN SELECT RAISE(ABORT,'immutable_meta'); END;
+CREATE TRIGGER universe_source_state_no_update BEFORE UPDATE ON universe_source_state
+BEGIN SELECT RAISE(ABORT,'immutable_source_state'); END;
+CREATE TRIGGER universe_source_state_no_delete BEFORE DELETE ON universe_source_state
+BEGIN SELECT RAISE(ABORT,'immutable_source_state'); END;
+CREATE TRIGGER universe_contract_no_update BEFORE UPDATE ON universe_contract
+BEGIN SELECT RAISE(ABORT,'immutable_contract'); END;
+CREATE TRIGGER universe_contract_no_delete BEFORE DELETE ON universe_contract
+BEGIN SELECT RAISE(ABORT,'immutable_contract'); END;
+CREATE TRIGGER universe_member_no_update BEFORE UPDATE ON universe_member
+BEGIN SELECT RAISE(ABORT,'immutable_member'); END;
+CREATE TRIGGER universe_member_no_delete BEFORE DELETE ON universe_member
+BEGIN SELECT RAISE(ABORT,'immutable_member'); END;
+CREATE TRIGGER universe_mapping_no_update BEFORE UPDATE ON universe_semantic_mapping
+BEGIN SELECT RAISE(ABORT,'immutable_mapping'); END;
+CREATE TRIGGER universe_mapping_no_delete BEFORE DELETE ON universe_semantic_mapping
+BEGIN SELECT RAISE(ABORT,'immutable_mapping'); END;
+CREATE TRIGGER universe_evidence_no_update BEFORE UPDATE ON universe_instrument_evidence
+BEGIN SELECT RAISE(ABORT,'immutable_evidence'); END;
+CREATE TRIGGER universe_evidence_no_delete BEFORE DELETE ON universe_instrument_evidence
+BEGIN SELECT RAISE(ABORT,'immutable_evidence'); END;
+CREATE TRIGGER universe_snapshot_no_update BEFORE UPDATE ON universe_required_symbol_snapshot
+BEGIN SELECT RAISE(ABORT,'immutable_snapshot'); END;
+CREATE TRIGGER universe_snapshot_no_delete BEFORE DELETE ON universe_required_symbol_snapshot
+BEGIN SELECT RAISE(ABORT,'immutable_snapshot'); END;
+CREATE TRIGGER universe_publication_context_no_update BEFORE UPDATE ON universe_publication_context
+BEGIN SELECT RAISE(ABORT,'immutable_publication_context'); END;
+CREATE TRIGGER universe_publication_context_no_delete BEFORE DELETE ON universe_publication_context
+BEGIN SELECT RAISE(ABORT,'immutable_publication_context'); END;
+CREATE TRIGGER contract_evidence_no_update BEFORE UPDATE ON contract_evidence
+BEGIN SELECT RAISE(ABORT,'immutable_contract_evidence'); END;
+CREATE TRIGGER contract_evidence_no_delete BEFORE DELETE ON contract_evidence
+BEGIN SELECT RAISE(ABORT,'immutable_contract_evidence'); END;
+CREATE TRIGGER contract_snapshot_no_update BEFORE UPDATE ON contract_required_snapshot
+BEGIN SELECT RAISE(ABORT,'immutable_contract_snapshot'); END;
+CREATE TRIGGER contract_snapshot_no_delete BEFORE DELETE ON contract_required_snapshot
+BEGIN SELECT RAISE(ABORT,'immutable_contract_snapshot'); END;
+CREATE TRIGGER universe_attempt_no_update BEFORE UPDATE ON universe_attempt
+BEGIN SELECT RAISE(ABORT,'immutable_attempt'); END;
+CREATE TRIGGER universe_attempt_no_delete BEFORE DELETE ON universe_attempt
+BEGIN SELECT RAISE(ABORT,'immutable_attempt'); END;
+CREATE TRIGGER universe_attempt_result_no_update BEFORE UPDATE ON universe_attempt_result
+BEGIN SELECT RAISE(ABORT,'immutable_attempt_result'); END;
+CREATE TRIGGER universe_attempt_result_no_delete BEFORE DELETE ON universe_attempt_result
+BEGIN SELECT RAISE(ABORT,'immutable_attempt_result'); END;
+
 ```
 
 The writer MUST reject any pre-existing non-v1 database; no legacy migration is implemented.
@@ -1635,10 +1694,12 @@ cannot emit `B_P` or `B_E`.
    semantics. It reads no credentials and constructs no provider.
 4. Add route/CLI filesystem fingerprint tests for missing, valid, stale and corrupt states, plus
    `tests/test_market_universe_status.py::test_source_version_and_terminal_attempt_status_matrix`
-   and `test_equal_timestamp_newer_source_state_id_is_stale` cover exact-date head, equal-time
-   source ordering, changed digest, and terminal matrix. `test_market_universe_cli_parser_and_invalid_date_are_read_only`
-   covers pure lexical parsing, while `test_future_date_checks_sidecar_proof` covers the unique
-   sidecar-proof-before-future-date ordering (`test_future_date_checks_sidecar_proof_before_semantic_date`).
+   and `tests/test_market_universe_status.py::test_equal_timestamp_newer_source_state_id_is_stale`
+   cover exact-date head, equal-time source ordering, changed digest, and terminal matrix.
+   `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only`
+   covers pure lexical parsing, while
+   `tests/test_market_universe_status.py::test_future_date_checks_sidecar_proof_before_semantic_date`
+   covers the unique sidecar-proof-before-future-date ordering.
 
 ### Step 7 — Compatibility documentation and no-migration rehearsal
 
@@ -1760,49 +1821,49 @@ range notation is used for review evidence.
 
 | Companion ID | Implementation evidence anchor |
 |---|---|
-| AC-1 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| AC-1 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
 | AC-2 | `tests/test_market_automation.py::test_calendar_fails_closed_outside_confirmed_year` |
 | AC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
-| AC-4 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| AC-5 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| AC-6 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| AC-4 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| AC-5 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| AC-6 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
 | AC-7 | `tests/test_market_automation.py::test_required_symbols_include_positions_and_all_watchlists` |
-| AC-8 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| AC-8 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
 | AC-9 | `tests/test_market_universe.py::test_unknown_one_loaded_match_rejects_contract_publication` |
 | AC-10 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
-| AC-11 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| AC-11 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
 | AC-12 | `tests/test_market_automation.py::test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch` |
 | AC-13 | `tests/test_market_universe_staged.py::test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar` |
 | AC-14 | `tests/test_market_universe_status.py::test_api_and_cli_project_the_same_promoted_snapshot` |
-| AC-15 | `tests/test_market_universe_staged.py::test_shadow_maintenance_hook_is_last_and_consumes_once` |
-| AC-16 | `tests/test_market_universe_status.py::test_no_migration_rehearsal_preserves_canonical_files_and_pointer` |
+| AC-15 | `tests/test_market_universe_staged.py::test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance` |
+| AC-16 | `tests/test_market_universe_staged.py::test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts` |
 | AC-17 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
 | AC-18 | `tests/test_market_automation.py::test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field` |
 | AC-19 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
-| AC-20 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| AC-20 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
 | EC-1 | `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only` |
 | EC-2 | `tests/test_market_universe_status.py::test_empty_or_missing_sidecar_is_control_error_without_initialization` |
 | EC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
 | EC-4 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
 | EC-5 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
-| EC-6 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| EC-7 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
-| EC-8 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
-| EC-9 | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| EC-6 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| EC-7 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| EC-8 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-9 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
 | EC-10 | `tests/test_market_universe.py::test_requested_unverified_source_is_never_publishable` |
 | EC-11 | `tests/test_market_automation.py::test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider` |
 | EC-12 | `tests/test_market_universe.py::test_sidecar_reader_rejects_missing_bidirectional_role_link` |
-| EC-13 | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
-| EC-14 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
-| EC-15 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
-| EC-16 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
-| EC-17 | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| EC-13 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| EC-14 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| EC-15 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-16 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| EC-17 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
 | EC-18 | `tests/test_market_universe.py::test_sidecar_cas_conflict_does_not_change_head` |
-| EC-19 | `tests/test_market_universe.py::test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper` |
+| EC-19 | `tests/test_market_universe_review_red.py::test_normative_ddl_matches_implementation_executes_and_strict_reader_accepts` |
 | EC-20 | `tests/test_market_universe_staged.py::test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop` |
 | EC-21 | `tests/test_market_universe_staged.py::test_disabled_maintenance_is_zero_hook_and_preserves_legacy_tick` |
 | EC-22 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
-| EC-23 | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
+| EC-23 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
 | EC-24 | `tests/test_market_universe_staged.py::test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete` |
 
 ### Mandatory individual FR evidence crosswalk
@@ -1812,34 +1873,75 @@ accepted as a substitute.
 
 | FR (requirement name) | Exact implementation evidence anchor |
 |---|---|
-| FR-1 — Versioned scope | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| FR-2 — Exact-session identity | `tests/test_market_universe.py::test_sidecar_initializes_without_head_and_cas_promotes_then_rejects_tamper` |
+| FR-1 — Versioned scope | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| FR-2 — Exact-session identity | `tests/test_market_universe_review_red.py::test_normative_ddl_matches_implementation_executes_and_strict_reader_accepts` |
 | FR-3 — Promoted calendar PIT gate | `tests/test_market_automation.py::test_calendar_fails_closed_outside_confirmed_year` |
 | FR-4 — Promoted classification PIT gate | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
-| FR-5 — Main-board base scope | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-5 — Main-board base scope | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
 | FR-6 — Required user symbols | `tests/test_market_automation.py::test_required_symbols_include_positions_and_all_watchlists` |
-| FR-7 — Required indexes | `tests/test_market_universe.py::test_required_index_identity_and_state_are_closed` |
+| FR-7 — Required indexes | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
 | FR-8 — Instrument evidence binding | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
-| FR-9 — Listing and delisting states | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| FR-10 — Suspension state | `tests/test_market_universe.py::test_raw_gate_unknown_and_state_mismatch_fail_closed` |
-| FR-11 — ST state | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| FR-12 — Closed expected-state vocabulary | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
-| FR-13 — Deterministic count equation | `tests/test_market_universe.py::test_member_and_count_hashes_are_deterministic_and_equation_is_fail_closed` |
+| FR-9 — Listing and delisting states | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| FR-10 — Suspension state | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| FR-11 — ST state | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| FR-12 — Closed expected-state vocabulary | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| FR-13 — Deterministic count equation | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
 | FR-14 — Unknown-zero publication gate | `tests/test_market_universe.py::test_unknown_one_loaded_match_rejects_contract_publication` |
-| FR-15 — Exact candidate set | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
-| FR-16 — Extras and duplicates are errors | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
-| FR-17 — Whole-session purity | `tests/test_market_universe.py::test_raw_batch_validator_rejects_partial_candidate_before_normalize` |
+| FR-15 — Exact candidate set | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| FR-16 — Extras and duplicates are errors | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| FR-17 — Whole-session purity | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
 | FR-18 — Immutable sidecar authority | `tests/test_market_universe.py::test_sidecar_cas_conflict_does_not_change_head` |
 | FR-19 — Canonical identity | `tests/test_market_universe_staged.py::test_attempt_plan_hash_preimage_uses_canonical_utc_z_timestamp` |
 | FR-20 — Read-only status | `tests/test_market_universe_status.py::test_api_and_cli_project_the_same_promoted_snapshot` |
 | FR-21 — Sanitized diagnostics | `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only` |
-| FR-22 — Maintenance priority | `tests/test_market_universe_staged.py::test_shadow_maintenance_hook_is_last_and_consumes_once` |
+| FR-22 — Maintenance priority | `tests/test_market_universe_staged.py::test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance` |
 | FR-23 — Classification maintenance trigger | `tests/test_market_universe_staged.py::test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop` |
 | FR-24 — Legacy compatibility modes | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
 | FR-25 — No authority widening | `tests/test_market_universe_staged.py::test_release_candidate_removes_runner_and_raw_symbol_public_fields` |
 | FR-26 — Safe migration path | `tests/test_market_universe_status.py::test_no_migration_rehearsal_preserves_canonical_files_and_pointer` |
 | FR-27 — Frozen predecessor contracts | `tests/test_market_automation.py::test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field` |
 
+
+### Final release-candidate attack-anchor registry
+
+The design and implementation records share this exact behavior-level registry. Every anchor is
+executed offline against typed fixtures; no `object()` or generic exception is used as a semantic
+substitute. The registry covers the adversarial gates that must remain visible during review.
+
+| Behavior | Exact test anchor |
+|---|---|
+| Main-board listing PIT window | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| ST missing/conflicting/unknown vocabulary | `tests/test_market_universe_review_red.py::test_st_missing_conflicting_or_unknown_vocabulary_fails_closed` |
+| Classification evidence PIT cutoff | `tests/test_market_universe_review_red.py::test_reviewed_evidence_requires_observed_at_at_or_before_cutoff` |
+| Wrong classification generation bundle | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| Required index identity/state | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| User snapshot atomic capture | `tests/test_market_universe_review_red.py::test_user_snapshot_capture_is_existing_descriptor_bound_and_atomic` |
+| User B-share rejection | `tests/test_market_universe_review_red.py::test_user_capture_rejects_b_share_identity` |
+| Sidecar orphan evidence rejection | `tests/test_market_universe_core_red.py::test_orphan_evidence_invalidates_global_sidecar` |
+| Sidecar path replacement | `tests/test_market_universe_review_red.py::test_universe_sidecar_fails_closed_when_path_is_replaced_after_open` |
+| Raw all-endpoint adapter boundary | `tests/test_market_provider_contract.py::test_baostock_adapter_uses_ordinary_incumbent_sdk_boundary_for_all_endpoints` |
+| Raw exact plan completion/cardinality | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| Raw extra/role/date shard rejection | `tests/test_market_provider_contract.py::test_raw_batch_binds_exact_logical_shard_role_schema_symbol_and_dates` |
+| Raw duplicate projection/lineage | `tests/test_market_provider_contract.py::test_provider_raw_batch_rejects_duplicate_projection_and_lineage` |
+| Raw mixed session/date rejection | `tests/test_market_provider_contract.py::test_endpoint_schema_variants_reject_date_mismatch_and_mixed_sessions` |
+| Raw suspended stock semantics | `tests/test_market_provider_contract.py::test_active_daily_rows_reject_null_activity_and_suspended_rows_reject_activity` |
+| Raw suspended index semantics | `tests/test_market_provider_contract.py::test_index_history_rows_reject_suspended_index` |
+| Raw complete frame and pagination terminal | `tests/test_market_provider_contract.py::test_success_attempt_requires_all_complete_frame_markers_and_one_pagination_terminal` |
+| Raw page after terminal | `tests/test_market_provider_contract.py::test_page_after_pagination_terminal_is_rejected` |
+| Fresh sealed maintenance order | `tests/test_market_universe_staged.py::test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance` |
+| Maintenance acquisition terminal preservation | `tests/test_market_universe_staged.py::test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts` |
+| Maintenance classification terminal/no provider | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| Maintenance restart dedup | `tests/test_market_universe_staged.py::test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete` |
+| Disabled zero-work lane | `tests/test_market_universe_staged.py::test_disabled_maintenance_is_zero_hook_and_preserves_legacy_tick` |
+| Read-only status/API/CLI | `tests/test_market_universe_status.py::test_empty_or_missing_sidecar_is_control_error_without_initialization` |
+| Sidecar bidirectional role-link integrity | `tests/test_market_universe.py::test_sidecar_reader_rejects_missing_bidirectional_role_link` |
+| First empty sidecar claim | `tests/test_market_universe_staged.py::test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar` |
+| Requested-unverified publication block | `tests/test_market_universe.py::test_requested_unverified_source_is_never_publishable` |
+| Status source/terminal precedence | `tests/test_market_universe_status.py::test_source_version_and_terminal_attempt_status_matrix` |
+| Equal timestamp source identity | `tests/test_market_universe_status.py::test_equal_timestamp_newer_source_state_id_is_stale` |
+| Sidecar proof precedes future-date rejection | `tests/test_market_universe_status.py::test_future_date_checks_sidecar_proof_before_semantic_date` |
+| Canonical callback does not use legacy fetch | `tests/test_market_automation.py::test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch` |
+| Snapshot failure zero-work | `tests/test_market_automation.py::test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider` |
 ## Rollback and Recovery
 
 - The feature flag returns the running system to legacy `off` behavior without data migration.

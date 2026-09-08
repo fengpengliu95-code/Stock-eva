@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
+import sqlite3
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from backend.app.market.universe import (
+    _NORMALIZED_UNIVERSE_DDL,
     RequiredSymbolSnapshotV1,
     SourceRefsV1,
     UniverseCountsV1,
@@ -14,6 +18,7 @@ from backend.app.market.universe import (
     UniverseSemanticMappingV1,
     UniverseSidecarStore,
     UniverseStoreUnavailable,
+    _ddl_statements,
     build_universe_contract,
     canonical_json_bytes,
     classification_snapshot_sha256,
@@ -25,6 +30,81 @@ from backend.app.market.universe import (
 from backend.app.user.models import PositionCreate
 from backend.app.user.store import UserDataError, UserStore
 from tests.test_market_universe import _authority, _bundle, _contract, _evidence, _mapping
+
+
+def _normative_ddl_from_doc(path: Path, marker: str) -> tuple[str, str]:
+    text = path.read_text()
+    marker_start = text.index(marker)
+    block_start = text.index("```sql\n", marker_start) + len("```sql\n")
+    block_end = text.index("\n```", block_start)
+    ddl = text[block_start:block_end]
+    normalized = "\n".join(_ddl_statements(ddl))
+    return ddl, normalized
+
+
+def test_normative_ddl_matches_implementation_executes_and_strict_reader_accepts(tmp_path):
+    docs_root = Path(__file__).parents[1] / "docs" / "plans"
+    docs = (
+        docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-design.md",
+        docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-implementation.md",
+    )
+    markers = (
+        "following DDL is normative (whitespace-normalized and",
+        "The implementation MUST use this normative v1 DDL (the canonical "
+        "whitespace-normalized text is",
+    )
+    for path, marker in zip(docs, markers, strict=True):
+        ddl, normalized = _normative_ddl_from_doc(path, marker)
+        assert normalized == _NORMALIZED_UNIVERSE_DDL, path
+        with sqlite3.connect(":memory:") as connection:
+            connection.executescript(ddl)
+
+    store = UniverseSidecarStore(tmp_path / "market_universe.sqlite3")
+    store.initialize()
+    contract = _contract()
+    mapping, evidence, snapshot = _bundle(contract)
+    store.promote(
+        contract,
+        expected_sequence=0,
+        expected_head_sha256=None,
+        mapping=mapping,
+        evidence=evidence,
+        authority_bundle=_authority(mapping, evidence),
+        required_snapshot=snapshot,
+        calendar_authority=__import__(
+            "tests.test_market_universe", fromlist=["_calendar_authority"]
+        )._calendar_authority(contract.trade_date),
+    )
+    _head, read_contract = store.read_verified_snapshot()
+    assert read_contract == contract
+
+
+def test_design_and_implementation_crosswalk_anchors_are_identical_real_behaviors():
+    """Every documented anchor must name a real offline test in both specs."""
+    docs_root = Path(__file__).parents[1] / "docs" / "plans"
+    docs = (
+        docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-design.md",
+        docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-implementation.md",
+    )
+    anchor_sets = []
+    for path in docs:
+        text = path.read_text()
+        anchors = set(re.findall(r"`(tests/[^`\n]+::test_[A-Za-z0-9_]+)`", text))
+        assert anchors, path
+        for anchor in anchors:
+            test_path, test_name = anchor.split("::", 1)
+            source = (Path(__file__).parents[1] / test_path).read_text()
+            assert re.search(rf"(?:async\s+)?def\s+{re.escape(test_name)}\s*\(", source), anchor
+        anchor_sets.append(anchors)
+    assert anchor_sets[0] == anchor_sets[1]
+    required = {
+        "tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window",
+        "tests/test_market_universe_review_red.py::test_st_missing_conflicting_or_unknown_vocabulary_fails_closed",
+        "tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality",
+        "tests/test_market_universe_staged.py::test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance",
+        "tests/test_market_universe_staged.py::test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts",
+    }
+    assert required <= anchor_sets[0]
 
 
 def _rehash_evidence(values: dict) -> UniverseInstrumentEvidenceV1:
@@ -46,6 +126,18 @@ def test_missing_listing_window_evidence_is_unknown_and_unpublishable():
         source_schema="classification.instrument.v1",
         artifact_origin="production_reviewed_artifact",
     )
+    with pytest.raises(ValueError):
+        _rehash_evidence(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("st_state", None), ("st_state", "maybe"), ("st_state", "yes")],
+)
+def test_st_missing_conflicting_or_unknown_vocabulary_fails_closed(field, value):
+    contract = _contract()
+    values = _evidence(contract.members[0], contract.trade_date).model_dump()
+    values[field] = value
     with pytest.raises(ValueError):
         _rehash_evidence(values)
 

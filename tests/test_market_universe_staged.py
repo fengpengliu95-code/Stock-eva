@@ -199,6 +199,105 @@ def test_shadow_maintenance_hook_is_last_and_consumes_once(tmp_path: Path):
     assert [item[0] for item in events] == ["canonical", "shadow"]
 
 
+def test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance(
+    tmp_path: Path,
+):
+    """AC15: only a sealed canonical execution can reach the real maintenance service."""
+    events = []
+    target = date(2026, 7, 23)
+    provider_factory_calls = []
+
+    class Shadow:
+        def offer(self, *args, **kwargs):
+            events.append("shadow")
+
+    class PostPublish:
+        def run_after_publication(self, result):
+            events.append("post_publish")
+
+    class ClassificationReader:
+        def read_snapshot(self, as_of, *, known_at, include_securities):
+            return ClassificationReadSnapshot(
+                ready_generation_id=None,
+                generation=None,
+                securities=[],
+                security_snapshot_date=None,
+                index_components=[],
+                index_snapshot_date=None,
+                sector_memberships=[],
+                sector_snapshot_date=None,
+            )
+
+    sidecar = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+
+    class RecordingMaintenance(UniverseMaintenanceService):
+        def __call__(self, **kwargs):
+            events.append("maintenance")
+            return super().__call__(**kwargs)
+
+    def provider_factory(**_kwargs):
+        provider_factory_calls.append(True)
+        raise AssertionError("classification-unavailable lane must not construct provider")
+
+    maintenance = RecordingMaintenance(
+        sidecar=sidecar,
+        calendar_store=SimpleNamespace(read_authority=lambda: _calendar_authority(target)),
+        classification_store=ClassificationReader(),
+        user_store=SimpleNamespace(),
+        lock_path=tmp_path / "maintenance.lock",
+        provider_factory=provider_factory,
+        context_validator=lambda value, **_kwargs: value,
+        clock=lambda: datetime(2026, 7, 23, 19, tzinfo=UTC),
+    )
+
+    # Attach the consumer outside the callback so the automation path exercises
+    # the same sealed-context handoff used by the production callback.
+    context_by_run: dict[str, UniversePublicationContextV1] = {}
+
+    def canonical_with_context(**kwargs):
+        events.append("canonical")
+        result = _ready_result(kwargs["run_id"], kwargs["trade_date"])
+        context_by_run[kwargs["run_id"]] = _maintenance_context(
+            kwargs["trade_date"], kwargs["run_id"]
+        )
+        return CanonicalRefreshExecution(result=result, builder_outcome="accepted")
+
+    canonical_with_context.consume_universe_publication_context = lambda run_id, trade_date: (
+        context_by_run.get(run_id)
+    )
+    service = MarketAutomationService(
+        MarketStore(tmp_path / "market.duckdb"),
+        _NoopProvider(),
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+        lock_path=tmp_path / "refresh.lock",
+        post_publish=PostPublish(),
+        shadow_handoff=Shadow(),
+        canonical_refresh=canonical_with_context,
+        universe_post_success_hook=ConcreteUniversePostSuccessHook(
+            environment="staging",
+            mode="shadow",
+            enabled=True,
+            maintenance_service=maintenance,
+        ),
+        market_universe_maintenance_enabled=True,
+        market_universe_mode="shadow",
+        environment="staging",
+        universe_context_validator=lambda value, **_kwargs: value,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None and outcome.result.status == "ready"
+    assert events == ["canonical", "post_publish", "shadow", "maintenance"]
+    assert service.last_universe_result is not None
+    assert service.last_universe_result.status == "BLOCKED"
+    assert service.last_universe_result.reason_code == "CLASSIFICATION_UNAVAILABLE"
+    assert service.last_universe_result.provider_requests == 0
+    assert provider_factory_calls == []
+    assert sidecar.read_latest_terminal_finished_at(target) is not None
+
+
 def test_concrete_hook_rejects_non_strict_service_fallback():
     with pytest.raises(TypeError):
         ConcreteUniversePostSuccessHook(
@@ -621,3 +720,178 @@ def test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop(t
     head, promoted = sidecar.read_verified_snapshot()
     assert head.sequence == 1
     assert promoted.trade_date == target
+
+
+def test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts(
+    tmp_path: Path,
+):
+    """AC16: an acquisition failure is durable and cannot damage canonical state."""
+    target = date(2026, 9, 1)
+    contract_fixture = _contract(trade_date=target)
+    mapping, evidence, _snapshot = _bundle(contract_fixture)
+    authority = _authority(mapping, evidence)
+
+    class ReviewedAuthority:
+        def preflight_source_version_digest(self, *, snapshot):
+            refs = SourceRefsV1(
+                calendar_generation_id="0" * 32,
+                calendar_sha256="0" * 64,
+                classification_generation_id="cls-1",
+                classification_generation_sequence=1,
+                classification_source="fixture",
+                classification_source_version="v1",
+                classification_source_snapshot_date=date(2026, 8, 31),
+                classification_observed_at=datetime(2026, 9, 1, 8, tzinfo=UTC),
+                classification_snapshot_sha256=classification_snapshot_sha256(evidence),
+                required_symbol_snapshot_id="0" * 32,
+                required_symbol_snapshot_sha256="0" * 64,
+                instrument_evidence_ids=tuple(item.evidence_id for item in evidence),
+                semantic_mapping_sha256=mapping.mapping_sha256,
+                source_version_digest="0" * 64,
+                provider_id="baostock",
+                trade_date=target,
+                exact_pit_cutoff=datetime(2026, 9, 1, 19, tzinfo=UTC),
+                source_date_semantics="source_observed",
+            )
+            return source_version_digest(refs, evidence)
+
+        def admit(self, snapshot, *, trade_date, refresh_id):
+            return authority
+
+    class Provider:
+        max_attempts = 1
+
+        def fetch(self, trade_date):
+            provider_fetches.append(trade_date)
+            raise RuntimeError("synthetic acquisition failure")
+
+    provider_factories = []
+    provider_fetches = []
+
+    def provider_factory(**kwargs):
+        provider_factories.append(kwargs)
+        return Provider()
+
+    generation = SimpleNamespace(
+        generation_id="cls-1",
+        sequence=1,
+        source="fixture",
+        source_version="v1",
+        source_snapshot_date=date(2026, 8, 31),
+        source_date_semantics="source_observed",
+        observed_at=datetime(2026, 9, 1, 8, tzinfo=UTC),
+    )
+    classification = ClassificationReadSnapshot(
+        ready_generation_id="cls-1",
+        generation=generation,
+        securities=[],
+        security_snapshot_date=None,
+        index_components=[],
+        index_snapshot_date=None,
+        sector_memberships=[],
+        sector_snapshot_date=None,
+    )
+    classification_store = SimpleNamespace(
+        read_snapshot=lambda as_of, **kwargs: classification,
+    )
+    user_store = SimpleNamespace(
+        capture_required_symbol_snapshot_existing=lambda: _user_capture(contract_fixture.members),
+    )
+    calendar_store = SimpleNamespace(read_authority=lambda: _calendar_authority(target))
+    reviewed = ReviewedAuthority()
+    sidecar = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+
+    # Establish an already-published prior head with the same strict service.
+    class GoodProvider:
+        max_attempts = 1
+
+        def fetch(self, trade_date):
+            return ClassificationSnapshot(
+                source="baostock",
+                source_version="fixture",
+                source_snapshot_date=trade_date,
+                source_date_semantics="source_observed",
+                observed_at=datetime(2026, 9, 1, 18, tzinfo=UTC),
+            )
+
+    good = UniverseMaintenanceService(
+        sidecar=sidecar,
+        calendar_store=calendar_store,
+        classification_store=classification_store,
+        user_store=user_store,
+        lock_path=tmp_path / "maintenance.lock",
+        provider_factory=lambda **kwargs: GoodProvider(),
+        context_validator=lambda value, **_kwargs: value,
+        reviewed_authority=reviewed,
+        clock=lambda: datetime(2026, 9, 1, 19, tzinfo=UTC),
+    )
+    first = good(
+        trade_date=target.isoformat(),
+        now="2026-09-01T19:00:00+00:00",
+        context=_maintenance_context(target, "run-prior"),
+        sidecar=sidecar,
+    )
+    assert first.status == "PROMOTED"
+    prior_head, prior_contract = sidecar.read_verified_snapshot()
+
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    artifacts = {
+        canonical_root / "canonical.parquet": b"canonical bytes",
+        canonical_root / "manifest.json": b"manifest bytes",
+        canonical_root / "CURRENT": b"prior pointer\n",
+    }
+    for path, payload in artifacts.items():
+        path.write_bytes(payload)
+    before_artifacts = {path: (path.read_bytes(), path.stat().st_ino) for path in artifacts}
+
+    failing = UniverseMaintenanceService(
+        sidecar=sidecar,
+        calendar_store=calendar_store,
+        classification_store=classification_store,
+        user_store=user_store,
+        lock_path=tmp_path / "maintenance.lock",
+        provider_factory=provider_factory,
+        context_validator=lambda value, **_kwargs: value,
+        reviewed_authority=reviewed,
+        clock=lambda: datetime(2026, 9, 2, 19, tzinfo=UTC),
+    )
+    failed = failing(
+        trade_date=target.isoformat(),
+        now="2026-09-02T19:00:00+00:00",
+        context=_maintenance_context(target, "run-failed"),
+        sidecar=sidecar,
+    )
+
+    assert failed.status == "BLOCKED"
+    assert failed.reason_code == "CLASSIFICATION_UNAVAILABLE"
+    assert failed.provider_requests == 1
+    assert provider_factories == [{"max_attempts": 1}]
+    assert provider_fetches == [target]
+    current_head, current_contract = sidecar.read_verified_snapshot()
+    assert current_head == prior_head
+    assert current_contract == prior_contract
+    assert sidecar.read_latest_terminal_finished_at(target) == datetime(2026, 9, 2, 19, tzinfo=UTC)
+    (
+        _status_head,
+        _status_contract,
+        _head_source,
+        _source_rows,
+        attempts,
+    ) = sidecar.read_status_snapshot(target)
+    assert attempts[-1][1] is not None
+    assert attempts[-1][1].terminal_status == "failed"
+    assert attempts[-1][1].reason_code == "CLASSIFICATION_UNAVAILABLE"
+    assert {path: (path.read_bytes(), path.stat().st_ino) for path in artifacts} == before_artifacts
+
+    # The durable terminal closes the same slot on restart; it must not acquire again.
+    second = failing(
+        trade_date=target.isoformat(),
+        now="2026-09-02T19:30:00+00:00",
+        context=_maintenance_context(target, "run-failed"),
+        sidecar=sidecar,
+    )
+    assert second.status == "DEFER"
+    assert second.reason_code == "NONE"
+    assert second.provider_requests == 0
+    assert provider_fetches == [target]
