@@ -356,6 +356,7 @@ class CalendarPromotionResult(_Frozen):
 
 class CalendarReadResult(_Frozen):
     status: Literal["ready", "unavailable"]
+    reason: str | None = None
     generation: CalendarGenerationV1 | None = None
     bundled: tuple[dict[str, Any], ...] | None = None
     source: CalendarSourceBundleV1 | None = None
@@ -371,12 +372,14 @@ class CalendarAuthorityAdmission:
 
     read_result: CalendarReadResult
     head_generation_sha256: str | None
+    reason: str | None
 
     def __init__(
         self,
         read_result: CalendarReadResult,
         *,
         head_generation_sha256: str | None,
+        reason: str | None = None,
         _secret: object | None = None,
     ) -> None:
         if _secret is not _CALENDAR_ADMISSION_SECRET:
@@ -394,10 +397,17 @@ class CalendarAuthorityAdmission:
                 or head_generation_sha256 != generation.generation_sha256
             ):
                 raise ValueError("calendar authority digest is not reader-verified")
-        elif head_generation_sha256 is not None:
-            raise ValueError("unavailable calendar authority has a head digest")
+            if reason is not None or read_result.reason is not None:
+                raise ValueError("ready calendar authority cannot have an unavailable reason")
+        else:
+            if head_generation_sha256 is not None:
+                raise ValueError("unavailable calendar authority has a head digest")
+            reason = reason or read_result.reason or "CALENDAR_AUTHORITY_UNAVAILABLE"
+            if read_result.reason not in (None, reason):
+                raise ValueError("calendar authority reason is not stable")
         object.__setattr__(self, "read_result", read_result)
         object.__setattr__(self, "head_generation_sha256", head_generation_sha256)
+        object.__setattr__(self, "reason", reason)
 
 
 class CalendarSourceMetadata(_Frozen):
@@ -1586,7 +1596,11 @@ class CalendarGenerationStore:
     @staticmethod
     def _empty_control() -> CalendarControlSnapshot:
         return CalendarControlSnapshot(
-            read_result=CalendarReadResult(status="unavailable", calendar=EMPTY_CALENDAR)
+            read_result=CalendarReadResult(
+                status="unavailable",
+                reason="CALENDAR_GENERATION_MISSING",
+                calendar=EMPTY_CALENDAR,
+            )
         )
 
     def read_control(self) -> CalendarControlSnapshot:
@@ -1652,9 +1666,18 @@ class CalendarGenerationStore:
     def read_authority(self) -> CalendarAuthorityAdmission:
         control = self.read_control()
         generation = control.read_result.generation
+        read_result = control.read_result
+        if generation is None and read_result.status == "ready":
+            read_result = read_result.model_copy(
+                update={
+                    "status": "unavailable",
+                    "reason": "CALENDAR_GENERATION_MISSING",
+                }
+            )
         return CalendarAuthorityAdmission(
-            control.read_result,
+            read_result,
             head_generation_sha256=(generation.generation_sha256 if generation else None),
+            reason=read_result.reason,
             _secret=_CALENDAR_ADMISSION_SECRET,
         )
 

@@ -726,6 +726,51 @@ def test_calendar_admission_is_frozen_and_reader_digest_bound():
         authority.read_result = authority.read_result
 
 
+def test_initialized_empty_calendar_authority_is_sealed_unavailable(tmp_path):
+    from backend.app.market.calendar_generation import CalendarGenerationStore
+
+    store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    connection = store._connect(readonly=False)
+    try:
+        store._initialize(connection)
+        connection.commit()
+    finally:
+        connection.close()
+    authority = store.read_authority()
+    assert authority.read_result.status == "unavailable"
+    assert authority.read_result.generation is None
+    assert authority.read_result.reason == "CALENDAR_GENERATION_MISSING"
+    assert authority.reason == "CALENDAR_GENERATION_MISSING"
+
+
+def test_empty_calendar_admission_blocks_promote_without_head_write(tmp_path):
+    from backend.app.market.calendar_generation import CalendarGenerationStore
+
+    candidate = _contract()
+    mapping, evidence, snapshot = _bundle(candidate)
+    calendar_store = CalendarGenerationStore(tmp_path / "calendar.sqlite3")
+    connection = calendar_store._connect(readonly=False)
+    try:
+        calendar_store._initialize(connection)
+        connection.commit()
+    finally:
+        connection.close()
+    universe_store = UniverseSidecarStore(tmp_path / "universe.sqlite3")
+    universe_store.initialize()
+    with pytest.raises(UniverseStoreUnavailable):
+        universe_store.promote(
+            candidate,
+            expected_sequence=0,
+            expected_head_sha256=None,
+            mapping=mapping,
+            evidence=evidence,
+            authority_bundle=_authority(mapping, evidence),
+            required_snapshot=snapshot,
+            calendar_authority=calendar_store.read_authority(),
+        )
+    assert universe_store.read_head() is None
+
+
 def test_partition_members_cannot_fall_between_layers():
     from tests.test_market_universe import _member
 
