@@ -114,3 +114,11 @@ content hash, while page/row/evidence/candidate fields are empty or null.
 `evidence_ready` is nonterminal; only a new terminal report version plus one
 immutable attestation and the expected job/window CAS updates can complete a
 session. Every report is append-only. Automatic failover remains disabled.
+
+## R2-F4.2 provider and Universe boundary
+
+R2-F4.2 的 exact-session Universe status projection 不会构造任何 provider，也不会把
+BaoStock、TickFlow 或 Tushare 的未持久化结果当作当前 Universe。source/version 变化只有在
+writer-owned sidecar 写入新的 `universe_source_state` 后才可见；查询层不能自行发现或修复
+provider 变化。Universe candidate 仍只能以完整会话发布，禁止 symbol-level 混源；secondary
+provider qualification、automatic failover 和生产 enablement 均保持关闭。

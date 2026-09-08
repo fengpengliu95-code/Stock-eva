@@ -3278,6 +3278,147 @@ class UniverseSidecarStore:
         finally:
             connection.close()
 
+    def read_status_snapshot(
+        self, trade_date: date
+    ) -> tuple[
+        UniverseHeadV1 | None,
+        UniverseContractV1 | None,
+        UniverseSourceStateV1 | None,
+        tuple[UniverseSourceStateV1, ...],
+        tuple[tuple[UniverseAttemptPlanV1, UniverseAttemptResultV1 | None], ...],
+    ]:
+        """Read the complete immutable status projection without initializing the sidecar.
+
+        This is deliberately separate from ``read_verified_snapshot``: a schema-valid sidecar
+        with an empty head is a proven ``unavailable`` state, not a storage failure.  All global
+        rows are validated in the same read transaction before any status decision is made.
+        """
+        if isinstance(trade_date, str):
+            trade_date = date.fromisoformat(trade_date)
+        if not self.path.exists() or self.path.is_symlink():
+            raise UniverseStoreUnavailable("universe sidecar unavailable")
+        connection = self._connect(readonly=True)
+        try:
+            connection.execute("BEGIN DEFERRED")
+            self._validate(connection)
+            row = connection.execute(
+                "SELECT sequence,contract_id,contract_sha256,head_sha256,updated_at "
+                "FROM universe_head WHERE singleton_id=1"
+            ).fetchone()
+            head: UniverseHeadV1 | None = None
+            contract: UniverseContractV1 | None = None
+            reachable: set[str] = set()
+            if row is not None:
+                contract = self._read_contract(connection, row["contract_id"])
+                if (
+                    row["contract_sha256"] != contract.contract_sha256
+                    or row["sequence"] != contract.sequence
+                    or row["head_sha256"]
+                    != _head_digest(row["sequence"], row["contract_id"], row["contract_sha256"])
+                ):
+                    raise UniverseStoreUnavailable("universe snapshot head mismatch")
+                current = contract
+                reachable.add(current.contract_id)
+                while current.sequence > 1:
+                    if (
+                        current.parent_contract_id is None
+                        or current.parent_contract_id in reachable
+                    ):
+                        raise UniverseStoreUnavailable("universe parent chain invalid")
+                    current = self._read_contract(connection, current.parent_contract_id)
+                    reachable.add(current.contract_id)
+                head = UniverseHeadV1(
+                    sequence=row["sequence"],
+                    contract_id=row["contract_id"],
+                    contract_sha256=row["contract_sha256"],
+                    head_sha256=row["head_sha256"],
+                    updated_at=datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00")),
+                )
+            self._validate_global(connection, reachable)
+
+            def source_state_from_row(source_row: sqlite3.Row) -> UniverseSourceStateV1:
+                return UniverseSourceStateV1(
+                    source_state_id=source_row[0],
+                    source_state_sha256=source_row[1],
+                    trade_date=date.fromisoformat(source_row[2]),
+                    provider_id=source_row[3],
+                    source_version_digest=source_row[4],
+                    source_refs_json=source_row[5],
+                    verified_at=datetime.fromisoformat(source_row[6].replace("Z", "+00:00")),
+                )
+
+            source_rows = tuple(
+                source_state_from_row(source_row)
+                for source_row in connection.execute(
+                    "SELECT * FROM universe_source_state WHERE trade_date=? "
+                    "ORDER BY verified_at ASC, source_state_id ASC",
+                    (trade_date.isoformat(),),
+                ).fetchall()
+            )
+            head_source: UniverseSourceStateV1 | None = None
+            if contract is not None and contract.source_state_id is not None:
+                source_row = connection.execute(
+                    "SELECT * FROM universe_source_state WHERE source_state_id=?",
+                    (contract.source_state_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise UniverseStoreUnavailable("universe head source state missing")
+                head_source = source_state_from_row(source_row)
+                if (
+                    head_source.trade_date != contract.trade_date
+                    or head_source.source_version_digest
+                    != contract.source_refs.source_version_digest
+                ):
+                    raise UniverseStoreUnavailable("universe head source state mismatch")
+
+            attempt_rows = connection.execute(
+                "SELECT a.*, r.terminal_status, r.classification_request_count, "
+                "r.reason_code, r.source_state_id AS result_source_state_id, "
+                "r.finished_at, r.result_sha256 "
+                "FROM universe_attempt a LEFT JOIN universe_attempt_result r "
+                "ON r.attempt_id=a.attempt_id WHERE a.trade_date=? "
+                "ORDER BY a.created_at ASC, a.attempt_id ASC",
+                (trade_date.isoformat(),),
+            ).fetchall()
+            attempts: list[tuple[UniverseAttemptPlanV1, UniverseAttemptResultV1 | None]] = []
+            for attempt_row in attempt_rows:
+                plan = UniverseAttemptPlanV1(
+                    attempt_id=attempt_row[0],
+                    dedup_key=attempt_row[1],
+                    hook_kind=attempt_row[2],
+                    refresh_id=attempt_row[3],
+                    canonical_run_id=attempt_row[4],
+                    source_version_digest=attempt_row[5],
+                    trade_date=date.fromisoformat(attempt_row[6]),
+                    operation_day=date.fromisoformat(attempt_row[7]),
+                    attempt_status=attempt_row[8],
+                    request_budget=attempt_row[9],
+                    classification_max_attempts=attempt_row[10],
+                    created_at=datetime.fromisoformat(str(attempt_row[11]).replace("Z", "+00:00")),
+                    planned_sha256=attempt_row[12],
+                )
+                result = None
+                if attempt_row[13] is not None:
+                    result = UniverseAttemptResultV1(
+                        attempt_id=attempt_row[0],
+                        terminal_status=attempt_row[13],
+                        classification_request_count=attempt_row[14],
+                        reason_code=attempt_row[15],
+                        source_state_id=attempt_row[16],
+                        finished_at=datetime.fromisoformat(
+                            str(attempt_row[17]).replace("Z", "+00:00")
+                        ),
+                        result_sha256=attempt_row[18],
+                    )
+                attempts.append((plan, result))
+            return head, contract, head_source, source_rows, tuple(attempts)
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+            if isinstance(exc, UniverseStoreUnavailable):
+                raise
+            raise UniverseStoreUnavailable("universe status snapshot unavailable") from exc
+        finally:
+            connection.close()
+
     def read_latest_source_state(self, trade_date: date) -> UniverseSourceStateV1 | None:
         """Return the newest writer-verified source row for one exact date."""
         if not self.path.exists() or self.path.is_symlink():

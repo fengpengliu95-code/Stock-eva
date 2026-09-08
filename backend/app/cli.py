@@ -102,6 +102,12 @@ from backend.app.market.providers.shadow_contracts import ShadowProviderId
 from backend.app.market.refresh import MarketRefreshService
 from backend.app.market.store import MarketStore
 from backend.app.market.universe import UniverseSidecarStore
+from backend.app.market.universe_status import (
+    UniverseStatusControlError,
+    UniverseStatusDateError,
+    build_universe_status,
+    parse_universe_trade_date,
+)
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.regime.acceptance import (
     MINIMUM_RELEASE_ONE_SESSIONS,
@@ -636,6 +642,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="persist only verified continuity repair jobs; never runs a provider repair",
     )
+    market_universe = subparsers.add_parser(
+        "market-universe",
+        help="read-only status of the persisted exact-session universe sidecar",
+    )
+    market_universe.add_argument(
+        "--date",
+        required=True,
+        dest="trade_date",
+        help="exact point-in-time date in YYYY-MM-DD format",
+    )
     return parser
 
 
@@ -681,6 +697,66 @@ def _continuity_cli_payload(
 
 def _calendar_runtime_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _market_universe_command(args: argparse.Namespace) -> int:
+    """Project the strict sidecar status; this path never initializes runtime directories."""
+    try:
+        requested = parse_universe_trade_date(args.trade_date)
+    except UniverseStatusDateError:
+        print(
+            json.dumps(
+                {
+                    "code": "universe_status_invalid",
+                    "reason_code": "PIT_VISIBILITY_INVALID",
+                    "provider_requests": 0,
+                    "writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    try:
+        settings = get_settings()
+        status = build_universe_status(
+            requested,
+            UniverseSidecarStore(StorageLayout(settings).universe_contract_database),
+        )
+    except UniverseStatusDateError:
+        print(
+            json.dumps(
+                {
+                    "code": "universe_status_invalid",
+                    "reason_code": "PIT_VISIBILITY_INVALID",
+                    "provider_requests": 0,
+                    "writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    except UniverseStatusControlError:
+        print(
+            json.dumps(
+                {"code": "universe_unavailable", "reason_code": "CONTROL_STATE_UNAVAILABLE"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 3
+    except Exception:
+        print(
+            json.dumps(
+                {"code": "universe_unavailable", "reason_code": "CONTROL_STATE_UNAVAILABLE"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 3
+    print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+    return 0 if status["status"] == "ready" else 1
 
 
 def _calendar_generation_status_command(_args: argparse.Namespace) -> int:
@@ -1427,6 +1503,8 @@ def main() -> int:
         return _calendar_maintenance_command(args)
     if args.command == "market-continuity":
         return _market_continuity_command(args)
+    if args.command == "market-universe":
+        return _market_universe_command(args)
     if args.command == "market-provider-daily-shadow":
         return _market_provider_daily_shadow_command(args)
     if args.command == "market-failover-readiness":

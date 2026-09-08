@@ -3,7 +3,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import SettingsError
 
@@ -42,7 +42,12 @@ from backend.app.market.failover import (
     build_capability_snapshot,
     build_readiness,
 )
-from backend.app.market.models import MarketDataStatus, MarketSummary, PriceSeriesPoint
+from backend.app.market.models import (
+    MarketDataStatus,
+    MarketSummary,
+    PriceSeriesPoint,
+    UniverseStatusSnapshotV1,
+)
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
 from backend.app.market.providers.shadow_contracts import AdmissionState, ShadowProviderId
@@ -57,12 +62,65 @@ from backend.app.market.supplemental import (
     SupplementalMarketResponse,
     supplemental_capabilities,
 )
+from backend.app.market.universe import UniverseSidecarStore
+from backend.app.market.universe_status import (
+    UniverseStatusControlError,
+    UniverseStatusDateError,
+    build_universe_status,
+    parse_universe_trade_date,
+)
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+@router.get("/universe", response_model=UniverseStatusSnapshotV1)
+def market_universe_status(
+    settings: Annotated[Settings, Depends(get_settings)],
+    trade_date: str = Query(..., description="Exact point-in-time date, YYYY-MM-DD"),
+) -> dict[str, object]:
+    """Return the persisted exact-session universe status without any writes or provider calls."""
+    try:
+        requested = parse_universe_trade_date(trade_date)
+    except UniverseStatusDateError:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "universe_status_invalid",
+                "reason_code": "PIT_VISIBILITY_INVALID",
+                "provider_requests": 0,
+                "writes": False,
+            },
+        ) from None
+    try:
+        return build_universe_status(
+            requested,
+            UniverseSidecarStore(StorageLayout(settings).universe_contract_database),
+        )
+    except UniverseStatusDateError:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "universe_status_invalid",
+                "reason_code": "PIT_VISIBILITY_INVALID",
+                "provider_requests": 0,
+                "writes": False,
+            },
+        ) from None
+    except UniverseStatusControlError:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "universe_control_unavailable"},
+        ) from None
+    except Exception:
+        # Public status must never leak storage paths, SQL or raw internal diagnostics.
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "universe_control_unavailable"},
+        ) from None
 
 
 def get_calendar_generation_api_settings() -> CalendarRuntimeSettings:

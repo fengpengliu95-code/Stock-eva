@@ -1,5 +1,19 @@
 # R1-A 时点分类主数据
 
+## R2-F4.2 exact-session Universe sidecar
+
+R2-F4.2 的 exact-session Universe 不是分类 GET 的替代品，而是 writer-owned、不可变的
+point-in-time authority。`universe_source_state` 将 promoted classification generation、
+instrument evidence、semantic mapping、calendar generation 和 required-user snapshot
+绑定为一个 `source_version_digest`；contract/head、attempt 和 terminal result 均在同一
+sidecar 中按哈希与 CAS 约束保存。
+
+公开状态查询 `GET /api/v1/market/universe?trade_date=YYYY-MM-DD` 与
+`stock-eva market-universe --date YYYY-MM-DD` 只读取已经证明完整的 sidecar。它们不读
+provider、UserStore 或外部分类/日历，不初始化目录，不迁移 schema，也不写 canonical、
+Parquet、manifest、pointer 或 sidecar。状态只反映 writer 已持久化的 source row；未持久化
+的分类变更在查询中不可见，这是有意的 PIT 语义。
+
 R1-A 提供版本化的证券主数据、指数成分和行业成员快照。它是 Release 1 后续市场状态、
 板块和龙头计算的只读输入，不提供实时行情、券商连接或交易写入。
 

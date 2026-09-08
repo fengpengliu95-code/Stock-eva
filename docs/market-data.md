@@ -1,5 +1,22 @@
 # 行情数据契约与运行状态
 
+## R2-F4.2 Universe status boundary
+
+exact-session Universe contract 是独立于 canonical 行情发布的控制面。状态字段包括
+`ready`、`stale`、`blocked`、`unavailable`、verified head/source digests、计数方程、
+固定 required indexes、required-user 数量和一条 allowlisted `reason_code`。`ready` 才能
+作为完整 Universe authority；`stale`（例如 `DATE_MISMATCH` 或
+`UNIVERSE_SOURCE_VERSION_CHANGED`）和 `blocked` 都不能被当作可发布集合。
+
+API/CLI 的 lexical-invalid 日期先在纯 parser 中返回 HTTP 422/CLI 2；对 lexical-valid
+日期先完成 sidecar/path/inode/schema/head/attempt 证明，证明失败固定返回 HTTP 503/CLI 3，
+然后才检查 future PIT 日期。状态查询固定 `provider_requests=0`、`writes=false`，也不创建
+缺失的 control directory。R2-F4.2 默认 off，未通过独立 review 和人工窗口不得启用生产维护。
+Universe counts 保持不可变方程：`total = trading + suspended + not_yet_listed + delisted +
+unknown`，且 `session_expected = trading + suspended`；任何不满足方程或 digest/head 链不完整
+都 fail closed。维护模式只允许显式 nonproduction + shadow，production 和默认 off 均不触发
+Universe provider 请求。
+
 ## 范围
 
 核心行情只处理上交所、深交所 A 股主板的公开免费收盘后日线。BaoStock 是唯一

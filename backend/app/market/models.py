@@ -211,6 +211,119 @@ class MarketDataStatus(BaseModel):
     ) = None
 
 
+class UniverseStatusCounts(BaseModel):
+    total: int = Field(ge=0)
+    trading: int = Field(ge=0)
+    suspended: int = Field(ge=0)
+    not_yet_listed: int = Field(ge=0)
+    delisted: int = Field(ge=0)
+    unknown: int = Field(ge=0)
+    session_expected: int = Field(ge=0)
+    loaded: int | None = Field(default=None, ge=0)
+    critical_attribute_unknown_count: int = Field(ge=0)
+
+
+class UniverseStatusLayers(BaseModel):
+    classification_evidence_count: int = Field(ge=0)
+    classification_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effective_main_board_count: int = Field(ge=0)
+    effective_main_board_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required_additions_count: int = Field(ge=0)
+    required_additions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class UniverseStatusSnapshotV1(BaseModel):
+    """Sanitized public projection of one verified universe sidecar snapshot."""
+
+    trade_date: date
+    universe_id: Literal["all-main-board-plus-required-symbols"]
+    schema_version: Literal[1] = 1
+    scope: Literal["all-main-board-plus-required-symbols"]
+    provider_requests: Literal[0] = 0
+    writes: Literal[False] = False
+    status: Literal["ready", "stale", "blocked", "unavailable"]
+    verified_head_trade_date: date | None
+    contract_id: str | None
+    contract_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_state_id: str | None
+    source_state_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_version_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    classification_generation_id: str | None
+    calendar_generation_id: str | None
+    calendar_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    counts: UniverseStatusCounts | None
+    layers: UniverseStatusLayers | None
+    required_indexes: tuple[Literal["sh.000001", "sz.399001"], ...] | None
+    required_user_symbol_count: int | None = Field(default=None, ge=0)
+    publication_eligible: bool
+    reason_code: Literal[
+        "CONTROL_STATE_UNAVAILABLE",
+        "PIT_VISIBILITY_INVALID",
+        "CALENDAR_UNAVAILABLE",
+        "CALENDAR_CONFLICT",
+        "CLASSIFICATION_UNAVAILABLE",
+        "USER_STORE_UNAVAILABLE",
+        "BLOCKED_INSTRUMENT_EVIDENCE_UNQUALIFIED",
+        "PIT_CUTOFF_VIOLATION",
+        "USER_SNAPSHOT_CHANGED",
+        "REQUIRED_INDEX_NOT_TRADING",
+        "REQUIRED_SYMBOL_INVALID",
+        "UNIVERSE_UNKNOWN_NONZERO",
+        "UNIVERSE_COUNT_MISMATCH",
+        "UNIVERSE_MISSING_SYMBOL",
+        "UNIVERSE_EXTRA_SYMBOL",
+        "UNIVERSE_DUPLICATE_SYMBOL",
+        "UNIVERSE_SESSION_DRIFT",
+        "UNIVERSE_STATE_MISMATCH",
+        "UNIVERSE_SOURCE_VERSION_CHANGED",
+        "DATE_MISMATCH",
+        "UNIVERSE_STORAGE_UNAVAILABLE",
+        "UNIVERSE_SCHEMA_MISMATCH",
+        "UNIVERSE_HEAD_CAS_CONFLICT",
+        "BLOCKED_ENFORCE_NOT_ENABLED",
+        "BLOCKED_PRODUCTION_MODE_OFF",
+        "LEGACY_SHADOW_DRIFT",
+        "ATTEMPT_INDETERMINATE",
+        "UNIVERSE_IDENTITY_CONFLICT",
+        "NONE",
+    ]
+
+    @model_validator(mode="after")
+    def validate_projection_shape(self) -> "UniverseStatusSnapshotV1":
+        nullable = (
+            self.verified_head_trade_date,
+            self.contract_id,
+            self.contract_sha256,
+            self.source_state_id,
+            self.source_state_sha256,
+            self.source_version_digest,
+            self.classification_generation_id,
+            self.calendar_generation_id,
+            self.calendar_sha256,
+            self.counts,
+            self.layers,
+            self.required_indexes,
+            self.required_user_symbol_count,
+        )
+        if self.status in {"blocked", "unavailable"}:
+            if any(value is not None for value in nullable) or self.publication_eligible:
+                raise ValueError("blocked/unavailable Universe projection must be empty")
+        elif any(value is None for value in nullable):
+            raise ValueError("ready/stale Universe projection is incomplete")
+        if self.status == "ready" and not self.publication_eligible:
+            raise ValueError("ready Universe projection must be publication eligible")
+        if self.status == "ready" and self.reason_code != "NONE":
+            raise ValueError("ready Universe projection reason must be NONE")
+        if self.status == "stale" and self.publication_eligible:
+            raise ValueError("stale Universe projection cannot be publication eligible")
+        if self.required_indexes is not None and self.required_indexes != (
+            "sh.000001",
+            "sz.399001",
+        ):
+            raise ValueError("required Universe index set is incomplete")
+        return self
+
+
 class PriceSeriesPoint(BaseModel):
     trade_date: date
     symbol: str
