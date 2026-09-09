@@ -2580,3 +2580,30 @@ precommit reason/effect. The exact parameterized anchors are
 `tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
 `tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
 No real NAS/provider or production enablement is performed.
+
+#### Batch3.6 cleanup result and restart-residue contract (implementation contract)
+
+The destination implementation uses a single cleanup accumulator for head temporary-fd close and
+hardlink unlink, root-session close, lock unlock, lock-fd close and directory-fd close. Cleanup
+failures are attempted independently and are never allowed to replace a primary unavailable reason;
+only the sanitized internal marker `replication_cleanup=failed` is retained. When no primary result
+exists, a cleanup failure remains a typed durability error. When a primary result is `replicated`
+or `already_replicated`, the outer result path returns `unavailable/CONTROL_STATE_UNAVAILABLE`,
+`proof=None`, and `destination_writes=true`. A primary unavailable result keeps its original reason
+and monotonic effect bit.
+
+`_destination_replace_at` carries cleanup failure state on its typed head-install error. If the
+head hard-link or exchange already succeeded, the shared wrapper preserves the head/record and
+maps all later cleanup uncertainty to controlled degraded output. On a later locked invocation,
+`_destination_cleanup_head_temporary_aliases` scans only the replication dirfd and removes a
+`.head.json.<24-lower-hex>.tmp` entry after proving exact bytes, regular `0600` mode, same
+device/inode as `head.json`, and link count `2`; malformed or unproven entries fail closed and are
+never silently deleted. This also makes restart recovery deterministic for an already-replicated
+checkpoint.
+
+The exact implementation anchors are
+`tests/test_replication_destination_batch3.py::test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`,
+`tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`, and
+`tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`.

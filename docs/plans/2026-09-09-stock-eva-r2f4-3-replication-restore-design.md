@@ -2755,6 +2755,7 @@ The parameterized offline attacks cover all three publication paths:
 `tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
 `tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
 `tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
+
 The live mount boundary tests in Batch3.3 remain the mount-failure evidence. No production fake
 inspector is exposed; `volume_id` unavailable remains `UNKNOWN/UNQUALIFIED`.
 
@@ -2776,3 +2777,37 @@ path. The exact parameterized offline anchors are
 `tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
 `tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
 `tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
+
+#### Batch3.6 cleanup result and restart-residue contract (normative)
+
+This amendment supersedes only cleanup-result handling in the preceding Batch3 destination
+amendments. The destination schema, immutable history, head linearization point, and offline-only
+scope are unchanged. The head-install primitive MUST accumulate temporary-fd close and temporary
+hardlink-unlink failures independently. A cleanup failure after the hard-link or exchange syscall
+has linearized MUST retain the visible head and record, clear any completion proof, and return
+`CONTROL_STATE_UNAVAILABLE` with `destination_writes=true` when the operation otherwise would have
+returned `replicated`. A cleanup failure MUST be represented only by a bounded sanitized marker
+(`replication_cleanup=failed`) in internal error/context state; no path, temporary name, or raw OS
+exception may cross the public boundary.
+
+The same rule applies to root-session close, destination lock unlock, lock-fd close and directory-fd
+close. If a primary unavailable result already exists, its reason and effect bit are preserved and
+the cleanup marker is secondary. If the primary result is `replicated` or `already_replicated`, the
+public result is degraded to `unavailable/CONTROL_STATE_UNAVAILABLE`, has `proof=null`, and sets
+`destination_writes=true`; a cleanup failure with no primary result remains a typed durability
+failure. Every best-effort cleanup item is attempted independently.
+
+After a successful head exchange whose temporary alias could not be removed, the next locked writer
+MAY remove it only after a descriptor-native proof of the exact allowlisted name
+`.head.json.<24-lower-hex>.tmp`, regular mode `0600`, identical bytes, same device/inode as the
+visible `head.json`, and link count exactly `2`. Any malformed, mismatched, symlinked, or otherwise
+unproven entry is `CONTROL_STATE_UNAVAILABLE` with no new destination mutation. A proven alias is
+removed through the held replication dirfd and its parent is fsynced; an already-replicated result
+whose restart cleanup made this effect is still reported with the monotonic destination effect bit.
+
+The exact offline anchors are
+`tests/test_replication_destination_batch3.py::test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`,
+`tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`, and
+`tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`.

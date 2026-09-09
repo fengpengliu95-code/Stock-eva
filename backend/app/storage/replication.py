@@ -128,10 +128,14 @@ class DestinationHeadInstallError(ReplicationDurabilityError):
         *,
         linearized: bool,
         reason_code: ReplicationReason = "COPY_FAILED",
+        cleanup_failed: bool = False,
     ) -> None:
         super().__init__(message)
         self.linearized = linearized
         self.reason_code = reason_code
+        # This is intentionally a boolean only.  Cleanup diagnostics must not
+        # expose the temporary name, path, or underlying OS exception.
+        self.cleanup_failed = cleanup_failed
 
 
 @dataclass(frozen=True)
@@ -6449,6 +6453,8 @@ class DestinationArchiveWriter:
                         linearized=False,
                     )
             except DestinationHeadInstallError as exc:
+                if exc.cleanup_failed:
+                    effect_context.cleanup_failed = True
                 if exc.linearized:
                     head_committed = True
                     mark_effect()
@@ -6477,11 +6483,26 @@ class DestinationArchiveWriter:
             reader._validate_history_namespace(root_fd)
             history_records = reader.list_verified_records(root_fd)
             baseline = reader.read_head(root_fd)
+            if _destination_cleanup_head_temporary_aliases(
+                replication_fd,
+                canonical_json_bytes(baseline.model_dump(mode="json"))
+                if baseline is not None
+                else None,
+            ):
+                # Removing a proven post-linearization alias is itself a
+                # destination effect and must remain visible to the caller.
+                mark_effect()
+                _fsync_open_directory(replication_fd)
         except ReplicationStateUnavailable as exc:
             reason = "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
             return finish(DestinationReplicationResult("unavailable", reason))
-        except ReplicationDurabilityError:
-            return finish(DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED"))
+        except ReplicationDurabilityError as exc:
+            reason = (
+                "CONTROL_STATE_UNAVAILABLE"
+                if "head temporary" in str(exc)
+                else "DESTINATION_TRUST_FAILED"
+            )
+            return finish(DestinationReplicationResult("unavailable", reason))
 
         def matches_checkpoint(candidate: ReplicationRecord, parent_record_hash: str) -> bool:
             """Prove a recovered record is the exact incoming checkpoint."""
@@ -6952,13 +6973,16 @@ class DestinationArchiveWriter:
             destination_writes = (
                 result.destination_writes or effect_context.destination_write_started
             )
-            if effect_context.cleanup_failed and result.status == "replicated":
+            if effect_context.cleanup_failed and result.status in {
+                "replicated",
+                "already_replicated",
+            }:
                 return DestinationReplicationResult(
                     "unavailable",
                     "CONTROL_STATE_UNAVAILABLE",
                     result.record,
                     None,
-                    destination_writes,
+                    True,
                 )
             return DestinationReplicationResult(
                 result.status,
@@ -7027,15 +7051,12 @@ class DestinationArchiveWriter:
                     try:
                         _destination_unlock(replication_fd, lock_fd)
                     except ReplicationDurabilityError:
-                        if result is not None and result.destination_writes:
-                            result = DestinationReplicationResult(
-                                "unavailable",
-                                "CONTROL_STATE_UNAVAILABLE",
-                                result.record,
-                                result.proof,
-                                True,
-                            )
-                        else:
+                        # Unlock/close is always best effort after a primary
+                        # result.  A successful or already-replicated
+                        # operation loses its proof when cleanup is uncertain;
+                        # an unavailable primary keeps its own reason/effect.
+                        effect_context.cleanup_failed = True
+                        if result is None:
                             raise
                 if result is None:
                     raise ReplicationDurabilityError("destination result is unavailable")
@@ -7129,6 +7150,7 @@ def _destination_replace_at(
     temporary = f".{name}.{secrets.token_hex(12)}.tmp"
     fd: int | None = None
     linearized = False
+    primary_error: BaseException | None = None
     try:
         current = _destination_read_at(parent_fd, (name,), optional=True)
         current_bytes = current[0] if current is not None else None
@@ -7176,36 +7198,112 @@ def _destination_replace_at(
         if readback is None or readback[0] != payload:
             raise ReplicationDurabilityError("destination head readback failed")
         return DestinationHeadInstallResult(linearized=True)
-    except ReplicationCASConflict:
+    except ReplicationCASConflict as exc:
+        primary_error = exc
         raise
-    except DestinationHeadInstallError:
+    except DestinationHeadInstallError as exc:
+        primary_error = exc
         raise
     except ReplicationDurabilityError as exc:
         reason_code: ReplicationReason = (
             "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
         )
-        raise DestinationHeadInstallError(
+        primary_error = DestinationHeadInstallError(
             "destination head install failed",
             linearized=linearized,
             reason_code=reason_code,
-        ) from exc
+        )
+        raise primary_error from exc
     except OSError as exc:
-        raise DestinationHeadInstallError(
+        primary_error = DestinationHeadInstallError(
             "destination head install failed",
             linearized=linearized,
-        ) from exc
+        )
+        raise primary_error from exc
     finally:
+        cleanup_failures: list[str] = []
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
-                pass
+                cleanup_failures.append("destination_head_fd_close")
         try:
             os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         except OSError:
-            pass
+            cleanup_failures.append("destination_head_temporary_unlink")
+        if cleanup_failures:
+            if primary_error is not None:
+                primary_error.add_note("replication_cleanup=failed")
+                if isinstance(primary_error, DestinationHeadInstallError):
+                    primary_error.cleanup_failed = True
+            else:
+                raise DestinationHeadInstallError(
+                    "destination head cleanup failed",
+                    linearized=linearized,
+                    cleanup_failed=True,
+                )
+
+
+def _destination_cleanup_head_temporary_aliases(
+    replication_fd: int,
+    head_payload: bytes | None,
+) -> bool:
+    """Remove only a proven hard-link alias left by a completed head install.
+
+    A failed best-effort unlink after the head exchange leaves the temporary
+    name as a second link to the now-visible head.  On restart that alias is
+    recoverable only when every part of that proof is exact.  An unknown,
+    private, mismatched, or non-hard-link entry remains fail-closed.
+    """
+    try:
+        names = os.listdir(replication_fd)
+    except OSError as exc:
+        raise ReplicationStateUnavailable(
+            "destination head temporary namespace is unavailable"
+        ) from exc
+    aliases = [name for name in names if name.startswith(".head.json.")]
+    if not aliases:
+        return False
+    if len(aliases) != 1:
+        raise ReplicationStateUnavailable("destination head temporary aliases are unsafe")
+    if head_payload is None:
+        raise ReplicationStateUnavailable("destination head temporary alias has no head")
+    try:
+        head_info = os.stat("head.json", dir_fd=replication_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ReplicationStateUnavailable("destination head is unavailable") from exc
+    if not stat.S_ISREG(head_info.st_mode) or stat.S_IMODE(head_info.st_mode) != 0o600:
+        raise ReplicationStateUnavailable("destination head is unsafe")
+    cleaned = False
+    for name in sorted(aliases):
+        if not re.fullmatch(r"\.head\.json\.[0-9a-f]{24}\.tmp", name):
+            raise ReplicationStateUnavailable("destination head temporary entry is unknown")
+        try:
+            info = os.stat(name, dir_fd=replication_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ReplicationStateUnavailable(
+                "destination head temporary entry is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_dev != head_info.st_dev
+            or info.st_ino != head_info.st_ino
+            or info.st_nlink != 2
+            or head_info.st_nlink != 2
+        ):
+            raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
+        current = _destination_read_at(replication_fd, (name,))
+        if current is None or current[0] != head_payload:
+            raise ReplicationStateUnavailable("destination head temporary alias mismatches")
+        try:
+            os.unlink(name, dir_fd=replication_fd)
+        except OSError as exc:
+            raise ReplicationDurabilityError("destination head temporary cleanup failed") from exc
+        cleaned = True
+    return cleaned
 
 
 def _complete_replication_with_proof(

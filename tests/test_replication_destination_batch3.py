@@ -1235,6 +1235,203 @@ def test_cleanup_failure_preserves_primary_copy_reason_and_effect(
     assert result.destination_writes is True
 
 
+def test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    replication_dir = destination / "_replication"
+    replication_identity = replication_dir.stat()
+    original_unlink = replication.os.unlink
+    injected = False
+
+    def fail_head_temporary_cleanup(name: object, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            not injected
+            and isinstance(name, str)
+            and name.startswith(".head.json.")
+            and isinstance(dir_fd, int)
+        ):
+            info = os.fstat(dir_fd)
+            if (info.st_dev, info.st_ino) == (
+                replication_identity.st_dev,
+                replication_identity.st_ino,
+            ):
+                injected = True
+                raise OSError(errno.EIO, "injected head temporary cleanup failure")
+        original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(replication.os, "unlink", fail_head_temporary_cleanup)
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert injected
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.proof is None
+    assert result.destination_writes is True
+    assert (replication_dir / "head.json").exists()
+    assert any(path.name.startswith(".head.json.") for path in replication_dir.iterdir())
+
+
+def test_head_readback_close_failure_after_success_degrades_without_losing_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    head = destination / "_replication" / "head.json"
+    original_close = replication.os.close
+    injected = False
+
+    def fail_head_readback_close(fd: int) -> None:
+        nonlocal injected
+        if not injected and head.exists():
+            try:
+                opened = os.fstat(fd)
+                current = head.stat()
+            except OSError:
+                opened = None
+                current = None
+            if (
+                opened is not None
+                and current is not None
+                and (
+                    opened.st_dev,
+                    opened.st_ino,
+                )
+                == (current.st_dev, current.st_ino)
+            ):
+                injected = True
+                raise OSError(errno.EIO, "injected head readback close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(replication.os, "close", fail_head_readback_close)
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert injected
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.proof is None
+    assert result.destination_writes is True
+    assert head.exists()
+
+
+def test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert first.record is not None
+    original_unlock = replication._destination_unlock
+
+    def fail_unlock(*args: object, **kwargs: object) -> None:
+        original_unlock(*args, **kwargs)
+        raise ReplicationDurabilityError("injected unlock cleanup failure")
+
+    monkeypatch.setattr(replication, "_destination_unlock", fail_unlock)
+    result = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:02:00Z")
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.proof is None
+    assert result.destination_writes is True
+    assert (destination / "_replication" / "head.json").exists()
+
+
+def test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    (source / "bars.parquet").write_bytes(b"changed-source")
+    original_unlock = replication._destination_unlock
+
+    def fail_unlock(*args: object, **kwargs: object) -> None:
+        original_unlock(*args, **kwargs)
+        raise ReplicationDurabilityError("injected unlock cleanup failure")
+
+    monkeypatch.setattr(replication, "_destination_unlock", fail_unlock)
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.status == "unavailable"
+    assert result.reason_code == "COPY_FAILED"
+    assert result.destination_writes is True
+
+
+def test_head_temporary_alias_is_strictly_recovered_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    replication_dir = destination / "_replication"
+    original_unlink = replication.os.unlink
+    injected = False
+
+    def leave_head_temporary_alias(name: object, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and isinstance(name, str)
+            and name.startswith(".head.json.")
+            and isinstance(kwargs.get("dir_fd"), int)
+        ):
+            injected = True
+            raise OSError(errno.EIO, "injected restart residue")
+        original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(replication.os, "unlink", leave_head_temporary_alias)
+    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert first.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert injected
+    residue = [path for path in replication_dir.iterdir() if path.name.startswith(".head.json.")]
+    assert len(residue) == 1
+
+    monkeypatch.setattr(replication.os, "unlink", original_unlink)
+    second = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:02:00Z")
+    assert second.reason_code == "ALREADY_REPLICATED"
+    assert second.record is not None
+    assert not any(path.name.startswith(".head.json.") for path in replication_dir.iterdir())
+
+
 def _head_recovery_case(tmp_path: Path, case: str):
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"
