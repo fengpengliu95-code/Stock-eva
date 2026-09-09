@@ -67,10 +67,10 @@ canonical pointer and cannot become a new source of market truth.
 - FR-3b: Every dataset-backed `NasMarketStore`/dataset pointer writer seam (`save_refresh`, reconcile-control-pointer, CLI reconciliation, `full_history` and legacy `save_external_publication` callers) MUST route through `publish_dataset_and_pointer`; no direct pointer write may bypass the binding, manifest publication lock or pre-publication guard. The plain `MarketStore` canonical commit MUST remain byte/behavior compatible and MUST not acquire this binding/guard or access NAS; its post-commit replication observation is `SOURCE_NOT_CONFIGURED` when no explicit dataset/manifest is present.
 - FR-3c: The dataset-backed central wrapper MUST acquire one non-reentrant opaque `ManifestPublicationLock` token before baseline manifest read and hold it through object/staging writes, manifest replace/readback, publication-binding write/fsync, DuckDB pointer commit and post-commit exact proof. `backfill`, `upsert`, `refresh`, reconcile and every other manifest mutation MUST use the same lock; `RefreshRunLock` is scheduling only and MUST NOT be the atomicity dependency. A final manifest fingerprint CAS check immediately before pointer commit MUST leave the pointer unchanged on drift.
 - FR-3d: Legacy/no-selection publications MUST use fixed domain-separated canonical-null selection/lineage digests; missing required v2 manifest metadata MUST return `SOURCE_UNAVAILABLE` and leave the pointer unchanged. A legal reconcile may reuse a binding only after the same lock-bound exact proof.
-- FR-3e: One `ManifestPublicationCoordinator` MUST expose exactly two mutually exclusive typed operations: `publish_manifest_only(...)` (manifest update/verification only, no binding/pointer) for `upsert_bars`/backfill, and `publish_dataset_and_pointer(...)` (manifest → binding → pointer) for dataset publication. Both may share only a token-checked locked primitive; manifest-only MUST NOT call the pointer operation.
+- FR-3e: One `ManifestPublicationCoordinator` MUST expose exactly two mutually exclusive typed operations: `publish_manifest_only(...)` (manifest update/verification only, no binding/pointer) for every `NasMarketStore.upsert_bars` and `BackfillService` batch, and `publish_dataset_and_pointer(...)` (manifest → binding → pointer) for dataset publication. Both may share only a token-checked locked primitive; manifest-only MUST NOT call the pointer operation.
 - FR-3f: Lock acquisition/token/baseline/guard/final-CAS failures before pointer commit MUST leave pointer bytes/hash/inode unchanged. After pointer commit, unlock/close/post-proof/control failures MUST NOT roll back canonical ready; they return degraded `CONTROL_STATE_UNAVAILABLE`, durably reconcile, and are handled by the next guard.
 - FR-3g: `publish_manifest_only` MUST return a typed three-state pointer proof: `ABSENT` only when the DB is absent or its proven-valid schema has no singleton row; `PRESENT{row_sha256,device,inode,schema_digest}` for a complete singleton; and `INVALID{reason_code=CONTROL_STATE_UNAVAILABLE}` for missing tables, corrupt schema, read failure, duplicate/malformed singleton or incomplete state. `INVALID` MUST fail closed before any manifest mutation, and `ABSENT` MUST never be a forced string, empty hash or synthetic row.
-- FR-3h: Before any manifest-only mutation, the coordinator MUST read the existing manifest lineage mode. An empty manifest may classify the incoming input as legacy or modern; a non-empty manifest MUST retain one complete mode/lineage. Modern backfill/upsert without exact immutable lineage MUST return `SOURCE_UNAVAILABLE` before mutation; it MUST never contaminate a modern manifest.
+- FR-3h: Before any manifest-only mutation, the coordinator MUST read the existing manifest lineage mode and invoke the discriminated-union `LineageResolver` for every `trade_date` in a `BackfillService` batch. An empty manifest may classify the incoming input as legacy or modern; a non-empty manifest MUST retain one complete mode/lineage. Any missing, unavailable or mismatched date resolution MUST fail the entire batch with `SOURCE_UNAVAILABLE` before the first upsert; it MUST never partially mutate or contaminate a modern manifest. Every existing `NasMarketStore.upsert_bars` caller MUST pass an explicit legacy input or an exact/allowlisted modern input; plain `MarketStore` is unchanged.
 - FR-4: The outbox MUST be a local durable SQLite sidecar with the normalized schema, immutable intent identity, allowlisted states, state-version CAS and durable terminal audit defined in this document.
 - FR-5: An enqueue failure MUST be observable as a sanitized `OUTBOX_ENQUEUE_FAILED` or `OUTBOX_JOURNALED` projection; a crash between pointer commit and enqueue MUST be recoverable by comparing the current strict source manifest with durable outbox/journal state.
 - FR-5a: Journal installation MUST use an `O_EXCL|O_NOFOLLOW` temporary, file/directory fsync, macOS `renameatx_np(RENAME_EXCL)` or portable hard-link-no-replace fallback; an existing target may be reused only when byte-identical and MUST never be overwritten.
@@ -222,11 +222,11 @@ Given all focused replication/restore fakes, existing NAS tests and static valid
 - EC-28: `RefreshRunLock` is absent, reordered or nested while the manifest publication lock is held → it cannot be used as the publication atomicity dependency; the opaque manifest-lock token remains the sole ownership proof and lock-order violation fails closed.
 - EC-29: A legacy/no-selection candidate lacks required v2 manifest metadata → fixed canonical-null selection/lineage digests are used only when metadata is intentionally absent; a required-but-missing field returns `SOURCE_UNAVAILABLE` and leaves the pointer unchanged.
 - EC-30: A plain `MarketStore` publishes without an explicit local dataset/manifest → its existing canonical commit is unchanged; no binding/guard/NAS work runs and the post-commit observation is `SOURCE_NOT_CONFIGURED`.
-- EC-31: `upsert_bars` or backfill invokes `publish_manifest_only(...)` → it may update and verify only the manifest; it must never create a binding or call the pointer wrapper, and pointer bytes/hash/inode remain unchanged.
+- EC-31: `NasMarketStore.upsert_bars` or a `BackfillService` batch invokes `publish_manifest_only(...)` with explicit per-date lineage input → it may update and verify only the manifest; it must never create a binding or call the pointer wrapper, and pointer bytes/hash/inode remain unchanged.
 - EC-32: Manifest lock acquisition, token, precommit or final-CAS readiness fails before pointer commit → pointer bytes/hash/inode remain unchanged and no post-commit degraded observation is emitted.
 - EC-33: Pointer commit succeeds but unlock/close/post-proof control fails → canonical ready remains visible; emit degraded `CONTROL_STATE_UNAVAILABLE`, durably record reconciliation evidence, and let the next pre-publication guard repair/prove control state.
 - EC-34: A manifest-only publication starts with an empty control database → return `PointerIdentity.ABSENT`; compare the complete tagged union before/after and do not serialize a fake string identity.
-- EC-35: A non-empty manifest is modern and a backfill omits, partially supplies or conflicts on lineage → return `SOURCE_UNAVAILABLE` before any manifest mutation; existing manifest and pointer identities remain unchanged.
+- EC-35: A multi-date `BackfillService` plan has one omitted, partial or conflicting per-date lineage input → the resolver returns `UNAVAILABLE/SOURCE_UNAVAILABLE` before any date is upserted; existing manifest and pointer identities remain unchanged.
 - EC-18: Two workers claim the same intent, or a worker lease expires → one state-version CAS wins; stale workers cannot copy, promote or mark success.
 - EC-19: Retry attempt reaches the sixth failure or a non-retryable integrity/trust failure occurs → durable `dead_letter`/terminal reason; no automatic unbounded retry.
 - EC-20: Restore source is invalid or changes during copy → no final temporary root, no canonical DB/pointer mutation, and bounded sanitized result.
@@ -593,9 +593,9 @@ real passing test/static check before an implementation release is considered.
 | FR-3e | `tests/test_dataset_replication.py::test_manifest_only_operation_never_calls_pointer_wrapper` |
 | FR-3f | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | FR-3g | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
-| FR-3h | `tests/test_dataset_replication.py::test_modern_backfill_without_exact_lineage_fails_closed` |
+| FR-3h | `tests/test_dataset_replication.py::test_backfill_service_requires_explicit_lineage_input_per_trade_date` |
 | FR-3i | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
-| FR-3j | `tests/test_dataset_replication.py::test_lineage_resolver_validates_retained_evidence_before_mutation` |
+| FR-3j | `tests/test_dataset_replication.py::test_lineage_resolver_returns_union_and_reuses_session_selection_hash_contract` |
 | FR-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
 | FR-5 | `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id` |
 | FR-5a | `tests/test_dataset_replication.py::test_journal_install_is_no_replace_and_reuses_identical_target` |
@@ -646,7 +646,7 @@ real passing test/static check before an implementation release is considered.
 | AC-23 | `tests/test_dataset_replication.py::test_manifest_only_upsert_and_backfill_preserve_pointer_bytes_hash_and_inode` |
 | AC-24 | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | AC-25 | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
-| AC-26 | `tests/test_dataset_replication.py::test_manifest_only_modern_backfill_lineage_is_required_and_preserved` |
+| AC-26 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure` |
 | AC-27 | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
 | AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
@@ -683,7 +683,7 @@ real passing test/static check before an implementation release is considered.
 | EC-32 | `tests/test_dataset_replication.py::test_pointer_precommit_lock_error_preserves_pointer_identity` |
 | EC-33 | `tests/test_dataset_replication.py::test_pointer_postcommit_control_error_is_durable_and_next_guard_reconciles` |
 | EC-34 | `tests/test_dataset_replication.py::test_manifest_only_present_pointer_identity_is_exact_before_after` |
-| EC-35 | `tests/test_dataset_replication.py::test_manifest_lineage_mode_is_inherited_before_mutation` |
+| EC-35 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_failure_preserves_manifest_and_pointer` |
 | EC-36 | `tests/test_dataset_replication.py::test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance` |
 | EC-37 | `tests/test_dataset_replication.py::test_missing_lineage_reader_returns_source_unavailable_before_mutation` |
 
@@ -1871,7 +1871,7 @@ The implementation inventory must name these exact seams and no generic callback
 | `backend/app/storage/dataset.py::NasMarketStore.save_refresh` | `publish_dataset_and_pointer` | binding/pointer exact proof under one token |
 | `backend/app/storage/dataset.py::NasMarketStore.upsert_bars` | `publish_manifest_only` | pointer bytes/hash/inode unchanged |
 | `backend/app/storage/dataset.py::NasMarketStore.reconcile_control_pointer` | `publish_dataset_and_pointer` | existing binding may be reused only after exact proof |
-| `backend/app/market/backfill.py` | `publish_manifest_only` per batch | no pointer wrapper call |
+| `backend/app/market/backfill.py::BackfillService.plan/execute` | `publish_manifest_only` per date/group after all date resolutions pass | explicit lineage input per `trade_date`; any resolver failure is whole-batch `SOURCE_UNAVAILABLE` before the first upsert |
 | `backend/app/market/full_history.py` | `publish_dataset_and_pointer` | no direct lock or pointer save |
 | `backend/app/cli.py` reconciliation | `publish_dataset_and_pointer` | no direct lock or pointer save |
 | `backend/app/main.py` startup reconciliation | `publish_dataset_and_pointer` | no direct lock; next guard owns recovery |
@@ -1956,7 +1956,7 @@ Required anchors: `test_manifest_only_empty_database_uses_absent_pointer_identit
 | `backend/app/storage/dataset.py::NasMarketStore.save_refresh` | `publish_dataset_and_pointer` | no direct pointer save or second lock |
 | `backend/app/storage/dataset.py::NasMarketStore.upsert_bars` | `publish_manifest_only` | no binding, guard, pointer or `SourceCommit` |
 | `backend/app/storage/dataset.py::NasMarketStore.reconcile_control_pointer` | `publish_dataset_and_pointer` | no standalone initialization writer |
-| `backend/app/market/backfill.py` | `publish_manifest_only` per batch | no pointer-operation call |
+| `backend/app/market/backfill.py::BackfillService.plan/execute` | `publish_manifest_only` per date/group after all date resolutions pass | explicit lineage input per `trade_date`; any resolver failure is whole-batch `SOURCE_UNAVAILABLE` before the first upsert |
 | `backend/app/market/full_history.py` | `publish_dataset_and_pointer` | no lock acquisition or direct pointer write |
 | `backend/app/cli.py` reconciliation | `publish_dataset_and_pointer` | no lock acquisition or direct pointer write |
 | `backend/app/main.py` startup reconciliation | `publish_dataset_and_pointer` | no lock acquisition; use the coordinator |
@@ -1991,10 +1991,10 @@ same exact immutable lineage. Reconcile follows the same algorithm and may reuse
 after exact lock-bound proof. Required anchors are
 `test_legacy_no_selection_uses_canonical_null_digests`,
 `test_modern_v2_lineage_is_strictly_validated`,
-`test_modern_backfill_without_exact_lineage_fails_closed`,
-`test_manifest_only_modern_backfill_lineage_is_required_and_preserved`,
+`test_backfill_service_requires_explicit_lineage_input_per_trade_date`,
+`test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure`,
 `test_partial_unknown_or_conflicting_v2_lineage_is_source_unavailable`, and
-`test_manifest_lineage_mode_is_inherited_before_mutation`.
+`test_backfill_service_multi_date_failure_preserves_manifest_and_pointer`.
 
 ### 4. Pointer linearization and phase-specific failure
 
@@ -2082,16 +2082,25 @@ type PublicationLineage = Readonly<{
 }>;
 ```
 
-The associated private frozen `SelectionRelation` is a validation relation, not a tenth
-manifest field: `provider_id`, `universe_id`, `candidate_id`, `evidence_id`, `trade_date`,
-`evidence_sha256`, `candidate_manifest_sha256` and `gate_report_sha256` MUST equal the selected
-candidate, retained evidence and successful gate records for the requested publication. The
-relation is checked before any manifest mutation and is included in the lineage/selection hash
-preimages already defined by this document.
+`SelectionRelation` is an alias of the existing frozen
+`backend/app/market/candidates.py::SessionSelection`; it is not a new model or hash contract.
+Its exact fields are `selection_id`, `trade_date`, `universe_id`, `selected_candidate_id`,
+`selected_provider_id`, `reason`, `fallback_from`, `evidence_sha256`,
+`candidate_manifest_sha256`, `gate_report_sha256`, `selected_at` and `selection_sha256`.
+The existing selection preimage is `SessionSelection.model_dump(mode="json")` with only
+`selection_sha256` removed, encoded as canonical JSON with sorted keys, UTF-8, no insignificant
+whitespace and no NaN, then plain SHA-256; no new domain or alternate selection digest is
+introduced. The relation additionally requires `selected_candidate_id`, `selected_provider_id`,
+`universe_id`, the three evidence/gate hashes and `trade_date` to equal the resolved
+`PublicationLineage` and requested date, with `reason="primary_ready"` and
+`fallback_from` absent. The existing `publication_lineage_sha256` is exactly
+`domain_sha256("stock-eva/r2f4.2/publication-lineage/v2", <the nine-field lineage object>)`;
+the replication binding's `selection_sha256`/`lineage_sha256` fields are aliases of those two
+existing values, not a second hash scheme. The relation is checked before any manifest mutation.
 
 The only resolver seam is the strict local `LineageResolver` (planned in
-`backend/app/storage/replication.py`), whose result is either the frozen model or a sanitized
-`SOURCE_UNAVAILABLE` failure:
+`backend/app/storage/replication.py`), whose result is the explicit discriminated union below;
+`null` is never returned or used to mean either legacy or unavailable:
 
 ```typescript
 type LineageInput =
@@ -2099,9 +2108,39 @@ type LineageInput =
   | Readonly<{ mode: "modern"; exact: PublicationLineage }>
   | Readonly<{ mode: "modern"; candidate_id: string; evidence_id: string }>;
 
+// These are additive fields/signature constraints on the existing Pydantic
+// models in backend/app/market/backfill.py; they do not introduce a runner or
+// replace BackfillPlan/BackfillRunRecord.
+type BackfillBatchPlan = Readonly<{
+  index: number;
+  start_date: string; end_date: string;
+  trading_dates: ReadonlyArray<string>;
+  symbols: ReadonlyArray<string>;
+  requested_points: number;
+  estimated_provider_requests: number;
+  lineage_by_trade_date: Readonly<Record<string, LineageInput>>;
+}>;
+
+interface BackfillService {
+  plan(input: Readonly<{
+    start_date: string; end_date: string; symbols: ReadonlyArray<string>;
+    symbol_batch_size: number; date_batch_size: number; max_batches: number;
+    trading_dates?: ReadonlyArray<string>;
+    lineage_by_trade_date: Readonly<Record<string, LineageInput>>;
+  }>): BackfillPlan;
+  execute(plan: BackfillPlan, options: Readonly<{
+    min_request_interval_seconds: number;
+  }>): BackfillRunRecord;
+}
+
+type LineageResolveResult =
+  | Readonly<{ kind: "LEGACY"; selection_sha256: string; lineage_sha256: string }>
+  | Readonly<{ kind: "MODERN"; lineage: PublicationLineage; selection: SessionSelection }>
+  | Readonly<{ kind: "UNAVAILABLE"; reason_code: "SOURCE_UNAVAILABLE" }>;
+
 interface LineageResolver {
   resolve(input: LineageInput, trade_date: string,
-          existing_mode: "empty" | "legacy" | "modern"): PublicationLineage | null;
+          existing_mode: "empty" | "legacy" | "modern"): LineageResolveResult;
 }
 ```
 
@@ -2112,20 +2151,44 @@ same full validation. It MUST NOT call a provider, use labels, inspect bars to g
 inherit any unverified field. Missing evidence, unavailable readers, digest mismatch, selection
 relation mismatch or unknown IDs returns `SOURCE_UNAVAILABLE` before manifest mutation.
 
-Existing non-empty legacy manifests accept only `mode="legacy"`; modern input is rejected. Existing
+`LineageResolveResult` is a discriminated union; no `null` result has semantic meaning. `LEGACY`
+contains the already-defined explicit legacy/no-selection digest pair and never fabricates a
+`SessionSelection`; `MODERN` contains both the nine-field lineage and the exact F4.2
+`SessionSelection`; `UNAVAILABLE` contains only `reason_code="SOURCE_UNAVAILABLE"`. Existing
+non-empty legacy manifests accept only `mode="legacy"`; modern input is rejected. Existing
 non-empty modern manifests accept only a fully validated exact same lineage (caller-supplied or
 resolver-loaded); legacy, partial and conflicting input is rejected. An empty manifest may choose
 legacy or modern, but modern still requires exact refs or the allowlisted resolver path. This
 decision is made before object staging or manifest replacement.
 
-The earlier nullable lineage argument is replaced by required
+`BackfillService.plan` MUST retain the existing `BackfillPlan`/`BackfillBatchPlan` shape and build
+each batch's `trading_dates` in ascending order. The required `lineage_by_trade_date` input is
+partitioned into each batch and MUST contain exactly one entry for every date in that batch (no
+missing, extra or duplicate date key; a duplicate is invalid before execution). The existing
+`BackfillService.execute(plan, *, min_request_interval_seconds)` remains the execution seam and
+MUST run the resolver once for every date in each batch, in ascending `trade_date` order, retaining
+the resulting `LineageResolveResult` values until all dates in that batch are validated. Only
+after every date is `LEGACY` or `MODERN` may it fetch/validate provider bars and call
+`NasMarketStore.upsert_bars` per date/group. Any `UNAVAILABLE` result records that batch as
+`status="error", error_code="SOURCE_UNAVAILABLE"` in the existing `BackfillAuditStore`, performs
+zero upserts/manifest/object/pointer mutation for that batch, and never validates one date and
+then mutates another. A date's lineage input is never inferred from another date, labels or bars.
+
+The former optional lineage argument is replaced by required
 `lineage_input: LineageInput` on `ManifestOnlyInput`, `DatasetPointerInput`,
-`NasMarketStore.upsert_bars(..., *, lineage_input)`, and each `BackfillRunner` batch. A legacy
+`NasMarketStore.upsert_bars(..., *, lineage_input)`, and each `BackfillBatchPlan` date mapping. A legacy
 caller passes the explicit legacy branch; a modern caller passes exact refs or the two allowlisted
 IDs. There is no default that silently selects legacy. `publish_manifest_only` resolves and
 validates this input before its lock-held manifest mutation; `publish_dataset_and_pointer` uses
 the same resolver before binding/pointer work. Plain `MarketStore` signatures and behavior remain
 unchanged and never invoke this resolver.
+
+The current production implementation path is `BackfillService.execute` in
+`backend/app/market/backfill.py`; it is the only allowed caller that fans a multi-date plan into
+`NasMarketStore.upsert_bars`. Any direct dataset-store caller must choose the explicit legacy
+branch or the exact/allowlisted modern branch at the call site. `MarketStore.upsert_bars` and all
+other plain-store APIs retain their existing signatures and behavior and are not adapted through
+this service.
 
 Concrete implementation seams are `backend/app/storage/dataset.py` for the coordinator and
 descriptor-bound pointer reader, `backend/app/storage/replication.py` for the frozen lineage and
@@ -2133,7 +2196,7 @@ resolver, `backend/app/market/evidence.py` and `backend/app/market/candidates.py
 retained-evidence readers, and `backend/app/market/backfill.py` for the explicit batch signature.
 The required evidence anchors are
 `test_manifest_only_invalid_pointer_identity_fails_closed`,
-`test_lineage_resolver_validates_retained_evidence_before_mutation`,
+`test_lineage_resolver_returns_union_and_reuses_session_selection_hash_contract`,
 `test_modern_backfill_requires_exact_lineage_or_resolver_evidence`,
 `test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance`, and
 `test_missing_lineage_reader_returns_source_unavailable_before_mutation`.
