@@ -80,9 +80,10 @@ def test_normative_ddl_matches_implementation_executes_and_strict_reader_accepts
 
 
 def test_design_and_implementation_crosswalk_anchors_are_identical_real_behaviors():
-    """Every documented anchor must name a real offline test in both specs."""
+    """Every documented attack anchor must name one real offline test in all records."""
     docs_root = Path(__file__).parents[1] / "docs" / "plans"
     docs = (
+        Path(__file__).parents[1] / "docs" / "acceptance" / "release-2-r2f4-2.md",
         docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-design.md",
         docs_root / "2026-09-08-stock-eva-r2f4-2-exact-session-universe-implementation.md",
     )
@@ -96,7 +97,7 @@ def test_design_and_implementation_crosswalk_anchors_are_identical_real_behavior
             source = (Path(__file__).parents[1] / test_path).read_text()
             assert re.search(rf"(?:async\s+)?def\s+{re.escape(test_name)}\s*\(", source), anchor
         anchor_sets.append(anchors)
-    assert anchor_sets[0] == anchor_sets[1]
+    assert anchor_sets[0] == anchor_sets[1] == anchor_sets[2]
     required = {
         "tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window",
         "tests/test_market_universe_review_red.py::test_st_missing_conflicting_or_unknown_vocabulary_fails_closed",
@@ -105,6 +106,64 @@ def test_design_and_implementation_crosswalk_anchors_are_identical_real_behavior
         "tests/test_market_universe_staged.py::test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts",
     }
     assert required <= anchor_sets[0]
+
+
+def _crosswalk_by_id(path: Path) -> dict[str, str]:
+    text = path.read_text()
+    if "docs/acceptance/" in str(path):
+        headings = (
+            "### Functional requirements",
+            "### Acceptance criteria",
+            "### Edge cases",
+        )
+    elif path.name.endswith("implementation.md"):
+        headings = (
+            "### Mandatory individual AC/EC evidence crosswalk",
+            "### Mandatory individual FR evidence crosswalk",
+        )
+    else:
+        headings = (
+            "### Mandatory individual AC/EC evidence crosswalk",
+            "### Individual FR evidence crosswalk",
+        )
+    result: dict[str, str] = {}
+    for heading in headings:
+        start = text.index(heading)
+        ends = [
+            position
+            for position in (text.find("\n### ", start + 1), text.find("\n## ", start + 1))
+            if position >= 0
+        ]
+        section = text[start : min(ends, default=len(text))]
+        for line in section.splitlines():
+            match = re.match(r"^\|\s*((?:FR|AC|EC)-\d+)\b", line)
+            if match:
+                anchors = re.findall(r"`(tests/[^`\n]+::test_[A-Za-z0-9_]+)`", line)
+                assert len(anchors) == 1, line
+                result[match.group(1)] = anchors[0]
+    return result
+
+
+def test_acceptance_and_both_plan_crosswalks_match_by_id_and_real_test_node():
+    root = Path(__file__).parents[1]
+    docs = (
+        root / "docs/acceptance/release-2-r2f4-2.md",
+        root / "docs/plans/2026-09-08-stock-eva-r2f4-2-exact-session-universe-design.md",
+        root / "docs/plans/2026-09-08-stock-eva-r2f4-2-exact-session-universe-implementation.md",
+    )
+    expected = {
+        *(f"FR-{number}" for number in range(1, 28)),
+        *(f"AC-{number}" for number in range(1, 21)),
+        *(f"EC-{number}" for number in range(1, 25)),
+    }
+    crosswalks = [_crosswalk_by_id(path) for path in docs]
+    for path, crosswalk in zip(docs, crosswalks, strict=True):
+        assert set(crosswalk) == expected, path
+        for anchor in crosswalk.values():
+            test_path, test_name = anchor.split("::", 1)
+            source = (root / test_path).read_text()
+            assert re.search(rf"(?:async\s+)?def\s+{re.escape(test_name)}\s*\(", source), anchor
+    assert crosswalks[0] == crosswalks[1] == crosswalks[2]
 
 
 def _rehash_evidence(values: dict) -> UniverseInstrumentEvidenceV1:

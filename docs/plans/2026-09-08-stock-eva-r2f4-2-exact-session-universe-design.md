@@ -1885,6 +1885,58 @@ The final acceptance record MUST list each FR/AC/EC result, test or static trace
 and the two strict validator outputs. This document remains `In Review` until independent SPEC
 and QUALITY reviews of the exact implementation commit complete.
 
+### Mandatory individual AC/EC evidence crosswalk
+
+The implementation checklist is intentionally keyed one-for-one to the companion design; no
+range notation is used for review evidence.
+
+| Companion ID | Implementation evidence anchor |
+|---|---|
+| AC-1 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| AC-2 | `tests/test_market_automation.py::test_calendar_fails_closed_outside_confirmed_year` |
+| AC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| AC-4 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| AC-5 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| AC-6 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| AC-7 | `tests/test_market_automation.py::test_required_symbols_include_positions_and_all_watchlists` |
+| AC-8 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| AC-9 | `tests/test_market_universe.py::test_unknown_one_loaded_match_rejects_contract_publication` |
+| AC-10 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| AC-11 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| AC-12 | `tests/test_market_automation.py::test_automatic_due_refresh_uses_canonical_callback_and_never_legacy_fetch` |
+| AC-13 | `tests/test_market_universe_staged.py::test_durable_attempt_claim_is_restart_safe_and_allows_first_empty_sidecar` |
+| AC-14 | `tests/test_market_universe_status.py::test_api_and_cli_project_the_same_promoted_snapshot` |
+| AC-15 | `tests/test_market_universe_staged.py::test_fresh_sealed_context_orders_canonical_postpublish_shadow_then_maintenance` |
+| AC-16 | `tests/test_market_universe_staged.py::test_failed_acquisition_records_terminal_and_preserves_prior_head_and_canonical_artifacts` |
+| AC-17 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
+| AC-18 | `tests/test_market_automation.py::test_automation_outcome_is_typed_and_legacy_dump_omits_only_new_null_field` |
+| AC-19 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| AC-20 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-1 | `tests/test_market_universe_status.py::test_market_universe_cli_parser_and_invalid_date_are_read_only` |
+| EC-2 | `tests/test_market_universe_status.py::test_empty_or_missing_sidecar_is_control_error_without_initialization` |
+| EC-3 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| EC-4 | `tests/test_market_universe_staged.py::test_maintenance_unqualified_classification_is_durable_and_never_calls_provider` |
+| EC-5 | `tests/test_market_universe.py::test_builder_rejects_authority_bundle_from_wrong_classification_generation` |
+| EC-6 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| EC-7 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| EC-8 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-9 | `tests/test_market_universe_review_red.py::test_effective_main_board_requires_point_in_time_listing_window` |
+| EC-10 | `tests/test_market_universe.py::test_requested_unverified_source_is_never_publishable` |
+| EC-11 | `tests/test_market_automation.py::test_automation_does_not_disguise_snapshot_failure_or_touch_store_or_provider` |
+| EC-12 | `tests/test_market_universe.py::test_sidecar_reader_rejects_missing_bidirectional_role_link` |
+| EC-13 | `tests/test_market_universe_review_red.py::test_required_index_evidence_requires_closed_identity_and_state` |
+| EC-14 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| EC-15 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-16 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| EC-17 | `tests/test_market_provider_contract.py::test_provider_raw_batch_requires_exact_plan_batch_completion_cardinality` |
+| EC-18 | `tests/test_market_universe.py::test_sidecar_cas_conflict_does_not_change_head` |
+| EC-19 | `tests/test_market_universe_review_red.py::test_normative_ddl_matches_implementation_executes_and_strict_reader_accepts` |
+| EC-20 | `tests/test_market_universe_staged.py::test_maintenance_service_promotes_one_reviewed_session_and_restart_is_noop` |
+| EC-21 | `tests/test_market_universe_staged.py::test_disabled_maintenance_is_zero_hook_and_preserves_legacy_tick` |
+| EC-22 | `tests/test_market_universe_staged.py::test_legacy_observer_is_count_hash_only_and_no_contract_is_typed_no_comparison` |
+| EC-23 | `tests/test_market_universe_review_red.py::test_raw_gate_rejects_cross_page_duplicate_identity_and_bad_shard_projection` |
+| EC-24 | `tests/test_market_universe_staged.py::test_attempt_dedup_identity_is_four_fields_but_plan_hash_is_complete` |
+
 ### Individual FR evidence crosswalk
 
 Each functional requirement has one evidence row; implementation may not report only a grouped
