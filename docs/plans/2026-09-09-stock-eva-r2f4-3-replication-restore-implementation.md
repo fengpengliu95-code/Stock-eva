@@ -2375,11 +2375,12 @@ data, NAS transfer and provider behavior remain unchanged.
 
 The generic local `transition` operation MUST reject `to_state="replicated"` before opening or
 mutating a sidecar generation. Caller-supplied destination generation, record or head digests do
-not constitute destination authority and can never authorize completion. A future dedicated
-`complete_replication(VerifiedDestinationCommitProof)` seam is reserved, but this batch provides
-no proof reader, destination token or completion implementation; the reserved seam returns a
-typed unavailable error. Existing generic transition tests MUST therefore prove zero sidecar
-writes and preservation of the leased `verifying` head.
+not constitute destination authority and can never authorize completion. The dedicated
+`complete_replication(VerifiedDestinationCommitProof)` seam remains distinct from generic local
+transitions; Batch3 supplies the descriptor-native destination reader and private proof token,
+and only a proof produced after record/head/object readback may complete a leased intent. Existing
+generic transition tests MUST still prove zero sidecar writes and preservation of the leased
+`verifying` head.
 
 `import_journal_files` MUST open the explicit absolute journal root once through its trusted
 descriptor chain and retain that root dirfd through enumeration, every `O_NOFOLLOW` child read,
@@ -2413,3 +2414,17 @@ The concrete anchors are
 `tests/test_dataset_replication.py::test_link_then_process_crash_leaves_proven_committed_staging_alias`,
 `tests/test_dataset_replication.py::test_staging_unlink_failure_is_degraded_but_proven_alias_remains_readable`,
 and `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id`.
+
+#### Batch3 destination archive amendment (offline implementation)
+
+`backend/app/storage/replication.py` now contains the explicit-root
+`DestinationDescriptor`, descriptor-native `DestinationArchiveReader`, and
+`DestinationArchiveWriter` used by offline fake-destination tests. It stages the complete
+inventory, manifest and sentinel, verifies size/hash readback, installs an immutable
+`replication-record.json` generation with the normative closed fields, and atomically CAS
+advances `_replication/head.json` under the descriptor-bound single-writer lock. The reader
+recomputes record/head hashes, checks parent lineage and rejects symlinks, extras, missing or
+changed objects. `VerifiedDestinationCommitProof` is reader-owned and is the only input accepted
+by the dedicated sidecar completion seam; generic local transitions still reject `replicated`.
+This batch remains offline-only: no NAS/SMB, provider, restore, API/CLI/automation wiring or
+production enablement is included.

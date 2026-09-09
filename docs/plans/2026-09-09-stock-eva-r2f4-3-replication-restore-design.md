@@ -2575,11 +2575,11 @@ data, NAS transfer and provider behavior remain unchanged.
 
 The generic local `transition` operation MUST reject `to_state="replicated"` before opening or
 mutating a sidecar generation. Caller-supplied destination generation, record or head digests do
-not constitute destination authority and can never authorize completion. A future dedicated
-`complete_replication(VerifiedDestinationCommitProof)` seam is reserved, but this batch provides
-no proof reader, destination token or completion implementation; the reserved seam returns a
-typed unavailable error. Existing generic transition tests MUST therefore prove zero sidecar
-writes and preservation of the leased `verifying` head.
+not constitute destination authority and can never authorize completion. The dedicated
+`complete_replication(VerifiedDestinationCommitProof)` seam is distinct from generic local
+transitions; Batch3's private proof token is emitted only by the strict destination archive
+reader after complete record/head/object verification. Existing generic transition tests MUST
+still prove zero sidecar writes and preservation of the leased `verifying` head.
 
 `import_journal_files` MUST open the explicit absolute journal root once through its trusted
 descriptor chain and retain that root dirfd through enumeration, every `O_NOFOLLOW` child read,

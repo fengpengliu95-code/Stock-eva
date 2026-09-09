@@ -2,14 +2,16 @@
 
 """Local replication primitives.
 
-This module deliberately contains only the durable local evidence boundary for
-R2-F4.3.  It does not copy to a destination, restore a dataset, or contact a
-provider.  The sidecar reader is read-only; initialization and journal writes
-are explicit writer operations.
+This module contains the durable local evidence boundary for R2-F4.3 and the
+offline, descriptor-bound destination archive primitives.  It never contacts a
+provider or performs restore/API/CLI wiring.  Destination and sidecar writes
+are explicit writer operations; status/readers remain read-only.
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -20,12 +22,13 @@ import sqlite3
 import stat
 import uuid
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
@@ -128,13 +131,60 @@ class ReplicationPostCommitConflict(ReplicationStateUnavailable):
     reason_code: Literal["CONTROL_STATE_UNAVAILABLE"] = "CONTROL_STATE_UNAVAILABLE"
 
 
+_DESTINATION_PROOF_TOKEN = object()
+
+
 class VerifiedDestinationCommitProof:
-    """Reserved completion-proof type; destination verification is not in Batch2."""
+    """A private proof emitted only after a strict destination readback.
 
-    __slots__ = ()
+    The constructor deliberately requires a module-private token.  A caller
+    cannot complete a local intent with destination digests copied from an
+    untrusted response; :class:`DestinationArchiveReader` is the only code
+    path that owns the token and creates this object.
+    """
 
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        raise TypeError("verified destination commit proof is not implemented")
+    __slots__ = (
+        "intent_id",
+        "checkpoint_id",
+        "destination_id",
+        "source_sequence",
+        "destination_generation",
+        "destination_record_sha256",
+        "destination_head_sha256",
+        "worker_id",
+        "state_version",
+        "now",
+        "_token",
+    )
+
+    def __init__(
+        self,
+        *,
+        intent_id: str | None,
+        checkpoint_id: str,
+        destination_id: str,
+        source_sequence: int,
+        destination_generation: str,
+        destination_record_sha256: str,
+        destination_head_sha256: str,
+        worker_id: str | None,
+        state_version: int | None,
+        now: str,
+        _token: object | None = None,
+    ) -> None:
+        if _token is not _DESTINATION_PROOF_TOKEN:
+            raise TypeError("verified destination commit proof is reader-owned")
+        self.intent_id = intent_id
+        self.checkpoint_id = checkpoint_id
+        self.destination_id = destination_id
+        self.source_sequence = source_sequence
+        self.destination_generation = destination_generation
+        self.destination_record_sha256 = destination_record_sha256
+        self.destination_head_sha256 = destination_head_sha256
+        self.worker_id = worker_id
+        self.state_version = state_version
+        self.now = now
+        self._token = _token
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -1152,6 +1202,7 @@ class ObjectInventoryEntry(BaseModel):
             path.is_absolute()
             or "\\" in value
             or any(component in {"", ".", ".."} for component in value.split("/"))
+            or any(component in _DESTINATION_CONTROL_NAMES for component in path.parts)
         ):
             raise ValueError("relative_path must be a safe relative path")
         return value
@@ -3533,7 +3584,14 @@ class ImmutableReplicationSidecarStore:
             normalized = (
                 checkpoint
                 if isinstance(checkpoint, SourceCheckpoint)
-                else SourceCheckpoint.model_validate(checkpoint)
+                else SourceCheckpoint.model_validate(
+                    {
+                        **checkpoint,
+                        "object_inventory": tuple(checkpoint.get("object_inventory", ())),
+                    }
+                    if isinstance(checkpoint, Mapping)
+                    else checkpoint
+                )
             )
         except (TypeError, ValueError) as exc:
             raise ReplicationStateUnavailable("source checkpoint is unavailable") from exc
@@ -3977,11 +4035,8 @@ class ImmutableReplicationSidecarStore:
         return result
 
     def complete_replication(self, proof: VerifiedDestinationCommitProof) -> ReplicationHead:
-        """Reserved destination-proof seam; deliberately unavailable in Batch2."""
-        del proof
-        raise ReplicationDurabilityError(
-            "dedicated verified destination completion is not implemented"
-        )
+        """Advance a leased intent only from a reader-owned destination proof."""
+        return _complete_replication_with_proof(self, proof)
 
     def get_intent(self, intent_id: str) -> ReplicationIntent:
         """Read one immutable intent from the strict sidecar without writes."""
@@ -4453,6 +4508,1959 @@ def _unavailable_status(reason_code: str, local_ready: bool) -> ReplicationStatu
     return ReplicationStatusResponse.model_validate(values)
 
 
+# ---------------------------------------------------------------------------
+# Batch 3: offline destination archive primitives
+# ---------------------------------------------------------------------------
+
+# The descriptor's schema identity is distinct from its hash domain.  Keep
+# this value aligned with the wire record described by the R2-F4.3 spec;
+# ``destination-descriptor/v1`` remains the domain separator for its digest.
+DESTINATION_DESCRIPTOR_SCHEMA = "stock-eva/r2f4.3/destination/v1"
+DESTINATION_SENTINEL_SCHEMA = "stock-eva/r2f4.3/destination-sentinel/v1"
+DESTINATION_RECORD_SCHEMA = "stock-eva/r2f4.3/replication-record/v1"
+DESTINATION_HEAD_SCHEMA = "stock-eva/r2f4.3/replication-head/v1"
+DESTINATION_DESCRIPTOR_NAME = ".stock-eva-replication-destination.json"
+DESTINATION_SENTINEL_NAME = ".stock-eva-dataset.json"
+DESTINATION_REPLICATION_DIR = "_replication"
+DESTINATION_HISTORY_DIR = "history"
+DESTINATION_STAGING_DIR = ".staging"
+DESTINATION_LOCK_NAME = ".writer.lock"
+DESTINATION_INIT_ACK = "CREATE_EMPTY_NAS_ARCHIVE_R2F4_3"
+_DESTINATION_CONTROL_NAMES = frozenset(
+    {
+        DESTINATION_DESCRIPTOR_NAME,
+        DESTINATION_SENTINEL_NAME,
+        "manifest.json",
+        DESTINATION_REPLICATION_DIR,
+    }
+)
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _parse_destination_manifest(
+    payload: bytes, *, expected_sha256: str | None = None
+) -> Mapping[str, object]:
+    """Parse the published manifest without changing canonical manifest bytes.
+
+    The canonical dataset manifest model remains owned by ``storage.models``;
+    this boundary only proves that the copied bytes are stable JSON and an
+    object, while the checkpoint/object inventory supplies the immutable
+    content contract. Existing canonical manifests use their established
+    serializer, so replication must preserve their bytes rather than impose a
+    second JSON encoding.
+    """
+    if expected_sha256 is not None and _sha256_bytes(payload) != expected_sha256:
+        raise ReplicationStateUnavailable("destination manifest hash mismatch")
+    try:
+        values = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplicationStateUnavailable("destination manifest is invalid") from exc
+    if not isinstance(values, Mapping):
+        raise ReplicationStateUnavailable("destination manifest is invalid")
+    return values
+
+
+def _destination_root_error(path: Path) -> ReplicationDurabilityError:
+    del path
+    return ReplicationDurabilityError("destination trust validation failed")
+
+
+def _validate_destination_root(path: Path, *, local_root: Path | None = None) -> Path:
+    """Validate an explicit destination lexically and through no-follow lstat."""
+    raw = str(path)
+    if (
+        not path.is_absolute()
+        or any(token in raw for token in ("$", "~", "`"))
+        or path == Path("/")
+        or path == Path.home()
+    ):
+        raise _destination_root_error(path)
+    normalized = _physical_path(Path(os.path.normpath(path)))
+    if local_root is not None:
+        local = _physical_path(Path(os.path.normpath(local_root)))
+        if (
+            not local.is_absolute()
+            or normalized == local
+            or normalized in local.parents
+            or local in normalized.parents
+        ):
+            raise _destination_root_error(path)
+    try:
+        _safe_parent(normalized)
+        info = os.lstat(normalized)
+    except FileNotFoundError:
+        # A separate init operation may create a new child, but it may never
+        # infer/create a missing parent or turn a missing path into a source.
+        return normalized
+    except OSError as exc:
+        raise _destination_root_error(path) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise _destination_root_error(path)
+    return normalized
+
+
+def _validate_source_root(path: Path) -> Path:
+    """Validate an explicit local source without destination home policy."""
+    raw = str(path)
+    if (
+        not path.is_absolute()
+        or any(token in raw for token in ("$", "~", "`"))
+        or path == Path("/")
+    ):
+        raise ReplicationDurabilityError("source root is unsafe")
+    normalized = _physical_path(Path(os.path.normpath(path)))
+    try:
+        _safe_parent(normalized)
+        info = os.lstat(normalized)
+    except (FileNotFoundError, OSError) as exc:
+        raise ReplicationDurabilityError("source root is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ReplicationDurabilityError("source root is unsafe")
+    return normalized
+
+
+def _destination_mount_fingerprint(
+    *,
+    mount_point: str,
+    fs_type: str,
+    normalized_options: str,
+    st_dev: int,
+    volume_id: str | None,
+) -> str:
+    return domain_sha256(
+        "stock-eva/r2f4.3/mount-fingerprint/v1",
+        {
+            "mount_point": mount_point,
+            "fs_type": fs_type,
+            "normalized_options": normalized_options,
+            "st_dev": st_dev,
+            "volume_id": volume_id,
+        },
+    )
+
+
+class DestinationDescriptor(BaseModel):
+    """Closed private trust descriptor for one explicit archive root."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    descriptor_schema: Literal[DESTINATION_DESCRIPTOR_SCHEMA] = DESTINATION_DESCRIPTOR_SCHEMA
+    schema_version: Literal[1] = 1
+    dataset: Literal["stock-eva-market"] = "stock-eva-market"
+    role: Literal["nas_archive"] = "nas_archive"
+    direction: Literal["local_to_nas"] = "local_to_nas"
+    root_dev: int = Field(gt=0)
+    root_ino: int = Field(gt=0)
+    parent_dev: int = Field(gt=0)
+    parent_ino: int = Field(gt=0)
+    mount_point: str = Field(min_length=1)
+    fs_type: str = Field(min_length=1, max_length=64)
+    mount_generation: str = Field(min_length=32, max_length=128, pattern=r"^[0-9a-f]+$")
+    mount_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    sentinel_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    single_writer_host_id: str = Field(min_length=1, max_length=128)
+    created_at: str = Field(min_length=20)
+    descriptor_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    _root_path: Path | None = PrivateAttr(default=None)
+
+    _created_at_is_utc = field_validator("created_at")(
+        lambda value: _validate_utc_timestamp(value, "created_at")
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_fields(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("destination descriptor fields are not exact")
+        return value
+
+    @classmethod
+    def from_root(
+        cls,
+        root: Path,
+        *,
+        single_writer_host_id: str = "local-host",
+        sentinel_sha256: str = ZERO_SHA256,
+        mount_point: str | None = None,
+        fs_type: str = "local",
+        normalized_options: str = "",
+        volume_id: str | None = None,
+        mount_generation: str | None = None,
+        created_at: str | None = None,
+        local_root: Path | None = None,
+    ) -> DestinationDescriptor:
+        bound = _validate_destination_root(Path(root), local_root=local_root)
+        if not bound.is_dir():
+            raise _destination_root_error(bound)
+        if not single_writer_host_id or len(single_writer_host_id) > 128:
+            raise _destination_root_error(bound)
+        if fs_type.lower() in {"smb", "smbfs", "cifs", "nfs", "sshfs"}:
+            raise ReplicationDurabilityError("destination mount is unsupported")
+        try:
+            root_info = os.stat(bound, follow_symlinks=False)
+            parent_info = os.stat(bound.parent, follow_symlinks=False)
+        except OSError as exc:
+            raise _destination_root_error(bound) from exc
+        mount_name = mount_point or str(bound)
+        generation = mount_generation or secrets.token_hex(32)
+        fingerprint = _destination_mount_fingerprint(
+            mount_point=mount_name,
+            fs_type=fs_type,
+            normalized_options=normalized_options,
+            st_dev=int(root_info.st_dev),
+            volume_id=volume_id,
+        )
+        values: dict[str, object] = {
+            "descriptor_schema": DESTINATION_DESCRIPTOR_SCHEMA,
+            "schema_version": 1,
+            "dataset": "stock-eva-market",
+            "role": "nas_archive",
+            "direction": "local_to_nas",
+            "root_dev": int(root_info.st_dev),
+            "root_ino": int(root_info.st_ino),
+            "parent_dev": int(parent_info.st_dev),
+            "parent_ino": int(parent_info.st_ino),
+            "mount_point": mount_name,
+            "fs_type": fs_type,
+            "mount_generation": generation,
+            "mount_fingerprint": fingerprint,
+            "sentinel_sha256": sentinel_sha256,
+            "single_writer_host_id": single_writer_host_id,
+            "created_at": created_at or _utc_now(),
+        }
+        values["descriptor_sha256"] = domain_sha256(
+            "stock-eva/r2f4.3/destination-descriptor/v1", values
+        )
+        descriptor = cls.model_validate(values)
+        descriptor._root_path = bound
+        return descriptor
+
+    @property
+    def destination_id(self) -> str:
+        return self.descriptor_sha256[:32]
+
+    @property
+    def root_path(self) -> Path:
+        if self._root_path is None:
+            raise ReplicationDurabilityError("destination root is not bound")
+        return self._root_path
+
+    def hash_preimage(self) -> dict[str, object]:
+        values = self.model_dump(mode="json")
+        values.pop("descriptor_sha256")
+        return values
+
+    def verify(self) -> None:
+        expected = domain_sha256("stock-eva/r2f4.3/destination-descriptor/v1", self.hash_preimage())
+        if expected != self.descriptor_sha256:
+            raise ReplicationDurabilityError("destination descriptor hash is invalid")
+        if self.direction != "local_to_nas" or self.role != "nas_archive":
+            raise ReplicationDurabilityError("destination direction is not allowed")
+        if self.fs_type.lower() in {"smb", "smbfs", "cifs", "nfs", "sshfs"}:
+            raise ReplicationDurabilityError("destination mount is unsupported")
+        _validate_sha(self.sentinel_sha256, "sentinel_sha256")
+        _validate_sha(self.mount_fingerprint, "mount_fingerprint")
+        _validate_utc_timestamp(self.created_at, "created_at")
+
+    def verify_bound(self) -> None:
+        self.verify()
+        root = _physical_path(self.root_path)
+        if _validate_destination_root(root) != root:
+            raise ReplicationDurabilityError("destination root changed")
+        try:
+            root_info = os.stat(root, follow_symlinks=False)
+            parent_info = os.stat(root.parent, follow_symlinks=False)
+        except OSError as exc:
+            raise ReplicationDurabilityError("destination mount is unavailable") from exc
+        if (int(root_info.st_dev), int(root_info.st_ino)) != (self.root_dev, self.root_ino):
+            raise ReplicationDurabilityError("destination root was rebound")
+        if (int(parent_info.st_dev), int(parent_info.st_ino)) != (self.parent_dev, self.parent_ino):
+            raise ReplicationDurabilityError("destination parent was rebound")
+        current_fp = _destination_mount_fingerprint(
+            mount_point=self.mount_point,
+            fs_type=self.fs_type,
+            normalized_options="",
+            st_dev=int(root_info.st_dev),
+            volume_id=None,
+        )
+        # A descriptor produced with an explicit synthetic mount fingerprint
+        # remains valid only when it uses the same local probe inputs.  The
+        # initializer always uses these values; an imported descriptor with a
+        # different mount identity fails closed.
+        if current_fp != self.mount_fingerprint:
+            raise ReplicationDurabilityError("destination mount fingerprint changed")
+
+    def verify_root_fd(self, root_fd: int) -> None:
+        """Verify a caller-owned root descriptor without reopening its path."""
+        self.verify()
+        try:
+            info = os.fstat(root_fd)
+        except OSError as exc:
+            raise ReplicationDurabilityError("destination root descriptor is unavailable") from exc
+        if not stat.S_ISDIR(info.st_mode) or (int(info.st_dev), int(info.st_ino)) != (
+            self.root_dev,
+            self.root_ino,
+        ):
+            raise ReplicationDurabilityError("destination root was rebound")
+
+    def persist(self) -> Path:
+        self.verify_bound()
+        path = self.root_path / DESTINATION_DESCRIPTOR_NAME
+        _install_no_replace(path, canonical_json_bytes(self.model_dump(mode="json")))
+        return path
+
+    @classmethod
+    def read(cls, path: Path) -> DestinationDescriptor:
+        payload, _ = _read_nofollow(path)
+        try:
+            model = cls.model_validate(json.loads(payload))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReplicationDurabilityError("destination descriptor is invalid") from exc
+        if canonical_json_bytes(model.model_dump(mode="json")) != payload:
+            raise ReplicationDurabilityError("destination descriptor is not canonical")
+        model._root_path = _physical_path(Path(path).parent)
+        model.verify_bound()
+        return model
+
+    load = read
+
+
+def _destination_open_dir(parent_fd: int, name: str) -> int:
+    try:
+        fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination directory is unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ReplicationDurabilityError("destination component is not a directory")
+        return fd
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _destination_open_dirs(root_fd: int, components: tuple[str, ...]) -> tuple[int, list[int]]:
+    current = root_fd
+    opened: list[int] = []
+    try:
+        for name in components:
+            if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                raise ReplicationDurabilityError("destination path component is unsafe")
+            current = _destination_open_dir(current, name)
+            opened.append(current)
+        return current, opened
+    except BaseException:
+        failures: list[str] = []
+        _close_descriptors(opened, failures)
+        _finish_cleanup(None, failures)
+        raise
+
+
+def _destination_read_at(
+    root_fd: int,
+    components: tuple[str, ...],
+    *,
+    optional: bool = False,
+    require_private_mode: bool = True,
+) -> tuple[bytes, os.stat_result] | None:
+    if not components:
+        raise ReplicationDurabilityError("destination artifact name is empty")
+    parent_fd = root_fd
+    dirs: list[int] = []
+    fd: int | None = None
+    primary: BaseException | None = None
+    try:
+        if len(components) > 1:
+            try:
+                parent_fd, dirs = _destination_open_dirs(root_fd, components[:-1])
+            except ReplicationDurabilityError:
+                if optional:
+                    try:
+                        os.stat(components[0], dir_fd=root_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        return None
+                raise
+        name = components[-1]
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ReplicationDurabilityError("destination artifact name is unsafe")
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            if optional:
+                return None
+            raise ReplicationDurabilityError("destination artifact is unavailable") from None
+        return _read_descriptor(fd, require_private_mode=require_private_mode)
+    except ReplicationDurabilityError as exc:
+        primary = exc
+        raise
+    except OSError as exc:
+        primary = ReplicationDurabilityError("destination artifact read failed")
+        raise primary from exc
+    finally:
+        failures: list[str] = []
+        if fd is not None:
+            _close_fd_best_effort(fd, "destination_artifact_fd", failures)
+        _close_descriptors(dirs, failures)
+        _finish_cleanup(primary, failures)
+
+
+def _destination_open_relative_file(root_fd: int, relative_path: str) -> tuple[int, list[int]]:
+    try:
+        candidate = Path(relative_path)
+    except TypeError as exc:
+        raise ReplicationDurabilityError("destination object path is unsafe") from exc
+    if (
+        candidate.is_absolute()
+        or "\\" in relative_path
+        or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+    ):
+        raise ReplicationDurabilityError("destination object path is unsafe")
+    parts = tuple(relative_path.split("/"))
+    parent_fd = root_fd
+    dirs: list[int] = []
+    try:
+        for name in parts[:-1]:
+            parent_fd = _destination_open_dir(parent_fd, name)
+            dirs.append(parent_fd)
+        fd = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ReplicationDurabilityError("destination object is not regular")
+        return fd, dirs
+    except OSError as exc:
+        failures: list[str] = []
+        _close_descriptors(dirs, failures)
+        primary = ReplicationDurabilityError("destination object is unavailable")
+        _finish_cleanup(primary, failures)
+        raise primary from exc
+    except BaseException:
+        failures: list[str] = []
+        _close_descriptors(dirs, failures)
+        _finish_cleanup(None, failures)
+        raise
+
+
+def _destination_read_relative(root_fd: int, relative_path: str) -> bytes:
+    fd, dirs = _destination_open_relative_file(root_fd, relative_path)
+    primary: BaseException | None = None
+    try:
+        payload, _ = _read_descriptor(fd, require_private_mode=False)
+        return payload
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        failures: list[str] = []
+        _close_fd_best_effort(fd, "destination_source_fd", failures)
+        _close_descriptors(dirs, failures)
+        _finish_cleanup(primary, failures)
+
+
+def _destination_list_files(dir_fd: int, prefix: str = "") -> set[str]:
+    """Enumerate only regular, no-follow files below a bound generation fd."""
+    found: set[str] = set()
+    try:
+        names = os.listdir(dir_fd)
+    except OSError as exc:
+        raise ReplicationStateUnavailable("destination generation listing is unavailable") from exc
+    for name in names:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ReplicationStateUnavailable("destination generation entry is unsafe")
+        relative = f"{prefix}/{name}" if prefix else name
+        try:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ReplicationStateUnavailable(
+                "destination generation entry is unavailable"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ReplicationStateUnavailable("destination generation entry is a symlink")
+        if stat.S_ISREG(info.st_mode):
+            found.add(relative)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise ReplicationStateUnavailable("destination generation entry type is invalid")
+        child = _destination_open_dir(dir_fd, name)
+        try:
+            found.update(_destination_list_files(child, relative))
+        finally:
+            failures: list[str] = []
+            _close_fd_best_effort(child, "destination_generation_child_fd", failures)
+            _finish_cleanup(None, failures)
+    return found
+
+
+def _destination_mkdir_at(parent_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination staging is unavailable") from exc
+    return _destination_open_dir(parent_fd, name)
+
+
+def _destination_write_at(parent_fd: int, name: str, payload: bytes) -> None:
+    """Install one private file without replacement through a held dirfd."""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ReplicationDurabilityError("destination file name is unsafe")
+    existing_fd: int | None = None
+    temporary_fd: int | None = None
+    temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+    try:
+        try:
+            existing_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            pass
+        if existing_fd is not None:
+            existing, _ = _read_descriptor(existing_fd)
+            if existing != payload:
+                raise ReplicationDurabilityError("destination artifact conflict")
+            return
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        _write_fully(temporary_fd, payload)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            try:
+                existing_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                existing, _ = _read_descriptor(existing_fd)
+            except OSError as read_exc:
+                raise ReplicationCASConflict("destination file CAS conflict") from read_exc
+            if existing != payload:
+                raise ReplicationCASConflict("destination file CAS conflict") from exc
+        _fsync_open_directory(parent_fd)
+    except ReplicationDurabilityError:
+        raise
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination artifact install failed") from exc
+    finally:
+        failures: list[str] = []
+        if existing_fd is not None:
+            _close_fd_best_effort(existing_fd, "destination_existing_fd", failures)
+        if temporary_fd is not None:
+            _close_fd_best_effort(temporary_fd, "destination_temporary_fd", failures)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            failures.append("destination_temporary_unlink")
+        _finish_cleanup(None, failures)
+
+
+def _destination_remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove only a private staging directory owned by this writer."""
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination staging cleanup failed") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ReplicationDurabilityError("destination staging entry is unsafe")
+    child = _destination_open_dir(parent_fd, name)
+    primary: BaseException | None = None
+    try:
+        for entry in os.listdir(child):
+            if entry in {".", ".."}:
+                continue
+            try:
+                info = os.stat(entry, dir_fd=child, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    _destination_remove_tree_at(child, entry)
+                elif stat.S_ISREG(info.st_mode):
+                    os.unlink(entry, dir_fd=child)
+                else:
+                    raise ReplicationDurabilityError("destination staging entry is unsafe")
+            except FileNotFoundError:
+                continue
+        os.rmdir(name, dir_fd=parent_fd)
+    except ReplicationDurabilityError as exc:
+        primary = exc
+        raise
+    except OSError as exc:
+        primary = ReplicationDurabilityError("destination staging cleanup failed")
+        raise primary from exc
+    finally:
+        failures: list[str] = []
+        _close_fd_best_effort(child, "destination_staging_fd", failures)
+        _finish_cleanup(primary, failures)
+
+
+def _destination_rename_noreplace(parent_fd: int, source: str, target: str) -> None:
+    """Use renameat2(RENAME_NOREPLACE) where available, never overwrite history."""
+    if not source or not target or "/" in source or "/" in target:
+        raise ReplicationDurabilityError("destination generation name is unsafe")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+    except OSError:
+        renameat2 = None
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            source.encode("utf-8"),
+            parent_fd,
+            target.encode("utf-8"),
+            1,
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise ReplicationCASConflict("destination generation already exists")
+        if error not in {errno.ENOSYS, errno.EINVAL}:
+            raise ReplicationDurabilityError("destination generation install failed")
+    # Portable fallback is protected by the destination writer lock.  It does
+    # not claim cross-process atomicity on filesystems without an exclusive
+    # rename primitive; an observed target is always treated as conflict.
+    try:
+        os.stat(target, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ReplicationCASConflict("destination generation already exists")
+    try:
+        os.rename(source, target, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except FileExistsError as exc:
+        raise ReplicationCASConflict("destination generation already exists") from exc
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination generation install failed") from exc
+
+
+@contextmanager
+def _destination_root_session(descriptor: DestinationDescriptor):
+    descriptor.verify_bound()
+    root_fd, descriptors = _open_directory_chain(descriptor.root_path, create=False)
+    primary: BaseException | None = None
+    try:
+        descriptor.verify_root_fd(root_fd)
+        yield root_fd
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        failures: list[str] = []
+        _close_descriptors(descriptors, failures)
+        _finish_cleanup(primary, failures)
+
+
+def _destination_lock(root_fd: int) -> tuple[int, int, list[int]]:
+    replication_fd = _destination_open_dir(root_fd, DESTINATION_REPLICATION_DIR)
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(
+            DESTINATION_LOCK_NAME,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=replication_fd,
+        )
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ReplicationDurabilityError("destination writer lock is unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise ReplicationDurabilityError("destination writer lock is unavailable") from exc
+        return replication_fd, lock_fd, [int(info.st_dev), int(info.st_ino), int(info.st_nlink)]
+    except OSError as exc:
+        failures: list[str] = []
+        if lock_fd is not None:
+            _close_fd_best_effort(lock_fd, "destination_lock_fd", failures)
+        _close_fd_best_effort(replication_fd, "destination_replication_fd", failures)
+        primary = ReplicationDurabilityError("destination writer lock is unavailable")
+        _finish_cleanup(primary, failures)
+        raise primary from exc
+    except BaseException:
+        failures: list[str] = []
+        if lock_fd is not None:
+            _close_fd_best_effort(lock_fd, "destination_lock_fd", failures)
+        _close_fd_best_effort(replication_fd, "destination_replication_fd", failures)
+        _finish_cleanup(None, failures)
+        raise
+
+
+def _destination_unlock(replication_fd: int, lock_fd: int) -> None:
+    failures: list[str] = []
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        failures.append("destination_lock_unlock")
+    _close_fd_best_effort(lock_fd, "destination_lock_fd", failures)
+    _close_fd_best_effort(replication_fd, "destination_replication_fd", failures)
+    _finish_cleanup(None, failures)
+
+
+def _destination_assert_lock(replication_fd: int, lock_fd: int, identity: list[int]) -> None:
+    try:
+        held = os.fstat(lock_fd)
+        current = os.stat(
+            DESTINATION_LOCK_NAME,
+            dir_fd=replication_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination writer lock changed") from exc
+    if (
+        not stat.S_ISREG(held.st_mode)
+        or (int(held.st_dev), int(held.st_ino), int(held.st_nlink)) != tuple(identity)
+        or (int(current.st_dev), int(current.st_ino), int(current.st_nlink)) != tuple(identity)
+        or stat.S_IMODE(current.st_mode) != 0o600
+    ):
+        raise ReplicationDurabilityError("destination writer lock changed")
+
+
+def initialize_destination(
+    root: Path,
+    *,
+    acknowledgement: str,
+    single_writer_host_id: str = "local-host",
+    sentinel_bytes: bytes | None = None,
+    local_root: Path | None = None,
+    created_at: str | None = None,
+) -> DestinationDescriptor:
+    """Create a new empty offline archive root under an exact typed ack.
+
+    This is deliberately separate from replication execution.  It accepts
+    only a new child and never adopts or overwrites an existing archive.
+    """
+    if acknowledgement != DESTINATION_INIT_ACK:
+        raise ReplicationDurabilityError("destination initialization acknowledgement is invalid")
+    bound = _validate_destination_root(Path(root), local_root=local_root)
+    if bound.exists():
+        if not bound.is_dir() or any(bound.iterdir()):
+            raise ReplicationDurabilityError("destination must be a new empty child")
+    else:
+        _safe_parent(bound.parent)
+        parent_fd, descriptors = _open_directory_chain(bound.parent, create=False)
+        try:
+            try:
+                os.mkdir(bound.name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise ReplicationDurabilityError("destination already exists") from exc
+            _fsync_open_directory(parent_fd)
+        except OSError as exc:
+            raise ReplicationDurabilityError("destination initialization failed") from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(descriptors, failures)
+            _finish_cleanup(None, failures)
+    sentinel = sentinel_bytes or canonical_json_bytes(
+        {
+            "dataset": "stock-eva-market",
+            "schema_version": 2,
+        }
+    )
+    if not isinstance(sentinel, bytes) or not sentinel:
+        raise ReplicationDurabilityError("destination sentinel is invalid")
+    descriptor = DestinationDescriptor.from_root(
+        bound,
+        single_writer_host_id=single_writer_host_id,
+        sentinel_sha256=_sha256_bytes(sentinel),
+        mount_point=str(bound),
+        fs_type="local",
+        created_at=created_at,
+        local_root=local_root,
+    )
+    replication_path = bound / DESTINATION_REPLICATION_DIR
+    history = replication_path / DESTINATION_HISTORY_DIR
+    staging = replication_path / DESTINATION_STAGING_DIR
+    # All ancestors are created by no-follow descriptor traversal; none of
+    # these operations resolve a user-controlled pathname after validation.
+    for directory in (replication_path, history, staging):
+        _fd, descriptors = _open_directory_chain(directory, create=True)
+        failures: list[str] = []
+        _close_descriptors(descriptors, failures)
+        _finish_cleanup(None, failures)
+    _install_no_replace(bound / DESTINATION_SENTINEL_NAME, sentinel)
+    descriptor.persist()
+    _install_no_replace(replication_path / DESTINATION_LOCK_NAME, b"")
+    return descriptor
+
+
+class ReplicationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    record_schema: Literal[DESTINATION_RECORD_SCHEMA] = DESTINATION_RECORD_SCHEMA
+    schema_version: Literal[1] = 1
+    replication_generation: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    direction: Literal["local_to_nas"] = "local_to_nas"
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int = Field(ge=1)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    parent_record_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    pointer_row_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    pointer_generation: str = Field(min_length=1, max_length=128)
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_trade_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_published_at: str = Field(min_length=20)
+    pointer_db_device: int = Field(gt=0)
+    pointer_db_inode: int = Field(gt=0)
+    pointer_db_schema_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_manifest_canonical_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_manifest_bytes_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_manifest_bytes_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    destination_object_set_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    object_inventory: tuple[ObjectInventoryEntry, ...]
+    object_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
+    byte_count: int = Field(ge=0)
+    descriptor_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    created_at: str = Field(min_length=20)
+    record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    _trade_date_is_iso = field_validator("source_trade_date")(
+        lambda value: _validate_iso_date(value, "source_trade_date")
+    )
+    _timestamps_are_utc = field_validator("source_published_at", "created_at")(
+        lambda value, info: _validate_utc_timestamp(value, info.field_name)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_fields(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("replication record fields are not exact")
+        return value
+
+    def hash_preimage(self) -> dict[str, object]:
+        values = self.model_dump(mode="json")
+        values.pop("record_sha256")
+        return values
+
+    def verify_hashes(self) -> None:
+        inventory = _object_inventory_projection(self.object_inventory)
+        if tuple((item["relative_path"], item["object_sha256"]) for item in inventory) != tuple(
+            sorted((item["relative_path"], item["object_sha256"]) for item in inventory)
+        ):
+            raise ReplicationDurabilityError("destination inventory is not sorted")
+        object_set = domain_sha256(SOURCE_OBJECT_SET_DOMAIN, inventory)
+        if (
+            self.source_object_set_sha256 != object_set
+            or self.destination_object_set_sha256 != object_set
+        ):
+            raise ReplicationDurabilityError("destination object set digest is invalid")
+        if self.parent_record_hash != ZERO_SHA256:
+            _validate_sha(self.parent_record_hash, "parent_record_hash")
+        elif self.source_sequence != 1:
+            raise ReplicationDurabilityError("destination lineage genesis is invalid")
+        expected = domain_sha256("stock-eva/r2f4.3/replication-record/v1", self.hash_preimage())
+        if expected != self.record_sha256:
+            raise ReplicationDurabilityError("destination record hash is invalid")
+        if (
+            self.object_count != len(inventory)
+            or self.byte_count != sum(int(item["size_bytes"]) for item in inventory)
+            or self.row_count != sum(int(item["row_count"]) for item in inventory)
+        ):
+            raise ReplicationDurabilityError("destination record counts are invalid")
+
+
+class DestinationHead(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    head_schema: Literal[DESTINATION_HEAD_SCHEMA] = DESTINATION_HEAD_SCHEMA
+    schema_version: Literal[1] = 1
+    destination_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    replication_generation: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    descriptor_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    direction: Literal["local_to_nas"] = "local_to_nas"
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int = Field(ge=1)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    parent_record_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    manifest_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    head_version: int = Field(ge=1)
+    updated_at: str = Field(min_length=20)
+    head_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    _updated_at_is_utc = field_validator("updated_at")(
+        lambda value: _validate_utc_timestamp(value, "updated_at")
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_fields(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("destination head fields are not exact")
+        return value
+
+    def hash_preimage(self) -> dict[str, object]:
+        values = self.model_dump(mode="json")
+        values.pop("head_sha256")
+        return values
+
+    def verify_hash(self) -> None:
+        if self.parent_record_hash != ZERO_SHA256:
+            _validate_sha(self.parent_record_hash, "parent_record_hash")
+        expected = domain_sha256("stock-eva/r2f4.3/replication-head/v1", self.hash_preimage())
+        if expected != self.head_sha256:
+            raise ReplicationDurabilityError("destination head hash is invalid")
+
+
+@dataclass(frozen=True)
+class DestinationReplicationResult:
+    status: Literal["replicated", "already_replicated", "unavailable"]
+    reason_code: ReplicationReason
+    record: ReplicationRecord | None = None
+    proof: VerifiedDestinationCommitProof | None = None
+    destination_writes: bool = False
+
+
+class SentinelProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    dataset: Literal["stock-eva-market"] = "stock-eva-market"
+    schema_version: Literal[2] = 2
+
+
+class DestinationArchiveReader:
+    """Descriptor-native read contract for the destination archive."""
+
+    def __init__(self, descriptor: DestinationDescriptor | Path) -> None:
+        if isinstance(descriptor, DestinationDescriptor):
+            self.descriptor = descriptor
+        else:
+            candidate = Path(descriptor)
+            descriptor_path = (
+                candidate / DESTINATION_DESCRIPTOR_NAME if candidate.is_dir() else candidate
+            )
+            self.descriptor = DestinationDescriptor.read(descriptor_path)
+
+    @contextmanager
+    def root_session(self):
+        with _destination_root_session(self.descriptor) as root_fd:
+            yield root_fd
+
+    def _root_or_bound(self, root_dirfd: int | None):
+        if root_dirfd is not None:
+            self.descriptor.verify_root_fd(root_dirfd)
+            return _null_context(root_dirfd)
+        return self.root_session()
+
+    def read_sentinel(self, root_dirfd: int | None = None) -> SentinelProjection:
+        with self._root_or_bound(root_dirfd) as root_fd:
+            result = _destination_read_at(
+                root_fd,
+                (DESTINATION_SENTINEL_NAME,),
+                require_private_mode=False,
+            )
+            if result is None:
+                raise ReplicationDurabilityError("destination sentinel is unavailable")
+            payload, _ = result
+            if _sha256_bytes(payload) != self.descriptor.sentinel_sha256:
+                raise ReplicationDurabilityError("destination sentinel is invalid")
+            try:
+                sentinel_values = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ReplicationStateUnavailable("destination sentinel is invalid") from exc
+            if sentinel_values != {"dataset": "stock-eva-market", "schema_version": 2}:
+                raise ReplicationStateUnavailable("destination sentinel schema is invalid")
+            return SentinelProjection.model_validate(sentinel_values)
+
+    def read_head(self, root_dirfd: int | None = None) -> DestinationHead | None:
+        with self._root_or_bound(root_dirfd) as root_fd:
+            result = _destination_read_at(
+                root_fd,
+                (DESTINATION_REPLICATION_DIR, "head.json"),
+                optional=True,
+            )
+            if result is None:
+                return None
+            payload, _ = result
+            try:
+                values = json.loads(payload)
+                head = DestinationHead.model_validate(values)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ReplicationStateUnavailable("destination head is unavailable") from exc
+            if canonical_json_bytes(head.model_dump(mode="json")) != payload:
+                raise ReplicationStateUnavailable("destination head is not canonical")
+            head.verify_hash()
+            if (
+                head.destination_id != self.descriptor.destination_id
+                or head.descriptor_sha256 != self.descriptor.descriptor_sha256
+            ):
+                raise ReplicationStateUnavailable("destination head trust identity is invalid")
+            return head
+
+    def _open_generation(self, root_fd: int, generation: str) -> tuple[int, list[int]]:
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise ReplicationDurabilityError("destination generation is invalid")
+        return _destination_open_dirs(
+            root_fd,
+            (DESTINATION_REPLICATION_DIR, DESTINATION_HISTORY_DIR, generation),
+        )
+
+    def read_record(
+        self, replication_generation: str | int, root_dirfd: int | str | None = None
+    ) -> ReplicationRecord:
+        # The low-level contract spells this as ``read_record(root_dirfd,
+        # generation)`` while the ergonomic public form is
+        # ``read_record(generation, root_dirfd=None)``.  Both use the same
+        # held descriptor and never reopen a checked path.
+        if isinstance(replication_generation, int) and isinstance(root_dirfd, str):
+            replication_generation, root_dirfd = root_dirfd, replication_generation
+        if not isinstance(replication_generation, str) or (
+            root_dirfd is not None and not isinstance(root_dirfd, int)
+        ):
+            raise ReplicationDurabilityError("destination record arguments are invalid")
+        with self._root_or_bound(root_dirfd) as root_fd:
+            generation_fd, dirs = self._open_generation(root_fd, replication_generation)
+            try:
+                result = _destination_read_at(generation_fd, ("replication-record.json",))
+                if result is None:
+                    raise ReplicationStateUnavailable("destination record is unavailable")
+                payload, _ = result
+                try:
+                    values = json.loads(payload)
+                    if isinstance(values, Mapping):
+                        values = dict(values)
+                        values["object_inventory"] = tuple(values.get("object_inventory", ()))
+                    record = ReplicationRecord.model_validate(values)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ReplicationStateUnavailable("destination record is unavailable") from exc
+                if canonical_json_bytes(record.model_dump(mode="json")) != payload:
+                    raise ReplicationStateUnavailable("destination record is not canonical")
+                if record.replication_generation != replication_generation:
+                    raise ReplicationStateUnavailable("destination record generation is invalid")
+                record.verify_hashes()
+                if (
+                    record.destination_id != self.descriptor.destination_id
+                    or record.descriptor_sha256 != self.descriptor.descriptor_sha256
+                ):
+                    raise ReplicationStateUnavailable(
+                        "destination record trust identity is invalid"
+                    )
+                return record
+            finally:
+                failures: list[str] = []
+                _close_descriptors(dirs, failures)
+                _finish_cleanup(None, failures)
+
+    def read_manifest(self, generation_dirfd: int) -> bytes:
+        result = _destination_read_at(
+            generation_dirfd, ("manifest.json",), require_private_mode=False
+        )
+        if result is None:
+            raise ReplicationStateUnavailable("destination manifest is unavailable")
+        return result[0]
+
+    def read_object(
+        self, generation: str | int, relative_path: str, root_dirfd: int | None = None
+    ) -> bytes:
+        if isinstance(generation, int) and root_dirfd is None:
+            # The low-level contract hands the reader an already-bound
+            # generation fd; do not reopen the destination root for this
+            # descriptor-native operation.
+            return _destination_read_relative(generation, relative_path)
+        with self._root_or_bound(root_dirfd) as root_fd:
+            dirs: list[int] = []
+            own_generation = False
+            if isinstance(generation, int):
+                generation_fd = generation
+            else:
+                generation_fd, dirs = self._open_generation(root_fd, generation)
+                own_generation = True
+            try:
+                payload = _destination_read_relative(generation_fd, relative_path)
+                return payload
+            finally:
+                if own_generation:
+                    failures: list[str] = []
+                    _close_descriptors(dirs, failures)
+                    _finish_cleanup(None, failures)
+
+    def verify_commit(
+        self,
+        *,
+        intent_id: str | None = None,
+        checkpoint_id: str,
+        source_sequence: int,
+        worker_id: str | None = None,
+        state_version: int | None = None,
+        destination_generation: str | None = None,
+        now: str | None = None,
+    ) -> VerifiedDestinationCommitProof:
+        with self.root_session() as root_fd:
+            self.read_sentinel(root_fd)
+            head = self.read_head(root_fd)
+            if head is None:
+                raise ReplicationStateUnavailable("destination head is unavailable")
+            if head.checkpoint_id != checkpoint_id or head.source_sequence != source_sequence:
+                raise ReplicationStateUnavailable("destination proof checkpoint mismatch")
+            generation = destination_generation or head.replication_generation
+            if generation != head.replication_generation:
+                raise ReplicationStateUnavailable("destination proof generation mismatch")
+            record = self.read_record(generation, root_fd)
+            if record.checkpoint_id != checkpoint_id or record.source_sequence != source_sequence:
+                raise ReplicationStateUnavailable("destination proof record mismatch")
+            if (
+                head.record_sha256 != record.record_sha256
+                or head.descriptor_sha256 != record.descriptor_sha256
+                or head.parent_record_hash != record.parent_record_hash
+                or head.manifest_sha256 != record.destination_manifest_bytes_sha256
+                or head.object_set_sha256 != record.destination_object_set_sha256
+            ):
+                raise ReplicationStateUnavailable("destination head projection is inconsistent")
+            expected_generation = domain_sha256(
+                "stock-eva/r2f4.3/replication-generation/v1",
+                {
+                    "destination_id": record.destination_id,
+                    "source_instance_id": record.source_instance_id,
+                    "source_sequence": record.source_sequence,
+                    "checkpoint_id": record.checkpoint_id,
+                    "publication_binding_sha256": record.publication_binding_sha256,
+                    "source_object_set_sha256": record.source_object_set_sha256,
+                    "parent_record_hash": record.parent_record_hash,
+                    "plan_sha256": record.plan_sha256,
+                },
+            )
+            if expected_generation != record.replication_generation:
+                raise ReplicationStateUnavailable("destination generation identity is invalid")
+            self._validate_history_namespace(root_fd)
+            self._verify_parent_chain(root_fd, record)
+            generation_fd, dirs = self._open_generation(root_fd, generation)
+            try:
+                generation_sentinel = _destination_read_at(
+                    generation_fd,
+                    (DESTINATION_SENTINEL_NAME,),
+                    require_private_mode=False,
+                )
+                if (
+                    generation_sentinel is None
+                    or _sha256_bytes(generation_sentinel[0]) != self.descriptor.sentinel_sha256
+                ):
+                    raise ReplicationStateUnavailable("destination generation sentinel mismatch")
+                manifest = self.read_manifest(generation_fd)
+                _parse_destination_manifest(
+                    manifest, expected_sha256=record.destination_manifest_bytes_sha256
+                )
+                expected_files = {
+                    "manifest.json",
+                    DESTINATION_SENTINEL_NAME,
+                    "replication-record.json",
+                    *(item.relative_path for item in record.object_inventory),
+                }
+                if _destination_list_files(generation_fd) != expected_files:
+                    raise ReplicationStateUnavailable("destination object inventory is incomplete")
+                for item in record.object_inventory:
+                    payload = _destination_read_relative(generation_fd, item.relative_path)
+                    if (
+                        len(payload) != item.size_bytes
+                        or _sha256_bytes(payload) != item.object_sha256
+                    ):
+                        raise ReplicationStateUnavailable("destination object verification failed")
+            finally:
+                failures: list[str] = []
+                _close_descriptors(dirs, failures)
+                _finish_cleanup(None, failures)
+            return VerifiedDestinationCommitProof(
+                intent_id=intent_id,
+                checkpoint_id=checkpoint_id,
+                destination_id=self.descriptor.destination_id,
+                source_sequence=source_sequence,
+                destination_generation=generation,
+                destination_record_sha256=record.record_sha256,
+                destination_head_sha256=head.head_sha256,
+                worker_id=worker_id,
+                state_version=state_version,
+                now=now or _utc_now(),
+                _token=_DESTINATION_PROOF_TOKEN,
+            )
+
+    def _validate_history_namespace(self, root_fd: int) -> None:
+        """Reject unallowlisted history entries before trusting a head."""
+        history_fd, dirs = _destination_open_dirs(
+            root_fd, (DESTINATION_REPLICATION_DIR, DESTINATION_HISTORY_DIR)
+        )
+        primary: BaseException | None = None
+        try:
+            for name in os.listdir(history_fd):
+                if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                    raise ReplicationStateUnavailable("destination history entry is unsafe")
+                info = os.stat(name, dir_fd=history_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise ReplicationStateUnavailable("destination history entry is a symlink")
+                if re.fullmatch(r"[0-9a-f]{64}", name):
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ReplicationStateUnavailable("destination generation entry is invalid")
+                    continue
+                if name.startswith(".") and name.endswith(".staging"):
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ReplicationStateUnavailable("destination staging entry is invalid")
+                    continue
+                raise ReplicationStateUnavailable("destination history entry is unknown")
+        except ReplicationStateUnavailable as exc:
+            primary = exc
+            raise
+        except OSError as exc:
+            primary = ReplicationStateUnavailable("destination history listing is unavailable")
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(primary, failures)
+
+    def _verify_parent_chain(self, root_fd: int, record: ReplicationRecord) -> None:
+        """Verify each immutable parent record through the same root fd."""
+        if record.parent_record_hash == ZERO_SHA256:
+            if record.source_sequence != 1:
+                raise ReplicationStateUnavailable("destination lineage genesis is invalid")
+            return
+        seen: set[str] = {record.record_sha256}
+        current = record
+        while current.parent_record_hash != ZERO_SHA256:
+            parent_hash = current.parent_record_hash
+            if parent_hash in seen:
+                raise ReplicationStateUnavailable("destination lineage is cyclic")
+            found: ReplicationRecord | None = None
+            try:
+                _replication_fd, dirs = _destination_open_dirs(
+                    root_fd, (DESTINATION_REPLICATION_DIR, DESTINATION_HISTORY_DIR)
+                )
+                history_fd = dirs[-1]
+                names = os.listdir(history_fd)
+            finally:
+                failures: list[str] = []
+                _close_descriptors(dirs if "dirs" in locals() else [], failures)
+                _finish_cleanup(None, failures)
+            for name in names:
+                if not re.fullmatch(r"[0-9a-f]{64}", name):
+                    continue
+                try:
+                    candidate = self.read_record(name, root_fd)
+                except ReplicationDurabilityError:
+                    continue
+                if candidate.record_sha256 == parent_hash:
+                    if found is not None:
+                        raise ReplicationStateUnavailable("destination lineage parent is ambiguous")
+                    found = candidate
+            if found is None:
+                raise ReplicationStateUnavailable("destination lineage parent is missing")
+            if (
+                found.source_instance_id != record.source_instance_id
+                or found.source_sequence >= current.source_sequence
+            ):
+                raise ReplicationStateUnavailable("destination lineage parent order is invalid")
+            seen.add(found.record_sha256)
+            current = found
+
+    def contains_checkpoint(
+        self,
+        root_dirfd: int,
+        *,
+        checkpoint_id: str,
+        source_instance_id: str,
+        source_sequence: int,
+    ) -> bool:
+        """Return whether a complete, strictly readable history record matches.
+
+        This is intentionally a descriptor-bound history lookup used only for
+        partial-order decisions.  A higher destination sequence is
+        ``DESTINATION_AHEAD`` only when this exact incoming checkpoint is an
+        existing ancestor; an unrelated checkpoint is a conflict.
+        """
+        history_fd, dirs = _destination_open_dirs(
+            root_dirfd, (DESTINATION_REPLICATION_DIR, DESTINATION_HISTORY_DIR)
+        )
+        primary: BaseException | None = None
+        try:
+            names = os.listdir(history_fd)
+        except OSError as exc:
+            primary = ReplicationStateUnavailable("destination history is unavailable")
+            raise primary from exc
+        finally:
+            # The directory remains open only for enumeration.  Each candidate
+            # is reopened through the original root descriptor below, never by
+            # a path string outside the trust boundary.
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(primary, failures)
+        for name in names:
+            if not re.fullmatch(r"[0-9a-f]{64}", name):
+                continue
+            try:
+                candidate = self.read_record(name, root_dirfd)
+            except ReplicationDurabilityError:
+                continue
+            if (
+                candidate.checkpoint_id == checkpoint_id
+                and candidate.source_instance_id == source_instance_id
+                and candidate.source_sequence == source_sequence
+            ):
+                return True
+        return False
+
+
+@contextmanager
+def _null_context(value: int):
+    yield value
+
+
+def _destination_record_generation(
+    *,
+    descriptor: DestinationDescriptor,
+    checkpoint: SourceCheckpoint,
+    source_sequence: int,
+    parent_record_hash: str,
+    plan_sha256: str,
+) -> str:
+    return domain_sha256(
+        "stock-eva/r2f4.3/replication-generation/v1",
+        {
+            "destination_id": descriptor.destination_id,
+            "source_instance_id": checkpoint.source_instance_id,
+            "source_sequence": source_sequence,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "publication_binding_sha256": checkpoint.publication_binding_sha256,
+            "source_object_set_sha256": checkpoint.source_object_set_sha256,
+            "parent_record_hash": parent_record_hash,
+            "plan_sha256": plan_sha256,
+        },
+    )
+
+
+def _destination_plan_hash(descriptor: DestinationDescriptor, checkpoint: SourceCheckpoint) -> str:
+    return domain_sha256(
+        "stock-eva/r2f4.3/replication-plan/v1",
+        {
+            "direction": "local_to_nas",
+            "destination_id": descriptor.destination_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "object_inventory": _object_inventory_projection(checkpoint.object_inventory),
+        },
+    )
+
+
+def _destination_record(
+    descriptor: DestinationDescriptor,
+    checkpoint: SourceCheckpoint,
+    *,
+    source_sequence: int,
+    parent_record_hash: str,
+    plan_sha256: str,
+    destination_manifest_bytes_sha256: str,
+    created_at: str,
+    replication_generation: str,
+) -> ReplicationRecord:
+    inventory = tuple(checkpoint.object_inventory)
+    values: dict[str, object] = {
+        "record_schema": DESTINATION_RECORD_SCHEMA,
+        "schema_version": 1,
+        "replication_generation": replication_generation,
+        "destination_id": descriptor.destination_id,
+        "direction": "local_to_nas",
+        "source_instance_id": checkpoint.source_instance_id,
+        "source_instance_sha256": checkpoint.source_instance_sha256,
+        "source_sequence": source_sequence,
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "publication_binding_sha256": checkpoint.publication_binding_sha256,
+        "parent_record_hash": parent_record_hash,
+        "pointer_row_sha256": checkpoint.pointer_row_sha256,
+        "pointer_generation": checkpoint.pointer_generation,
+        "source_run_id": checkpoint.source_run_id,
+        "source_trade_date": checkpoint.source_trade_date,
+        "source_published_at": checkpoint.source_published_at,
+        "pointer_db_device": checkpoint.pointer_db_device,
+        "pointer_db_inode": checkpoint.pointer_db_inode,
+        "pointer_db_schema_digest": checkpoint.pointer_db_schema_digest,
+        "source_manifest_canonical_sha256": checkpoint.manifest_canonical_sha256,
+        "source_manifest_bytes_sha256": checkpoint.source_manifest_bytes_sha256,
+        "source_object_set_sha256": checkpoint.source_object_set_sha256,
+        "destination_manifest_bytes_sha256": destination_manifest_bytes_sha256,
+        "destination_object_set_sha256": checkpoint.source_object_set_sha256,
+        "object_inventory": [item.model_dump(mode="json") for item in inventory],
+        "object_count": len(inventory),
+        "row_count": sum(item.row_count for item in inventory),
+        "byte_count": sum(item.size_bytes for item in inventory),
+        "descriptor_sha256": descriptor.descriptor_sha256,
+        "plan_sha256": plan_sha256,
+        "created_at": created_at,
+    }
+    values["record_sha256"] = domain_sha256("stock-eva/r2f4.3/replication-record/v1", values)
+    values["object_inventory"] = inventory
+    record = ReplicationRecord.model_validate(values)
+    record.verify_hashes()
+    return record
+
+
+def _destination_head(
+    descriptor: DestinationDescriptor,
+    record: ReplicationRecord,
+    *,
+    head_version: int,
+    updated_at: str,
+) -> DestinationHead:
+    values: dict[str, object] = {
+        "head_schema": DESTINATION_HEAD_SCHEMA,
+        "schema_version": 1,
+        "destination_id": descriptor.destination_id,
+        "replication_generation": record.replication_generation,
+        "record_sha256": record.record_sha256,
+        "descriptor_sha256": descriptor.descriptor_sha256,
+        "direction": "local_to_nas",
+        "source_instance_id": record.source_instance_id,
+        "source_instance_sha256": record.source_instance_sha256,
+        "source_sequence": record.source_sequence,
+        "checkpoint_id": record.checkpoint_id,
+        "publication_binding_sha256": record.publication_binding_sha256,
+        "parent_record_hash": record.parent_record_hash,
+        "manifest_sha256": record.destination_manifest_bytes_sha256,
+        "object_set_sha256": record.destination_object_set_sha256,
+        "head_version": head_version,
+        "updated_at": updated_at,
+    }
+    values["head_sha256"] = domain_sha256("stock-eva/r2f4.3/replication-head/v1", values)
+    head = DestinationHead.model_validate(values)
+    head.verify_hash()
+    return head
+
+
+def build_replication_record(
+    descriptor: DestinationDescriptor,
+    checkpoint: SourceCheckpoint,
+    *,
+    source_sequence: int,
+    parent_record_hash: str = ZERO_SHA256,
+    destination_manifest_bytes_sha256: str | None = None,
+    created_at: str | None = None,
+) -> ReplicationRecord:
+    """Build and seal a record using the normative closed hash preimage."""
+    plan_sha256 = _destination_plan_hash(descriptor, checkpoint)
+    generation = _destination_record_generation(
+        descriptor=descriptor,
+        checkpoint=checkpoint,
+        source_sequence=source_sequence,
+        parent_record_hash=parent_record_hash,
+        plan_sha256=plan_sha256,
+    )
+    return _destination_record(
+        descriptor,
+        checkpoint,
+        source_sequence=source_sequence,
+        parent_record_hash=parent_record_hash,
+        plan_sha256=plan_sha256,
+        destination_manifest_bytes_sha256=(
+            destination_manifest_bytes_sha256 or checkpoint.source_manifest_bytes_sha256
+        ),
+        created_at=created_at or _utc_now(),
+        replication_generation=generation,
+    )
+
+
+def build_destination_head(
+    descriptor: DestinationDescriptor,
+    record: ReplicationRecord,
+    *,
+    head_version: int = 1,
+    updated_at: str | None = None,
+) -> DestinationHead:
+    return _destination_head(
+        descriptor,
+        record,
+        head_version=head_version,
+        updated_at=updated_at or _utc_now(),
+    )
+
+
+class DestinationArchiveWriter:
+    """Offline/fake destination writer with one descriptor-bound lock."""
+
+    def __init__(self, descriptor: DestinationDescriptor | Path, *, source_root: Path) -> None:
+        self.descriptor = (
+            descriptor
+            if isinstance(descriptor, DestinationDescriptor)
+            else DestinationDescriptor.read(
+                Path(descriptor) / DESTINATION_DESCRIPTOR_NAME
+                if Path(descriptor).is_dir()
+                else Path(descriptor)
+            )
+        )
+        self.source_root = _physical_path(Path(source_root))
+        _validate_source_root(self.source_root)
+        if (
+            self.source_root == self.descriptor.root_path
+            or self.source_root in self.descriptor.root_path.parents
+            or self.descriptor.root_path in self.source_root.parents
+        ):
+            raise ReplicationDurabilityError("source and destination overlap")
+
+    def _replicate_locked(
+        self,
+        root_fd: int,
+        checkpoint: SourceCheckpoint,
+        *,
+        source_sequence: int,
+        intent_id: str | None,
+        now: str,
+        lock_fd: int,
+        lock_identity: list[int],
+        replication_fd: int,
+    ) -> DestinationReplicationResult:
+        reader = DestinationArchiveReader(self.descriptor)
+        _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+        # The destination role/sentinel is part of the trust boundary and
+        # must be proven before staging any new generation.  Otherwise a
+        # tampered empty archive could advance its head and only be noticed by
+        # the post-commit reader.
+        reader.read_sentinel(root_fd)
+        baseline = reader.read_head(root_fd)
+        if baseline is None and source_sequence != 1:
+            # A sequence without a committed parent is not an admissible
+            # genesis.  Reject before creating staging or a visible record.
+            raise ReplicationStateUnavailable("destination lineage genesis is invalid")
+        if baseline is not None:
+            baseline_record = reader.read_record(baseline.replication_generation, root_fd)
+            if baseline_record.record_sha256 != baseline.record_sha256:
+                raise ReplicationStateUnavailable("destination head record mismatch")
+            reader.verify_commit(
+                checkpoint_id=baseline.checkpoint_id,
+                source_sequence=baseline.source_sequence,
+                now=now,
+            )
+            if baseline.source_instance_id != checkpoint.source_instance_id:
+                return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+            if baseline.source_sequence > source_sequence:
+                if reader.contains_checkpoint(
+                    root_fd,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    source_instance_id=checkpoint.source_instance_id,
+                    source_sequence=source_sequence,
+                ):
+                    return DestinationReplicationResult("unavailable", "DESTINATION_AHEAD")
+                return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+            if baseline.source_sequence == source_sequence:
+                if baseline.checkpoint_id != checkpoint.checkpoint_id:
+                    return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+                proof = reader.verify_commit(
+                    intent_id=intent_id,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    source_sequence=source_sequence,
+                    now=now,
+                )
+                record = reader.read_record(baseline.replication_generation, root_fd)
+                return DestinationReplicationResult(
+                    "already_replicated", "ALREADY_REPLICATED", record, proof, False
+                )
+        parent_hash = baseline.record_sha256 if baseline is not None else ZERO_SHA256
+        plan_sha256 = _destination_plan_hash(self.descriptor, checkpoint)
+        generation = _destination_record_generation(
+            descriptor=self.descriptor,
+            checkpoint=checkpoint,
+            source_sequence=source_sequence,
+            parent_record_hash=parent_hash,
+            plan_sha256=plan_sha256,
+        )
+        replication_fd = _destination_open_dir(root_fd, DESTINATION_REPLICATION_DIR)
+        history_fd = _destination_open_dir(replication_fd, DESTINATION_HISTORY_DIR)
+        staging_name = f".{generation}.staging"
+        staging_fd: int | None = None
+        linked = False
+        head_committed = False
+        try:
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=history_fd)
+            except FileExistsError as exc:
+                raise ReplicationDurabilityError("destination staging conflict") from exc
+            staging_fd = _destination_open_dir(history_fd, staging_name)
+            source_fd, source_dirs = _open_directory_chain(self.source_root, create=False)
+            try:
+                sentinel = _destination_read_relative(source_fd, DESTINATION_SENTINEL_NAME)
+                if _sha256_bytes(sentinel) != self.descriptor.sentinel_sha256:
+                    raise ReplicationDurabilityError("destination sentinel does not match source")
+                manifest = _destination_read_relative(source_fd, "manifest.json")
+                if _sha256_bytes(manifest) != checkpoint.source_manifest_bytes_sha256:
+                    raise ReplicationDurabilityError("source manifest hash mismatch")
+                _parse_destination_manifest(
+                    manifest, expected_sha256=checkpoint.source_manifest_bytes_sha256
+                )
+                _destination_write_at(staging_fd, DESTINATION_SENTINEL_NAME, sentinel)
+                _destination_write_at(staging_fd, "manifest.json", manifest)
+                for item in checkpoint.object_inventory:
+                    payload = _destination_read_relative(source_fd, item.relative_path)
+                    if (
+                        len(payload) != item.size_bytes
+                        or _sha256_bytes(payload) != item.object_sha256
+                    ):
+                        raise ReplicationDurabilityError("source object verification failed")
+                    target_fd = staging_fd
+                    target_dirs: list[int] = []
+                    parts = tuple(item.relative_path.split("/"))
+                    try:
+                        for part in parts[:-1]:
+                            target_fd = _destination_mkdir_at(target_fd, part)
+                            target_dirs.append(target_fd)
+                        _destination_write_at(target_fd, parts[-1], payload)
+                        readback = _destination_read_at(
+                            target_fd, (parts[-1],), require_private_mode=False
+                        )
+                        if (
+                            readback is None
+                            or len(readback[0]) != item.size_bytes
+                            or _sha256_bytes(readback[0]) != item.object_sha256
+                        ):
+                            raise ReplicationDurabilityError("destination object readback failed")
+                    finally:
+                        failures: list[str] = []
+                        _close_descriptors(target_dirs, failures)
+                        _finish_cleanup(None, failures)
+            finally:
+                failures = []
+                _close_descriptors(source_dirs, failures)
+                _finish_cleanup(None, failures)
+            record = _destination_record(
+                self.descriptor,
+                checkpoint,
+                source_sequence=source_sequence,
+                parent_record_hash=parent_hash,
+                plan_sha256=plan_sha256,
+                destination_manifest_bytes_sha256=_sha256_bytes(manifest),
+                created_at=now,
+                replication_generation=generation,
+            )
+            _destination_write_at(
+                staging_fd,
+                "replication-record.json",
+                canonical_json_bytes(record.model_dump(mode="json")),
+            )
+            _fsync_open_directory(staging_fd)
+            os.close(staging_fd)
+            staging_fd = None
+            _destination_rename_noreplace(history_fd, staging_name, generation)
+            linked = True
+            _fsync_open_directory(history_fd)
+            _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+            head = _destination_head(
+                self.descriptor,
+                record,
+                head_version=baseline.head_version + 1 if baseline is not None else 1,
+                updated_at=now,
+            )
+            current_head_bytes = _destination_read_at(replication_fd, ("head.json",), optional=True)
+            baseline_bytes = (
+                canonical_json_bytes(baseline.model_dump(mode="json"))
+                if baseline is not None
+                else None
+            )
+            if (
+                current_head_bytes[0] if current_head_bytes is not None else None
+            ) != baseline_bytes:
+                raise ReplicationCASConflict("destination head CAS conflict")
+            _destination_replace_at(
+                replication_fd,
+                "head.json",
+                canonical_json_bytes(head.model_dump(mode="json")),
+                expected=baseline_bytes,
+            )
+            head_committed = True
+            _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+            self.descriptor.verify_bound()
+            proof = reader.verify_commit(
+                intent_id=intent_id,
+                checkpoint_id=checkpoint.checkpoint_id,
+                source_sequence=source_sequence,
+                destination_generation=generation,
+                now=now,
+            )
+            return DestinationReplicationResult("replicated", "NONE", record, proof, True)
+        except (ReplicationCASConflict, ReplicationStateUnavailable) as exc:
+            reason = (
+                "CAS_CONFLICT"
+                if isinstance(exc, ReplicationCASConflict)
+                else "DESTINATION_TRUST_FAILED"
+            )
+            if isinstance(exc, ReplicationStateUnavailable) and "lineage" in str(exc):
+                reason = "DESTINATION_CONFLICT"
+            return DestinationReplicationResult(
+                "unavailable", reason, destination_writes=head_committed
+            )
+        except ReplicationDurabilityError:
+            return DestinationReplicationResult(
+                "unavailable", "COPY_FAILED", destination_writes=head_committed
+            )
+        finally:
+            if staging_fd is not None:
+                try:
+                    os.close(staging_fd)
+                except OSError:
+                    pass
+            if not linked:
+                _destination_remove_tree_at(history_fd, staging_name)
+            failures: list[str] = []
+            _close_fd_best_effort(history_fd, "destination_history_fd", failures)
+            _close_fd_best_effort(replication_fd, "destination_replication_fd", failures)
+            _finish_cleanup(None, failures)
+
+    def replicate(
+        self,
+        checkpoint: SourceCheckpoint | Mapping[str, object],
+        *,
+        source_sequence: int,
+        intent_id: str | None = None,
+        now: str | None = None,
+    ) -> DestinationReplicationResult:
+        try:
+            normalized = (
+                checkpoint
+                if isinstance(checkpoint, SourceCheckpoint)
+                else SourceCheckpoint.model_validate(
+                    {
+                        **checkpoint,
+                        "object_inventory": tuple(checkpoint.get("object_inventory", ())),
+                    }
+                    if isinstance(checkpoint, Mapping)
+                    else checkpoint
+                )
+            )
+            normalized.verify_hashes()
+            if not isinstance(source_sequence, int) or source_sequence < 1:
+                raise ReplicationDurabilityError("source sequence is invalid")
+            occurred_at = now or _utc_now()
+            _validate_utc_timestamp(occurred_at, "now")
+            self.descriptor.verify_bound()
+            with _destination_root_session(self.descriptor) as root_fd:
+                replication_fd, lock_fd, lock_identity = _destination_lock(root_fd)
+                result: DestinationReplicationResult | None = None
+                try:
+                    self.descriptor.verify_bound()
+                    result = self._replicate_locked(
+                        root_fd,
+                        normalized,
+                        source_sequence=source_sequence,
+                        intent_id=intent_id,
+                        now=occurred_at,
+                        lock_fd=lock_fd,
+                        lock_identity=lock_identity,
+                        replication_fd=replication_fd,
+                    )
+                finally:
+                    try:
+                        _destination_unlock(replication_fd, lock_fd)
+                    except ReplicationDurabilityError:
+                        if result is not None and result.destination_writes:
+                            result = DestinationReplicationResult(
+                                "unavailable",
+                                "CONTROL_STATE_UNAVAILABLE",
+                                result.record,
+                                result.proof,
+                                True,
+                            )
+                        else:
+                            raise
+                if result is None:
+                    raise ReplicationDurabilityError("destination result is unavailable")
+                return result
+        except ReplicationCASConflict:
+            return DestinationReplicationResult("unavailable", "CAS_CONFLICT")
+        except ReplicationDurabilityError as exc:
+            message = str(exc)
+            reason: ReplicationReason = "DESTINATION_TRUST_FAILED"
+            if "lock" in message or "unsupported" in message:
+                reason = "MOUNT_UNSUPPORTED"
+            elif "mount" in message:
+                reason = "DESTINATION_MOUNT_UNAVAILABLE"
+            elif "rebound" in message or "changed" in message:
+                reason = "DESTINATION_REBOUND"
+            elif "source" in message or "manifest" in message:
+                reason = "SOURCE_UNAVAILABLE"
+            elif "object" in message or "staging" in message or "copy" in message:
+                reason = "COPY_FAILED"
+            return DestinationReplicationResult("unavailable", reason)
+
+    execute = replicate
+
+
+DestinationReplicationService = DestinationArchiveWriter
+DestinationTrust = DestinationDescriptor
+ReplicationDestinationWriter = DestinationArchiveWriter
+DestinationWriter = DestinationArchiveWriter
+DestinationDescriptor.from_path = DestinationDescriptor.from_root  # type: ignore[attr-defined]
+
+
+def build_destination_descriptor(
+    root: Path,
+    *,
+    single_writer_host_id: str = "local-host",
+    sentinel_sha256: str = ZERO_SHA256,
+    local_root: Path | None = None,
+    created_at: str | None = None,
+) -> DestinationDescriptor:
+    """Small explicit-root factory used by offline drain fixtures."""
+    return DestinationDescriptor.from_root(
+        root,
+        single_writer_host_id=single_writer_host_id,
+        sentinel_sha256=sentinel_sha256,
+        local_root=local_root,
+        created_at=created_at,
+    )
+
+
+def _destination_replace_at(
+    parent_fd: int, name: str, payload: bytes, *, expected: bytes | None
+) -> None:
+    current = _destination_read_at(parent_fd, (name,), optional=True)
+    current_bytes = current[0] if current is not None else None
+    if current_bytes != expected:
+        raise ReplicationCASConflict("destination head CAS conflict")
+    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+    fd: int | None = None
+    try:
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        _write_fully(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        current = _destination_read_at(parent_fd, (name,), optional=True)
+        if (current[0] if current is not None else None) != expected:
+            raise ReplicationCASConflict("destination head CAS conflict")
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _fsync_open_directory(parent_fd)
+    except ReplicationDurabilityError:
+        raise
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination head install failed") from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _complete_replication_with_proof(
+    store: ImmutableReplicationSidecarStore,
+    proof: VerifiedDestinationCommitProof,
+) -> ReplicationHead:
+    if (
+        not isinstance(proof, VerifiedDestinationCommitProof)
+        or proof._token is not _DESTINATION_PROOF_TOKEN
+    ):
+        raise ReplicationDurabilityError(
+            "replication completion requires a dedicated verified destination proof"
+        )
+    if proof.intent_id is None or proof.worker_id is None or proof.state_version is None:
+        raise ReplicationDurabilityError("destination completion proof is incomplete")
+    _validate_sha(proof.intent_id, "intent_id")
+    _validate_sha(proof.checkpoint_id, "checkpoint_id")
+    _validate_sha(proof.destination_generation, "destination_generation")
+    _validate_sha(proof.destination_record_sha256, "destination_record_sha256")
+    _validate_sha(proof.destination_head_sha256, "destination_head_sha256")
+    _validate_utc_timestamp(proof.now, "now")
+
+    def mutate(connection: sqlite3.Connection) -> _MutationOutcome:
+        intent = connection.execute(
+            "SELECT destination_id, source_sequence, checkpoint_id FROM replication_intents WHERE intent_id=?",
+            (proof.intent_id,),
+        ).fetchone()
+        if intent is None or intent != (
+            proof.destination_id,
+            proof.source_sequence,
+            proof.checkpoint_id,
+        ):
+            raise ReplicationStateUnavailable("replication completion proof does not match intent")
+        head = store._head_row(connection, proof.intent_id)
+        if head[1] != "verifying" or head[2] != proof.state_version or head[4] != proof.worker_id:
+            raise ReplicationCASConflict("replication completion lease changed")
+        if head[5] is None or _timestamp_value(str(head[5])) <= _timestamp_value(proof.now):
+            raise ReplicationCASConflict("replication completion lease expired")
+        store._append_event_and_update_head(
+            connection,
+            intent_id=proof.intent_id,
+            from_state="verifying",
+            to_state="replicated",
+            attempt=int(store._latest_event(connection, proof.intent_id)[6]),
+            reason_code="NONE",
+            occurred_at=proof.now,
+            lease_owner=None,
+            lease_until=None,
+            next_attempt_at=proof.now,
+            destination_replication_generation=proof.destination_generation,
+            destination_record_sha256=proof.destination_record_sha256,
+            destination_head_sha256=proof.destination_head_sha256,
+            event_type="transition",
+        )
+        return _MutationOutcome(store._head_view(connection, proof.intent_id), True)
+
+    result = store._mutate_generation(mutate)
+    if not isinstance(result, ReplicationHead):
+        raise ReplicationDurabilityError("replication completion result is invalid")
+    return result
+
+
 __all__ = [
     "Effects",
     "SIDECAR_DDL",
@@ -4489,6 +6497,32 @@ __all__ = [
     "ReplicationStatus",
     "ReplicationStatusService",
     "VerifiedDestinationCommitProof",
+    "DestinationDescriptor",
+    "DestinationTrust",
+    "DestinationArchiveReader",
+    "DestinationArchiveWriter",
+    "DestinationReplicationService",
+    "ReplicationDestinationWriter",
+    "DestinationWriter",
+    "DestinationReplicationResult",
+    "ReplicationRecord",
+    "DestinationHead",
+    "SentinelProjection",
+    "build_replication_record",
+    "build_destination_head",
+    "initialize_destination",
+    "build_destination_descriptor",
+    "DESTINATION_DESCRIPTOR_SCHEMA",
+    "DESTINATION_SENTINEL_SCHEMA",
+    "DESTINATION_RECORD_SCHEMA",
+    "DESTINATION_HEAD_SCHEMA",
+    "DESTINATION_INIT_ACK",
+    "DESTINATION_DESCRIPTOR_NAME",
+    "DESTINATION_SENTINEL_NAME",
+    "DESTINATION_REPLICATION_DIR",
+    "DESTINATION_HISTORY_DIR",
+    "DESTINATION_STAGING_DIR",
+    "DESTINATION_LOCK_NAME",
     "SourceCheckpoint",
     "SourceInstanceRecord",
     "SourceInstanceStore",
