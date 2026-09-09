@@ -593,7 +593,7 @@ real passing test/static check before an implementation release is considered.
 | FR-3e | `tests/test_dataset_replication.py::test_manifest_only_operation_never_calls_pointer_wrapper` |
 | FR-3f | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | FR-3g | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
-| FR-3h | `tests/test_dataset_replication.py::test_backfill_service_requires_explicit_lineage_input_per_trade_date` |
+| FR-3h | `tests/test_dataset_replication.py::test_backfill_service_requires_explicit_lineage_input_per_trade_date`; `tests/test_market_backfill.py::test_cli_nas_lineage_parser_preserves_order_and_rejects_duplicate_before_dict` |
 | FR-3i | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
 | FR-3j | `tests/test_dataset_replication.py::test_lineage_resolver_returns_union_and_reuses_session_selection_hash_contract` |
 | FR-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
@@ -642,13 +642,13 @@ real passing test/static check before an implementation release is considered.
 | AC-19 | `tests/test_launchagent_assets.py::test_refresh_replication_hook_is_optional_and_tcc_safe` |
 | AC-20 | `tests/test_dataset_replication.py::test_replication_release_evidence_is_offline_and_exact_head_recorded` |
 | AC-21 | `tests/test_dataset_replication.py::test_manifest_fingerprint_drift_blocks_pointer_cas` |
-| AC-22 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured` |
+| AC-22 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`; `tests/test_market_backfill.py::test_cli_plain_market_store_backfill_legacy_behavior_is_unchanged` |
 | AC-23 | `tests/test_dataset_replication.py::test_manifest_only_upsert_and_backfill_preserve_pointer_bytes_hash_and_inode` |
 | AC-24 | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | AC-25 | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
-| AC-26 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure` |
+| AC-26 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure`; `tests/test_market_backfill.py::test_cli_nas_lineage_gap_or_extra_is_zero_provider_zero_write` |
 | AC-27 | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
-| AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence` |
+| AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence`; `tests/test_market_backfill.py::test_cli_nas_valid_lineage_all_dates_admitted_before_first_provider_fetch` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | EC-2 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
 | EC-3 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
@@ -678,12 +678,12 @@ real passing test/static check before an implementation release is considered.
 | EC-27 | `tests/test_dataset_replication.py::test_manifest_lock_blocks_concurrent_backfill_or_upsert_mutation` |
 | EC-28 | `tests/test_dataset_replication.py::test_refresh_run_lock_is_not_publication_atomicity_dependency` |
 | EC-29 | `tests/test_dataset_replication.py::test_missing_v2_manifest_metadata_blocks_pointer` |
-| EC-30 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured` |
+| EC-30 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`; `tests/test_market_backfill.py::test_cli_plain_market_store_rejects_lineage_input` |
 | EC-31 | `tests/test_dataset_replication.py::test_manifest_only_operation_never_calls_pointer_wrapper` |
 | EC-32 | `tests/test_dataset_replication.py::test_pointer_precommit_lock_error_preserves_pointer_identity` |
 | EC-33 | `tests/test_dataset_replication.py::test_pointer_postcommit_control_error_is_durable_and_next_guard_reconciles` |
 | EC-34 | `tests/test_dataset_replication.py::test_manifest_only_present_pointer_identity_is_exact_before_after` |
-| EC-35 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_failure_preserves_manifest_and_pointer` |
+| EC-35 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_failure_preserves_manifest_and_pointer`; `tests/test_market_backfill.py::test_backfill_service_dataset_preflight_fails_before_audit_or_provider` |
 | EC-36 | `tests/test_dataset_replication.py::test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance` |
 | EC-37 | `tests/test_dataset_replication.py::test_missing_lineage_reader_returns_source_unavailable_before_mutation` |
 
@@ -2200,3 +2200,143 @@ The required evidence anchors are
 `test_modern_backfill_requires_exact_lineage_or_resolver_evidence`,
 `test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance`, and
 `test_missing_lineage_reader_returns_source_unavailable_before_mutation`.
+
+## R2-F4.3.9 tenth-round normative amendment — CLI BackfillService store split
+
+This is the final normative amendment for the ordinary `backfill` command. It supersedes every
+earlier backfill/CLI sentence that implies a `Record` map is the input boundary, that lineage is
+silently defaulted, that the plain `MarketStore` needs lineage, or that a dataset plan may call a
+provider/audit writer before all date lineage has been admitted. It is still specification only:
+no implementation, provider request, NAS access, database write or production enablement is
+authorized by this section.
+
+### 1. Local lineage-file grammar and ordered parser boundary
+
+`backend/app/cli.py` adds an optional `backfill --lineage-input PATH` flag. `PATH` is a local,
+regular, non-symlink file opened with a no-follow descriptor; URLs, credential references,
+environment expansion, `HOME`/root paths and unresolved paths are rejected. The file is private
+operator input: its path, JSON content, identifiers and raw parser exception are never printed or
+logged. The exact JSON shape is an object with only these fields:
+
+```json
+{
+  "schema": "stock-eva/r2f4.3/backfill-lineage/v1",
+  "entries": [
+    {"trade_date": "2026-09-07", "lineage_input": {"mode": "legacy"}},
+    {"trade_date": "2026-09-08", "lineage_input": {"mode": "modern", "candidate_id": "<id>", "evidence_id": "<id>"}}
+  ]
+}
+```
+
+`entries` is deliberately an ordered JSON array, never a JSON object keyed by date. The parser
+uses an ordered `(key, value)` object-pairs boundary and rejects duplicate keys in the top-level
+object, each entry or each `lineage_input` object before converting any object to a `dict`. It
+returns `tuple[(trade_date, LineageInput), ...]` in file order. It then requires strict ISO dates,
+ascending order, exactly one entry per expected confirmed `trade_date`, no missing date/gap and no
+extra date, before constructing `lineage_by_trade_date`. Unknown fields, malformed modes,
+duplicate entries and missing/unreadable files return the sanitized CLI error projection
+`status="error", error_code="BACKFILL_LINEAGE_INPUT_INVALID"` or
+`BACKFILL_LINEAGE_INPUT_UNAVAILABLE`, exit code `2`, `provider_requests=0`, and every write/effect
+flag false. No provider is constructed or called on this failure path.
+
+The expected dates are obtained before provider construction from the strict local calendar
+snapshot (`get_trading_calendar().snapshot().confirmed_open_sessions`). For `--effective-days`,
+the same local snapshot selects the bounded final sessions; if the snapshot cannot prove the
+range, the command returns `SOURCE_UNAVAILABLE` with zero provider requests and zero writes. The
+file parser receives this expected ordered tuple, so date gap/extra detection is complete before
+any BaoStock calendar query, `validate_readiness`, reconciliation, audit initialization or market
+data request.
+
+### 2. `main()` store split and exact NAS admission order
+
+The ordinary `backfill` branch in `backend/app/cli.py` resolves settings/layout and identifies the
+store type first, then dispatches before the generic NAS `validate_readiness()`/
+`reconcile_control_pointer()` block and before constructing `BaoStockProvider`:
+
+1. For a plain `MarketStore`, a supplied `--lineage-input` is rejected as
+   `BACKFILL_LINEAGE_INPUT_NOT_SUPPORTED_FOR_PLAIN_STORE`, exit `2`, with
+   `provider_requests=0` and zero writes. Without the option, the existing plain-store
+   `BackfillService.plan(...)` and `BackfillService.execute(...)` path, provider calendar lookup,
+   audit behavior, output shape and status mapping remain unchanged. It does not instantiate the
+   lineage resolver or coordinator.
+2. For a `NasMarketStore`, the command first derives the local expected dates and performs the
+   ordered lineage-file parse above. If the flag is omitted, it performs a strict read-only
+   manifest-mode read: only a proven existing `legacy` mode may be converted into an explicit
+   `LineageInput{mode="legacy"}` pair for every expected date; an absent/empty or invalid mode
+   requires the flag, and an existing `modern` mode also requires the flag because modern input
+   must carry evidence references for every date. This is an explicit `MANIFEST_LEGACY` branch,
+   never a silent default. No `Record` conversion occurs until all parser checks pass.
+3. The admitted ordered pairs are passed to `BackfillService.plan_dataset(...)`; this method
+   retains the existing `BackfillPlan`/`BackfillBatchPlan` models, partitions the pairs by the
+   existing batch dates, and rejects any missing, extra, duplicate or cross-date mapping. It uses
+   the local date tuple and makes no provider request. The plan is rejected before any audit,
+   manifest, object or pointer write if its mapping is not exact.
+4. `BackfillService.execute(...)` performs the strict `LineageResolver` preflight for every date
+   in every dataset batch, ascending by `trade_date`, retaining all discriminated results before
+   the first provider fetch. A provider object may be constructed after parser/plan admission,
+   but until every result is `LEGACY` or `MODERN` it MUST NOT open a provider session, login or
+   request data; initialize/record `BackfillAuditStore`, upsert bars, stage objects, mutate
+   `manifest.json` or commit the DuckDB pointer. Any `UNAVAILABLE/SOURCE_UNAVAILABLE` result
+   returns the existing sanitized run projection with `provider_requests=0`, zero effects and
+   unchanged manifest/pointer/sidecar bytes. After all dates pass, the existing readiness/control
+   checks may run, provider fetches may begin, and every `NasMarketStore.upsert_bars` invocation
+   receives the resolved explicit input for its own `trade_date`; no date may inherit another
+   date's lineage.
+
+### 3. Real `BackfillService` API compatibility
+
+`backend/app/market/backfill.py::BackfillService` remains the only backfill service; no alternate
+runner class or generic callback is introduced. Its existing plain-store methods retain their
+current contract, while the dataset path adds a separate method so a required lineage argument
+cannot alter plain callers:
+
+```typescript
+interface BackfillService {
+  // Existing plain MarketStore contract: unchanged signature and behavior.
+  plan(input: ExistingPlainBackfillPlanInput): BackfillPlan;
+  // Dataset-only overload; trading_dates are already proven by the local calendar.
+  plan_dataset(input: Readonly<{
+    start_date: string; end_date: string; symbols: ReadonlyArray<string>;
+    symbol_batch_size: number; date_batch_size: number; max_batches: number;
+    trading_dates: ReadonlyArray<string>;
+    lineage_pairs: ReadonlyArray<Readonly<{
+      trade_date: string; lineage_input: LineageInput;
+    }>>;
+  }>): BackfillPlan;
+  // Existing return model and interval option remain unchanged.
+  execute(plan: BackfillPlan, options: Readonly<{
+    min_request_interval_seconds: number;
+  }>): BackfillRunRecord;
+}
+```
+
+`plan_dataset` is valid only when the service store is `NasMarketStore`; the plain `plan` is valid
+only for `MarketStore` and must reject a dataset plan. Every `BackfillBatchPlan` created by
+`plan_dataset` carries a `lineage_by_trade_date` mapping only after the ordered-pairs boundary has
+proved uniqueness and exact date coverage. `execute` resolves all mappings before any side effect;
+the provider bars are then split by their exact `trade_date` and the corresponding explicit
+`lineage_input` is passed to `NasMarketStore.upsert_bars(..., *, lineage_input)`. A direct
+dataset-store caller must likewise pass explicit `mode="legacy"` or the exact/allowlisted modern
+input. `MarketStore` APIs and their legacy call sites remain untouched.
+
+### 4. Required CLI and service evidence
+
+The following are exact planned behavior tests, in addition to the existing R2-F4.3 resolver and
+publication tests:
+
+- `tests/test_market_backfill.py::test_cli_nas_lineage_parser_preserves_order_and_rejects_duplicate_before_dict`
+- `tests/test_market_backfill.py::test_cli_nas_lineage_missing_duplicate_invalid_is_zero_provider_zero_write`
+- `tests/test_market_backfill.py::test_cli_nas_lineage_gap_or_extra_is_zero_provider_zero_write`
+- `tests/test_market_backfill.py::test_cli_nas_valid_lineage_all_dates_admitted_before_first_provider_fetch`
+- `tests/test_market_backfill.py::test_cli_nas_existing_legacy_manifest_selects_explicit_legacy_branch`
+- `tests/test_market_backfill.py::test_backfill_service_dataset_preflight_fails_before_audit_or_provider`
+- `tests/test_market_backfill.py::test_cli_plain_market_store_backfill_legacy_behavior_is_unchanged`
+- `tests/test_market_backfill.py::test_cli_plain_market_store_rejects_lineage_input`
+
+These tests must assert `provider_requests=0`, provider-call count `0`, canonical manifest/object/
+pointer and audit-sidecar bytes/inodes unchanged for NAS missing/duplicate/invalid/gap/extra and
+resolver-failure cases; assert every expected date is admitted before the first provider fetch for
+the valid-NAS case; assert the pre-existing plain-store CLI plan/execute behavior byte/behavior
+compatible; and assert the plain-store option rejection occurs before provider construction.
+The two crosswalks above are updated to reference these exact anchors. The R2-F4.3 status remains
+`In Review / NO-GO`; this amendment does not claim implementation or production enablement.
