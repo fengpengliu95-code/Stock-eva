@@ -56,6 +56,7 @@ JOURNAL_SCHEMA_VERSION = 1
 SIDECAR_ROOT_NAME = "replication-sidecar"
 SIDECAR_LOCK_NAME = ".writer.lock"
 SIDECAR_GENESIS_NAME = "genesis.json"
+SIDECAR_STAGING_NAME = ".staging"
 SIDECAR_GENERATION_WIDTH = 20
 SIDECAR_GENERATION_SUFFIX = ".db"
 
@@ -125,6 +126,15 @@ class ReplicationPostCommitConflict(ReplicationStateUnavailable):
     """A generation was linked, then its final namespace proof failed."""
 
     reason_code: Literal["CONTROL_STATE_UNAVAILABLE"] = "CONTROL_STATE_UNAVAILABLE"
+
+
+class VerifiedDestinationCommitProof:
+    """Reserved completion-proof type; destination verification is not in Batch2."""
+
+    __slots__ = ()
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("verified destination commit proof is not implemented")
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -1368,6 +1378,10 @@ class JournalRecord(BaseModel):
     @classmethod
     def read(cls, path: Path) -> Self:
         payload, _ = _read_nofollow(Path(path))
+        return cls._from_payload(Path(path).name, payload)
+
+    @classmethod
+    def _from_payload(cls, filename: str, payload: bytes) -> Self:
         try:
             values = json.loads(payload)
             projection = dict(values["checkpoint_projection"])
@@ -1376,7 +1390,7 @@ class JournalRecord(BaseModel):
             record = cls.model_validate(values)
         except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise ReplicationDurabilityError("replication journal is invalid") from exc
-        if Path(path).name != f"{record.checkpoint_id}.json":
+        if filename != f"{record.checkpoint_id}.json":
             raise ReplicationDurabilityError("replication journal filename is invalid")
         if canonical_json_bytes(record.model_dump(mode="json")) != payload:
             raise ReplicationDurabilityError("replication journal is not canonical")
@@ -1993,6 +2007,7 @@ def _verify_writer_lock_entry(
 # namespace.  These helpers intentionally use only a held sidecar dirfd for
 # authority; a generation is never opened for writing after installation.
 _GENERATION_RE = re.compile(r"^[0-9]{20}\.db$")
+_STAGING_TEMP_RE = re.compile(r"^\.([0-9]{20}\.db)\.tmp$")
 
 
 def _sidecar_root(path: Path) -> Path:
@@ -2138,8 +2153,161 @@ class _GenerationEntry:
     fingerprint: _SqliteFingerprint
 
 
+def _directory_fingerprint(info: os.stat_result) -> tuple[int, int, int, int]:
+    if not stat.S_ISDIR(info.st_mode):
+        raise ReplicationDurabilityError("replication directory is not a directory")
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(stat.S_IMODE(info.st_mode)),
+        int(info.st_nlink),
+    )
+
+
+def _assert_directory_fingerprint(fd: int, expected: tuple[int, int, int, int]) -> None:
+    try:
+        actual = _directory_fingerprint(os.fstat(fd))
+    except OSError as exc:
+        raise ReplicationStateUnavailable("replication directory changed during read") from exc
+    if actual != expected:
+        raise ReplicationStateUnavailable("replication directory changed during read")
+
+
+def _ensure_staging_directory(root_fd: int) -> int:
+    """Open the fixed staging namespace through the already-held root dirfd."""
+    try:
+        staging_fd = os.open(SIDECAR_STAGING_NAME, _DIRECTORY_FLAGS, dir_fd=root_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(SIDECAR_STAGING_NAME, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            staging_fd = os.open(SIDECAR_STAGING_NAME, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        except OSError as exc:
+            raise ReplicationDurabilityError(
+                "replication staging namespace is unavailable"
+            ) from exc
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication staging namespace is unavailable") from exc
+    try:
+        info = os.fstat(staging_fd)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ReplicationDurabilityError("replication staging namespace is unsafe")
+        return staging_fd
+    except BaseException as exc:
+        failures: list[str] = []
+        _close_fd_best_effort(staging_fd, "staging_dir_fd", failures)
+        _finish_cleanup(exc, failures)
+        raise
+
+
+def _has_writer_lock_entry(root_fd: int) -> bool:
+    """Tell the low-level install helper whether it runs in a sidecar session."""
+    fd: int | None = None
+    try:
+        fd = os.open(
+            SIDECAR_LOCK_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        info = os.fstat(fd)
+        return stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            failures: list[str] = []
+            _close_fd_best_effort(fd, "lock_entry_probe_fd", failures)
+            _finish_cleanup(None, failures)
+
+
+def _scan_staging_namespace(
+    root_fd: int,
+    entries: tuple[_GenerationEntry, ...],
+    *,
+    ignore_name: str | None = None,
+    repair_orphans: bool = False,
+) -> set[int]:
+    """Validate staging entries and return generations proven to have aliases.
+
+    A staging entry is trusted only when it is the deterministic temporary name
+    for an existing generation and is the exact same hardlink (bytes, device,
+    inode, mode and link count).  A regular pre-link orphan may be removed only
+    by a locked writer; status remains strictly read-only and reports it as
+    unavailable.  All other names, links and types fail closed.
+    """
+    try:
+        staging_fd = os.open(SIDECAR_STAGING_NAME, _DIRECTORY_FLAGS, dir_fd=root_fd)
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise ReplicationStateUnavailable("replication staging namespace is unavailable") from exc
+    aliases: set[int] = set()
+    orphan_names: list[str] = []
+    entries_by_sequence = {entry.sequence: entry for entry in entries}
+    primary: BaseException | None = None
+    try:
+        staging_info = os.fstat(staging_fd)
+        if not stat.S_ISDIR(staging_info.st_mode) or stat.S_IMODE(staging_info.st_mode) != 0o700:
+            raise ReplicationStateUnavailable("replication staging namespace is unsafe")
+        for name in sorted(os.listdir(staging_fd)):
+            if ignore_name is not None and name == ignore_name:
+                continue
+            match = _STAGING_TEMP_RE.fullmatch(name)
+            if match is None:
+                raise ReplicationStateUnavailable(
+                    "replication staging namespace contains unknown entry"
+                )
+            payload, info = _read_at(staging_fd, name)
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                raise ReplicationStateUnavailable("replication staging entry is unsafe")
+            sequence = int(match.group(1)[:SIDECAR_GENERATION_WIDTH])
+            generation = entries_by_sequence.get(sequence)
+            if generation is None:
+                if not repair_orphans:
+                    raise ReplicationStateUnavailable("replication staging orphan is unavailable")
+                orphan_names.append(name)
+                continue
+            if (
+                payload != generation.payload
+                or generation.stat.st_dev != info.st_dev
+                or generation.stat.st_ino != info.st_ino
+                or generation.stat.st_nlink != info.st_nlink
+                or generation.stat.st_nlink != 2
+                or stat.S_IMODE(generation.stat.st_mode) != stat.S_IMODE(info.st_mode)
+            ):
+                raise ReplicationStateUnavailable("replication staging alias is invalid")
+            aliases.add(sequence)
+        if orphan_names:
+            for name in orphan_names:
+                try:
+                    os.unlink(name, dir_fd=staging_fd)
+                except OSError as exc:
+                    raise ReplicationDurabilityError(
+                        "replication staging orphan cleanup failed"
+                    ) from exc
+            _fsync_open_directory(staging_fd)
+            _fsync_open_directory(root_fd)
+        return aliases
+    except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+        primary = exc
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        primary = ReplicationStateUnavailable("replication staging namespace is unavailable")
+        raise primary from exc
+    finally:
+        failures: list[str] = []
+        _close_fd_best_effort(staging_fd, "staging_dir_fd", failures)
+        _finish_cleanup(primary, failures)
+
+
 def _scan_generation_namespace(
-    root_fd: int, *, require_genesis: bool = True, ignore_name: str | None = None
+    root_fd: int,
+    *,
+    require_genesis: bool = True,
+    ignore_name: str | None = None,
+    repair_staging_orphans: bool = False,
 ) -> tuple[
     dict[str, object] | None, bytes | None, _GenerationEntry | None, tuple[_GenerationEntry, ...]
 ]:
@@ -2147,7 +2315,7 @@ def _scan_generation_namespace(
         names = os.listdir(root_fd)
     except OSError as exc:
         raise ReplicationStateUnavailable("replication sidecar namespace is unavailable") from exc
-    allowed = {SIDECAR_LOCK_NAME, SIDECAR_GENESIS_NAME}
+    allowed = {SIDECAR_LOCK_NAME, SIDECAR_GENESIS_NAME, SIDECAR_STAGING_NAME}
     generations: list[tuple[int, str]] = []
     for name in names:
         if ignore_name is not None and name == ignore_name:
@@ -2176,9 +2344,18 @@ def _scan_generation_namespace(
     for sequence, name in generations:
         payload, info = _read_at(root_fd, name)
         fingerprint = _stat_fingerprint(info, payload)
-        if fingerprint is None or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        if fingerprint is None or stat.S_IMODE(info.st_mode) != 0o600:
             raise ReplicationStateUnavailable("replication sidecar generation is unsafe")
         entries.append(_GenerationEntry(sequence, name, payload, info, fingerprint))
+    aliases = _scan_staging_namespace(
+        root_fd,
+        tuple(entries),
+        ignore_name=ignore_name,
+        repair_orphans=repair_staging_orphans,
+    )
+    for entry in entries:
+        if entry.stat.st_nlink not in ({1, 2} if entry.sequence in aliases else {1}):
+            raise ReplicationStateUnavailable("replication sidecar generation link count is unsafe")
     return genesis, genesis_payload, entries[-1] if entries else None, tuple(entries)
 
 
@@ -2434,9 +2611,11 @@ def _open_generation_writer_session(path: Path) -> _GenerationWriterSession:
     try:
         lock_fd, token = _acquire_writer_lock(root_fd, SIDECAR_LOCK_NAME)
         # Scan while the lock is held.  Unknown/WAL/SHM entries are never
-        # ignored, including on an otherwise empty sidecar.
+        # ignored, including on an otherwise empty sidecar.  A validated
+        # regular pre-link orphan is cleaned here, while status remains
+        # strictly read-only and reports it as unavailable.
         genesis, genesis_payload, _latest, entries = _scan_generation_namespace(
-            root_fd, require_genesis=False
+            root_fd, require_genesis=False, repair_staging_orphans=True
         )
         session = _GenerationWriterSession(
             root, root_fd, descriptors, lock_fd, token, genesis, genesis_payload, entries
@@ -2468,18 +2647,22 @@ def _install_fixed_at(
     before_install: object | None = None,
 ) -> None:
     """Install one immutable basename without overwrite."""
-    temp = f".{name}.{uuid.uuid4().hex}.tmp"
+    temp = f".{name}.tmp"
+    staging_fd: int | None = None
     temp_fd: int | None = None
     primary: BaseException | None = None
     failures: list[str] = []
     installed = False
+    temp_owned = False
     try:
+        staging_fd = _ensure_staging_directory(root_fd)
         temp_fd = os.open(
             temp,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
-            dir_fd=root_fd,
+            dir_fd=staging_fd,
         )
+        temp_owned = True
         _write_fully(temp_fd, payload)
         os.fsync(temp_fd)
         close_failures: list[str] = []
@@ -2490,12 +2673,30 @@ def _install_fixed_at(
         if before_install is not None:
             before_install(temp)
         try:
-            os.link(temp, name, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
+            os.link(
+                temp,
+                name,
+                src_dir_fd=staging_fd,
+                dst_dir_fd=root_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise ReplicationCASConflict("replication generation CAS conflict") from exc
         installed = True
-        os.unlink(temp, dir_fd=root_fd)
+        os.unlink(temp, dir_fd=staging_fd)
         temp = ""
+        temp_owned = False
+        _fsync_open_directory(staging_fd)
+        # Keep the fixed namespace hidden when there is no residual staging
+        # evidence.  A committed hardlink alias or an external entry remains
+        # visible for the strict scanner to prove or reject.
+        if _has_writer_lock_entry(root_fd) and not os.listdir(staging_fd):
+            try:
+                os.rmdir(SIDECAR_STAGING_NAME, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                _fsync_open_directory(root_fd)
         _fsync_open_directory(root_fd)
     except ReplicationCASConflict as exc:
         primary = exc
@@ -2513,6 +2714,9 @@ def _install_fixed_at(
         primary = exc
         raise
     except OSError as exc:
+        if not installed and isinstance(exc, FileExistsError):
+            primary = ReplicationCASConflict("replication generation CAS conflict")
+            raise primary from exc
         if installed:
             primary = ReplicationPostCommitConflict(
                 "replication generation committed; CONTROL_STATE_UNAVAILABLE "
@@ -2527,13 +2731,16 @@ def _install_fixed_at(
     finally:
         if temp_fd is not None:
             _close_fd_best_effort(temp_fd, "generation_temp_fd", failures)
-        if temp:
+        if temp and temp_owned:
             try:
-                os.unlink(temp, dir_fd=root_fd)
+                if staging_fd is not None:
+                    os.unlink(temp, dir_fd=staging_fd)
             except FileNotFoundError:
                 pass
             except OSError:
                 failures.append("generation_temp_unlink")
+        if staging_fd is not None:
+            _close_fd_best_effort(staging_fd, "staging_dir_fd", failures)
         if failures:
             error = _cleanup_error(failures)
             if primary is not None:
@@ -3696,6 +3903,14 @@ class ImmutableReplicationSidecarStore:
             raise ReplicationCASConflict("replication state-version expectation is invalid")
         if to_state not in _OUTBOX_STATES or to_state == "pending":
             raise ReplicationDurabilityError("replication transition is not allowed")
+        if to_state == "replicated":
+            # Completion is a destination-authority operation.  A generic
+            # local transition must never be able to manufacture that state
+            # from caller-supplied digests; the dedicated proof seam is not
+            # implemented in this batch.
+            raise ReplicationDurabilityError(
+                "replication completion requires a dedicated verified destination proof"
+            )
         if reason_code not in set(get_args(ReplicationReason)):
             raise ReplicationDurabilityError("replication reason is not allowed")
         occurred_at = now or _utc_now()
@@ -3761,6 +3976,13 @@ class ImmutableReplicationSidecarStore:
             raise ReplicationDurabilityError("replication transition result is invalid")
         return result
 
+    def complete_replication(self, proof: VerifiedDestinationCommitProof) -> ReplicationHead:
+        """Reserved destination-proof seam; deliberately unavailable in Batch2."""
+        del proof
+        raise ReplicationDurabilityError(
+            "dedicated verified destination completion is not implemented"
+        )
+
     def get_intent(self, intent_id: str) -> ReplicationIntent:
         """Read one immutable intent from the strict sidecar without writes."""
         _validate_sha(intent_id, "intent_id")
@@ -3810,12 +4032,58 @@ class ImmutableReplicationSidecarStore:
         records: list[tuple[JournalRecord, str]] = []
         primary: BaseException | None = None
         try:
-            for name in sorted(os.listdir(root_fd)):
+            root_baseline = _directory_fingerprint(os.fstat(root_fd))
+            names = sorted(os.listdir(root_fd))
+            _assert_directory_fingerprint(root_fd, root_baseline)
+            for name in names:
                 if not isinstance(name, str) or not re.fullmatch(r"[0-9a-f]{64}\.json", name):
                     raise ReplicationStateUnavailable("replication journal namespace is invalid")
-                path = root / name
-                record = JournalRecord.read(path)
+                payload, info = _read_at(root_fd, name)
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise ReplicationStateUnavailable("replication journal entry is unsafe")
+                record = JournalRecord._from_payload(name, payload)
                 records.append((record, name))
+                _assert_directory_fingerprint(root_fd, root_baseline)
+            _assert_directory_fingerprint(root_fd, root_baseline)
+            result = self.import_journals(
+                [record for record, _name in records],
+                operation_day=operation_day,
+                destination_id=destination_id,
+                created_at=created_at,
+            )
+            _assert_directory_fingerprint(root_fd, root_baseline)
+            # The generation is already durable.  Unlinking is an optimization
+            # and is deliberately outside the transaction so a crash is harmless.
+            expected_root = root_baseline
+            for _record, name in records:
+                _assert_directory_fingerprint(root_fd, expected_root)
+                try:
+                    os.unlink(name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise ReplicationDurabilityError(
+                        "replication journal cleanup is unavailable"
+                    ) from exc
+                else:
+                    # Directory link-count behavior differs across filesystems:
+                    # macOS decrements it for this unlink, while some POSIX
+                    # filesystems leave it unchanged for regular children.
+                    # Re-read the held fd and permit only those two outcomes;
+                    # device/inode/mode must remain exact.
+                    actual_root = _directory_fingerprint(os.fstat(root_fd))
+                    if actual_root[:3] != expected_root[:3] or actual_root[3] not in {
+                        expected_root[3],
+                        expected_root[3] - 1,
+                    }:
+                        raise ReplicationStateUnavailable(
+                            "replication directory changed during cleanup"
+                        )
+                    expected_root = actual_root
+                _assert_directory_fingerprint(root_fd, expected_root)
+            _fsync_open_directory(root_fd)
+            _assert_directory_fingerprint(root_fd, expected_root)
+            return result
         except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
             primary = exc
             raise
@@ -3826,31 +4094,6 @@ class ImmutableReplicationSidecarStore:
             failures: list[str] = []
             _close_descriptors(descriptors, failures)
             _finish_cleanup(primary, failures)
-        result = self.import_journals(
-            [record for record, _name in records],
-            operation_day=operation_day,
-            destination_id=destination_id,
-            created_at=created_at,
-        )
-        # The generation is already durable.  Unlinking is an optimization and
-        # is deliberately outside the transaction so a crash is harmless.
-        unlink_failures: list[str] = []
-        root_fd, descriptors = _open_directory_chain(root, create=False)
-        try:
-            for _record, name in records:
-                try:
-                    os.unlink(name, dir_fd=root_fd)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    unlink_failures.append("journal_unlink")
-            if not unlink_failures:
-                _fsync_open_directory(root_fd)
-        finally:
-            _close_descriptors(descriptors, unlink_failures)
-        if unlink_failures:
-            raise ReplicationDurabilityError("replication journal cleanup is unavailable")
-        return result
 
     def _fsync_database(self) -> None:
         _fsync_directory(self.path)
@@ -4215,6 +4458,7 @@ __all__ = [
     "SIDECAR_DDL",
     "SIDECAR_DDL_SHA256",
     "SIDECAR_SCHEMA_DIGEST",
+    "SIDECAR_STAGING_NAME",
     "DATASET_IDENTITY_DOMAIN",
     "SOURCE_DATASET_DOMAIN",
     "SOURCE_INSTANCE_DOMAIN",
@@ -4244,6 +4488,7 @@ __all__ = [
     "ReplicationStatusResponse",
     "ReplicationStatus",
     "ReplicationStatusService",
+    "VerifiedDestinationCommitProof",
     "SourceCheckpoint",
     "SourceInstanceRecord",
     "SourceInstanceStore",

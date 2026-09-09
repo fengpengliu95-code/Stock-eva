@@ -1270,10 +1270,11 @@ an OS-level close succeeded when it failed. Required anchors are
 The earlier mutable `replication.sqlite3` pathname is a retired, non-compatible prototype; this
 Batch1 has no migration or compatibility write path for it. The sidecar authority is the explicit
 absolute `<local_control_dir>/replication-sidecar/` directory, reached only through a trusted
-descriptor chain. Its allowlisted namespace is exactly `.writer.lock`, `genesis.json`, and
-zero-padded generation files `00000000000000000000.db` through
-`99999999999999999999.db`; temporary names exist only during a locked write and must be removed
-before the operation is successful. Any unknown name, WAL/SHM-like name, gap, duplicate, symlink,
+descriptor chain. Its allowlisted namespace is exactly `.writer.lock`, `genesis.json`, the optional
+fixed `.staging` directory, and zero-padded generation files `00000000000000000000.db` through
+`99999999999999999999.db`; staging temporary names exist only during a locked write and must be
+removed before the operation is successful unless they are a strictly proven committed hardlink
+residue. Any unknown name, WAL/SHM-like name, gap, duplicate, symlink,
 wrong type or unreadable entry makes the sidecar unavailable. The canonical market schema remains
 unchanged; the sidecar DDL is extended only by the Batch1.7 generation-metadata amendment below.
 
@@ -1287,8 +1288,8 @@ lock inode can never become a new authority: normal writers fail closed with
 
 Every mutation runs under that anchored lock, scans and validates the complete contiguous
 generation chain, and computes the deterministic next sequence. It serializes the private
-`:memory:` SQLite image, writes an `O_EXCL|O_NOFOLLOW` temporary file through the held root dirfd,
-fsyncs it, then installs only the fixed next basename using no-replace hard-link/rename-excl
+`:memory:` SQLite image, writes a deterministic `O_EXCL|O_NOFOLLOW` temporary file through the
+held `.staging` dirfd, fsyncs it, then installs only the fixed next basename using no-replace hard-link/rename-excl
 semantics and fsyncs the root directory. `EEXIST` is a typed CAS conflict; no generation is ever
 replaced, truncated or modified. The lock and baseline are re-proven before install, after install
 before readback, and after final fsync. A namespace anomaly before install causes zero generation
@@ -2569,3 +2570,46 @@ typed `ReplicationDurabilityError`. Required runtime anchors are
 and `tests/test_dataset_replication.py::test_descriptor_cleanup_failure_without_primary_is_typed`.
 The API/crosswalk/model change is additive to the local status projection only; canonical market
 data, NAS transfer and provider behavior remain unchanged.
+
+#### Batch2.1 outbox completion and descriptor-native staging amendment (normative)
+
+The generic local `transition` operation MUST reject `to_state="replicated"` before opening or
+mutating a sidecar generation. Caller-supplied destination generation, record or head digests do
+not constitute destination authority and can never authorize completion. A future dedicated
+`complete_replication(VerifiedDestinationCommitProof)` seam is reserved, but this batch provides
+no proof reader, destination token or completion implementation; the reserved seam returns a
+typed unavailable error. Existing generic transition tests MUST therefore prove zero sidecar
+writes and preservation of the leased `verifying` head.
+
+`import_journal_files` MUST open the explicit absolute journal root once through its trusted
+descriptor chain and retain that root dirfd through enumeration, every `O_NOFOLLOW` child read,
+sidecar import, every `unlinkat`-equivalent journal removal and final directory fsync. It MUST
+capture and re-prove the held root's `(device,inode,mode,nlink)` before and after each phase (the
+expected link count is adjusted only for successful regular-file unlink). It MUST never reopen the
+root pathname after the initial descriptor bind; pathname replacement therefore cannot redirect a
+read or deletion to a new directory. Journal child bytes, regular type, mode `0600` and link count
+are also checked, and all public errors remain sanitized.
+
+The sidecar root allowlist includes the fixed descriptor-native directory `.staging` in addition to
+`.writer.lock`, `genesis.json` and zero-padded generation basenames. Staging entries are limited to
+`.<20-digit-generation>.db.tmp`, regular mode-`0600` files. A status reader performs no cleanup:
+it may ignore a staging entry only when the matching generation is present and the staging file is
+provably the same hardlink (identical bytes/hash, device, inode, mode and link count exactly `2`).
+Any pre-link orphan, unknown name, symlink, wrong type/mode, mismatched bytes or unexpected link
+count makes status unavailable without writes. A locked writer may remove only a validated regular
+pre-link orphan before its next mutation; it never removes an unknown or unsafe entry.
+
+Generation writes place the deterministic temporary file in `.staging` through held dirfds, then
+link the fixed generation basename into the root with no-replace semantics. The generation is the
+linearization point. If cleanup of a staged hardlink fails after a successful link, the operation
+returns sanitized degraded `CONTROL_STATE_UNAVAILABLE`; future status remains readable only when
+the strict hardlink-alias proof above succeeds. Crash/subprocess tests cover this case, and a
+same-`source_published_at` journal batch is ordered by `(source_published_at,checkpoint_id)`.
+The concrete anchors are
+`tests/test_dataset_replication.py::test_generic_transition_cannot_complete_replication_without_dedicated_proof`,
+`tests/test_dataset_replication.py::test_journal_import_uses_one_held_root_descriptor_across_path_replacement`,
+`tests/test_dataset_replication.py::test_committed_generation_staging_hardlink_residue_is_ignored_read_only`,
+`tests/test_dataset_replication.py::test_prelink_staging_orphan_blocks_status_then_writer_cleans_it`,
+`tests/test_dataset_replication.py::test_link_then_process_crash_leaves_proven_committed_staging_alias`,
+`tests/test_dataset_replication.py::test_staging_unlink_failure_is_degraded_but_proven_alias_remains_readable`,
+and `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id`.

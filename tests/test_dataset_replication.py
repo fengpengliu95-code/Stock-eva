@@ -115,6 +115,23 @@ def _install_fixed_generation_process(path: str, payload: bytes, queue: object) 
         os.close(root_fd)
 
 
+def _crash_after_generation_link_process(path: str, payload: bytes) -> None:
+    """Crash after linking the fixed generation, before staging cleanup."""
+    root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    real_unlink = replication.os.unlink
+
+    def crash_before_staging_cleanup(name: object, *args: object, **kwargs: object) -> object:
+        if isinstance(name, str) and name.endswith(".db.tmp"):
+            os._exit(77)
+        return real_unlink(name, *args, **kwargs)
+
+    replication.os.unlink = crash_before_staging_cleanup  # type: ignore[assignment]
+    try:
+        replication._install_fixed_at(root_fd, "00000000000000000001.db", payload)
+    finally:  # pragma: no cover - the injected crash exits before cleanup
+        os.close(root_fd)
+
+
 def _claim_sidecar_process(path: str, worker_id: str, queue: object) -> None:
     try:
         claim = ReplicationSidecarStore(Path(path)).claim_due(
@@ -725,10 +742,14 @@ def test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id(
     store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     first = _checkpoint_for_journal(
-        created_at="2026-09-09T00:00:01Z", source_published_at="2026-09-09T00:00:00Z"
+        publication_binding_sha256="c" * 64,
+        created_at="2026-09-09T00:00:01Z",
+        source_published_at="2026-09-09T00:00:00Z",
     )
     second = _checkpoint_for_journal(
-        created_at="2026-09-09T00:00:02Z", source_published_at="2026-09-09T00:00:01Z"
+        publication_binding_sha256="d" * 64,
+        created_at="2026-09-09T00:00:02Z",
+        source_published_at="2026-09-09T00:00:00Z",
     )
     # The helper above intentionally exercises the public journal import path;
     # records with equal publication time are ordered by checkpoint id.
@@ -740,6 +761,10 @@ def test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id(
     )
     assert result.intent_ids
     assert result.source_sequences == (1, 2)
+    ordered = sorted((first, second), key=lambda item: item.checkpoint_id)
+    assert tuple(
+        store.get_intent(intent_id).checkpoint_id for intent_id in result.intent_ids
+    ) == tuple(record.checkpoint_id for record in ordered)
     assert (
         store.import_journals(
             [first, second],
@@ -749,6 +774,52 @@ def test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id(
         ).intent_ids
         == result.intent_ids
     )
+
+
+def test_generic_transition_cannot_complete_replication_without_dedicated_proof(
+    tmp_path: Path,
+) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    intent = sidecar.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    claim = sidecar.claim_due(worker_id="worker-a", now="2026-09-09T00:01:00Z")
+    assert claim is not None
+    verifying = sidecar.transition(
+        intent_id=intent.intent_ids[0],
+        worker_id="worker-a",
+        expected_state_version=claim.state_version,
+        to_state="verifying",
+        now="2026-09-09T00:01:01Z",
+    )
+    before = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in sidecar.path.iterdir()
+        if path.is_file()
+    }
+    with pytest.raises(ReplicationDurabilityError, match="dedicated|proof"):
+        sidecar.transition(
+            intent_id=intent.intent_ids[0],
+            worker_id="worker-a",
+            expected_state_version=verifying.state_version,
+            to_state="replicated",
+            destination_replication_generation="2" * 64,
+            destination_record_sha256="3" * 64,
+            destination_head_sha256="4" * 64,
+            now="2026-09-09T00:01:02Z",
+        )
+    after = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in sidecar.path.iterdir()
+        if path.is_file()
+    }
+    assert after == before
+    assert sidecar.read_status().verifying_count == 1
 
 
 def test_concurrent_claim_uses_lease_and_state_version_cas(tmp_path: Path) -> None:
@@ -955,6 +1026,40 @@ def test_checkpoint_journal_import_is_sorted_idempotent_before_removal(tmp_path:
         == 0
     )
     assert len(list(sidecar.path.glob("[0-9]*.db"))) == generation_count
+
+
+def test_journal_import_uses_one_held_root_descriptor_across_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    journal_root = tmp_path / "control" / "replication-journal"
+    record = _checkpoint_for_journal()
+    record.install(journal_root)
+    old_root = journal_root.with_name("replication-journal-old")
+    real_listdir = replication.os.listdir
+    swapped = False
+
+    def replace_root_after_enumeration(value: object) -> object:
+        nonlocal swapped
+        names = real_listdir(value)  # type: ignore[arg-type]
+        if isinstance(value, int) and not swapped:
+            journal_root.rename(old_root)
+            journal_root.mkdir(mode=0o700)
+            swapped = True
+        return names
+
+    monkeypatch.setattr(replication.os, "listdir", replace_root_after_enumeration)
+    result = sidecar.import_journal_files(
+        journal_root,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:01:00Z",
+    )
+    assert result.imported_count == 1
+    assert swapped is True
+    assert list(old_root.iterdir()) == []
+    assert list(journal_root.iterdir()) == []
 
 
 def test_operation_day_is_scheduling_metadata_not_intent_identity(tmp_path: Path) -> None:
@@ -1540,6 +1645,110 @@ def test_sidecar_generation_status_is_zero_write_and_reads_highest_stable_genera
         "00000000000000000000.db",
         "00000000000000000001.db",
     ]
+
+
+def test_committed_generation_staging_hardlink_residue_is_ignored_read_only(
+    tmp_path: Path,
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    staging = root / ".staging"
+    staging.mkdir(exist_ok=True)
+    staging.chmod(0o700)
+    generation = _generation_files(root)[0]
+    residue = staging / ".00000000000000000000.db.tmp"
+    os.link(generation, residue)
+    before = {
+        path.name: (path.stat().st_ino, path.stat().st_nlink, path.read_bytes())
+        for path in (generation, residue)
+    }
+    assert store.read_status().reason_code == "NONE"
+    after = {
+        path.name: (path.stat().st_ino, path.stat().st_nlink, path.read_bytes())
+        for path in (generation, residue)
+    }
+    assert after == before
+
+
+def test_prelink_staging_orphan_blocks_status_then_writer_cleans_it(
+    tmp_path: Path,
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    staging = root / ".staging"
+    staging.mkdir(exist_ok=True)
+    staging.chmod(0o700)
+    orphan = staging / ".00000000000000000001.db.tmp"
+    orphan.write_bytes(b"pre-link orphan")
+    orphan.chmod(0o600)
+    with pytest.raises(ReplicationStateUnavailable, match="staging|temporary|namespace"):
+        store.read_status()
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert not orphan.exists()
+    assert store.read_status().reason_code == "NONE"
+
+
+def test_link_then_process_crash_leaves_proven_committed_staging_alias(
+    tmp_path: Path,
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_crash_after_generation_link_process, args=(str(root), payload)
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 77
+    assert _generation_files(root)[-1].read_bytes() == payload
+    assert store.read_status().reason_code == "NONE"
+
+
+def test_staging_unlink_failure_is_degraded_but_proven_alias_remains_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    session = replication._open_generation_writer_session(root)
+    real_unlink = replication.os.unlink
+
+    def fail_staging_unlink(name: object, *args: object, **kwargs: object) -> object:
+        if name == ".00000000000000000001.db.tmp":
+            raise OSError("injected staging cleanup failure")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(replication.os, "unlink", fail_staging_unlink)
+    try:
+        with pytest.raises(replication.ReplicationPostCommitConflict):
+            replication._install_generation(session, payload)
+    finally:
+        # The lock close is outside the injected staging unlink operation.
+        monkeypatch.setattr(replication.os, "unlink", real_unlink)
+        replication._close_generation_writer_session(session)
+    assert _generation_files(root)[-1].read_bytes() == payload
+    residue = root / ".staging" / ".00000000000000000001.db.tmp"
+    assert residue.read_bytes() == payload
+    assert store.read_status().reason_code == "NONE"
 
 
 def test_sidecar_generation_lock_replacement_is_fail_closed_before_publish(tmp_path: Path) -> None:
