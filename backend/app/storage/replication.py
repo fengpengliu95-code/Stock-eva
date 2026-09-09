@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -45,6 +46,14 @@ SOURCE_OBJECT_SET_DOMAIN: Literal["stock-eva/r2f4.3/object-set/v1"] = (
     "stock-eva/r2f4.3/object-set/v1"
 )
 JOURNAL_SCHEMA_VERSION = 1
+
+# The replication sidecar is an immutable generation log.  The former
+# ``replication.sqlite3`` file is deliberately not part of this namespace.
+SIDECAR_ROOT_NAME = "replication-sidecar"
+SIDECAR_LOCK_NAME = ".writer.lock"
+SIDECAR_GENESIS_NAME = "genesis.json"
+SIDECAR_GENERATION_WIDTH = 20
+SIDECAR_GENERATION_SUFFIX = ".db"
 
 ReplicationState = Literal["disabled", "ready", "degraded", "unavailable"]
 ReplicationReason = Literal[
@@ -84,6 +93,10 @@ class ReplicationDurabilityError(RuntimeError):
 
 class ReplicationStateUnavailable(ReplicationDurabilityError):
     """The local sidecar is missing, corrupt, or cannot be proven consistent."""
+
+
+class ReplicationCASConflict(ReplicationDurabilityError):
+    """A deterministic next generation already exists with no overwrite allowed."""
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -1566,119 +1579,7 @@ def _stat_fingerprint(
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, digest)
 
 
-def _stat_optional_nofollow(path: Path) -> os.stat_result | None:
-    """Stat an optional artifact without resolving any path component."""
-    path = _physical_path(path)
-    try:
-        _, descriptors = _open_directory_chain(path.parent)
-    except ReplicationDurabilityError:
-        if not path.parent.exists():
-            return None
-        raise
-    fd: int | None = None
-    try:
-        try:
-            fd = os.open(
-                path.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=descriptors[-1],
-            )
-        except FileNotFoundError:
-            return None
-        return os.fstat(fd)
-    except OSError as exc:
-        raise ReplicationDurabilityError("replication artifact stat failed") from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
-        _close_descriptors(descriptors)
-
-
-def _stat_optional_at(parent_fd: int, name: str) -> os.stat_result | None:
-    """Stat an optional basename relative to an already trusted directory fd."""
-    fd: int | None = None
-    try:
-        try:
-            fd = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
-            )
-        except FileNotFoundError:
-            return None
-        return os.fstat(fd)
-    except OSError as exc:
-        raise ReplicationDurabilityError("replication artifact stat failed") from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
-def _capture_sqlite_snapshot(
-    path: Path,
-) -> dict[
-    str,
-    tuple[Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None],
-]:
-    path = _physical_path(path)
-    try:
-        main_payload, main_stat = _read_nofollow(path)
-    except ReplicationDurabilityError as exc:
-        raise ReplicationStateUnavailable(
-            "replication sidecar source descriptor is unavailable"
-        ) from exc
-    snapshot: dict[
-        str,
-        tuple[
-            Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None
-        ],
-    ] = {"main": (path, main_payload, main_stat, _stat_fingerprint(main_stat, main_payload))}
-    for name, sidecar in (("wal", Path(f"{path}-wal")), ("shm", Path(f"{path}-shm"))):
-        try:
-            sidecar_stat = _stat_optional_nofollow(sidecar)
-        except ReplicationDurabilityError as exc:
-            raise ReplicationStateUnavailable(
-                "replication sidecar auxiliary descriptor is unavailable"
-            ) from exc
-        if sidecar_stat is not None:
-            raise ReplicationStateUnavailable(f"replication sidecar {name.upper()} is present")
-        snapshot[name] = (sidecar, None, None, None)
-    return snapshot
-
-
-def _assert_sqlite_snapshot_unchanged(
-    snapshot: dict[
-        str,
-        tuple[
-            Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None
-        ],
-    ],
-) -> None:
-    for name, (path, _payload, _prior_stat, prior_fingerprint) in snapshot.items():
-        if name == "main":
-            try:
-                current_payload, current_stat = _read_nofollow(path)
-            except ReplicationDurabilityError as exc:
-                raise ReplicationStateUnavailable(
-                    "replication sidecar changed during read"
-                ) from exc
-            current_fingerprint = _stat_fingerprint(current_stat, current_payload)
-        else:
-            try:
-                current_stat = _stat_optional_nofollow(path)
-            except ReplicationDurabilityError as exc:
-                raise ReplicationStateUnavailable(
-                    "replication sidecar changed during read"
-                ) from exc
-            current_fingerprint = _stat_fingerprint(current_stat)
-        if current_fingerprint != prior_fingerprint:
-            raise ReplicationStateUnavailable("replication sidecar changed during read")
-
-
 _SqliteFingerprint = tuple[int, int, int, int, str | None]
-_SqliteSnapshot = dict[
-    str, tuple[Path, bytes | None, os.stat_result | None, _SqliteFingerprint | None]
-]
 
 
 def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
@@ -1709,40 +1610,8 @@ def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
         ) from exc
 
 
-def _open_verified_sqlite_readonly(path: Path) -> tuple[sqlite3.Connection, _SqliteSnapshot]:
-    """Open a SELECT-only SQLite image without any filesystem database."""
-    snapshot = _capture_sqlite_snapshot(path)
-    main_payload = snapshot["main"][1]
-    if main_payload is None:
-        raise ReplicationStateUnavailable("replication sidecar source is empty")
-    connection = _deserialize_sqlite_bytes(main_payload)
-    try:
-        _assert_sqlite_snapshot_unchanged(snapshot)
-    except BaseException:
-        connection.close()
-        raise
-    return connection, snapshot
-
-
-@dataclass
-class _WriterSession:
-    path: Path
-    parent_fd: int
-    descriptors: list[int]
-    target_fd: int | None
-    payload: bytes | None
-    stat: os.stat_result | None
-    fingerprint: _SqliteFingerprint | None
-    lock_fd: int | None = None
-    lock_token: _WriterLockToken | None = None
-    auxiliary_fingerprints: tuple[_SqliteFingerprint | None, _SqliteFingerprint | None] = (
-        None,
-        None,
-    )
-
-
 class _WriterLockToken:
-    """Opaque proof that a sidecar writer owns its descriptor-bound lock."""
+    """Descriptor-bound proof for the fixed immutable-sidecar lock inode."""
 
     __slots__ = (
         "lock_dev",
@@ -1754,21 +1623,17 @@ class _WriterLockToken:
         "released",
     )
 
-    def __init__(self, info: os.stat_result, parent_info: os.stat_result) -> None:
-        self.lock_dev = info.st_dev
-        self.lock_ino = info.st_ino
-        self.lock_nlink = info.st_nlink
-        self.lock_mode = stat.S_IMODE(info.st_mode)
+    def __init__(self, lock_info: os.stat_result, parent_info: os.stat_result) -> None:
+        self.lock_dev = lock_info.st_dev
+        self.lock_ino = lock_info.st_ino
+        self.lock_nlink = lock_info.st_nlink
+        self.lock_mode = stat.S_IMODE(lock_info.st_mode)
         self.parent_dev = parent_info.st_dev
         self.parent_ino = parent_info.st_ino
         self.released = False
 
 
-_WRITER_LOCK_SUFFIX = ".lock"
-
-
 def _acquire_writer_lock(parent_fd: int, lock_name: str) -> tuple[int, _WriterLockToken]:
-    """Acquire the fixed sidecar writer lock through a trusted parent dirfd."""
     lock_fd: int | None = None
     try:
         lock_fd = os.open(
@@ -1830,45 +1695,26 @@ def _release_writer_lock(
 
 
 def _verify_writer_lock_entry(
-    parent_fd: int,
-    lock_name: str,
-    lock_fd: int,
-    token: _WriterLockToken,
+    parent_fd: int, lock_name: str, lock_fd: int, token: _WriterLockToken
 ) -> None:
-    """Prove the fixed lock basename still names the held inode."""
     entry_fd: int | None = None
     try:
         parent_info = os.fstat(parent_fd)
         if (parent_info.st_dev, parent_info.st_ino) != (token.parent_dev, token.parent_ino):
             raise ReplicationDurabilityError("replication writer parent descriptor changed")
-        held_info = os.fstat(lock_fd)
-        held_identity = (
-            held_info.st_dev,
-            held_info.st_ino,
-            held_info.st_nlink,
-            stat.S_IMODE(held_info.st_mode),
-        )
-        token_identity = (
-            token.lock_dev,
-            token.lock_ino,
-            token.lock_nlink,
-            token.lock_mode,
-        )
+        held = os.fstat(lock_fd)
+        held_identity = (held.st_dev, held.st_ino, held.st_nlink, stat.S_IMODE(held.st_mode))
+        token_identity = (token.lock_dev, token.lock_ino, token.lock_nlink, token.lock_mode)
         if held_identity != token_identity:
             raise ReplicationDurabilityError("replication writer lock identity changed")
-        entry_fd = os.open(
-            lock_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-        entry_info = os.fstat(entry_fd)
-        entry_identity = (
-            entry_info.st_dev,
-            entry_info.st_ino,
-            entry_info.st_nlink,
-            stat.S_IMODE(entry_info.st_mode),
-        )
-        if entry_identity != token_identity:
+        entry_fd = os.open(lock_name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        entry = os.fstat(entry_fd)
+        if (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_nlink,
+            stat.S_IMODE(entry.st_mode),
+        ) != token_identity:
             raise ReplicationDurabilityError("replication writer lock entry changed")
     except ReplicationDurabilityError:
         raise
@@ -1882,358 +1728,524 @@ def _verify_writer_lock_entry(
                 pass
 
 
-def _require_writer_lock(session: _WriterSession) -> None:
-    """Reject CAS helpers invoked without the opaque lock ownership proof."""
-    token = session.lock_token
-    if session.lock_fd is None or token is None:
-        raise ReplicationDurabilityError("replication writer lock token is missing")
-    if token.released:
-        raise ReplicationDurabilityError("replication writer lock token is released")
-    try:
-        info = os.fstat(session.lock_fd)
-        parent_info = os.fstat(session.parent_fd)
-        if (parent_info.st_dev, parent_info.st_ino) != (token.parent_dev, token.parent_ino):
-            raise ReplicationDurabilityError("replication writer parent descriptor changed")
-        if (
-            info.st_dev,
-            info.st_ino,
-            info.st_nlink,
-            stat.S_IMODE(info.st_mode),
-        ) != (
-            token.lock_dev,
-            token.lock_ino,
-            token.lock_nlink,
-            token.lock_mode,
-        ):
-            raise ReplicationDurabilityError("replication writer lock identity changed")
-        _verify_writer_lock_entry(
-            session.parent_fd,
-            f"{session.path.name}{_WRITER_LOCK_SUFFIX}",
-            session.lock_fd,
-            token,
-        )
-        # LOCK_NB is only a proof check: this descriptor already owns the
-        # exclusive lock, and the call never releases or replaces it.
-        fcntl.flock(session.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except ReplicationDurabilityError:
-        raise
-    except OSError as exc:
-        raise ReplicationDurabilityError("replication writer lock is not held") from exc
+# Batch1.6 replaces the mutable prototype above with an immutable generation
+# namespace.  These helpers intentionally use only a held sidecar dirfd for
+# authority; a generation is never opened for writing after installation.
+_GENERATION_RE = re.compile(r"^[0-9]{20}\.db$")
 
 
-def _open_writer_session(path: Path) -> _WriterSession:
-    """Open the fixed database basename through a trusted parent dirfd."""
-    path = _physical_path(path)
-    parent_fd, descriptors = _open_directory_chain(path.parent, create=True)
-    target_fd: int | None = None
-    lock_fd: int | None = None
-    lock_token: _WriterLockToken | None = None
+def _sidecar_root(path: Path) -> Path:
+    path = _physical_path(Path(path))
+    if not path.is_absolute():
+        raise ReplicationDurabilityError("replication sidecar root must be absolute")
+    return path
+
+
+def _generation_filename(sequence: int) -> str:
+    if sequence < 0 or sequence >= 10**SIDECAR_GENERATION_WIDTH:
+        raise ReplicationDurabilityError("replication generation sequence is invalid")
+    return f"{sequence:0{SIDECAR_GENERATION_WIDTH}d}{SIDECAR_GENERATION_SUFFIX}"
+
+
+def _generation_lock_identity(info: os.stat_result) -> dict[str, int]:
+    return {
+        "lock_dev": int(info.st_dev),
+        "lock_ino": int(info.st_ino),
+        "lock_nlink": int(info.st_nlink),
+        "lock_mode": int(stat.S_IMODE(info.st_mode)),
+    }
+
+
+def _genesis_preimage(values: Mapping[str, object]) -> dict[str, object]:
+    return {key: values[key] for key in values if key != "genesis_sha256"}
+
+
+def _build_genesis(
+    *,
+    source_instance_id: str,
+    source_instance_sha256: str,
+    lock_info: os.stat_result,
+    created_at: str,
+) -> dict[str, object]:
+    _validate_sha(source_instance_id, "source_instance_id")
+    _validate_sha(source_instance_sha256, "source_instance_sha256")
+    _validate_utc_timestamp(created_at, "created_at")
+    values: dict[str, object] = {
+        "genesis_schema": "stock-eva/r2f4.3/replication-sidecar-genesis/v1",
+        "schema_version": 1,
+        "sidecar_schema_identity": SIDECAR_SCHEMA_IDENTITY,
+        "sidecar_schema_digest": SIDECAR_SCHEMA_DIGEST,
+        "source_instance_id": source_instance_id,
+        "source_instance_sha256": source_instance_sha256,
+        "lock_dev": int(lock_info.st_dev),
+        "lock_ino": int(lock_info.st_ino),
+        "lock_nlink": int(lock_info.st_nlink),
+        "lock_mode": int(stat.S_IMODE(lock_info.st_mode)),
+        "created_at": created_at,
+    }
+    values["genesis_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/replication-sidecar-genesis/v1", _genesis_preimage(values)
+    )
+    return values
+
+
+def _validate_genesis(payload: bytes) -> dict[str, object]:
     try:
-        lock_fd, lock_token = _acquire_writer_lock(parent_fd, f"{path.name}{_WRITER_LOCK_SUFFIX}")
-        _verify_writer_lock_entry(
-            parent_fd,
-            f"{path.name}{_WRITER_LOCK_SUFFIX}",
-            lock_fd,
-            lock_token,
-        )
-        auxiliary_fingerprints: list[_SqliteFingerprint | None] = []
-        for suffix in ("-wal", "-shm"):
-            try:
-                auxiliary_stat = _stat_optional_at(parent_fd, f"{path.name}{suffix}")
-            except ReplicationDurabilityError as exc:
-                raise ReplicationStateUnavailable(
-                    f"replication sidecar {suffix[1:].upper()} is unavailable"
-                ) from exc
-            if auxiliary_stat is not None:
-                raise ReplicationStateUnavailable(
-                    f"replication sidecar {suffix[1:].upper()} is present"
-                )
-            auxiliary_fingerprints.append(_stat_fingerprint(auxiliary_stat))
+        value = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplicationStateUnavailable("replication sidecar genesis is invalid") from exc
+    expected = {
+        "genesis_schema",
+        "schema_version",
+        "sidecar_schema_identity",
+        "sidecar_schema_digest",
+        "source_instance_id",
+        "source_instance_sha256",
+        "lock_dev",
+        "lock_ino",
+        "lock_nlink",
+        "lock_mode",
+        "created_at",
+        "genesis_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ReplicationStateUnavailable("replication sidecar genesis fields are invalid")
+    if (
+        value["genesis_schema"] != "stock-eva/r2f4.3/replication-sidecar-genesis/v1"
+        or value["schema_version"] != 1
+        or value["sidecar_schema_identity"] != SIDECAR_SCHEMA_IDENTITY
+        or value["sidecar_schema_digest"] != SIDECAR_SCHEMA_DIGEST
+    ):
+        raise ReplicationStateUnavailable("replication sidecar genesis identity is invalid")
+    for field in ("source_instance_id", "source_instance_sha256", "sidecar_schema_digest"):
         try:
-            target_fd = os.open(
-                path.name,
-                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
+            _validate_sha(value[field], field)
+        except (TypeError, ValueError) as exc:
+            raise ReplicationStateUnavailable(
+                "replication sidecar genesis digest is invalid"
+            ) from exc
+    for field in ("lock_dev", "lock_ino", "lock_nlink"):
+        if not isinstance(value[field], int) or value[field] <= 0:
+            raise ReplicationStateUnavailable(
+                "replication sidecar genesis lock identity is invalid"
             )
-        except FileNotFoundError:
-            if lock_token is None or lock_fd is None:
-                raise ReplicationDurabilityError("replication writer lock is unavailable") from None
-            return _WriterSession(
-                path,
-                parent_fd,
-                descriptors,
-                None,
-                None,
-                None,
-                None,
-                lock_fd,
-                lock_token,
-                tuple(auxiliary_fingerprints),
-            )
-        payload, info = _read_descriptor(target_fd)
-        fingerprint = _stat_fingerprint(info, payload)
-        _verify_writer_lock_entry(
-            parent_fd,
-            f"{path.name}{_WRITER_LOCK_SUFFIX}",
-            lock_fd,
-            lock_token,
-        )
-        if lock_token is None or lock_fd is None:
-            raise ReplicationDurabilityError("replication writer lock is unavailable")
-        return _WriterSession(
-            path,
-            parent_fd,
-            descriptors,
-            target_fd,
-            payload,
-            info,
-            fingerprint,
-            lock_fd,
-            lock_token,
-            tuple(auxiliary_fingerprints),
-        )
-    except BaseException:
-        if target_fd is not None:
-            try:
-                os.close(target_fd)
-            except OSError:
-                pass
-        if lock_fd is not None and lock_token is not None:
-            _release_writer_lock(lock_fd, lock_token)
-        _close_descriptors(descriptors)
-        raise
+    if value["lock_mode"] != 0o600:
+        raise ReplicationStateUnavailable("replication sidecar genesis lock mode is invalid")
+    try:
+        _validate_utc_timestamp(value["created_at"], "created_at")
+        _validate_sha(value["genesis_sha256"], "genesis_sha256")
+    except (TypeError, ValueError) as exc:
+        raise ReplicationStateUnavailable("replication sidecar genesis digest is invalid") from exc
+    if (
+        domain_sha256("stock-eva/r2f4.3/replication-sidecar-genesis/v1", _genesis_preimage(value))
+        != value["genesis_sha256"]
+    ):
+        raise ReplicationStateUnavailable("replication sidecar genesis hash is invalid")
+    if canonical_json_bytes(value) != payload:
+        raise ReplicationStateUnavailable("replication sidecar genesis is not canonical")
+    return value
 
 
-def _close_writer_session(session: _WriterSession) -> None:
-    failures: list[str] = []
-    if session.target_fd is not None:
-        _close_fd_best_effort(session.target_fd, "target_fd", failures)
-    if session.lock_fd is not None and session.lock_token is not None:
-        _release_writer_lock(session.lock_fd, session.lock_token, failures)
-    descriptor_failures = _close_descriptors(session.descriptors)
-    if descriptor_failures:
-        failures.extend(descriptor_failures)
-    if failures:
-        raise _cleanup_error(failures)
-
-
-def _read_writer_target(session: _WriterSession) -> tuple[bytes, os.stat_result]:
-    """Read the current fixed basename through the already-open parent dirfd."""
+def _read_at(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
     fd: int | None = None
     try:
-        fd = os.open(
-            session.path.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=session.parent_fd,
-        )
+        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
         return _read_descriptor(fd)
     except FileNotFoundError as exc:
-        raise ReplicationDurabilityError("replication sidecar target disappeared") from exc
+        raise ReplicationStateUnavailable("replication sidecar entry disappeared") from exc
     except OSError as exc:
-        raise ReplicationDurabilityError("replication sidecar target is unsafe") from exc
+        raise ReplicationStateUnavailable("replication sidecar entry is unsafe") from exc
     finally:
         if fd is not None:
             os.close(fd)
 
 
-def _assert_writer_auxiliary_stable(session: _WriterSession, *, phase: str) -> None:
-    """Require WAL/SHM to remain absent for the whole writer operation."""
-    _require_writer_lock(session)
-    for suffix, prior_fingerprint in zip(
-        ("-wal", "-shm"), session.auxiliary_fingerprints, strict=True
-    ):
-        try:
-            current_stat = _stat_optional_at(session.parent_fd, f"{session.path.name}{suffix}")
-        except ReplicationDurabilityError as exc:
-            raise ReplicationStateUnavailable(
-                f"replication sidecar auxiliary state is unavailable during {phase}"
-            ) from exc
-        current_fingerprint = _stat_fingerprint(current_stat)
-        if current_fingerprint != prior_fingerprint:
-            raise ReplicationStateUnavailable(
-                f"replication sidecar auxiliary state changed during {phase}"
-            )
+@dataclass(frozen=True)
+class _GenerationEntry:
+    sequence: int
+    name: str
+    payload: bytes
+    stat: os.stat_result
+    fingerprint: _SqliteFingerprint
 
 
-def _assert_writer_session_stable(session: _WriterSession) -> None:
-    """CAS-check both the held inode and the fixed directory entry."""
-    _require_writer_lock(session)
-    _assert_writer_auxiliary_stable(session, phase="pre-install")
-    if session.fingerprint is None:
-        try:
-            _read_writer_target(session)
-        except ReplicationDurabilityError as exc:
-            if "disappeared" in str(exc):
-                return
+def _scan_generation_namespace(
+    root_fd: int, *, require_genesis: bool = True, ignore_name: str | None = None
+) -> tuple[
+    dict[str, object] | None, bytes | None, _GenerationEntry | None, tuple[_GenerationEntry, ...]
+]:
+    try:
+        names = os.listdir(root_fd)
+    except OSError as exc:
+        raise ReplicationStateUnavailable("replication sidecar namespace is unavailable") from exc
+    allowed = {SIDECAR_LOCK_NAME, SIDECAR_GENESIS_NAME}
+    generations: list[tuple[int, str]] = []
+    for name in names:
+        if ignore_name is not None and name == ignore_name:
+            continue
+        if name in allowed:
+            continue
+        if _GENERATION_RE.fullmatch(name):
+            generations.append((int(name[:SIDECAR_GENERATION_WIDTH]), name))
+            continue
+        raise ReplicationStateUnavailable("replication sidecar namespace contains unknown entry")
+    generations.sort()
+    if [sequence for sequence, _name in generations] != list(range(len(generations))):
+        raise ReplicationStateUnavailable("replication sidecar generation chain has a gap")
+    genesis: dict[str, object] | None = None
+    genesis_payload: bytes | None = None
+    try:
+        genesis_payload, genesis_stat = _read_at(root_fd, SIDECAR_GENESIS_NAME)
+    except ReplicationStateUnavailable:
+        if require_genesis or generations:
             raise
-        raise ReplicationDurabilityError("replication sidecar target appeared during write")
-    try:
-        current_payload, current_stat = _read_writer_target(session)
-    except ReplicationDurabilityError as exc:
-        raise ReplicationDurabilityError(
-            "replication sidecar identity changed during write"
-        ) from exc
-    current_fingerprint = _stat_fingerprint(current_stat, current_payload)
-    if current_fingerprint != session.fingerprint:
-        raise ReplicationDurabilityError("replication sidecar identity changed during write")
-    if session.target_fd is None:
-        raise ReplicationDurabilityError("replication sidecar descriptor is unavailable")
-    held_payload, held_stat = _read_descriptor(session.target_fd)
-    if _stat_fingerprint(held_stat, held_payload) != session.fingerprint:
-        raise ReplicationDurabilityError("replication sidecar descriptor changed during write")
+    else:
+        if stat.S_IMODE(genesis_stat.st_mode) != 0o600 or genesis_stat.st_nlink != 1:
+            raise ReplicationStateUnavailable("replication sidecar genesis mode is unsafe")
+        genesis = _validate_genesis(genesis_payload)
+    entries: list[_GenerationEntry] = []
+    for sequence, name in generations:
+        payload, info = _read_at(root_fd, name)
+        fingerprint = _stat_fingerprint(info, payload)
+        if fingerprint is None or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+            raise ReplicationStateUnavailable("replication sidecar generation is unsafe")
+        entries.append(_GenerationEntry(sequence, name, payload, info, fingerprint))
+    return genesis, genesis_payload, entries[-1] if entries else None, tuple(entries)
 
 
-def _install_memory_snapshot(session: _WriterSession, payload: bytes) -> None:
-    """Persist a private image using the held parent dirfd and a CAS."""
-    _require_writer_lock(session)
-    _assert_writer_session_stable(session)
-    temporary_name = f".{session.path.name}.{uuid.uuid4().hex}.tmp"
-    temporary_fd: int | None = None
-    primary_error: BaseException | None = None
+def _validate_generation_chain(
+    entries: tuple[_GenerationEntry, ...], genesis: Mapping[str, object]
+) -> None:
+    """Validate every immutable image, not only the highest filename."""
+    for entry in entries:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = _deserialize_sqlite_bytes(entry.payload)
+            _validate_sqlite_schema(connection)
+            meta = connection.execute(
+                """SELECT schema_version, schema_identity, ddl_sha256, schema_digest,
+                          source_instance_id, source_instance_sha256, created_at
+                     FROM replication_sidecar_meta"""
+            ).fetchall()
+            if (
+                len(meta) != 1
+                or meta[0][:4]
+                != (1, SIDECAR_SCHEMA_IDENTITY, SIDECAR_DDL_SHA256, SIDECAR_SCHEMA_DIGEST)
+                or meta[0][4] != genesis["source_instance_id"]
+                or meta[0][5] != genesis["source_instance_sha256"]
+            ):
+                raise ReplicationStateUnavailable("replication generation identity is invalid")
+            _validate_utc_timestamp(meta[0][6], "created_at")
+            _validate_event_reachability(
+                connection,
+                expected_source_instance_id=genesis["source_instance_id"],
+                expected_source_instance_sha256=genesis["source_instance_sha256"],
+            )
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            if isinstance(exc, ReplicationStateUnavailable):
+                raise
+            raise ReplicationStateUnavailable("replication generation is invalid") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def _validate_generation_payload(payload: bytes, genesis: Mapping[str, object]) -> None:
+    """Validate a candidate image before it can enter the immutable chain."""
+    connection: sqlite3.Connection | None = None
     try:
-        temporary_fd = os.open(
-            temporary_name,
+        connection = _deserialize_sqlite_bytes(payload)
+        _validate_sqlite_schema(connection)
+        meta = connection.execute(
+            """SELECT schema_version, schema_identity, ddl_sha256, schema_digest,
+                      source_instance_id, source_instance_sha256, created_at
+                 FROM replication_sidecar_meta"""
+        ).fetchall()
+        if (
+            len(meta) != 1
+            or meta[0][:4]
+            != (
+                1,
+                SIDECAR_SCHEMA_IDENTITY,
+                SIDECAR_DDL_SHA256,
+                SIDECAR_SCHEMA_DIGEST,
+            )
+            or meta[0][4] != genesis["source_instance_id"]
+            or meta[0][5] != genesis["source_instance_sha256"]
+        ):
+            raise ReplicationStateUnavailable("replication generation identity is invalid")
+        _validate_utc_timestamp(meta[0][6], "created_at")
+        _validate_event_reachability(
+            connection,
+            expected_source_instance_id=genesis["source_instance_id"],
+            expected_source_instance_sha256=genesis["source_instance_sha256"],
+        )
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, ReplicationStateUnavailable):
+            raise
+        raise ReplicationStateUnavailable("replication generation is invalid") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _compare_generation_snapshot(
+    root_fd: int,
+    *,
+    genesis_payload: bytes,
+    entries: tuple[_GenerationEntry, ...],
+    ignore_name: str | None = None,
+) -> None:
+    current_genesis, current_genesis_payload, _latest, current_entries = _scan_generation_namespace(
+        root_fd, ignore_name=ignore_name
+    )
+    if current_genesis_payload != genesis_payload or tuple(
+        (entry.sequence, entry.name, entry.fingerprint) for entry in current_entries
+    ) != tuple((entry.sequence, entry.name, entry.fingerprint) for entry in entries):
+        raise ReplicationStateUnavailable("replication sidecar generation changed during read")
+    if current_genesis is None:
+        raise ReplicationStateUnavailable("replication sidecar genesis is unavailable")
+    _validate_generation_chain(current_entries, current_genesis)
+    _lock_payload, lock_info = _read_at(root_fd, SIDECAR_LOCK_NAME)
+    if _generation_lock_identity(lock_info) != {
+        key: current_genesis[key] for key in ("lock_dev", "lock_ino", "lock_nlink", "lock_mode")
+    }:
+        raise ReplicationStateUnavailable("replication sidecar lock authority changed")
+
+
+def _assert_generation_lock(session: _GenerationWriterSession) -> None:
+    if session.lock_fd is None or session.lock_token is None or session.lock_token.released:
+        raise ReplicationDurabilityError("replication writer lock token is missing")
+    _verify_writer_lock_entry(
+        session.root_fd, SIDECAR_LOCK_NAME, session.lock_fd, session.lock_token
+    )
+    if session.genesis is not None:
+        info = os.fstat(session.lock_fd)
+        if _generation_lock_identity(info) != {
+            key: session.genesis[key] for key in ("lock_dev", "lock_ino", "lock_nlink", "lock_mode")
+        }:
+            raise ReplicationDurabilityError("replication writer lock authority changed")
+
+
+@dataclass
+class _GenerationWriterSession:
+    path: Path
+    root_fd: int
+    descriptors: list[int]
+    lock_fd: int
+    lock_token: _WriterLockToken
+    genesis: dict[str, object] | None
+    genesis_payload: bytes | None
+    entries: tuple[_GenerationEntry, ...]
+
+    @property
+    def latest_sequence(self) -> int:
+        return self.entries[-1].sequence if self.entries else -1
+
+
+def _open_generation_writer_session(path: Path) -> _GenerationWriterSession:
+    root = _sidecar_root(path)
+    root_fd, descriptors = _open_directory_chain(root, create=True)
+    lock_fd: int | None = None
+    token: _WriterLockToken | None = None
+    try:
+        lock_fd, token = _acquire_writer_lock(root_fd, SIDECAR_LOCK_NAME)
+        # Scan while the lock is held.  Unknown/WAL/SHM entries are never
+        # ignored, including on an otherwise empty sidecar.
+        genesis, genesis_payload, _latest, entries = _scan_generation_namespace(
+            root_fd, require_genesis=False
+        )
+        session = _GenerationWriterSession(
+            root, root_fd, descriptors, lock_fd, token, genesis, genesis_payload, entries
+        )
+        _assert_generation_lock(session)
+        return session
+    except BaseException:
+        failures: list[str] = []
+        if lock_fd is not None and token is not None:
+            _release_writer_lock(lock_fd, token, failures)
+        _close_descriptors(descriptors, failures)
+        if failures:
+            raise _cleanup_error(failures) from None
+        raise
+
+
+def _close_generation_writer_session(session: _GenerationWriterSession) -> None:
+    failures: list[str] = []
+    if session.lock_fd is not None:
+        _release_writer_lock(session.lock_fd, session.lock_token, failures)
+    _close_descriptors(session.descriptors, failures)
+    if failures:
+        raise _cleanup_error(failures)
+
+
+def _install_fixed_at(
+    root_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    before_install: object | None = None,
+) -> None:
+    """Install one immutable basename without overwrite."""
+    temp = f".{name}.{uuid.uuid4().hex}.tmp"
+    temp_fd: int | None = None
+    primary: BaseException | None = None
+    failures: list[str] = []
+    try:
+        temp_fd = os.open(
+            temp,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
-            dir_fd=session.parent_fd,
+            dir_fd=root_fd,
         )
-        _write_fully(temporary_fd, payload)
-        os.fsync(temporary_fd)
-        os.close(temporary_fd)
-        temporary_fd = None
-        _assert_writer_session_stable(session)
-        if session.fingerprint is None:
-            try:
-                os.link(
-                    temporary_name,
-                    session.path.name,
-                    src_dir_fd=session.parent_fd,
-                    dst_dir_fd=session.parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                existing, _ = _read_writer_target(session)
-                if existing != payload:
-                    raise ReplicationDurabilityError(
-                        "replication sidecar target appeared with different bytes"
-                    ) from exc
-        elif session.payload == b"":
-            os.replace(
-                temporary_name,
-                session.path.name,
-                src_dir_fd=session.parent_fd,
-                dst_dir_fd=session.parent_fd,
-            )
-        else:
-            raise ReplicationDurabilityError("replication sidecar is already initialized")
-        # The atomic install is the visibility point.  Re-prove lock
-        # authority and auxiliary absence before reading the new target; if a
-        # WAL/SHM appeared now, the new image remains visible but the
-        # operation is degraded and must not overwrite it.
-        _require_writer_lock(session)
-        _assert_writer_auxiliary_stable(session, phase="post-install")
-        final_payload, final_stat = _read_writer_target(session)
-        if final_payload != payload:
-            raise ReplicationDurabilityError("replication sidecar install readback mismatch")
-        installed_fingerprint = _stat_fingerprint(final_stat, final_payload)
-        _require_writer_lock(session)
-        _assert_writer_auxiliary_stable(session, phase="final-readback")
-        _fsync_open_directory(session.parent_fd)
-        _require_writer_lock(session)
-        _assert_writer_auxiliary_stable(session, phase="post-fsync")
-        persisted_payload, persisted_stat = _read_writer_target(session)
-        if _stat_fingerprint(persisted_stat, persisted_payload) != installed_fingerprint:
-            raise ReplicationStateUnavailable("replication sidecar changed after parent fsync")
+        _write_fully(temp_fd, payload)
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = None
+        if before_install is not None:
+            before_install(temp)
+        try:
+            os.link(temp, name, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ReplicationCASConflict("replication generation CAS conflict") from exc
+        os.unlink(temp, dir_fd=root_fd)
+        temp = ""
+        _fsync_open_directory(root_fd)
     except BaseException as exc:
-        primary_error = exc
+        primary = exc
         raise
     finally:
-        cleanup_failures: list[str] = []
-        if temporary_fd is not None:
-            _close_fd_best_effort(temporary_fd, "temporary_fd", cleanup_failures)
-        try:
-            os.unlink(temporary_name, dir_fd=session.parent_fd)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            cleanup_failures.append("temporary_unlink")
-        if cleanup_failures:
-            error = _cleanup_error(cleanup_failures)
-            if primary_error is not None:
-                primary_error.add_note("replication_cleanup=failed")
+        if temp_fd is not None:
+            _close_fd_best_effort(temp_fd, "generation_temp_fd", failures)
+        if temp:
+            try:
+                os.unlink(temp, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                failures.append("generation_temp_unlink")
+        if failures:
+            error = _cleanup_error(failures)
+            if primary is not None:
+                primary.add_note("replication_cleanup=failed")
             else:
                 raise error
 
 
-class ReplicationSidecarStore:
+def _generation_payload(
+    source_instance_id: str, source_instance_sha256: str, created_at: str
+) -> bytes:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SIDECAR_DDL)
+        connection.execute(
+            """INSERT INTO replication_sidecar_meta
+               (sidecar_id, schema_version, schema_identity, ddl_sha256, schema_digest,
+                source_instance_id, source_instance_sha256, created_at)
+               VALUES (1, 1, ?, ?, ?, ?, ?, ?)""",
+            (
+                SIDECAR_SCHEMA_IDENTITY,
+                SIDECAR_DDL_SHA256,
+                SIDECAR_SCHEMA_DIGEST,
+                source_instance_id,
+                source_instance_sha256,
+                created_at,
+            ),
+        )
+        connection.commit()
+        return connection.serialize(name="main")
+    finally:
+        connection.close()
+
+
+def _install_generation(session: _GenerationWriterSession, payload: bytes) -> None:
+    _assert_generation_lock(session)
+    if session.genesis_payload is None or session.genesis is None:
+        raise ReplicationDurabilityError("replication sidecar genesis is unavailable")
+    _validate_generation_payload(payload, session.genesis)
+    _compare_generation_snapshot(
+        session.root_fd, genesis_payload=session.genesis_payload, entries=session.entries
+    )
+    sequence = session.latest_sequence + 1
+    name = _generation_filename(sequence)
+    _install_fixed_at(
+        session.root_fd,
+        name,
+        payload,
+        before_install=lambda temporary_name: (
+            _assert_generation_lock(session),
+            _compare_generation_snapshot(
+                session.root_fd,
+                genesis_payload=session.genesis_payload or b"",
+                entries=session.entries,
+                ignore_name=temporary_name,
+            ),
+        ),
+    )
+    # The installed generation is already immutable.  Re-read it and prove
+    # the lock and complete namespace before reporting success.
+    _assert_generation_lock(session)
+    _genesis, genesis_payload, _latest, entries = _scan_generation_namespace(session.root_fd)
+    if genesis_payload != session.genesis_payload or entries[-1].payload != payload:
+        raise ReplicationStateUnavailable("replication generation install readback mismatch")
+    session.entries = entries
+
+
+def _open_generation_readonly(
+    path: Path,
+) -> tuple[sqlite3.Connection, int, bytes, tuple[_GenerationEntry, ...]]:
+    root = _sidecar_root(path)
+    root_fd, descriptors = _open_directory_chain(root, create=False)
+    try:
+        genesis, genesis_payload, latest, entries = _scan_generation_namespace(root_fd)
+        if genesis is None or genesis_payload is None or latest is None:
+            raise ReplicationStateUnavailable("replication sidecar genesis is unavailable")
+        lock_payload, lock_info = _read_at(root_fd, SIDECAR_LOCK_NAME)
+        del lock_payload
+        if _generation_lock_identity(lock_info) != {
+            key: genesis[key] for key in ("lock_dev", "lock_ino", "lock_nlink", "lock_mode")
+        }:
+            raise ReplicationStateUnavailable("replication sidecar lock authority changed")
+        connection = _deserialize_sqlite_bytes(latest.payload)
+        try:
+            _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
+        except BaseException:
+            connection.close()
+            raise
+        # The root descriptor is the authority for the remainder of this
+        # read.  Ancestor descriptors have already been checked and can be
+        # closed without reopening the path.
+        ancestor_failures = _close_descriptors(descriptors[:-1])
+        if ancestor_failures:
+            connection.close()
+            _close_fd_best_effort(root_fd, "sidecar_root_fd", ancestor_failures)
+            raise _cleanup_error(ancestor_failures)
+        return connection, root_fd, genesis_payload, entries
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
+
+
+def _close_readonly_generation(root_fd: int, connection: sqlite3.Connection) -> None:
+    failures: list[str] = []
+    _close_connection_best_effort(connection, failures)
+    _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
+    if failures:
+        raise _cleanup_error(failures)
+
+
+class ImmutableReplicationSidecarStore:
     def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+        self.path = _sidecar_root(path)
 
     @staticmethod
     def _connect_writer(path: Path) -> sqlite3.Connection:
-        """Compatibility probe returning an unpersisted descriptor-native image."""
-        session = _open_writer_session(path)
-        connection: sqlite3.Connection | None = None
-        connection_closed = False
-        primary_error: BaseException | None = None
+        connection, root_fd, _genesis, _entries = _open_generation_readonly(path)
         try:
-            connection = (
-                _deserialize_sqlite_bytes(session.payload)
-                if session.payload
-                else sqlite3.connect(":memory:")
-            )
-            _assert_writer_session_stable(session)
+            connection.execute("PRAGMA query_only = ON")
             return connection
-        except ReplicationStateUnavailable as exc:
-            primary_error = exc
-            if connection is not None:
-                failures: list[str] = []
-                _close_connection_best_effort(connection, failures)
-                connection_closed = True
-                if failures:
-                    primary_error.add_note("replication_cleanup=failed")
-            raise
-        except ReplicationDurabilityError as exc:
-            primary_error = exc
-            if connection is not None:
-                failures = []
-                _close_connection_best_effort(connection, failures)
-                connection_closed = True
-                if failures:
-                    primary_error.add_note("replication_cleanup=failed")
-            raise
-        except (OSError, sqlite3.Error) as exc:
-            primary_error = ReplicationDurabilityError("replication sidecar is not writable")
-            if connection is not None:
-                failures = []
-                _close_connection_best_effort(connection, failures)
-                connection_closed = True
-                if failures:
-                    primary_error.add_note("replication_cleanup=failed")
-            raise primary_error from exc
-        except BaseException as exc:
-            primary_error = exc
-            if connection is not None:
-                failures = []
-                _close_connection_best_effort(connection, failures)
-                connection_closed = True
-                if failures:
-                    primary_error.add_note("replication_cleanup=failed")
-            raise
         finally:
-            cleanup_failures: list[str] = []
-            try:
-                _close_writer_session(session)
-            except ReplicationDurabilityError:
-                cleanup_failures.append("writer_session")
-            if cleanup_failures:
-                if connection is not None and not connection_closed:
-                    _close_connection_best_effort(connection, cleanup_failures)
-                    connection_closed = True
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _close_fd_best_effort(root_fd, "sidecar_root_fd", [])
 
     def initialize(
         self,
@@ -2244,24 +2256,46 @@ class ReplicationSidecarStore:
     ) -> None:
         _validate_sha(source_instance_id, "source_instance_id")
         _validate_sha(source_instance_sha256, "source_instance_sha256")
-        session = _open_writer_session(self.path)
+        session = _open_generation_writer_session(self.path)
         connection: sqlite3.Connection | None = None
-        primary_error: BaseException | None = None
+        primary: BaseException | None = None
         try:
-            if session.payload:
-                connection = _deserialize_sqlite_bytes(session.payload)
+            now = created_at or _utc_now()
+            if session.genesis is None:
+                if session.entries:
+                    raise ReplicationStateUnavailable("replication sidecar genesis is missing")
+                genesis = _build_genesis(
+                    source_instance_id=source_instance_id,
+                    source_instance_sha256=source_instance_sha256,
+                    lock_info=os.fstat(session.lock_fd),
+                    created_at=now,
+                )
+                _install_fixed_at(
+                    session.root_fd, SIDECAR_GENESIS_NAME, canonical_json_bytes(genesis)
+                )
+                session.genesis = genesis
+                session.genesis_payload = canonical_json_bytes(genesis)
+            elif (
+                session.genesis["source_instance_id"] != source_instance_id
+                or session.genesis["source_instance_sha256"] != source_instance_sha256
+            ):
+                raise ReplicationDurabilityError("replication sidecar source identity conflicts")
+            if session.entries:
+                connection = _deserialize_sqlite_bytes(session.entries[-1].payload)
                 connection.execute("PRAGMA query_only = ON")
                 meta = connection.execute(
-                    """SELECT source_instance_id, source_instance_sha256
-                         FROM replication_sidecar_meta"""
+                    "SELECT source_instance_id, source_instance_sha256 FROM replication_sidecar_meta"
                 ).fetchall()
-                _assert_writer_session_stable(session)
+                _validate_sqlite_schema(connection)
                 if meta != [(source_instance_id, source_instance_sha256)]:
                     raise ReplicationDurabilityError(
                         "replication sidecar source identity conflicts"
                     )
-                # Existing sidecars are never migrated by initialization.
-                self.read_status()
+                _compare_generation_snapshot(
+                    session.root_fd,
+                    genesis_payload=session.genesis_payload or b"",
+                    entries=session.entries,
+                )
                 return
             connection = sqlite3.connect(":memory:")
             connection.executescript(SIDECAR_DDL)
@@ -2276,41 +2310,33 @@ class ReplicationSidecarStore:
                     SIDECAR_SCHEMA_DIGEST,
                     source_instance_id,
                     source_instance_sha256,
-                    created_at or _utc_now(),
+                    now,
                 ),
             )
             connection.commit()
-            payload = connection.serialize(name="main")
-            _install_memory_snapshot(session, payload)
-        except ReplicationDurabilityError as exc:
-            primary_error = exc
-            raise
-        except (OSError, sqlite3.Error) as exc:
-            primary_error = ReplicationDurabilityError("replication sidecar initialization failed")
-            if connection is not None:
-                connection.rollback()
-            raise primary_error from exc
+            _install_generation(session, connection.serialize(name="main"))
+        except (sqlite3.Error, OSError) as exc:
+            primary = ReplicationDurabilityError("replication sidecar initialization failed")
+            raise primary from exc
         except BaseException as exc:
-            primary_error = exc
+            primary = exc
             raise
         finally:
-            cleanup_failures: list[str] = []
+            failures: list[str] = []
             if connection is not None:
-                _close_connection_best_effort(connection, cleanup_failures)
+                _close_connection_best_effort(connection, failures)
             try:
-                _close_writer_session(session)
+                _close_generation_writer_session(session)
             except ReplicationDurabilityError:
-                cleanup_failures.append("writer_session")
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
+                failures.append("writer_session")
+            if failures:
+                if primary is not None:
+                    primary.add_note("replication_cleanup=failed")
                 else:
-                    raise _cleanup_error(cleanup_failures)
+                    raise _cleanup_error(failures)
 
     def _fsync_database(self) -> None:
-        database_path = _physical_path(self.path)
-        _fsync_nofollow(database_path)
-        _fsync_directory(database_path.parent)
+        _fsync_directory(self.path)
 
     def read_status(
         self,
@@ -2319,9 +2345,12 @@ class ReplicationSidecarStore:
         source_instance: SourceInstanceRecord | None = None,
     ) -> ReplicationStatusResponse:
         connection: sqlite3.Connection | None = None
-        snapshot: _SqliteSnapshot | None = None
+        root_fd: int | None = None
+        counts: dict[str, int] = {}
+        replicated: tuple[object, ...] | None = None
+        row: tuple[object, ...] | None = None
         try:
-            connection, snapshot = _open_verified_sqlite_readonly(self.path)
+            connection, root_fd, genesis_payload, entries = _open_generation_readonly(self.path)
             connection.execute("PRAGMA query_only = ON")
             _validate_sqlite_schema(connection)
             meta = connection.execute(
@@ -2338,12 +2367,7 @@ class ReplicationSidecarStore:
                 raise ReplicationStateUnavailable("replication sidecar identity is invalid")
             _validate_sha(meta[0][4], "source_instance_id")
             _validate_sha(meta[0][5], "source_instance_sha256")
-            try:
-                _validate_utc_timestamp(meta[0][6], "created_at")
-            except (TypeError, ValueError) as exc:
-                raise ReplicationStateUnavailable(
-                    "replication sidecar timestamp is invalid"
-                ) from exc
+            _validate_utc_timestamp(meta[0][6], "created_at")
             if source_instance is not None and (
                 meta[0][4] != source_instance.source_instance_id
                 or meta[0][5] != source_instance.source_instance_sha256
@@ -2354,15 +2378,14 @@ class ReplicationSidecarStore:
                     "SELECT current_state, COUNT(*) FROM replication_heads GROUP BY current_state"
                 ).fetchall()
             )
-            invalid = set(counts) - {
+            if set(counts) - {
                 "pending",
                 "copying",
                 "verifying",
                 "retry_wait",
                 "replicated",
                 "dead_letter",
-            }
-            if invalid:
+            }:
                 raise ReplicationStateUnavailable("replication sidecar state is invalid")
             _validate_event_reachability(
                 connection,
@@ -2371,110 +2394,104 @@ class ReplicationSidecarStore:
             )
             replicated = connection.execute(
                 """SELECT i.manifest_canonical_sha256, e.occurred_at
-                     FROM replication_heads h
-                     JOIN replication_intents i ON i.intent_id = h.intent_id
-                     JOIN replication_attempt_events e
-                       ON e.intent_id = h.intent_id AND e.event_sequence = h.last_event_sequence
-                    WHERE h.current_state = 'replicated'
-                    ORDER BY e.occurred_at DESC LIMIT 1"""
+                     FROM replication_heads h JOIN replication_intents i ON i.intent_id=h.intent_id
+                     JOIN replication_attempt_events e ON e.intent_id=h.intent_id AND e.event_sequence=h.last_event_sequence
+                    WHERE h.current_state='replicated' ORDER BY e.occurred_at DESC LIMIT 1"""
             ).fetchone()
             row = connection.execute(
-                """SELECT destination_id, descriptor_sha256, head_sha256,
-                          replication_generation, record_sha256, source_instance_id,
-                          source_sequence, health_state, health_observed_at,
-                          cache_version, updated_at
-                     FROM replication_destination_cache
-                    ORDER BY updated_at DESC LIMIT 1"""
+                """SELECT destination_id, descriptor_sha256, head_sha256, replication_generation,
+                          record_sha256, source_instance_id, source_sequence, health_state,
+                          health_observed_at, cache_version, updated_at
+                     FROM replication_destination_cache ORDER BY updated_at DESC LIMIT 1"""
             ).fetchone()
-            if snapshot is None:
-                raise ReplicationStateUnavailable("replication sidecar snapshot is unavailable")
-            _assert_sqlite_snapshot_unchanged(snapshot)
-        except (sqlite3.Error, OSError) as exc:
-            raise ReplicationStateUnavailable from exc
+            _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
+        except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+            if isinstance(exc, ReplicationStateUnavailable):
+                raise
+            raise ReplicationStateUnavailable("replication sidecar status is unavailable") from exc
         finally:
             if connection is not None:
                 connection.close()
+            if root_fd is not None:
+                os.close(root_fd)
         if row is None:
             health, observed = "unknown", None
         else:
-            (
-                destination_id,
-                descriptor_sha256,
-                head_sha256,
-                replication_generation,
-                record_sha256,
-                cache_source_instance_id,
-                source_sequence,
-                health,
-                observed,
-                cache_version,
-                updated_at,
-            ) = row
-            if not isinstance(destination_id, str) or len(destination_id) != 32:
-                raise ReplicationStateUnavailable("replication destination identity is invalid")
-            for digest, name in (
-                (descriptor_sha256, "descriptor_sha256"),
-                (head_sha256, "head_sha256"),
-                (replication_generation, "replication_generation"),
-                (record_sha256, "record_sha256"),
-                (cache_source_instance_id, "source_instance_id"),
-            ):
-                if digest is not None:
-                    try:
+            try:
+                (
+                    destination_id,
+                    descriptor_sha256,
+                    head_sha256,
+                    generation,
+                    record_sha256,
+                    cache_source,
+                    sequence,
+                    health,
+                    observed,
+                    cache_version,
+                    updated_at,
+                ) = row
+                if not isinstance(destination_id, str) or len(destination_id) != 32:
+                    raise ReplicationStateUnavailable("replication cache identity is invalid")
+                for digest, name in (
+                    (descriptor_sha256, "descriptor_sha256"),
+                    (head_sha256, "head_sha256"),
+                    (generation, "replication_generation"),
+                    (record_sha256, "record_sha256"),
+                    (cache_source, "source_instance_id"),
+                ):
+                    if digest is not None:
                         _validate_sha(digest, name)
-                    except (TypeError, ValueError) as exc:
-                        raise ReplicationStateUnavailable(
-                            "replication cache digest is invalid"
-                        ) from exc
-            if source_sequence is not None and (
-                not isinstance(source_sequence, int) or source_sequence < 1
-            ):
-                raise ReplicationStateUnavailable("replication cache sequence is invalid")
-            if health not in {"unknown", "healthy", "unavailable", "unsupported"}:
-                raise ReplicationStateUnavailable("replication cache state is invalid")
-            if (health == "unknown") != (observed is None):
-                raise ReplicationStateUnavailable("replication cache timestamp is invalid")
-            for timestamp, name in ((observed, "health_observed_at"), (updated_at, "updated_at")):
-                if timestamp is not None:
-                    try:
+                if sequence is not None and (not isinstance(sequence, int) or sequence < 1):
+                    raise ReplicationStateUnavailable("replication cache sequence is invalid")
+                if health not in {"unknown", "healthy", "unavailable", "unsupported"} or (
+                    health == "unknown"
+                ) != (observed is None):
+                    raise ReplicationStateUnavailable("replication cache state is invalid")
+                for timestamp, name in (
+                    (observed, "health_observed_at"),
+                    (updated_at, "updated_at"),
+                ):
+                    if timestamp is not None:
                         _validate_utc_timestamp(timestamp, name)
-                    except (TypeError, ValueError) as exc:
-                        raise ReplicationStateUnavailable(
-                            "replication cache timestamp is invalid"
-                        ) from exc
-            if not isinstance(cache_version, int) or cache_version < 0:
-                raise ReplicationStateUnavailable("replication cache version is invalid")
-        try:
-            result = ReplicationStatusResponse(
-                status="ready" if not counts else "degraded",
-                reason_code="NONE",
-                enabled=True,
-                source_ready=True,
-                destination_configured=False,
-                outbox_schema_version=1,
-                pending_count=int(counts.get("pending", 0)),
-                copying_count=int(counts.get("copying", 0)),
-                verifying_count=int(counts.get("verifying", 0)),
-                retry_wait_count=int(counts.get("retry_wait", 0)),
-                dead_letter_count=int(counts.get("dead_letter", 0)),
-                last_replicated_source_manifest_sha256=replicated[0] if replicated else None,
-                last_replicated_at=replicated[1] if replicated else None,
-                local_ready=local_ready,
-                destination_health=health,
-                destination_health_observed_at=observed,
-                queue_lag_seconds=None,
-                lag_seconds=None,
-                effects=ReplicationEffects(
-                    writes=False,
-                    canonical_writes=False,
-                    destination_writes=False,
-                    outbox_writes=False,
-                    restore_writes=False,
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            raise ReplicationStateUnavailable("replication status projection is invalid") from exc
-        return result
+                if not isinstance(cache_version, int) or cache_version < 0:
+                    raise ReplicationStateUnavailable("replication cache version is invalid")
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable(
+                    "replication cache projection is invalid"
+                ) from exc
+        return ReplicationStatusResponse(
+            status="ready" if not counts else "degraded",
+            reason_code="NONE",
+            enabled=True,
+            source_ready=True,
+            destination_configured=False,
+            outbox_schema_version=1,
+            pending_count=int(counts.get("pending", 0)),
+            copying_count=int(counts.get("copying", 0)),
+            verifying_count=int(counts.get("verifying", 0)),
+            retry_wait_count=int(counts.get("retry_wait", 0)),
+            dead_letter_count=int(counts.get("dead_letter", 0)),
+            last_replicated_source_manifest_sha256=replicated[0] if replicated else None,
+            last_replicated_at=replicated[1] if replicated else None,
+            local_ready=local_ready,
+            destination_health=health,
+            destination_health_observed_at=observed,
+            queue_lag_seconds=None,
+            lag_seconds=None,
+            effects=ReplicationEffects(
+                writes=False,
+                canonical_writes=False,
+                destination_writes=False,
+                outbox_writes=False,
+                restore_writes=False,
+            ),
+        )
+
+
+# Keep the public symbol stable; the old mutable implementation above is not
+# reachable by callers after this binding and its pathname is never opened.
+ReplicationSidecarStore = ImmutableReplicationSidecarStore  # noqa: F811
 
 
 class ReplicationStatusService:
@@ -2491,7 +2508,7 @@ class ReplicationStatusService:
         source_instance_path = layout.replication_source_instance
         if source_instance_path is None:
             return _unavailable_status("SOURCE_NOT_CONFIGURED", self.local_ready)
-        sidecar = ReplicationSidecarStore(layout.replication_database)
+        sidecar = ReplicationSidecarStore(layout.replication_sidecar_root)
         try:
             # Establish sidecar availability first.  A missing/corrupt sidecar
             # is REPLICATION_STATE_UNAVAILABLE even when source evidence is
@@ -2569,6 +2586,7 @@ __all__ = [
     "JournalRecord",
     "ObjectInventoryEntry",
     "ReplicationDurabilityError",
+    "ReplicationCASConflict",
     "ReplicationEffects",
     "ReplicationReason",
     "ReplicationSidecarStore",

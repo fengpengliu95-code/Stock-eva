@@ -1259,6 +1259,49 @@ an OS-level close succeeded when it failed. Required anchors are
 `test_sidecar_writer_cleanup_reports_unlock_and_fd_failures_after_attempts`, and
 `test_sidecar_concurrent_initializers_have_one_multiprocess_winner`.
 
+#### Batch1.6 immutable sidecar generations amendment (normative; supersedes prior sidecar writer text)
+
+The earlier mutable `replication.sqlite3` pathname is a retired, non-compatible prototype; this
+Batch1 has no migration or compatibility write path for it. The sidecar authority is the explicit
+absolute `<local_control_dir>/replication-sidecar/` directory, reached only through a trusted
+descriptor chain. Its allowlisted namespace is exactly `.writer.lock`, `genesis.json`, and
+zero-padded generation files `00000000000000000000.db` through
+`99999999999999999999.db`; temporary names exist only during a locked write and must be removed
+before the operation is successful. Any unknown name, WAL/SHM-like name, gap, duplicate, symlink,
+wrong type or unreadable entry makes the sidecar unavailable. The canonical market schema and the
+normative SQLite DDL above do not change.
+
+`genesis.json` is an immutable canonical record whose closed fields are the sidecar schema/version,
+source instance id and digest, lock device/inode/link-count/mode, creation timestamp and its
+domain-separated digest. The first locked initializer creates the fixed lock file and genesis with
+no-replace installation, then creates generation `00000000000000000000.db`; subsequent writers
+must prove the current lock entry still matches genesis before any write. A replacement or ABA
+lock inode can never become a new authority: normal writers fail closed with
+`OUTBOX_DURABILITY_UNAVAILABLE`.
+
+Every mutation runs under that anchored lock, scans and validates the complete contiguous
+generation chain, and computes the deterministic next sequence. It serializes the private
+`:memory:` SQLite image, writes an `O_EXCL|O_NOFOLLOW` temporary file through the held root dirfd,
+fsyncs it, then installs only the fixed next basename using no-replace hard-link/rename-excl
+semantics and fsyncs the root directory. `EEXIST` is a typed CAS conflict; no generation is ever
+replaced, truncated or modified. The lock and baseline are re-proven before install, after install
+before readback, and after final fsync. A namespace anomaly before install causes zero generation
+publication; one appearing after install leaves the immutable generation visible but returns a
+degraded durable failure and never overwrites it.
+
+Status never creates, locks, migrates or writes the root. It scans the exact namespace, validates
+genesis and the contiguous chain, reads the highest generation through `O_NOFOLLOW`, deserializes
+it in memory and re-scans stable generation/lock/main fingerprints before returning. Generation
+files are immutable evidence. All cleanup uses the Batch1.5 best-effort accumulator, including
+temporary unlink and every fd/lock close; cleanup errors are typed and sanitized. Required anchors
+are `test_sidecar_generation_namespace_rejects_mutable_or_unknown_entries`,
+`test_sidecar_generation_gap_or_symlink_is_unavailable_without_writes`,
+`test_sidecar_generation_status_is_zero_write_and_reads_highest_stable_generation`,
+`test_sidecar_generation_lock_replacement_is_fail_closed_before_publish`,
+`test_sidecar_generation_concurrent_initializers_have_one_multiprocess_winner`,
+`test_sidecar_generation_auxiliary_appearance_is_degraded_after_install`, and
+`test_sidecar_generation_repeat_initialize_is_idempotent`.
+
 The event closed field set is exactly `(event_id,intent_id,event_sequence,prev_event_sha256,
 event_type,from_state,to_state,attempt,reason_code,state_version,occurred_at,
 destination_replication_generation,destination_record_sha256,destination_head_sha256,event_sha256)`; the
@@ -1669,7 +1712,7 @@ The only configuration names and defaults are:
 | `replication_enabled` | `STOCK_EVA_REPLICATION_ENABLED` | `false` |
 | `replication_drain_enabled` | `STOCK_EVA_MARKET_REPLICATION_DRAIN_ENABLED` | `false`; automation NAS writes require this plus an approved descriptor and lock |
 | `replication_destination_root` | `STOCK_EVA_REPLICATION_DESTINATION_ROOT` | `None`; explicit absolute approved child only |
-| `replication_database_name` | `STOCK_EVA_REPLICATION_DATABASE_NAME` | `replication.sqlite3`; safe basename only |
+| `replication_database_name` | `STOCK_EVA_REPLICATION_DATABASE_NAME` | legacy parsing only; no mutable sidecar pathname |
 | `replication_journal_root_name` | `STOCK_EVA_REPLICATION_JOURNAL_ROOT_NAME` | `replication-journal`; safe basename only |
 | `replication_max_attempts` | `STOCK_EVA_REPLICATION_MAX_ATTEMPTS` | `6`; fixed upper bound |
 | `replication_lease_seconds` | `STOCK_EVA_REPLICATION_LEASE_SECONDS` | `900`; positive bounded integer |

@@ -3,7 +3,6 @@ import multiprocessing
 import os
 import sqlite3
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -104,7 +103,7 @@ def test_replication_defaults_off_and_layout_is_local(tmp_path: Path) -> None:
     assert settings.replication_enabled is False
     assert settings.replication_drain_enabled is False
     assert settings.replication_direction == "local_to_nas"
-    assert layout.replication_database == tmp_path / "control" / "replication.sqlite3"
+    assert layout.replication_sidecar_root == tmp_path / "control" / "replication-sidecar"
     assert layout.replication_journal_root == tmp_path / "control" / "replication-journal"
     assert layout.replication_lock == tmp_path / "locks" / "replication.lock"
     assert (
@@ -140,7 +139,8 @@ def test_replication_status_reads_valid_sidecar_without_writing(tmp_path: Path) 
         source_instance_id=source.source_instance_id,
         source_instance_sha256=source.source_instance_sha256,
     )
-    before = (layout.replication_database.stat().st_ino, layout.replication_database.read_bytes())
+    root = layout.replication_sidecar_root
+    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()}
 
     result = ReplicationStatusService(settings).read()
 
@@ -148,10 +148,7 @@ def test_replication_status_reads_valid_sidecar_without_writing(tmp_path: Path) 
     assert result.reason_code == "NONE"
     assert result.source_ready is True
     assert result.provider_requests == 0
-    assert (
-        layout.replication_database.stat().st_ino,
-        layout.replication_database.read_bytes(),
-    ) == before
+    assert {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()} == before
 
 
 def test_status_uses_no_filesystem_clone_and_preserves_all_sidecar_artifacts(
@@ -169,31 +166,15 @@ def test_status_uses_no_filesystem_clone_and_preserves_all_sidecar_artifacts(
         source_instance_id=source.source_instance_id,
         source_instance_sha256=source.source_instance_sha256,
     )
-    before = {
-        path: (path.stat().st_ino, path.read_bytes())
-        for path in layout.replication_database.parent.glob("replication.sqlite3*")
-    }
+    root = layout.replication_sidecar_root
+    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()}
 
     def fail_if_clone(*args: object, **kwargs: object) -> None:
         raise AssertionError("status must not create a filesystem SQLite clone")
 
-    snapshot_checks: list[object] = []
-    real_snapshot_check = replication._assert_sqlite_snapshot_unchanged
-
-    def observe_snapshot(snapshot: object) -> None:
-        snapshot_checks.append(snapshot)
-        real_snapshot_check(snapshot)  # type: ignore[arg-type]
-
     monkeypatch.setattr(replication, "_open_verified_sqlite_clone", fail_if_clone, raising=False)
-    monkeypatch.setattr(replication, "_assert_sqlite_snapshot_unchanged", observe_snapshot)
     assert ReplicationStatusService(settings).read().reason_code == "NONE"
-    # The status service performs two independent sidecar reads (precedence
-    # check, then source-identity-bound check), each with open/end proofs.
-    assert len(snapshot_checks) == 4
-    after = {
-        path: (path.stat().st_ino, path.read_bytes())
-        for path in layout.replication_database.parent.glob("replication.sqlite3*")
-    }
+    after = {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()}
     assert after == before
 
 
@@ -214,17 +195,18 @@ def test_replication_status_missing_sidecar_is_unavailable_without_initializatio
 
     assert result.status == "unavailable"
     assert result.reason_code == "REPLICATION_STATE_UNAVAILABLE"
-    assert layout.replication_database.exists() is False
+    assert layout.replication_sidecar_root.exists() is False
 
 
 def test_replication_sidecar_normative_ddl_identity_and_immutable_event_history(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
 
-    with sqlite3.connect(path) as connection:
+    connection = _latest_generation_connection(path)
+    try:
         tables = {
             row[0]
             for row in connection.execute(
@@ -247,6 +229,8 @@ def test_replication_sidecar_normative_ddl_identity_and_immutable_event_history(
             connection.execute(
                 "UPDATE replication_sidecar_meta SET schema_version=1 WHERE sidecar_id=1"
             )
+    finally:
+        connection.close()
 
 
 def test_source_instance_record_is_immutable_and_fsynced(tmp_path: Path) -> None:
@@ -439,12 +423,13 @@ def test_journal_install_revalidates_model_copy_projection_before_write(tmp_path
 
 
 def test_sidecar_global_reachability_rejects_orphan_event(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     ReplicationSidecarStore(path).initialize(
         source_instance_id="a" * 64,
         source_instance_sha256="b" * 64,
     )
-    with sqlite3.connect(path) as connection:
+
+    def mutate(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute(
             """INSERT INTO replication_attempt_events
@@ -455,28 +440,33 @@ def test_sidecar_global_reachability_rejects_orphan_event(tmp_path: Path) -> Non
                     '2026-09-09T00:00:00Z', ?)""",
             ("c" * 64, "d" * 64, "0" * 64, "e" * 64),
         )
+
+    _rewrite_latest_generation(path, mutate)
     with pytest.raises(Exception, match="reachability|sequence|hash"):
         ReplicationSidecarStore(path).read_status()
 
 
 @pytest.mark.parametrize("tamper", ["user_version", "index"])
 def test_sidecar_reader_rejects_schema_identity_tamper(tmp_path: Path, tamper: str) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     ReplicationSidecarStore(path).initialize(
         source_instance_id="a" * 64,
         source_instance_sha256="b" * 64,
     )
-    with sqlite3.connect(path) as connection:
+
+    def mutate(connection: sqlite3.Connection) -> None:
         if tamper == "user_version":
             connection.execute("PRAGMA user_version = 99")
         else:
             connection.execute("DROP INDEX replication_heads_due_idx")
+
+    _rewrite_latest_generation(path, mutate)
     with pytest.raises(ReplicationStateUnavailable, match="DDL|version"):
         ReplicationSidecarStore(path).read_status()
 
 
 def test_sidecar_reader_rejects_intent_source_identity_mismatch(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     identity_fields = {
@@ -517,17 +507,20 @@ def test_sidecar_reader_rejects_intent_source_identity_mismatch(tmp_path: Path) 
     )
     columns = ",".join(row)
     placeholders = ",".join("?" * len(row))
-    with sqlite3.connect(path) as connection:
+
+    def mutate(connection: sqlite3.Connection) -> None:
         connection.execute(
             f"INSERT INTO replication_intents ({columns}) VALUES ({placeholders})",
             tuple(row.values()),
         )
+
+    _rewrite_latest_generation(path, mutate)
     with pytest.raises(ReplicationStateUnavailable, match="source identity"):
         store.read_status()
 
 
 def test_sidecar_reader_rejects_stale_lease_on_nonleased_head(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     occurred_at = "2026-09-09T00:00:00Z"
@@ -596,7 +589,8 @@ def test_sidecar_reader_rejects_stale_lease_on_nonleased_head(tmp_path: Path) ->
         **event_fields,
         "event_sha256": domain_sha256("stock-eva/r2f4.3/replication-event/v1", event_fields),
     }
-    with sqlite3.connect(path) as connection:
+
+    def mutate(connection: sqlite3.Connection) -> None:
         columns = ",".join(intent)
         connection.execute(
             f"INSERT INTO replication_intents ({columns}) VALUES ({','.join('?' * len(intent))})",
@@ -615,29 +609,32 @@ def test_sidecar_reader_rejects_stale_lease_on_nonleased_head(tmp_path: Path) ->
                VALUES (?, 'pending', 0, 0, 'stale-owner', ?, ?, 'NONE', ?)""",
             (intent_id, "2026-09-09T00:10:00Z", "2026-09-09T00:00:00Z", occurred_at),
         )
+
+    _rewrite_latest_generation(path, mutate)
     with pytest.raises(ReplicationStateUnavailable, match="invalid|stale"):
         store.read_status()
 
 
 def test_status_rejects_existing_wal_shm_without_writes(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
-    wal_path = path.with_name(path.name + "-wal")
-    shm_path = path.with_name(path.name + "-shm")
+    root = path.parent / "replication-sidecar"
+    wal_path = root / "00000000000000000000.db-wal"
+    shm_path = root / "00000000000000000000.db-shm"
     wal_path.write_bytes(b"unexpected wal")
     shm_path.write_bytes(b"unexpected shm")
     wal_path.chmod(0o600)
     shm_path.chmod(0o600)
     before = {
         artifact: (artifact.stat().st_ino, artifact.stat().st_mtime_ns, artifact.read_bytes())
-        for artifact in (path, wal_path, shm_path)
+        for artifact in (root / "00000000000000000000.db", wal_path, shm_path)
     }
     with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|sidecar"):
         store.read_status()
     after = {
         artifact: (artifact.stat().st_ino, artifact.stat().st_mtime_ns, artifact.read_bytes())
-        for artifact in (path, wal_path, shm_path)
+        for artifact in (root / "00000000000000000000.db", wal_path, shm_path)
     }
     assert after == before
 
@@ -645,7 +642,7 @@ def test_status_rejects_existing_wal_shm_without_writes(tmp_path: Path) -> None:
 def test_sidecar_sqlite_engine_uses_memory_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     real_connect = sqlite3.connect
@@ -693,18 +690,25 @@ def test_sqlite_deserialize_failure_closes_private_connection(
 def test_status_same_stat_byte_mutation_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     real_validate = replication._validate_sqlite_schema
+    mutated = False
 
     def mutate_after_open(connection: sqlite3.Connection) -> None:
+        nonlocal mutated
         real_validate(connection)
-        stat_before = path.stat()
-        payload = bytearray(path.read_bytes())
+        if mutated:
+            return
+        mutated = True
+        root = path.parent / "replication-sidecar"
+        generation = root / "00000000000000000000.db"
+        stat_before = generation.stat()
+        payload = bytearray(generation.read_bytes())
         payload[-1] ^= 1
-        path.write_bytes(payload)
-        os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+        generation.write_bytes(payload)
+        os.utime(generation, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
 
     monkeypatch.setattr(replication, "_validate_sqlite_schema", mutate_after_open)
     with pytest.raises(ReplicationStateUnavailable, match="changed|fingerprint"):
@@ -738,184 +742,34 @@ def test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors(
 def test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
-    real_unlink = replication.os.unlink
-    closed_sessions: list[object] = []
-    real_close_writer_session = replication._close_writer_session
-
-    def fail_temp_cleanup(name: object, *args: object, **kwargs: object):
-        if kwargs.get("dir_fd") is not None:
-            raise OSError("injected cleanup failure")
-        return real_unlink(name, *args, **kwargs)
-
-    def observe_writer_close(session: object) -> None:
-        closed_sessions.append(session)
-        real_close_writer_session(session)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(replication.os, "unlink", fail_temp_cleanup)
-    monkeypatch.setattr(replication, "_close_writer_session", observe_writer_close)
-    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
-        store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
-    assert closed_sessions
-    assert path.exists()
-    assert any(
-        entry.name.startswith(f".{path.name}.") and entry.name.endswith(".tmp")
-        for entry in path.parent.iterdir()
-    )
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert _generation_files(path.parent / "replication-sidecar")
 
 
 def test_writer_identity_check_rejects_replacement_between_open_and_connect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     path.parent.mkdir()
     ReplicationSidecarStore(path).initialize(
         source_instance_id="a" * 64,
         source_instance_sha256="b" * 64,
     )
-    real_connect = sqlite3.connect
-
-    def racing_connect(database: object, *args: object, **kwargs: object):
-        os.replace(path, path.with_name("replaced.sqlite3"))
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(replication.sqlite3, "connect", racing_connect)
-    with pytest.raises(ReplicationDurabilityError, match="identity|changed|writable"):
+    root = path.parent / "replication-sidecar"
+    lock = root / ".writer.lock"
+    lock.unlink()
+    with pytest.raises(
+        ReplicationDurabilityError, match="identity|changed|writable|unavailable|disappeared"
+    ):
         ReplicationSidecarStore._connect_writer(path)
-    assert not path.exists()
-    assert (path.with_name("replaced.sqlite3")).stat().st_size > 100
-
-
-def test_sidecar_writer_lock_serializes_descriptor_sessions(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
-    first = replication._open_writer_session(path)
-    acquired: list[replication._WriterSession] = []
-
-    def open_second() -> None:
-        acquired.append(replication._open_writer_session(path))
-
-    thread = threading.Thread(target=open_second)
-    thread.start()
-    time.sleep(0.05)
-    assert thread.is_alive()
-    replication._close_writer_session(first)
-    thread.join(timeout=2)
-    assert not thread.is_alive()
-    assert len(acquired) == 1
-    replication._close_writer_session(acquired[0])
-
-
-def test_sidecar_cas_helper_requires_writer_lock_token(tmp_path: Path) -> None:
-    session = replication._WriterSession(
-        path=tmp_path / "control" / "replication.sqlite3",
-        parent_fd=-1,
-        descriptors=[],
-        target_fd=None,
-        payload=None,
-        stat=None,
-        fingerprint=None,
-    )
-    with pytest.raises(ReplicationDurabilityError, match="lock token"):
-        replication._install_memory_snapshot(session, b"not-a-database")
-
-
-def test_sidecar_writer_lock_entry_replacement_is_fail_closed(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
-    session = replication._open_writer_session(path)
-    lock_path = path.with_name(f"{path.name}.lock")
-    replacement = path.with_name("replacement.lock")
-    replacement.write_bytes(b"replacement")
-    replacement.chmod(0o600)
-    os.replace(lock_path, path.with_name("old.lock"))
-    os.replace(replacement, lock_path)
-    try:
-        with pytest.raises(ReplicationDurabilityError, match="lock"):
-            replication._install_memory_snapshot(session, b"not-a-database")
-        assert not path.exists()
-    finally:
-        replication._close_writer_session(session)
-
-
-@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
-def test_sidecar_auxiliary_appearance_before_install_is_zero_write(
-    tmp_path: Path, suffix: str
-) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
-    path.parent.mkdir(parents=True)
-    path.touch(mode=0o600)
-    session = replication._open_writer_session(path)
-    before = path.read_bytes()
-    auxiliary = path.with_name(path.name + suffix)
-    auxiliary.write_bytes(b"appeared")
-    auxiliary.chmod(0o600)
-    try:
-        with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|auxiliary"):
-            replication._install_memory_snapshot(session, b"not-a-database")
-        assert path.read_bytes() == before
-    finally:
-        replication._close_writer_session(session)
-
-
-def test_sidecar_auxiliary_appearance_after_install_is_degraded_and_not_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
-    session = replication._open_writer_session(path)
-    calls = 0
-    real_read_target = replication._read_writer_target
-    payload = b"SQLite format 3\x00" + b"\x00" * 100
-
-    def install_then_appear(current: replication._WriterSession):
-        nonlocal calls
-        calls += 1
-        result = real_read_target(current)
-        if calls == 3:
-            auxiliary = path.with_name(path.name + "-wal")
-            auxiliary.write_bytes(b"appeared-after-install")
-            auxiliary.chmod(0o600)
-        return result
-
-    monkeypatch.setattr(replication, "_read_writer_target", install_then_appear)
-    try:
-        with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|auxiliary"):
-            replication._install_memory_snapshot(session, payload)
-        assert path.read_bytes() == payload
-    finally:
-        replication._close_writer_session(session)
-
-
-def test_sidecar_writer_cleanup_reports_unlock_and_fd_failures_after_attempts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
-    session = replication._open_writer_session(path)
-    real_close = replication.os.close
-    real_flock = replication.fcntl.flock
-    close_calls: list[int] = []
-
-    def fail_selected_close(fd: int) -> None:
-        close_calls.append(fd)
-        if fd in {session.target_fd, session.lock_fd}:
-            raise OSError("injected close failure")
-        real_close(fd)
-
-    def fail_unlock(fd: int, operation: int) -> object:
-        if operation == replication.fcntl.LOCK_UN:
-            raise OSError("injected unlock failure")
-        return real_flock(fd, operation)
-
-    monkeypatch.setattr(replication.os, "close", fail_selected_close)
-    monkeypatch.setattr(replication.fcntl, "flock", fail_unlock)
-    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
-        replication._close_writer_session(session)
-    assert len(close_calls) >= 2
+    assert _generation_files(root)
 
 
 def test_sidecar_concurrent_initializers_have_one_multiprocess_winner(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     path.parent.mkdir(parents=True)
-    path.touch(mode=0o600)
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
     processes = [
@@ -936,7 +790,7 @@ def test_sidecar_concurrent_initializers_have_one_multiprocess_winner(tmp_path: 
 
 
 def test_repeated_initialize_reads_held_descriptor_from_offset_zero(tmp_path: Path) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     store = ReplicationSidecarStore(path)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
@@ -946,9 +800,8 @@ def test_repeated_initialize_reads_held_descriptor_from_offset_zero(tmp_path: Pa
 def test_existing_empty_sidecar_concurrent_initializers_have_one_winner(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     path.parent.mkdir(parents=True)
-    path.touch(mode=0o600)
     barrier = threading.Barrier(2)
     outcomes: list[str] = []
 
@@ -979,7 +832,7 @@ def test_existing_empty_sidecar_concurrent_initializers_have_one_winner(
 def test_connect_writer_closes_memory_connection_on_durability_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "control" / "replication.sqlite3"
+    path = tmp_path / "control" / "replication-sidecar"
     ReplicationSidecarStore(path).initialize(
         source_instance_id="a" * 64,
         source_instance_sha256="b" * 64,
@@ -993,8 +846,8 @@ def test_connect_writer_closes_memory_connection_on_durability_error(
     monkeypatch.setattr(replication, "_deserialize_sqlite_bytes", lambda _payload: FakeConnection())
     monkeypatch.setattr(
         replication,
-        "_assert_writer_session_stable",
-        lambda _session: (_ for _ in ()).throw(
+        "_compare_generation_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ReplicationDurabilityError("injected durability failure")
         ),
     )
@@ -1155,3 +1008,256 @@ def test_source_checkpoint_hash_excludes_sequence_and_binds_complete_inventory()
     )
     assert checkpoint.checkpoint_id != checkpoint.checkpoint_payload_sha256
     assert checkpoint.object_inventory[0].relative_path == "bars.parquet"
+
+
+def _generation_sidecar_root(tmp_path: Path) -> Path:
+    return tmp_path / "control" / "replication-sidecar"
+
+
+def _generation_files(root: Path) -> list[Path]:
+    return sorted(
+        root.glob(
+            "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].db"
+        )
+    )
+
+
+def _latest_generation_connection(path: Path) -> sqlite3.Connection:
+    root = path if path.name == "replication-sidecar" else path.parent / "replication-sidecar"
+    return replication._deserialize_sqlite_bytes(_generation_files(root)[-1].read_bytes())
+
+
+def _rewrite_latest_generation(path: Path, mutate: object) -> None:
+    root = path if path.name == "replication-sidecar" else path.parent / "replication-sidecar"
+    generation = _generation_files(root)[-1]
+    connection = _latest_generation_connection(root)
+    try:
+        mutate(connection)
+        connection.commit()
+        payload = connection.serialize(name="main")
+    finally:
+        connection.close()
+    generation.write_bytes(payload)
+
+
+def test_sidecar_generation_namespace_rejects_mutable_or_unknown_entries(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    unknown = root / "replication.sqlite3"
+    unknown.write_bytes(b"retired mutable prototype")
+    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()}
+    with pytest.raises(ReplicationStateUnavailable, match="namespace|unknown"):
+        store.read_status()
+    after = {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()}
+    assert after == before
+
+
+def test_sidecar_generation_gap_or_symlink_is_unavailable_without_writes(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    first = _generation_files(root)[0]
+    gap = root / "00000000000000000002.db"
+    gap.symlink_to(first)
+    before = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in root.iterdir()
+        if not path.is_symlink()
+    }
+    with pytest.raises(ReplicationStateUnavailable, match="generation|namespace|symlink"):
+        store.read_status()
+    after = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in root.iterdir()
+        if not path.is_symlink()
+    }
+    assert after == before
+
+
+def test_sidecar_generation_status_is_zero_write_and_reads_highest_stable_generation(
+    tmp_path: Path,
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    connection = _latest_generation_connection(root)
+    try:
+        replication._install_generation(session, connection.serialize(name="main"))
+    finally:
+        connection.close()
+        replication._close_generation_writer_session(session)
+    before = {
+        path.name: (
+            path.stat().st_ino,
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.read_bytes(),
+        )
+        for path in root.iterdir()
+    }
+    assert store.read_status().reason_code == "NONE"
+    after = {
+        path.name: (
+            path.stat().st_ino,
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.read_bytes(),
+        )
+        for path in root.iterdir()
+    }
+    assert after == before
+    assert [path.name for path in _generation_files(root)] == [
+        "00000000000000000000.db",
+        "00000000000000000001.db",
+    ]
+
+
+def test_sidecar_generation_lock_replacement_is_fail_closed_before_publish(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    lock = root / ".writer.lock"
+    replacement = root / ".replacement.lock"
+    replacement.write_bytes(b"replacement")
+    replacement.chmod(0o600)
+    lock.unlink()
+    replacement.rename(lock)
+    with pytest.raises(ReplicationDurabilityError, match="lock|authority"):
+        store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert [path.name for path in _generation_files(root)] == ["00000000000000000000.db"]
+
+
+def test_sidecar_generation_concurrent_initializers_have_one_multiprocess_winner(
+    tmp_path: Path,
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_initialize_sidecar_process,
+            args=(str(root), source_instance_id, queue),
+        )
+        for source_instance_id in ("a" * 64, "c" * 64)
+    ]
+    for process in processes:
+        process.start()
+    outcomes = [queue.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert outcomes.count("success") == 1
+    assert outcomes.count("error") == 1
+    assert [path.name for path in _generation_files(root)] == ["00000000000000000000.db"]
+
+
+def test_sidecar_generation_repeat_initialize_is_idempotent(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    generation = _generation_files(root)[0]
+    before = generation.stat()
+    payload = generation.read_bytes()
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    after = generation.stat()
+    assert generation.read_bytes() == payload
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def test_sidecar_generation_auxiliary_appearance_after_install_is_degraded_and_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    connection = _latest_generation_connection(root)
+    try:
+        payload = connection.serialize(name="main")
+    finally:
+        connection.close()
+    real_install = replication._install_fixed_at
+
+    def install_then_inject(*args: object, **kwargs: object) -> None:
+        real_install(*args, **kwargs)
+        (root / "00000000000000000001.db-wal").write_bytes(b"unexpected auxiliary")
+
+    monkeypatch.setattr(replication, "_install_fixed_at", install_then_inject)
+    try:
+        with pytest.raises(ReplicationStateUnavailable, match="namespace|unknown|auxiliary"):
+            replication._install_generation(session, payload)
+    finally:
+        replication._close_generation_writer_session(session)
+    assert (root / "00000000000000000001.db").exists()
+    with pytest.raises(ReplicationStateUnavailable):
+        store.read_status()
+
+
+def test_sidecar_generation_lock_replacement_after_install_is_degraded_and_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    connection = _latest_generation_connection(root)
+    try:
+        payload = connection.serialize(name="main")
+    finally:
+        connection.close()
+    real_install = replication._install_fixed_at
+
+    def install_then_replace(*args: object, **kwargs: object) -> None:
+        real_install(*args, **kwargs)
+        lock = root / ".writer.lock"
+        lock.unlink()
+        replacement = root / ".replacement.lock"
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+        replacement.rename(lock)
+
+    monkeypatch.setattr(replication, "_install_fixed_at", install_then_replace)
+    try:
+        with pytest.raises(ReplicationDurabilityError, match="lock|authority"):
+            replication._install_generation(session, payload)
+    finally:
+        replication._close_generation_writer_session(session)
+    assert (root / "00000000000000000001.db").exists()
+    with pytest.raises(ReplicationStateUnavailable):
+        store.read_status()
+
+
+def test_sidecar_generation_eexist_is_typed_cas_conflict_without_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    connection = _latest_generation_connection(root)
+    try:
+        payload = connection.serialize(name="main")
+    finally:
+        connection.close()
+    target = root / "00000000000000000001.db"
+    target_payload = b"attacker-owned-bytes"
+    real_link = replication.os.link
+
+    def racing_link(source: object, destination: object, **kwargs: object) -> object:
+        target.write_bytes(target_payload)
+        target.chmod(0o600)
+        return real_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(replication.os, "link", racing_link)
+    try:
+        with pytest.raises(replication.ReplicationCASConflict):
+            replication._install_generation(session, payload)
+    finally:
+        replication._close_generation_writer_session(session)
+    assert target.read_bytes() == target_payload

@@ -121,7 +121,19 @@ class StorageLayout:
 
     @property
     def replication_database(self) -> Path:
-        return self.settings.local_control_dir / self.settings.replication_database_name
+        # Compatibility name only: the sidecar authority is a directory of
+        # immutable generations, never a mutable ``replication.sqlite3`` file.
+        return self.replication_sidecar_root
+
+    @property
+    def replication_sidecar_root(self) -> Path:
+        """Immutable replication sidecar generation root.
+
+        ``replication_database`` remains a legacy configuration property for
+        parsing compatibility only; no sidecar writer is allowed to use that
+        mutable pathname.
+        """
+        return self.settings.local_control_dir / "replication-sidecar"
 
     @property
     def replication_journal_root(self) -> Path:
@@ -151,6 +163,7 @@ class StorageLayout:
         """Create only local replication parents for an explicit writer operation."""
         for path in (
             self.settings.local_control_dir,
+            self.replication_sidecar_root,
             self.replication_journal_root,
             self.settings.local_lock_dir,
         ):
