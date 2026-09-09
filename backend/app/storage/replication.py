@@ -131,60 +131,38 @@ class ReplicationPostCommitConflict(ReplicationStateUnavailable):
     reason_code: Literal["CONTROL_STATE_UNAVAILABLE"] = "CONTROL_STATE_UNAVAILABLE"
 
 
-_DESTINATION_PROOF_TOKEN = object()
+class VerifiedDestinationCommitProof(BaseModel):
+    """Closed, immutable proof projection supplied to the verifier.
 
-
-class VerifiedDestinationCommitProof:
-    """A private proof emitted only after a strict destination readback.
-
-    The constructor deliberately requires a module-private token.  A caller
-    cannot complete a local intent with destination digests copied from an
-    untrusted response; :class:`DestinationArchiveReader` is the only code
-    path that owns the token and creates this object.
+    The model is intentionally constructible so callers cannot rely on
+    secrecy of an in-memory token.  Completion still requires the configured
+    descriptor-native verifier to reread the destination and compare every
+    field before touching the local sidecar.
     """
 
-    __slots__ = (
-        "intent_id",
-        "checkpoint_id",
-        "destination_id",
-        "source_sequence",
-        "destination_generation",
-        "destination_record_sha256",
-        "destination_head_sha256",
-        "worker_id",
-        "state_version",
-        "now",
-        "_token",
-    )
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    def __init__(
-        self,
-        *,
-        intent_id: str | None,
-        checkpoint_id: str,
-        destination_id: str,
-        source_sequence: int,
-        destination_generation: str,
-        destination_record_sha256: str,
-        destination_head_sha256: str,
-        worker_id: str | None,
-        state_version: int | None,
-        now: str,
-        _token: object | None = None,
-    ) -> None:
-        if _token is not _DESTINATION_PROOF_TOKEN:
-            raise TypeError("verified destination commit proof is reader-owned")
-        self.intent_id = intent_id
-        self.checkpoint_id = checkpoint_id
-        self.destination_id = destination_id
-        self.source_sequence = source_sequence
-        self.destination_generation = destination_generation
-        self.destination_record_sha256 = destination_record_sha256
-        self.destination_head_sha256 = destination_head_sha256
-        self.worker_id = worker_id
-        self.state_version = state_version
-        self.now = now
-        self._token = _token
+    intent_id: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    source_sequence: int = Field(ge=1)
+    destination_generation: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_head_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    worker_id: str | None = Field(default=None, min_length=1, max_length=128)
+    state_version: int | None = Field(default=None, ge=1)
+    now: str
+
+    _now_is_utc = field_validator("now")(lambda value: _validate_utc_timestamp(value, "now"))
+
+    @model_validator(mode="before")
+    @classmethod
+    def exact_fields(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("destination proof fields are not exact")
+        return value
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -3184,8 +3162,12 @@ def _intent_row_from_checkpoint(
 
 
 class ImmutableReplicationSidecarStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, destination_verifier: object | None = None) -> None:
         self.path = _sidecar_root(path)
+        # Completion is deliberately opt-in and requires a concrete
+        # descriptor-native verifier.  A bare sidecar can still queue and
+        # inspect local state, but it cannot promote an intent to replicated.
+        self._destination_verifier = destination_verifier
 
     @staticmethod
     def _connect_writer(path: Path) -> sqlite3.Connection:
@@ -4035,8 +4017,14 @@ class ImmutableReplicationSidecarStore:
         return result
 
     def complete_replication(self, proof: VerifiedDestinationCommitProof) -> ReplicationHead:
-        """Advance a leased intent only from a reader-owned destination proof."""
-        return _complete_replication_with_proof(self, proof)
+        """Advance a leased intent only after fresh destination readback."""
+        verifier = self._destination_verifier
+        if verifier is None or type(verifier) is not DestinationCommitVerifier:
+            raise ReplicationDurabilityError(
+                "replication completion requires a configured destination verifier"
+            )
+        verified = verifier.verify(proof)
+        return _complete_replication_with_proof(self, verified)
 
     def get_intent(self, intent_id: str) -> ReplicationIntent:
         """Read one immutable intent from the strict sidecar without writes."""
@@ -4658,6 +4646,8 @@ class DestinationDescriptor(BaseModel):
     parent_ino: int = Field(gt=0)
     mount_point: str = Field(min_length=1)
     fs_type: str = Field(min_length=1, max_length=64)
+    normalized_options: str = Field(max_length=4096)
+    volume_id: str | None = Field(default=None, max_length=256)
     mount_generation: str = Field(min_length=32, max_length=128, pattern=r"^[0-9a-f]+$")
     mount_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     sentinel_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -4726,6 +4716,8 @@ class DestinationDescriptor(BaseModel):
             "parent_ino": int(parent_info.st_ino),
             "mount_point": mount_name,
             "fs_type": fs_type,
+            "normalized_options": normalized_options,
+            "volume_id": volume_id,
             "mount_generation": generation,
             "mount_fingerprint": fingerprint,
             "sentinel_sha256": sentinel_sha256,
@@ -4783,9 +4775,9 @@ class DestinationDescriptor(BaseModel):
         current_fp = _destination_mount_fingerprint(
             mount_point=self.mount_point,
             fs_type=self.fs_type,
-            normalized_options="",
+            normalized_options=self.normalized_options,
             st_dev=int(root_info.st_dev),
-            volume_id=None,
+            volume_id=self.volume_id,
         )
         # A descriptor produced with an explicit synthetic mount fingerprint
         # remains valid only when it uses the same local probe inputs.  The
@@ -5127,14 +5119,23 @@ def _destination_remove_tree_at(parent_fd: int, name: str) -> None:
 
 
 def _destination_rename_noreplace(parent_fd: int, source: str, target: str) -> None:
-    """Use renameat2(RENAME_NOREPLACE) where available, never overwrite history."""
+    """Install a directory with same-parent no-replace semantics.
+
+    macOS exposes the required primitive as ``renameatx_np`` while Linux
+    exposes it as ``renameat2``.  The regular-file fallback is an exclusive
+    hard-link followed by removal of the temporary name; it is intentionally
+    not used for directories because hard-linking directories is unsupported
+    by the filesystem.  There is no stat-then-rename fallback.
+    """
     if not source or not target or "/" in source or "/" in target:
         raise ReplicationDurabilityError("destination generation name is unsafe")
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = getattr(libc, "renameat2", None)
+        renameatx_np = getattr(libc, "renameatx_np", None)
     except OSError:
         renameat2 = None
+        renameatx_np = None
     if renameat2 is not None:
         renameat2.argtypes = [
             ctypes.c_int,
@@ -5158,21 +5159,116 @@ def _destination_rename_noreplace(parent_fd: int, source: str, target: str) -> N
             raise ReplicationCASConflict("destination generation already exists")
         if error not in {errno.ENOSYS, errno.EINVAL}:
             raise ReplicationDurabilityError("destination generation install failed")
-    # Portable fallback is protected by the destination writer lock.  It does
-    # not claim cross-process atomicity on filesystems without an exclusive
-    # rename primitive; an observed target is always treated as conflict.
+    if renameatx_np is not None:
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            parent_fd,
+            source.encode("utf-8"),
+            parent_fd,
+            target.encode("utf-8"),
+            0x00000004,  # RENAME_EXCL
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise ReplicationCASConflict("destination generation already exists")
+        if error not in {errno.ENOSYS, errno.EINVAL}:
+            raise ReplicationDurabilityError("destination generation install failed")
+    # Portable fallback uses the filesystem's atomic link-create rule.  A
+    # prior stat followed by rename is not a no-replace operation: another
+    # writer can create the target between those calls and the rename would
+    # silently overwrite it.  If hard links are unavailable this destination
+    # cannot provide the required publication contract.
     try:
-        os.stat(target, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        raise ReplicationCASConflict("destination generation already exists")
-    try:
-        os.rename(source, target, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.link(
+            source,
+            target,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
     except FileExistsError as exc:
         raise ReplicationCASConflict("destination generation already exists") from exc
     except OSError as exc:
+        if exc.errno in {errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EPERM}:
+            raise ReplicationDurabilityError("destination generation install unsupported") from exc
         raise ReplicationDurabilityError("destination generation install failed") from exc
+    try:
+        os.unlink(source, dir_fd=parent_fd)
+    except FileExistsError as exc:
+        raise ReplicationDurabilityError("destination generation cleanup failed") from exc
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination generation cleanup failed") from exc
+
+
+def _destination_exchange(parent_fd: int, source: str, target: str) -> None:
+    """Atomically swap a staged regular file with an existing target.
+
+    Head replacement is the only mutable destination projection.  It must not
+    use a path-based unconditional overwrite.  The native exchange primitive
+    preserves the target's atomic visibility and lets the caller unlink the
+    old bytes only after the swap and directory fsync.
+    """
+    if not source or not target or "/" in source or "/" in target:
+        raise ReplicationDurabilityError("destination head name is unsafe")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        renameatx_np = getattr(libc, "renameatx_np", None)
+    except OSError:
+        renameat2 = None
+        renameatx_np = None
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            source.encode("utf-8"),
+            parent_fd,
+            target.encode("utf-8"),
+            0x00000002,  # RENAME_EXCHANGE
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOENT}:
+            raise ReplicationDurabilityError("destination head exchange failed")
+    if renameatx_np is not None:
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            parent_fd,
+            source.encode("utf-8"),
+            parent_fd,
+            target.encode("utf-8"),
+            0x00000002,  # RENAME_SWAP
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOENT}:
+            raise ReplicationDurabilityError("destination head exchange failed")
+    raise ReplicationDurabilityError("destination head exchange unsupported")
 
 
 @contextmanager
@@ -5182,6 +5278,7 @@ def _destination_root_session(descriptor: DestinationDescriptor):
     primary: BaseException | None = None
     try:
         descriptor.verify_root_fd(root_fd)
+        _destination_verify_persisted_descriptor(descriptor, root_fd)
         yield root_fd
     except BaseException as exc:
         primary = exc
@@ -5190,6 +5287,30 @@ def _destination_root_session(descriptor: DestinationDescriptor):
         failures: list[str] = []
         _close_descriptors(descriptors, failures)
         _finish_cleanup(primary, failures)
+
+
+def _destination_verify_persisted_descriptor(
+    expected: DestinationDescriptor, root_fd: int
+) -> DestinationDescriptor:
+    """Bind a session to the exact descriptor bytes stored at the root."""
+    expected.verify()
+    result = _destination_read_at(root_fd, (DESTINATION_DESCRIPTOR_NAME,))
+    if result is None:
+        raise ReplicationStateUnavailable("destination descriptor is unavailable")
+    payload, _ = result
+    try:
+        values = json.loads(payload)
+        persisted = DestinationDescriptor.model_validate(values)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplicationStateUnavailable("destination descriptor is invalid") from exc
+    if canonical_json_bytes(persisted.model_dump(mode="json")) != payload:
+        raise ReplicationStateUnavailable("destination descriptor is not canonical")
+    if persisted.model_dump(mode="json") != expected.model_dump(mode="json"):
+        raise ReplicationStateUnavailable("destination descriptor does not match expected")
+    persisted._root_path = expected.root_path
+    persisted.verify()
+    persisted.verify_root_fd(root_fd)
+    return persisted
 
 
 def _destination_lock(root_fd: int) -> tuple[int, int, list[int]]:
@@ -5262,6 +5383,8 @@ def initialize_destination(
     *,
     acknowledgement: str,
     single_writer_host_id: str = "local-host",
+    normalized_options: str = "",
+    volume_id: str | None = None,
     sentinel_bytes: bytes | None = None,
     local_root: Path | None = None,
     created_at: str | None = None,
@@ -5306,6 +5429,8 @@ def initialize_destination(
         sentinel_sha256=_sha256_bytes(sentinel),
         mount_point=str(bound),
         fs_type="local",
+        normalized_options=normalized_options,
+        volume_id=volume_id,
         created_at=created_at,
         local_root=local_root,
     )
@@ -5633,6 +5758,82 @@ class DestinationArchiveReader:
                     _close_descriptors(dirs, failures)
                     _finish_cleanup(None, failures)
 
+    def verify_record(self, root_dirfd: int, replication_generation: str) -> ReplicationRecord:
+        """Verify one immutable generation independently of ``head.json``."""
+        self.read_sentinel(root_dirfd)
+        record = self.read_record(replication_generation, root_dirfd)
+        expected_generation = domain_sha256(
+            "stock-eva/r2f4.3/replication-generation/v1",
+            {
+                "destination_id": record.destination_id,
+                "source_instance_id": record.source_instance_id,
+                "source_sequence": record.source_sequence,
+                "checkpoint_id": record.checkpoint_id,
+                "publication_binding_sha256": record.publication_binding_sha256,
+                "source_object_set_sha256": record.source_object_set_sha256,
+                "parent_record_hash": record.parent_record_hash,
+                "plan_sha256": record.plan_sha256,
+            },
+        )
+        if expected_generation != record.replication_generation:
+            raise ReplicationStateUnavailable("destination generation identity is invalid")
+        self._validate_history_namespace(root_dirfd)
+        self._verify_parent_chain(root_dirfd, record)
+        generation_fd, dirs = self._open_generation(root_dirfd, replication_generation)
+        try:
+            generation_sentinel = _destination_read_at(
+                generation_fd,
+                (DESTINATION_SENTINEL_NAME,),
+                require_private_mode=False,
+            )
+            if (
+                generation_sentinel is None
+                or _sha256_bytes(generation_sentinel[0]) != self.descriptor.sentinel_sha256
+            ):
+                raise ReplicationStateUnavailable("destination generation sentinel mismatch")
+            manifest = self.read_manifest(generation_fd)
+            _parse_destination_manifest(
+                manifest, expected_sha256=record.destination_manifest_bytes_sha256
+            )
+            expected_files = {
+                "manifest.json",
+                DESTINATION_SENTINEL_NAME,
+                "replication-record.json",
+                *(item.relative_path for item in record.object_inventory),
+            }
+            if _destination_list_files(generation_fd) != expected_files:
+                raise ReplicationStateUnavailable("destination object inventory is incomplete")
+            for item in record.object_inventory:
+                payload = _destination_read_relative(generation_fd, item.relative_path)
+                if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+                    raise ReplicationStateUnavailable("destination object verification failed")
+        finally:
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(None, failures)
+        return record
+
+    def list_verified_records(self, root_dirfd: int) -> tuple[ReplicationRecord, ...]:
+        """Strictly read every final history generation before a mutation."""
+        history_fd, dirs = _destination_open_dirs(
+            root_dirfd, (DESTINATION_REPLICATION_DIR, DESTINATION_HISTORY_DIR)
+        )
+        primary: BaseException | None = None
+        try:
+            names = os.listdir(history_fd)
+        except OSError as exc:
+            primary = ReplicationStateUnavailable("destination history listing is unavailable")
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(primary, failures)
+        records: list[ReplicationRecord] = []
+        for name in sorted(names):
+            if re.fullmatch(r"[0-9a-f]{64}", name):
+                records.append(self.verify_record(root_dirfd, name))
+        return tuple(records)
+
     def verify_commit(
         self,
         *,
@@ -5665,58 +5866,7 @@ class DestinationArchiveReader:
                 or head.object_set_sha256 != record.destination_object_set_sha256
             ):
                 raise ReplicationStateUnavailable("destination head projection is inconsistent")
-            expected_generation = domain_sha256(
-                "stock-eva/r2f4.3/replication-generation/v1",
-                {
-                    "destination_id": record.destination_id,
-                    "source_instance_id": record.source_instance_id,
-                    "source_sequence": record.source_sequence,
-                    "checkpoint_id": record.checkpoint_id,
-                    "publication_binding_sha256": record.publication_binding_sha256,
-                    "source_object_set_sha256": record.source_object_set_sha256,
-                    "parent_record_hash": record.parent_record_hash,
-                    "plan_sha256": record.plan_sha256,
-                },
-            )
-            if expected_generation != record.replication_generation:
-                raise ReplicationStateUnavailable("destination generation identity is invalid")
-            self._validate_history_namespace(root_fd)
-            self._verify_parent_chain(root_fd, record)
-            generation_fd, dirs = self._open_generation(root_fd, generation)
-            try:
-                generation_sentinel = _destination_read_at(
-                    generation_fd,
-                    (DESTINATION_SENTINEL_NAME,),
-                    require_private_mode=False,
-                )
-                if (
-                    generation_sentinel is None
-                    or _sha256_bytes(generation_sentinel[0]) != self.descriptor.sentinel_sha256
-                ):
-                    raise ReplicationStateUnavailable("destination generation sentinel mismatch")
-                manifest = self.read_manifest(generation_fd)
-                _parse_destination_manifest(
-                    manifest, expected_sha256=record.destination_manifest_bytes_sha256
-                )
-                expected_files = {
-                    "manifest.json",
-                    DESTINATION_SENTINEL_NAME,
-                    "replication-record.json",
-                    *(item.relative_path for item in record.object_inventory),
-                }
-                if _destination_list_files(generation_fd) != expected_files:
-                    raise ReplicationStateUnavailable("destination object inventory is incomplete")
-                for item in record.object_inventory:
-                    payload = _destination_read_relative(generation_fd, item.relative_path)
-                    if (
-                        len(payload) != item.size_bytes
-                        or _sha256_bytes(payload) != item.object_sha256
-                    ):
-                        raise ReplicationStateUnavailable("destination object verification failed")
-            finally:
-                failures: list[str] = []
-                _close_descriptors(dirs, failures)
-                _finish_cleanup(None, failures)
+            self.verify_record(root_fd, generation)
             return VerifiedDestinationCommitProof(
                 intent_id=intent_id,
                 checkpoint_id=checkpoint_id,
@@ -5728,7 +5878,6 @@ class DestinationArchiveReader:
                 worker_id=worker_id,
                 state_version=state_version,
                 now=now or _utc_now(),
-                _token=_DESTINATION_PROOF_TOKEN,
             )
 
     def _validate_history_namespace(self, root_fd: int) -> None:
@@ -5748,10 +5897,13 @@ class DestinationArchiveReader:
                     if not stat.S_ISDIR(info.st_mode):
                         raise ReplicationStateUnavailable("destination generation entry is invalid")
                     continue
+                # A crashed/incomplete destination generation is an orphan,
+                # not a recoverable history record.  It must be quarantined
+                # by an explicit operator before another writer can mutate
+                # the namespace; silently cleaning it here would violate the
+                # pre-mutation zero-write trust proof.
                 if name.startswith(".") and name.endswith(".staging"):
-                    if not stat.S_ISDIR(info.st_mode):
-                        raise ReplicationStateUnavailable("destination staging entry is invalid")
-                    continue
+                    raise ReplicationStateUnavailable("destination staging orphan is unsafe")
                 raise ReplicationStateUnavailable("destination history entry is unknown")
         except ReplicationStateUnavailable as exc:
             primary = exc
@@ -5853,6 +6005,36 @@ class DestinationArchiveReader:
             ):
                 return True
         return False
+
+
+class DestinationCommitVerifier:
+    """Fresh, descriptor-native verifier used by sidecar completion."""
+
+    def __init__(self, descriptor: DestinationDescriptor | Path) -> None:
+        self.reader = DestinationArchiveReader(descriptor)
+
+    def verify(self, proof: VerifiedDestinationCommitProof) -> VerifiedDestinationCommitProof:
+        if not isinstance(proof, VerifiedDestinationCommitProof):
+            raise ReplicationDurabilityError("destination completion proof is invalid")
+        if proof.intent_id is None or proof.worker_id is None or proof.state_version is None:
+            raise ReplicationDurabilityError("destination completion proof is incomplete")
+        try:
+            refreshed = self.reader.verify_commit(
+                intent_id=proof.intent_id,
+                checkpoint_id=proof.checkpoint_id,
+                source_sequence=proof.source_sequence,
+                worker_id=proof.worker_id,
+                state_version=proof.state_version,
+                destination_generation=proof.destination_generation,
+                now=proof.now,
+            )
+        except (ReplicationDurabilityError, ValueError) as exc:
+            raise ReplicationStateUnavailable(
+                "destination completion proof cannot be freshly verified"
+            ) from exc
+        if refreshed != proof:
+            raise ReplicationStateUnavailable("destination completion proof is stale")
+        return refreshed
 
 
 @contextmanager
@@ -6029,7 +6211,13 @@ def build_destination_head(
 class DestinationArchiveWriter:
     """Offline/fake destination writer with one descriptor-bound lock."""
 
-    def __init__(self, descriptor: DestinationDescriptor | Path, *, source_root: Path) -> None:
+    def __init__(
+        self,
+        descriptor: DestinationDescriptor | Path,
+        *,
+        source_root: Path,
+        writer_host_id: str,
+    ) -> None:
         self.descriptor = (
             descriptor
             if isinstance(descriptor, DestinationDescriptor)
@@ -6040,6 +6228,9 @@ class DestinationArchiveWriter:
             )
         )
         self.source_root = _physical_path(Path(source_root))
+        self.writer_host_id = writer_host_id
+        if writer_host_id != self.descriptor.single_writer_host_id:
+            raise ReplicationDurabilityError("destination writer host is not authorized")
         _validate_source_root(self.source_root)
         if (
             self.source_root == self.descriptor.root_path
@@ -6061,17 +6252,93 @@ class DestinationArchiveWriter:
         replication_fd: int,
     ) -> DestinationReplicationResult:
         reader = DestinationArchiveReader(self.descriptor)
+        head_committed = False
         _destination_assert_lock(replication_fd, lock_fd, lock_identity)
         # The destination role/sentinel is part of the trust boundary and
         # must be proven before staging any new generation.  Otherwise a
         # tampered empty archive could advance its head and only be noticed by
         # the post-commit reader.
-        reader.read_sentinel(root_fd)
-        baseline = reader.read_head(root_fd)
-        if baseline is None and source_sequence != 1:
-            # A sequence without a committed parent is not an admissible
-            # genesis.  Reject before creating staging or a visible record.
-            raise ReplicationStateUnavailable("destination lineage genesis is invalid")
+        try:
+            reader.read_sentinel(root_fd)
+            reader._validate_history_namespace(root_fd)
+            history_records = reader.list_verified_records(root_fd)
+            baseline = reader.read_head(root_fd)
+        except ReplicationStateUnavailable as exc:
+            reason = "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
+            return DestinationReplicationResult("unavailable", reason)
+        except ReplicationDurabilityError:
+            return DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED")
+
+        def matches_checkpoint(candidate: ReplicationRecord, parent_record_hash: str) -> bool:
+            """Prove a recovered record is the exact incoming checkpoint."""
+            plan_sha256 = _destination_plan_hash(self.descriptor, checkpoint)
+            expected_generation = _destination_record_generation(
+                descriptor=self.descriptor,
+                checkpoint=checkpoint,
+                source_sequence=source_sequence,
+                parent_record_hash=parent_record_hash,
+                plan_sha256=plan_sha256,
+            )
+            if candidate.replication_generation != expected_generation:
+                return False
+            if (
+                candidate.destination_manifest_bytes_sha256
+                != checkpoint.source_manifest_bytes_sha256
+            ):
+                return False
+            expected = _destination_record(
+                self.descriptor,
+                checkpoint,
+                source_sequence=source_sequence,
+                parent_record_hash=parent_record_hash,
+                plan_sha256=plan_sha256,
+                destination_manifest_bytes_sha256=checkpoint.source_manifest_bytes_sha256,
+                created_at=candidate.created_at,
+                replication_generation=expected_generation,
+            )
+            return expected.model_dump(mode="json") == candidate.model_dump(mode="json")
+
+        if baseline is None:
+            matching_orphans = [
+                candidate
+                for candidate in history_records
+                if candidate.checkpoint_id == checkpoint.checkpoint_id
+                and candidate.source_instance_id == checkpoint.source_instance_id
+                and candidate.source_sequence == source_sequence
+                and matches_checkpoint(candidate, ZERO_SHA256)
+            ]
+            if matching_orphans:
+                if (
+                    len(matching_orphans) != 1
+                    or source_sequence != 1
+                    or matching_orphans[0].parent_record_hash != ZERO_SHA256
+                ):
+                    raise ReplicationStateUnavailable("destination orphan generation conflicts")
+                orphan = matching_orphans[0]
+                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                recovered_head = _destination_head(
+                    self.descriptor, orphan, head_version=1, updated_at=now
+                )
+                _destination_replace_at(
+                    replication_fd,
+                    "head.json",
+                    canonical_json_bytes(recovered_head.model_dump(mode="json")),
+                    expected=None,
+                )
+                head_committed = True
+                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                proof = reader.verify_commit(
+                    intent_id=intent_id,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    source_sequence=source_sequence,
+                    destination_generation=orphan.replication_generation,
+                    now=now,
+                )
+                return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
+            if history_records or source_sequence != 1:
+                # A sequence without a committed parent, or any unrelated
+                # orphan generation, is not an admissible new genesis.
+                raise ReplicationStateUnavailable("destination lineage genesis is invalid")
         if baseline is not None:
             baseline_record = reader.read_record(baseline.replication_generation, root_fd)
             if baseline_record.record_sha256 != baseline.record_sha256:
@@ -6081,6 +6348,66 @@ class DestinationArchiveWriter:
                 source_sequence=baseline.source_sequence,
                 now=now,
             )
+            baseline_chain_hashes: set[str] = set()
+            current_record = baseline_record
+            records_by_hash = {record.record_sha256: record for record in history_records}
+            if len(records_by_hash) != len(history_records):
+                raise ReplicationStateUnavailable("destination history contains duplicate records")
+            while True:
+                if current_record.record_sha256 in baseline_chain_hashes:
+                    raise ReplicationStateUnavailable("destination lineage is cyclic")
+                baseline_chain_hashes.add(current_record.record_sha256)
+                if current_record.parent_record_hash == ZERO_SHA256:
+                    break
+                current_record = records_by_hash.get(current_record.parent_record_hash)
+                if current_record is None:
+                    raise ReplicationStateUnavailable("destination lineage parent is missing")
+            orphan_records = [
+                record
+                for record in history_records
+                if record.record_sha256 not in baseline_chain_hashes
+            ]
+            if orphan_records:
+                matching_orphans = [
+                    record
+                    for record in orphan_records
+                    if record.checkpoint_id == checkpoint.checkpoint_id
+                    and record.source_instance_id == checkpoint.source_instance_id
+                    and record.source_sequence == source_sequence
+                    and record.parent_record_hash == baseline.record_sha256
+                    and matches_checkpoint(record, baseline.record_sha256)
+                ]
+                if (
+                    len(orphan_records) != 1
+                    or len(matching_orphans) != 1
+                    or source_sequence != baseline.source_sequence + 1
+                ):
+                    raise ReplicationStateUnavailable("destination orphan generation conflicts")
+                orphan = matching_orphans[0]
+                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                recovered_head = _destination_head(
+                    self.descriptor,
+                    orphan,
+                    head_version=baseline.head_version + 1,
+                    updated_at=now,
+                )
+                baseline_bytes = canonical_json_bytes(baseline.model_dump(mode="json"))
+                _destination_replace_at(
+                    replication_fd,
+                    "head.json",
+                    canonical_json_bytes(recovered_head.model_dump(mode="json")),
+                    expected=baseline_bytes,
+                )
+                head_committed = True
+                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                proof = reader.verify_commit(
+                    intent_id=intent_id,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    source_sequence=source_sequence,
+                    destination_generation=orphan.replication_generation,
+                    now=now,
+                )
+                return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
             if baseline.source_instance_id != checkpoint.source_instance_id:
                 return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
             if baseline.source_sequence > source_sequence:
@@ -6119,7 +6446,6 @@ class DestinationArchiveWriter:
         staging_name = f".{generation}.staging"
         staging_fd: int | None = None
         linked = False
-        head_committed = False
         try:
             try:
                 os.mkdir(staging_name, mode=0o700, dir_fd=history_fd)
@@ -6237,9 +6563,10 @@ class DestinationArchiveWriter:
             return DestinationReplicationResult(
                 "unavailable", reason, destination_writes=head_committed
             )
-        except ReplicationDurabilityError:
+        except ReplicationDurabilityError as exc:
+            reason = "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
             return DestinationReplicationResult(
-                "unavailable", "COPY_FAILED", destination_writes=head_committed
+                "unavailable", reason, destination_writes=head_committed
             )
         finally:
             if staging_fd is not None:
@@ -6280,6 +6607,8 @@ class DestinationArchiveWriter:
                 raise ReplicationDurabilityError("source sequence is invalid")
             occurred_at = now or _utc_now()
             _validate_utc_timestamp(occurred_at, "now")
+            if self.writer_host_id != self.descriptor.single_writer_host_id:
+                raise ReplicationDurabilityError("destination writer host is not authorized")
             self.descriptor.verify_bound()
             with _destination_root_session(self.descriptor) as root_fd:
                 replication_fd, lock_fd, lock_identity = _destination_lock(root_fd)
@@ -6344,6 +6673,8 @@ def build_destination_descriptor(
     root: Path,
     *,
     single_writer_host_id: str = "local-host",
+    normalized_options: str = "",
+    volume_id: str | None = None,
     sentinel_sha256: str = ZERO_SHA256,
     local_root: Path | None = None,
     created_at: str | None = None,
@@ -6352,6 +6683,8 @@ def build_destination_descriptor(
     return DestinationDescriptor.from_root(
         root,
         single_writer_host_id=single_writer_host_id,
+        normalized_options=normalized_options,
+        volume_id=volume_id,
         sentinel_sha256=sentinel_sha256,
         local_root=local_root,
         created_at=created_at,
@@ -6361,6 +6694,12 @@ def build_destination_descriptor(
 def _destination_replace_at(
     parent_fd: int, name: str, payload: bytes, *, expected: bytes | None
 ) -> None:
+    """CAS-install a regular pointer without unconditional overwrite.
+
+    A missing pointer uses exclusive hard-link installation.  Replacing an
+    existing pointer uses the platform's atomic exchange primitive; a
+    filesystem without either capability is explicitly unsupported.
+    """
     current = _destination_read_at(parent_fd, (name,), optional=True)
     current_bytes = current[0] if current is not None else None
     if current_bytes != expected:
@@ -6381,7 +6720,25 @@ def _destination_replace_at(
         current = _destination_read_at(parent_fd, (name,), optional=True)
         if (current[0] if current is not None else None) != expected:
             raise ReplicationCASConflict("destination head CAS conflict")
-        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        if expected is None:
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise ReplicationCASConflict("destination head CAS conflict") from exc
+            except OSError as exc:
+                if exc.errno in {errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EPERM}:
+                    raise ReplicationDurabilityError(
+                        "destination head install unsupported"
+                    ) from exc
+                raise ReplicationDurabilityError("destination head install failed") from exc
+        else:
+            _destination_exchange(parent_fd, temporary, name)
         _fsync_open_directory(parent_fd)
     except ReplicationDurabilityError:
         raise
@@ -6405,10 +6762,7 @@ def _complete_replication_with_proof(
     store: ImmutableReplicationSidecarStore,
     proof: VerifiedDestinationCommitProof,
 ) -> ReplicationHead:
-    if (
-        not isinstance(proof, VerifiedDestinationCommitProof)
-        or proof._token is not _DESTINATION_PROOF_TOKEN
-    ):
+    if not isinstance(proof, VerifiedDestinationCommitProof):
         raise ReplicationDurabilityError(
             "replication completion requires a dedicated verified destination proof"
         )
@@ -6500,6 +6854,7 @@ __all__ = [
     "DestinationDescriptor",
     "DestinationTrust",
     "DestinationArchiveReader",
+    "DestinationCommitVerifier",
     "DestinationArchiveWriter",
     "DestinationReplicationService",
     "ReplicationDestinationWriter",

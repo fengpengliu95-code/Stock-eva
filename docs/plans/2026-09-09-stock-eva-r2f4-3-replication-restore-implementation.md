@@ -2377,8 +2377,9 @@ The generic local `transition` operation MUST reject `to_state="replicated"` bef
 mutating a sidecar generation. Caller-supplied destination generation, record or head digests do
 not constitute destination authority and can never authorize completion. The dedicated
 `complete_replication(VerifiedDestinationCommitProof)` seam remains distinct from generic local
-transitions; Batch3 supplies the descriptor-native destination reader and private proof token,
-and only a proof produced after record/head/object readback may complete a leased intent. Existing
+transitions; Batch3 supplies a frozen closed proof projection, not a secrecy-based private token.
+Only a configured `DestinationCommitVerifier` that freshly rereads and verifies the persisted
+descriptor, head, record and every object may authorize completion of a leased intent. Existing
 generic transition tests MUST still prove zero sidecar writes and preservation of the leased
 `verifying` head.
 
@@ -2422,9 +2423,29 @@ and `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_b
 `DestinationArchiveWriter` used by offline fake-destination tests. It stages the complete
 inventory, manifest and sentinel, verifies size/hash readback, installs an immutable
 `replication-record.json` generation with the normative closed fields, and atomically CAS
-advances `_replication/head.json` under the descriptor-bound single-writer lock. The reader
-recomputes record/head hashes, checks parent lineage and rejects symlinks, extras, missing or
-changed objects. `VerifiedDestinationCommitProof` is reader-owned and is the only input accepted
-by the dedicated sidecar completion seam; generic local transitions still reject `replicated`.
+advances `_replication/head.json` under the descriptor-bound single-writer lock. History
+generation installation uses same-parent no-replace primitives (`renameatx_np(RENAME_EXCL)`/
+`renameat2` where available, otherwise exclusive hard-link installation for regular files); head
+creation uses exclusive hard-link installation and an existing-head CAS uses an atomic native
+exchange. There is no stat-then-rename or unconditional `os.replace` fallback; unsupported
+filesystems return typed `MOUNT_UNSUPPORTED`. A legacy descriptor missing normalized-options or
+volume-id is never adopted or silently rewritten; only an explicitly empty destination may be
+initialized with a new descriptor. The reader recomputes record/head hashes, checks
+parent lineage and rejects symlinks, extras, missing or changed objects. The persisted descriptor
+includes normalized mount-options, volume-id and configured single-writer host identity; each
+operation rereads and byte-compares it before mutation. `VerifiedDestinationCommitProof` is a
+frozen closed projection and the dedicated sidecar completion seam invokes a configured
+descriptor-native verifier for fresh descriptor/head/record/object readback; generic local
+transitions still reject `replicated`.
+The Batch3 attack/regression anchors are
+`tests/test_replication_destination_batch3.py::test_writer_revalidates_persisted_descriptor_and_host_before_mutation`,
+`tests/test_replication_destination_batch3.py::test_history_pollution_is_rejected_before_first_no_head_mutation`,
+`tests/test_replication_destination_batch3.py::test_history_staging_orphan_is_rejected_before_mutation`,
+`tests/test_replication_destination_batch3.py::test_orphan_generation_is_recovered_without_recopied_source`,
+`tests/test_replication_destination_batch3.py::test_orphan_child_generation_is_recovered_without_recopied_source`,
+`tests/test_replication_destination_batch3.py::test_completion_rejects_unconfigured_or_mutated_proof_before_sidecar_write`,
+`tests/test_replication_destination_batch3.py::test_destination_head_install_never_uses_unconditional_replace`,
+`tests/test_replication_destination_batch3.py::test_destination_no_replace_install_unsupported_is_typed_and_zero_head_write`,
+and `tests/test_replication_destination_batch3.py::test_destination_writer_requires_explicit_configured_host_identity`.
 This batch remains offline-only: no NAS/SMB, provider, restore, API/CLI/automation wiring or
 production enablement is included.

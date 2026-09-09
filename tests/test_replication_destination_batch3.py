@@ -8,6 +8,7 @@ import backend.app.storage.replication as replication
 from backend.app.storage.replication import (
     DestinationArchiveReader,
     DestinationArchiveWriter,
+    DestinationCommitVerifier,
     DestinationDescriptor,
     ReplicationDurabilityError,
     ReplicationSidecarStore,
@@ -79,6 +80,22 @@ def test_destination_descriptor_rejects_unsafe_root_and_binds_digest(tmp_path: P
         tampered.verify()
 
 
+def test_destination_writer_requires_explicit_configured_host_identity(tmp_path: Path) -> None:
+    source, _checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+        single_writer_host_id="host-a",
+    )
+    with pytest.raises(TypeError):
+        DestinationArchiveWriter(descriptor, source_root=source)
+    with pytest.raises(ReplicationDurabilityError):
+        DestinationArchiveWriter(descriptor, source_root=source, writer_host_id="host-b")
+
+
 def test_destination_copy_publishes_record_and_head_only_after_readback(tmp_path: Path) -> None:
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"
@@ -91,9 +108,9 @@ def test_destination_copy_publishes_record_and_head_only_after_readback(tmp_path
     )
     persisted = DestinationArchiveReader(destination).descriptor
     assert persisted.model_dump(mode="json") == descriptor.model_dump(mode="json")
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "NONE"
     reader = DestinationArchiveReader(descriptor)
     head = reader.read_head()
@@ -114,13 +131,39 @@ def test_destination_copy_is_idempotent_and_does_not_overwrite_head(tmp_path: Pa
         sentinel_bytes=sentinel,
         single_writer_host_id="host-a",
     )
-    writer = DestinationArchiveWriter(descriptor, source_root=source)
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
     first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     head_bytes = (destination / "_replication" / "head.json").read_bytes()
     second = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:02:00Z")
     assert first.record is not None
     assert second.reason_code == "ALREADY_REPLICATED"
     assert (destination / "_replication" / "head.json").read_bytes() == head_bytes
+
+
+def test_destination_head_install_never_uses_unconditional_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+
+    def fail_unconditional_replace(*args: object, **kwargs: object) -> None:
+        raise AssertionError("destination head must not use unconditional replace")
+
+    monkeypatch.setattr(replication.os, "replace", fail_unconditional_replace)
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    assert writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z").record
+    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
+    assert second.reason_code == "NONE"
 
 
 def test_verified_proof_is_required_for_sidecar_completion(tmp_path: Path) -> None:
@@ -133,7 +176,10 @@ def test_verified_proof_is_required_for_sidecar_completion(tmp_path: Path) -> No
         sentinel_bytes=sentinel,
         single_writer_host_id="host-a",
     )
-    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar = ReplicationSidecarStore(
+        tmp_path / "control" / "replication-sidecar",
+        destination_verifier=DestinationCommitVerifier(descriptor),
+    )
     sidecar.initialize(
         source_instance_id=checkpoint.source_instance_id,
         source_instance_sha256=checkpoint.source_instance_sha256,
@@ -153,9 +199,9 @@ def test_verified_proof_is_required_for_sidecar_completion(tmp_path: Path) -> No
         to_state="verifying",
         now="2026-09-09T00:01:01Z",
     )
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=claim.source_sequence, now="2026-09-09T00:01:02Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=claim.source_sequence, now="2026-09-09T00:01:02Z")
     proof = DestinationArchiveReader(descriptor).verify_commit(
         intent_id=intent.intent_id,
         checkpoint_id=checkpoint.checkpoint_id,
@@ -169,6 +215,254 @@ def test_verified_proof_is_required_for_sidecar_completion(tmp_path: Path) -> No
     assert completed.current_state == "replicated"
 
 
+def test_completion_rejects_unconfigured_or_mutated_proof_before_sidecar_write(
+    tmp_path: Path,
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    result = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.record is not None
+    proof = DestinationArchiveReader(descriptor).verify_commit(
+        checkpoint_id=checkpoint.checkpoint_id,
+        source_sequence=1,
+        now="2026-09-09T00:01:01Z",
+    )
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(
+        source_instance_id=checkpoint.source_instance_id,
+        source_instance_sha256=checkpoint.source_instance_sha256,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    intent = sidecar.enqueue_checkpoint(
+        checkpoint,
+        operation_day="2026-09-09",
+        destination_id=descriptor.destination_id,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    claim = sidecar.claim_due(worker_id="worker-a", now="2026-09-09T00:01:00Z")
+    assert claim is not None
+    verifying = sidecar.transition(
+        intent_id=intent.intent_id,
+        worker_id="worker-a",
+        expected_state_version=claim.state_version,
+        to_state="verifying",
+        now="2026-09-09T00:01:00Z",
+    )
+    proof = proof.model_copy(
+        update={
+            "intent_id": intent.intent_id,
+            "worker_id": "worker-a",
+            "state_version": verifying.state_version,
+        }
+    )
+    with pytest.raises(ReplicationDurabilityError):
+        sidecar.complete_replication(proof)
+
+    class FakeVerifier(DestinationCommitVerifier):
+        def verify(
+            self, candidate: VerifiedDestinationCommitProof
+        ) -> VerifiedDestinationCommitProof:
+            return candidate
+
+    with pytest.raises(ReplicationDurabilityError):
+        ReplicationSidecarStore(
+            tmp_path / "control" / "replication-sidecar",
+            destination_verifier=FakeVerifier(descriptor),
+        ).complete_replication(proof)
+    configured = ReplicationSidecarStore(
+        tmp_path / "control" / "replication-sidecar",
+        destination_verifier=DestinationCommitVerifier(descriptor),
+    )
+    mutated = proof.model_copy(update={"destination_head_sha256": "1" * 64})
+    with pytest.raises(ReplicationDurabilityError):
+        configured.complete_replication(mutated)
+    assert configured.read_status().verifying_count == 1
+
+
+def test_writer_revalidates_persisted_descriptor_and_host_before_mutation(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+        single_writer_host_id="host-a",
+    )
+    descriptor_path = destination / ".stock-eva-replication-destination.json"
+    values = descriptor.model_dump(mode="json")
+    values["single_writer_host_id"] = "host-b"
+    values["descriptor_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/destination-descriptor/v1",
+        {key: value for key, value in values.items() if key != "descriptor_sha256"},
+    )
+    descriptor_path.write_bytes(canonical_json_bytes(values))
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id="host-a"
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.reason_code == "DESTINATION_TRUST_FAILED"
+    assert not (destination / "_replication" / "head.json").exists()
+
+
+def test_legacy_descriptor_missing_mount_fields_is_not_adopted(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    values = descriptor.model_dump(mode="json")
+    values.pop("normalized_options")
+    values.pop("volume_id")
+    values["descriptor_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/destination-descriptor/v1",
+        {key: value for key, value in values.items() if key != "descriptor_sha256"},
+    )
+    (destination / ".stock-eva-replication-destination.json").write_bytes(
+        canonical_json_bytes(values)
+    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.reason_code == "DESTINATION_TRUST_FAILED"
+    assert not (destination / "_replication" / "head.json").exists()
+
+
+def test_history_pollution_is_rejected_before_first_no_head_mutation(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    (destination / "_replication" / "history" / "unknown").write_bytes(b"x")
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.reason_code == "DESTINATION_TRUST_FAILED"
+    assert not (destination / "_replication" / "head.json").exists()
+
+
+def test_history_staging_orphan_is_rejected_before_mutation(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    staging = destination / "_replication" / "history" / ("." + "a" * 64 + ".staging")
+    staging.mkdir()
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.reason_code == "DESTINATION_TRUST_FAILED"
+    assert not (destination / "_replication" / "head.json").exists()
+
+
+def test_orphan_generation_is_recovered_without_recopied_source(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert first.record is not None
+    (destination / "_replication" / "head.json").unlink()
+    original_read = replication._destination_read_relative
+
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+
+    def fail_source_read(fd: int, relative_path: str) -> bytes:
+        if (
+            (os_stat := replication.os.fstat(fd)).st_dev,
+            os_stat.st_ino,
+        ) == source_identity and relative_path in {
+            "bars.parquet",
+            "manifest.json",
+            ".stock-eva-dataset.json",
+        }:
+            raise AssertionError("orphan recovery recopied source")
+        return original_read(fd, relative_path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(replication, "_destination_read_relative", fail_source_read)
+    try:
+        recovered = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:02:00Z")
+    finally:
+        monkeypatch.undo()
+    assert recovered.reason_code == "NONE"
+    assert (destination / "_replication" / "head.json").exists()
+
+
+def test_orphan_child_generation_is_recovered_without_recopied_source(
+    tmp_path: Path,
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert first.record is not None
+    head_path = destination / "_replication" / "head.json"
+    first_head = head_path.read_bytes()
+    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
+    assert second.record is not None
+    head_path.write_bytes(first_head)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    original_read = replication._destination_read_relative
+
+    def fail_source_read(fd: int, relative_path: str) -> bytes:
+        info = replication.os.fstat(fd)
+        if (info.st_dev, info.st_ino) == source_identity and relative_path in {
+            "bars.parquet",
+            "manifest.json",
+            ".stock-eva-dataset.json",
+        }:
+            raise AssertionError("orphan recovery recopied source")
+        return original_read(fd, relative_path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(replication, "_destination_read_relative", fail_source_read)
+    try:
+        recovered = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
+    finally:
+        monkeypatch.undo()
+    assert recovered.reason_code == "NONE"
+    assert recovered.record is not None
+    assert recovered.record.replication_generation == second.record.replication_generation
+    assert DestinationArchiveReader(descriptor).read_head().replication_generation == (
+        second.record.replication_generation
+    )
+
+
 def test_destination_object_hash_failure_never_advances_head(tmp_path: Path) -> None:
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"
@@ -179,9 +473,9 @@ def test_destination_object_hash_failure_never_advances_head(tmp_path: Path) -> 
         sentinel_bytes=sentinel,
     )
     (source / "bars.parquet").write_bytes(b"tampered")
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "COPY_FAILED"
     assert not (destination / "_replication" / "head.json").exists()
 
@@ -195,7 +489,9 @@ def test_destination_older_source_cannot_overwrite_newer_head(tmp_path: Path) ->
         acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
         sentinel_bytes=sentinel,
     )
-    writer = DestinationArchiveWriter(descriptor, source_root=source)
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
     writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:01:30Z")
     before = (destination / "_replication" / "head.json").read_bytes()
@@ -216,9 +512,9 @@ def test_destination_lock_symlink_and_unsupported_mount_fail_closed(tmp_path: Pa
     lock = destination / "_replication" / ".writer.lock"
     lock.unlink()
     lock.symlink_to(tmp_path / "attacker")
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "MOUNT_UNSUPPORTED"
     assert not (destination / "_replication" / "head.json").exists()
     with pytest.raises(ReplicationDurabilityError):
@@ -235,9 +531,9 @@ def test_destination_sentinel_tamper_is_rejected_before_any_generation(tmp_path:
         sentinel_bytes=sentinel,
     )
     (destination / ".stock-eva-dataset.json").write_bytes(b"tampered")
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "DESTINATION_TRUST_FAILED"
     assert not (destination / "_replication" / "head.json").exists()
 
@@ -251,7 +547,9 @@ def test_destination_reader_rejects_head_alias_tamper_without_path_reopen(tmp_pa
         acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
         sentinel_bytes=sentinel,
     )
-    writer = DestinationArchiveWriter(descriptor, source_root=source)
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
     result = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.record is not None
     head_path = destination / "_replication" / "head.json"
@@ -280,9 +578,9 @@ def test_destination_source_symlink_is_copy_failure_and_not_published(tmp_path: 
         acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
         sentinel_bytes=sentinel,
     )
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "COPY_FAILED"
     assert not (destination / "_replication" / "head.json").exists()
 
@@ -305,24 +603,49 @@ def test_destination_partial_write_is_not_reported_as_success(
         raise ReplicationDurabilityError("injected partial destination write")
 
     monkeypatch.setattr(replication, "_write_fully", partial_write)
-    result = DestinationArchiveWriter(descriptor, source_root=source).replicate(
-        checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z"
-    )
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "COPY_FAILED"
     assert not (destination / "_replication" / "head.json").exists()
 
 
+def test_destination_no_replace_install_unsupported_is_typed_and_zero_head_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+
+    def unsupported_install(*args: object, **kwargs: object) -> None:
+        raise ReplicationDurabilityError("destination generation install unsupported")
+
+    monkeypatch.setattr(replication, "_destination_rename_noreplace", unsupported_install)
+    result = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert result.reason_code == "MOUNT_UNSUPPORTED"
+    assert not (destination / "_replication" / "head.json").exists()
+
+
 def test_verified_destination_proof_cannot_be_fabricated() -> None:
-    with pytest.raises(TypeError):
-        VerifiedDestinationCommitProof(
-            intent_id=None,
-            checkpoint_id="a" * 64,
-            destination_id="b" * 32,
-            source_sequence=1,
-            destination_generation="c" * 64,
-            destination_record_sha256="d" * 64,
-            destination_head_sha256="e" * 64,
-            worker_id=None,
-            state_version=None,
-            now="2026-09-09T00:00:00Z",
-        )
+    proof = VerifiedDestinationCommitProof(
+        intent_id=None,
+        checkpoint_id="a" * 64,
+        destination_id="b" * 32,
+        source_sequence=1,
+        destination_generation="c" * 64,
+        destination_record_sha256="d" * 64,
+        destination_head_sha256="e" * 64,
+        worker_id=None,
+        state_version=None,
+        now="2026-09-09T00:00:00Z",
+    )
+    assert proof.destination_id == "b" * 32
+    with pytest.raises((TypeError, ValueError)):
+        proof.destination_id = "f" * 32

@@ -1340,7 +1340,7 @@ The exact private descriptor filename is `.stock-eva-replication-destination.jso
 JSON (sorted keys, compact separators, UTF-8, one terminating newline) has exactly this schema:
 
 ```json
-{"descriptor_schema":"stock-eva/r2f4.3/destination/v1","schema_version":1,"dataset":"stock-eva-market","role":"nas_archive","direction":"local_to_nas","root_dev":0,"root_ino":0,"parent_dev":0,"parent_ino":0,"mount_point":"/private/approved/child","fs_type":"smbfs","mount_generation":"<64-hex>","mount_fingerprint":"<64-hex>","sentinel_sha256":"<64-hex>","single_writer_host_id":"<64-hex>","created_at":"2026-09-09T00:00:00Z","descriptor_sha256":"<64-hex>"}
+{"descriptor_schema":"stock-eva/r2f4.3/destination/v1","schema_version":1,"dataset":"stock-eva-market","role":"nas_archive","direction":"local_to_nas","root_dev":0,"root_ino":0,"parent_dev":0,"parent_ino":0,"mount_point":"/private/approved/child","fs_type":"local","normalized_options":"","volume_id":null,"mount_generation":"<64-hex>","mount_fingerprint":"<64-hex>","sentinel_sha256":"<64-hex>","single_writer_host_id":"<64-hex>","created_at":"2026-09-09T00:00:00Z","descriptor_sha256":"<64-hex>"}
 ```
 
 The placeholder values above are type examples only. `root_dev/root_ino` and
@@ -1348,7 +1348,9 @@ The placeholder values above are type examples only. `root_dev/root_ino` and
 `fs_type`, `mount_generation` and `mount_fingerprint` come from the mount inspector;
 `sentinel_sha256` binds the expected role/schema; `single_writer_host_id` identifies the sole
 approved writer host; `role` MUST equal `nas_archive` and direction MUST equal `local_to_nas`.
-`descriptor_sha256` is
+`normalized_options` is the canonical sorted mount-option projection (empty for the offline
+local fixture) and `volume_id` is the platform volume/filesystem identifier or JSON `null` when
+unavailable. `descriptor_sha256` is
 `domain_sha256('stock-eva/r2f4.3/destination-descriptor/v1', all other descriptor fields)`, and
 `destination_id` is the first 32 lower-case hex characters of that descriptor hash. The descriptor
 file is private control data: public API/CLI/status never returns its path or mount_point.
@@ -2571,14 +2573,40 @@ and `tests/test_dataset_replication.py::test_descriptor_cleanup_failure_without_
 The API/crosswalk/model change is additive to the local status projection only; canonical market
 data, NAS transfer and provider behavior remain unchanged.
 
+#### Batch3 destination archive amendment (offline implementation)
+
+The Batch3 destination writer is limited to local temporary fake archives. Before any destination
+mutation it rereads and byte-compares the persisted descriptor through the held root descriptor,
+validates the complete history namespace (including unknown, symlink, corrupt, orphan and
+conflicting generations), and requires an explicit configured `single_writer_host_id`; it never
+infers identity from the machine hostname. A valid same-checkpoint orphan may recover the head
+only after the complete record/object/parent-chain proof; unrelated or staging orphans fail closed
+with zero destination writes. `DestinationCommitVerifier` rereads descriptor, head, record and
+objects for every completion proof, so a constructible frozen proof cannot authorize a stale or
+mutated completion by itself. History and head installation use no-replace primitives only: native
+`renameatx_np(RENAME_EXCL)`/`renameat2` where available, exclusive hard-link installation for
+regular files, and native atomic exchange for an existing head. There is no stat-then-rename or
+unconditional overwrite fallback; unsupported filesystems return `MOUNT_UNSUPPORTED`. A legacy
+descriptor missing these fields is never adopted or silently rewritten; only an explicitly empty
+destination may be initialized with a new descriptor. The exact offline anchors are the Batch3
+tests in the companion implementation plan, especially
+`test_writer_revalidates_persisted_descriptor_and_host_before_mutation`,
+`test_history_staging_orphan_is_rejected_before_mutation`,
+`test_orphan_child_generation_is_recovered_without_recopied_source`,
+`test_completion_rejects_unconfigured_or_mutated_proof_before_sidecar_write`, and
+`test_destination_no_replace_install_unsupported_is_typed_and_zero_head_write`.
+No real NAS/provider/API/CLI/automation wiring or production enablement is included.
+
 #### Batch2.1 outbox completion and descriptor-native staging amendment (normative)
 
 The generic local `transition` operation MUST reject `to_state="replicated"` before opening or
 mutating a sidecar generation. Caller-supplied destination generation, record or head digests do
 not constitute destination authority and can never authorize completion. The dedicated
 `complete_replication(VerifiedDestinationCommitProof)` seam is distinct from generic local
-transitions; Batch3's private proof token is emitted only by the strict destination archive
-reader after complete record/head/object verification. Existing generic transition tests MUST
+transitions; the proof is a frozen closed projection and is not trusted by secrecy or a private
+token. A configured `DestinationCommitVerifier` must freshly reread the persisted descriptor,
+head, record and every object through descriptor-bound readers, compare the complete proof, and
+only then may the sidecar completion transaction run. Existing generic transition tests MUST
 still prove zero sidecar writes and preservation of the leased `verifying` head.
 
 `import_journal_files` MUST open the explicit absolute journal root once through its trusted
