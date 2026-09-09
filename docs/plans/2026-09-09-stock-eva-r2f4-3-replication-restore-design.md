@@ -59,8 +59,10 @@ canonical pointer and cannot become a new source of market truth.
 ## Functional Requirements
 
 - FR-1: Replication MUST be an explicitly enabled capability with `STOCK_EVA_REPLICATION_ENABLED=false` as the default; disabled mode MUST perform zero outbox, destination, restore and provider work.
+- FR-1a: `replication_enabled` MUST only authorize local checkpoint capture/enqueue. Automated NAS draining additionally requires `STOCK_EVA_MARKET_REPLICATION_DRAIN_ENABLED=true`, a validated approved descriptor and the project writer lock; the setting defaults to false and the CLI `--execute` is an independent explicit operator authorization.
 - FR-2: A successful local canonical publication MUST define a deterministic replication intent from the committed local manifest/pointer identity; replication MUST observe the committed pointer and MUST NOT fetch or republish market data.
 - FR-3: The canonical publication transaction MUST commit before any outbox enqueue attempt; an enqueue failure MUST NOT roll back, hide, or change a ready local pointer.
+- FR-3a: Before every next canonical pointer commit, a refresh-lock durability guard MUST prove or durably establish the current singleton checkpoint; failure MUST block only the next commit with `OUTBOX_DURABILITY_UNAVAILABLE` and MUST preserve the current ready pointer.
 - FR-4: The outbox MUST be a local durable SQLite sidecar with the normalized schema, immutable intent identity, allowlisted states, state-version CAS and durable terminal audit defined in this document.
 - FR-5: An enqueue failure MUST be observable as a sanitized `OUTBOX_ENQUEUE_FAILED` or `OUTBOX_JOURNALED` projection; a crash between pointer commit and enqueue MUST be recoverable by comparing the current strict source manifest with durable outbox/journal state.
 - FR-6: Source discovery MUST use one descriptor-bound strict snapshot of the local immutable sentinel, manifest and every referenced Parquet object, including size, schema, row count, object hash, inode/fingerprint and source manifest bytes hash.
@@ -367,18 +369,19 @@ descriptor-read bytes and have no JSON preimage.
 The closed preimages are:
 
 ```text
-object_set_sha256 = domain_sha256("stock-eva/r2f4.3/object-set/v1", object_inventory)
-source_instance_id = domain_sha256("stock-eva/r2f4.3/source-instance/v1",
-  {pointer_db_device,pointer_db_inode,pointer_db_schema_digest,source_instance_nonce})
+source_object_set_sha256 = domain_sha256("stock-eva/r2f4.3/object-set/v1", object_inventory)
+source_instance_id = domain_sha256("stock-eva/r2f4.3/source-instance/v2",
+  {canonical_root_path,canonical_schema_digest,source_instance_domain,fsync_contract,source_instance_nonce,
+   pointer_db_device,pointer_db_inode})
 checkpoint_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1",
-  {source_instance_id,pointer_row_sha256,pointer_generation,source_run_id,source_trade_date,
+  {source_instance_id,source_instance_sha256,pointer_row_sha256,pointer_generation,source_run_id,source_trade_date,
    source_published_at,pointer_db_device,pointer_db_inode,pointer_db_schema_digest,
-   manifest_canonical_sha256,source_manifest_bytes_sha256,object_set_sha256,object_inventory})
+   manifest_canonical_sha256,source_manifest_bytes_sha256,source_object_set_sha256,object_inventory})
 checkpoint_payload_sha256 = domain_sha256("stock-eva/r2f4.3/source-checkpoint-payload/v1",
-  {checkpoint_id,source_instance_id,pointer_row_sha256,pointer_generation,source_run_id,
+  {checkpoint_id,source_instance_id,source_instance_sha256,pointer_row_sha256,pointer_generation,source_run_id,
    source_trade_date,source_published_at,pointer_db_device,pointer_db_inode,
    pointer_db_schema_digest,manifest_canonical_sha256,source_manifest_bytes_sha256,
-   object_set_sha256,object_inventory})
+   source_object_set_sha256,object_inventory})
 plan_sha256 = domain_sha256("stock-eva/r2f4.3/replication-plan/v1",
   {direction,destination_id,checkpoint_id,object_inventory})
 intent_id = domain_sha256("stock-eva/r2f4.3/replication-intent/v1",
@@ -400,7 +403,8 @@ exposes no destination identifier unless it is an opaque 32-hex digest.
 
 | Entity | Fields | Constraints and purpose |
 |---|---|---|
-| `SourceCheckpoint` | checkpoint_id, source_instance_id, pointer DB device/inode/schema digest, singleton run/date/published_at, generation, manifest/object-set hashes, complete inventory | Created from the committed pointer before sequence allocation; checkpoint_id excludes source_sequence and never changes canonical rows/files. |
+| `SourceInstanceRecord` | source_instance_schema, schema_version, source_instance_id, canonical_root_path, canonical_schema_digest, source_instance_domain, fsync_contract, source_instance_nonce, pointer_db_device/inode, created_at, source_instance_sha256 | Private immutable `source-instance.json`; `fsync_contract=file_and_parent_directory`, O_EXCL/no-follow plus file/parent fsync; missing/conflicting identity blocks journal creation. |
+| `SourceCheckpoint` | checkpoint_id, source_instance_id, source_instance_sha256, pointer DB device/inode/schema digest, singleton run/date/published_at, generation, manifest/source_object_set hashes, complete inventory | Created from the committed pointer before sequence allocation; checkpoint_id excludes source_sequence and never changes canonical rows/files. |
 | `ReplicationIntent` | intent_id, operation_day, direction, destination_id, checkpoint_id, source sequence, plan/intent hashes, object/row/byte counts | Frozen after enqueue; deduplicated by destination/checkpoint and source sequence; operation_day is scheduling metadata only; no payload rows. |
 | `ReplicationAttemptEvent` | intent_id, event sequence, prev/event hashes, transition fields, attempt, state version, reason, timestamp, optional NAS record/head hashes | Append-only immutable evidence; contiguous replay from genesis; max six claims; result hashes bind the post-head sidecar audit to NAS. |
 | `ReplicationHead` | intent_id, state, state_version, lease owner/until, next attempt, last event sequence/reason | Mutable derived projection updated only by CAS in the same transaction as its event. |
@@ -456,18 +460,22 @@ first reduced to one of these allowlisted reasons and no second public mapping e
 | `SYMLINK_UNSAFE` | `unavailable` | 422 | 2 |
 | `DIRECTION_NOT_ALLOWED` | `unavailable` | 422 | 2 |
 
+The `NONE -> ready` row applies to status and execute; the sole plan-mode success projection is
+`mode=plan,status=dry_run,reason_code=NONE` with all effects false, and is covered by
+`test_market_replicate_plan_success_is_dry_run_reason_none_and_zero_write`.
+
 ### Transaction boundary
 
 The implementation MUST preserve this sequence:
 
 ```text
 strict provider/candidate gates
+  -> pre-publication durability guard under the existing refresh/control lock
   -> canonical immutable object + local manifest/pointer transaction commits
-  -> strict local pointer observation creates replication-only source checkpoint
-  -> canonical ready result becomes durable
+  -> frozen SourceCommit observation creates replication-only source checkpoint
   -> local outbox enqueue transaction (or atomic journal fallback)
   -> optional bounded destination drain
-  -> existing post-publish/shadow/universe work
+  -> unrelated downstream shadow/universe work
 ```
 
 The canonical transaction never depends on a NAS socket, destination lock, outbox SQLite commit or
@@ -491,7 +499,7 @@ writer observes the same committed pointer and creates it; it never refetches or
 | After record directory commit, before NAS head commit | ready | complete unselected record; current NAS head unchanged | replay verifies record and either advances head or isolates record |
 | After NAS head fsync, before sidecar result/cache | ready | new complete NAS head is authoritative; SQLite is stale only | next run reads NAS head/record and idempotently reconciles sidecar result/cache |
 | During NAS head replacement/fsync | ready | previous or new complete head, never partial | strict head reader accepts one committed state; retry is idempotent |
-| During restore directory rename | ready | no destination or one complete standard sentinel/manifest directory | strict `NasMarketStore` reader sees only the complete final directory |
+| During restore directory rename | ready | no destination or one complete standard sentinel/manifest directory | `DestinationArchiveReader` and the pure output validators see only the complete final directory |
 
 ### Destination and restore safety
 
@@ -501,8 +509,9 @@ control root, user database root, staging root, temporary root, share root or an
 environment path. A NAS replication record is publishable only when its lineage says
 `direction=local_to_nas` and its source object set is complete; the separate head is the only
 visible selector. Restore reads only the archive record, manifest and objects and writes a new temporary root using the existing
-standard sentinel/`manifest.json` reader, but never updates `MarketStore`, `NasMarketStore.control`,
-`CURRENT`, `published_snapshots`, canonical Parquet or the replication outbox.
+standard sentinel/`manifest.json` output validated by pure schema/Parquet readers, but never updates
+`MarketStore`, `NasMarketStore.control`, `CURRENT`, `published_snapshots`, canonical Parquet or the
+replication outbox.
 
 ## Out of Scope
 
@@ -534,8 +543,10 @@ real passing test/static check before an implementation release is considered.
 | ID | Exact planned evidence anchor |
 |---|---|
 | FR-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
+| FR-1a | `tests/test_dataset_replication.py::test_automation_drain_requires_flag_and_approved_descriptor` |
 | FR-2 | `tests/test_dataset_replication.py::test_source_checkpoint_binds_committed_pointer_without_canonical_mutation` |
 | FR-3 | `tests/test_dataset_replication.py::test_enqueue_failure_preserves_local_pointer_ready` |
+| FR-3a | `tests/test_dataset_replication.py::test_prepublication_guard_blocks_next_pointer_when_current_checkpoint_not_durable` |
 | FR-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
 | FR-5 | `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id` |
 | FR-6 | `tests/test_dataset_replication.py::test_source_checkpoint_rejects_missing_changed_or_corrupt_object` |
@@ -627,22 +638,112 @@ a database.
 The source checkpoint is replication-owned and is created only after the canonical pointer commit.
 It copies the exact original values from the strict pointer row: `run_id`, `trade_date`,
 `published_at`, plus the observed pointer DB `device`, `inode`, `schema_digest`,
-`manifest_canonical_sha256` and `object_set_sha256`. The sidecar meta row contains a persistent
-`source_instance_nonce`; it is replication control state and is never written to canonical
-storage. The source instance is rebuilt when device, inode or schema changes, and is computed from
-all four values `{pointer_db_device,pointer_db_inode,pointer_db_schema_digest,source_instance_nonce}`.
-No new column, table, trigger or DDL migration is made to the canonical control schema. The reader
-requires:
+`manifest_canonical_sha256` and `source_object_set_sha256`. An independent immutable private
+control file, `<local_control_root>/replication/source-instance.json`, is the source-instance
+authority; it is never part of the canonical dataset. Its closed fields are
+`source_instance_schema,schema_version,source_instance_id,canonical_root_path,
+canonical_schema_digest,source_instance_domain,fsync_contract,source_instance_nonce,pointer_db_device,
+pointer_db_inode,created_at,source_instance_sha256`. The path is private control metadata (never
+public output), the schema is the exact canonical control schema digest, the domain is the fixed
+`stock-eva/r2f4.3/local-canonical` value, and nonce/device/inode are captured from the bound source
+descriptor. The file is created only by explicit writer execution with
+`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0600`, complete canonical JSON, file+parent fsync, and
+is immutable thereafter. `source_instance_sha256` hashes all fields except itself under
+`stock-eva/r2f4.3/source-instance-record/v1`; `source_instance_id` is the domain hash of
+`{canonical_root_path,canonical_schema_digest,source_instance_domain,fsync_contract,source_instance_nonce,
+pointer_db_device,pointer_db_inode}` under `stock-eva/r2f4.3/source-instance/v2`.
+
+The file's canonical closed projection is:
+
+```json
+{"source_instance_schema":"stock-eva/r2f4.3/source-instance/v1","schema_version":1,"source_instance_id":"<64-hex>","canonical_root_path":"/private/local-canonical","canonical_schema_digest":"<64-hex>","source_instance_domain":"stock-eva/r2f4.3/local-canonical","fsync_contract":"file_and_parent_directory","source_instance_nonce":"<64-hex>","pointer_db_device":1,"pointer_db_inode":1,"created_at":"2026-09-09T08:00:00Z","source_instance_sha256":"<64-hex>"}
+```
+
+Values are type examples only; the actual file is sorted compact UTF-8 with one newline and no
+unknown/duplicate fields. The canonical root path is retained only in this private control file,
+never in public API/CLI/log output.
+The sidecar and every journal MUST carry both `source_instance_id` and
+`source_instance_sha256`; a missing, conflicting, unreadable or non-fsynced source-instance file
+maps to `OUTBOX_DURABILITY_UNAVAILABLE` and MUST NOT create a journal. No new column, table,
+trigger or DDL migration is made to the canonical control schema. The reader requires:
 
 ```text
 pointer row is the committed singleton for the requested run/date
 pointer_db_device/inode/schema == the descriptor-bound control snapshot
 pointer_generation == the observed manifest.generation
 manifest_canonical_sha256 == domain_sha256("stock-eva/r2f4.3/manifest-canonical/v1", manifest_projection)
-object_set_sha256 == domain(sorted complete manifest object inventory)
-refresh_runs.run_id is present, ready, and has the pointer's exact trade_date/published_at
-refresh_runs.manifest inventory equals the strict manifest object inventory
+source_object_set_sha256 == domain_sha256("stock-eva/r2f4.3/object-set/v1", sorted complete manifest object inventory)
+published_snapshots.singleton = 1 and refresh_runs.status = 'ready'
+published_snapshots.run_id = refresh_runs.run_id
+published_snapshots.trade_date = refresh_runs.requested_date
+published_snapshots.published_at = refresh_runs.completed_at
 ```
+
+The exact proof query is `published_snapshots ps JOIN refresh_runs rr ON rr.run_id = ps.run_id`;
+it MUST return one row with the equal run/date/completion values above, with all timestamps in
+canonical UTC-Z form. Manifest inventory and its hashes are verified separately from this join;
+no manifest inventory column is assumed in `refresh_runs`.
+
+Before every subsequent canonical pointer commit, the same refresh/control writer lock MUST run a
+`before_canonical_pointer_commit(NextCanonicalPointer) -> CanonicalDurabilityGuardResult` guard.
+The guard reads the current committed singleton and proves that its `checkpoint_id` is already
+accepted in the sidecar, or that its `<checkpoint_id>.json` journal is complete, fsynced and
+descriptor-bound. If neither proof exists, the guard reconstructs the current checkpoint from the
+current visible pointer and durably journals/imports it before allowing the next pointer commit.
+No provider, Parquet rewrite or canonical mutation is allowed in this guard. Failure to prove or
+durably establish the current checkpoint returns `OUTBOX_DURABILITY_UNAVAILABLE` and blocks only
+the next pointer commit; it MUST NOT roll back, hide or alter the current ready pointer. The
+post-commit observation seam remains after a successful pointer commit and is not a substitute for
+this pre-publication guard.
+
+The first publication with no current singleton is explicitly allowed because there is no prior
+ready state to protect. The required state/crash matrix is: first/no-current -> allow; current
+already accepted -> allow; current only in a valid fsynced journal -> import then allow; current
+missing/invalid sidecar and journal -> attempt journal/import, then block on failure; crash during
+guard -> old pointer remains ready and the next guard retries; crash after guard/import but before
+the next pointer -> the durable checkpoint is reused; crash after pointer commit before the
+post-commit observation -> the current pointer is recoverable from its checkpoint/journal and the
+next guard repairs or blocks before any further pointer. Required tests are
+`test_prepublication_guard_blocks_next_pointer_when_current_checkpoint_not_durable`,
+`test_prepublication_guard_imports_current_fsynced_journal_before_next_pointer`,
+`test_prepublication_guard_first_publication_has_no_prior_singleton`,
+`test_prepublication_guard_crash_after_pointer_commit_recovers_current`,
+`test_post_commit_observation_is_after_pointer_and_cannot_replace_guard`, and
+`test_guard_and_post_commit_share_refresh_control_lock`.
+
+The publication seam uses two frozen, sealed value objects with closed field sets:
+
+```typescript
+type SourceCommit = Readonly<{
+  source_commit_schema: "stock-eva/r2f4.3/source-commit/v1";
+  pointer_row_sha256: string; pointer_generation: string; source_run_id: string;
+  source_trade_date: string; source_published_at: string;
+  pointer_db_device: number; pointer_db_inode: number; pointer_db_schema_digest: string;
+  manifest_canonical_sha256: string; source_manifest_bytes_sha256: string;
+  source_object_set_sha256: string; object_inventory: ReadonlyArray<ObjectInventoryItem>;
+  source_instance_id: string; source_instance_sha256: string;
+  committed_at: string; source_commit_sha256: string;
+}>;
+type ReplicationObservation = Readonly<{
+  observation_schema: "stock-eva/r2f4.3/replication-observation/v1";
+  source_commit_sha256: string; checkpoint_id: string; source_instance_id: string;
+  source_sequence: number | null; intent_id: string | null; enqueue_state: string;
+  reason_code: ReplicationReason; effects: Effects; observed_at: string;
+  observation_sha256: string;
+}>;
+```
+
+`source_commit_sha256` hashes every `SourceCommit` field except itself under the named domain;
+`observation_sha256` does the same for `ReplicationObservation`. The canonical publication owner
+seals `SourceCommit` after pointer commit; the replication service owns and seals the observation.
+The owner boundary is explicit: the source publisher invokes the seam after the pointer commit and
+before releasing the refresh/control lock, while the service may only read source evidence and
+append downstream evidence. Neither value object contains paths, credentials, provider payload or
+mutable handles, and the seam cannot mutate a canonical result. The seam is not the legacy generic
+publication callback. Required tests are
+`test_source_commit_and_replication_observation_are_frozen_sealed_and_hash_bound`,
+`test_post_commit_observation_is_after_pointer_and_cannot_replace_guard`, and
+`test_main_wires_guard_and_typed_commit_seam_inside_refresh_lock`.
 
 It also requires the sentinel role/schema, manifest role, object paths, object hashes, sizes,
 schemas and row counts to be valid. A mismatch is `LOCAL_POINTER_MISMATCH` and invalidates the
@@ -654,8 +755,8 @@ open the canonical DuckDB with the existing refresh/control writer lock held: op
 `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, fstat path and fd, verify device/inode, copy bytes through the fd
 to a private mode-0600 temporary immutable clone, fsync clone and parent, re-fstat the source
 size/mtime/device/inode, and reject any drift. DuckDB is opened only `read_only=True` on that
-clone to verify `published_snapshots`, `refresh_runs` ready/run/date/published values and manifest
-inventory. The clone is deleted or isolated in private quarantine in `finally`; its path is never
+clone to verify the exact published-snapshot/refresh-run join above and manifest inventory
+separately. The clone is deleted or isolated in private quarantine in `finally`; its path is never
 public evidence.
 
 If the sidecar is unavailable, a journal stores this complete checkpoint projection and
@@ -670,12 +771,12 @@ not create a second request or intent. Historical files, an unreferenced object,
 cannot be selected.
 
 The journal JSON is closed and contains exactly
-`journal_schema_version,checkpoint_id,source_instance_id,source_published_at,checkpoint_projection,
+`journal_schema_version,checkpoint_id,source_instance_id,source_instance_sha256,source_published_at,checkpoint_projection,
 checkpoint_payload_sha256,created_at,journal_sha256`. `checkpoint_projection` is the complete
 checkpoint field set used by the `checkpoint_id` preimage; it contains no `source_sequence`,
 `intent_id`, `operation_day`, provider payload or credentials. Canonical JSON, one newline and
 `journal_sha256 = domain_sha256("stock-eva/r2f4.3/replication-journal/v1",
-{journal_schema_version,checkpoint_id,source_instance_id,checkpoint_payload_sha256,
+{journal_schema_version,checkpoint_id,source_instance_id,source_instance_sha256,checkpoint_payload_sha256,
 source_published_at,created_at})` are mandatory. Unknown/duplicate fields, a filename mismatch or
 any digest mismatch makes the journal invalid and prevents import.
 
@@ -703,6 +804,8 @@ canonical migration. Required tests are
 `test_main_wires_explicit_local_pointer_reader_without_nas_fallback`,
 `test_duckdb_source_clone_is_descriptor_bound_and_drift_fails_closed`,
 `test_duckdb_clone_requires_ready_refresh_run_and_pointer_manifest_inventory`,
+`test_source_proof_uses_published_snapshot_refresh_run_join_and_separate_manifest_inventory`,
+`test_source_proof_rejects_refresh_run_status_date_or_completed_at_mismatch`,
 `test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id`,
 `test_multiple_checkpoint_journals_crash_and_recover_exactly_once`, and
 `test_cli_execute_holds_existing_project_writer_lock`.
@@ -716,6 +819,10 @@ insert exactly one `replication_sidecar_meta` row whose
 `domain_sha256('stock-eva/r2f4.3/replication-schema/v1',
 {schema_identity,schema_version,ddl_sha256})`. Any missing, extra, mismatched or duplicate meta
 row makes the sidecar unavailable; readers never repair it.
+The meta `source_instance_id` and `source_instance_sha256` MUST exactly match the immutable
+private `source-instance.json` record and the bound canonical source descriptor. A missing or
+conflicting record makes the sidecar `OUTBOX_DURABILITY_UNAVAILABLE`; no journal or intent may be
+created until the identity proof is restored by explicit writer execution.
 
 The sidecar has four intentionally different classes of state:
 
@@ -734,12 +841,35 @@ The sidecar has four intentionally different classes of state:
   orphan event, a gap or a broken hash chain, or a head
   whose last sequence is not the replayed state is unavailable, not an inferred status.
 
-The strict destination reader opens the descriptor, NAS `head.json`, the referenced immutable
-`replication-record.json`, manifest and every object by descriptor-bound no-follow file
-descriptors. It recomputes the complete head/record preimages and requires all checkpoint,
-manifest, object-set, descriptor and parent hashes to agree. A missing/extra field, mismatched
+The strict destination reader is the descriptor-native `DestinationArchiveReader`; it opens the
+trusted destination root once as `root_dirfd` with
+`O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW`, then uses only `openat(root_dirfd, child,
+O_RDONLY|O_CLOEXEC|O_NOFOLLOW)` and child directory fds for every sentinel, `head.json`, record,
+manifest and object. Each fd is fstat before and after read, and parent device/inode plus the
+descriptor fingerprint are checked at every boundary. No path is re-resolved after trust, and
+`NasMarketStore` MUST NOT be called to reopen a path. Only its pure sentinel/schema/Parquet
+validation functions may be reused after bytes have been read through the bound fds. The reader
+recomputes complete head/record preimages and requires all checkpoint, manifest, object-set,
+descriptor and parent hashes to agree. A missing/extra field, symlink, inode drift, mismatched
 record, broken parent, invalid health cache or head that does not name a complete history
 generation is unavailable; SQLite cache is never used as an authority and status never repairs it.
+
+The closed reader contract is:
+
+```text
+DestinationArchiveReader.read_sentinel(root_dirfd) -> SentinelProjection
+DestinationArchiveReader.read_head(root_dirfd) -> DestinationHead
+DestinationArchiveReader.read_record(root_dirfd, replication_generation) -> ReplicationRecord
+DestinationArchiveReader.read_manifest(generation_dirfd) -> ManifestBytes
+DestinationArchiveReader.read_object(generation_dirfd, relative_path) -> VerifiedObjectBytes
+```
+
+`root_dirfd` and `generation_dirfd` are owned descriptor handles, not paths. Relative names are
+validated against the fixed archive grammar before `openat`; absolute names, `..`, symlinks,
+unexpected device/inode or duplicate/extra entries fail closed. Required tests are
+`test_destination_archive_reader_uses_root_dirfd_openat_no_path_reopen`,
+`test_destination_archive_reader_rejects_symlink_or_inode_drift`, and
+`test_destination_archive_reader_reuses_only_pure_manifest_and_parquet_validation`.
 
 The normative schema is the following exact SQL after removing trailing whitespace and normalizing
 line endings. Readers must compare the normalized DDL and digests, not merely table names:
@@ -756,7 +886,8 @@ CREATE TABLE replication_sidecar_meta (
     schema_identity TEXT NOT NULL CHECK (schema_identity = 'stock-eva/r2f4.3/replication-sidecar/v1'),
     ddl_sha256 TEXT NOT NULL CHECK (length(ddl_sha256) = 64),
     schema_digest TEXT NOT NULL CHECK (length(schema_digest) = 64),
-    source_instance_nonce TEXT NOT NULL CHECK (length(source_instance_nonce) = 64),
+    source_instance_id TEXT NOT NULL CHECK (length(source_instance_id) = 64),
+    source_instance_sha256 TEXT NOT NULL CHECK (length(source_instance_sha256) = 64),
     created_at TEXT NOT NULL
 ) STRICT;
 
@@ -775,8 +906,9 @@ CREATE TABLE replication_intents (
     pointer_db_inode INTEGER NOT NULL CHECK (pointer_db_inode > 0),
     pointer_db_schema_digest TEXT NOT NULL CHECK (length(pointer_db_schema_digest) = 64),
     manifest_canonical_sha256 TEXT NOT NULL CHECK (length(manifest_canonical_sha256) = 64),
-    object_set_sha256 TEXT NOT NULL CHECK (length(object_set_sha256) = 64),
+    source_object_set_sha256 TEXT NOT NULL CHECK (length(source_object_set_sha256) = 64),
     source_instance_id TEXT NOT NULL CHECK (length(source_instance_id) = 64),
+    source_instance_sha256 TEXT NOT NULL CHECK (length(source_instance_sha256) = 64),
     source_sequence INTEGER NOT NULL CHECK (source_sequence >= 1),
     checkpoint_id TEXT NOT NULL CHECK (length(checkpoint_id) = 64),
     source_manifest_bytes_sha256 TEXT NOT NULL CHECK (length(source_manifest_bytes_sha256) = 64),
@@ -915,8 +1047,8 @@ control writer lock is held, open the explicit local DuckDB with
 `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, fstat the path and fd, and require device/inode equality. Copy
 bytes through that fd to a private mode-0600 temporary immutable clone, fsync the clone and parent,
 then fstat the source again and require unchanged size/mtime/device/inode. Open DuckDB only
-`read_only=True` on the clone and verify `published_snapshots`, `refresh_runs` ready/run/date/
-published values and complete manifest inventory. Any open/read/copy/drift/schema failure is
+`read_only=True` on the clone and verify the exact published-snapshot/refresh-run join above and
+complete manifest inventory separately. Any open/read/copy/drift/schema failure is
 fail-closed and the temporary clone is removed or isolated in `finally`; no clone path is exposed.
 The CLI execute path acquires this same project writer lock before the proof and all writes.
 External writers that bypass the project lock are out of scope.
@@ -1002,13 +1134,25 @@ order is not an ordering rule. Required test:
 `test_nas_record_lineage_source_sequence_parent_record_partial_order` and
 `test_destination_ahead_divergent_tie_and_cas_are_fail_closed`.
 
+Before deriving a new destination generation, the writer MUST use
+`DestinationArchiveReader` to inspect the candidate history directory. If a record for the same
+`checkpoint_id` already exists, it MUST verify descriptor, source-instance record, manifest,
+complete object inventory, every object byte/hash and the stored record bytes. An exact valid
+record is reused byte-for-byte with its original generation, record hash and immutable `created_at`;
+it is never regenerated or overwritten. A differing, incomplete or corrupt existing record maps to
+`DESTINATION_CONFLICT`/`DESTINATION_TRUST_FAILED` and is never overwritten. Only an absent
+generation may be staged with a new immutable `created_at`. Tests are
+`test_existing_generation_record_is_verified_and_reused_byte_identically`,
+`test_existing_generation_record_conflict_is_not_overwritten`, and
+`test_created_at_is_immutable_across_retries`.
+
 The NAS history record is self-contained and immutable. Every
 `_replication/history/<replication_generation>/` directory MUST contain exactly one
 `replication-record.json` with this closed field set, plus the existing standard sentinel,
 `manifest.json` and referenced immutable Parquet objects:
 
 ```json
-{"record_schema":"stock-eva/r2f4.3/replication-record/v1","schema_version":1,"replication_generation":"<64-hex>","destination_id":"<32-hex>","direction":"local_to_nas","source_instance_id":"<64-hex>","source_sequence":1,"checkpoint_id":"<64-hex>","parent_record_hash":"<64-hex>","pointer_row_sha256":"<64-hex>","pointer_generation":"<opaque>","source_run_id":"<opaque>","source_trade_date":"2026-09-09","source_published_at":"2026-09-09T08:00:00Z","pointer_db_device":1,"pointer_db_inode":1,"pointer_db_schema_digest":"<64-hex>","source_manifest_canonical_sha256":"<64-hex>","source_manifest_bytes_sha256":"<64-hex>","source_object_set_sha256":"<64-hex>","destination_manifest_bytes_sha256":"<64-hex>","destination_object_set_sha256":"<64-hex>","object_inventory":[{"relative_path":"<safe-relative-path>","object_sha256":"<64-hex>","size_bytes":0,"row_count":0,"trade_date":"2026-09-09","source":"<opaque>"}],"object_count":0,"row_count":0,"byte_count":0,"descriptor_sha256":"<64-hex>","plan_sha256":"<64-hex>","created_at":"2026-09-09T08:00:00Z","record_sha256":"<64-hex>"}
+{"record_schema":"stock-eva/r2f4.3/replication-record/v1","schema_version":1,"replication_generation":"<64-hex>","destination_id":"<32-hex>","direction":"local_to_nas","source_instance_id":"<64-hex>","source_instance_sha256":"<64-hex>","source_sequence":1,"checkpoint_id":"<64-hex>","parent_record_hash":"<64-hex>","pointer_row_sha256":"<64-hex>","pointer_generation":"<opaque>","source_run_id":"<opaque>","source_trade_date":"2026-09-09","source_published_at":"2026-09-09T08:00:00Z","pointer_db_device":1,"pointer_db_inode":1,"pointer_db_schema_digest":"<64-hex>","source_manifest_canonical_sha256":"<64-hex>","source_manifest_bytes_sha256":"<64-hex>","source_object_set_sha256":"<64-hex>","destination_manifest_bytes_sha256":"<64-hex>","destination_object_set_sha256":"<64-hex>","object_inventory":[{"relative_path":"<safe-relative-path>","object_sha256":"<64-hex>","size_bytes":0,"row_count":0,"trade_date":"2026-09-09","source":"<opaque>"}],"object_count":0,"row_count":0,"byte_count":0,"descriptor_sha256":"<64-hex>","plan_sha256":"<64-hex>","created_at":"2026-09-09T08:00:00Z","record_sha256":"<64-hex>"}
 ```
 
 The example is type-only; values are never placeholders in an actual record. The JSON is sorted,
@@ -1021,18 +1165,19 @@ consulting SQLite, a source pointer or a provider.
 The NAS head is also self-contained and atomically replaced. Its exact closed schema is:
 
 ```json
-{"head_schema":"stock-eva/r2f4.3/replication-head/v1","schema_version":1,"destination_id":"<32-hex>","replication_generation":"<64-hex>","record_sha256":"<64-hex>","descriptor_sha256":"<64-hex>","direction":"local_to_nas","source_instance_id":"<64-hex>","source_sequence":1,"checkpoint_id":"<64-hex>","parent_record_hash":"<64-hex>","manifest_sha256":"<64-hex>","object_set_sha256":"<64-hex>","head_version":1,"updated_at":"2026-09-09T08:00:00Z","head_sha256":"<64-hex>"}
+{"head_schema":"stock-eva/r2f4.3/replication-head/v1","schema_version":1,"destination_id":"<32-hex>","replication_generation":"<64-hex>","record_sha256":"<64-hex>","descriptor_sha256":"<64-hex>","direction":"local_to_nas","source_instance_id":"<64-hex>","source_instance_sha256":"<64-hex>","source_sequence":1,"checkpoint_id":"<64-hex>","parent_record_hash":"<64-hex>","manifest_sha256":"<64-hex>","object_set_sha256":"<64-hex>","head_version":1,"updated_at":"2026-09-09T08:00:00Z","head_sha256":"<64-hex>"}
 ```
 
 `head_sha256` hashes every other head field under its named domain; the reader recomputes it and
 follows only the named record. The writer stages objects and record in a hidden same-parent
-directory, fsyncs them and the history parent, atomically installs the complete history directory,
-then atomically replaces `head.json` and fsyncs its parent. This NAS head commit is the only
-destination visibility point. Only after it succeeds does the writer append the sidecar result and
-update the non-authoritative destination cache. A crash after NAS head commit but before SQLite
-result is recovered by reading NAS head/record and idempotently appending the already-observed
-result; a crash before NAS head leaves the previous head unchanged. No local cache is allowed to
-select a record or make a missing NAS head ready.
+directory, fsyncs them and the history parent, and installs the complete history directory with a
+same-parent no-replace operation (`renameat2(RENAME_NOREPLACE)` or a verified exclusive
+equivalent). It MUST never replace an existing generation. It then atomically replaces `head.json`
+and fsyncs its parent. This NAS head commit is the only destination visibility point. Only after it
+succeeds does the writer append the sidecar result and update the non-authoritative destination
+cache. A crash after NAS head commit but before SQLite result is recovered by reading NAS head/record
+and idempotently appending the already-observed result; a crash before NAS head leaves the previous
+head unchanged. No local cache is allowed to select a record or make a missing NAS head ready.
 In the head projection, `manifest_sha256` is exactly the referenced record's
 `destination_manifest_bytes_sha256` and `object_set_sha256` is exactly its
 `destination_object_set_sha256`; these aliases are not independently sourced values.
@@ -1076,17 +1221,30 @@ terminal reason. An idempotent execute may have no physical destination write, b
 occurred. It MUST never label an execute as a plan or silently claim all-false effects. Required
 test: `test_execute_response_reports_effects_without_false_dry_run_claim`.
 
+For a lexically valid plan whose strict source/descriptor proofs pass, the controlled projection
+is exactly `mode=plan`, `status=dry_run`, `reason_code=NONE`, `execution_allowed=false`,
+`provider_requests=0`, and all five effect flags false. A plan never claims an execute, does not
+allocate an intent or initialize a destination, and a validation failure retains its specific
+allowlisted reason instead of being rewritten as success. Required test:
+`test_market_replicate_plan_success_is_dry_run_reason_none_and_zero_write`.
+
 ### H6 — hidden restore staging and post-rename rule
 
-Restore requires that the final destination path does not exist. It writes into hidden staging in
-the same parent directory, named by an opaque restore id and excluded by the existing
-`NasMarketStore` sentinel/manifest reader. Before the only visibility point it MUST validate the
+Restore requires that the final destination path does not exist. It creates hidden staging through
+the parent directory fd with `openat(..., O_CREAT|O_EXCL|O_NOFOLLOW, 0700)` and creates every
+staged file with `O_CREAT|O_EXCL|O_NOFOLLOW`, then fsyncs each file, staging directory and parent.
+It is named by an opaque restore id and excluded by the existing reader. Before the only visibility point it MUST validate the
 source descriptor and fingerprints, exact standard sentinel/manifest schema and role, complete
 object set (including no extra/duplicate entries), every object size/schema/row/hash/date, counts,
 and representative read-only API queries. It fsyncs every staged file, the staging directory and
-parent, then atomically renames the hidden staging directory to the previously nonexistent
-destination on the same filesystem. That directory rename is the only visibility point; the
-existing `NasMarketStore` reader recognizes only the standard final sentinel and `manifest.json`.
+parent, then installs the hidden staging directory with a same-parent no-replace operation
+(`renameat2(RENAME_NOREPLACE)`, or a platform-equivalent exclusive link/install protocol that
+proves no replacement). It MUST NOT use rename-over-existing or `os.replace`. If the final name
+appears, the operation returns `PATH_CHANGED`/`DESTINATION_CONFLICT` and never overwrites it. An
+existing final destination with the exact checkpoint is read and verified byte-for-byte by
+`DestinationArchiveReader` and may return idempotent success without modifying it; a differing
+destination is always rejected. The no-replace install is the only visibility point; the existing
+reader recognizes only the standard final sentinel and `manifest.json`.
 
 After rename, only bounded non-semantic readback of the final directory/inode and manifest bytes is
 allowed; there is no second schema/count/query gate that can retroactively fail the task. If the
@@ -1094,8 +1252,12 @@ rename fails, staging is removed or isolated in quarantine; if a post-rename rea
 unexpected inode/bytes result, the destination is isolated and the strict reader rejects it. There
 is no typed restore pointer and no modification to canonical control state. Required tests are
 `test_restore_semantics_complete_before_atomic_rename`,
-`test_restore_rename_failure_leaves_destination_absent_or_quarantined`, and
-`test_restore_post_rename_readback_is_nonsemantic`.
+`test_restore_rename_failure_leaves_destination_absent_or_quarantined`,
+`test_restore_post_rename_readback_is_nonsemantic`,
+`test_restore_staging_uses_o_excl_nofollow_and_fsync`,
+`test_restore_install_is_no_replace`,
+`test_restore_existing_same_checkpoint_is_verified_without_write`, and
+`test_restore_existing_destination_is_never_overwritten`.
 
 The crash rows are normative: crash during hidden staging leaves no final destination (or isolated
 staging); crash immediately before rename leaves no visible destination; crash during the atomic
@@ -1136,6 +1298,8 @@ sidecar I/O; only when enabled does lexical validation precede an optional stric
 sidecar proof. It may not initialize, migrate, repair or acquire a lock. A more specific earlier
 class wins; status never overwrites a higher-priority reason with a later projection. This mapping
 and priority is implemented and tested, not inferred from enum order.
+The `NONE -> ready` row applies to status and execute; the sole plan-mode success projection is
+`mode=plan,status=dry_run,reason_code=NONE` with all effects false, as defined in H5.
 
 The hash contract is closed and exact. Every set/list is sorted by the stated tuple and no object
 contains its own digest field in the preimage:
@@ -1143,7 +1307,7 @@ contains its own digest field in the preimage:
 ```text
 pointer_row_sha256 = domain_sha256("stock-eva/r2f4.3/pointer-row/v1",
   {singleton,run_id,trade_date,published_at})
-object_set_sha256 = domain_sha256("stock-eva/r2f4.3/object-set/v1",
+source_object_set_sha256 = domain_sha256("stock-eva/r2f4.3/object-set/v1",
   sort(object_inventory, key=(relative_path,object_sha256)))
 descriptor_sha256 = domain_sha256("stock-eva/r2f4.3/destination-descriptor/v1",
   {descriptor_schema,schema_version,dataset,role,direction,root_dev,root_ino,parent_dev,
@@ -1153,17 +1317,17 @@ replication_generation = domain_sha256("stock-eva/r2f4.3/replication-generation/
   {destination_id,source_instance_id,source_sequence,checkpoint_id,source_object_set_sha256,
    parent_record_hash,plan_sha256})
 checkpoint_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1",
-  {source_instance_id,pointer_row_sha256,pointer_generation,source_run_id,source_trade_date,
+  {source_instance_id,source_instance_sha256,pointer_row_sha256,pointer_generation,source_run_id,source_trade_date,
    source_published_at,pointer_db_device,pointer_db_inode,pointer_db_schema_digest,
    manifest_canonical_sha256,source_manifest_bytes_sha256,source_object_set_sha256,object_inventory})
 checkpoint_payload_sha256 = domain_sha256("stock-eva/r2f4.3/source-checkpoint-payload/v1",
-  {checkpoint_id,source_instance_id,pointer_row_sha256,pointer_generation,source_run_id,
+  {checkpoint_id,source_instance_id,source_instance_sha256,pointer_row_sha256,pointer_generation,source_run_id,
    source_trade_date,source_published_at,pointer_db_device,pointer_db_inode,
    pointer_db_schema_digest,manifest_canonical_sha256,source_manifest_bytes_sha256,
-   object_set_sha256,object_inventory})
+   source_object_set_sha256,object_inventory})
 record_sha256 = domain_sha256("stock-eva/r2f4.3/replication-record/v1",
   {record_schema,schema_version,replication_generation,destination_id,direction,
-   source_instance_id,source_sequence,checkpoint_id,parent_record_hash,pointer_row_sha256,
+   source_instance_id,source_instance_sha256,source_sequence,checkpoint_id,parent_record_hash,pointer_row_sha256,
    pointer_generation,source_run_id,source_trade_date,source_published_at,pointer_db_device,
    pointer_db_inode,pointer_db_schema_digest,source_manifest_canonical_sha256,
    source_manifest_bytes_sha256,source_object_set_sha256,destination_manifest_bytes_sha256,
@@ -1171,7 +1335,7 @@ record_sha256 = domain_sha256("stock-eva/r2f4.3/replication-record/v1",
    plan_sha256,created_at})
 head_sha256 = domain_sha256("stock-eva/r2f4.3/replication-head/v1",
   {head_schema,schema_version,destination_id,replication_generation,record_sha256,
-   descriptor_sha256,direction,source_instance_id,source_sequence,checkpoint_id,
+   descriptor_sha256,direction,source_instance_id,source_instance_sha256,source_sequence,checkpoint_id,
    parent_record_hash,manifest_sha256,object_set_sha256,head_version,updated_at})
 event_id = domain_sha256("stock-eva/r2f4.3/replication-event-id/v1",
   {intent_id,event_sequence,attempt,state_version,occurred_at})
@@ -1180,13 +1344,21 @@ event_sha256 = domain_sha256("stock-eva/r2f4.3/replication-event/v1",
    attempt,reason_code,state_version,occurred_at,destination_replication_generation,
    destination_record_sha256,destination_head_sha256})
 journal_sha256 = domain_sha256("stock-eva/r2f4.3/replication-journal/v1",
-  {journal_schema_version,checkpoint_id,source_instance_id,checkpoint_payload_sha256,
+  {journal_schema_version,checkpoint_id,source_instance_id,source_instance_sha256,checkpoint_payload_sha256,
    source_published_at,created_at})
+source_commit_sha256 = domain_sha256("stock-eva/r2f4.3/source-commit/v1",
+  {source_commit_schema,pointer_row_sha256,pointer_generation,source_run_id,source_trade_date,
+   source_published_at,pointer_db_device,pointer_db_inode,pointer_db_schema_digest,
+   manifest_canonical_sha256,source_manifest_bytes_sha256,source_object_set_sha256,object_inventory,
+   source_instance_id,source_instance_sha256,committed_at})
+observation_sha256 = domain_sha256("stock-eva/r2f4.3/replication-observation/v1",
+  {observation_schema,source_commit_sha256,checkpoint_id,source_instance_id,source_sequence,
+   intent_id,enqueue_state,reason_code,effects,observed_at})
 intent_sha256 = domain_sha256("stock-eva/r2f4.3/replication-intent-row/v1",
   {intent_id,schema_version,direction,destination_id,checkpoint_id,pointer_row_sha256,
    pointer_generation,source_run_id,source_trade_date,source_published_at,pointer_db_inode,
-   pointer_db_device,pointer_db_schema_digest,manifest_canonical_sha256,object_set_sha256,
-   source_instance_id,source_sequence,source_manifest_bytes_sha256,
+   pointer_db_device,pointer_db_schema_digest,manifest_canonical_sha256,source_object_set_sha256,
+   source_instance_id,source_instance_sha256,source_sequence,source_manifest_bytes_sha256,
    plan_sha256,object_count,row_count,byte_count,created_at})
 ```
 
@@ -1199,7 +1371,10 @@ journal import restart-safe: a repeated checkpoint or retry reuses its existing 
 intent, regardless of operation_day. `operation_day` is scheduling metadata only and is excluded
 from `checkpoint_id`, `plan_sha256`, `intent_id` and `intent_sha256`. The normalized JSON encoder is the one defined above,
 including explicit null/false/zero/empty values and one final newline. Golden tests mutate one
-field, one sort order and the newline and prove a different digest.
+field, one sort order and the newline and prove a different digest. The canonical source digest
+name is always `source_object_set_sha256`; a bare `object_set_sha256` is reserved only for the
+destination-head compatibility alias. Required vector test:
+`test_source_object_set_sha256_golden_vectors_are_canonical`.
 
 New CLI commands dispatch before `ensure_local_runtime_dirs()`, DB initialization or any provider
 factory: lexical validation is first, then strict read-only proofs. `market-replicate`,
@@ -1246,6 +1421,7 @@ The only configuration names and defaults are:
 | Setting | Environment | Default / rule |
 |---|---|---|
 | `replication_enabled` | `STOCK_EVA_REPLICATION_ENABLED` | `false` |
+| `replication_drain_enabled` | `STOCK_EVA_MARKET_REPLICATION_DRAIN_ENABLED` | `false`; automation NAS writes require this plus an approved descriptor and lock |
 | `replication_destination_root` | `STOCK_EVA_REPLICATION_DESTINATION_ROOT` | `None`; explicit absolute approved child only |
 | `replication_database_name` | `STOCK_EVA_REPLICATION_DATABASE_NAME` | `replication.sqlite3`; safe basename only |
 | `replication_journal_root_name` | `STOCK_EVA_REPLICATION_JOURNAL_ROOT_NAME` | `replication-journal`; safe basename only |
@@ -1259,6 +1435,14 @@ seconds. No unresolved environment syntax, `HOME`, root, share root, credential 
 is accepted. Descriptor schema, descriptor digest, mount identity and the typed acknowledgement
 above are fixed contracts, not operator-provided strings.
 
+`replication_enabled` permits only local checkpoint capture/enqueue. Automation may write NAS only
+when `replication_drain_enabled` is true, the descriptor is approved and the project writer lock
+is held. CLI `--execute` is an independent explicit authorization and does not enable background
+draining. These rules are covered by
+`test_replication_enabled_only_enqueues_when_drain_disabled`,
+`test_automation_drain_requires_flag_and_approved_descriptor`, and
+`test_cli_execute_is_independent_explicit_authorization`.
+
 The following NFR rows are added to the existing FR/AC/EC crosswalk in both documents. They are
 planned exact anchors and MUST be created and passed during implementation; a future test name is
 not current evidence.
@@ -1271,9 +1455,9 @@ not current evidence.
 | NFR-4 | `tests/test_dataset_replication.py::test_drain_budget_is_one_intent_six_attempts_and_fifteen_minutes` |
 | NFR-5 | `tests/test_dataset_replication.py::test_retry_schedule_is_exact_and_bounded` |
 | NFR-6 | `tests/test_dataset_replication.py::test_outbox_transition_is_transactional_and_state_versioned` |
-| NFR-7 | `tests/test_dataset_replication.py::test_hash_preimages_are_golden_and_newline_terminated` |
+| NFR-7 | `tests/test_dataset_replication.py::test_source_object_set_sha256_golden_vectors_are_canonical` |
 | NFR-8 | `tests/test_dataset_replication.py::test_status_cli_api_have_no_path_or_secret` |
-| NFR-9 | `tests/test_dataset_replication.py::test_descriptor_bound_reads_reject_symlink_and_toctou` |
+| NFR-9 | `tests/test_dataset_replication.py::test_destination_archive_reader_uses_root_dirfd_openat_no_path_reopen` |
 | NFR-10 | `tests/test_dataset_replication.py::test_nas_failure_does_not_change_local_ready_pointer` |
 | NFR-11 | `tests/test_dataset_replication.py::test_status_10k_terminal_rows_under_500ms_without_parquet_scan` |
 | NFR-12 | `tests/test_dataset_replication.py::test_failed_restore_has_no_reader_visible_root` |
