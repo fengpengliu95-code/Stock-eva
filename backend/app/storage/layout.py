@@ -6,6 +6,47 @@ from pathlib import Path
 from backend.app.config import Settings
 from backend.app.storage.models import LocalStoragePaths
 
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def _physical_path(path: Path) -> Path:
+    absolute = Path(os.path.normpath(path))
+    if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
+        return Path("/private/var", *absolute.parts[2:])
+    return absolute
+
+
+def _ensure_directory_chain(path: Path) -> None:
+    """Create a local writer directory only through no-follow dirfds."""
+    if not path.is_absolute():
+        raise ValueError("replication writer directory must be absolute")
+    normalized = _physical_path(path)
+    descriptors: list[int] = []
+    try:
+        current = os.open(Path(normalized.anchor), _DIRECTORY_FLAGS)
+        descriptors.append(current)
+        for component in normalized.parts[1:]:
+            created = False
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=current)
+                created = True
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            if created:
+                os.fsync(child)
+                os.fsync(current)
+            descriptors.append(child)
+            current = child
+    except OSError as exc:
+        raise ValueError("replication writer directory ancestor is unsafe") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
 
 @dataclass(frozen=True)
 class StorageLayout:
@@ -113,7 +154,7 @@ class StorageLayout:
             self.replication_journal_root,
             self.settings.local_lock_dir,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            _ensure_directory_chain(path)
 
     @property
     def daily_bar_shadow_evidence_root(self) -> Path:

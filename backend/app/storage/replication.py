@@ -16,12 +16,12 @@ import os
 import secrets
 import sqlite3
 import stat
-import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self, get_args
+from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -356,13 +356,20 @@ def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, lis
         current = os.open(Path(path.anchor), _DIRECTORY_FLAGS)
         descriptors.append(current)
         for component in path.parts[1:]:
+            created = False
             try:
                 child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
             except FileNotFoundError:
                 if not create:
                     raise
                 os.mkdir(component, mode=0o700, dir_fd=current)
+                created = True
                 child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            if created:
+                # A newly-created directory is not durable until both the
+                # child inode and its containing directory have been synced.
+                _fsync_open_directory(child)
+                _fsync_open_directory(current)
             descriptors.append(child)
             current = child
         return descriptors[-1], descriptors
@@ -862,6 +869,24 @@ class ObjectInventoryEntry(BaseModel):
         return value
 
 
+def _object_inventory_projection(
+    inventory: Iterable[ObjectInventoryEntry | Mapping[str, object]],
+) -> list[dict[str, object]]:
+    try:
+        entries = tuple(
+            item
+            if isinstance(item, ObjectInventoryEntry)
+            else ObjectInventoryEntry.model_validate(item)
+            for item in inventory
+        )
+    except (TypeError, ValueError) as exc:
+        raise ReplicationDurabilityError("source checkpoint inventory is invalid") from exc
+    keys = tuple((item.relative_path, item.object_sha256) for item in entries)
+    if tuple(sorted(keys)) != keys or len({item.relative_path for item in entries}) != len(entries):
+        raise ReplicationDurabilityError("source checkpoint inventory is not sorted and unique")
+    return [item.model_dump(mode="json") for item in entries]
+
+
 class SourceCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -912,6 +937,10 @@ class SourceCheckpoint(BaseModel):
     def verify_hashes(self) -> None:
         if self.checkpoint_schema != "stock-eva/r2f4.3/source-checkpoint/v1":
             raise ReplicationDurabilityError("source checkpoint schema is invalid")
+        inventory_projection = _object_inventory_projection(self.object_inventory)
+        expected_object_set = domain_sha256(SOURCE_OBJECT_SET_DOMAIN, inventory_projection)
+        if self.source_object_set_sha256 != expected_object_set:
+            raise ReplicationDurabilityError("source object set digest does not match inventory")
         expected_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1", self.hash_preimage())
         if expected_id != self.checkpoint_id:
             raise ReplicationDurabilityError("source checkpoint identity is invalid")
@@ -939,17 +968,7 @@ def build_source_checkpoint(
     source_object_set_sha256: str,
     object_inventory: Iterable[ObjectInventoryEntry | Mapping[str, object]],
 ) -> SourceCheckpoint:
-    inventory = tuple(
-        item
-        if isinstance(item, ObjectInventoryEntry)
-        else ObjectInventoryEntry.model_validate(item)
-        for item in object_inventory
-    )
-    if tuple(sorted((item.relative_path, item.object_sha256) for item in inventory)) != tuple(
-        (item.relative_path, item.object_sha256) for item in inventory
-    ) or len({item.relative_path for item in inventory}) != len(inventory):
-        raise ReplicationDurabilityError("source checkpoint inventory is not sorted and unique")
-    inventory_projection = [item.model_dump(mode="json") for item in inventory]
+    inventory_projection = _object_inventory_projection(object_inventory)
     expected_object_set = domain_sha256(SOURCE_OBJECT_SET_DOMAIN, inventory_projection)
     if source_object_set_sha256 != expected_object_set:
         raise ReplicationDurabilityError("source object set digest does not match inventory")
@@ -1083,6 +1102,7 @@ class JournalRecord(BaseModel):
             raise ReplicationDurabilityError("replication journal filename is invalid")
         if canonical_json_bytes(record.model_dump(mode="json")) != payload:
             raise ReplicationDurabilityError("replication journal is not canonical")
+        record.checkpoint_projection.verify_hashes()
         record.verify_hash()
         return record
 
@@ -1176,7 +1196,12 @@ def _event_hash_preimage(row: tuple[object, ...]) -> dict[str, object]:
     return dict(zip(keys, row, strict=True))
 
 
-def _validate_intent_rows(connection: sqlite3.Connection) -> set[str]:
+def _validate_intent_rows(
+    connection: sqlite3.Connection,
+    *,
+    expected_source_instance_id: str | None = None,
+    expected_source_instance_sha256: str | None = None,
+) -> set[str]:
     """Validate the immutable intent projection before replaying events."""
     columns = (
         "intent_id",
@@ -1219,6 +1244,11 @@ def _validate_intent_rows(connection: sqlite3.Connection) -> set[str]:
         _validate_sha(intent_id, "intent_id")
         if values["schema_version"] != 1 or values["direction"] != "local_to_nas":
             raise ReplicationStateUnavailable("replication intent schema is invalid")
+        if expected_source_instance_id is not None and (
+            values["source_instance_id"] != expected_source_instance_id
+            or values["source_instance_sha256"] != expected_source_instance_sha256
+        ):
+            raise ReplicationStateUnavailable("replication intent source identity is invalid")
         if not isinstance(values["destination_id"], str) or len(values["destination_id"]) != 32:
             raise ReplicationStateUnavailable("replication intent destination is invalid")
         if not isinstance(values["pointer_generation"], str) or not (
@@ -1293,8 +1323,17 @@ def _validate_intent_rows(connection: sqlite3.Connection) -> set[str]:
     return intent_ids
 
 
-def _validate_event_reachability(connection: sqlite3.Connection) -> None:
-    intent_ids = _validate_intent_rows(connection)
+def _validate_event_reachability(
+    connection: sqlite3.Connection,
+    *,
+    expected_source_instance_id: str | None = None,
+    expected_source_instance_sha256: str | None = None,
+) -> None:
+    intent_ids = _validate_intent_rows(
+        connection,
+        expected_source_instance_id=expected_source_instance_id,
+        expected_source_instance_sha256=expected_source_instance_sha256,
+    )
     event_rows = connection.execute(
         """SELECT event_id, intent_id, event_sequence, prev_event_sha256, event_type,
                   from_state, to_state, attempt, reason_code, state_version, occurred_at,
@@ -1445,7 +1484,12 @@ def _validate_event_reachability(connection: sqlite3.Connection) -> None:
             or head[3] < 0
         ):
             raise ReplicationStateUnavailable("replication head counters are invalid")
-        if (head[1] in {"copying", "verifying"}) != (head[4] is not None and head[5] is not None):
+        lease_expected = head[1] in {"copying", "verifying"}
+        if lease_expected != (head[4] is not None and head[5] is not None):
+            raise ReplicationStateUnavailable("replication head lease is invalid")
+        if not lease_expected and (head[4] is not None or head[5] is not None):
+            raise ReplicationStateUnavailable("replication head lease is stale")
+        if lease_expected and (not isinstance(head[4], str) or not head[4] or head[5] is None):
             raise ReplicationStateUnavailable("replication head lease is invalid")
         for timestamp, name in (
             (head[5], "lease_until"),
@@ -1461,68 +1505,107 @@ def _validate_event_reachability(connection: sqlite3.Connection) -> None:
                     ) from exc
         if head[7] not in set(get_args(ReplicationReason)):
             raise ReplicationStateUnavailable("replication head reason is invalid")
+        final_reason = rows[-1][8]
+        final_occurred_at = rows[-1][9]
+        if head[7] != final_reason or head[8] != final_occurred_at:
+            raise ReplicationStateUnavailable("replication head replay projection is stale")
         if head[1] != prior_state or head[2] != prior_version or head[3] != len(rows) - 1:
             raise ReplicationStateUnavailable("replication head does not replay events")
 
 
-def _open_verified_sqlite_clone(
+def _stat_fingerprint(value: os.stat_result | None) -> tuple[int, int, int, int] | None:
+    if value is None:
+        return None
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+def _capture_sqlite_snapshot(
     path: Path,
-    *,
-    main_payload: bytes | None = None,
-    main_stat: os.stat_result | None = None,
-) -> tuple[sqlite3.Connection, tempfile.TemporaryDirectory[str]]:
-    """Open a no-follow, read-only SQLite clone without reopening the source path."""
+) -> dict[str, tuple[Path, bytes | None, os.stat_result | None]]:
     path = _physical_path(path)
-    if main_payload is None:
-        main_payload, main_stat = _read_nofollow(path)
-    if main_stat is None:
-        raise ReplicationStateUnavailable("replication sidecar source descriptor is unavailable")
-    wal_path = Path(f"{path}-wal")
-    shm_path = Path(f"{path}-shm")
-    sidecars: list[tuple[str, bytes]] = []
-    for sidecar_path, suffix in ((wal_path, "-wal"), (shm_path, "-shm")):
-        optional = _read_optional_nofollow(sidecar_path, require_private_mode=False)
-        if optional is not None:
-            sidecars.append((suffix, optional[0]))
-    temporary = tempfile.TemporaryDirectory(prefix="stock-eva-replication-read-")
-    clone_root = Path(temporary.name)
-    clone_path = clone_root / "database.sqlite3"
     try:
-        targets = [(clone_path, main_payload)] + [
-            (Path(f"{clone_path}{suffix}"), data) for suffix, data in sidecars
-        ]
-        clone_parent_fd, clone_descriptors = _open_directory_chain(clone_root)
+        main_payload, main_stat = _read_nofollow(path)
+    except ReplicationDurabilityError as exc:
+        raise ReplicationStateUnavailable(
+            "replication sidecar source descriptor is unavailable"
+        ) from exc
+    snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] = {
+        "main": (path, main_payload, main_stat)
+    }
+    for name, sidecar in (("wal", Path(f"{path}-wal")), ("shm", Path(f"{path}-shm"))):
         try:
-            for target, payload in targets:
-                fd = os.open(
-                    target.name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=clone_parent_fd,
-                )
-                try:
-                    _write_fully(fd, payload)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            _fsync_open_directory(clone_parent_fd)
-        finally:
-            _close_descriptors(clone_descriptors)
-        connection = sqlite3.connect(f"file:{clone_path}?mode=ro", uri=True)
-        current_stat = _stat_nofollow(path)
-        if (main_stat.st_dev, main_stat.st_ino, main_stat.st_size, main_stat.st_mtime_ns) != (
-            current_stat.st_dev,
-            current_stat.st_ino,
-            current_stat.st_size,
-            current_stat.st_mtime_ns,
-        ):
-            connection.close()
-            temporary.cleanup()
-            raise ReplicationStateUnavailable("replication sidecar changed during clone")
-        return connection, temporary
+            artifact = _read_optional_nofollow(sidecar, require_private_mode=False)
+        except ReplicationDurabilityError as exc:
+            raise ReplicationStateUnavailable(
+                "replication sidecar auxiliary descriptor is unavailable"
+            ) from exc
+        snapshot[name] = (sidecar, artifact[0], artifact[1]) if artifact else (sidecar, None, None)
+    return snapshot
+
+
+def _assert_sqlite_snapshot_unchanged(
+    snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]],
+) -> None:
+    for name, (path, _payload, prior_stat) in snapshot.items():
+        if name == "main":
+            try:
+                current_stat = _stat_nofollow(path)
+            except ReplicationDurabilityError as exc:
+                raise ReplicationStateUnavailable(
+                    "replication sidecar changed during read"
+                ) from exc
+        else:
+            try:
+                current = _read_optional_nofollow(path, require_private_mode=False)
+            except ReplicationDurabilityError as exc:
+                raise ReplicationStateUnavailable(
+                    "replication sidecar changed during read"
+                ) from exc
+            current_stat = current[1] if current is not None else None
+        if _stat_fingerprint(current_stat) != _stat_fingerprint(prior_stat):
+            raise ReplicationStateUnavailable("replication sidecar changed during read")
+
+
+def _open_verified_sqlite_readonly(
+    path: Path,
+) -> tuple[sqlite3.Connection, dict[str, tuple[Path, bytes | None, os.stat_result | None]]]:
+    """Open a read-only SQLite view after descriptor snapshot verification.
+
+    A WAL frame cannot be applied by ``Connection.deserialize``.  For the
+    normal checkpointed case we therefore deserialize into ``:memory:``.  If
+    a WAL has committed frames, SQLite is opened read-only so it can apply
+    those frames; the descriptor snapshot is checked before and after every
+    query window.  Neither branch creates a filesystem artifact.
+    """
+    snapshot = _capture_sqlite_snapshot(path)
+    main_path, main_payload, _main_stat = snapshot["main"]
+    wal_payload = snapshot["wal"][1]
+    try:
+        if wal_payload:
+            database_uri = f"file:{quote(str(main_path), safe='/')}?mode=ro"
+            connection = sqlite3.connect(database_uri, uri=True)
+        else:
+            connection = sqlite3.connect(":memory:")
+            # The canonical sidecar uses WAL mode.  A checkpointed SQLite
+            # image still carries the WAL header bits, which an in-memory
+            # database cannot open without a filesystem WAL.  Rebind only the
+            # private deserialized bytes to rollback mode; the source bytes
+            # and its descriptors remain untouched.
+            private_payload = bytearray(main_payload or b"")
+            if len(private_payload) < 20 or private_payload[:16] != b"SQLite format 3\x00":
+                raise ReplicationStateUnavailable("replication sidecar header is invalid")
+            private_payload[18:20] = b"\x01\x01"
+            connection.deserialize(bytes(private_payload), name="main")
     except (OSError, sqlite3.Error) as exc:
-        temporary.cleanup()
-        raise ReplicationStateUnavailable("replication sidecar clone is unavailable") from exc
+        raise ReplicationStateUnavailable(
+            "replication sidecar read-only view is unavailable"
+        ) from exc
+    try:
+        _assert_sqlite_snapshot_unchanged(snapshot)
+    except ReplicationStateUnavailable:
+        connection.close()
+        raise
+    return connection, snapshot
 
 
 class ReplicationSidecarStore:
@@ -1545,20 +1628,37 @@ class ReplicationSidecarStore:
         except OSError as exc:
             _close_descriptors(descriptors)
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
+        connection: sqlite3.Connection | None = None
+        handed_off = False
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
                 raise ReplicationDurabilityError("replication sidecar permissions are unsafe")
-            connection = sqlite3.connect(path)
+            # The descriptor above creates the basename safely when absent.
+            # ``mode=rw`` is deliberate: a pathname replacement cannot make
+            # SQLite create or initialize an attacker-controlled file before
+            # the post-connect identity proof runs.
+            database_uri = f"file:{quote(str(path), safe='/')}?mode=rw"
+            connection = sqlite3.connect(database_uri, uri=True)
+            current = _stat_nofollow(path)
+            if _stat_fingerprint(current) != _stat_fingerprint(info):
+                connection.close()
+                connection = None
+                raise ReplicationDurabilityError(
+                    "replication sidecar identity changed during connect"
+                )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
+            handed_off = True
             return connection
         except ReplicationDurabilityError:
             raise
         except sqlite3.Error as exc:
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
         finally:
+            if connection is not None and not handed_off:
+                connection.close()
             if fd is not None:
                 os.close(fd)
             _close_descriptors(descriptors)
@@ -1575,13 +1675,9 @@ class ReplicationSidecarStore:
         existing_artifact = _read_optional_nofollow(self.path)
         if existing_artifact is not None and existing_artifact[1].st_size > 0:
             connection: sqlite3.Connection | None = None
-            temporary: tempfile.TemporaryDirectory[str] | None = None
+            snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] | None = None
             try:
-                connection, temporary = _open_verified_sqlite_clone(
-                    self.path,
-                    main_payload=existing_artifact[0],
-                    main_stat=existing_artifact[1],
-                )
+                connection, snapshot = _open_verified_sqlite_readonly(self.path)
                 meta = connection.execute(
                     """SELECT source_instance_id, source_instance_sha256
                          FROM replication_sidecar_meta"""
@@ -1591,8 +1687,6 @@ class ReplicationSidecarStore:
             finally:
                 if connection is not None:
                     connection.close()
-                if temporary is not None:
-                    temporary.cleanup()
             if meta != [(source_instance_id, source_instance_sha256)]:
                 raise ReplicationDurabilityError("replication sidecar source identity conflicts")
             # Existing sidecars are never migrated by initialization.
@@ -1636,21 +1730,10 @@ class ReplicationSidecarStore:
         local_ready: bool = False,
         source_instance: SourceInstanceRecord | None = None,
     ) -> ReplicationStatusResponse:
-        try:
-            payload, main_stat = _read_nofollow(self.path)
-        except ReplicationDurabilityError as exc:
-            raise ReplicationStateUnavailable from exc
         connection: sqlite3.Connection | None = None
-        temporary: tempfile.TemporaryDirectory[str] | None = None
+        snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] | None = None
         try:
-            # The SQLite Python API cannot bind a caller-owned fd.  Deserialize
-            # the already verified no-follow bytes into a private clone rather
-            # than reopening the source pathname.  This preserves WAL frames.
-            connection, temporary = _open_verified_sqlite_clone(
-                self.path,
-                main_payload=payload,
-                main_stat=main_stat,
-            )
+            connection, snapshot = _open_verified_sqlite_readonly(self.path)
             connection.execute("PRAGMA query_only = ON")
             _validate_sqlite_schema(connection)
             meta = connection.execute(
@@ -1693,7 +1776,11 @@ class ReplicationSidecarStore:
             }
             if invalid:
                 raise ReplicationStateUnavailable("replication sidecar state is invalid")
-            _validate_event_reachability(connection)
+            _validate_event_reachability(
+                connection,
+                expected_source_instance_id=meta[0][4],
+                expected_source_instance_sha256=meta[0][5],
+            )
             replicated = connection.execute(
                 """SELECT i.manifest_canonical_sha256, e.occurred_at
                      FROM replication_heads h
@@ -1711,13 +1798,14 @@ class ReplicationSidecarStore:
                      FROM replication_destination_cache
                     ORDER BY updated_at DESC LIMIT 1"""
             ).fetchone()
+            if snapshot is None:
+                raise ReplicationStateUnavailable("replication sidecar snapshot is unavailable")
+            _assert_sqlite_snapshot_unchanged(snapshot)
         except (sqlite3.Error, OSError) as exc:
             raise ReplicationStateUnavailable from exc
         finally:
             if connection is not None:
                 connection.close()
-            if temporary is not None:
-                temporary.cleanup()
         if row is None:
             health, observed = "unknown", None
         else:

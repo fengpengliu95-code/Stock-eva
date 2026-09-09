@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import backend.app.storage.replication as replication
 from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.replication import (
@@ -136,6 +137,49 @@ def test_replication_status_reads_valid_sidecar_without_writing(tmp_path: Path) 
         layout.replication_database.stat().st_ino,
         layout.replication_database.read_bytes(),
     ) == before
+
+
+def test_status_uses_no_filesystem_clone_and_preserves_all_sidecar_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, replication_enabled=True)
+    layout = StorageLayout(settings)
+    source = SourceInstanceStore(layout.replication_source_instance).create(
+        canonical_root_path=tmp_path / "dataset",
+        canonical_schema_digest="c" * 64,
+        source_instance_nonce="d" * 64,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    ReplicationSidecarStore(layout.replication_database).initialize(
+        source_instance_id=source.source_instance_id,
+        source_instance_sha256=source.source_instance_sha256,
+    )
+    before = {
+        path: (path.stat().st_ino, path.read_bytes())
+        for path in layout.replication_database.parent.glob("replication.sqlite3*")
+    }
+
+    def fail_if_clone(*args: object, **kwargs: object) -> None:
+        raise AssertionError("status must not create a filesystem SQLite clone")
+
+    snapshot_checks: list[object] = []
+    real_snapshot_check = replication._assert_sqlite_snapshot_unchanged
+
+    def observe_snapshot(snapshot: object) -> None:
+        snapshot_checks.append(snapshot)
+        real_snapshot_check(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(replication, "_open_verified_sqlite_clone", fail_if_clone, raising=False)
+    monkeypatch.setattr(replication, "_assert_sqlite_snapshot_unchanged", observe_snapshot)
+    assert ReplicationStatusService(settings).read().reason_code == "NONE"
+    # The status service performs two independent sidecar reads (precedence
+    # check, then source-identity-bound check), each with open/end proofs.
+    assert len(snapshot_checks) == 4
+    after = {
+        path: (path.stat().st_ino, path.read_bytes())
+        for path in layout.replication_database.parent.glob("replication.sqlite3*")
+    }
+    assert after == before
 
 
 def test_replication_status_missing_sidecar_is_unavailable_without_initialization(
@@ -307,6 +351,48 @@ def test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch() -
         build_source_checkpoint(**{**common, "source_object_set_sha256": "1" * 64})
 
 
+def test_journal_read_verifies_nested_checkpoint_object_set(tmp_path: Path) -> None:
+    record = _checkpoint_for_journal()
+    checkpoint_values = record.checkpoint_projection.model_dump(mode="json")
+    checkpoint_values["object_inventory"][0]["object_sha256"] = "3" * 64
+    checkpoint_preimage = dict(checkpoint_values)
+    checkpoint_preimage.pop("checkpoint_schema")
+    checkpoint_preimage.pop("checkpoint_id")
+    checkpoint_preimage.pop("checkpoint_payload_sha256")
+    checkpoint_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1", checkpoint_preimage)
+    checkpoint_values["checkpoint_id"] = checkpoint_id
+    checkpoint_values["checkpoint_payload_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/source-checkpoint-payload/v1",
+        checkpoint_preimage | {"checkpoint_id": checkpoint_id},
+    )
+    outer = record.model_dump(mode="json")
+    outer["checkpoint_projection"] = checkpoint_values
+    outer["checkpoint_id"] = checkpoint_id
+    outer["checkpoint_payload_sha256"] = checkpoint_values["checkpoint_payload_sha256"]
+    outer["journal_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/replication-journal/v1",
+        {
+            key: outer[key]
+            for key in (
+                "journal_schema_version",
+                "checkpoint_id",
+                "source_instance_id",
+                "source_instance_sha256",
+                "publication_binding_sha256",
+                "checkpoint_payload_sha256",
+                "source_published_at",
+                "created_at",
+            )
+        },
+    )
+    path = tmp_path / "journals" / f"{checkpoint_id}.json"
+    path.parent.mkdir()
+    path.write_bytes(replication.canonical_json_bytes(outer))
+    path.chmod(0o600)
+    with pytest.raises(ReplicationDurabilityError, match="object set"):
+        JournalRecord.read(path)
+
+
 def test_journal_projection_is_exact_source_checkpoint_projection() -> None:
     with pytest.raises(
         (ValidationError, ReplicationDurabilityError), match="projection|checkpoint"
@@ -372,6 +458,181 @@ def test_sidecar_reader_rejects_schema_identity_tamper(tmp_path: Path, tamper: s
             connection.execute("DROP INDEX replication_heads_due_idx")
     with pytest.raises(ReplicationStateUnavailable, match="DDL|version"):
         ReplicationSidecarStore(path).read_status()
+
+
+def test_sidecar_reader_rejects_intent_source_identity_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    identity_fields = {
+        "direction": "local_to_nas",
+        "destination_id": "1" * 32,
+        "source_instance_id": "c" * 64,
+        "source_sequence": 1,
+        "checkpoint_id": "d" * 64,
+        "plan_sha256": "e" * 64,
+    }
+    intent_id = domain_sha256("stock-eva/r2f4.3/replication-intent/v1", identity_fields)
+    row = {
+        "intent_id": intent_id,
+        "schema_version": 1,
+        "operation_day": "2026-09-09",
+        **identity_fields,
+        "pointer_row_sha256": "f" * 64,
+        "pointer_generation": "generation-1",
+        "source_run_id": "run-1",
+        "source_trade_date": "2026-09-09",
+        "source_published_at": "2026-09-09T00:00:00Z",
+        "pointer_db_device": 1,
+        "pointer_db_inode": 2,
+        "pointer_db_schema_digest": "0" * 64,
+        "manifest_canonical_sha256": "1" * 64,
+        "source_object_set_sha256": "2" * 64,
+        "publication_binding_sha256": "3" * 64,
+        "source_instance_sha256": "4" * 64,
+        "source_manifest_bytes_sha256": "5" * 64,
+        "object_count": 0,
+        "row_count": 0,
+        "byte_count": 0,
+        "created_at": "2026-09-09T00:00:00Z",
+    }
+    row["intent_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/replication-intent-row/v1",
+        {key: value for key, value in row.items() if key != "intent_sha256"},
+    )
+    columns = ",".join(row)
+    placeholders = ",".join("?" * len(row))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"INSERT INTO replication_intents ({columns}) VALUES ({placeholders})",
+            tuple(row.values()),
+        )
+    with pytest.raises(ReplicationStateUnavailable, match="source identity"):
+        store.read_status()
+
+
+def test_sidecar_reader_rejects_stale_lease_on_nonleased_head(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    occurred_at = "2026-09-09T00:00:00Z"
+    identity_fields = {
+        "direction": "local_to_nas",
+        "destination_id": "1" * 32,
+        "source_instance_id": "a" * 64,
+        "source_sequence": 1,
+        "checkpoint_id": "d" * 64,
+        "plan_sha256": "e" * 64,
+    }
+    intent_id = domain_sha256("stock-eva/r2f4.3/replication-intent/v1", identity_fields)
+    intent = {
+        "intent_id": intent_id,
+        "schema_version": 1,
+        "operation_day": "2026-09-09",
+        **identity_fields,
+        "pointer_row_sha256": "f" * 64,
+        "pointer_generation": "generation-1",
+        "source_run_id": "run-1",
+        "source_trade_date": "2026-09-09",
+        "source_published_at": occurred_at,
+        "pointer_db_device": 1,
+        "pointer_db_inode": 2,
+        "pointer_db_schema_digest": "0" * 64,
+        "manifest_canonical_sha256": "1" * 64,
+        "source_object_set_sha256": "2" * 64,
+        "publication_binding_sha256": "3" * 64,
+        "source_instance_sha256": "b" * 64,
+        "source_manifest_bytes_sha256": "4" * 64,
+        "object_count": 0,
+        "row_count": 0,
+        "byte_count": 0,
+        "created_at": occurred_at,
+    }
+    intent["intent_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/replication-intent-row/v1",
+        {key: value for key, value in intent.items() if key != "intent_sha256"},
+    )
+    event_fields = {
+        "event_id": domain_sha256(
+            "stock-eva/r2f4.3/replication-event-id/v1",
+            {
+                "intent_id": intent_id,
+                "event_sequence": 0,
+                "attempt": 0,
+                "state_version": 0,
+                "occurred_at": occurred_at,
+            },
+        ),
+        "intent_id": intent_id,
+        "event_sequence": 0,
+        "prev_event_sha256": "0" * 64,
+        "event_type": "intent_created",
+        "from_state": None,
+        "to_state": "pending",
+        "attempt": 0,
+        "reason_code": "NONE",
+        "state_version": 0,
+        "occurred_at": occurred_at,
+        "destination_replication_generation": None,
+        "destination_record_sha256": None,
+        "destination_head_sha256": None,
+    }
+    event = {
+        **event_fields,
+        "event_sha256": domain_sha256("stock-eva/r2f4.3/replication-event/v1", event_fields),
+    }
+    with sqlite3.connect(path) as connection:
+        columns = ",".join(intent)
+        connection.execute(
+            f"INSERT INTO replication_intents ({columns}) VALUES ({','.join('?' * len(intent))})",
+            tuple(intent.values()),
+        )
+        columns = ",".join(event)
+        connection.execute(
+            f"INSERT INTO replication_attempt_events ({columns}) VALUES "
+            f"({','.join('?' * len(event))})",
+            tuple(event.values()),
+        )
+        connection.execute(
+            """INSERT INTO replication_heads
+               (intent_id, current_state, state_version, last_event_sequence,
+                lease_owner, lease_until, next_attempt_at, last_reason_code, updated_at)
+               VALUES (?, 'pending', 0, 0, 'stale-owner', ?, ?, 'NONE', ?)""",
+            (intent_id, "2026-09-09T00:10:00Z", "2026-09-09T00:00:00Z", occurred_at),
+        )
+    with pytest.raises(ReplicationStateUnavailable, match="invalid|stale"):
+        store.read_status()
+
+
+def test_writer_identity_check_rejects_replacement_between_open_and_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    path.parent.mkdir()
+    path.write_bytes(b"original")
+    path.chmod(0o600)
+    real_connect = sqlite3.connect
+
+    def racing_connect(database: object, *args: object, **kwargs: object):
+        os.replace(path, path.with_name("replaced.sqlite3"))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(replication.sqlite3, "connect", racing_connect)
+    with pytest.raises(ReplicationDurabilityError, match="identity|changed|writable"):
+        ReplicationSidecarStore._connect_writer(path)
+    assert not path.exists()
+    assert (path.with_name("replaced.sqlite3")).read_bytes() == b"original"
+
+
+def test_writer_dirs_reject_symlink_ancestor_without_creating_through_it(tmp_path: Path) -> None:
+    real_control = tmp_path / "real-control"
+    real_control.mkdir()
+    linked_control = tmp_path / "linked-control"
+    linked_control.symlink_to(real_control, target_is_directory=True)
+    settings = _settings(tmp_path, local_control_dir=linked_control)
+    with pytest.raises((OSError, ValueError, RuntimeError)):
+        StorageLayout(settings).ensure_replication_writer_dirs()
+    assert not (real_control / "replication-journal").exists()
 
 
 def test_public_status_rejects_non_allowlisted_reason_and_exposes_no_path() -> None:
