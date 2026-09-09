@@ -2690,3 +2690,45 @@ The exact Batch3.2 behavior anchors are
 `tests/test_replication_destination_batch3.py::test_cas_conflict_after_generation_install_reports_destination_effect`.
 The plan remains `In Review / NO-GO` until the complete release gates close; this amendment does
 not authorize production or real-NAS execution.
+
+#### Batch3.3 final destination phase boundaries and effect propagation (normative)
+
+This amendment supersedes only the phase-boundary and effect wording in Batch3.2; it does not
+change the canonical market schema, manifest, pointer, sidecar schema, or the offline-only scope.
+The production constructor is restricted to `SystemMountInspector`. Tests may pass an explicit
+`MountInspector` protocol double through the testing seam; a fake inspector is never selected by
+production wiring. A live probe must prove that the held destination root is under the reported
+mount point and that its device exactly matches the persisted descriptor. An unavailable volume id
+is recorded as `UNKNOWN/UNQUALIFIED` and is never inferred or guessed.
+
+Every destination write is audited using the following independently testable phase table:
+
+| phase | fresh persisted/live boundary | drift semantics | effect |
+| --- | --- | --- | --- |
+| root/session and preflight | descriptor bytes/hash, root fd and live mount | stop before mutation | `false` |
+| staging directory, sentinel, manifest, object directories/files, readback, record | immediately before and after each operation | stop all later phases; no head | `true` after the first actual mutation |
+| generation no-replace install | before install, immediately after install and before history fsync | preserve immutable generation; do not publish head | `true` |
+| history-directory fsync | fresh check after fsync as a separate boundary | preserve generation; do not publish head | `true` |
+| head CAS and post-CAS readback | before CAS, after CAS, and after verifier return | head remains; return `CONTROL_STATE_UNAVAILABLE` | `true` |
+| orphan head recovery | same pre/post and verifier-return checks as normal publish | recovered head remains; no sidecar completion | `true` |
+
+`DestinationArchiveReader.verify_commit` is not the final trust point. Both normal publication and
+each orphan-recovery path must run a fresh persisted-descriptor/live-mount proof after it returns.
+`DestinationCommitVerifier.verify` performs an additional fresh descriptor-native root session after
+the reader returns and before a sidecar completion can occur. Drift after the verifier therefore
+preserves destination history/head evidence but yields `CONTROL_STATE_UNAVAILABLE` and no valid
+completion proof.
+
+`_DestinationEffectContext.destination_write_started` is monotonic and is passed through the
+writer's outer result path, root-session cleanup, unlock and close failures. Cleanup uses an
+accumulator; failures are sanitized secondary notes and cannot replace a primary reason or reset
+the effect bit. With no primary result a cleanup failure remains a typed durability error. The
+exact offline anchors are
+`tests/test_replication_destination_batch3.py::test_live_mount_probe_requires_root_under_reported_mountpoint`,
+`tests/test_replication_destination_batch3.py::test_commit_verifier_reproves_mount_after_reader_returns`,
+`tests/test_replication_destination_batch3.py::test_normal_publish_mount_drift_after_verifier_preserves_head_as_degraded`,
+`tests/test_replication_destination_batch3.py::test_generation_install_mount_drift_before_history_fsync_keeps_head_unpublished`,
+`tests/test_replication_destination_batch3.py::test_history_fsync_mount_drift_keeps_head_unpublished`,
+`tests/test_replication_destination_batch3.py::test_orphan_recovery_mount_drift_after_verifier_preserves_head_as_degraded`,
+`tests/test_replication_destination_batch3.py::test_orphan_child_recovery_mount_drift_after_verifier_preserves_head`, and
+`tests/test_replication_destination_batch3.py::test_cleanup_failure_preserves_primary_copy_reason_and_effect`.

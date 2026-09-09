@@ -2498,3 +2498,42 @@ The exact Batch3.2 behavior anchors are
 `tests/test_replication_destination_batch3.py::test_cas_conflict_after_generation_install_reports_destination_effect`.
 The plan remains `In Review / NO-GO` until the complete release gates close; this amendment does
 not authorize production or real-NAS execution.
+
+#### Batch3.3 final destination phase boundaries and effect propagation (implementation contract)
+
+This section is the implementation counterpart to the design amendment and supersedes only
+conflicting Batch3.2 phase/effect prose. It preserves the canonical market schema, manifest,
+pointer and sidecar schema. Production construction uses only `SystemMountInspector`; a fake
+`MountInspector` is supplied only through an explicit offline testing seam. The live probe must
+prove the held destination root is below the reported mount point and has the exact persisted
+device identity. `volume_id=None` is surfaced only as `UNKNOWN/UNQUALIFIED`; no value is guessed.
+
+The writer implementation and tests use this phase table as the acceptance matrix:
+
+| phase | implementation boundary | required result on drift | effect |
+| --- | --- | --- | --- |
+| root/session and preflight | persisted descriptor bytes/hash plus live inspector | no destination mutation | `false` |
+| staging mkdir, sentinel/manifest/object files, object directories, readback, record | fresh proof before and after every operation | stop before generation/head | `true` after mutation |
+| generation no-replace link | proof before, after link and before history fsync | immutable generation retained, head absent | `true` |
+| history fsync | independent fresh proof after fsync | generation retained, head absent | `true` |
+| head CAS/post-readback | proof before/after CAS and after reader verifier returns | preserve head and return `CONTROL_STATE_UNAVAILABLE` | `true` |
+| orphan genesis/child recovery | same boundaries, including verifier-return proof | preserve recovered head, do not complete sidecar | `true` |
+
+Normal publication and both orphan recovery branches call `DestinationArchiveReader.verify_commit`
+then immediately run a fresh descriptor/live boundary; `DestinationCommitVerifier.verify` runs one
+more fresh descriptor-native root session after the reader result and before completion. A verifier
+or mount drift at this point never returns a completion proof. `_DestinationEffectContext` carries
+the monotonic `destination_write_started` flag through `_replicate_locked`, outer exception mapping,
+root-session close, unlock and cleanup. Cleanup failures are accumulated as sanitized secondary
+state and do not replace the primary reason; if no primary result exists they remain typed
+durability failures. The exact implementation anchors are
+`tests/test_replication_destination_batch3.py::test_live_mount_probe_requires_root_under_reported_mountpoint`,
+`tests/test_replication_destination_batch3.py::test_commit_verifier_reproves_mount_after_reader_returns`,
+`tests/test_replication_destination_batch3.py::test_normal_publish_mount_drift_after_verifier_preserves_head_as_degraded`,
+`tests/test_replication_destination_batch3.py::test_generation_install_mount_drift_before_history_fsync_keeps_head_unpublished`,
+`tests/test_replication_destination_batch3.py::test_history_fsync_mount_drift_keeps_head_unpublished`,
+`tests/test_replication_destination_batch3.py::test_orphan_recovery_mount_drift_after_verifier_preserves_head_as_degraded`,
+`tests/test_replication_destination_batch3.py::test_orphan_child_recovery_mount_drift_after_verifier_preserves_head`, and
+`tests/test_replication_destination_batch3.py::test_cleanup_failure_preserves_primary_copy_reason_and_effect`.
+No real NAS, provider request, restore, API/CLI/automation wiring or production enablement is
+performed by this batch.

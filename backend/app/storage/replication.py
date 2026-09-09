@@ -20,6 +20,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -4679,6 +4680,10 @@ def _destination_live_mount_identity(
         raise ReplicationStateUnavailable("destination mount identity is invalid") from exc
     if live_fs_type in {"smb", "smbfs", "cifs", "nfs", "sshfs"}:
         raise ReplicationDurabilityError("destination mount is unsupported")
+    try:
+        _physical_path(descriptor.root_path).relative_to(_physical_path(Path(live_mount_point)))
+    except ValueError as exc:
+        raise ReplicationStateUnavailable("destination root is outside live mount") from exc
     if (
         (int(root_info.st_dev) != descriptor.root_dev)
         or live_mount_point != descriptor.mount_point
@@ -5679,6 +5684,15 @@ class DestinationReplicationResult:
     destination_writes: bool = False
 
 
+@dataclass
+class _DestinationEffectContext:
+    """Monotonic destination-effect state shared across cleanup boundaries."""
+
+    destination_write_started: bool = False
+    last_result: DestinationReplicationResult | None = None
+    cleanup_failed: bool = False
+
+
 class SentinelProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -6141,6 +6155,18 @@ class DestinationCommitVerifier:
             ) from exc
         if refreshed != proof:
             raise ReplicationStateUnavailable("destination completion proof is stale")
+        # ``verify_commit`` performs a complete descriptor-native read, but a
+        # completion caller must also prove the persisted descriptor and live
+        # mount *after* that read returns.  This closes the interval in which
+        # a remount/rebind could occur between the reader's final byte and the
+        # sidecar completion write.
+        try:
+            with self.reader.root_session():
+                pass
+        except (ReplicationDurabilityError, ValueError) as exc:
+            raise ReplicationStateUnavailable(
+                "destination completion boundary is unavailable"
+            ) from exc
         return refreshed
 
 
@@ -6360,6 +6386,7 @@ class DestinationArchiveWriter:
         lock_fd: int,
         lock_identity: list[int],
         replication_fd: int,
+        effect_context: _DestinationEffectContext,
     ) -> DestinationReplicationResult:
         reader = DestinationArchiveReader(self.descriptor, mount_inspector=self.mount_inspector)
         proof_intent_id = claim_context.intent_id if claim_context is not None else intent_id
@@ -6367,6 +6394,17 @@ class DestinationArchiveWriter:
         proof_state_version = claim_context.state_version if claim_context is not None else None
         head_committed = False
         destination_write_started = False
+
+        def mark_effect() -> None:
+            """Record an effect monotonically, including outer cleanup failures."""
+            nonlocal destination_write_started
+            destination_write_started = True
+            effect_context.destination_write_started = True
+
+        def finish(result: DestinationReplicationResult) -> DestinationReplicationResult:
+            """Retain the primary result if a later cleanup step fails."""
+            effect_context.last_result = result
+            return result
 
         def check_boundary() -> None:
             """Freshly prove the persisted descriptor and live mount identity."""
@@ -6378,8 +6416,13 @@ class DestinationArchiveWriter:
             check_boundary()
         except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
             if isinstance(exc, ReplicationDurabilityError) and "unsupported" in str(exc):
-                return DestinationReplicationResult("unavailable", "MOUNT_UNSUPPORTED")
-            return DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED")
+                return finish(DestinationReplicationResult("unavailable", "MOUNT_UNSUPPORTED"))
+            reason = (
+                "DESTINATION_REBOUND"
+                if "changed" in str(exc) or "outside live mount" in str(exc)
+                else "DESTINATION_TRUST_FAILED"
+            )
+            return finish(DestinationReplicationResult("unavailable", reason))
         # The destination role/sentinel is part of the trust boundary and
         # must be proven before staging any new generation.  Otherwise a
         # tampered empty archive could advance its head and only be noticed by
@@ -6391,9 +6434,9 @@ class DestinationArchiveWriter:
             baseline = reader.read_head(root_fd)
         except ReplicationStateUnavailable as exc:
             reason = "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
-            return DestinationReplicationResult("unavailable", reason)
+            return finish(DestinationReplicationResult("unavailable", reason))
         except ReplicationDurabilityError:
-            return DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED")
+            return finish(DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED"))
 
         def matches_checkpoint(candidate: ReplicationRecord, parent_record_hash: str) -> bool:
             """Prove a recovered record is the exact incoming checkpoint."""
@@ -6453,24 +6496,36 @@ class DestinationArchiveWriter:
                     expected=None,
                 )
                 head_committed = True
-                destination_write_started = True
+                mark_effect()
                 try:
                     check_boundary()
                 except (ReplicationStateUnavailable, ReplicationDurabilityError):
-                    return DestinationReplicationResult(
-                        "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
                     )
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
-                proof = reader.verify_commit(
-                    intent_id=proof_intent_id,
-                    checkpoint_id=checkpoint.checkpoint_id,
-                    source_sequence=source_sequence,
-                    destination_generation=orphan.replication_generation,
-                    worker_id=proof_worker_id,
-                    state_version=proof_state_version,
-                    now=now,
+                try:
+                    proof = reader.verify_commit(
+                        intent_id=proof_intent_id,
+                        checkpoint_id=checkpoint.checkpoint_id,
+                        source_sequence=source_sequence,
+                        destination_generation=orphan.replication_generation,
+                        worker_id=proof_worker_id,
+                        state_version=proof_state_version,
+                        now=now,
+                    )
+                    check_boundary()
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
+                    )
+                return finish(
+                    DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
                 )
-                return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
             if history_records or source_sequence != 1:
                 # A sequence without a committed parent, or any unrelated
                 # orphan generation, is not an admissible new genesis.
@@ -6536,26 +6591,38 @@ class DestinationArchiveWriter:
                     expected=baseline_bytes,
                 )
                 head_committed = True
-                destination_write_started = True
+                mark_effect()
                 try:
                     check_boundary()
                 except (ReplicationStateUnavailable, ReplicationDurabilityError):
-                    return DestinationReplicationResult(
-                        "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
                     )
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
-                proof = reader.verify_commit(
-                    intent_id=proof_intent_id,
-                    checkpoint_id=checkpoint.checkpoint_id,
-                    source_sequence=source_sequence,
-                    destination_generation=orphan.replication_generation,
-                    worker_id=proof_worker_id,
-                    state_version=proof_state_version,
-                    now=now,
+                try:
+                    proof = reader.verify_commit(
+                        intent_id=proof_intent_id,
+                        checkpoint_id=checkpoint.checkpoint_id,
+                        source_sequence=source_sequence,
+                        destination_generation=orphan.replication_generation,
+                        worker_id=proof_worker_id,
+                        state_version=proof_state_version,
+                        now=now,
+                    )
+                    check_boundary()
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
+                    )
+                return finish(
+                    DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
                 )
-                return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
             if baseline.source_instance_id != checkpoint.source_instance_id:
-                return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+                return finish(DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT"))
             if baseline.source_sequence > source_sequence:
                 if reader.contains_checkpoint(
                     root_fd,
@@ -6563,11 +6630,13 @@ class DestinationArchiveWriter:
                     source_instance_id=checkpoint.source_instance_id,
                     source_sequence=source_sequence,
                 ):
-                    return DestinationReplicationResult("unavailable", "DESTINATION_AHEAD")
-                return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+                    return finish(DestinationReplicationResult("unavailable", "DESTINATION_AHEAD"))
+                return finish(DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT"))
             if baseline.source_sequence == source_sequence:
                 if baseline.checkpoint_id != checkpoint.checkpoint_id:
-                    return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+                    return finish(
+                        DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
+                    )
                 proof = reader.verify_commit(
                     intent_id=proof_intent_id,
                     checkpoint_id=checkpoint.checkpoint_id,
@@ -6577,8 +6646,10 @@ class DestinationArchiveWriter:
                     now=now,
                 )
                 record = reader.read_record(baseline.replication_generation, root_fd)
-                return DestinationReplicationResult(
-                    "already_replicated", "ALREADY_REPLICATED", record, proof, False
+                return finish(
+                    DestinationReplicationResult(
+                        "already_replicated", "ALREADY_REPLICATED", record, proof, False
+                    )
                 )
         parent_hash = baseline.record_sha256 if baseline is not None else ZERO_SHA256
         plan_sha256 = _destination_plan_hash(self.descriptor, checkpoint)
@@ -6594,13 +6665,14 @@ class DestinationArchiveWriter:
         staging_name = f".{generation}.staging"
         staging_fd: int | None = None
         linked = False
+        record: ReplicationRecord | None = None
         try:
             check_boundary()
             try:
                 os.mkdir(staging_name, mode=0o700, dir_fd=history_fd)
             except FileExistsError as exc:
                 raise ReplicationDurabilityError("destination staging conflict") from exc
-            destination_write_started = True
+            mark_effect()
             check_boundary()
             staging_fd = _destination_open_dir(history_fd, staging_name)
             source_fd, source_dirs = _open_directory_chain(self.source_root, create=False)
@@ -6616,10 +6688,10 @@ class DestinationArchiveWriter:
                 )
                 check_boundary()
                 _destination_write_at(staging_fd, DESTINATION_SENTINEL_NAME, sentinel)
-                destination_write_started = True
+                mark_effect()
                 check_boundary()
                 _destination_write_at(staging_fd, "manifest.json", manifest)
-                destination_write_started = True
+                mark_effect()
                 check_boundary()
                 for item in checkpoint.object_inventory:
                     payload = _destination_read_relative(source_fd, item.relative_path)
@@ -6636,11 +6708,11 @@ class DestinationArchiveWriter:
                             check_boundary()
                             target_fd = _destination_mkdir_at(target_fd, part)
                             target_dirs.append(target_fd)
-                            destination_write_started = True
+                            mark_effect()
                             check_boundary()
                         check_boundary()
                         _destination_write_at(target_fd, parts[-1], payload)
-                        destination_write_started = True
+                        mark_effect()
                         check_boundary()
                         readback = _destination_read_at(
                             target_fd, (parts[-1],), require_private_mode=False
@@ -6676,16 +6748,22 @@ class DestinationArchiveWriter:
                 "replication-record.json",
                 canonical_json_bytes(record.model_dump(mode="json")),
             )
-            destination_write_started = True
+            mark_effect()
             check_boundary()
             _fsync_open_directory(staging_fd)
             os.close(staging_fd)
             staging_fd = None
             check_boundary()
             _destination_rename_noreplace(history_fd, staging_name, generation)
-            destination_write_started = True
+            mark_effect()
             linked = True
+            # The directory install is its own publication boundary.  A
+            # remount or descriptor drift here must leave the immutable
+            # generation intact but prevent head publication.
+            check_boundary()
             _fsync_open_directory(history_fd)
+            # Re-prove again after the history directory fsync; this is a
+            # separate durability phase from the no-replace install.
             check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
             head = _destination_head(
@@ -6712,7 +6790,7 @@ class DestinationArchiveWriter:
                 expected=baseline_bytes,
             )
             head_committed = True
-            destination_write_started = True
+            mark_effect()
             check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
             self.descriptor.verify_bound()
@@ -6725,13 +6803,21 @@ class DestinationArchiveWriter:
                 state_version=proof_state_version,
                 now=now,
             )
-            return DestinationReplicationResult("replicated", "NONE", record, proof, True)
+            # The verifier's return is not the final trust point.  Re-read the
+            # persisted descriptor and independent live mount identity before
+            # allowing the caller to complete the local sidecar.
+            check_boundary()
+            return finish(DestinationReplicationResult("replicated", "NONE", record, proof, True))
         except (ReplicationCASConflict, ReplicationStateUnavailable) as exc:
             if head_committed:
-                return DestinationReplicationResult(
-                    "unavailable",
-                    "CONTROL_STATE_UNAVAILABLE",
-                    destination_writes=True,
+                return finish(
+                    DestinationReplicationResult(
+                        "unavailable",
+                        "CONTROL_STATE_UNAVAILABLE",
+                        record,
+                        None,
+                        destination_writes=True,
+                    )
                 )
             reason = (
                 "CAS_CONFLICT"
@@ -6740,32 +6826,50 @@ class DestinationArchiveWriter:
             )
             if isinstance(exc, ReplicationStateUnavailable) and "lineage" in str(exc):
                 reason = "DESTINATION_CONFLICT"
-            return DestinationReplicationResult(
-                "unavailable", reason, destination_writes=destination_write_started
+            if isinstance(exc, ReplicationStateUnavailable) and (
+                "changed" in str(exc) or "rebound" in str(exc)
+            ):
+                reason = "DESTINATION_REBOUND"
+            return finish(
+                DestinationReplicationResult(
+                    "unavailable", reason, destination_writes=destination_write_started
+                )
             )
         except ReplicationDurabilityError as exc:
             if head_committed:
-                return DestinationReplicationResult(
-                    "unavailable",
-                    "CONTROL_STATE_UNAVAILABLE",
-                    destination_writes=True,
+                return finish(
+                    DestinationReplicationResult(
+                        "unavailable",
+                        "CONTROL_STATE_UNAVAILABLE",
+                        record,
+                        None,
+                        destination_writes=True,
+                    )
                 )
             reason = "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
-            return DestinationReplicationResult(
-                "unavailable", reason, destination_writes=destination_write_started
+            return finish(
+                DestinationReplicationResult(
+                    "unavailable", reason, destination_writes=destination_write_started
+                )
             )
         finally:
+            cleanup_failures: list[str] = []
             if staging_fd is not None:
-                try:
-                    os.close(staging_fd)
-                except OSError:
-                    pass
+                _close_fd_best_effort(staging_fd, "destination_staging_fd", cleanup_failures)
             if not linked:
-                _destination_remove_tree_at(history_fd, staging_name)
-            failures: list[str] = []
-            _close_fd_best_effort(history_fd, "destination_history_fd", failures)
-            _close_fd_best_effort(replication_fd, "destination_replication_fd", failures)
-            _finish_cleanup(None, failures)
+                try:
+                    _destination_remove_tree_at(history_fd, staging_name)
+                except (ReplicationDurabilityError, OSError):
+                    cleanup_failures.append("destination_staging_cleanup")
+            _close_fd_best_effort(history_fd, "destination_history_fd", cleanup_failures)
+            _close_fd_best_effort(replication_fd, "destination_replication_fd", cleanup_failures)
+            if cleanup_failures:
+                effect_context.cleanup_failed = True
+                primary = sys.exc_info()[1]
+                if primary is not None:
+                    primary.add_note("replication_cleanup=failed")
+                elif effect_context.last_result is None:
+                    _finish_cleanup(None, cleanup_failures)
 
     def replicate(
         self,
@@ -6776,6 +6880,31 @@ class DestinationArchiveWriter:
         claim_context: ReplicationClaimContext | None = None,
         now: str | None = None,
     ) -> DestinationReplicationResult:
+        effect_context = _DestinationEffectContext()
+
+        def result_with_effect(
+            result: DestinationReplicationResult,
+        ) -> DestinationReplicationResult:
+            """Preserve the primary reason while carrying monotonic effects."""
+            destination_writes = (
+                result.destination_writes or effect_context.destination_write_started
+            )
+            if effect_context.cleanup_failed and result.status == "replicated":
+                return DestinationReplicationResult(
+                    "unavailable",
+                    "CONTROL_STATE_UNAVAILABLE",
+                    result.record,
+                    None,
+                    destination_writes,
+                )
+            return DestinationReplicationResult(
+                result.status,
+                result.reason_code,
+                result.record,
+                result.proof,
+                destination_writes,
+            )
+
         try:
             normalized = (
                 checkpoint
@@ -6829,6 +6958,7 @@ class DestinationArchiveWriter:
                         lock_fd=lock_fd,
                         lock_identity=lock_identity,
                         replication_fd=replication_fd,
+                        effect_context=effect_context,
                     )
                 finally:
                     try:
@@ -6846,10 +6976,20 @@ class DestinationArchiveWriter:
                             raise
                 if result is None:
                     raise ReplicationDurabilityError("destination result is unavailable")
-                return result
+                return result_with_effect(result)
         except ReplicationCASConflict:
-            return DestinationReplicationResult("unavailable", "CAS_CONFLICT")
+            if effect_context.last_result is not None:
+                return result_with_effect(effect_context.last_result)
+            return DestinationReplicationResult(
+                "unavailable",
+                "CAS_CONFLICT",
+                destination_writes=effect_context.destination_write_started,
+            )
         except ReplicationDurabilityError as exc:
+            if effect_context.last_result is not None:
+                if "cleanup failed" in str(exc):
+                    effect_context.cleanup_failed = True
+                return result_with_effect(effect_context.last_result)
             message = str(exc)
             reason: ReplicationReason = "DESTINATION_TRUST_FAILED"
             if "lock" in message or "unsupported" in message:
@@ -6864,7 +7004,9 @@ class DestinationArchiveWriter:
                 reason = "SOURCE_UNAVAILABLE"
             elif "object" in message or "staging" in message or "copy" in message:
                 reason = "COPY_FAILED"
-            return DestinationReplicationResult("unavailable", reason)
+            return DestinationReplicationResult(
+                "unavailable", reason, destination_writes=effect_context.destination_write_started
+            )
 
     execute = replicate
 
