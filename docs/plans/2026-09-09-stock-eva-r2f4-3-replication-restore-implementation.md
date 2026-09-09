@@ -58,7 +58,7 @@ replication/restore control and never widens canonical provider authority.
 - FR-3d: Legacy/no-selection publications use fixed domain-separated canonical-null selection/lineage digests; missing required v2 manifest metadata returns `SOURCE_UNAVAILABLE` and leaves the pointer unchanged. Legal reconcile may reuse a binding only after the same lock-bound exact proof.
 - FR-3e: Implement one `ManifestPublicationCoordinator` with exactly two mutually exclusive typed operations: `publish_manifest_only(...)` (manifest update/verification only, no binding/pointer) for `upsert_bars`/backfill, and `publish_dataset_and_pointer(...)` (manifest → binding → pointer) for dataset publication. Both share only a token-checked locked primitive; manifest-only MUST NOT call the pointer operation.
 - FR-3f: Lock acquisition/token/baseline/guard/final-CAS failures before pointer commit leave pointer bytes/hash/inode unchanged. After pointer commit, unlock/close/post-proof/control failures cannot roll back canonical ready; return degraded `CONTROL_STATE_UNAVAILABLE`, durably reconcile, and let the next guard handle it.
-- FR-3g: `publish_manifest_only` returns a typed tagged-union pointer proof: `ABSENT` for no pointer row, or `PRESENT{row_sha256,db_fingerprint,db_device,db_inode,db_schema_digest}`; it compares the complete before/after value exactly, without a forced string sentinel.
+- FR-3g: `publish_manifest_only` returns a typed three-state pointer proof: `ABSENT` only when the DB is absent or its proven-valid schema has no singleton row; `PRESENT{row_sha256,device,inode,schema_digest}` for a complete singleton; and `INVALID{reason_code=CONTROL_STATE_UNAVAILABLE}` for missing tables, corrupt schema, read failure, duplicate/malformed singleton or incomplete state. `INVALID` fails closed before any manifest mutation, and `ABSENT` is never a forced string, empty hash or synthetic row.
 - FR-3h: Before any manifest-only mutation, the coordinator reads the existing manifest lineage mode. An empty manifest may classify incoming input as legacy or modern; a non-empty manifest retains one complete mode/lineage. Modern backfill/upsert without exact immutable lineage returns `SOURCE_UNAVAILABLE` before mutation and never contaminates a modern manifest.
 - FR-4: Implement the normative SQLite outbox, immutable identity, state transitions, terminal retention and state-version CAS.
 - FR-5: Persist or journal enqueue gaps and reconcile a pointer/outbox gap after restart without a provider request.
@@ -112,7 +112,7 @@ Given replication is disabled and local data is ready, When the automation and s
 
 ### AC-2: Binding, pointer and enqueue boundary (FR-2, FR-2a, FR-3, FR-3b, FR-3c, FR-3d, FR-5, FR-25, NFR-6, NFR-10)
 
-Given a dataset-backed publication has a successful manifest but binding write/readback fails, When any pointer writer seam attempts publication, Then the new pointer commit is blocked, the prior ready pointer is unchanged, no provider is called, and the failure is `OUTBOX_DURABILITY_UNAVAILABLE`; given a valid binding, the central seam commits the pointer only when all binding fields match exactly. The same non-reentrant manifest lock MUST cover baseline read, object/staging writes, manifest replace/readback, binding fsync, pointer commit and post-commit exact proof; a final fingerprint drift blocks the pointer. A legacy/no-selection publication uses canonical-null selection/lineage digests, while missing required v2 metadata returns `SOURCE_UNAVAILABLE`; a plain `MarketStore` keeps its existing canonical commit and only observes `SOURCE_NOT_CONFIGURED`. After that pointer commit, a synthetic outbox error preserves ready state and projects `OUTBOX_ENQUEUE_FAILED` without rollback. Required tests are `test_binding_write_failure_blocks_pointer_without_rollback`, `test_publication_is_atomic_under_one_manifest_publication_lock`, `test_manifest_fingerprint_drift_blocks_pointer_cas`, `test_publication_binding_is_fsynced_before_pointer_and_exactly_matches`, `test_manifest_changed_before_pointer_commit_is_rejected`, `test_all_dataset_pointer_writers_route_through_central_binding_commit`, `test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`, `test_legacy_no_selection_uses_canonical_null_digests`, `test_missing_v2_manifest_metadata_blocks_pointer`, and `test_enqueue_failure_preserves_local_pointer_ready`.
+Given a dataset-backed publication has a successful manifest but binding write/readback fails, When any pointer writer seam attempts publication, Then the new pointer commit is blocked, the prior ready pointer is unchanged, no provider is called, and the failure is `OUTBOX_DURABILITY_UNAVAILABLE`; given a valid binding, the central seam commits the pointer only when all binding fields match exactly. The same non-reentrant manifest lock MUST cover baseline read, object/staging writes, manifest replace/readback, binding fsync, pointer commit and post-commit exact proof; a final fingerprint drift blocks the pointer. A legacy/no-selection publication uses canonical-null selection/lineage digests, while missing required v2 metadata returns `SOURCE_UNAVAILABLE`; a plain `MarketStore` keeps its existing canonical commit and only observes `SOURCE_NOT_CONFIGURED`. After that pointer commit, a synthetic outbox error preserves ready state and projects `OUTBOX_ENQUEUE_FAILED` without rollback. Required tests are `test_binding_write_failure_blocks_pointer_without_rollback`, `test_publication_is_atomic_under_one_manifest_publication_lock`, `test_manifest_fingerprint_drift_blocks_pointer_cas`, `test_publication_binding_is_fsynced_before_pointer_and_exactly_matches`, `test_manifest_changed_before_pointer_commit_is_rejected`, `test_all_dataset_pointer_writers_route_through_coordinator`, `test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`, `test_legacy_no_selection_uses_canonical_null_digests`, `test_missing_v2_manifest_metadata_blocks_pointer`, and `test_enqueue_failure_preserves_local_pointer_ready`.
 
 ### AC-3: Binding and journal crash recovery (FR-3, FR-4, FR-5, FR-26, NFR-6, NFR-7)
 
@@ -597,13 +597,15 @@ they must be real and passing before implementation review can close. No grouped
 | FR-2a | `tests/test_dataset_replication.py::test_publication_binding_is_fsynced_before_pointer_and_exactly_matches` |
 | FR-3 | `tests/test_dataset_replication.py::test_enqueue_failure_preserves_local_pointer_ready` |
 | FR-3a | `tests/test_dataset_replication.py::test_prepublication_guard_blocks_next_pointer_when_current_checkpoint_not_durable` |
-| FR-3b | `tests/test_dataset_replication.py::test_all_dataset_pointer_writers_route_through_central_binding_commit` |
+| FR-3b | `tests/test_dataset_replication.py::test_all_dataset_pointer_writers_route_through_coordinator` |
 | FR-3c | `tests/test_dataset_replication.py::test_publication_is_atomic_under_one_manifest_publication_lock` |
 | FR-3d | `tests/test_dataset_replication.py::test_legacy_no_selection_uses_canonical_null_digests` |
 | FR-3e | `tests/test_dataset_replication.py::test_manifest_only_operation_never_calls_pointer_wrapper` |
 | FR-3f | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | FR-3g | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
 | FR-3h | `tests/test_dataset_replication.py::test_modern_backfill_without_exact_lineage_fails_closed` |
+| FR-3i | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
+| FR-3j | `tests/test_dataset_replication.py::test_lineage_resolver_validates_retained_evidence_before_mutation` |
 | FR-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
 | FR-5 | `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id` |
 | FR-5a | `tests/test_dataset_replication.py::test_journal_install_is_no_replace_and_reuses_identical_target` |
@@ -655,6 +657,8 @@ they must be real and passing before implementation review can close. No grouped
 | AC-24 | `tests/test_dataset_replication.py::test_post_pointer_unlock_failure_degrades_without_rollback` |
 | AC-25 | `tests/test_dataset_replication.py::test_manifest_only_empty_database_uses_absent_pointer_identity` |
 | AC-26 | `tests/test_dataset_replication.py::test_manifest_only_modern_backfill_lineage_is_required_and_preserved` |
+| AC-27 | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
+| AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | EC-2 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
 | EC-3 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
@@ -690,6 +694,8 @@ they must be real and passing before implementation review can close. No grouped
 | EC-33 | `tests/test_dataset_replication.py::test_pointer_postcommit_control_error_is_durable_and_next_guard_reconciles` |
 | EC-34 | `tests/test_dataset_replication.py::test_manifest_only_present_pointer_identity_is_exact_before_after` |
 | EC-35 | `tests/test_dataset_replication.py::test_manifest_lineage_mode_is_inherited_before_mutation` |
+| EC-36 | `tests/test_dataset_replication.py::test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance` |
+| EC-37 | `tests/test_dataset_replication.py::test_missing_lineage_reader_returns_source_unavailable_before_mutation` |
 
 ## R2-F4.3.2 implementation amendment — single-authority H1-H6/M1-M6 closure
 
@@ -710,8 +716,8 @@ Do not alter `published_snapshots` or `manifest.json`. After the canonical point
 exact binding proof, the strict reader creates a replication-only checkpoint containing the
 original singleton row values (`run_id`, `trade_date`, `published_at`), current pointer DB
 device/inode/schema digest, manifest canonical hash, active binding hash and
-`source_object_set_sha256`; the DB fingerprint is checkpoint tamper evidence, not stable source
-identity. An independent immutable private record at
+`source_object_set_sha256`; the current device/inode/schema tuple is checkpoint tamper evidence,
+not stable source identity. An independent immutable private record at
 `<local_dataset>/_replication/source-instance.json` is the source-instance authority and is never
 canonical. Its exact fields are
 `source_instance_schema,schema_version,source_instance_id,canonical_root_path,
@@ -790,7 +796,7 @@ observation. Route dataset-backed `NasMarketStore.save_refresh`,
 The legacy method may be called only inside the dataset seam. Plain `MarketStore` canonical
 publication remains unchanged: it performs no binding/guard/NAS work and its replication
 observation is `SOURCE_NOT_CONFIGURED` without explicit dataset/manifest. Required routing tests
-are `test_all_dataset_pointer_writers_route_through_central_binding_commit`,
+are `test_all_dataset_pointer_writers_route_through_coordinator`,
 `test_publication_is_atomic_under_one_manifest_publication_lock`,
 `test_manifest_fingerprint_drift_blocks_pointer_cas`, and
 `test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`.
@@ -1689,11 +1695,12 @@ exactly these mutually exclusive typed operations:
 ```typescript
 type PointerIdentity =
   | Readonly<{ kind: "ABSENT" }>
-  | Readonly<{ kind: "PRESENT"; row_sha256: string; db_fingerprint: string;
-               db_device: number; db_inode: number; db_schema_digest: string }>;
+  | Readonly<{ kind: "PRESENT"; row_sha256: string; device: number;
+               inode: number; schema_digest: string }>
+  | Readonly<{ kind: "INVALID"; reason_code: "CONTROL_STATE_UNAVAILABLE" }>;
 type ManifestOnlyInput = Readonly<{
   bars: ReadonlyArray<DailyBar>; source: string;
-  publication_lineage: PublicationLineage | null;
+  lineage_input: LineageInput;
 }>;
 type ManifestOnlyResult = Readonly<{
   manifest_generation: string; manifest_bytes_sha256: string;
@@ -1703,7 +1710,7 @@ type ManifestOnlyResult = Readonly<{
 }>;
 type DatasetPointerInput = Readonly<{
   bars: ReadonlyArray<DailyBar>; source: string; result: RefreshResult;
-  selection: PublishedSelection | null; publication_lineage: PublicationLineage | null;
+  selection: PublishedSelection | null; lineage_input: LineageInput;
 }>;
 type DatasetPointerResult = Readonly<{
   manifest_generation: string; publication_binding: SourcePublicationBinding;
@@ -1724,11 +1731,15 @@ manifest → binding/fsync → final fingerprint CAS → DuckDB pointer commit �
 path. It is used by `save_refresh`, `reconcile_control_pointer`, `full_history`, CLI reconciliation
 and startup reconciliation. Manifest-only MUST NOT call or delegate to the pointer operation.
 
-For manifest-only operations, an empty control database or no singleton pointer is represented as
-`PointerIdentity { kind: "ABSENT" }`; it is never represented by a forced string, empty hash or
-synthetic row. A present pointer is `PRESENT` with all five fields above. The coordinator captures
-the tagged union before and after and requires structural equality of every field, including
-`db_device`/`db_inode` and `db_fingerprint`; otherwise the manifest-only operation fails closed.
+For manifest-only operations, `ABSENT` is permitted only when the control DB is absent, or when a
+descriptor-bound read proves the schema valid and proves that the singleton pointer row is absent.
+It is never represented by a forced string, empty hash or synthetic row. A present pointer is
+`PRESENT` with exactly the four canonical-rebuild fields `row_sha256`, `device`, `inode` and
+`schema_digest`. Missing tables, corrupt or unknown schema, read failure, duplicate/malformed
+singleton state or any incomplete control state returns `INVALID` with
+`reason_code=CONTROL_STATE_UNAVAILABLE`; it MUST fail closed before manifest-only mutation. The
+coordinator captures the tagged union before and after and requires structural equality of every
+field; an `INVALID` result never proceeds and is not converted to `ABSENT`.
 Required anchors: `test_manifest_only_empty_database_uses_absent_pointer_identity`,
 `test_manifest_only_present_pointer_identity_is_exact_before_after`, and
 `test_manifest_only_upsert_and_backfill_preserve_pointer_bytes_hash_and_inode`.
@@ -1805,6 +1816,119 @@ The final lock/crash matrix is:
 | pointer committed, unlock/close/post-proof/control failure | Canonical ready remains; degraded `CONTROL_STATE_UNAVAILABLE`; durable reconcile; no rollback. |
 | next writer after post-pointer control error | Guard proves/reconciles current state before any next pointer commit. |
 
-The exact crosswalk contains FR-3e through FR-3h, AC-23 through AC-26 and EC-31 through EC-35 in
+The exact crosswalk contains FR-3e through FR-3j, AC-23 through AC-28 and EC-31 through EC-37 in
 both documents. Status remains `In Review / NO-GO`; this consolidation is a specification update,
 not implementation or production evidence.
+
+## Final normative read-state and lineage resolver correction — R2-F4.3.7
+
+This section is normative and supersedes every older pointer-read, nullable-lineage or inferred-
+lineage sentence in both R2-F4.3 documents. It is still a specification only: it authorizes no
+implementation, NAS access, provider request or production operation.
+
+### M1 — three-state pointer read and no undefined fingerprint
+
+`PointerIdentity` is the complete private read result. Its `PRESENT` branch contains only fields
+that can be reconstructed from the canonical control database and descriptor-bound filesystem
+read; no additional database identity field or alias is defined:
+
+```typescript
+type PointerIdentity =
+  | Readonly<{ kind: "ABSENT" }>
+  | Readonly<{ kind: "PRESENT"; row_sha256: string; device: number;
+               inode: number; schema_digest: string }>
+  | Readonly<{ kind: "INVALID"; reason_code: "CONTROL_STATE_UNAVAILABLE" }>;
+```
+
+`row_sha256` is the existing domain-separated hash of the exact canonical singleton-row
+projection. `device` and `inode` are the `fstat` identity of the opened control DB descriptor;
+`schema_digest` is the existing strict control-schema digest. `SourceCheckpoint` continues to
+use its explicit `pointer_row_sha256`, `pointer_db_device`, `pointer_db_inode` and
+`pointer_db_schema_digest` fields, which are the corresponding four values; no fifth fingerprint
+is introduced.
+
+`ABSENT` is legal only in exactly two cases: the control DB does not exist, or a read-only,
+descriptor-bound read proves the known schema valid and proves the singleton pointer row absent.
+An existing DB with a missing table, unknown/corrupt schema, unreadable/locked read, duplicate or
+malformed singleton, missing required state, or any other incomplete control state returns
+`INVALID{reason_code: "CONTROL_STATE_UNAVAILABLE"}`. It MUST NOT be normalized to `ABSENT`.
+`publish_manifest_only` reads the tagged state before mutation and again after mutation; any
+`INVALID` state fails closed before the first manifest/object mutation. A `PRESENT` state must
+match exactly on all four fields, and `ABSENT` must remain `ABSENT`; no sentinel string, empty
+hash, synthetic row or partial equality is accepted. The invalid-state test is zero-provider and
+asserts manifest, object, pointer bytes/inode and sidecar bytes remain unchanged.
+
+### M2/M3 — private frozen publication lineage and resolver seam
+
+The manifest has no new fields. Define a private, frozen `PublicationLineage` with exactly these
+nine immutable fields (not labels inferred from bars):
+
+```typescript
+type PublicationLineage = Readonly<{
+  provider_id: string;
+  universe_id: string;
+  evidence_id: string;
+  evidence_sha256: string;
+  candidate_id: string;
+  candidate_manifest_sha256: string;
+  gate_report_sha256: string;
+  adapter_version: string;
+  source_schema_version: string;
+}>;
+```
+
+The associated private frozen `SelectionRelation` is a validation relation, not a tenth
+manifest field: `provider_id`, `universe_id`, `candidate_id`, `evidence_id`, `trade_date`,
+`evidence_sha256`, `candidate_manifest_sha256` and `gate_report_sha256` MUST equal the selected
+candidate, retained evidence and successful gate records for the requested publication. The
+relation is checked before any manifest mutation and is included in the lineage/selection hash
+preimages already defined by this document.
+
+The only resolver seam is the strict local `LineageResolver` (planned in
+`backend/app/storage/replication.py`), whose result is either the frozen model or a sanitized
+`SOURCE_UNAVAILABLE` failure:
+
+```typescript
+type LineageInput =
+  | Readonly<{ mode: "legacy" }>
+  | Readonly<{ mode: "modern"; exact: PublicationLineage }>
+  | Readonly<{ mode: "modern"; candidate_id: string; evidence_id: string }>;
+
+interface LineageResolver {
+  resolve(input: LineageInput, trade_date: string,
+          existing_mode: "empty" | "legacy" | "modern"): PublicationLineage | null;
+}
+```
+
+For `mode="modern"; exact`, the resolver validates every supplied digest, candidate, selection,
+evidence and gate reference against local retained successful evidence. The ID form may load only
+by allowlisted `candidate_id`/`evidence_id` from those same local readers and then performs the
+same full validation. It MUST NOT call a provider, use labels, inspect bars to guess lineage, or
+inherit any unverified field. Missing evidence, unavailable readers, digest mismatch, selection
+relation mismatch or unknown IDs returns `SOURCE_UNAVAILABLE` before manifest mutation.
+
+Existing non-empty legacy manifests accept only `mode="legacy"`; modern input is rejected. Existing
+non-empty modern manifests accept only a fully validated exact same lineage (caller-supplied or
+resolver-loaded); legacy, partial and conflicting input is rejected. An empty manifest may choose
+legacy or modern, but modern still requires exact refs or the allowlisted resolver path. This
+decision is made before object staging or manifest replacement.
+
+The earlier nullable lineage argument is replaced by required
+`lineage_input: LineageInput` on `ManifestOnlyInput`, `DatasetPointerInput`,
+`NasMarketStore.upsert_bars(..., *, lineage_input)`, and each `BackfillRunner` batch. A legacy
+caller passes the explicit legacy branch; a modern caller passes exact refs or the two allowlisted
+IDs. There is no default that silently selects legacy. `publish_manifest_only` resolves and
+validates this input before its lock-held manifest mutation; `publish_dataset_and_pointer` uses
+the same resolver before binding/pointer work. Plain `MarketStore` signatures and behavior remain
+unchanged and never invoke this resolver.
+
+Concrete implementation seams are `backend/app/storage/dataset.py` for the coordinator and
+descriptor-bound pointer reader, `backend/app/storage/replication.py` for the frozen lineage and
+resolver, `backend/app/market/evidence.py` and `backend/app/market/candidates.py` for strict
+retained-evidence readers, and `backend/app/market/backfill.py` for the explicit batch signature.
+The required evidence anchors are
+`test_manifest_only_invalid_pointer_identity_fails_closed`,
+`test_lineage_resolver_validates_retained_evidence_before_mutation`,
+`test_modern_backfill_requires_exact_lineage_or_resolver_evidence`,
+`test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance`, and
+`test_missing_lineage_reader_returns_source_unavailable_before_mutation`.
