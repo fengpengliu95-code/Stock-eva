@@ -204,6 +204,43 @@ def test_status_uses_no_filesystem_clone_and_preserves_all_sidecar_artifacts(
     assert after == before
 
 
+@pytest.mark.parametrize(
+    "primary_type",
+    [ReplicationStateUnavailable, ReplicationDurabilityError],
+)
+def test_status_preserves_typed_primary_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_type: type[ReplicationDurabilityError],
+) -> None:
+    settings = _settings(tmp_path, replication_enabled=True)
+    layout = StorageLayout(settings)
+    ReplicationSidecarStore(layout.replication_sidecar_root).initialize(
+        source_instance_id="a" * 64,
+        source_instance_sha256="b" * 64,
+    )
+    real_open = replication._open_generation_readonly
+    real_close = replication._close_fd_best_effort
+
+    def fail_validation(_connection: sqlite3.Connection) -> None:
+        raise primary_type("injected status primary")
+
+    def fail_close(fd: int, label: str, failures: list[str]) -> None:
+        real_close(fd, label, failures)
+        failures.append("injected_status_cleanup")
+
+    def open_then_inject(path: Path):
+        handles = real_open(path)
+        monkeypatch.setattr(replication, "_validate_sqlite_schema", fail_validation)
+        monkeypatch.setattr(replication, "_close_fd_best_effort", fail_close)
+        return handles
+
+    monkeypatch.setattr(replication, "_open_generation_readonly", open_then_inject)
+    with pytest.raises(primary_type, match="injected status primary") as caught:
+        ReplicationSidecarStore(layout.replication_sidecar_root).read_status()
+    assert "replication_cleanup=failed" in getattr(caught.value, "__notes__", [])
+
+
 def test_replication_status_missing_sidecar_is_unavailable_without_initialization(
     tmp_path: Path,
 ) -> None:

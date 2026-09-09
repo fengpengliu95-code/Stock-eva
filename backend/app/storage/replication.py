@@ -2678,10 +2678,10 @@ class ImmutableReplicationSidecarStore:
                      FROM replication_destination_cache ORDER BY updated_at DESC LIMIT 1"""
             ).fetchone()
             _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            primary_error = exc
+            raise
         except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
-            if isinstance(exc, ReplicationStateUnavailable):
-                primary_error = exc
-                raise
             primary_error = ReplicationStateUnavailable("replication sidecar status is unavailable")
             raise primary_error from exc
         finally:
