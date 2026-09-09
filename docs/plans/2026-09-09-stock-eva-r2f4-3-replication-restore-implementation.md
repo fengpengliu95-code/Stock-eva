@@ -974,7 +974,10 @@ CREATE TABLE replication_sidecar_meta (
     schema_digest TEXT NOT NULL CHECK (length(schema_digest) = 64),
     source_instance_id TEXT NOT NULL CHECK (length(source_instance_id) = 64),
     source_instance_sha256 TEXT NOT NULL CHECK (length(source_instance_sha256) = 64),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    generation_number INTEGER NOT NULL CHECK (generation_number >= 0),
+    previous_generation_sha256 TEXT NOT NULL CHECK (length(previous_generation_sha256) = 64),
+    generation_payload_sha256 TEXT NOT NULL CHECK (length(generation_payload_sha256) = 64)
 ) STRICT;
 
 CREATE TABLE replication_intents (
@@ -1068,7 +1071,9 @@ CREATE INDEX replication_destination_cache_health_idx
     ON replication_destination_cache (health_state, updated_at);
 
 CREATE TRIGGER replication_sidecar_meta_no_update
-BEFORE UPDATE ON replication_sidecar_meta BEGIN
+BEFORE UPDATE ON replication_sidecar_meta
+WHEN OLD.generation_payload_sha256 <> '0000000000000000000000000000000000000000000000000000000000000000'
+BEGIN
     SELECT RAISE(ABORT, 'replication schema identity is immutable');
 END;
 CREATE TRIGGER replication_sidecar_meta_no_delete
@@ -1212,8 +1217,8 @@ descriptor chain. Its allowlisted namespace is exactly `.writer.lock`, `genesis.
 zero-padded generation files `00000000000000000000.db` through
 `99999999999999999999.db`; temporary names exist only during a locked write and must be removed
 before the operation is successful. Any unknown name, WAL/SHM-like name, gap, duplicate, symlink,
-wrong type or unreadable entry makes the sidecar unavailable. The canonical market schema and the
-normative SQLite DDL above do not change.
+wrong type or unreadable entry makes the sidecar unavailable. The canonical market schema remains
+unchanged; the sidecar DDL is extended only by the Batch1.7 generation-metadata amendment below.
 
 `genesis.json` is an immutable canonical record whose closed fields are the sidecar schema/version,
 source instance id and digest, lock device/inode/link-count/mode, creation timestamp and its
@@ -2276,3 +2281,67 @@ the valid-NAS case; assert the pre-existing plain-store CLI plan/execute behavio
 compatible; and assert the plain-store option rejection occurs before provider construction.
 The two crosswalks above are updated to reference these exact anchors. The R2-F4.3 status remains
 `In Review / NO-GO`; this amendment does not claim implementation or production enablement.
+
+#### Batch1.7 immutable-generation integrity and threat-model amendment (normative)
+
+This amendment supersedes conflicting Batch1.6 sidecar-generation wording. Batch1.7 protects the
+cooperative Stock EVA writers, process crashes, accidental corruption, and symlink/path trust. It
+does not claim to defend against a same-UID uncooperative process that continuously changes the
+namespace between atomic syscalls. Hostile rollback or deletion of the chain tail cannot be proven
+without an external trust anchor; this batch has no external anchor. A locally complete chain may
+therefore report `ready` only with public `trust_scope="LOCAL_CHAIN_ONLY"`; that value means
+internally verified, not externally anchored or rollback-proof.
+
+The only generation commit linearization point is installation of the fixed zero-padded basename
+with no-replace hard-link (or an equivalent checked rename-excl). Lock, callback, baseline and
+auxiliary namespace checks happen before that point. A normal cooperative precheck failure writes
+no generation. If an uncooperative process inserts an entry after the last precheck but before the
+link and the link succeeds, the generation is nevertheless committed by definition: it MUST be
+retained, the operation returns a sanitized degraded
+`ReplicationPostCommitConflict(reason_code="CONTROL_STATE_UNAVAILABLE")`, and later readers fail
+closed on the namespace conflict. The implementation MUST NOT claim that this race had zero write.
+
+Every generation `replication_sidecar_meta` row has the closed additions
+`generation_number INTEGER`, `previous_generation_sha256 TEXT`, and
+`generation_payload_sha256 TEXT`. `generation_number` equals the filename sequence; generation
+zero uses `previous_generation_sha256=64-zero-hex`; every later generation stores the lower-case
+SHA-256 of the complete previous generation bytes. `generation_payload_sha256` is
+`domain_sha256("stock-eva/r2f4.3/replication-generation-payload/v1", preimage)` where `preimage`
+is the closed object `{generation_number,previous_generation_sha256,tables}`. `tables` is ordered
+as `(replication_sidecar_meta,replication_intents,replication_destination_cache,
+replication_attempt_events,replication_heads)`; each item contains the exact `PRAGMA table_info`
+column order and rows ordered by `rowid`; the `generation_payload_sha256` cell itself is excluded
+from that one table projection, and SQLite values use canonical JSON (bytes are tagged lower-case
+hex). No other field is excluded. This avoids circular hashing while binding all logical content.
+
+Readers recompute this digest, require metadata sequence equal to the filename, require the exact
+previous-byte digest, and validate every generation in the complete contiguous chain before
+selecting the highest one. A changed middle generation, legal old snapshot substitution, or hash
+field edit is unavailable. The DDL trigger permits only the private construction transition from
+the all-zero payload digest to its computed digest before no-replace installation; installed
+generation files and all non-placeholder metadata are immutable.
+
+Genesis remains a separate immutable record. Initialization is deterministic and resumable: under
+the cooperative lock, install `genesis.json` no-replace first, then install generation zero
+no-replace. A crash between those points leaves a valid genesis with no generation; the next
+initializer verifies the same source/lock identity and deterministically resumes generation zero.
+It MUST never create a second genesis or replace either artifact. Lock device/inode/link-count is
+only cooperative serialization and tamper evidence, not the security root; replacement discovered
+by a post-linearization proof returns degraded `CONTROL_STATE_UNAVAILABLE` and never replaces an
+immutable generation.
+
+All sidecar cleanup uses one best-effort accumulator: every temporary unlink, fd close, directory
+close, lock unlock and connection close is attempted independently. A cleanup-only failure raises
+sanitized `ReplicationDurabilityError`; with a primary failure it adds only a bounded
+`replication_cleanup=failed` note and never exposes a path or raw OS exception.
+
+The exact behavior anchors are
+`tests/test_dataset_replication.py::test_generation_metadata_binds_sequence_parent_and_content_hash`,
+`tests/test_dataset_replication.py::test_generation_parent_chain_tamper_is_unavailable`,
+`tests/test_dataset_replication.py::test_genesis_partial_initialization_resumes_deterministically`,
+`tests/test_dataset_replication.py::test_same_next_generation_multiprocess_has_one_no_replace_winner`,
+`tests/test_dataset_replication.py::test_postlinearization_namespace_conflict_preserves_generation_and_degrades`,
+`tests/test_dataset_replication.py::test_sidecar_generation_auxiliary_appearance_after_install_is_degraded_and_immutable`,
+and `tests/test_dataset_replication.py::test_sidecar_generation_lock_replacement_after_install_is_degraded_and_immutable`.
+The amendment remains implementation-only for Batch1: no NAS transfer, restore, provider request,
+or production enablement is authorized.

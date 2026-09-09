@@ -1,3 +1,4 @@
+import hashlib
 import json
 import multiprocessing
 import os
@@ -96,6 +97,21 @@ def _initialize_sidecar_process(path: str, source_instance_id: str, queue: objec
         queue.put("success")  # type: ignore[attr-defined]
 
 
+def _install_fixed_generation_process(path: str, payload: bytes, queue: object) -> None:
+    """Race the deterministic filename install without a shared Python lock."""
+    root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        replication._install_fixed_at(root_fd, "00000000000000000001.db", payload)
+    except replication.ReplicationCASConflict:
+        queue.put("cas_conflict")  # type: ignore[attr-defined]
+    except BaseException as exc:  # pragma: no cover - diagnostic child path
+        queue.put(type(exc).__name__)  # type: ignore[attr-defined]
+    else:
+        queue.put("installed")  # type: ignore[attr-defined]
+    finally:
+        os.close(root_fd)
+
+
 def test_replication_defaults_off_and_layout_is_local(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     layout = StorageLayout(settings)
@@ -148,6 +164,7 @@ def test_replication_status_reads_valid_sidecar_without_writing(tmp_path: Path) 
     assert result.reason_code == "NONE"
     assert result.source_ready is True
     assert result.provider_requests == 0
+    assert result.trust_scope == "LOCAL_CHAIN_ONLY"
     assert {path.name: (path.stat().st_ino, path.read_bytes()) for path in root.iterdir()} == before
 
 
@@ -1082,12 +1099,16 @@ def test_sidecar_generation_status_is_zero_write_and_reads_highest_stable_genera
     store = ReplicationSidecarStore(root)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     session = replication._open_generation_writer_session(root)
-    connection = _latest_generation_connection(root)
-    try:
-        replication._install_generation(session, connection.serialize(name="main"))
-    finally:
-        connection.close()
-        replication._close_generation_writer_session(session)
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    replication._install_generation(session, payload)
+    replication._close_generation_writer_session(session)
     before = {
         path.name: (
             path.stat().st_ino,
@@ -1177,11 +1198,14 @@ def test_sidecar_generation_auxiliary_appearance_after_install_is_degraded_and_i
     store = ReplicationSidecarStore(root)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     session = replication._open_generation_writer_session(root)
-    connection = _latest_generation_connection(root)
-    try:
-        payload = connection.serialize(name="main")
-    finally:
-        connection.close()
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
     real_install = replication._install_fixed_at
 
     def install_then_inject(*args: object, **kwargs: object) -> None:
@@ -1206,11 +1230,14 @@ def test_sidecar_generation_lock_replacement_after_install_is_degraded_and_immut
     store = ReplicationSidecarStore(root)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     session = replication._open_generation_writer_session(root)
-    connection = _latest_generation_connection(root)
-    try:
-        payload = connection.serialize(name="main")
-    finally:
-        connection.close()
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
     real_install = replication._install_fixed_at
 
     def install_then_replace(*args: object, **kwargs: object) -> None:
@@ -1240,11 +1267,14 @@ def test_sidecar_generation_eexist_is_typed_cas_conflict_without_overwrite(
     store = ReplicationSidecarStore(root)
     store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
     session = replication._open_generation_writer_session(root)
-    connection = _latest_generation_connection(root)
-    try:
-        payload = connection.serialize(name="main")
-    finally:
-        connection.close()
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
     target = root / "00000000000000000001.db"
     target_payload = b"attacker-owned-bytes"
     real_link = replication.os.link
@@ -1261,3 +1291,139 @@ def test_sidecar_generation_eexist_is_typed_cas_conflict_without_overwrite(
     finally:
         replication._close_generation_writer_session(session)
     assert target.read_bytes() == target_payload
+
+
+def test_generation_metadata_binds_sequence_parent_and_content_hash(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    ReplicationSidecarStore(root).initialize(
+        source_instance_id="a" * 64, source_instance_sha256="b" * 64
+    )
+    generation = _generation_files(root)[0]
+    payload = generation.read_bytes()
+    connection = replication._deserialize_sqlite_bytes(payload)
+    try:
+        metadata = connection.execute(
+            """SELECT generation_number, previous_generation_sha256,
+                      generation_payload_sha256
+                 FROM replication_sidecar_meta"""
+        ).fetchone()
+    finally:
+        connection.close()
+    assert metadata is not None
+    assert metadata[0] == 0
+    assert metadata[1] == replication.ZERO_SHA256
+    assert isinstance(metadata[2], str)
+    assert len(metadata[2]) == 64
+    assert metadata[2] != replication.ZERO_SHA256
+
+
+def test_generation_parent_chain_tamper_is_unavailable(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    replication._install_generation(session, payload)
+    replication._close_generation_writer_session(session)
+    first = _generation_files(root)[0]
+    tampered = replication._deserialize_sqlite_bytes(first.read_bytes())
+    try:
+        tampered.execute(
+            "INSERT INTO replication_destination_cache "
+            "(destination_id, descriptor_sha256, health_state, cache_version, updated_at) "
+            "VALUES (?, ?, 'unknown', 0, ?)",
+            ("e" * 32, "f" * 64, "2026-09-09T00:00:00Z"),
+        )
+        tampered.commit()
+        first.write_bytes(tampered.serialize(name="main"))
+    finally:
+        tampered.close()
+    with pytest.raises(ReplicationStateUnavailable):
+        store.read_status()
+
+
+def test_genesis_partial_initialization_resumes_deterministically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    real_install = replication._install_generation
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise replication.ReplicationDurabilityError("injected generation crash")
+        return real_install(*args, **kwargs)
+
+    monkeypatch.setattr(replication, "_install_generation", fail_once)
+    store = ReplicationSidecarStore(root)
+    with pytest.raises(ReplicationDurabilityError, match="crash"):
+        store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert (root / "genesis.json").exists()
+    assert _generation_files(root) == []
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert [path.name for path in _generation_files(root)] == ["00000000000000000000.db"]
+
+
+def test_same_next_generation_multiprocess_has_one_no_replace_winner(tmp_path: Path) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    root.mkdir(parents=True)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    payload = b"fixed-next-generation"
+    processes = [
+        context.Process(
+            target=_install_fixed_generation_process,
+            args=(str(root), payload, queue),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    outcomes = [queue.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(outcomes) == ["cas_conflict", "installed"]
+    assert (root / "00000000000000000001.db").read_bytes() == payload
+
+
+def test_postlinearization_namespace_conflict_preserves_generation_and_degrades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _generation_sidecar_root(tmp_path)
+    store = ReplicationSidecarStore(root)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    session = replication._open_generation_writer_session(root)
+    previous = _generation_files(root)[-1].read_bytes()
+    payload = replication._generation_payload(
+        "a" * 64,
+        "b" * 64,
+        "2026-09-09T00:00:00Z",
+        generation_number=1,
+        previous_generation_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    real_link = replication.os.link
+
+    def link_then_add_unknown(source: object, destination: object, **kwargs: object) -> object:
+        result = real_link(source, destination, **kwargs)
+        (root / "late-namespace-entry").write_bytes(b"external")
+        return result
+
+    monkeypatch.setattr(replication.os, "link", link_then_add_unknown)
+    try:
+        with pytest.raises(replication.ReplicationPostCommitConflict):
+            replication._install_generation(session, payload)
+    finally:
+        replication._close_generation_writer_session(session)
+    assert (root / "00000000000000000001.db").exists()
+    with pytest.raises(ReplicationStateUnavailable):
+        store.read_status()

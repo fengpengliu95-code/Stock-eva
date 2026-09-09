@@ -45,6 +45,10 @@ DATASET_IDENTITY_DOMAIN: Literal["stock-eva/r2f4.3/dataset-identity/v1"] = (
 SOURCE_OBJECT_SET_DOMAIN: Literal["stock-eva/r2f4.3/object-set/v1"] = (
     "stock-eva/r2f4.3/object-set/v1"
 )
+GENERATION_PAYLOAD_DOMAIN: Literal["stock-eva/r2f4.3/replication-generation-payload/v1"] = (
+    "stock-eva/r2f4.3/replication-generation-payload/v1"
+)
+GENERATION_TRUST_SCOPE: Literal["LOCAL_CHAIN_ONLY"] = "LOCAL_CHAIN_ONLY"
 JOURNAL_SCHEMA_VERSION = 1
 
 # The replication sidecar is an immutable generation log.  The former
@@ -99,6 +103,12 @@ class ReplicationCASConflict(ReplicationDurabilityError):
     """A deterministic next generation already exists with no overwrite allowed."""
 
 
+class ReplicationPostCommitConflict(ReplicationStateUnavailable):
+    """A generation was linked, then its final namespace proof failed."""
+
+    reason_code: Literal["CONTROL_STATE_UNAVAILABLE"] = "CONTROL_STATE_UNAVAILABLE"
+
+
 def canonical_json_bytes(value: object) -> bytes:
     """Return the one-newline canonical JSON representation used by R2-F4.3."""
     return (
@@ -137,7 +147,10 @@ def _expected_sqlite_objects() -> set[tuple[str, str, str | None, str | None]]:
             ).fetchall()
         )
     finally:
-        connection.close()
+        failures: list[str] = []
+        _close_connection_best_effort(connection, failures)
+        if failures:
+            raise _cleanup_error(failures)
 
 
 SIDECAR_DDL = """PRAGMA foreign_keys = ON;
@@ -153,7 +166,10 @@ CREATE TABLE replication_sidecar_meta (
     schema_digest TEXT NOT NULL CHECK (length(schema_digest) = 64),
     source_instance_id TEXT NOT NULL CHECK (length(source_instance_id) = 64),
     source_instance_sha256 TEXT NOT NULL CHECK (length(source_instance_sha256) = 64),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    generation_number INTEGER NOT NULL CHECK (generation_number >= 0),
+    previous_generation_sha256 TEXT NOT NULL CHECK (length(previous_generation_sha256) = 64),
+    generation_payload_sha256 TEXT NOT NULL CHECK (length(generation_payload_sha256) = 64)
 ) STRICT;
 
 CREATE TABLE replication_intents (
@@ -247,7 +263,9 @@ CREATE INDEX replication_destination_cache_health_idx
     ON replication_destination_cache (health_state, updated_at);
 
 CREATE TRIGGER replication_sidecar_meta_no_update
-BEFORE UPDATE ON replication_sidecar_meta BEGIN
+BEFORE UPDATE ON replication_sidecar_meta
+WHEN OLD.generation_payload_sha256 <> '0000000000000000000000000000000000000000000000000000000000000000'
+BEGIN
     SELECT RAISE(ABORT, 'replication schema identity is immutable');
 END;
 CREATE TRIGGER replication_sidecar_meta_no_delete
@@ -388,11 +406,10 @@ def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, lis
             current = child
         return descriptors[-1], descriptors
     except (OSError, ReplicationDurabilityError) as exc:
-        for descriptor in reversed(descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        cleanup_failures: list[str] = []
+        _close_descriptors(descriptors, cleanup_failures)
+        if cleanup_failures:
+            exc.add_note("replication_cleanup=failed")
         if isinstance(exc, ReplicationDurabilityError):
             raise
         raise ReplicationDurabilityError("replication path ancestor is unavailable") from exc
@@ -466,6 +483,7 @@ def _read_nofollow(
     _, descriptors = _open_directory_chain(path.parent)
     parent_fd = descriptors[-1]
     fd: int | None = None
+    primary_error: BaseException | None = None
     try:
         fd = os.open(
             path.name,
@@ -474,13 +492,26 @@ def _read_nofollow(
         )
         return _read_descriptor(fd, require_private_mode=require_private_mode)
     except FileNotFoundError as exc:
+        primary_error = exc
         raise ReplicationDurabilityError("replication artifact is unreadable") from exc
     except OSError as exc:
+        primary_error = exc
         raise ReplicationDurabilityError("replication artifact read failed") from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if fd is not None:
-            os.close(fd)
-        _close_descriptors(descriptors)
+            cleanup_failures: list[str] = []
+            _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
+            _close_descriptors(descriptors, cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
+        else:
+            _close_descriptors(descriptors)
 
 
 def _read_optional_nofollow(
@@ -500,6 +531,7 @@ def _read_optional_nofollow(
         raise
     parent_fd = descriptors[-1]
     fd: int | None = None
+    primary_error: BaseException | None = None
     try:
         try:
             fd = os.open(
@@ -511,17 +543,30 @@ def _read_optional_nofollow(
             return None
         return _read_descriptor(fd, require_private_mode=require_private_mode)
     except OSError as exc:
+        primary_error = exc
         raise ReplicationDurabilityError("replication artifact read failed") from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if fd is not None:
-            os.close(fd)
-        _close_descriptors(descriptors)
+            cleanup_failures = []
+            _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
+            _close_descriptors(descriptors, cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
+        else:
+            _close_descriptors(descriptors)
 
 
 def _stat_nofollow(path: Path) -> os.stat_result:
     path = _physical_path(path)
     _, descriptors = _open_directory_chain(path.parent)
     fd: int | None = None
+    primary_error: BaseException | None = None
     try:
         fd = os.open(
             path.name,
@@ -530,11 +575,23 @@ def _stat_nofollow(path: Path) -> os.stat_result:
         )
         return os.fstat(fd)
     except OSError as exc:
+        primary_error = exc
         raise ReplicationDurabilityError("replication artifact is unreadable") from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if fd is not None:
-            os.close(fd)
-        _close_descriptors(descriptors)
+            cleanup_failures: list[str] = []
+            _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
+            _close_descriptors(descriptors, cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
+        else:
+            _close_descriptors(descriptors)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -563,6 +620,7 @@ def _fsync_nofollow(path: Path, *, optional: bool = False) -> None:
             return
         raise
     fd: int | None = None
+    primary_error: BaseException | None = None
     try:
         try:
             fd = os.open(
@@ -576,11 +634,23 @@ def _fsync_nofollow(path: Path, *, optional: bool = False) -> None:
             raise
         os.fsync(fd)
     except OSError as exc:
+        primary_error = exc
         raise ReplicationDurabilityError("replication artifact fsync failed") from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if fd is not None:
-            os.close(fd)
-        _close_descriptors(descriptors)
+            cleanup_failures: list[str] = []
+            _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
+            _close_descriptors(descriptors, cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
+        else:
+            _close_descriptors(descriptors)
 
 
 def _write_fully(fd: int, payload: bytes) -> None:
@@ -727,6 +797,7 @@ class ReplicationStatusResponse(BaseModel):
     execution_allowed: Literal[False] = False
     effects: ReplicationEffects
     paths_exposed: Literal[False] = False
+    trust_scope: Literal["LOCAL_CHAIN_ONLY"] = GENERATION_TRUST_SCOPE
 
     @model_validator(mode="after")
     def public_projection_is_sanitized(self) -> ReplicationStatusResponse:
@@ -1596,13 +1667,19 @@ def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
         private_payload[18:20] = b"\x01\x01"
         connection.deserialize(bytes(private_payload), name="main")
         return connection
-    except ReplicationStateUnavailable:
+    except ReplicationStateUnavailable as exc:
         if connection is not None:
-            connection.close()
+            cleanup_failures: list[str] = []
+            _close_connection_best_effort(connection, cleanup_failures)
+            if cleanup_failures:
+                exc.add_note("replication_cleanup=failed")
         raise
     except BaseException as exc:
         if connection is not None:
-            connection.close()
+            cleanup_failures = []
+            _close_connection_best_effort(connection, cleanup_failures)
+            if cleanup_failures:
+                exc.add_note("replication_cleanup=failed")
         if isinstance(exc, ReplicationStateUnavailable):
             raise
         raise ReplicationStateUnavailable(
@@ -1652,27 +1729,27 @@ def _acquire_writer_lock(parent_fd: int, lock_name: str) -> tuple[int, _WriterLo
         token = _WriterLockToken(after, os.fstat(parent_fd))
         _verify_writer_lock_entry(parent_fd, lock_name, lock_fd, token)
         return lock_fd, token
-    except ReplicationDurabilityError:
+    except ReplicationDurabilityError as exc:
+        cleanup_failures: list[str] = []
         if lock_fd is not None:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             except OSError:
-                pass
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
+                cleanup_failures.append("lock_unlock")
+            _close_fd_best_effort(lock_fd, "lock_fd", cleanup_failures)
+        if cleanup_failures:
+            exc.add_note("replication_cleanup=failed")
         raise
     except OSError as exc:
+        cleanup_failures = []
         if lock_fd is not None:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             except OSError:
-                pass
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
+                cleanup_failures.append("lock_unlock")
+            _close_fd_best_effort(lock_fd, "lock_fd", cleanup_failures)
+        if cleanup_failures:
+            exc.add_note("replication_cleanup=failed")
         raise ReplicationDurabilityError("replication writer lock is unavailable") from exc
 
 
@@ -1687,10 +1764,7 @@ def _release_writer_lock(
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
     except OSError:
         collected.append("lock_unlock")
-    try:
-        os.close(lock_fd)
-    except OSError:
-        collected.append("lock_fd")
+    _close_fd_best_effort(lock_fd, "lock_fd", collected)
     return collected
 
 
@@ -1698,6 +1772,7 @@ def _verify_writer_lock_entry(
     parent_fd: int, lock_name: str, lock_fd: int, token: _WriterLockToken
 ) -> None:
     entry_fd: int | None = None
+    primary_error: BaseException | None = None
     try:
         parent_info = os.fstat(parent_fd)
         if (parent_info.st_dev, parent_info.st_ino) != (token.parent_dev, token.parent_ino):
@@ -1716,16 +1791,21 @@ def _verify_writer_lock_entry(
             stat.S_IMODE(entry.st_mode),
         ) != token_identity:
             raise ReplicationDurabilityError("replication writer lock entry changed")
-    except ReplicationDurabilityError:
+    except ReplicationDurabilityError as exc:
+        primary_error = exc
         raise
     except OSError as exc:
-        raise ReplicationDurabilityError("replication writer lock entry is unavailable") from exc
+        primary_error = ReplicationDurabilityError("replication writer lock entry is unavailable")
+        raise primary_error from exc
     finally:
         if entry_fd is not None:
-            try:
-                os.close(entry_fd)
-            except OSError:
-                pass
+            cleanup_failures: list[str] = []
+            _close_fd_best_effort(entry_fd, "lock_entry_fd", cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
 
 
 # Batch1.6 replaces the mutable prototype above with an immutable generation
@@ -1848,16 +1928,24 @@ def _validate_genesis(payload: bytes) -> dict[str, object]:
 
 def _read_at(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
     fd: int | None = None
+    primary: BaseException | None = None
     try:
         fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
         return _read_descriptor(fd)
     except FileNotFoundError as exc:
+        primary = exc
         raise ReplicationStateUnavailable("replication sidecar entry disappeared") from exc
     except OSError as exc:
+        primary = exc
         raise ReplicationStateUnavailable("replication sidecar entry is unsafe") from exc
     finally:
         if fd is not None:
-            os.close(fd)
+            failures: list[str] = []
+            _close_fd_best_effort(fd, "sidecar_entry_fd", failures)
+            if failures and primary is not None:
+                primary.add_note("replication_cleanup=failed")
+            elif failures:
+                raise _cleanup_error(failures)
 
 
 @dataclass(frozen=True)
@@ -1913,12 +2001,94 @@ def _scan_generation_namespace(
     return genesis, genesis_payload, entries[-1] if entries else None, tuple(entries)
 
 
+_GENERATION_DATA_TABLES = (
+    "replication_sidecar_meta",
+    "replication_intents",
+    "replication_destination_cache",
+    "replication_attempt_events",
+    "replication_heads",
+)
+
+
+def _canonical_sqlite_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return {"__bytes__": value.hex()}
+    if value is None or isinstance(value, (int, float, str, bool)):
+        return value
+    raise ReplicationStateUnavailable("replication generation contains unsupported value")
+
+
+def _generation_payload_preimage(connection: sqlite3.Connection) -> dict[str, object]:
+    """Build the closed logical snapshot used by generation content hashes.
+
+    The digest field itself is excluded to avoid a circular preimage.  SQLite
+    schema objects remain independently checked by ``_validate_sqlite_schema``.
+    """
+    tables: list[dict[str, object]] = []
+    for table in _GENERATION_DATA_TABLES:
+        columns = [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+        if not columns:
+            raise ReplicationStateUnavailable("replication generation table is missing")
+        selected = [
+            column
+            for column in columns
+            if not (table == "replication_sidecar_meta" and column == "generation_payload_sha256")
+        ]
+        quoted = ", ".join(f'"{column}"' for column in selected)
+        rows = connection.execute(f'SELECT {quoted} FROM "{table}" ORDER BY rowid').fetchall()
+        tables.append(
+            {
+                "table": table,
+                "columns": selected,
+                "rows": [[_canonical_sqlite_value(value) for value in row] for row in rows],
+            }
+        )
+    meta = connection.execute(
+        """SELECT generation_number, previous_generation_sha256
+             FROM replication_sidecar_meta"""
+    ).fetchall()
+    if len(meta) != 1:
+        raise ReplicationStateUnavailable("replication generation metadata is invalid")
+    return {
+        "generation_number": meta[0][0],
+        "previous_generation_sha256": meta[0][1],
+        "tables": tables,
+    }
+
+
+def _generation_payload_digest(connection: sqlite3.Connection) -> str:
+    return domain_sha256(GENERATION_PAYLOAD_DOMAIN, _generation_payload_preimage(connection))
+
+
+def _generation_meta(connection: sqlite3.Connection) -> tuple[int, str, str]:
+    rows = connection.execute(
+        """SELECT generation_number, previous_generation_sha256,
+                          generation_payload_sha256
+                     FROM replication_sidecar_meta"""
+    ).fetchall()
+    if len(rows) != 1:
+        raise ReplicationStateUnavailable("replication generation metadata is invalid")
+    generation_number, previous_hash, payload_hash = rows[0]
+    if not isinstance(generation_number, int) or generation_number < 0:
+        raise ReplicationStateUnavailable("replication generation number is invalid")
+    try:
+        _validate_sha(previous_hash, "previous_generation_sha256")
+        _validate_sha(payload_hash, "generation_payload_sha256")
+    except (TypeError, ValueError) as exc:
+        raise ReplicationStateUnavailable("replication generation digest is invalid") from exc
+    expected = _generation_payload_digest(connection)
+    if payload_hash != expected:
+        raise ReplicationStateUnavailable("replication generation payload hash is invalid")
+    return generation_number, previous_hash, payload_hash
+
+
 def _validate_generation_chain(
     entries: tuple[_GenerationEntry, ...], genesis: Mapping[str, object]
 ) -> None:
     """Validate every immutable image, not only the highest filename."""
-    for entry in entries:
+    for index, entry in enumerate(entries):
         connection: sqlite3.Connection | None = None
+        primary_error: BaseException | None = None
         try:
             connection = _deserialize_sqlite_bytes(entry.payload)
             _validate_sqlite_schema(connection)
@@ -1941,18 +2111,41 @@ def _validate_generation_chain(
                 expected_source_instance_id=genesis["source_instance_id"],
                 expected_source_instance_sha256=genesis["source_instance_sha256"],
             )
+            generation_number, previous_hash, _payload_hash = _generation_meta(connection)
+            expected_previous = (
+                ZERO_SHA256
+                if index == 0
+                else hashlib.sha256(entries[index - 1].payload).hexdigest()
+            )
+            if generation_number != entry.sequence or previous_hash != expected_previous:
+                raise ReplicationStateUnavailable("replication generation parent chain is invalid")
+        except ReplicationStateUnavailable as exc:
+            primary_error = exc
+            raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-            if isinstance(exc, ReplicationStateUnavailable):
-                raise
+            primary_error = exc
             raise ReplicationStateUnavailable("replication generation is invalid") from exc
         finally:
             if connection is not None:
-                connection.close()
+                failures: list[str] = []
+                _close_connection_best_effort(connection, failures)
+                if failures:
+                    if primary_error is not None:
+                        primary_error.add_note("replication_cleanup=failed")
+                    else:
+                        raise _cleanup_error(failures)
 
 
-def _validate_generation_payload(payload: bytes, genesis: Mapping[str, object]) -> None:
+def _validate_generation_payload(
+    payload: bytes,
+    genesis: Mapping[str, object],
+    *,
+    expected_sequence: int | None = None,
+    expected_previous: str | None = None,
+) -> None:
     """Validate a candidate image before it can enter the immutable chain."""
     connection: sqlite3.Connection | None = None
+    primary_error: BaseException | None = None
     try:
         connection = _deserialize_sqlite_bytes(payload)
         _validate_sqlite_schema(connection)
@@ -1975,18 +2168,31 @@ def _validate_generation_payload(payload: bytes, genesis: Mapping[str, object]) 
         ):
             raise ReplicationStateUnavailable("replication generation identity is invalid")
         _validate_utc_timestamp(meta[0][6], "created_at")
+        generation_number, previous_hash, _payload_hash = _generation_meta(connection)
+        if expected_sequence is not None and generation_number != expected_sequence:
+            raise ReplicationStateUnavailable("replication generation number is invalid")
+        if expected_previous is not None and previous_hash != expected_previous:
+            raise ReplicationStateUnavailable("replication generation parent is invalid")
         _validate_event_reachability(
             connection,
             expected_source_instance_id=genesis["source_instance_id"],
             expected_source_instance_sha256=genesis["source_instance_sha256"],
         )
+    except ReplicationStateUnavailable as exc:
+        primary_error = exc
+        raise
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-        if isinstance(exc, ReplicationStateUnavailable):
-            raise
+        primary_error = exc
         raise ReplicationStateUnavailable("replication generation is invalid") from exc
     finally:
         if connection is not None:
-            connection.close()
+            failures: list[str] = []
+            _close_connection_best_effort(connection, failures)
+            if failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(failures)
 
 
 def _compare_generation_snapshot(
@@ -2060,13 +2266,13 @@ def _open_generation_writer_session(path: Path) -> _GenerationWriterSession:
         )
         _assert_generation_lock(session)
         return session
-    except BaseException:
+    except BaseException as exc:
         failures: list[str] = []
         if lock_fd is not None and token is not None:
             _release_writer_lock(lock_fd, token, failures)
         _close_descriptors(descriptors, failures)
         if failures:
-            raise _cleanup_error(failures) from None
+            exc.add_note("replication_cleanup=failed")
         raise
 
 
@@ -2091,6 +2297,7 @@ def _install_fixed_at(
     temp_fd: int | None = None
     primary: BaseException | None = None
     failures: list[str] = []
+    installed = False
     try:
         temp_fd = os.open(
             temp,
@@ -2100,7 +2307,10 @@ def _install_fixed_at(
         )
         _write_fully(temp_fd, payload)
         os.fsync(temp_fd)
-        os.close(temp_fd)
+        close_failures: list[str] = []
+        _close_fd_best_effort(temp_fd, "generation_temp_fd", close_failures)
+        if close_failures:
+            raise _cleanup_error(close_failures)
         temp_fd = None
         if before_install is not None:
             before_install(temp)
@@ -2108,9 +2318,34 @@ def _install_fixed_at(
             os.link(temp, name, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
         except FileExistsError as exc:
             raise ReplicationCASConflict("replication generation CAS conflict") from exc
+        installed = True
         os.unlink(temp, dir_fd=root_fd)
         temp = ""
         _fsync_open_directory(root_fd)
+    except ReplicationCASConflict as exc:
+        primary = exc
+        raise
+    except ReplicationPostCommitConflict as exc:
+        primary = exc
+        raise
+    except ReplicationDurabilityError as exc:
+        if installed:
+            primary = ReplicationPostCommitConflict(
+                "replication generation committed; CONTROL_STATE_UNAVAILABLE "
+                "post-install durability proof failed"
+            )
+            raise primary from exc
+        primary = exc
+        raise
+    except OSError as exc:
+        if installed:
+            primary = ReplicationPostCommitConflict(
+                "replication generation committed; CONTROL_STATE_UNAVAILABLE "
+                "post-install durability proof failed"
+            )
+            raise primary from exc
+        primary = ReplicationDurabilityError("replication generation install failed")
+        raise primary from exc
     except BaseException as exc:
         primary = exc
         raise
@@ -2133,16 +2368,26 @@ def _install_fixed_at(
 
 
 def _generation_payload(
-    source_instance_id: str, source_instance_sha256: str, created_at: str
+    source_instance_id: str,
+    source_instance_sha256: str,
+    created_at: str,
+    *,
+    generation_number: int = 0,
+    previous_generation_sha256: str = ZERO_SHA256,
 ) -> bytes:
+    if generation_number < 0:
+        raise ValueError("generation_number must be non-negative")
+    _validate_sha(previous_generation_sha256, "previous_generation_sha256")
     connection = sqlite3.connect(":memory:")
+    primary_error: BaseException | None = None
     try:
         connection.executescript(SIDECAR_DDL)
         connection.execute(
             """INSERT INTO replication_sidecar_meta
                (sidecar_id, schema_version, schema_identity, ddl_sha256, schema_digest,
-                source_instance_id, source_instance_sha256, created_at)
-               VALUES (1, 1, ?, ?, ?, ?, ?, ?)""",
+                source_instance_id, source_instance_sha256, created_at,
+                generation_number, previous_generation_sha256, generation_payload_sha256)
+               VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 SIDECAR_SCHEMA_IDENTITY,
                 SIDECAR_DDL_SHA256,
@@ -2150,23 +2395,53 @@ def _generation_payload(
                 source_instance_id,
                 source_instance_sha256,
                 created_at,
+                generation_number,
+                previous_generation_sha256,
+                ZERO_SHA256,
             ),
         )
         connection.commit()
+        digest = _generation_payload_digest(connection)
+        connection.execute(
+            """UPDATE replication_sidecar_meta
+                  SET generation_payload_sha256 = ?
+                WHERE sidecar_id = 1""",
+            (digest,),
+        )
+        connection.commit()
         return connection.serialize(name="main")
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        connection.close()
+        failures: list[str] = []
+        _close_connection_best_effort(connection, failures)
+        if failures:
+            if primary_error is not None:
+                primary_error.add_note("replication_cleanup=failed")
+            else:
+                raise _cleanup_error(failures)
 
 
 def _install_generation(session: _GenerationWriterSession, payload: bytes) -> None:
     _assert_generation_lock(session)
     if session.genesis_payload is None or session.genesis is None:
         raise ReplicationDurabilityError("replication sidecar genesis is unavailable")
-    _validate_generation_payload(payload, session.genesis)
+    sequence = session.latest_sequence + 1
+    expected_previous = (
+        ZERO_SHA256
+        if not session.entries
+        else hashlib.sha256(session.entries[-1].payload).hexdigest()
+    )
+    _validate_generation_payload(
+        payload,
+        session.genesis,
+        expected_sequence=sequence,
+        expected_previous=expected_previous,
+    )
     _compare_generation_snapshot(
         session.root_fd, genesis_payload=session.genesis_payload, entries=session.entries
     )
-    sequence = session.latest_sequence + 1
     name = _generation_filename(sequence)
     _install_fixed_at(
         session.root_fd,
@@ -2183,12 +2458,20 @@ def _install_generation(session: _GenerationWriterSession, payload: bytes) -> No
         ),
     )
     # The installed generation is already immutable.  Re-read it and prove
-    # the lock and complete namespace before reporting success.
-    _assert_generation_lock(session)
-    _genesis, genesis_payload, _latest, entries = _scan_generation_namespace(session.root_fd)
-    if genesis_payload != session.genesis_payload or entries[-1].payload != payload:
-        raise ReplicationStateUnavailable("replication generation install readback mismatch")
-    session.entries = entries
+    # the lock and complete namespace before reporting success.  Failure here
+    # is post-linearization: retain the generation and make the sidecar
+    # unavailable for subsequent readers.
+    try:
+        _assert_generation_lock(session)
+        _genesis, genesis_payload, _latest, entries = _scan_generation_namespace(session.root_fd)
+        if genesis_payload != session.genesis_payload or entries[-1].payload != payload:
+            raise ReplicationStateUnavailable("replication generation install readback mismatch")
+        session.entries = entries
+    except (ReplicationDurabilityError, ReplicationStateUnavailable) as exc:
+        raise ReplicationPostCommitConflict(
+            "replication generation committed; CONTROL_STATE_UNAVAILABLE "
+            "final lock/namespace proof failed"
+        ) from exc
 
 
 def _open_generation_readonly(
@@ -2196,6 +2479,7 @@ def _open_generation_readonly(
 ) -> tuple[sqlite3.Connection, int, bytes, tuple[_GenerationEntry, ...]]:
     root = _sidecar_root(path)
     root_fd, descriptors = _open_directory_chain(root, create=False)
+    connection: sqlite3.Connection | None = None
     try:
         genesis, genesis_payload, latest, entries = _scan_generation_namespace(root_fd)
         if genesis is None or genesis_payload is None or latest is None:
@@ -2207,22 +2491,24 @@ def _open_generation_readonly(
         }:
             raise ReplicationStateUnavailable("replication sidecar lock authority changed")
         connection = _deserialize_sqlite_bytes(latest.payload)
-        try:
-            _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
-        except BaseException:
-            connection.close()
-            raise
+        _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
         # The root descriptor is the authority for the remainder of this
         # read.  Ancestor descriptors have already been checked and can be
         # closed without reopening the path.
         ancestor_failures = _close_descriptors(descriptors[:-1])
+        descriptors = [root_fd]
         if ancestor_failures:
-            connection.close()
+            _close_connection_best_effort(connection, ancestor_failures)
             _close_fd_best_effort(root_fd, "sidecar_root_fd", ancestor_failures)
             raise _cleanup_error(ancestor_failures)
         return connection, root_fd, genesis_payload, entries
-    except BaseException:
-        _close_descriptors(descriptors)
+    except BaseException as exc:
+        failures: list[str] = []
+        if connection is not None:
+            _close_connection_best_effort(connection, failures)
+        _close_descriptors(descriptors, failures)
+        if failures:
+            exc.add_note("replication_cleanup=failed")
         raise
 
 
@@ -2243,9 +2529,19 @@ class ImmutableReplicationSidecarStore:
         connection, root_fd, _genesis, _entries = _open_generation_readonly(path)
         try:
             connection.execute("PRAGMA query_only = ON")
-            return connection
-        finally:
-            _close_fd_best_effort(root_fd, "sidecar_root_fd", [])
+        except BaseException as exc:
+            failures: list[str] = []
+            _close_connection_best_effort(connection, failures)
+            _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
+            if failures:
+                exc.add_note("replication_cleanup=failed")
+            raise
+        failures = []
+        _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
+        if failures:
+            _close_connection_best_effort(connection, failures)
+            raise _cleanup_error(failures)
+        return connection
 
     def initialize(
         self,
@@ -2297,24 +2593,12 @@ class ImmutableReplicationSidecarStore:
                     entries=session.entries,
                 )
                 return
-            connection = sqlite3.connect(":memory:")
-            connection.executescript(SIDECAR_DDL)
-            connection.execute(
-                """INSERT INTO replication_sidecar_meta
-                   (sidecar_id, schema_version, schema_identity, ddl_sha256, schema_digest,
-                    source_instance_id, source_instance_sha256, created_at)
-                   VALUES (1, 1, ?, ?, ?, ?, ?, ?)""",
-                (
-                    SIDECAR_SCHEMA_IDENTITY,
-                    SIDECAR_DDL_SHA256,
-                    SIDECAR_SCHEMA_DIGEST,
-                    source_instance_id,
-                    source_instance_sha256,
-                    now,
-                ),
+            payload = _generation_payload(
+                source_instance_id,
+                source_instance_sha256,
+                now,
             )
-            connection.commit()
-            _install_generation(session, connection.serialize(name="main"))
+            _install_generation(session, payload)
         except (sqlite3.Error, OSError) as exc:
             primary = ReplicationDurabilityError("replication sidecar initialization failed")
             raise primary from exc
@@ -2349,6 +2633,7 @@ class ImmutableReplicationSidecarStore:
         counts: dict[str, int] = {}
         replicated: tuple[object, ...] | None = None
         row: tuple[object, ...] | None = None
+        primary_error: BaseException | None = None
         try:
             connection, root_fd, genesis_payload, entries = _open_generation_readonly(self.path)
             connection.execute("PRAGMA query_only = ON")
@@ -2407,13 +2692,21 @@ class ImmutableReplicationSidecarStore:
             _compare_generation_snapshot(root_fd, genesis_payload=genesis_payload, entries=entries)
         except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
             if isinstance(exc, ReplicationStateUnavailable):
+                primary_error = exc
                 raise
-            raise ReplicationStateUnavailable("replication sidecar status is unavailable") from exc
+            primary_error = ReplicationStateUnavailable("replication sidecar status is unavailable")
+            raise primary_error from exc
         finally:
+            cleanup_failures: list[str] = []
             if connection is not None:
-                connection.close()
+                _close_connection_best_effort(connection, cleanup_failures)
             if root_fd is not None:
-                os.close(root_fd)
+                _close_fd_best_effort(root_fd, "sidecar_root_fd", cleanup_failures)
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
         if row is None:
             health, observed = "unknown", None
         else:
@@ -2583,10 +2876,13 @@ __all__ = [
     "SOURCE_DATASET_DOMAIN",
     "SOURCE_INSTANCE_DOMAIN",
     "SOURCE_OBJECT_SET_DOMAIN",
+    "GENERATION_PAYLOAD_DOMAIN",
+    "GENERATION_TRUST_SCOPE",
     "JournalRecord",
     "ObjectInventoryEntry",
     "ReplicationDurabilityError",
     "ReplicationCASConflict",
+    "ReplicationPostCommitConflict",
     "ReplicationEffects",
     "ReplicationReason",
     "ReplicationSidecarStore",
