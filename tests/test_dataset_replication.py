@@ -141,6 +141,15 @@ def test_replication_disabled_is_zero_work(tmp_path: Path) -> None:
     assert not (tmp_path / "dataset").exists()
 
 
+def test_public_status_exposes_fixed_local_chain_trust_scope(tmp_path: Path) -> None:
+    result = ReplicationStatusService(_settings(tmp_path)).read()
+    assert result.trust_scope == "LOCAL_CHAIN_ONLY"
+    values = result.model_dump()
+    values["trust_scope"] = "REMOTE_ATTESTED"
+    with pytest.raises(ValidationError):
+        ReplicationStatusResponse.model_validate(values)
+
+
 def test_replication_status_reads_valid_sidecar_without_writing(tmp_path: Path) -> None:
     settings = _settings(tmp_path, replication_enabled=True)
     layout = StorageLayout(settings)
@@ -745,15 +754,64 @@ def test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors(
             raise OSError("injected cleanup failure")
         return real_unlink(name, *args, **kwargs)
 
-    def observe_descriptor_close(descriptors: list[int]) -> None:
+    def observe_descriptor_close(descriptors: list[int], failures: list[str] | None = None) -> None:
         cleanup_calls.append(tuple(descriptors))
-        real_close_descriptors(descriptors)
+        real_close_descriptors(descriptors, failures)
 
     monkeypatch.setattr(replication.os, "unlink", fail_temp_cleanup)
     monkeypatch.setattr(replication, "_close_descriptors", observe_descriptor_close)
     with pytest.raises(ReplicationDurabilityError, match="cleanup"):
         replication._install_no_replace(path, b"record")
     assert cleanup_calls
+
+
+def test_descriptor_cleanup_failure_after_primary_read_error_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_close = replication._close_fd_best_effort
+
+    def fail_close(fd: int, label: str, failures: list[str]) -> None:
+        real_close(fd, label, failures)
+        failures.append("injected_descriptor_cleanup")
+
+    monkeypatch.setattr(replication, "_close_fd_best_effort", fail_close)
+    with pytest.raises(ReplicationDurabilityError) as caught:
+        replication._read_nofollow(tmp_path / "missing-record.json")
+    assert "replication_cleanup=failed" in getattr(caught.value, "__notes__", [])
+
+
+def test_sidecar_entry_cleanup_failure_preserves_typed_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "record.json").mkdir()
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_close = replication._close_fd_best_effort
+
+    def fail_close(fd: int, label: str, failures: list[str]) -> None:
+        real_close(fd, label, failures)
+        failures.append("injected_descriptor_cleanup")
+
+    monkeypatch.setattr(replication, "_close_fd_best_effort", fail_close)
+    try:
+        with pytest.raises(ReplicationDurabilityError) as caught:
+            replication._read_at(parent_fd, "record.json")
+        assert "replication_cleanup=failed" in getattr(caught.value, "__notes__", [])
+    finally:
+        os.close(parent_fd)
+
+
+def test_descriptor_cleanup_failure_without_primary_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_close = replication._close_fd_best_effort
+
+    def fail_close(fd: int, label: str, failures: list[str]) -> None:
+        real_close(fd, label, failures)
+        failures.append("injected_descriptor_cleanup")
+
+    monkeypatch.setattr(replication, "_close_fd_best_effort", fail_close)
+    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
+        replication._fsync_directory(tmp_path)
 
 
 def test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors(

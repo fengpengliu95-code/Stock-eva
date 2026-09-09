@@ -265,6 +265,7 @@ interface ReplicationStatusResponse {
   execution_allowed: false;
   effects: Effects;
   paths_exposed: false;
+  trust_scope: "LOCAL_CHAIN_ONLY";
 }
 
 GET /api/v1/storage/replication -> ReplicationStatusResponse
@@ -1693,6 +1694,7 @@ path is allowed.
 | NFR-13 | `tests/test_launchagent_assets.py::test_replication_defaults_off_and_no_provider_in_dry_run` |
 | NFR-14 | `tests/test_nas_dataset.py::test_canonical_manifest_and_pointer_bytes_remain_unchanged` |
 | NFR-15 | `tests/test_dataset_replication.py::test_spec_evidence_uses_no_real_nas_or_provider` |
+| NFR-16 | `tests/test_dataset_replication.py::test_public_status_exposes_fixed_local_chain_trust_scope` |
 
 The full FR/AC/EC crosswalk above and this NFR table MUST remain byte-for-byte identical to the
 companion design crosswalk. Before implementation release, an automated checker must extract both
@@ -2345,3 +2347,25 @@ The exact behavior anchors are
 and `tests/test_dataset_replication.py::test_sidecar_generation_lock_replacement_after_install_is_degraded_and_immutable`.
 The amendment remains implementation-only for Batch1: no NAS transfer, restore, provider request,
 or production enablement is authorized.
+
+#### Batch1.8 status trust scope and cleanup finalization (normative)
+
+`ReplicationStatusResponse` has the closed public field
+`trust_scope: "LOCAL_CHAIN_ONLY"`. It is present in disabled, ready, degraded and unavailable
+responses, is fixed by the serializer and is validated by the strict public model. No remote,
+external-attested or destination trust value is admitted in this batch. The field is a bounded
+capability statement and never contains a path, credential, payload or exception string.
+
+Every descriptor-owning helper supplies one cleanup accumulator to `_close_descriptors`; no
+sidecar path may call it without an accumulator or ignore its returned failures. The read,
+optional-read, stat, fsync, generation, lock, and status paths capture a typed primary failure
+before entering `finally`, then independently attempt every artifact, directory, memory
+connection, lock and temporary-fd close. Cleanup cannot replace a primary error; it adds only the
+sanitized note `replication_cleanup=failed`. With no primary error, any cleanup failure raises a
+typed `ReplicationDurabilityError`. Required runtime anchors are
+`tests/test_dataset_replication.py::test_public_status_exposes_fixed_local_chain_trust_scope`,
+`tests/test_dataset_replication.py::test_descriptor_cleanup_failure_after_primary_read_error_is_recorded`,
+`tests/test_dataset_replication.py::test_sidecar_entry_cleanup_failure_preserves_typed_primary`,
+and `tests/test_dataset_replication.py::test_descriptor_cleanup_failure_without_primary_is_typed`.
+The API/crosswalk/model change is additive to the local status projection only; canonical market
+data, NAS transfer and provider behavior remain unchanged.

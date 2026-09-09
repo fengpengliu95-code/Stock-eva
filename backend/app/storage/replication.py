@@ -408,11 +408,12 @@ def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, lis
     except (OSError, ReplicationDurabilityError) as exc:
         cleanup_failures: list[str] = []
         _close_descriptors(descriptors, cleanup_failures)
-        if cleanup_failures:
-            exc.add_note("replication_cleanup=failed")
         if isinstance(exc, ReplicationDurabilityError):
+            _finish_cleanup(exc, cleanup_failures)
             raise
-        raise ReplicationDurabilityError("replication path ancestor is unavailable") from exc
+        primary = ReplicationDurabilityError("replication path ancestor is unavailable")
+        _finish_cleanup(primary, cleanup_failures)
+        raise primary from exc
 
 
 def _close_fd_best_effort(fd: int, label: str, failures: list[str]) -> None:
@@ -434,11 +435,19 @@ def _close_connection_best_effort(connection: sqlite3.Connection, failures: list
         failures.append("memory_connection")
 
 
-def _close_descriptors(descriptors: list[int], failures: list[str] | None = None) -> list[str]:
-    collected = failures if failures is not None else []
+def _close_descriptors(descriptors: list[int], failures: list[str]) -> None:
     for descriptor in reversed(descriptors):
-        _close_fd_best_effort(descriptor, "dir_fd", collected)
-    return collected
+        _close_fd_best_effort(descriptor, "dir_fd", failures)
+
+
+def _finish_cleanup(primary: BaseException | None, failures: list[str]) -> None:
+    """Finish a cleanup scope without masking its primary failure."""
+    if not failures:
+        return
+    if primary is not None:
+        primary.add_note("replication_cleanup=failed")
+        return
+    raise _cleanup_error(failures)
 
 
 def _read_descriptor(
@@ -492,11 +501,11 @@ def _read_nofollow(
         )
         return _read_descriptor(fd, require_private_mode=require_private_mode)
     except FileNotFoundError as exc:
-        primary_error = exc
-        raise ReplicationDurabilityError("replication artifact is unreadable") from exc
+        primary_error = ReplicationDurabilityError("replication artifact is unreadable")
+        raise primary_error from exc
     except OSError as exc:
-        primary_error = exc
-        raise ReplicationDurabilityError("replication artifact read failed") from exc
+        primary_error = ReplicationDurabilityError("replication artifact read failed")
+        raise primary_error from exc
     except BaseException as exc:
         primary_error = exc
         raise
@@ -505,13 +514,11 @@ def _read_nofollow(
             cleanup_failures: list[str] = []
             _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
             _close_descriptors(descriptors, cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
         else:
-            _close_descriptors(descriptors)
+            cleanup_failures = []
+            _close_descriptors(descriptors, cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
 
 
 def _read_optional_nofollow(
@@ -543,8 +550,8 @@ def _read_optional_nofollow(
             return None
         return _read_descriptor(fd, require_private_mode=require_private_mode)
     except OSError as exc:
-        primary_error = exc
-        raise ReplicationDurabilityError("replication artifact read failed") from exc
+        primary_error = ReplicationDurabilityError("replication artifact read failed")
+        raise primary_error from exc
     except BaseException as exc:
         primary_error = exc
         raise
@@ -553,13 +560,11 @@ def _read_optional_nofollow(
             cleanup_failures = []
             _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
             _close_descriptors(descriptors, cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
         else:
-            _close_descriptors(descriptors)
+            cleanup_failures = []
+            _close_descriptors(descriptors, cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
 
 
 def _stat_nofollow(path: Path) -> os.stat_result:
@@ -575,8 +580,8 @@ def _stat_nofollow(path: Path) -> os.stat_result:
         )
         return os.fstat(fd)
     except OSError as exc:
-        primary_error = exc
-        raise ReplicationDurabilityError("replication artifact is unreadable") from exc
+        primary_error = ReplicationDurabilityError("replication artifact is unreadable")
+        raise primary_error from exc
     except BaseException as exc:
         primary_error = exc
         raise
@@ -585,23 +590,27 @@ def _stat_nofollow(path: Path) -> os.stat_result:
             cleanup_failures: list[str] = []
             _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
             _close_descriptors(descriptors, cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
         else:
-            _close_descriptors(descriptors)
+            cleanup_failures = []
+            _close_descriptors(descriptors, cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
 
 
 def _fsync_directory(path: Path) -> None:
     path = _physical_path(path)
     _, descriptors = _open_directory_chain(path)
     fd = descriptors[-1]
+    primary_error: BaseException | None = None
     try:
         _fsync_open_directory(fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        _close_descriptors(descriptors)
+        cleanup_failures: list[str] = []
+        _close_descriptors(descriptors, cleanup_failures)
+        _finish_cleanup(primary_error, cleanup_failures)
 
 
 def _fsync_open_directory(fd: int) -> None:
@@ -634,8 +643,8 @@ def _fsync_nofollow(path: Path, *, optional: bool = False) -> None:
             raise
         os.fsync(fd)
     except OSError as exc:
-        primary_error = exc
-        raise ReplicationDurabilityError("replication artifact fsync failed") from exc
+        primary_error = ReplicationDurabilityError("replication artifact fsync failed")
+        raise primary_error from exc
     except BaseException as exc:
         primary_error = exc
         raise
@@ -644,13 +653,11 @@ def _fsync_nofollow(path: Path, *, optional: bool = False) -> None:
             cleanup_failures: list[str] = []
             _close_fd_best_effort(fd, "artifact_fd", cleanup_failures)
             _close_descriptors(descriptors, cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
         else:
-            _close_descriptors(descriptors)
+            cleanup_failures = []
+            _close_descriptors(descriptors, cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
 
 
 def _write_fully(fd: int, payload: bytes) -> None:
@@ -748,15 +755,8 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
             cleanup_failures.append("temporary_unlink")
         if target_fd is not None:
             _close_fd_best_effort(target_fd, "target_fd", cleanup_failures)
-        descriptor_failures = _close_descriptors(descriptors)
-        if descriptor_failures:
-            cleanup_failures.extend(descriptor_failures)
-        if cleanup_failures:
-            error = _cleanup_error(cleanup_failures)
-            if primary_error is not None:
-                primary_error.add_note("replication_cleanup=failed")
-            else:
-                raise error
+        _close_descriptors(descriptors, cleanup_failures)
+        _finish_cleanup(primary_error, cleanup_failures)
 
 
 class ReplicationEffects(BaseModel):
@@ -1801,11 +1801,7 @@ def _verify_writer_lock_entry(
         if entry_fd is not None:
             cleanup_failures: list[str] = []
             _close_fd_best_effort(entry_fd, "lock_entry_fd", cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
 
 
 # Batch1.6 replaces the mutable prototype above with an immutable generation
@@ -1933,19 +1929,19 @@ def _read_at(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
         fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
         return _read_descriptor(fd)
     except FileNotFoundError as exc:
-        primary = exc
-        raise ReplicationStateUnavailable("replication sidecar entry disappeared") from exc
+        primary = ReplicationStateUnavailable("replication sidecar entry disappeared")
+        raise primary from exc
     except OSError as exc:
+        primary = ReplicationStateUnavailable("replication sidecar entry is unsafe")
+        raise primary from exc
+    except BaseException as exc:
         primary = exc
-        raise ReplicationStateUnavailable("replication sidecar entry is unsafe") from exc
+        raise
     finally:
+        failures: list[str] = []
         if fd is not None:
-            failures: list[str] = []
             _close_fd_best_effort(fd, "sidecar_entry_fd", failures)
-            if failures and primary is not None:
-                primary.add_note("replication_cleanup=failed")
-            elif failures:
-                raise _cleanup_error(failures)
+        _finish_cleanup(primary, failures)
 
 
 @dataclass(frozen=True)
@@ -2182,17 +2178,13 @@ def _validate_generation_payload(
         primary_error = exc
         raise
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-        primary_error = exc
-        raise ReplicationStateUnavailable("replication generation is invalid") from exc
+        primary_error = ReplicationStateUnavailable("replication generation is invalid")
+        raise primary_error from exc
     finally:
         if connection is not None:
             failures: list[str] = []
             _close_connection_best_effort(connection, failures)
-            if failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(failures)
+            _finish_cleanup(primary_error, failures)
 
 
 def _compare_generation_snapshot(
@@ -2271,8 +2263,7 @@ def _open_generation_writer_session(path: Path) -> _GenerationWriterSession:
         if lock_fd is not None and token is not None:
             _release_writer_lock(lock_fd, token, failures)
         _close_descriptors(descriptors, failures)
-        if failures:
-            exc.add_note("replication_cleanup=failed")
+        _finish_cleanup(exc, failures)
         raise
 
 
@@ -2281,8 +2272,7 @@ def _close_generation_writer_session(session: _GenerationWriterSession) -> None:
     if session.lock_fd is not None:
         _release_writer_lock(session.lock_fd, session.lock_token, failures)
     _close_descriptors(session.descriptors, failures)
-    if failures:
-        raise _cleanup_error(failures)
+    _finish_cleanup(None, failures)
 
 
 def _install_fixed_at(
@@ -2495,20 +2485,20 @@ def _open_generation_readonly(
         # The root descriptor is the authority for the remainder of this
         # read.  Ancestor descriptors have already been checked and can be
         # closed without reopening the path.
-        ancestor_failures = _close_descriptors(descriptors[:-1])
+        ancestor_failures: list[str] = []
+        _close_descriptors(descriptors[:-1], ancestor_failures)
         descriptors = [root_fd]
         if ancestor_failures:
             _close_connection_best_effort(connection, ancestor_failures)
             _close_fd_best_effort(root_fd, "sidecar_root_fd", ancestor_failures)
-            raise _cleanup_error(ancestor_failures)
+            _finish_cleanup(None, ancestor_failures)
         return connection, root_fd, genesis_payload, entries
     except BaseException as exc:
         failures: list[str] = []
         if connection is not None:
             _close_connection_best_effort(connection, failures)
         _close_descriptors(descriptors, failures)
-        if failures:
-            exc.add_note("replication_cleanup=failed")
+        _finish_cleanup(exc, failures)
         raise
 
 
@@ -2516,8 +2506,7 @@ def _close_readonly_generation(root_fd: int, connection: sqlite3.Connection) -> 
     failures: list[str] = []
     _close_connection_best_effort(connection, failures)
     _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
-    if failures:
-        raise _cleanup_error(failures)
+    _finish_cleanup(None, failures)
 
 
 class ImmutableReplicationSidecarStore:
@@ -2533,14 +2522,13 @@ class ImmutableReplicationSidecarStore:
             failures: list[str] = []
             _close_connection_best_effort(connection, failures)
             _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
-            if failures:
-                exc.add_note("replication_cleanup=failed")
+            _finish_cleanup(exc, failures)
             raise
         failures = []
         _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
         if failures:
             _close_connection_best_effort(connection, failures)
-            raise _cleanup_error(failures)
+            _finish_cleanup(None, failures)
         return connection
 
     def initialize(
@@ -2702,11 +2690,7 @@ class ImmutableReplicationSidecarStore:
                 _close_connection_best_effort(connection, cleanup_failures)
             if root_fd is not None:
                 _close_fd_best_effort(root_fd, "sidecar_root_fd", cleanup_failures)
-            if cleanup_failures:
-                if primary_error is not None:
-                    primary_error.add_note("replication_cleanup=failed")
-                else:
-                    raise _cleanup_error(cleanup_failures)
+            _finish_cleanup(primary_error, cleanup_failures)
         if row is None:
             health, observed = "unknown", None
         else:
