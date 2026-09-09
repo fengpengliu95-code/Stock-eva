@@ -30,6 +30,7 @@ class MountInfo:
     mount_point: Path
     filesystem_type: str
     options: tuple[str, ...]
+    volume_id: str | None = None
 
 
 class MountInspector(Protocol):

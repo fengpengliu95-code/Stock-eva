@@ -2641,3 +2641,52 @@ The concrete anchors are
 `tests/test_dataset_replication.py::test_link_then_process_crash_leaves_proven_committed_staging_alias`,
 `tests/test_dataset_replication.py::test_staging_unlink_failure_is_degraded_but_proven_alias_remains_readable`,
 and `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id`.
+
+#### Batch3.2 live-boundary, claim binding and effect semantics (normative)
+
+This amendment supersedes any conflicting Batch3 wording above. Every destination root session
+starts from two independent proofs: the canonical persisted descriptor bytes/hash read through the
+held root descriptor, and a fresh live `SystemMountInspector` probe. The persisted descriptor is
+only an expectation; it is not a substitute for the live probe. The probe canonicalizes the
+mountpoint, lower-case filesystem type, de-duplicated lexicographically sorted options, volume id,
+and held-root device identity, then compares all values to the persisted descriptor. Tests may
+inject a local fake `MountInspector` with the same contract; no real NAS or mount operation is
+permitted.
+
+The same descriptor-native persisted/live comparison is performed immediately before and after
+each destination write boundary: staging-directory creation, every staging object/manifest/
+sentinel/record write and readback, generation-directory no-replace installation, history fsync,
+head CAS installation, and post-CAS head/readback. A pre-boundary mismatch stops all later writes;
+if an earlier staging/object/generation mutation occurred, the sanitized result sets
+`destination_writes=true`, otherwise it is false. A mismatch after the head linearization point
+does not remove or rewrite the head: the result is degraded `CONTROL_STATE_UNAVAILABLE` with
+`destination_writes=true`, and the immutable generation remains the only recoverable artifact.
+
+Sidecar-owned execution uses the frozen, closed `ReplicationClaimContext` model with exactly
+`intent_id`, `worker_id`, `state_version`, `checkpoint_id`, `source_instance_id`, and
+`source_instance_sha256`. `DestinationArchiveWriter.replicate(..., claim_context=...)` requires
+this context whenever an intent is supplied, rejects non-model/extra fields, and compares the
+context checkpoint and source identities to the complete `SourceCheckpoint` before opening the
+destination write session. The returned `VerifiedDestinationCommitProof` carries the same intent,
+worker, state-version, source-instance id and source-instance digest values; `DestinationCommitVerifier`
+and sidecar completion reread the current destination and leased sidecar state, so callers cannot
+supply arbitrary restart values.
+Restart reconciliation derives its claim identity from the current sidecar claim/head and the
+strict checkpoint projection; a stale worker or proof cannot advance the head.
+
+`destination_writes` is a monotonic operation-effect bit, not a success bit: it becomes true as
+soon as staging, an object/record, a generation directory, or the head is actually installed and
+never returns to false. A CAS conflict after generation installation therefore reports
+`CAS_CONFLICT` with `destination_writes=true`; failures before the first destination mutation
+report false. The canonical market dataset, manifest, pointer, provider behavior, NAS transfer
+enablement, and automatic failover remain unchanged and out of scope.
+
+The exact Batch3.2 behavior anchors are
+`tests/test_replication_destination_batch3.py::test_mount_identity_drift_before_staging_is_zero_write`,
+`tests/test_replication_destination_batch3.py::test_live_mount_identity_fields_are_independently_fail_closed`,
+`tests/test_replication_destination_batch3.py::test_mount_identity_drift_after_staging_is_degraded_with_effect`,
+`tests/test_replication_destination_batch3.py::test_claim_context_binds_writer_proof_for_sidecar_completion`,
+`tests/test_replication_destination_batch3.py::test_claim_context_checkpoint_mismatch_is_zero_write`, and
+`tests/test_replication_destination_batch3.py::test_cas_conflict_after_generation_install_reports_destination_effect`.
+The plan remains `In Review / NO-GO` until the complete release gates close; this amendment does
+not authorize production or real-NAS execution.

@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 
 from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
+from backend.app.storage.preflight import MountInspector, SystemMountInspector
 
 ZERO_SHA256 = "0" * 64
 SIDECAR_SCHEMA_IDENTITY = "stock-eva/r2f4.3/replication-sidecar/v1"
@@ -151,6 +152,12 @@ class VerifiedDestinationCommitProof(BaseModel):
     destination_generation: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     destination_record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     destination_head_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_id: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_instance_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     worker_id: str | None = Field(default=None, min_length=1, max_length=128)
     state_version: int | None = Field(default=None, ge=1)
     now: str
@@ -163,6 +170,19 @@ class VerifiedDestinationCommitProof(BaseModel):
         if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
             raise ValueError("destination proof fields are not exact")
         return value
+
+
+class ReplicationClaimContext(BaseModel):
+    """Frozen sidecar claim identity required for writer-owned completion."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    intent_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    worker_id: str = Field(min_length=1, max_length=128)
+    state_version: int = Field(ge=1)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -4630,6 +4650,45 @@ def _destination_mount_fingerprint(
     )
 
 
+def _normalize_mount_options(options: Iterable[str]) -> str:
+    values = sorted({str(option).strip() for option in options if str(option).strip()})
+    if any("," in value or "\n" in value or "\r" in value for value in values):
+        raise ReplicationDurabilityError("destination mount options are invalid")
+    return ",".join(values)
+
+
+def _destination_live_mount_identity(
+    descriptor: DestinationDescriptor,
+    root_fd: int,
+    mount_inspector: MountInspector,
+) -> None:
+    """Compare persisted expectations with an independent live mount probe."""
+    try:
+        info = mount_inspector.find_mount(descriptor.root_path)
+        root_info = os.fstat(root_fd)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ReplicationStateUnavailable("destination mount identity is unavailable") from exc
+    if info is None:
+        raise ReplicationStateUnavailable("destination mount identity is unavailable")
+    try:
+        live_mount_point = str(_physical_path(Path(info.mount_point)))
+        live_fs_type = str(info.filesystem_type).lower()
+        live_options = _normalize_mount_options(info.options)
+        live_volume_id = getattr(info, "volume_id", None)
+    except (TypeError, ValueError) as exc:
+        raise ReplicationStateUnavailable("destination mount identity is invalid") from exc
+    if live_fs_type in {"smb", "smbfs", "cifs", "nfs", "sshfs"}:
+        raise ReplicationDurabilityError("destination mount is unsupported")
+    if (
+        (int(root_info.st_dev) != descriptor.root_dev)
+        or live_mount_point != descriptor.mount_point
+        or live_fs_type != descriptor.fs_type.lower()
+        or live_options != descriptor.normalized_options
+        or live_volume_id != descriptor.volume_id
+    ):
+        raise ReplicationStateUnavailable("destination mount identity changed")
+
+
 class DestinationDescriptor(BaseModel):
     """Closed private trust descriptor for one explicit archive root."""
 
@@ -4682,6 +4741,7 @@ class DestinationDescriptor(BaseModel):
         mount_generation: str | None = None,
         created_at: str | None = None,
         local_root: Path | None = None,
+        mount_inspector: MountInspector | None = None,
     ) -> DestinationDescriptor:
         bound = _validate_destination_root(Path(root), local_root=local_root)
         if not bound.is_dir():
@@ -4695,14 +4755,29 @@ class DestinationDescriptor(BaseModel):
             parent_info = os.stat(bound.parent, follow_symlinks=False)
         except OSError as exc:
             raise _destination_root_error(bound) from exc
-        mount_name = mount_point or str(bound)
+        inspector = mount_inspector or SystemMountInspector()
+        mount_info = inspector.find_mount(bound)
+        if mount_info is None:
+            raise ReplicationDurabilityError("destination mount is unavailable")
+        live_mount_point = str(_physical_path(Path(mount_info.mount_point)))
+        live_fs_type = str(mount_info.filesystem_type).lower()
+        if live_fs_type in {"smb", "smbfs", "cifs", "nfs", "sshfs"}:
+            raise ReplicationDurabilityError("destination mount is unsupported")
+        # ``local`` is an offline fixture placeholder; the persisted
+        # descriptor records the inspector's actual filesystem identity.
+        mount_name = (
+            live_mount_point if mount_point is None or mount_point == str(bound) else mount_point
+        )
+        descriptor_fs_type = live_fs_type if fs_type == "local" else fs_type
+        descriptor_options = _normalize_mount_options(mount_info.options)
+        descriptor_volume_id = getattr(mount_info, "volume_id", None)
         generation = mount_generation or secrets.token_hex(32)
         fingerprint = _destination_mount_fingerprint(
             mount_point=mount_name,
-            fs_type=fs_type,
-            normalized_options=normalized_options,
+            fs_type=descriptor_fs_type,
+            normalized_options=descriptor_options,
             st_dev=int(root_info.st_dev),
-            volume_id=volume_id,
+            volume_id=descriptor_volume_id if volume_id is None else volume_id,
         )
         values: dict[str, object] = {
             "descriptor_schema": DESTINATION_DESCRIPTOR_SCHEMA,
@@ -4715,9 +4790,9 @@ class DestinationDescriptor(BaseModel):
             "parent_dev": int(parent_info.st_dev),
             "parent_ino": int(parent_info.st_ino),
             "mount_point": mount_name,
-            "fs_type": fs_type,
-            "normalized_options": normalized_options,
-            "volume_id": volume_id,
+            "fs_type": descriptor_fs_type,
+            "normalized_options": descriptor_options,
+            "volume_id": descriptor_volume_id if volume_id is None else volume_id,
             "mount_generation": generation,
             "mount_fingerprint": fingerprint,
             "sentinel_sha256": sentinel_sha256,
@@ -5272,13 +5347,20 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> None:
 
 
 @contextmanager
-def _destination_root_session(descriptor: DestinationDescriptor):
+def _destination_root_session(
+    descriptor: DestinationDescriptor,
+    *,
+    mount_inspector: MountInspector | None = None,
+):
     descriptor.verify_bound()
     root_fd, descriptors = _open_directory_chain(descriptor.root_path, create=False)
     primary: BaseException | None = None
     try:
         descriptor.verify_root_fd(root_fd)
-        _destination_verify_persisted_descriptor(descriptor, root_fd)
+        persisted = _destination_verify_persisted_descriptor(descriptor, root_fd)
+        _destination_live_mount_identity(
+            persisted, root_fd, mount_inspector or SystemMountInspector()
+        )
         yield root_fd
     except BaseException as exc:
         primary = exc
@@ -5388,6 +5470,7 @@ def initialize_destination(
     sentinel_bytes: bytes | None = None,
     local_root: Path | None = None,
     created_at: str | None = None,
+    mount_inspector: MountInspector | None = None,
 ) -> DestinationDescriptor:
     """Create a new empty offline archive root under an exact typed ack.
 
@@ -5433,6 +5516,7 @@ def initialize_destination(
         volume_id=volume_id,
         created_at=created_at,
         local_root=local_root,
+        mount_inspector=mount_inspector,
     )
     replication_path = bound / DESTINATION_REPLICATION_DIR
     history = replication_path / DESTINATION_HISTORY_DIR
@@ -5605,7 +5689,12 @@ class SentinelProjection(BaseModel):
 class DestinationArchiveReader:
     """Descriptor-native read contract for the destination archive."""
 
-    def __init__(self, descriptor: DestinationDescriptor | Path) -> None:
+    def __init__(
+        self,
+        descriptor: DestinationDescriptor | Path,
+        *,
+        mount_inspector: MountInspector | None = None,
+    ) -> None:
         if isinstance(descriptor, DestinationDescriptor):
             self.descriptor = descriptor
         else:
@@ -5614,15 +5703,20 @@ class DestinationArchiveReader:
                 candidate / DESTINATION_DESCRIPTOR_NAME if candidate.is_dir() else candidate
             )
             self.descriptor = DestinationDescriptor.read(descriptor_path)
+        self.mount_inspector = mount_inspector or SystemMountInspector()
 
     @contextmanager
     def root_session(self):
-        with _destination_root_session(self.descriptor) as root_fd:
+        with _destination_root_session(
+            self.descriptor, mount_inspector=self.mount_inspector
+        ) as root_fd:
             yield root_fd
 
     def _root_or_bound(self, root_dirfd: int | None):
         if root_dirfd is not None:
             self.descriptor.verify_root_fd(root_dirfd)
+            persisted = _destination_verify_persisted_descriptor(self.descriptor, root_dirfd)
+            _destination_live_mount_identity(persisted, root_dirfd, self.mount_inspector)
             return _null_context(root_dirfd)
         return self.root_session()
 
@@ -5875,6 +5969,8 @@ class DestinationArchiveReader:
                 destination_generation=generation,
                 destination_record_sha256=record.record_sha256,
                 destination_head_sha256=head.head_sha256,
+                source_instance_id=record.source_instance_id,
+                source_instance_sha256=record.source_instance_sha256,
                 worker_id=worker_id,
                 state_version=state_version,
                 now=now or _utc_now(),
@@ -6010,13 +6106,24 @@ class DestinationArchiveReader:
 class DestinationCommitVerifier:
     """Fresh, descriptor-native verifier used by sidecar completion."""
 
-    def __init__(self, descriptor: DestinationDescriptor | Path) -> None:
-        self.reader = DestinationArchiveReader(descriptor)
+    def __init__(
+        self,
+        descriptor: DestinationDescriptor | Path,
+        *,
+        mount_inspector: MountInspector | None = None,
+    ) -> None:
+        self.reader = DestinationArchiveReader(descriptor, mount_inspector=mount_inspector)
 
     def verify(self, proof: VerifiedDestinationCommitProof) -> VerifiedDestinationCommitProof:
         if not isinstance(proof, VerifiedDestinationCommitProof):
             raise ReplicationDurabilityError("destination completion proof is invalid")
-        if proof.intent_id is None or proof.worker_id is None or proof.state_version is None:
+        if (
+            proof.intent_id is None
+            or proof.worker_id is None
+            or proof.state_version is None
+            or proof.source_instance_id is None
+            or proof.source_instance_sha256 is None
+        ):
             raise ReplicationDurabilityError("destination completion proof is incomplete")
         try:
             refreshed = self.reader.verify_commit(
@@ -6217,6 +6324,7 @@ class DestinationArchiveWriter:
         *,
         source_root: Path,
         writer_host_id: str,
+        mount_inspector: MountInspector | None = None,
     ) -> None:
         self.descriptor = (
             descriptor
@@ -6229,6 +6337,7 @@ class DestinationArchiveWriter:
         )
         self.source_root = _physical_path(Path(source_root))
         self.writer_host_id = writer_host_id
+        self.mount_inspector = mount_inspector or SystemMountInspector()
         if writer_host_id != self.descriptor.single_writer_host_id:
             raise ReplicationDurabilityError("destination writer host is not authorized")
         _validate_source_root(self.source_root)
@@ -6246,14 +6355,31 @@ class DestinationArchiveWriter:
         *,
         source_sequence: int,
         intent_id: str | None,
+        claim_context: ReplicationClaimContext | None,
         now: str,
         lock_fd: int,
         lock_identity: list[int],
         replication_fd: int,
     ) -> DestinationReplicationResult:
-        reader = DestinationArchiveReader(self.descriptor)
+        reader = DestinationArchiveReader(self.descriptor, mount_inspector=self.mount_inspector)
+        proof_intent_id = claim_context.intent_id if claim_context is not None else intent_id
+        proof_worker_id = claim_context.worker_id if claim_context is not None else None
+        proof_state_version = claim_context.state_version if claim_context is not None else None
         head_committed = False
+        destination_write_started = False
+
+        def check_boundary() -> None:
+            """Freshly prove the persisted descriptor and live mount identity."""
+            persisted = _destination_verify_persisted_descriptor(self.descriptor, root_fd)
+            _destination_live_mount_identity(persisted, root_fd, self.mount_inspector)
+
         _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+        try:
+            check_boundary()
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            if isinstance(exc, ReplicationDurabilityError) and "unsupported" in str(exc):
+                return DestinationReplicationResult("unavailable", "MOUNT_UNSUPPORTED")
+            return DestinationReplicationResult("unavailable", "DESTINATION_TRUST_FAILED")
         # The destination role/sentinel is part of the trust boundary and
         # must be proven before staging any new generation.  Otherwise a
         # tampered empty archive could advance its head and only be noticed by
@@ -6315,6 +6441,7 @@ class DestinationArchiveWriter:
                 ):
                     raise ReplicationStateUnavailable("destination orphan generation conflicts")
                 orphan = matching_orphans[0]
+                check_boundary()
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
                 recovered_head = _destination_head(
                     self.descriptor, orphan, head_version=1, updated_at=now
@@ -6326,12 +6453,21 @@ class DestinationArchiveWriter:
                     expected=None,
                 )
                 head_committed = True
+                destination_write_started = True
+                try:
+                    check_boundary()
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return DestinationReplicationResult(
+                        "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                    )
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
                 proof = reader.verify_commit(
-                    intent_id=intent_id,
+                    intent_id=proof_intent_id,
                     checkpoint_id=checkpoint.checkpoint_id,
                     source_sequence=source_sequence,
                     destination_generation=orphan.replication_generation,
+                    worker_id=proof_worker_id,
+                    state_version=proof_state_version,
                     now=now,
                 )
                 return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
@@ -6384,6 +6520,7 @@ class DestinationArchiveWriter:
                 ):
                     raise ReplicationStateUnavailable("destination orphan generation conflicts")
                 orphan = matching_orphans[0]
+                check_boundary()
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
                 recovered_head = _destination_head(
                     self.descriptor,
@@ -6399,12 +6536,21 @@ class DestinationArchiveWriter:
                     expected=baseline_bytes,
                 )
                 head_committed = True
+                destination_write_started = True
+                try:
+                    check_boundary()
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return DestinationReplicationResult(
+                        "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                    )
                 _destination_assert_lock(replication_fd, lock_fd, lock_identity)
                 proof = reader.verify_commit(
-                    intent_id=intent_id,
+                    intent_id=proof_intent_id,
                     checkpoint_id=checkpoint.checkpoint_id,
                     source_sequence=source_sequence,
                     destination_generation=orphan.replication_generation,
+                    worker_id=proof_worker_id,
+                    state_version=proof_state_version,
                     now=now,
                 )
                 return DestinationReplicationResult("replicated", "NONE", orphan, proof, True)
@@ -6423,9 +6569,11 @@ class DestinationArchiveWriter:
                 if baseline.checkpoint_id != checkpoint.checkpoint_id:
                     return DestinationReplicationResult("unavailable", "DESTINATION_CONFLICT")
                 proof = reader.verify_commit(
-                    intent_id=intent_id,
+                    intent_id=proof_intent_id,
                     checkpoint_id=checkpoint.checkpoint_id,
                     source_sequence=source_sequence,
+                    worker_id=proof_worker_id,
+                    state_version=proof_state_version,
                     now=now,
                 )
                 record = reader.read_record(baseline.replication_generation, root_fd)
@@ -6447,10 +6595,13 @@ class DestinationArchiveWriter:
         staging_fd: int | None = None
         linked = False
         try:
+            check_boundary()
             try:
                 os.mkdir(staging_name, mode=0o700, dir_fd=history_fd)
             except FileExistsError as exc:
                 raise ReplicationDurabilityError("destination staging conflict") from exc
+            destination_write_started = True
+            check_boundary()
             staging_fd = _destination_open_dir(history_fd, staging_name)
             source_fd, source_dirs = _open_directory_chain(self.source_root, create=False)
             try:
@@ -6463,8 +6614,13 @@ class DestinationArchiveWriter:
                 _parse_destination_manifest(
                     manifest, expected_sha256=checkpoint.source_manifest_bytes_sha256
                 )
+                check_boundary()
                 _destination_write_at(staging_fd, DESTINATION_SENTINEL_NAME, sentinel)
+                destination_write_started = True
+                check_boundary()
                 _destination_write_at(staging_fd, "manifest.json", manifest)
+                destination_write_started = True
+                check_boundary()
                 for item in checkpoint.object_inventory:
                     payload = _destination_read_relative(source_fd, item.relative_path)
                     if (
@@ -6477,9 +6633,15 @@ class DestinationArchiveWriter:
                     parts = tuple(item.relative_path.split("/"))
                     try:
                         for part in parts[:-1]:
+                            check_boundary()
                             target_fd = _destination_mkdir_at(target_fd, part)
                             target_dirs.append(target_fd)
+                            destination_write_started = True
+                            check_boundary()
+                        check_boundary()
                         _destination_write_at(target_fd, parts[-1], payload)
+                        destination_write_started = True
+                        check_boundary()
                         readback = _destination_read_at(
                             target_fd, (parts[-1],), require_private_mode=False
                         )
@@ -6489,6 +6651,7 @@ class DestinationArchiveWriter:
                             or _sha256_bytes(readback[0]) != item.object_sha256
                         ):
                             raise ReplicationDurabilityError("destination object readback failed")
+                        check_boundary()
                     finally:
                         failures: list[str] = []
                         _close_descriptors(target_dirs, failures)
@@ -6507,17 +6670,23 @@ class DestinationArchiveWriter:
                 created_at=now,
                 replication_generation=generation,
             )
+            check_boundary()
             _destination_write_at(
                 staging_fd,
                 "replication-record.json",
                 canonical_json_bytes(record.model_dump(mode="json")),
             )
+            destination_write_started = True
+            check_boundary()
             _fsync_open_directory(staging_fd)
             os.close(staging_fd)
             staging_fd = None
+            check_boundary()
             _destination_rename_noreplace(history_fd, staging_name, generation)
+            destination_write_started = True
             linked = True
             _fsync_open_directory(history_fd)
+            check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
             head = _destination_head(
                 self.descriptor,
@@ -6535,6 +6704,7 @@ class DestinationArchiveWriter:
                 current_head_bytes[0] if current_head_bytes is not None else None
             ) != baseline_bytes:
                 raise ReplicationCASConflict("destination head CAS conflict")
+            check_boundary()
             _destination_replace_at(
                 replication_fd,
                 "head.json",
@@ -6542,17 +6712,27 @@ class DestinationArchiveWriter:
                 expected=baseline_bytes,
             )
             head_committed = True
+            destination_write_started = True
+            check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
             self.descriptor.verify_bound()
             proof = reader.verify_commit(
-                intent_id=intent_id,
+                intent_id=proof_intent_id,
                 checkpoint_id=checkpoint.checkpoint_id,
                 source_sequence=source_sequence,
                 destination_generation=generation,
+                worker_id=proof_worker_id,
+                state_version=proof_state_version,
                 now=now,
             )
             return DestinationReplicationResult("replicated", "NONE", record, proof, True)
         except (ReplicationCASConflict, ReplicationStateUnavailable) as exc:
+            if head_committed:
+                return DestinationReplicationResult(
+                    "unavailable",
+                    "CONTROL_STATE_UNAVAILABLE",
+                    destination_writes=True,
+                )
             reason = (
                 "CAS_CONFLICT"
                 if isinstance(exc, ReplicationCASConflict)
@@ -6561,12 +6741,18 @@ class DestinationArchiveWriter:
             if isinstance(exc, ReplicationStateUnavailable) and "lineage" in str(exc):
                 reason = "DESTINATION_CONFLICT"
             return DestinationReplicationResult(
-                "unavailable", reason, destination_writes=head_committed
+                "unavailable", reason, destination_writes=destination_write_started
             )
         except ReplicationDurabilityError as exc:
+            if head_committed:
+                return DestinationReplicationResult(
+                    "unavailable",
+                    "CONTROL_STATE_UNAVAILABLE",
+                    destination_writes=True,
+                )
             reason = "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
             return DestinationReplicationResult(
-                "unavailable", reason, destination_writes=head_committed
+                "unavailable", reason, destination_writes=destination_write_started
             )
         finally:
             if staging_fd is not None:
@@ -6587,6 +6773,7 @@ class DestinationArchiveWriter:
         *,
         source_sequence: int,
         intent_id: str | None = None,
+        claim_context: ReplicationClaimContext | None = None,
         now: str | None = None,
     ) -> DestinationReplicationResult:
         try:
@@ -6603,6 +6790,21 @@ class DestinationArchiveWriter:
                 )
             )
             normalized.verify_hashes()
+            if claim_context is not None and not isinstance(claim_context, ReplicationClaimContext):
+                raise ReplicationDurabilityError("replication claim context is invalid")
+            if claim_context is not None:
+                if intent_id is not None and intent_id != claim_context.intent_id:
+                    raise ReplicationDurabilityError("replication claim intent mismatch")
+                if claim_context.checkpoint_id != normalized.checkpoint_id:
+                    raise ReplicationDurabilityError("replication claim checkpoint mismatch")
+                if (
+                    claim_context.source_instance_id != normalized.source_instance_id
+                    or claim_context.source_instance_sha256 != normalized.source_instance_sha256
+                ):
+                    raise ReplicationDurabilityError("replication claim source mismatch")
+                intent_id = claim_context.intent_id
+            elif intent_id is not None:
+                raise ReplicationDurabilityError("replication claim context is required")
             if not isinstance(source_sequence, int) or source_sequence < 1:
                 raise ReplicationDurabilityError("source sequence is invalid")
             occurred_at = now or _utc_now()
@@ -6610,7 +6812,9 @@ class DestinationArchiveWriter:
             if self.writer_host_id != self.descriptor.single_writer_host_id:
                 raise ReplicationDurabilityError("destination writer host is not authorized")
             self.descriptor.verify_bound()
-            with _destination_root_session(self.descriptor) as root_fd:
+            with _destination_root_session(
+                self.descriptor, mount_inspector=self.mount_inspector
+            ) as root_fd:
                 replication_fd, lock_fd, lock_identity = _destination_lock(root_fd)
                 result: DestinationReplicationResult | None = None
                 try:
@@ -6620,6 +6824,7 @@ class DestinationArchiveWriter:
                         normalized,
                         source_sequence=source_sequence,
                         intent_id=intent_id,
+                        claim_context=claim_context,
                         now=occurred_at,
                         lock_fd=lock_fd,
                         lock_identity=lock_identity,
@@ -6649,10 +6854,12 @@ class DestinationArchiveWriter:
             reason: ReplicationReason = "DESTINATION_TRUST_FAILED"
             if "lock" in message or "unsupported" in message:
                 reason = "MOUNT_UNSUPPORTED"
-            elif "mount" in message:
-                reason = "DESTINATION_MOUNT_UNAVAILABLE"
             elif "rebound" in message or "changed" in message:
                 reason = "DESTINATION_REBOUND"
+            elif "mount" in message:
+                reason = "DESTINATION_MOUNT_UNAVAILABLE"
+            elif "claim" in message:
+                reason = "DESTINATION_TRUST_FAILED"
             elif "source" in message or "manifest" in message:
                 reason = "SOURCE_UNAVAILABLE"
             elif "object" in message or "staging" in message or "copy" in message:
@@ -6678,6 +6885,7 @@ def build_destination_descriptor(
     sentinel_sha256: str = ZERO_SHA256,
     local_root: Path | None = None,
     created_at: str | None = None,
+    mount_inspector: MountInspector | None = None,
 ) -> DestinationDescriptor:
     """Small explicit-root factory used by offline drain fixtures."""
     return DestinationDescriptor.from_root(
@@ -6688,6 +6896,7 @@ def build_destination_descriptor(
         sentinel_sha256=sentinel_sha256,
         local_root=local_root,
         created_at=created_at,
+        mount_inspector=mount_inspector,
     )
 
 
@@ -6766,7 +6975,13 @@ def _complete_replication_with_proof(
         raise ReplicationDurabilityError(
             "replication completion requires a dedicated verified destination proof"
         )
-    if proof.intent_id is None or proof.worker_id is None or proof.state_version is None:
+    if (
+        proof.intent_id is None
+        or proof.worker_id is None
+        or proof.state_version is None
+        or proof.source_instance_id is None
+        or proof.source_instance_sha256 is None
+    ):
         raise ReplicationDurabilityError("destination completion proof is incomplete")
     _validate_sha(proof.intent_id, "intent_id")
     _validate_sha(proof.checkpoint_id, "checkpoint_id")
@@ -6777,13 +6992,17 @@ def _complete_replication_with_proof(
 
     def mutate(connection: sqlite3.Connection) -> _MutationOutcome:
         intent = connection.execute(
-            "SELECT destination_id, source_sequence, checkpoint_id FROM replication_intents WHERE intent_id=?",
+            """SELECT destination_id, source_sequence, checkpoint_id,
+                              source_instance_id, source_instance_sha256
+                         FROM replication_intents WHERE intent_id=?""",
             (proof.intent_id,),
         ).fetchone()
         if intent is None or intent != (
             proof.destination_id,
             proof.source_sequence,
             proof.checkpoint_id,
+            proof.source_instance_id,
+            proof.source_instance_sha256,
         ):
             raise ReplicationStateUnavailable("replication completion proof does not match intent")
         head = store._head_row(connection, proof.intent_id)
@@ -6832,6 +7051,7 @@ __all__ = [
     "ReplicationDurabilityError",
     "ReplicationCASConflict",
     "ReplicationClaim",
+    "ReplicationClaimContext",
     "ReplicationHead",
     "ReplicationImportResult",
     "ReplicationIntent",
