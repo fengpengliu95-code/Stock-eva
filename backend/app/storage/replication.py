@@ -18,10 +18,10 @@ import sqlite3
 import stat
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self, get_args
-from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -559,6 +559,7 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
     parent = path.parent
     parent_fd, descriptors = _open_directory_chain(parent, create=True)
     target_fd: int | None = None
+    primary_error: BaseException | None = None
     temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
         try:
@@ -620,17 +621,30 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
         _fsync_open_directory(parent_fd)
         return path
     except OSError as exc:
-        raise ReplicationDurabilityError("replication artifact install failed") from exc
+        primary_error = ReplicationDurabilityError("replication artifact install failed")
+        raise primary_error from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_error: OSError | None = None
         try:
             os.unlink(temporary_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise ReplicationDurabilityError("replication temporary cleanup failed") from exc
+            cleanup_error = exc
         if target_fd is not None:
-            os.close(target_fd)
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
         _close_descriptors(descriptors)
+        if cleanup_error is not None:
+            error = ReplicationDurabilityError("replication temporary cleanup failed")
+            if primary_error is not None:
+                raise error from primary_error
+            raise error from cleanup_error
 
 
 class ReplicationEffects(BaseModel):
@@ -1513,15 +1527,70 @@ def _validate_event_reachability(
             raise ReplicationStateUnavailable("replication head does not replay events")
 
 
-def _stat_fingerprint(value: os.stat_result | None) -> tuple[int, int, int, int] | None:
+def _stat_fingerprint(
+    value: os.stat_result | None,
+    payload: bytes | None = None,
+) -> tuple[int, int, int, int, str | None] | None:
     if value is None:
         return None
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    digest = hashlib.sha256(payload).hexdigest() if payload is not None else None
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, digest)
+
+
+def _stat_optional_nofollow(path: Path) -> os.stat_result | None:
+    """Stat an optional artifact without resolving any path component."""
+    path = _physical_path(path)
+    try:
+        _, descriptors = _open_directory_chain(path.parent)
+    except ReplicationDurabilityError:
+        if not path.parent.exists():
+            return None
+        raise
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptors[-1],
+            )
+        except FileNotFoundError:
+            return None
+        return os.fstat(fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication artifact stat failed") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        _close_descriptors(descriptors)
+
+
+def _stat_optional_at(parent_fd: int, name: str) -> os.stat_result | None:
+    """Stat an optional basename relative to an already trusted directory fd."""
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        return os.fstat(fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication artifact stat failed") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _capture_sqlite_snapshot(
     path: Path,
-) -> dict[str, tuple[Path, bytes | None, os.stat_result | None]]:
+) -> dict[
+    str,
+    tuple[Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None],
+]:
     path = _physical_path(path)
     try:
         main_payload, main_stat = _read_nofollow(path)
@@ -1529,83 +1598,270 @@ def _capture_sqlite_snapshot(
         raise ReplicationStateUnavailable(
             "replication sidecar source descriptor is unavailable"
         ) from exc
-    snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] = {
-        "main": (path, main_payload, main_stat)
-    }
+    snapshot: dict[
+        str,
+        tuple[
+            Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None
+        ],
+    ] = {"main": (path, main_payload, main_stat, _stat_fingerprint(main_stat, main_payload))}
     for name, sidecar in (("wal", Path(f"{path}-wal")), ("shm", Path(f"{path}-shm"))):
         try:
-            artifact = _read_optional_nofollow(sidecar, require_private_mode=False)
+            sidecar_stat = _stat_optional_nofollow(sidecar)
         except ReplicationDurabilityError as exc:
             raise ReplicationStateUnavailable(
                 "replication sidecar auxiliary descriptor is unavailable"
             ) from exc
-        snapshot[name] = (sidecar, artifact[0], artifact[1]) if artifact else (sidecar, None, None)
+        if sidecar_stat is not None:
+            raise ReplicationStateUnavailable(f"replication sidecar {name.upper()} is present")
+        snapshot[name] = (sidecar, None, None, None)
     return snapshot
 
 
 def _assert_sqlite_snapshot_unchanged(
-    snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]],
+    snapshot: dict[
+        str,
+        tuple[
+            Path, bytes | None, os.stat_result | None, tuple[int, int, int, int, str | None] | None
+        ],
+    ],
 ) -> None:
-    for name, (path, _payload, prior_stat) in snapshot.items():
+    for name, (path, _payload, _prior_stat, prior_fingerprint) in snapshot.items():
         if name == "main":
             try:
-                current_stat = _stat_nofollow(path)
+                current_payload, current_stat = _read_nofollow(path)
             except ReplicationDurabilityError as exc:
                 raise ReplicationStateUnavailable(
                     "replication sidecar changed during read"
                 ) from exc
+            current_fingerprint = _stat_fingerprint(current_stat, current_payload)
         else:
             try:
-                current = _read_optional_nofollow(path, require_private_mode=False)
+                current_stat = _stat_optional_nofollow(path)
             except ReplicationDurabilityError as exc:
                 raise ReplicationStateUnavailable(
                     "replication sidecar changed during read"
                 ) from exc
-            current_stat = current[1] if current is not None else None
-        if _stat_fingerprint(current_stat) != _stat_fingerprint(prior_stat):
+            current_fingerprint = _stat_fingerprint(current_stat)
+        if current_fingerprint != prior_fingerprint:
             raise ReplicationStateUnavailable("replication sidecar changed during read")
 
 
-def _open_verified_sqlite_readonly(
-    path: Path,
-) -> tuple[sqlite3.Connection, dict[str, tuple[Path, bytes | None, os.stat_result | None]]]:
-    """Open a read-only SQLite view after descriptor snapshot verification.
+_SqliteFingerprint = tuple[int, int, int, int, str | None]
+_SqliteSnapshot = dict[
+    str, tuple[Path, bytes | None, os.stat_result | None, _SqliteFingerprint | None]
+]
 
-    A WAL frame cannot be applied by ``Connection.deserialize``.  For the
-    normal checkpointed case we therefore deserialize into ``:memory:``.  If
-    a WAL has committed frames, SQLite is opened read-only so it can apply
-    those frames; the descriptor snapshot is checked before and after every
-    query window.  Neither branch creates a filesystem artifact.
-    """
-    snapshot = _capture_sqlite_snapshot(path)
-    main_path, main_payload, _main_stat = snapshot["main"]
-    wal_payload = snapshot["wal"][1]
+
+def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
+    """Deserialize one private SQLite image and close it on every failure."""
+    if len(payload) < 20 or payload[:16] != b"SQLite format 3\x00":
+        raise ReplicationStateUnavailable("replication sidecar header is invalid")
+    connection: sqlite3.Connection | None = None
     try:
-        if wal_payload:
-            database_uri = f"file:{quote(str(main_path), safe='/')}?mode=ro"
-            connection = sqlite3.connect(database_uri, uri=True)
-        else:
-            connection = sqlite3.connect(":memory:")
-            # The canonical sidecar uses WAL mode.  A checkpointed SQLite
-            # image still carries the WAL header bits, which an in-memory
-            # database cannot open without a filesystem WAL.  Rebind only the
-            # private deserialized bytes to rollback mode; the source bytes
-            # and its descriptors remain untouched.
-            private_payload = bytearray(main_payload or b"")
-            if len(private_payload) < 20 or private_payload[:16] != b"SQLite format 3\x00":
-                raise ReplicationStateUnavailable("replication sidecar header is invalid")
-            private_payload[18:20] = b"\x01\x01"
-            connection.deserialize(bytes(private_payload), name="main")
-    except (OSError, sqlite3.Error) as exc:
+        connection = sqlite3.connect(":memory:")
+        # A database checkpointed from WAL mode retains the WAL header bits.
+        # Rebind those two bytes only in the private image; the source bytes
+        # are never modified and no WAL/SHM is opened or created.
+        private_payload = bytearray(payload)
+        private_payload[18:20] = b"\x01\x01"
+        connection.deserialize(bytes(private_payload), name="main")
+        return connection
+    except ReplicationStateUnavailable:
+        if connection is not None:
+            connection.close()
+        raise
+    except Exception as exc:
+        if connection is not None:
+            connection.close()
         raise ReplicationStateUnavailable(
-            "replication sidecar read-only view is unavailable"
+            "replication sidecar in-memory deserialize failed"
         ) from exc
+
+
+def _open_verified_sqlite_readonly(path: Path) -> tuple[sqlite3.Connection, _SqliteSnapshot]:
+    """Open a SELECT-only SQLite image without any filesystem database."""
+    snapshot = _capture_sqlite_snapshot(path)
+    main_payload = snapshot["main"][1]
+    if main_payload is None:
+        raise ReplicationStateUnavailable("replication sidecar source is empty")
+    connection = _deserialize_sqlite_bytes(main_payload)
     try:
         _assert_sqlite_snapshot_unchanged(snapshot)
-    except ReplicationStateUnavailable:
+    except BaseException:
         connection.close()
         raise
     return connection, snapshot
+
+
+@dataclass
+class _WriterSession:
+    path: Path
+    parent_fd: int
+    descriptors: list[int]
+    target_fd: int | None
+    payload: bytes | None
+    stat: os.stat_result | None
+    fingerprint: _SqliteFingerprint | None
+
+
+def _open_writer_session(path: Path) -> _WriterSession:
+    """Open the fixed database basename through a trusted parent dirfd."""
+    path = _physical_path(path)
+    parent_fd, descriptors = _open_directory_chain(path.parent, create=True)
+    target_fd: int | None = None
+    try:
+        for suffix in ("-wal", "-shm"):
+            try:
+                auxiliary_stat = _stat_optional_at(parent_fd, f"{path.name}{suffix}")
+            except ReplicationDurabilityError as exc:
+                raise ReplicationStateUnavailable(
+                    f"replication sidecar {suffix[1:].upper()} is unavailable"
+                ) from exc
+            if auxiliary_stat is not None:
+                raise ReplicationStateUnavailable(
+                    f"replication sidecar {suffix[1:].upper()} is present"
+                )
+        try:
+            target_fd = os.open(
+                path.name,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return _WriterSession(path, parent_fd, descriptors, None, None, None, None)
+        payload, info = _read_descriptor(target_fd)
+        fingerprint = _stat_fingerprint(info, payload)
+        return _WriterSession(path, parent_fd, descriptors, target_fd, payload, info, fingerprint)
+    except BaseException:
+        if target_fd is not None:
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
+        _close_descriptors(descriptors)
+        raise
+
+
+def _close_writer_session(session: _WriterSession) -> None:
+    if session.target_fd is not None:
+        try:
+            os.close(session.target_fd)
+        except OSError:
+            pass
+    _close_descriptors(session.descriptors)
+
+
+def _read_writer_target(session: _WriterSession) -> tuple[bytes, os.stat_result]:
+    """Read the current fixed basename through the already-open parent dirfd."""
+    fd: int | None = None
+    try:
+        fd = os.open(
+            session.path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=session.parent_fd,
+        )
+        return _read_descriptor(fd)
+    except FileNotFoundError as exc:
+        raise ReplicationDurabilityError("replication sidecar target disappeared") from exc
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication sidecar target is unsafe") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _assert_writer_session_stable(session: _WriterSession) -> None:
+    """CAS-check both the held inode and the fixed directory entry."""
+    if session.fingerprint is None:
+        try:
+            _read_writer_target(session)
+        except ReplicationDurabilityError as exc:
+            if "disappeared" in str(exc):
+                return
+            raise
+        raise ReplicationDurabilityError("replication sidecar target appeared during write")
+    try:
+        current_payload, current_stat = _read_writer_target(session)
+    except ReplicationDurabilityError as exc:
+        raise ReplicationDurabilityError(
+            "replication sidecar identity changed during write"
+        ) from exc
+    current_fingerprint = _stat_fingerprint(current_stat, current_payload)
+    if current_fingerprint != session.fingerprint:
+        raise ReplicationDurabilityError("replication sidecar identity changed during write")
+    if session.target_fd is None:
+        raise ReplicationDurabilityError("replication sidecar descriptor is unavailable")
+    held_payload, held_stat = _read_descriptor(session.target_fd)
+    if _stat_fingerprint(held_stat, held_payload) != session.fingerprint:
+        raise ReplicationDurabilityError("replication sidecar descriptor changed during write")
+
+
+def _install_memory_snapshot(session: _WriterSession, payload: bytes) -> None:
+    """Persist a private image using the held parent dirfd and a CAS."""
+    temporary_name = f".{session.path.name}.{uuid.uuid4().hex}.tmp"
+    temporary_fd: int | None = None
+    primary_error: BaseException | None = None
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=session.parent_fd,
+        )
+        _write_fully(temporary_fd, payload)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        _assert_writer_session_stable(session)
+        if session.fingerprint is None:
+            try:
+                os.link(
+                    temporary_name,
+                    session.path.name,
+                    src_dir_fd=session.parent_fd,
+                    dst_dir_fd=session.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                existing, _ = _read_writer_target(session)
+                if existing != payload:
+                    raise ReplicationDurabilityError(
+                        "replication sidecar target appeared with different bytes"
+                    ) from exc
+        elif session.payload == b"":
+            os.replace(
+                temporary_name,
+                session.path.name,
+                src_dir_fd=session.parent_fd,
+                dst_dir_fd=session.parent_fd,
+            )
+        else:
+            raise ReplicationDurabilityError("replication sidecar is already initialized")
+        final_payload, _ = _read_writer_target(session)
+        if final_payload != payload:
+            raise ReplicationDurabilityError("replication sidecar install readback mismatch")
+        _fsync_open_directory(session.parent_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if temporary_fd is not None:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        cleanup_error: OSError | None = None
+        try:
+            os.unlink(temporary_name, dir_fd=session.parent_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            cleanup_error = exc
+        if cleanup_error is not None:
+            error = ReplicationDurabilityError("replication temporary cleanup failed")
+            if primary_error is not None:
+                raise error from primary_error
+            raise error from cleanup_error
 
 
 class ReplicationSidecarStore:
@@ -1614,54 +1870,27 @@ class ReplicationSidecarStore:
 
     @staticmethod
     def _connect_writer(path: Path) -> sqlite3.Connection:
-        path = _physical_path(path)
-        parent = path.parent
-        parent_fd, descriptors = _open_directory_chain(parent, create=True)
-        fd: int | None = None
-        try:
-            fd = os.open(
-                path.name,
-                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=parent_fd,
-            )
-        except OSError as exc:
-            _close_descriptors(descriptors)
-            raise ReplicationDurabilityError("replication sidecar is not writable") from exc
+        """Compatibility probe returning an unpersisted descriptor-native image."""
+        session = _open_writer_session(path)
         connection: sqlite3.Connection | None = None
-        handed_off = False
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-                raise ReplicationDurabilityError("replication sidecar permissions are unsafe")
-            # The descriptor above creates the basename safely when absent.
-            # ``mode=rw`` is deliberate: a pathname replacement cannot make
-            # SQLite create or initialize an attacker-controlled file before
-            # the post-connect identity proof runs.
-            database_uri = f"file:{quote(str(path), safe='/')}?mode=rw"
-            connection = sqlite3.connect(database_uri, uri=True)
-            current = _stat_nofollow(path)
-            if _stat_fingerprint(current) != _stat_fingerprint(info):
-                connection.close()
-                connection = None
-                raise ReplicationDurabilityError(
-                    "replication sidecar identity changed during connect"
-                )
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            handed_off = True
+            connection = (
+                _deserialize_sqlite_bytes(session.payload)
+                if session.payload
+                else sqlite3.connect(":memory:")
+            )
+            _assert_writer_session_stable(session)
             return connection
-        except ReplicationDurabilityError:
+        except ReplicationStateUnavailable:
+            if connection is not None:
+                connection.close()
             raise
-        except sqlite3.Error as exc:
+        except (OSError, sqlite3.Error) as exc:
+            if connection is not None:
+                connection.close()
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
         finally:
-            if connection is not None and not handed_off:
-                connection.close()
-            if fd is not None:
-                os.close(fd)
-            _close_descriptors(descriptors)
+            _close_writer_session(session)
 
     def initialize(
         self,
@@ -1672,31 +1901,28 @@ class ReplicationSidecarStore:
     ) -> None:
         _validate_sha(source_instance_id, "source_instance_id")
         _validate_sha(source_instance_sha256, "source_instance_sha256")
-        existing_artifact = _read_optional_nofollow(self.path)
-        if existing_artifact is not None and existing_artifact[1].st_size > 0:
-            connection: sqlite3.Connection | None = None
-            snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] | None = None
-            try:
-                connection, snapshot = _open_verified_sqlite_readonly(self.path)
+        session = _open_writer_session(self.path)
+        connection: sqlite3.Connection | None = None
+        try:
+            if session.payload:
+                connection = _deserialize_sqlite_bytes(session.payload)
+                connection.execute("PRAGMA query_only = ON")
                 meta = connection.execute(
                     """SELECT source_instance_id, source_instance_sha256
                          FROM replication_sidecar_meta"""
                 ).fetchall()
-            except sqlite3.Error as exc:
-                raise ReplicationDurabilityError("existing replication sidecar is invalid") from exc
-            finally:
-                if connection is not None:
-                    connection.close()
-            if meta != [(source_instance_id, source_instance_sha256)]:
-                raise ReplicationDurabilityError("replication sidecar source identity conflicts")
-            # Existing sidecars are never migrated by initialization.
-            self.read_status()
-            return
-        connection = self._connect_writer(self.path)
-        try:
+                _assert_writer_session_stable(session)
+                if meta != [(source_instance_id, source_instance_sha256)]:
+                    raise ReplicationDurabilityError(
+                        "replication sidecar source identity conflicts"
+                    )
+                # Existing sidecars are never migrated by initialization.
+                self.read_status()
+                return
+            connection = sqlite3.connect(":memory:")
             connection.executescript(SIDECAR_DDL)
             connection.execute(
-                """INSERT OR IGNORE INTO replication_sidecar_meta
+                """INSERT INTO replication_sidecar_meta
                    (sidecar_id, schema_version, schema_identity, ddl_sha256, schema_digest,
                     source_instance_id, source_instance_sha256, created_at)
                    VALUES (1, 1, ?, ?, ?, ?, ?, ?)""",
@@ -1710,18 +1936,22 @@ class ReplicationSidecarStore:
                 ),
             )
             connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error as exc:
-            connection.rollback()
+            payload = connection.serialize(name="main")
+            _install_memory_snapshot(session, payload)
+        except ReplicationDurabilityError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            if connection is not None:
+                connection.rollback()
             raise ReplicationDurabilityError("replication sidecar initialization failed") from exc
         finally:
-            connection.close()
-        self._fsync_database()
+            if connection is not None:
+                connection.close()
+            _close_writer_session(session)
 
     def _fsync_database(self) -> None:
         database_path = _physical_path(self.path)
         _fsync_nofollow(database_path)
-        _fsync_nofollow(Path(f"{database_path}-wal"), optional=True)
         _fsync_directory(database_path.parent)
 
     def read_status(
@@ -1731,7 +1961,7 @@ class ReplicationSidecarStore:
         source_instance: SourceInstanceRecord | None = None,
     ) -> ReplicationStatusResponse:
         connection: sqlite3.Connection | None = None
-        snapshot: dict[str, tuple[Path, bytes | None, os.stat_result | None]] | None = None
+        snapshot: _SqliteSnapshot | None = None
         try:
             connection, snapshot = _open_verified_sqlite_readonly(self.path)
             connection.execute("PRAGMA query_only = ON")

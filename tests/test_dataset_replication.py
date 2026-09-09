@@ -604,13 +604,161 @@ def test_sidecar_reader_rejects_stale_lease_on_nonleased_head(tmp_path: Path) ->
         store.read_status()
 
 
+def test_status_rejects_existing_wal_shm_without_writes(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    wal_path = path.with_name(path.name + "-wal")
+    shm_path = path.with_name(path.name + "-shm")
+    wal_path.write_bytes(b"unexpected wal")
+    shm_path.write_bytes(b"unexpected shm")
+    wal_path.chmod(0o600)
+    shm_path.chmod(0o600)
+    before = {
+        artifact: (artifact.stat().st_ino, artifact.stat().st_mtime_ns, artifact.read_bytes())
+        for artifact in (path, wal_path, shm_path)
+    }
+    with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|sidecar"):
+        store.read_status()
+    after = {
+        artifact: (artifact.stat().st_ino, artifact.stat().st_mtime_ns, artifact.read_bytes())
+        for artifact in (path, wal_path, shm_path)
+    }
+    assert after == before
+
+
+def test_sidecar_sqlite_engine_uses_memory_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    real_connect = sqlite3.connect
+    databases: list[object] = []
+
+    def memory_only_connect(database: object, *args: object, **kwargs: object):
+        databases.append(database)
+        if database != ":memory:":
+            raise AssertionError("sidecar must never reopen a pathname")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(replication.sqlite3, "connect", memory_only_connect)
+    assert store.read_status().reason_code == "NONE"
+    assert databases and all(database == ":memory:" for database in databases)
+
+
+def test_sqlite_deserialize_failure_closes_private_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = sqlite3.connect(":memory:")
+    seed.execute("CREATE TABLE probe (value TEXT)")
+    payload = seed.serialize()
+    seed.close()
+    connections: list[object] = []
+
+    class FailingDeserializeConnection:
+        def deserialize(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected deserialize failure")
+
+        def close(self) -> None:
+            connections.append("closed")
+
+    def connect_memory_only(database: object, *_args: object, **_kwargs: object):
+        assert database == ":memory:"
+        connection = FailingDeserializeConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(replication.sqlite3, "connect", connect_memory_only)
+    with pytest.raises(ReplicationStateUnavailable, match="deserialize"):
+        replication._deserialize_sqlite_bytes(payload)
+    assert len(connections) == 2 and connections[1] == "closed"
+
+
+def test_status_same_stat_byte_mutation_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    real_validate = replication._validate_sqlite_schema
+
+    def mutate_after_open(connection: sqlite3.Connection) -> None:
+        real_validate(connection)
+        stat_before = path.stat()
+        payload = bytearray(path.read_bytes())
+        payload[-1] ^= 1
+        path.write_bytes(payload)
+        os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+
+    monkeypatch.setattr(replication, "_validate_sqlite_schema", mutate_after_open)
+    with pytest.raises(ReplicationStateUnavailable, match="changed|fingerprint"):
+        store.read_status()
+
+
+def test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "record.json"
+    real_unlink = replication.os.unlink
+    cleanup_calls: list[tuple[int, ...]] = []
+    real_close_descriptors = replication._close_descriptors
+
+    def fail_temp_cleanup(name: object, *args: object, **kwargs: object):
+        if kwargs.get("dir_fd") is not None:
+            raise OSError("injected cleanup failure")
+        return real_unlink(name, *args, **kwargs)
+
+    def observe_descriptor_close(descriptors: list[int]) -> None:
+        cleanup_calls.append(tuple(descriptors))
+        real_close_descriptors(descriptors)
+
+    monkeypatch.setattr(replication.os, "unlink", fail_temp_cleanup)
+    monkeypatch.setattr(replication, "_close_descriptors", observe_descriptor_close)
+    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
+        replication._install_no_replace(path, b"record")
+    assert cleanup_calls
+
+
+def test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    real_unlink = replication.os.unlink
+    closed_sessions: list[object] = []
+    real_close_writer_session = replication._close_writer_session
+
+    def fail_temp_cleanup(name: object, *args: object, **kwargs: object):
+        if kwargs.get("dir_fd") is not None:
+            raise OSError("injected cleanup failure")
+        return real_unlink(name, *args, **kwargs)
+
+    def observe_writer_close(session: object) -> None:
+        closed_sessions.append(session)
+        real_close_writer_session(session)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(replication.os, "unlink", fail_temp_cleanup)
+    monkeypatch.setattr(replication, "_close_writer_session", observe_writer_close)
+    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
+        store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert closed_sessions
+    assert path.exists()
+    assert any(
+        entry.name.startswith(f".{path.name}.") and entry.name.endswith(".tmp")
+        for entry in path.parent.iterdir()
+    )
+
+
 def test_writer_identity_check_rejects_replacement_between_open_and_connect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "control" / "replication.sqlite3"
     path.parent.mkdir()
-    path.write_bytes(b"original")
-    path.chmod(0o600)
+    ReplicationSidecarStore(path).initialize(
+        source_instance_id="a" * 64,
+        source_instance_sha256="b" * 64,
+    )
     real_connect = sqlite3.connect
 
     def racing_connect(database: object, *args: object, **kwargs: object):
@@ -621,7 +769,7 @@ def test_writer_identity_check_rejects_replacement_between_open_and_connect(
     with pytest.raises(ReplicationDurabilityError, match="identity|changed|writable"):
         ReplicationSidecarStore._connect_writer(path)
     assert not path.exists()
-    assert (path.with_name("replaced.sqlite3")).read_bytes() == b"original"
+    assert (path.with_name("replaced.sqlite3")).stat().st_size > 100
 
 
 def test_writer_dirs_reject_symlink_ancestor_without_creating_through_it(tmp_path: Path) -> None:

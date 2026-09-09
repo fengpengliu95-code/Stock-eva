@@ -406,7 +406,7 @@ closed selection and lineage projections, not free-form labels.
 | Coordinator operation boundary | Exactly two typed mutually exclusive operations share only a token-checked primitive; manifest-only never calls the pointer wrapper | FR-3e, AC-23, EC-31 |
 | Pointer phase errors | Only acquire/token/baseline/guard/final-CAS occur before pointer commit; any failure leaves pointer identity untouched. Post-pointer control errors are degraded durable reconciliation | FR-3f, AC-24, EC-32/33 |
 | Enqueue gap | `<checkpoint_id>.json` journal fallback; startup imports all journals sorted by `(source_published_at,checkpoint_id)` in one transaction | AC-3, EC-16/17 |
-| Claim | `BEGIN IMMEDIATE`, lease owner/until and `state_version` conditional update | AC-4, AC-11 |
+| Claim | Private in-memory transaction, lease owner/until and `state_version` conditional update; serialized through the descriptor-native engine | AC-4, AC-11 |
 | Copy | Stage under destination `_staging/<intent>`; no manifest references staging | AC-7/8 |
 | Readback | Open no-follow and verify size/schema/rows/hash/fingerprint before each rename | AC-5/7 |
 | Publish | Under the descriptor lock, install self-contained NAS record, atomically commit complete NAS head first, then append SQLite result/cache; fsync each boundary | AC-8/9 |
@@ -803,9 +803,11 @@ are `test_all_dataset_pointer_writers_route_through_coordinator`,
 
 When the sidecar is unavailable, write `<checkpoint_id>.json` containing the full checkpoint
 projection and no sequence. Recovery opens every journal no-follow, validates hashes, sorts by
-`(source_published_at,checkpoint_id)`, and in one `BEGIN IMMEDIATE` WAL/FULL transaction allocates
-source sequences and creates intent, genesis event and head rows. Only after DB/WAL and parent
-fsync may each journal be archived/deleted; crashes or unlink failures leave re-importable files.
+`(source_published_at,checkpoint_id)`, and in one private in-memory transaction allocates source
+sequences and creates intent, genesis event and head rows. The complete image is then serialized
+through the descriptor-native engine and installed only after baseline CAS, file fsync and parent
+fsync; only then may each journal be archived/deleted. Crashes or unlink failures leave
+re-importable files.
 Checkpoint and `(direction,destination_id,checkpoint_id)` uniqueness make repeat import/restart
 and retry reuse one sequence and one intent regardless of operation_day. The intent contains this
 checkpoint and can copy only the current visible generation.
@@ -1100,13 +1102,40 @@ BEGIN
 END;
 ```
 
-Every connection sets WAL/FULL. A head update and event append are one transaction, followed by
-database/WAL and parent-directory fsync. The status reader opens the DB read-only with
-`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, verifies descriptor inode/device before and after SELECT and
-performs no initialization, migration, checkpoint, repair or cleanup. It must preserve sidecar
-bytes/inodes for all status cases. Implement and test global reachability/replay and the zero-write
-status contract before any writer test: `tests/test_dataset_replication.py::test_outbox_global_reachability_and_event_replay`
-and `tests/test_dataset_replication.py::test_status_missing_corrupt_or_locked_outbox_is_zero_write`.
+#### Batch1.3 descriptor-native SQLite amendment (normative)
+
+This amendment supersedes every earlier Batch1 sentence that permits a sidecar pathname
+`sqlite3.connect(path)`, a SQLite WAL/SHM sidecar, a temporary filesystem clone, or a read-only
+SQLite URI as the status/writer engine. The normative DDL above is unchanged, but all sidecar
+read and write operations MUST use the same descriptor-native snapshot engine. Under the
+approved local sidecar lock, it opens the explicit absolute parent through a trusted dirfd and
+`O_NOFOLLOW`, then opens the fixed basename through that dirfd. It reads the main database bytes
+and records a full descriptor fingerprint `(st_dev, st_ino, st_size, st_mtime_ns, sha256)` before
+and after the entire SQLite query/transaction window. Any existing `replication.sqlite3-wal` or
+`replication.sqlite3-shm` is `CONTROL_STATE_UNAVAILABLE` and MUST cause zero writes; this batch
+does not merge WAL frames.
+
+The engine MUST deserialize the stable main bytes into `sqlite3.connect(':memory:')` only. The
+writer runs DDL/transactions in that private memory database, serializes the complete image,
+and installs it under the already-open parent dirfd using `O_EXCL|O_NOFOLLOW` temporary bytes,
+file fsync, baseline fingerprint CAS, no-replace/atomic install and parent-directory fsync.
+It MUST never reopen the checked pathname, create or read WAL/SHM, or write an attacker-selected
+replacement. A status read is SELECT-only against the memory image; it MUST close the in-memory
+connection in every success and failure path, and MUST compare main bytes/hash and full
+fingerprint before returning. Temporary cleanup is independently guarded; every descriptor is
+closed, and cleanup failure returns a typed durability error after best-effort cleanup.
+
+WAL/FULL remain properties of the normative schema contract where applicable, but no runtime
+sidecar connection may materialize WAL/SHM in this batch. Tests MUST assert no clone/temp/WAL/SHM
+creation, `sqlite3.connect` receives only `':memory:'`, replacement/same-stat byte races fail
+closed, all descriptors close, and sidecar bytes/inodes/mtimes remain unchanged for status and
+failed writes. The exact anchors are
+`test_status_rejects_existing_wal_shm_without_writes`,
+`test_sidecar_sqlite_engine_uses_memory_only`,
+`test_sqlite_deserialize_failure_closes_private_connection`,
+`test_status_same_stat_byte_mutation_is_unavailable`, and
+`test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors`, and
+`test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors`.
 
 The event closed field set is exactly `(event_id,intent_id,event_sequence,prev_event_sha256,
 event_type,from_state,to_state,attempt,reason_code,state_version,occurred_at,
@@ -1452,9 +1481,9 @@ intent_sha256 = domain_sha256("stock-eva/r2f4.3/replication-intent-row/v1",
 
 Genesis `prev_event_sha256` and `parent_record_hash` are exactly 64 zero hex characters; all other
 digests are 64 lower-case hex. `checkpoint_id` excludes `source_sequence`. In one
-`BEGIN IMMEDIATE` transaction recovery sorts all valid journals by
-`(source_published_at,checkpoint_id)`, allocates sequences and creates intent/event/head rows.
-Unique constraints make restart-safe import and retries reuse one sequence and intent regardless of
+Private in-memory transaction recovery sorts all valid journals by `(source_published_at,checkpoint_id)`,
+allocates sequences and creates intent/event/head rows, then serializes through the descriptor-native
+engine with baseline CAS and fsync. Unique constraints make restart-safe import and retries reuse one sequence and intent regardless of
 operation_day. `operation_day` is scheduling metadata only and is excluded from `checkpoint_id`,
 `plan_sha256`, `intent_id` and `intent_sha256`. Use the normalized JSON encoder above with explicit null/false/zero/empty values and
 one final newline. Golden tests mutate one field, one sort order and the newline and require a
@@ -1469,8 +1498,9 @@ read-only, and only execute can create approved local sidecar parents. Explicitl
 `<checkpoint_id>.json`, mode `0600`, `O_NOFOLLOW`, complete newline-terminated bytes, a unique
 `O_EXCL` temporary, fsync(fd), macOS `renameatx_np(RENAME_EXCL)` or portable hard-link-no-replace
 install and parent fsync. Existing target bytes may be reused only when identical; otherwise the
-journal is a durability failure. Import validates no-follow fd/inode and hash,
-commits all sorted intent/event/head rows WAL/FULL, fsyncs, then removes the journal; failed removal is safely
+journal is a durability failure. Import validates no-follow fd/inode and hash, applies all sorted
+intent/event/head rows in the private in-memory image, serializes and commits the complete
+snapshot with baseline CAS and fsync, then removes the journal; failed removal is safely
 re-importable. The exact early-dispatch/source/journal anchors are
 `tests/test_dataset_replication.py::test_market_replicate_dry_run_parent_absent_creates_nothing`,
 `tests/test_dataset_replication.py::test_market_restore_dry_run_parent_absent_creates_nothing`,

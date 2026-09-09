@@ -902,11 +902,12 @@ public evidence.
 
 If the sidecar is unavailable, a journal stores this complete checkpoint projection and
 `checkpoint_id` with no sequence. Recovery enumerates every journal, validates each descriptor-bound
-file, and imports them sorted by `(source_published_at, checkpoint_id)`. One SQLite
-`BEGIN IMMEDIATE` transaction allocates the next source sequence and creates the intent, genesis
-event and mutable head for every pending checkpoint in that deterministic order. Only after that
-transaction commits with WAL/FULL and the DB/parent fsync succeeds may each journal be archived or
-deleted; a crash or unlink failure leaves it re-importable and deduplication is by checkpoint.
+file, and imports them sorted by `(source_published_at, checkpoint_id)`. One private in-memory
+transaction allocates the next source sequence and creates the intent, genesis event and mutable
+head for every pending checkpoint in that deterministic order. The complete image is then
+serialized through the Batch1.3 descriptor-native engine; only after baseline CAS, file fsync and
+parent fsync may each journal be archived or deleted. A crash or unlink failure leaves it
+re-importable and deduplication is by checkpoint.
 The same checkpoint always reuses its sequence and intent, so restart, time and journal order do
 not create a second request or intent. Historical files, an unreferenced object, or a later pointer
 cannot be selected.
@@ -1158,15 +1159,40 @@ BEGIN
 END;
 ```
 
-Writers MUST set WAL/FULL for every connection, commit the head and event together, fsync the
-database and WAL where present, then fsync the sidecar parent directory. The read-only status
-reader opens the sidecar with `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, fstats before and after the
-transaction, uses a SQLite read-only URI, verifies inode/device and does a complete global
-reachability/replay check. It performs no `CREATE`, `PRAGMA` migration, checkpoint, journal
-cleanup, lock repair or writer fallback. Tests MUST assert sidecar bytes and inode are unchanged
-for missing, corrupt, locked and healthy status; see
-`test_outbox_global_reachability_and_event_replay` and
-`test_status_missing_corrupt_or_locked_outbox_is_zero_write`.
+#### Batch1.3 descriptor-native SQLite amendment (normative)
+
+This amendment supersedes every earlier Batch1 sentence that permits a sidecar pathname
+`sqlite3.connect(path)`, a SQLite WAL/SHM sidecar, a temporary filesystem clone, or a read-only
+SQLite URI as the status/writer engine. The normative DDL above is unchanged, but all sidecar
+read and write operations MUST use the same descriptor-native snapshot engine. Under the
+approved local sidecar lock, it opens the explicit absolute parent through a trusted dirfd and
+`O_NOFOLLOW`, then opens the fixed basename through that dirfd. It reads the main database bytes
+and records a full descriptor fingerprint `(st_dev, st_ino, st_size, st_mtime_ns, sha256)` before
+and after the entire SQLite query/transaction window. Any existing `replication.sqlite3-wal` or
+`replication.sqlite3-shm` is `CONTROL_STATE_UNAVAILABLE` and MUST cause zero writes; this batch
+does not merge WAL frames.
+
+The engine MUST deserialize the stable main bytes into `sqlite3.connect(':memory:')` only. The
+writer runs DDL/transactions in that private memory database, serializes the complete image,
+and installs it under the already-open parent dirfd using `O_EXCL|O_NOFOLLOW` temporary bytes,
+file fsync, baseline fingerprint CAS, no-replace/atomic install and parent-directory fsync.
+It MUST never reopen the checked pathname, create or read WAL/SHM, or write an attacker-selected
+replacement. A status read is SELECT-only against the memory image; it MUST close the in-memory
+connection in every success and failure path, and MUST compare main bytes/hash and full
+fingerprint before returning. Temporary cleanup is independently guarded; every descriptor is
+closed, and cleanup failure returns a typed durability error after best-effort cleanup.
+
+WAL/FULL remain properties of the normative schema contract where applicable, but no runtime
+sidecar connection may materialize WAL/SHM in this batch. Tests MUST assert no clone/temp/WAL/SHM
+creation, `sqlite3.connect` receives only `':memory:'`, replacement/same-stat byte races fail
+closed, all descriptors close, and sidecar bytes/inodes/mtimes remain unchanged for status and
+failed writes. The exact anchors are
+`test_status_rejects_existing_wal_shm_without_writes`,
+`test_sidecar_sqlite_engine_uses_memory_only`,
+`test_sqlite_deserialize_failure_closes_private_connection`,
+`test_status_same_stat_byte_mutation_is_unavailable`, and
+`test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors`, and
+`test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors`.
 
 The event closed field set is exactly `(event_id,intent_id,event_sequence,prev_event_sha256,
 event_type,from_state,to_state,attempt,reason_code,state_version,occurred_at,
@@ -1511,8 +1537,9 @@ intent_sha256 = domain_sha256("stock-eva/r2f4.3/replication-intent-row/v1",
 `prev_event_sha256` and `parent_record_hash` at genesis are exactly 64 zero hex characters;
 all other digests are 64 lower-case hex. `checkpoint_id` is computed before SQLite allocation and
 does not include `source_sequence`. Recovery sorts every valid journal by
-`(source_published_at,checkpoint_id)` and, in one `BEGIN IMMEDIATE` transaction, allocates the
-next sequence and creates intent/event/head rows. The unique constraints make allocation and
+`(source_published_at,checkpoint_id)` and, in one private in-memory transaction, allocates the
+next sequence and creates intent/event/head rows. The complete image is serialized through the
+descriptor-native engine with baseline CAS and fsync. The unique constraints make allocation and
 journal import restart-safe: a repeated checkpoint or retry reuses its existing sequence and
 intent, regardless of operation_day. `operation_day` is scheduling metadata only and is excluded
 from `checkpoint_id`, `plan_sha256`, `intent_id` and `intent_sha256`. The normalized JSON encoder is the one defined above,
@@ -1541,10 +1568,11 @@ by temporary-file unlink and parent fsync. If the target already exists, open it
 reuse it only when its bytes are exactly identical; any differing target is
 `OUTBOX_DURABILITY_UNAVAILABLE` and is never overwritten. Import opens no-follow and fstats
 before/after; it validates the checkpoint/binding hash, sorts all pending journals by
-`(source_published_at,checkpoint_id)`, inserts intent/event/head rows in one WAL/FULL transaction,
-fsyncs the DB and parent, and only then unlinks the journal and fsyncs its parent. Unlink failure
-leaves a harmless journal for idempotent re-import. Crash tests cover temp, install, existing-target
-and import boundaries and require no provider request. The journal-specific anchors are
+`(source_published_at,checkpoint_id)`, inserts intent/event/head rows in one private in-memory
+transaction, serializes the complete image through the descriptor-native engine, fsyncs the DB and
+parent, and only then unlinks the journal and fsyncs its parent. Unlink failure leaves a harmless
+journal for idempotent re-import. Crash tests cover temp, install, existing-target and import
+boundaries and require no provider request. The journal-specific anchors are
 `test_journal_temp_uses_o_excl_no_follow_and_fsync`,
 `test_journal_install_is_no_replace_and_reuses_identical_target`, and
 `test_journal_conflicting_target_fails_without_overwrite`.
