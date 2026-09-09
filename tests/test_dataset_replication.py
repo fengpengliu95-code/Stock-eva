@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -770,6 +772,107 @@ def test_writer_identity_check_rejects_replacement_between_open_and_connect(
         ReplicationSidecarStore._connect_writer(path)
     assert not path.exists()
     assert (path.with_name("replaced.sqlite3")).stat().st_size > 100
+
+
+def test_sidecar_writer_lock_serializes_descriptor_sessions(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    first = replication._open_writer_session(path)
+    acquired: list[replication._WriterSession] = []
+
+    def open_second() -> None:
+        acquired.append(replication._open_writer_session(path))
+
+    thread = threading.Thread(target=open_second)
+    thread.start()
+    time.sleep(0.05)
+    assert thread.is_alive()
+    replication._close_writer_session(first)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(acquired) == 1
+    replication._close_writer_session(acquired[0])
+
+
+def test_sidecar_cas_helper_requires_writer_lock_token(tmp_path: Path) -> None:
+    session = replication._WriterSession(
+        path=tmp_path / "control" / "replication.sqlite3",
+        parent_fd=-1,
+        descriptors=[],
+        target_fd=None,
+        payload=None,
+        stat=None,
+        fingerprint=None,
+    )
+    with pytest.raises(ReplicationDurabilityError, match="lock token"):
+        replication._install_memory_snapshot(session, b"not-a-database")
+
+
+def test_repeated_initialize_reads_held_descriptor_from_offset_zero(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    store = ReplicationSidecarStore(path)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    assert store.read_status().reason_code == "NONE"
+
+
+def test_existing_empty_sidecar_concurrent_initializers_have_one_winner(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    path.parent.mkdir(parents=True)
+    path.touch(mode=0o600)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def initialize(source_instance_id: str) -> None:
+        barrier.wait()
+        try:
+            ReplicationSidecarStore(path).initialize(
+                source_instance_id=source_instance_id,
+                source_instance_sha256="b" * 64,
+            )
+        except ReplicationDurabilityError:
+            outcomes.append("error")
+        else:
+            outcomes.append("success")
+
+    threads = [
+        threading.Thread(target=initialize, args=("a" * 64,)),
+        threading.Thread(target=initialize, args=("c" * 64,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert outcomes.count("success") == 1
+    assert outcomes.count("error") == 1
+
+
+def test_connect_writer_closes_memory_connection_on_durability_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    ReplicationSidecarStore(path).initialize(
+        source_instance_id="a" * 64,
+        source_instance_sha256="b" * 64,
+    )
+    closed: list[bool] = []
+
+    class FakeConnection:
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(replication, "_deserialize_sqlite_bytes", lambda _payload: FakeConnection())
+    monkeypatch.setattr(
+        replication,
+        "_assert_writer_session_stable",
+        lambda _session: (_ for _ in ()).throw(
+            ReplicationDurabilityError("injected durability failure")
+        ),
+    )
+    with pytest.raises(ReplicationDurabilityError, match="durability"):
+        ReplicationSidecarStore._connect_writer(path)
+    assert closed == [True]
 
 
 def test_writer_dirs_reject_symlink_ancestor_without_creating_through_it(tmp_path: Path) -> None:

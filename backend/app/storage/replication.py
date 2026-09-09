@@ -10,6 +10,7 @@ are explicit writer operations.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -403,11 +404,17 @@ def _read_descriptor(
     if require_private_mode and stat.S_IMODE(before.st_mode) != 0o600:
         raise ReplicationDurabilityError("replication artifact permissions are unsafe")
     chunks: list[bytes] = []
+    offset = 0
     while True:
-        chunk = os.read(fd, 1024 * 1024)
+        # ``pread`` makes every proof independent of the descriptor's current
+        # offset.  A held writer descriptor is read more than once (baseline,
+        # CAS and final proof), so a plain ``read`` would turn the second proof
+        # into an empty read and could hide an ABA/replacement race.
+        chunk = os.pread(fd, 1024 * 1024, offset)
         if not chunk:
             break
         chunks.append(chunk)
+        offset += len(chunk)
     after = os.fstat(fd)
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
         after.st_dev,
@@ -1670,9 +1677,11 @@ def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
         if connection is not None:
             connection.close()
         raise
-    except Exception as exc:
+    except BaseException as exc:
         if connection is not None:
             connection.close()
+        if isinstance(exc, ReplicationStateUnavailable):
+            raise
         raise ReplicationStateUnavailable(
             "replication sidecar in-memory deserialize failed"
         ) from exc
@@ -1702,6 +1711,98 @@ class _WriterSession:
     payload: bytes | None
     stat: os.stat_result | None
     fingerprint: _SqliteFingerprint | None
+    lock_fd: int | None = None
+    lock_token: _WriterLockToken | None = None
+
+
+class _WriterLockToken:
+    """Opaque proof that a sidecar writer owns its descriptor-bound lock."""
+
+    __slots__ = ("lock_dev", "lock_ino", "released")
+
+    def __init__(self, info: os.stat_result) -> None:
+        self.lock_dev = info.st_dev
+        self.lock_ino = info.st_ino
+        self.released = False
+
+
+_WRITER_LOCK_SUFFIX = ".lock"
+
+
+def _acquire_writer_lock(parent_fd: int, lock_name: str) -> tuple[int, _WriterLockToken]:
+    """Acquire the fixed sidecar writer lock through a trusted parent dirfd."""
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(lock_fd)
+        if not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o600:
+            raise ReplicationDurabilityError("replication writer lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        after = os.fstat(lock_fd)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ReplicationDurabilityError("replication writer lock changed during acquire")
+        return lock_fd, _WriterLockToken(after)
+    except ReplicationDurabilityError:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        raise ReplicationDurabilityError("replication writer lock is unavailable") from exc
+
+
+def _release_writer_lock(lock_fd: int, token: _WriterLockToken) -> None:
+    if token.released:
+        return
+    token.released = True
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+
+def _require_writer_lock(session: _WriterSession) -> None:
+    """Reject CAS helpers invoked without the opaque lock ownership proof."""
+    token = session.lock_token
+    if session.lock_fd is None or token is None:
+        raise ReplicationDurabilityError("replication writer lock token is missing")
+    if token.released:
+        raise ReplicationDurabilityError("replication writer lock token is released")
+    try:
+        info = os.fstat(session.lock_fd)
+        if (info.st_dev, info.st_ino) != (token.lock_dev, token.lock_ino):
+            raise ReplicationDurabilityError("replication writer lock identity changed")
+        # LOCK_NB is only a proof check: this descriptor already owns the
+        # exclusive lock, and the call never releases or replaces it.
+        fcntl.flock(session.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ReplicationDurabilityError:
+        raise
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication writer lock is not held") from exc
 
 
 def _open_writer_session(path: Path) -> _WriterSession:
@@ -1709,7 +1810,10 @@ def _open_writer_session(path: Path) -> _WriterSession:
     path = _physical_path(path)
     parent_fd, descriptors = _open_directory_chain(path.parent, create=True)
     target_fd: int | None = None
+    lock_fd: int | None = None
+    lock_token: _WriterLockToken | None = None
     try:
+        lock_fd, lock_token = _acquire_writer_lock(parent_fd, f"{path.name}{_WRITER_LOCK_SUFFIX}")
         for suffix in ("-wal", "-shm"):
             try:
                 auxiliary_stat = _stat_optional_at(parent_fd, f"{path.name}{suffix}")
@@ -1728,16 +1832,34 @@ def _open_writer_session(path: Path) -> _WriterSession:
                 dir_fd=parent_fd,
             )
         except FileNotFoundError:
-            return _WriterSession(path, parent_fd, descriptors, None, None, None, None)
+            if lock_token is None or lock_fd is None:
+                raise ReplicationDurabilityError("replication writer lock is unavailable") from None
+            return _WriterSession(
+                path, parent_fd, descriptors, None, None, None, None, lock_fd, lock_token
+            )
         payload, info = _read_descriptor(target_fd)
         fingerprint = _stat_fingerprint(info, payload)
-        return _WriterSession(path, parent_fd, descriptors, target_fd, payload, info, fingerprint)
+        if lock_token is None or lock_fd is None:
+            raise ReplicationDurabilityError("replication writer lock is unavailable")
+        return _WriterSession(
+            path,
+            parent_fd,
+            descriptors,
+            target_fd,
+            payload,
+            info,
+            fingerprint,
+            lock_fd,
+            lock_token,
+        )
     except BaseException:
         if target_fd is not None:
             try:
                 os.close(target_fd)
             except OSError:
                 pass
+        if lock_fd is not None and lock_token is not None:
+            _release_writer_lock(lock_fd, lock_token)
         _close_descriptors(descriptors)
         raise
 
@@ -1748,6 +1870,8 @@ def _close_writer_session(session: _WriterSession) -> None:
             os.close(session.target_fd)
         except OSError:
             pass
+    if session.lock_fd is not None and session.lock_token is not None:
+        _release_writer_lock(session.lock_fd, session.lock_token)
     _close_descriptors(session.descriptors)
 
 
@@ -1772,6 +1896,7 @@ def _read_writer_target(session: _WriterSession) -> tuple[bytes, os.stat_result]
 
 def _assert_writer_session_stable(session: _WriterSession) -> None:
     """CAS-check both the held inode and the fixed directory entry."""
+    _require_writer_lock(session)
     if session.fingerprint is None:
         try:
             _read_writer_target(session)
@@ -1798,6 +1923,7 @@ def _assert_writer_session_stable(session: _WriterSession) -> None:
 
 def _install_memory_snapshot(session: _WriterSession, payload: bytes) -> None:
     """Persist a private image using the held parent dirfd and a CAS."""
+    _require_writer_lock(session)
     temporary_name = f".{session.path.name}.{uuid.uuid4().hex}.tmp"
     temporary_fd: int | None = None
     primary_error: BaseException | None = None
@@ -1885,10 +2011,18 @@ class ReplicationSidecarStore:
             if connection is not None:
                 connection.close()
             raise
+        except ReplicationDurabilityError:
+            if connection is not None:
+                connection.close()
+            raise
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
                 connection.close()
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
         finally:
             _close_writer_session(session)
 

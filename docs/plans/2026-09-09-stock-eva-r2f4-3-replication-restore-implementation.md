@@ -1137,6 +1137,38 @@ failed writes. The exact anchors are
 `test_sidecar_writer_cleanup_failure_is_typed_and_closes_descriptors`, and
 `test_memory_writer_cleanup_failure_is_typed_and_closes_descriptors`.
 
+#### Batch1.4 sidecar writer-lock amendment (normative)
+
+Every sidecar writer operation MUST acquire the fixed lock file
+`<sidecar-basename>.lock` in the sidecar's explicit parent directory through the already
+trusted parent dirfd, with `O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, a regular-file
+check, and an OS advisory exclusive lock. The lock descriptor identity is captured in an opaque
+writer token. `initialize`, `_connect_writer`, every future sidecar mutation and every sidecar
+CAS/install helper MUST carry that token; a missing, released, changed or non-owned token is a
+typed `ReplicationDurabilityError` and the helper MUST perform no mutation. The same lock is
+held continuously from auxiliary-file and main baseline capture through the private in-memory
+transaction, temporary write/fsync, baseline fingerprint CAS, no-replace/atomic installation,
+final readback and parent-directory fsync. An existing empty database is still a CAS baseline;
+it MUST NOT be silently overwritten by a second writer. Cooperating concurrent writers therefore
+have one winner, while the later writer re-reads the new baseline and either performs an exact
+idempotent initialization or returns a typed identity/CAS conflict. The lock serializes the
+cooperating A-B-A case; full `(st_dev, st_ino, st_size, st_mtime_ns, sha256)` comparisons remain
+mandatory for uncooperative replacement or byte mutation.
+
+All held descriptors MUST use explicit offset-independent `pread` (or an equivalent seek-to-zero
+proof) for every repeated read. `_connect_writer` MUST close its private memory connection for
+every `ReplicationDurabilityError`, SQLite error or other failure after opening it. Installation
+cleanup MUST use independent `finally` paths: close every fd even when temporary unlink fails,
+return a typed cleanup error, and leave only an explicitly observable residue for later safe
+cleanup. Status remains writer-lock-free and zero-write, but retains the complete before/after
+fingerprint proof and rejects any WAL/SHM appearance. Required anchors are
+`test_sidecar_writer_lock_serializes_descriptor_sessions`,
+`test_sidecar_cas_helper_requires_writer_lock_token`,
+`test_repeated_initialize_reads_held_descriptor_from_offset_zero`,
+`test_existing_empty_sidecar_concurrent_initializers_have_one_winner`, and
+`test_connect_writer_closes_memory_connection_on_durability_error`, in addition to the Batch1.3
+anchors above.
+
 The event closed field set is exactly `(event_id,intent_id,event_sequence,prev_event_sha256,
 event_type,from_state,to_state,attempt,reason_code,state_version,occurred_at,
 destination_replication_generation,destination_record_sha256,destination_head_sha256,event_sha256)`;
