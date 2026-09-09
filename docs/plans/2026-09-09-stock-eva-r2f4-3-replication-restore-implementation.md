@@ -2537,3 +2537,46 @@ durability failures. The exact implementation anchors are
 `tests/test_replication_destination_batch3.py::test_cleanup_failure_preserves_primary_copy_reason_and_effect`.
 No real NAS, provider request, restore, API/CLI/automation wiring or production enablement is
 performed by this batch.
+
+#### Batch3.4 head linearization evidence (implementation contract)
+
+This amendment supersedes only the head-install error/effect wording above. It does not modify
+canonical market data, manifest/pointer bytes, sidecar schema or the offline-only boundary. The
+private `_destination_replace_at` primitive raises `DestinationHeadInstallError(linearized=...)`
+with a sanitized precommit reason. A single `install_head` wrapper is used by normal publication,
+genesis orphan recovery and child orphan recovery. It marks `head_committed` and the shared
+`_DestinationEffectContext` immediately after successful hard-link/no-replace or atomic exchange,
+before parent fsync and explicit head readback.
+
+Post-linearization fsync, readback, lock or live mount failure preserves the installed head and
+returns `CONTROL_STATE_UNAVAILABLE`, `destination_writes=true`, and no sidecar completion proof.
+Pre-syscall failure leaves head absent and returns the primitive's precommit reason while retaining
+any earlier generation effect. The public `replicate` path receives the shared effect context;
+cleanup errors are accumulated as sanitized secondary state and cannot reset or replace the primary
+reason. The real offline anchors across all three paths are
+`tests/test_replication_destination_batch3.py::test_head_install_parent_fsync_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
+`tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
+Production construction remains `SystemMountInspector` only; volume-id absence is
+`UNKNOWN/UNQUALIFIED` and fake inspector injection is test-only. No real NAS/provider or production
+enablement is performed.
+
+#### Batch3.5 head linearization result contract (implementation contract)
+
+The private `_destination_replace_at` primitive now returns the frozen
+`DestinationHeadInstallResult` on success and raises `DestinationHeadInstallError` carrying
+`linearized` and a sanitized precommit `reason_code` on failure. It sets `linearized=true` directly
+after the no-replace hard-link or atomic exchange syscall, before parent fsync or explicit head
+readback. Normal publication and both orphan recovery branches use the single `install_head`
+wrapper, which propagates this state into `head_committed` and `_DestinationEffectContext`.
+
+Any parent-fsync, readback, lock or live-mount failure after linearization preserves the head and
+record and produces `CONTROL_STATE_UNAVAILABLE`, `destination_writes=true`, and no completion
+proof across all three branches. A pre-syscall failure leaves head absent and retains the
+precommit reason/effect. The exact parameterized anchors are
+`tests/test_replication_destination_batch3.py::test_head_install_parent_fsync_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
+`tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
+No real NAS/provider or production enablement is performed.

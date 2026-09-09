@@ -119,6 +119,28 @@ class ReplicationDurabilityError(RuntimeError):
     """A local immutable artifact could not be safely persisted or read."""
 
 
+class DestinationHeadInstallError(ReplicationDurabilityError):
+    """Head install failure carrying whether the atomic syscall linearized."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        linearized: bool,
+        reason_code: ReplicationReason = "COPY_FAILED",
+    ) -> None:
+        super().__init__(message)
+        self.linearized = linearized
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True)
+class DestinationHeadInstallResult:
+    """Successful head-install outcome at the atomic linearization point."""
+
+    linearized: bool
+
+
 class ReplicationStateUnavailable(ReplicationDurabilityError):
     """The local sidecar is missing, corrupt, or cannot be proven consistent."""
 
@@ -5289,7 +5311,7 @@ def _destination_rename_noreplace(parent_fd: int, source: str, target: str) -> N
         raise ReplicationDurabilityError("destination generation cleanup failed") from exc
 
 
-def _destination_exchange(parent_fd: int, source: str, target: str) -> None:
+def _destination_exchange(parent_fd: int, source: str, target: str) -> bool:
     """Atomically swap a staged regular file with an existing target.
 
     Head replacement is the only mutable destination projection.  It must not
@@ -5323,7 +5345,7 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> None:
             0x00000002,  # RENAME_EXCHANGE
         )
         if result == 0:
-            return
+            return True
         error = ctypes.get_errno()
         if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOENT}:
             raise ReplicationDurabilityError("destination head exchange failed")
@@ -5344,7 +5366,7 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> None:
             0x00000002,  # RENAME_SWAP
         )
         if result == 0:
-            return
+            return True
         error = ctypes.get_errno()
         if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOENT}:
             raise ReplicationDurabilityError("destination head exchange failed")
@@ -6411,6 +6433,29 @@ class DestinationArchiveWriter:
             persisted = _destination_verify_persisted_descriptor(self.descriptor, root_fd)
             _destination_live_mount_identity(persisted, root_fd, self.mount_inspector)
 
+        def install_head(payload: bytes, *, expected: bytes | None) -> None:
+            """Install head through one linearization-aware wrapper."""
+            nonlocal head_committed
+            try:
+                outcome = _destination_replace_at(
+                    replication_fd,
+                    "head.json",
+                    payload,
+                    expected=expected,
+                )
+                if outcome is not None and not outcome.linearized:
+                    raise DestinationHeadInstallError(
+                        "destination head install did not linearize",
+                        linearized=False,
+                    )
+            except DestinationHeadInstallError as exc:
+                if exc.linearized:
+                    head_committed = True
+                    mark_effect()
+                raise
+            head_committed = True
+            mark_effect()
+
         _destination_assert_lock(replication_fd, lock_fd, lock_identity)
         try:
             check_boundary()
@@ -6489,14 +6534,10 @@ class DestinationArchiveWriter:
                 recovered_head = _destination_head(
                     self.descriptor, orphan, head_version=1, updated_at=now
                 )
-                _destination_replace_at(
-                    replication_fd,
-                    "head.json",
+                install_head(
                     canonical_json_bytes(recovered_head.model_dump(mode="json")),
                     expected=None,
                 )
-                head_committed = True
-                mark_effect()
                 try:
                     check_boundary()
                 except (ReplicationStateUnavailable, ReplicationDurabilityError):
@@ -6505,7 +6546,14 @@ class DestinationArchiveWriter:
                             "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
                         )
                     )
-                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                try:
+                    _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
+                    )
                 try:
                     proof = reader.verify_commit(
                         intent_id=proof_intent_id,
@@ -6584,14 +6632,10 @@ class DestinationArchiveWriter:
                     updated_at=now,
                 )
                 baseline_bytes = canonical_json_bytes(baseline.model_dump(mode="json"))
-                _destination_replace_at(
-                    replication_fd,
-                    "head.json",
+                install_head(
                     canonical_json_bytes(recovered_head.model_dump(mode="json")),
                     expected=baseline_bytes,
                 )
-                head_committed = True
-                mark_effect()
                 try:
                     check_boundary()
                 except (ReplicationStateUnavailable, ReplicationDurabilityError):
@@ -6600,7 +6644,14 @@ class DestinationArchiveWriter:
                             "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
                         )
                     )
-                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                try:
+                    _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                except (ReplicationStateUnavailable, ReplicationDurabilityError):
+                    return finish(
+                        DestinationReplicationResult(
+                            "unavailable", "CONTROL_STATE_UNAVAILABLE", orphan, None, True
+                        )
+                    )
                 try:
                     proof = reader.verify_commit(
                         intent_id=proof_intent_id,
@@ -6783,14 +6834,10 @@ class DestinationArchiveWriter:
             ) != baseline_bytes:
                 raise ReplicationCASConflict("destination head CAS conflict")
             check_boundary()
-            _destination_replace_at(
-                replication_fd,
-                "head.json",
+            install_head(
                 canonical_json_bytes(head.model_dump(mode="json")),
                 expected=baseline_bytes,
             )
-            head_committed = True
-            mark_effect()
             check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
             self.descriptor.verify_bound()
@@ -6833,6 +6880,22 @@ class DestinationArchiveWriter:
             return finish(
                 DestinationReplicationResult(
                     "unavailable", reason, destination_writes=destination_write_started
+                )
+            )
+        except DestinationHeadInstallError as exc:
+            if exc.linearized or head_committed:
+                return finish(
+                    DestinationReplicationResult(
+                        "unavailable",
+                        "CONTROL_STATE_UNAVAILABLE",
+                        record,
+                        None,
+                        destination_write_started,
+                    )
+                )
+            return finish(
+                DestinationReplicationResult(
+                    "unavailable", exc.reason_code, destination_writes=destination_write_started
                 )
             )
         except ReplicationDurabilityError as exc:
@@ -6985,6 +7048,18 @@ class DestinationArchiveWriter:
                 "CAS_CONFLICT",
                 destination_writes=effect_context.destination_write_started,
             )
+        except DestinationHeadInstallError as exc:
+            if exc.linearized:
+                return DestinationReplicationResult(
+                    "unavailable",
+                    "CONTROL_STATE_UNAVAILABLE",
+                    destination_writes=True,
+                )
+            return DestinationReplicationResult(
+                "unavailable",
+                exc.reason_code,
+                destination_writes=effect_context.destination_write_started,
+            )
         except ReplicationDurabilityError as exc:
             if effect_context.last_result is not None:
                 if "cleanup failed" in str(exc):
@@ -7044,20 +7119,21 @@ def build_destination_descriptor(
 
 def _destination_replace_at(
     parent_fd: int, name: str, payload: bytes, *, expected: bytes | None
-) -> None:
+) -> DestinationHeadInstallResult:
     """CAS-install a regular pointer without unconditional overwrite.
 
     A missing pointer uses exclusive hard-link installation.  Replacing an
     existing pointer uses the platform's atomic exchange primitive; a
     filesystem without either capability is explicitly unsupported.
     """
-    current = _destination_read_at(parent_fd, (name,), optional=True)
-    current_bytes = current[0] if current is not None else None
-    if current_bytes != expected:
-        raise ReplicationCASConflict("destination head CAS conflict")
     temporary = f".{name}.{secrets.token_hex(12)}.tmp"
     fd: int | None = None
+    linearized = False
     try:
+        current = _destination_read_at(parent_fd, (name,), optional=True)
+        current_bytes = current[0] if current is not None else None
+        if current_bytes != expected:
+            raise ReplicationCASConflict("destination head CAS conflict")
         fd = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -7088,13 +7164,36 @@ def _destination_replace_at(
                         "destination head install unsupported"
                     ) from exc
                 raise ReplicationDurabilityError("destination head install failed") from exc
+            linearized = True
         else:
             _destination_exchange(parent_fd, temporary, name)
+            # _destination_exchange returns only after its atomic exchange
+            # syscall succeeds.  From this point a later fsync/readback
+            # failure must retain the committed-head semantics.
+            linearized = True
         _fsync_open_directory(parent_fd)
-    except ReplicationDurabilityError:
+        readback = _destination_read_at(parent_fd, (name,), optional=False)
+        if readback is None or readback[0] != payload:
+            raise ReplicationDurabilityError("destination head readback failed")
+        return DestinationHeadInstallResult(linearized=True)
+    except ReplicationCASConflict:
         raise
+    except DestinationHeadInstallError:
+        raise
+    except ReplicationDurabilityError as exc:
+        reason_code: ReplicationReason = (
+            "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
+        )
+        raise DestinationHeadInstallError(
+            "destination head install failed",
+            linearized=linearized,
+            reason_code=reason_code,
+        ) from exc
     except OSError as exc:
-        raise ReplicationDurabilityError("destination head install failed") from exc
+        raise DestinationHeadInstallError(
+            "destination head install failed",
+            linearized=linearized,
+        ) from exc
     finally:
         if fd is not None:
             try:
@@ -7191,6 +7290,8 @@ __all__ = [
     "JournalRecord",
     "ObjectInventoryEntry",
     "ReplicationDurabilityError",
+    "DestinationHeadInstallError",
+    "DestinationHeadInstallResult",
     "ReplicationCASConflict",
     "ReplicationClaim",
     "ReplicationClaimContext",

@@ -2732,3 +2732,47 @@ exact offline anchors are
 `tests/test_replication_destination_batch3.py::test_orphan_recovery_mount_drift_after_verifier_preserves_head_as_degraded`,
 `tests/test_replication_destination_batch3.py::test_orphan_child_recovery_mount_drift_after_verifier_preserves_head`, and
 `tests/test_replication_destination_batch3.py::test_cleanup_failure_preserves_primary_copy_reason_and_effect`.
+
+#### Batch3.4 head linearization evidence (normative)
+
+This amendment supersedes only the head-install error/effect wording in earlier Batch3 sections.
+The canonical schema, manifest, pointer shape, sidecar schema and no-real-NAS scope do not change.
+`_destination_replace_at` MUST expose a typed `DestinationHeadInstallError` with a boolean
+`linearized` and a sanitized precommit reason. The head wrapper is the only caller used by normal
+publication, genesis orphan recovery and child orphan recovery. It MUST set the operation's
+`head_committed` and monotonic `destination_writes` immediately after a successful no-replace link
+or atomic exchange syscall, before any later fsync or readback.
+
+If parent-directory fsync, head readback, lock proof or live mount proof fails after that syscall,
+the immutable head remains visible and the result MUST be
+`CONTROL_STATE_UNAVAILABLE` with `destination_writes=true` and no completion proof. A failure
+before the atomic syscall keeps the head absent and preserves the precommit reason/effect. The
+outer writer result MUST consume the linearization/effect context rather than reconstructing a
+default `false`; cleanup failures remain sanitized secondary state.
+
+The parameterized offline attacks cover all three publication paths:
+`tests/test_replication_destination_batch3.py::test_head_install_parent_fsync_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
+`tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.
+The live mount boundary tests in Batch3.3 remain the mount-failure evidence. No production fake
+inspector is exposed; `volume_id` unavailable remains `UNKNOWN/UNQUALIFIED`.
+
+#### Batch3.5 head linearization result contract (normative)
+
+`_destination_replace_at` returns the typed `DestinationHeadInstallResult` on success and raises
+`DestinationHeadInstallError(linearized, reason_code)` on failure. The `linearized` bit is set
+immediately after the successful no-replace hard-link or atomic exchange syscall, before parent
+fsync or head readback. The shared `install_head` wrapper is the only publication/recovery seam;
+it consumes that result/error and carries the bit into `head_committed` and the operation effect.
+
+Post-linearization parent-fsync, readback, lock or mount failures in normal, genesis-orphan and
+child-orphan paths preserve the installed head/record and return
+`CONTROL_STATE_UNAVAILABLE` with `destination_writes=true` and no completion proof. A
+pre-linearization failure preserves the precommit reason and does not claim a head. This contract
+prevents a successful atomic syscall from being misclassified by a later exception or cleanup
+path. The exact parameterized offline anchors are
+`tests/test_replication_destination_batch3.py::test_head_install_parent_fsync_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_readback_failure_after_linearization_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_install_lock_failure_after_linearization_is_controlled`, and
+`tests/test_replication_destination_batch3.py::test_head_install_pre_syscall_failure_keeps_head_unpublished`.

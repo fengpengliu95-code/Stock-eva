@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ from backend.app.storage.replication import (
     ReplicationClaimContext,
     ReplicationDurabilityError,
     ReplicationSidecarStore,
+    ReplicationStateUnavailable,
     VerifiedDestinationCommitProof,
     build_source_checkpoint,
     canonical_json_bytes,
@@ -1231,3 +1233,139 @@ def test_cleanup_failure_preserves_primary_copy_reason_and_effect(
     ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "COPY_FAILED"
     assert result.destination_writes is True
+
+
+def _head_recovery_case(tmp_path: Path, case: str):
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    sequence = 1
+    if case == "genesis_orphan":
+        first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+        assert first.record is not None
+        (destination / "_replication" / "head.json").unlink()
+    elif case == "child_orphan":
+        first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+        assert first.record is not None
+        first_head = (destination / "_replication" / "head.json").read_bytes()
+        second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
+        assert second.record is not None
+        (destination / "_replication" / "head.json").write_bytes(first_head)
+        sequence = 2
+    elif case != "normal":
+        raise AssertionError(f"unknown head case {case}")
+    return writer, checkpoint, destination, sequence
+
+
+@pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
+def test_head_install_parent_fsync_failure_after_linearization_is_controlled(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, sequence = _head_recovery_case(tmp_path, case)
+    replication_stat = (destination / "_replication").stat()
+    original = replication._fsync_open_directory
+    injected = False
+
+    def fail_replication_fsync(fd: int) -> None:
+        nonlocal injected
+        info = os.fstat(fd)
+        if (
+            not injected
+            and info.st_dev == replication_stat.st_dev
+            and info.st_ino == replication_stat.st_ino
+        ):
+            injected = True
+            raise ReplicationDurabilityError("injected head parent fsync failure")
+        original(fd)
+
+    monkeypatch.setattr(replication, "_fsync_open_directory", fail_replication_fsync)
+    result = writer.replicate(checkpoint, source_sequence=sequence, now="2026-09-09T00:03:00Z")
+    assert injected
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.destination_writes is True
+    assert (destination / "_replication" / "head.json").exists()
+
+
+@pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
+def test_head_install_readback_failure_after_linearization_is_controlled(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, sequence = _head_recovery_case(tmp_path, case)
+    original = replication._destination_read_at
+    read_count = 0
+    failure_at = 4 if case == "normal" else 3
+
+    def fail_head_readback(
+        root_fd: int,
+        components: tuple[str, ...],
+        **kwargs: object,
+    ):
+        nonlocal read_count
+        if components == ("head.json",):
+            read_count += 1
+            if read_count == failure_at:
+                raise ReplicationDurabilityError("injected head readback failure")
+        return original(root_fd, components, **kwargs)
+
+    monkeypatch.setattr(replication, "_destination_read_at", fail_head_readback)
+    result = writer.replicate(checkpoint, source_sequence=sequence, now="2026-09-09T00:03:00Z")
+    assert read_count >= failure_at
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.destination_writes is True
+    assert (destination / "_replication" / "head.json").exists()
+
+
+@pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
+def test_head_install_lock_failure_after_linearization_is_controlled(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, sequence = _head_recovery_case(tmp_path, case)
+    head = destination / "_replication" / "head.json"
+    baseline = head.read_bytes() if head.exists() else None
+    original = replication._destination_assert_lock
+    injected = False
+
+    def fail_after_head(*args: object, **kwargs: object) -> None:
+        nonlocal injected
+        current = head.read_bytes() if head.exists() else None
+        if not injected and current != baseline:
+            injected = True
+            raise ReplicationStateUnavailable("injected post-head lock proof failure")
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(replication, "_destination_assert_lock", fail_after_head)
+    result = writer.replicate(checkpoint, source_sequence=sequence, now="2026-09-09T00:03:00Z")
+    assert injected
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.destination_writes is True
+    assert head.exists()
+
+
+def test_head_install_pre_syscall_failure_keeps_head_unpublished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, sequence = _head_recovery_case(tmp_path, "normal")
+    replication_stat = (destination / "_replication").stat()
+    original = replication.os.link
+
+    def fail_head_link(*args: object, **kwargs: object):
+        parent_fd = kwargs.get("dst_dir_fd")
+        if isinstance(parent_fd, int):
+            info = os.fstat(parent_fd)
+            if info.st_dev == replication_stat.st_dev and info.st_ino == replication_stat.st_ino:
+                raise OSError(errno.EIO, "injected pre-linearization head link failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(replication.os, "link", fail_head_link)
+    result = writer.replicate(checkpoint, source_sequence=sequence, now="2026-09-09T00:03:00Z")
+    assert result.reason_code == "COPY_FAILED"
+    assert result.destination_writes is True
+    assert not (destination / "_replication" / "head.json").exists()
