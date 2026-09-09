@@ -4,7 +4,7 @@
 
 **Date:** 2026-09-09 (Asia/Shanghai)
 
-**Status:** In Review / NO-GO pending the R2-F4.3.2 single-authority amendment below; implementation remains blocked
+**Status:** In Review / NO-GO pending the R2-F4.3.3 manifest-publication-lock amendment below; implementation remains blocked
 
 **Reviewers:** Stock EVA architecture, data reliability and operations reviewers
 
@@ -64,7 +64,9 @@ canonical pointer and cannot become a new source of market truth.
 - FR-2a: After manifest success and before a dataset-backed DuckDB pointer commit, the canonical owner MUST create the immutable private `<local_dataset>/_replication/source-commits/<run_id>.json` publication-binding record, fsync its bytes and parent directories, and require the pointer to match it exactly; this additive artifact MUST NOT change canonical manifest or pointer schemas.
 - FR-3: The canonical publication transaction MUST commit before any outbox enqueue attempt; an enqueue failure MUST NOT roll back, hide, or change a ready local pointer.
 - FR-3a: Before every next canonical pointer commit, a refresh-lock durability guard MUST prove or durably establish the current singleton checkpoint; failure MUST block only the next commit with `OUTBOX_DURABILITY_UNAVAILABLE` and MUST preserve the current ready pointer.
-- FR-3b: Every published-pointer writer seam (`NasMarketStore.save_refresh`, initialize/reconcile-control-pointer paths, CLI reconciliation, `full_history` and legacy `save_external_publication` callers) MUST route through one `commit_published_snapshot_with_binding` seam; no direct pointer write may bypass the binding and pre-publication guard. A plain `MarketStore` without an explicit dataset/manifest MUST project `SOURCE_NOT_CONFIGURED` and MUST never fall back to NAS.
+- FR-3b: Every dataset-backed `NasMarketStore`/dataset pointer writer seam (`save_refresh`, initialize/reconcile-control-pointer paths, CLI reconciliation, `full_history` and legacy `save_external_publication` callers) MUST route through one `commit_published_snapshot_with_binding` seam; no direct pointer write may bypass the binding, manifest publication lock or pre-publication guard. The plain `MarketStore` canonical commit MUST remain byte/behavior compatible and MUST not acquire this binding/guard or access NAS; its post-commit replication observation is `SOURCE_NOT_CONFIGURED` when no explicit dataset/manifest is present.
+- FR-3c: The dataset-backed central wrapper MUST acquire one non-reentrant opaque `ManifestPublicationLock` token before baseline manifest read and hold it through object/staging writes, manifest replace/readback, publication-binding write/fsync, DuckDB pointer commit and post-commit exact proof. `backfill`, `upsert`, `refresh`, initialize/reconcile and every other manifest mutation MUST use the same lock; `RefreshRunLock` is scheduling only and MUST NOT be the atomicity dependency. A final manifest fingerprint CAS check immediately before pointer commit MUST leave the pointer unchanged on drift.
+- FR-3d: Legacy/no-selection publications MUST use fixed domain-separated canonical-null selection/lineage digests; missing required v2 manifest metadata MUST return `SOURCE_UNAVAILABLE` and leave the pointer unchanged. A legal reconcile may reuse a binding only after the same lock-bound exact proof.
 - FR-4: The outbox MUST be a local durable SQLite sidecar with the normalized schema, immutable intent identity, allowlisted states, state-version CAS and durable terminal audit defined in this document.
 - FR-5: An enqueue failure MUST be observable as a sanitized `OUTBOX_ENQUEUE_FAILED` or `OUTBOX_JOURNALED` projection; a crash between pointer commit and enqueue MUST be recoverable by comparing the current strict source manifest with durable outbox/journal state.
 - FR-5a: Journal installation MUST use an `O_EXCL|O_NOFOLLOW` temporary, file/directory fsync, macOS `renameatx_np(RENAME_EXCL)` or portable hard-link-no-replace fallback; an existing target may be reused only when byte-identical and MUST never be overwritten.
@@ -115,9 +117,9 @@ canonical pointer and cannot become a new source of market truth.
 
 Given replication is disabled and a valid local canonical publication exists, When automation and status are run, Then the disabled branch returns before constructing or opening the sidecar/source/destination/lock, local readiness and pointer identity remain ready, the provider request count is zero, the outbox/destination/restore hooks are not called, and no local tree or database bytes change.
 
-### AC-2: Binding, pointer and enqueue boundary (FR-2, FR-2a, FR-3, FR-3b, FR-5, FR-25, NFR-6, NFR-10)
+### AC-2: Binding, pointer and enqueue boundary (FR-2, FR-2a, FR-3, FR-3b, FR-3c, FR-3d, FR-5, FR-25, NFR-6, NFR-10)
 
-Given a dataset-backed publication has a successful manifest but binding write/readback fails, When any pointer writer seam attempts publication, Then the new pointer commit is blocked, the prior ready pointer is unchanged, no provider is called, and the failure is `OUTBOX_DURABILITY_UNAVAILABLE`; given a valid binding, the central seam commits the pointer only when all binding fields match exactly. After that pointer commit, a synthetic outbox error preserves ready state and projects `OUTBOX_ENQUEUE_FAILED` without rollback. Required tests are `test_binding_write_failure_blocks_pointer_without_rollback`, `test_publication_binding_is_fsynced_before_pointer_and_exactly_matches`, `test_manifest_changed_before_pointer_commit_is_rejected`, `test_all_published_pointer_writers_route_through_central_binding_commit`, `test_plain_market_store_without_dataset_manifest_returns_source_not_configured`, and `test_enqueue_failure_preserves_local_pointer_ready`.
+Given a dataset-backed publication has a successful manifest but binding write/readback fails, When any pointer writer seam attempts publication, Then the new pointer commit is blocked, the prior ready pointer is unchanged, no provider is called, and the failure is `OUTBOX_DURABILITY_UNAVAILABLE`; given a valid binding, the central seam commits the pointer only when all binding fields match exactly. The same non-reentrant manifest lock MUST cover baseline read, object/staging writes, manifest replace/readback, binding fsync, pointer commit and post-commit exact proof; a final fingerprint drift blocks the pointer. A legacy/no-selection publication uses canonical-null selection/lineage digests, while missing required v2 metadata returns `SOURCE_UNAVAILABLE`; a plain `MarketStore` keeps its existing canonical commit and only observes `SOURCE_NOT_CONFIGURED`. After that pointer commit, a synthetic outbox error preserves ready state and projects `OUTBOX_ENQUEUE_FAILED` without rollback. Required tests are `test_binding_write_failure_blocks_pointer_without_rollback`, `test_publication_is_atomic_under_one_manifest_publication_lock`, `test_manifest_fingerprint_drift_blocks_pointer_cas`, `test_publication_binding_is_fsynced_before_pointer_and_exactly_matches`, `test_manifest_changed_before_pointer_commit_is_rejected`, `test_all_dataset_pointer_writers_route_through_central_binding_commit`, `test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`, `test_legacy_no_selection_uses_canonical_null_digests`, `test_missing_v2_manifest_metadata_blocks_pointer`, and `test_enqueue_failure_preserves_local_pointer_ready`.
 
 ### AC-3: Binding and journal crash recovery (FR-3, FR-4, FR-5, FR-26, NFR-6, NFR-7)
 
@@ -212,6 +214,10 @@ Given all focused replication/restore fakes, existing NAS tests and static valid
 - EC-17: Process crashes after journal write before outbox import → import is idempotent; journal removal is attempted only after the outbox row is committed.
 - EC-25: A binding temp/install, manifest mutation, or pointer transaction crashes before commit → only an inactive immutable binding or quarantined temp may remain; the previous pointer remains ready and no mismatched binding becomes an active SourceCommit.
 - EC-26: The local control DB inode rotates during a legitimate migration → the current checkpoint records the new device/inode/schema, but the immutable dataset-root nonce/identity remains stable; any replacement that fails strict root, nonce, schema, singleton, manifest or pointer proof is `LOCAL_POINTER_MISMATCH`/`OUTBOX_DURABILITY_UNAVAILABLE` and is never accepted.
+- EC-27: A concurrent `backfill`/`upsert`/refresh mutates the manifest during a dataset-backed publication → the shared non-reentrant manifest lock serializes the mutation; any final fingerprint drift fails the pointer CAS and leaves the prior pointer unchanged.
+- EC-28: `RefreshRunLock` is absent, reordered or nested while the manifest publication lock is held → it cannot be used as the publication atomicity dependency; the opaque manifest-lock token remains the sole ownership proof and lock-order violation fails closed.
+- EC-29: A legacy/no-selection candidate lacks required v2 manifest metadata → fixed canonical-null selection/lineage digests are used only when metadata is intentionally absent; a required-but-missing field returns `SOURCE_UNAVAILABLE` and leaves the pointer unchanged.
+- EC-30: A plain `MarketStore` publishes without an explicit local dataset/manifest → its existing canonical commit is unchanged; no binding/guard/NAS work runs and the post-commit observation is `SOURCE_NOT_CONFIGURED`.
 - EC-18: Two workers claim the same intent, or a worker lease expires → one state-version CAS wins; stale workers cannot copy, promote or mark success.
 - EC-19: Retry attempt reaches the sixth failure or a non-retryable integrity/trust failure occurs → durable `dead_letter`/terminal reason; no automatic unbounded retry.
 - EC-20: Restore source is invalid or changes during copy → no final temporary root, no canonical DB/pointer mutation, and bounded sanitized result.
@@ -567,7 +573,9 @@ real passing test/static check before an implementation release is considered.
 | FR-2a | `tests/test_dataset_replication.py::test_publication_binding_is_fsynced_before_pointer_and_exactly_matches` |
 | FR-3 | `tests/test_dataset_replication.py::test_enqueue_failure_preserves_local_pointer_ready` |
 | FR-3a | `tests/test_dataset_replication.py::test_prepublication_guard_blocks_next_pointer_when_current_checkpoint_not_durable` |
-| FR-3b | `tests/test_dataset_replication.py::test_all_published_pointer_writers_route_through_central_binding_commit` |
+| FR-3b | `tests/test_dataset_replication.py::test_all_dataset_pointer_writers_route_through_central_binding_commit` |
+| FR-3c | `tests/test_dataset_replication.py::test_publication_is_atomic_under_one_manifest_publication_lock` |
+| FR-3d | `tests/test_dataset_replication.py::test_legacy_no_selection_uses_canonical_null_digests` |
 | FR-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
 | FR-5 | `tests/test_dataset_replication.py::test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id` |
 | FR-5a | `tests/test_dataset_replication.py::test_journal_install_is_no_replace_and_reuses_identical_target` |
@@ -594,7 +602,7 @@ real passing test/static check before an implementation release is considered.
 | FR-26 | `tests/test_dataset_replication.py::test_replication_evidence_replays_without_provider` |
 | FR-27 | `tests/test_nas_dataset.py::test_verified_local_mirror_is_idempotent_and_manifest_readable` |
 | AC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
-| AC-2 | `tests/test_dataset_replication.py::test_binding_write_failure_blocks_pointer_without_rollback` |
+| AC-2 | `tests/test_dataset_replication.py::test_publication_is_atomic_under_one_manifest_publication_lock` |
 | AC-3 | `tests/test_dataset_replication.py::test_pointer_unchanged_after_binding_crash_is_recoverable` |
 | AC-4 | `tests/test_dataset_replication.py::test_replication_sidecar_normative_ddl_identity_and_immutable_event_history` |
 | AC-5 | `tests/test_dataset_replication.py::test_source_checkpoint_rejects_missing_changed_or_corrupt_object` |
@@ -613,6 +621,8 @@ real passing test/static check before an implementation release is considered.
 | AC-18 | `tests/test_nas_dataset.py::test_verified_local_mirror_is_idempotent_and_manifest_readable` |
 | AC-19 | `tests/test_launchagent_assets.py::test_refresh_replication_hook_is_optional_and_tcc_safe` |
 | AC-20 | `tests/test_dataset_replication.py::test_replication_release_evidence_is_offline_and_exact_head_recorded` |
+| AC-21 | `tests/test_dataset_replication.py::test_manifest_fingerprint_drift_blocks_pointer_cas` |
+| AC-22 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | EC-2 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
 | EC-3 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
@@ -639,6 +649,10 @@ real passing test/static check before an implementation release is considered.
 | EC-24 | `tests/test_dataset_replication.py::test_reverse_replication_and_mount_attempts_are_zero_write` |
 | EC-25 | `tests/test_dataset_replication.py::test_manifest_changed_before_pointer_commit_is_rejected` |
 | EC-26 | `tests/test_dataset_replication.py::test_legal_db_inode_rotation_with_same_root_nonce_is_accepted` |
+| EC-27 | `tests/test_dataset_replication.py::test_manifest_lock_blocks_concurrent_backfill_or_upsert_mutation` |
+| EC-28 | `tests/test_dataset_replication.py::test_refresh_run_lock_is_not_publication_atomicity_dependency` |
+| EC-29 | `tests/test_dataset_replication.py::test_missing_v2_manifest_metadata_blocks_pointer` |
+| EC-30 | `tests/test_dataset_replication.py::test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured` |
 
 ## R2-F4.3.2 normative amendment — single-authority release-candidate closure
 
@@ -751,22 +765,21 @@ schema remain unchanged. Required tests are
 `test_pointer_unchanged_after_binding_crash_is_recoverable`, and
 `test_publication_binding_target_existing_identical_is_reused`.
 
-All pointer writer seams MUST call the central
-`commit_published_snapshot_with_binding` operation under the existing refresh/control writer lock.
-The seam owns binding creation/readback, the pre-publication guard, the one canonical pointer
-commit, exact active-binding proof, and the post-commit typed observation. The required callers
-are `NasMarketStore.save_refresh`, `NasMarketStore.initialize`,
-`NasMarketStore.reconcile_control_pointer`, the CLI reconciliation path,
-`full_history` publication, `MarketStore.save_refresh(publish=True)` and the legacy
+All dataset-backed pointer writer seams MUST call the central
+`commit_published_snapshot_with_binding` operation under the wrapper-owned
+`ManifestPublicationLock`. The seam owns binding creation/readback, the pre-publication guard,
+the one canonical pointer commit, exact active-binding proof, and the post-commit typed
+observation. The required callers are `NasMarketStore.save_refresh`,
+`NasMarketStore.initialize`, `NasMarketStore.reconcile_control_pointer`, dataset `backfill`,
+`upsert`, refresh, the CLI reconciliation path, `full_history` publication and the legacy
 `save_external_publication` call path. `save_external_publication` may be called only internally by
-this seam; no direct caller may bypass the binding or guard. A plain `MarketStore` with no explicit
-local dataset root/manifest returns `SOURCE_NOT_CONFIGURED` for replication, never infers NAS and
-never creates a `SourceCommit`. Required routing tests are
-`test_all_published_pointer_writers_route_through_central_binding_commit`,
-`test_save_external_publication_is_not_a_publication_bypass`,
-`test_nas_market_store_save_refresh_and_reconcile_use_binding`,
-`test_full_history_and_cli_reconcile_use_binding`, and
-`test_plain_market_store_without_dataset_manifest_returns_source_not_configured`.
+this dataset seam; no direct caller may bypass the binding, lock or guard. Plain `MarketStore`
+canonical publication is unchanged: it performs no binding/guard/NAS work and its replication
+observation is `SOURCE_NOT_CONFIGURED` without an explicit dataset/manifest. Required routing
+tests are `test_all_dataset_pointer_writers_route_through_central_binding_commit`,
+`test_publication_is_atomic_under_one_manifest_publication_lock`,
+`test_manifest_fingerprint_drift_blocks_pointer_cas`, and
+`test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured`.
 
 Before every subsequent canonical pointer commit, the same refresh/control writer lock MUST run a
 `before_canonical_pointer_commit(NextCanonicalPointer) -> CanonicalDurabilityGuardResult` guard.
@@ -1577,3 +1590,120 @@ requires explicit assertions for canonical object/pointer bytes and inodes, zero
 requests, the 15-minute budget, and every hash golden vector. The implementation plan's steps,
 models, DDL, API, reason mapping, transaction and crash matrix are amended by this section and
 must reproduce it before any implementation is called SPEC GO.
+
+## R2-F4.3.3 sixth-round normative amendment — manifest publication lock and plain-store boundary
+
+This amendment is the sole authority for the H1/M1/M3 closure and supersedes any earlier
+statement that makes the refresh lock, a callback, or a plain `MarketStore` the publication
+atomicity boundary. It remains a specification only: no implementation, NAS access, mount,
+provider request or production execution is authorized.
+
+### H1 — one lock-owned dataset publication
+
+The existing `_ManifestLock` is promoted to the internal `ManifestPublicationLock`. It is
+non-reentrant and its acquisition returns an opaque, unforgeable
+`ManifestPublicationLockToken`; the token cannot be serialized, supplied by a caller, or acquired
+twice by the same publication. The dataset-backed central wrapper
+`commit_published_snapshot_with_binding(...)` acquires exactly one token and owns it until the
+post-commit exact proof completes. Its ordered critical section is:
+
+```text
+baseline descriptor-bound manifest read + fingerprint
+  -> objects and private staging creation/readback
+  -> manifest replacement + fsync + strict readback
+  -> immutable source-binding write/readback + file/parent fsync
+  -> final manifest fingerprint CAS
+  -> DuckDB external publication pointer commit
+  -> pointer/manifest/binding exact proof
+```
+
+The final fingerprint is
+`manifest_fingerprint = domain_sha256("stock-eva/r2f4.3/manifest-fingerprint/v1", {
+manifest_bytes_sha256,manifest_canonical_sha256,manifest_generation,source_object_set_sha256})`.
+The wrapper re-reads it through descriptor-bound handles immediately before the pointer
+transaction. Any generation, byte hash, canonical hash or object-set drift returns
+`LOCAL_POINTER_MISMATCH`, leaves the previous pointer untouched and keeps the new binding
+inactive. The lock remains held through the pointer transaction and the exact proof; enqueue,
+journal import and NAS drain begin only after the local publication boundary has completed.
+
+Every dataset-backed `NasMarketStore` writer uses this wrapper exactly once:
+`save_refresh`, `initialize`, `reconcile_control_pointer`, `backfill`, `upsert`, refresh,
+`full_history` and CLI reconciliation. Their internal `_publish_bars_locked(token, ...)` path
+requires the wrapper-owned token and never acquires `_ManifestLock`; no public method may acquire
+the lock and then call another public method that acquires it. All manifest mutation paths use the
+same lock, so concurrent backfill/upsert/refresh/reconcile cannot mutate the baseline or manifest
+between the read, binding and pointer phases. A startup, CLI or `full_history` caller passes no
+lock token and does no lock acquisition itself.
+
+`RefreshRunLock` is optional scheduling coordination only. When present, its fixed order is
+`RefreshRunLock -> ManifestPublicationLock`; the wrapper never acquires `RefreshRunLock`, and no
+path acquires the two in reverse order. Publication correctness never depends on the refresh lock.
+Lock busy, token mismatch, lock-order inversion or release failure is fail-closed with no pointer
+advance. Required concurrency/crash anchors are
+`test_publication_is_atomic_under_one_manifest_publication_lock`,
+`test_manifest_lock_blocks_concurrent_backfill_or_upsert_mutation`,
+`test_manifest_fingerprint_drift_blocks_pointer_cas`,
+`test_refresh_run_lock_is_not_publication_atomicity_dependency`,
+`test_pointer_unchanged_after_manifest_publication_crash_before_pointer`, and
+`test_binding_reproved_after_manifest_publication_crash_after_pointer`.
+
+### M1 — legacy null digests and required v2 metadata
+
+The legacy/no-selection adapter has exactly these canonical null digests; omission, the string
+`"null"`, an empty object and an empty string are different and invalid:
+
+```text
+canonical_null_selection_sha256 =
+  domain_sha256("stock-eva/r2f4.3/selection-null/v1", None)
+canonical_null_lineage_sha256 =
+  domain_sha256("stock-eva/r2f4.3/lineage-null/v1", None)
+```
+
+The canonical JSON preimage for each is the literal UTF-8 `null` followed by one newline under
+the stated domain. A legacy publication may reuse an existing immutable binding only when these
+digests and every pointer/manifest field match under the publication lock. A schema-v2 manifest
+must contain `provider_id,universe_id,evidence_id,evidence_sha256,candidate_id,
+candidate_manifest_sha256,gate_report_sha256,adapter_version,source_schema_version` for every
+object entry; required-but-missing, malformed or conflicting metadata returns `SOURCE_UNAVAILABLE`
+before binding/pointer commit. This is distinct from an intentionally absent selection, which uses
+the two fixed null digests. Required anchors are
+`test_legacy_no_selection_uses_canonical_null_digests` and
+`test_missing_v2_manifest_metadata_blocks_pointer`.
+
+### M3 — plain `MarketStore` compatibility and ownership
+
+The plain `MarketStore` path is not a dataset-backed replication writer. Its existing canonical
+commit, locking, bytes and behavior remain unchanged. It does not write a source binding, run the
+pre-publication durability guard, acquire `ManifestPublicationLock`, infer a dataset root, or
+access NAS. After its successful canonical DuckDB commit, the typed replication observation is
+`SOURCE_NOT_CONFIGURED` unless an explicit dataset/manifest-backed `NasMarketStore` wrapper was
+used. Replication errors can therefore never alter plain-store canonical success. The only paths
+that may produce an active `SourceCommit` are the dataset-backed wrapper methods listed above.
+`test_plain_market_store_canonical_commit_is_unchanged_and_replication_is_not_configured` is the
+required compatibility anchor.
+
+### File ownership and transaction/crash matrix
+
+`backend/app/storage/dataset.py` owns `ManifestPublicationLock`, its opaque token, the central
+wrapper and `_publish_bars_locked`; `backend/app/market/refresh.py`, `backfill.py`,
+`full_history.py` and `backend/app/cli.py` call the wrapper without acquiring the manifest lock;
+`backend/app/market/store.py` retains the plain canonical path. The transaction boundary is:
+
+```text
+baseline manifest -> objects/staging -> manifest replace/readback
+  -> binding fsync -> final fingerprint CAS -> pointer commit -> exact proof
+  -> release manifest lock -> journal/outbox observation
+```
+
+| Failure point | Required result |
+|---|---|
+| Concurrent mutation/backfill while wrapper owns the lock | Mutation waits or returns busy; it cannot alter the baseline or publish a stale pointer. |
+| Final manifest fingerprint drift | `LOCAL_POINTER_MISMATCH`; previous pointer remains ready; new manifest/binding is inactive. |
+| Binding/fsync failure | `OUTBOX_DURABILITY_UNAVAILABLE`; pointer is not attempted and prior pointer bytes remain unchanged. |
+| Crash before pointer commit | Old pointer remains visible; staging/temp/binding may be quarantined but never becomes active. |
+| Crash after pointer commit before exact proof | Reconciliation reopens the same lock-bound manifest/binding and proves the committed pointer; it does not regenerate or overwrite the binding. |
+| Plain `MarketStore` canonical commit or replication failure | Existing canonical result/bytes are preserved; observation is `SOURCE_NOT_CONFIGURED`; no replication side effect can roll it back. |
+
+The design and implementation crosswalks include FR-3b/3c/3d, AC-21/AC-22 and EC-27 through
+EC-30 with exact anchors. The status remains `In Review / NO-GO`; this amendment does not claim
+implementation or SPEC/QUALITY approval.
