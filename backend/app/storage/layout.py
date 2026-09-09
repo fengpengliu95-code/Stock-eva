@@ -91,9 +91,9 @@ class StorageLayout:
         return self.settings.local_lock_dir / self.settings.replication_lock_name
 
     @property
-    def replication_source_instance(self) -> Path:
+    def replication_source_instance(self) -> Path | None:
         if self.settings.local_market_dataset_root is None:
-            return Path("_replication") / self.settings.replication_source_instance_name
+            return None
         return (
             self.settings.local_market_dataset_root
             / "_replication"
@@ -101,9 +101,9 @@ class StorageLayout:
         )
 
     @property
-    def replication_source_commits(self) -> Path:
+    def replication_source_commits(self) -> Path | None:
         if self.settings.local_market_dataset_root is None:
-            return Path("_replication") / "source-commits"
+            return None
         return self.settings.local_market_dataset_root / "_replication" / "source-commits"
 
     def ensure_replication_writer_dirs(self) -> None:

@@ -16,13 +16,14 @@ import os
 import secrets
 import sqlite3
 import stat
+import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
@@ -30,7 +31,18 @@ from backend.app.storage.layout import StorageLayout
 ZERO_SHA256 = "0" * 64
 SIDECAR_SCHEMA_IDENTITY = "stock-eva/r2f4.3/replication-sidecar/v1"
 SOURCE_INSTANCE_SCHEMA = "stock-eva/r2f4.3/source-instance/v2"
-SOURCE_INSTANCE_DOMAIN = "stock-eva/r2f4.3/source-instance/v3"
+SOURCE_INSTANCE_DOMAIN: Literal["stock-eva/r2f4.3/source-instance/v3"] = (
+    "stock-eva/r2f4.3/source-instance/v3"
+)
+SOURCE_DATASET_DOMAIN: Literal["stock-eva/r2f4.3/local-canonical"] = (
+    "stock-eva/r2f4.3/local-canonical"
+)
+DATASET_IDENTITY_DOMAIN: Literal["stock-eva/r2f4.3/dataset-identity/v1"] = (
+    "stock-eva/r2f4.3/dataset-identity/v1"
+)
+SOURCE_OBJECT_SET_DOMAIN: Literal["stock-eva/r2f4.3/object-set/v1"] = (
+    "stock-eva/r2f4.3/object-set/v1"
+)
 JOURNAL_SCHEMA_VERSION = 1
 
 ReplicationState = Literal["disabled", "ready", "degraded", "unavailable"]
@@ -97,6 +109,21 @@ def normalized_ddl_bytes(ddl: str) -> bytes:
     normalized = ddl.replace("\r\n", "\n").replace("\r", "\n")
     normalized = "\n".join(line.rstrip() for line in normalized.splitlines()).strip("\n")
     return (normalized + "\n").encode("utf-8")
+
+
+def _expected_sqlite_objects() -> set[tuple[str, str, str | None, str | None]]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SIDECAR_DDL)
+        return set(
+            connection.execute(
+                """SELECT type, name, tbl_name, sql
+                     FROM sqlite_master
+                    WHERE type IN ('table', 'index', 'trigger')"""
+            ).fetchall()
+        )
+    finally:
+        connection.close()
 
 
 SIDECAR_DDL = """PRAGMA foreign_keys = ON;
@@ -256,12 +283,16 @@ def _utc_now() -> str:
 
 
 def _validate_sha(value: str, field: str) -> None:
-    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
         raise ValueError(f"{field} must be a lower-case SHA-256 digest")
 
 
 def _validate_utc_timestamp(value: str, field: str) -> str:
-    if not value.endswith("Z"):
+    if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError(f"{field} must use a UTC Z timestamp")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
@@ -273,6 +304,8 @@ def _validate_utc_timestamp(value: str, field: str) -> str:
 
 
 def _validate_iso_date(value: str, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO date")
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError as exc:
@@ -281,6 +314,7 @@ def _validate_iso_date(value: str, field: str) -> str:
 
 
 def _safe_parent(path: Path) -> None:
+    path = _physical_path(path)
     if not path.is_absolute():
         raise ReplicationDurabilityError("replication path must be absolute")
     current = Path(path.anchor)
@@ -294,49 +328,214 @@ def _safe_parent(path: Path) -> None:
             raise ReplicationDurabilityError("replication path ancestor is unsafe")
 
 
-def _read_nofollow(path: Path) -> tuple[bytes, os.stat_result]:
+def _physical_path(path: Path) -> Path:
+    """Bind macOS's system /var alias before descriptor operations."""
+    if not path.is_absolute():
+        return path
+    absolute = Path(os.path.normpath(path))
+    if absolute.parts[1:2] == ("var",) and Path("/var").is_symlink():
+        return Path("/private/var", *absolute.parts[2:])
+    return absolute
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, list[int]]:
+    """Open every ancestor with ``openat``-style descriptor traversal.
+
+    The returned descriptors remain open until the caller closes the list.  No
+    later operation in the critical section needs to reopen a checked path.
+    """
+    path = _physical_path(path)
+    if not path.is_absolute() or path == Path("/") and not create:
+        if not path.is_absolute():
+            raise ReplicationDurabilityError("replication path must be absolute")
+    descriptors: list[int] = []
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    except OSError as exc:
+        current = os.open(Path(path.anchor), _DIRECTORY_FLAGS)
+        descriptors.append(current)
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o700, dir_fd=current)
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            descriptors.append(child)
+            current = child
+        return descriptors[-1], descriptors
+    except (OSError, ReplicationDurabilityError) as exc:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if isinstance(exc, ReplicationDurabilityError):
+            raise
+        raise ReplicationDurabilityError("replication path ancestor is unavailable") from exc
+
+
+def _close_descriptors(descriptors: list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _read_descriptor(
+    fd: int,
+    *,
+    require_private_mode: bool = True,
+) -> tuple[bytes, os.stat_result]:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ReplicationDurabilityError("replication artifact is not a regular file")
+    if require_private_mode and stat.S_IMODE(before.st_mode) != 0o600:
+        raise ReplicationDurabilityError("replication artifact permissions are unsafe")
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ReplicationDurabilityError("replication artifact changed during read")
+    return b"".join(chunks), after
+
+
+def _read_nofollow(
+    path: Path,
+    *,
+    require_private_mode: bool = True,
+) -> tuple[bytes, os.stat_result]:
+    path = _physical_path(path)
+    _, descriptors = _open_directory_chain(path.parent)
+    parent_fd = descriptors[-1]
+    fd: int | None = None
+    try:
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        return _read_descriptor(fd, require_private_mode=require_private_mode)
+    except FileNotFoundError as exc:
         raise ReplicationDurabilityError("replication artifact is unreadable") from exc
-    try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise ReplicationDurabilityError("replication artifact is not a regular file")
-        if stat.S_IMODE(before.st_mode) != 0o600:
-            raise ReplicationDurabilityError("replication artifact permissions are unsafe")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise ReplicationDurabilityError("replication artifact changed during read")
-        return b"".join(chunks), after
     except OSError as exc:
         raise ReplicationDurabilityError("replication artifact read failed") from exc
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        _close_descriptors(descriptors)
+
+
+def _read_optional_nofollow(
+    path: Path,
+    *,
+    require_private_mode: bool = True,
+) -> tuple[bytes, os.stat_result] | None:
+    """Read an optional sidecar without treating a symlink as absence."""
+    path = _physical_path(path)
+    try:
+        _, descriptors = _open_directory_chain(path.parent)
+    except ReplicationDurabilityError:
+        # A missing ancestor means this optional artifact is absent.  An
+        # existing but unsafe ancestor must still fail closed.
+        if not path.parent.exists():
+            return None
+        raise
+    parent_fd = descriptors[-1]
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        return _read_descriptor(fd, require_private_mode=require_private_mode)
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication artifact read failed") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        _close_descriptors(descriptors)
+
+
+def _stat_nofollow(path: Path) -> os.stat_result:
+    path = _physical_path(path)
+    _, descriptors = _open_directory_chain(path.parent)
+    fd: int | None = None
+    try:
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=descriptors[-1],
+        )
+        return os.fstat(fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication artifact is unreadable") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        _close_descriptors(descriptors)
 
 
 def _fsync_directory(path: Path) -> None:
+    path = _physical_path(path)
+    _, descriptors = _open_directory_chain(path)
+    fd = descriptors[-1]
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise ReplicationDurabilityError("replication parent is not durable") from exc
+        _fsync_open_directory(fd)
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _fsync_open_directory(fd: int) -> None:
     try:
         os.fsync(fd)
     except OSError as exc:
         raise ReplicationDurabilityError("replication parent fsync failed") from exc
+
+
+def _fsync_nofollow(path: Path, *, optional: bool = False) -> None:
+    path = _physical_path(path)
+    try:
+        _, descriptors = _open_directory_chain(path.parent)
+    except ReplicationDurabilityError:
+        if optional and not path.parent.exists():
+            return
+        raise
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptors[-1],
+            )
+        except FileNotFoundError:
+            if optional:
+                return
+            raise
+        os.fsync(fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication artifact fsync failed") from exc
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        _close_descriptors(descriptors)
 
 
 def _write_fully(fd: int, payload: bytes) -> None:
@@ -349,48 +548,82 @@ def _write_fully(fd: int, payload: bytes) -> None:
 
 
 def _install_no_replace(path: Path, payload: bytes) -> Path:
+    path = _physical_path(path)
     parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    _safe_parent(parent)
-    if path.exists() or path.is_symlink():
-        existing, _ = _read_nofollow(path)
-        if existing == payload:
-            return path
-        raise ReplicationDurabilityError("replication durability conflict: artifact already exists")
-
-    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    parent_fd, descriptors = _open_directory_chain(parent, create=True)
+    target_fd: int | None = None
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
+        try:
+            target_fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            target_fd = None
+        except OSError as exc:
+            raise ReplicationDurabilityError("replication artifact target is unsafe") from exc
+        if target_fd is not None:
+            try:
+                existing, _ = _read_descriptor(target_fd)
+            finally:
+                os.close(target_fd)
+                target_fd = None
+            if existing == payload:
+                return path
+            raise ReplicationDurabilityError(
+                "replication durability conflict: artifact already exists"
+            )
+
         fd = os.open(
-            temporary,
+            temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
+            dir_fd=parent_fd,
         )
         try:
             _write_fully(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
-        _fsync_directory(parent)
         try:
-            os.link(temporary, path, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
-            existing, _ = _read_nofollow(path)
+            target_fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                existing, _ = _read_descriptor(target_fd)
+            finally:
+                os.close(target_fd)
+                target_fd = None
             if existing != payload:
                 raise ReplicationDurabilityError(
                     "replication durability conflict: artifact already exists"
                 ) from exc
-        else:
-            _fsync_directory(parent)
+        _fsync_open_directory(parent_fd)
         return path
     except OSError as exc:
         raise ReplicationDurabilityError("replication artifact install failed") from exc
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         except OSError as exc:
             raise ReplicationDurabilityError("replication temporary cleanup failed") from exc
+        if target_fd is not None:
+            os.close(target_fd)
+        _close_descriptors(descriptors)
 
 
 class ReplicationEffects(BaseModel):
@@ -411,24 +644,41 @@ class ReplicationStatusResponse(BaseModel):
     enabled: bool
     source_ready: bool
     destination_configured: bool
-    outbox_schema_version: int | None
-    pending_count: int
-    copying_count: int
-    verifying_count: int
-    retry_wait_count: int
-    dead_letter_count: int
-    last_replicated_source_manifest_sha256: str | None
+    outbox_schema_version: Literal[1] | None
+    pending_count: int = Field(ge=0)
+    copying_count: int = Field(ge=0)
+    verifying_count: int = Field(ge=0)
+    retry_wait_count: int = Field(ge=0)
+    dead_letter_count: int = Field(ge=0)
+    last_replicated_source_manifest_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     last_replicated_at: str | None
     local_ready: bool
     destination_health: Literal["unknown", "healthy", "unavailable", "unsupported"]
     destination_health_observed_at: str | None
-    queue_lag_seconds: int | None
-    lag_seconds: int | None
+    queue_lag_seconds: int | None = Field(default=None, ge=0)
+    lag_seconds: int | None = Field(default=None, ge=0)
     provider_requests: Literal[0] = 0
     mode: Literal["status"] = "status"
     execution_allowed: Literal[False] = False
     effects: ReplicationEffects
     paths_exposed: Literal[False] = False
+
+    @model_validator(mode="after")
+    def public_projection_is_sanitized(self) -> ReplicationStatusResponse:
+        for value, field in (
+            (self.last_replicated_source_manifest_sha256, "last_replicated_source_manifest_sha256"),
+        ):
+            if value is not None:
+                _validate_sha(value, field)
+        for value, field in (
+            (self.last_replicated_at, "last_replicated_at"),
+            (self.destination_health_observed_at, "destination_health_observed_at"),
+        ):
+            if value is not None:
+                _validate_utc_timestamp(value, field)
+        return self
 
 
 class SourceInstanceRecord(BaseModel):
@@ -439,7 +689,7 @@ class SourceInstanceRecord(BaseModel):
     source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     canonical_root_path: str = Field(min_length=1)
     canonical_schema_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    source_instance_domain: str = Field(min_length=1)
+    source_instance_domain: Literal[SOURCE_DATASET_DOMAIN] = SOURCE_DATASET_DOMAIN
     fsync_contract: Literal["file_and_parent_directory"] = "file_and_parent_directory"
     source_instance_nonce: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     dataset_identity: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -468,6 +718,26 @@ class SourceInstanceRecord(BaseModel):
         if expected != self.source_instance_sha256:
             raise ReplicationDurabilityError("source instance hash is invalid")
 
+    def verify_identity(self) -> None:
+        dataset_identity = domain_sha256(
+            DATASET_IDENTITY_DOMAIN,
+            {
+                "canonical_root_path": self.canonical_root_path,
+                "canonical_schema_digest": self.canonical_schema_digest,
+                "source_instance_domain": self.source_instance_domain,
+                "source_instance_nonce": self.source_instance_nonce,
+            },
+        )
+        source_instance_id = domain_sha256(
+            SOURCE_INSTANCE_DOMAIN,
+            {"dataset_identity": dataset_identity},
+        )
+        if (
+            self.dataset_identity != dataset_identity
+            or self.source_instance_id != source_instance_id
+        ):
+            raise ReplicationDurabilityError("source instance identity is invalid")
+
 
 class SourceInstanceStore:
     def __init__(self, path: Path) -> None:
@@ -478,30 +748,35 @@ class SourceInstanceStore:
         *,
         canonical_root_path: Path,
         canonical_schema_digest: str,
-        source_instance_domain: str,
+        source_instance_domain: str = SOURCE_DATASET_DOMAIN,
         source_instance_nonce: str | None = None,
         created_at: str | None = None,
     ) -> SourceInstanceRecord:
-        canonical_root = Path(os.path.abspath(canonical_root_path))
-        if not canonical_root.is_absolute() or canonical_root == Path("/"):
+        if not canonical_root_path.is_absolute():
+            raise ReplicationDurabilityError("canonical root must be an absolute local root")
+        canonical_root = _physical_path(canonical_root_path)
+        if canonical_root == Path("/"):
             raise ReplicationDurabilityError("canonical root is unsafe")
         expected_path = canonical_root / "_replication" / "source-instance.json"
-        if Path(os.path.abspath(self.path)) != expected_path:
+        if _physical_path(self.path) != expected_path:
             raise ReplicationDurabilityError("source instance path is outside canonical layout")
         _validate_sha(canonical_schema_digest, "canonical_schema_digest")
         nonce = source_instance_nonce or secrets.token_hex(32)
         _validate_sha(nonce, "source_instance_nonce")
+        if source_instance_domain != SOURCE_DATASET_DOMAIN:
+            raise ReplicationDurabilityError("source instance domain is not approved")
         dataset_identity = domain_sha256(
-            "stock-eva/r2f4.3/dataset-identity/v1",
+            DATASET_IDENTITY_DOMAIN,
             {
                 "canonical_root_path": str(canonical_root),
                 "canonical_schema_digest": canonical_schema_digest,
                 "source_instance_domain": source_instance_domain,
+                "source_instance_nonce": nonce,
             },
         )
         source_instance_id = domain_sha256(
             SOURCE_INSTANCE_DOMAIN,
-            {"dataset_identity": dataset_identity, "source_instance_nonce": nonce},
+            {"dataset_identity": dataset_identity},
         )
         values: dict[str, object] = {
             "source_instance_schema": SOURCE_INSTANCE_SCHEMA,
@@ -520,11 +795,18 @@ class SourceInstanceStore:
         )
         record = SourceInstanceRecord.model_validate(values)
         record.verify_hash()
+        record.verify_identity()
         payload = canonical_json_bytes(record.model_dump(mode="json"))
         _install_no_replace(self.path, payload)
-        return self.read()
+        return self.read(canonical_root_path=canonical_root)
 
-    def read(self) -> SourceInstanceRecord:
+    def read(
+        self,
+        *,
+        canonical_root_path: Path | None = None,
+        canonical_schema_digest: str | None = None,
+    ) -> SourceInstanceRecord:
+        _safe_parent(self.path.parent)
         payload, _ = _read_nofollow(self.path)
         try:
             record = SourceInstanceRecord.model_validate(json.loads(payload))
@@ -533,6 +815,23 @@ class SourceInstanceStore:
         if canonical_json_bytes(record.model_dump(mode="json")) != payload:
             raise ReplicationDurabilityError("source instance record is not canonical")
         record.verify_hash()
+        record.verify_identity()
+        expected_path = _physical_path(
+            Path(record.canonical_root_path) / "_replication" / "source-instance.json"
+        )
+        if _physical_path(self.path) != expected_path:
+            raise ReplicationDurabilityError("source instance path is outside canonical layout")
+        if canonical_root_path is not None:
+            if not canonical_root_path.is_absolute():
+                raise ReplicationDurabilityError("canonical root must be an absolute local root")
+            expected_root = str(_physical_path(canonical_root_path))
+            if record.canonical_root_path != expected_root:
+                raise ReplicationDurabilityError("source instance canonical root mismatch")
+        if (
+            canonical_schema_digest is not None
+            and record.canonical_schema_digest != canonical_schema_digest
+        ):
+            raise ReplicationDurabilityError("source instance schema digest mismatch")
         return record
 
 
@@ -540,9 +839,15 @@ class ObjectInventoryEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     relative_path: str = Field(min_length=1)
-    sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    byte_count: int = Field(ge=0)
+    object_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
     row_count: int = Field(ge=0)
+    trade_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source: str = Field(min_length=1, max_length=128)
+
+    _trade_date_is_iso = field_validator("trade_date")(
+        lambda value: _validate_iso_date(value, "trade_date")
+    )
 
     @field_validator("relative_path")
     @classmethod
@@ -590,13 +895,23 @@ class SourceCheckpoint(BaseModel):
         lambda value: _validate_utc_timestamp(value, "source_published_at")
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def closed_projection(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("source checkpoint projection fields are not exact")
+        return value
+
     def hash_preimage(self) -> dict[str, object]:
         value = self.model_dump(mode="json")
+        value.pop("checkpoint_schema")
         value.pop("checkpoint_id")
         value.pop("checkpoint_payload_sha256")
         return value
 
     def verify_hashes(self) -> None:
+        if self.checkpoint_schema != "stock-eva/r2f4.3/source-checkpoint/v1":
+            raise ReplicationDurabilityError("source checkpoint schema is invalid")
         expected_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1", self.hash_preimage())
         if expected_id != self.checkpoint_id:
             raise ReplicationDurabilityError("source checkpoint identity is invalid")
@@ -630,10 +945,14 @@ def build_source_checkpoint(
         else ObjectInventoryEntry.model_validate(item)
         for item in object_inventory
     )
-    if tuple(sorted(item.relative_path for item in inventory)) != tuple(
-        item.relative_path for item in inventory
+    if tuple(sorted((item.relative_path, item.object_sha256) for item in inventory)) != tuple(
+        (item.relative_path, item.object_sha256) for item in inventory
     ) or len({item.relative_path for item in inventory}) != len(inventory):
         raise ReplicationDurabilityError("source checkpoint inventory is not sorted and unique")
+    inventory_projection = [item.model_dump(mode="json") for item in inventory]
+    expected_object_set = domain_sha256(SOURCE_OBJECT_SET_DOMAIN, inventory_projection)
+    if source_object_set_sha256 != expected_object_set:
+        raise ReplicationDurabilityError("source object set digest does not match inventory")
     values: dict[str, object] = {
         "checkpoint_schema": "stock-eva/r2f4.3/source-checkpoint/v1",
         "source_instance_id": source_instance_id,
@@ -650,12 +969,16 @@ def build_source_checkpoint(
         "manifest_canonical_sha256": manifest_canonical_sha256,
         "source_manifest_bytes_sha256": source_manifest_bytes_sha256,
         "source_object_set_sha256": source_object_set_sha256,
-        "object_inventory": tuple(item.model_dump(mode="json") for item in inventory),
+        "object_inventory": tuple(inventory_projection),
     }
-    checkpoint_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1", values)
+    checkpoint_preimage = dict(values)
+    checkpoint_preimage.pop("checkpoint_schema")
+    checkpoint_id = domain_sha256("stock-eva/r2f4.3/source-checkpoint/v1", checkpoint_preimage)
     values["checkpoint_id"] = checkpoint_id
+    payload_preimage = dict(checkpoint_preimage)
+    payload_preimage["checkpoint_id"] = checkpoint_id
     values["checkpoint_payload_sha256"] = domain_sha256(
-        "stock-eva/r2f4.3/source-checkpoint-payload/v1", values
+        "stock-eva/r2f4.3/source-checkpoint-payload/v1", payload_preimage
     )
     checkpoint = SourceCheckpoint.model_validate(values)
     checkpoint.verify_hashes()
@@ -670,7 +993,7 @@ class JournalRecord(BaseModel):
     source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     source_published_at: str = Field(min_length=20)
-    checkpoint_projection: dict[str, object]
+    checkpoint_projection: SourceCheckpoint
     publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     checkpoint_payload_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     created_at: str = Field(min_length=20)
@@ -682,6 +1005,27 @@ class JournalRecord(BaseModel):
     _created_at_is_utc = field_validator("created_at")(
         lambda value: _validate_utc_timestamp(value, "created_at")
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def closed_projection(cls, value: object) -> object:
+        if isinstance(value, Mapping) and set(value) != set(cls.model_fields):
+            raise ValueError("replication journal fields are not exact")
+        return value
+
+    @model_validator(mode="after")
+    def checkpoint_projection_is_bound(self) -> JournalRecord:
+        checkpoint = self.checkpoint_projection
+        if (
+            checkpoint.checkpoint_id != self.checkpoint_id
+            or checkpoint.source_instance_id != self.source_instance_id
+            or checkpoint.source_instance_sha256 != self.source_instance_sha256
+            or checkpoint.publication_binding_sha256 != self.publication_binding_sha256
+            or checkpoint.source_published_at != self.source_published_at
+            or checkpoint.checkpoint_payload_sha256 != self.checkpoint_payload_sha256
+        ):
+            raise ValueError("journal checkpoint projection is not bound")
+        return self
 
     def hash_preimage(self) -> dict[str, object]:
         return {
@@ -701,17 +1045,39 @@ class JournalRecord(BaseModel):
             raise ReplicationDurabilityError("replication journal hash is invalid")
 
     def install(self, root: Path) -> Path:
-        self.verify_hash()
+        # ``model_copy(update=...)`` intentionally bypasses Pydantic
+        # validators.  Re-validate the closed nested projection at the write
+        # boundary so an in-memory mutation cannot add a path, payload or
+        # other journal-only field while retaining the outer journal hash.
+        try:
+            values = self.model_dump(mode="json", warnings="error")
+        except Exception as exc:
+            raise ReplicationDurabilityError("replication journal projection is invalid") from exc
+        projection = dict(values["checkpoint_projection"])
+        projection["object_inventory"] = tuple(projection.get("object_inventory", ()))
+        values["checkpoint_projection"] = projection
+        try:
+            record = type(self).model_validate(values)
+        except (TypeError, ValueError) as exc:
+            raise ReplicationDurabilityError("replication journal projection is invalid") from exc
+        if record != self:
+            raise ReplicationDurabilityError("replication journal projection is not immutable")
+        record.checkpoint_projection.verify_hashes()
+        record.verify_hash()
         path = Path(root) / f"{self.checkpoint_id}.json"
-        _install_no_replace(path, canonical_json_bytes(self.model_dump(mode="json")))
+        _install_no_replace(path, canonical_json_bytes(record.model_dump(mode="json")))
         return path
 
     @classmethod
     def read(cls, path: Path) -> Self:
         payload, _ = _read_nofollow(Path(path))
         try:
-            record = cls.model_validate(json.loads(payload))
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            values = json.loads(payload)
+            projection = dict(values["checkpoint_projection"])
+            projection["object_inventory"] = tuple(projection.get("object_inventory", ()))
+            values["checkpoint_projection"] = projection
+            record = cls.model_validate(values)
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise ReplicationDurabilityError("replication journal is invalid") from exc
         if Path(path).name != f"{record.checkpoint_id}.json":
             raise ReplicationDurabilityError("replication journal filename is invalid")
@@ -728,20 +1094,31 @@ def build_journal_record(
     source_instance_sha256: str,
     publication_binding_sha256: str,
     source_published_at: str,
-    checkpoint_projection: Mapping[str, object],
+    checkpoint_projection: SourceCheckpoint | Mapping[str, object],
     created_at: str | None = None,
 ) -> JournalRecord:
-    projection = dict(checkpoint_projection)
-    checkpoint_payload_sha256 = domain_sha256(
-        "stock-eva/r2f4.3/source-checkpoint-payload/v1", projection
-    )
+    try:
+        checkpoint = (
+            checkpoint_projection
+            if isinstance(checkpoint_projection, SourceCheckpoint)
+            else SourceCheckpoint.model_validate(
+                {
+                    **checkpoint_projection,
+                    "object_inventory": tuple(checkpoint_projection.get("object_inventory", ())),
+                }
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ReplicationDurabilityError("journal checkpoint projection is invalid") from exc
+    checkpoint.verify_hashes()
+    checkpoint_payload_sha256 = checkpoint.checkpoint_payload_sha256
     values: dict[str, object] = {
         "journal_schema_version": JOURNAL_SCHEMA_VERSION,
         "checkpoint_id": checkpoint_id,
         "source_instance_id": source_instance_id,
         "source_instance_sha256": source_instance_sha256,
         "source_published_at": source_published_at,
-        "checkpoint_projection": projection,
+        "checkpoint_projection": checkpoint,
         "publication_binding_sha256": publication_binding_sha256,
         "checkpoint_payload_sha256": checkpoint_payload_sha256,
         "created_at": created_at or _utc_now(),
@@ -764,32 +1141,427 @@ def build_journal_record(
     return record
 
 
+def _validate_sqlite_schema(connection: sqlite3.Connection) -> None:
+    user_version = connection.execute("PRAGMA user_version").fetchone()
+    if user_version != (1,):
+        raise ReplicationStateUnavailable("replication sidecar user version is invalid")
+    actual = set(
+        connection.execute(
+            """SELECT type, name, tbl_name, sql
+                 FROM sqlite_master
+                WHERE type IN ('table', 'index', 'trigger')"""
+        ).fetchall()
+    )
+    if actual != _expected_sqlite_objects():
+        raise ReplicationStateUnavailable("replication sidecar DDL is invalid")
+
+
+def _event_hash_preimage(row: tuple[object, ...]) -> dict[str, object]:
+    keys = (
+        "event_id",
+        "intent_id",
+        "event_sequence",
+        "prev_event_sha256",
+        "event_type",
+        "from_state",
+        "to_state",
+        "attempt",
+        "reason_code",
+        "state_version",
+        "occurred_at",
+        "destination_replication_generation",
+        "destination_record_sha256",
+        "destination_head_sha256",
+    )
+    return dict(zip(keys, row, strict=True))
+
+
+def _validate_intent_rows(connection: sqlite3.Connection) -> set[str]:
+    """Validate the immutable intent projection before replaying events."""
+    columns = (
+        "intent_id",
+        "schema_version",
+        "operation_day",
+        "direction",
+        "destination_id",
+        "pointer_row_sha256",
+        "pointer_generation",
+        "source_run_id",
+        "source_trade_date",
+        "source_published_at",
+        "pointer_db_device",
+        "pointer_db_inode",
+        "pointer_db_schema_digest",
+        "manifest_canonical_sha256",
+        "source_object_set_sha256",
+        "publication_binding_sha256",
+        "source_instance_id",
+        "source_instance_sha256",
+        "source_sequence",
+        "checkpoint_id",
+        "source_manifest_bytes_sha256",
+        "plan_sha256",
+        "intent_sha256",
+        "object_count",
+        "row_count",
+        "byte_count",
+        "created_at",
+    )
+    rows = connection.execute(
+        "SELECT " + ", ".join(columns) + " FROM replication_intents ORDER BY intent_id"
+    ).fetchall()
+    intent_ids: set[str] = set()
+    for row in rows:
+        values = dict(zip(columns, row, strict=True))
+        intent_id = values["intent_id"]
+        if not isinstance(intent_id, str):
+            raise ReplicationStateUnavailable("replication intent identity is invalid")
+        _validate_sha(intent_id, "intent_id")
+        if values["schema_version"] != 1 or values["direction"] != "local_to_nas":
+            raise ReplicationStateUnavailable("replication intent schema is invalid")
+        if not isinstance(values["destination_id"], str) or len(values["destination_id"]) != 32:
+            raise ReplicationStateUnavailable("replication intent destination is invalid")
+        if not isinstance(values["pointer_generation"], str) or not (
+            1 <= len(values["pointer_generation"]) <= 128
+        ):
+            raise ReplicationStateUnavailable("replication intent pointer generation is invalid")
+        if not isinstance(values["source_run_id"], str) or not (
+            1 <= len(values["source_run_id"]) <= 128
+        ):
+            raise ReplicationStateUnavailable("replication intent run id is invalid")
+        for field in ("operation_day", "source_trade_date"):
+            try:
+                _validate_iso_date(values[field], field)
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable("replication intent date is invalid") from exc
+        for field in ("source_published_at", "created_at"):
+            try:
+                _validate_utc_timestamp(values[field], field)
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable(
+                    "replication intent timestamp is invalid"
+                ) from exc
+        for field in (
+            "pointer_row_sha256",
+            "pointer_db_schema_digest",
+            "manifest_canonical_sha256",
+            "source_object_set_sha256",
+            "publication_binding_sha256",
+            "source_instance_id",
+            "source_instance_sha256",
+            "checkpoint_id",
+            "source_manifest_bytes_sha256",
+            "plan_sha256",
+            "intent_sha256",
+        ):
+            try:
+                _validate_sha(values[field], field)
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable("replication intent digest is invalid") from exc
+        for field in (
+            "pointer_db_device",
+            "pointer_db_inode",
+            "source_sequence",
+            "object_count",
+            "row_count",
+            "byte_count",
+        ):
+            if not isinstance(values[field], int) or values[field] < (
+                1 if field in {"pointer_db_device", "pointer_db_inode", "source_sequence"} else 0
+            ):
+                raise ReplicationStateUnavailable("replication intent numeric field is invalid")
+        expected_id = domain_sha256(
+            "stock-eva/r2f4.3/replication-intent/v1",
+            {
+                "direction": values["direction"],
+                "destination_id": values["destination_id"],
+                "source_instance_id": values["source_instance_id"],
+                "source_sequence": values["source_sequence"],
+                "checkpoint_id": values["checkpoint_id"],
+                "plan_sha256": values["plan_sha256"],
+            },
+        )
+        if intent_id != expected_id:
+            raise ReplicationStateUnavailable("replication intent identity is invalid")
+        intent_preimage = {
+            field: values[field] for field in columns if field not in {"intent_sha256"}
+        }
+        expected_hash = domain_sha256("stock-eva/r2f4.3/replication-intent-row/v1", intent_preimage)
+        if values["intent_sha256"] != expected_hash:
+            raise ReplicationStateUnavailable("replication intent hash is invalid")
+        intent_ids.add(intent_id)
+    return intent_ids
+
+
+def _validate_event_reachability(connection: sqlite3.Connection) -> None:
+    intent_ids = _validate_intent_rows(connection)
+    event_rows = connection.execute(
+        """SELECT event_id, intent_id, event_sequence, prev_event_sha256, event_type,
+                  from_state, to_state, attempt, reason_code, state_version, occurred_at,
+                  destination_replication_generation, destination_record_sha256,
+                  destination_head_sha256, event_sha256
+             FROM replication_attempt_events
+            ORDER BY intent_id, event_sequence"""
+    ).fetchall()
+    head_rows = {
+        row[0]: row
+        for row in connection.execute(
+            """SELECT intent_id, current_state, state_version, last_event_sequence,
+                      lease_owner, lease_until, next_attempt_at, last_reason_code,
+                      updated_at
+                 FROM replication_heads"""
+        )
+    }
+    events_by_intent: dict[str, list[tuple[object, ...]]] = {}
+    for row in event_rows:
+        events_by_intent.setdefault(row[1], []).append(row)
+    if set(events_by_intent) != intent_ids or set(head_rows) != intent_ids:
+        raise ReplicationStateUnavailable("replication event reachability is incomplete")
+    allowed = {
+        ("pending", "copying"),
+        ("copying", "verifying"),
+        ("verifying", "replicated"),
+        ("pending", "retry_wait"),
+        ("copying", "retry_wait"),
+        ("verifying", "retry_wait"),
+        ("retry_wait", "pending"),
+        ("pending", "dead_letter"),
+        ("copying", "dead_letter"),
+        ("verifying", "dead_letter"),
+    }
+    for intent_id, rows in events_by_intent.items():
+        if not rows or [row[2] for row in rows] != list(range(len(rows))):
+            raise ReplicationStateUnavailable("replication event sequence has a gap")
+        prior_state: str | None = None
+        prior_sha = ZERO_SHA256
+        prior_version = -1
+        for index, row in enumerate(rows):
+            (
+                event_id,
+                _row_intent_id,
+                event_sequence,
+                prev_event_sha256,
+                event_type,
+                from_state,
+                to_state,
+                attempt,
+                reason_code,
+                state_version,
+                occurred_at,
+                destination_replication_generation,
+                destination_record_sha256,
+                destination_head_sha256,
+                event_sha256,
+            ) = row
+            if event_sequence != index or prev_event_sha256 != prior_sha:
+                raise ReplicationStateUnavailable("replication event hash chain is broken")
+            if not isinstance(event_id, str) or not isinstance(intent_id, str):
+                raise ReplicationStateUnavailable("replication event identity is invalid")
+            for digest, name in (
+                (event_id, "event_id"),
+                (prev_event_sha256, "prev_event_sha256"),
+                (event_sha256, "event_sha256"),
+            ):
+                try:
+                    _validate_sha(digest, name)
+                except (TypeError, ValueError) as exc:
+                    raise ReplicationStateUnavailable(
+                        "replication event digest is invalid"
+                    ) from exc
+            if reason_code not in set(get_args(ReplicationReason)):
+                raise ReplicationStateUnavailable("replication event reason is invalid")
+            try:
+                _validate_utc_timestamp(occurred_at, "occurred_at")
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable("replication event timestamp is invalid") from exc
+            expected_event_id = domain_sha256(
+                "stock-eva/r2f4.3/replication-event-id/v1",
+                {
+                    "intent_id": intent_id,
+                    "event_sequence": event_sequence,
+                    "attempt": attempt,
+                    "state_version": state_version,
+                    "occurred_at": occurred_at,
+                },
+            )
+            if event_id != expected_event_id:
+                raise ReplicationStateUnavailable("replication event id is invalid")
+            expected_event_sha = domain_sha256(
+                "stock-eva/r2f4.3/replication-event/v1",
+                _event_hash_preimage(row[:-1]),
+            )
+            if event_sha256 != expected_event_sha:
+                raise ReplicationStateUnavailable("replication event hash is invalid")
+            if event_type not in {"intent_created", "claim", "transition", "attempt", "terminal"}:
+                raise ReplicationStateUnavailable("replication event type is invalid")
+            if not isinstance(to_state, str) or not isinstance(state_version, int):
+                raise ReplicationStateUnavailable("replication event state is invalid")
+            if state_version < 0 or not isinstance(attempt, int) or not 0 <= attempt <= 6:
+                raise ReplicationStateUnavailable("replication event counters are invalid")
+            for digest, name in (
+                (destination_replication_generation, "destination_replication_generation"),
+                (destination_record_sha256, "destination_record_sha256"),
+                (destination_head_sha256, "destination_head_sha256"),
+            ):
+                if digest is not None:
+                    try:
+                        _validate_sha(digest, name)
+                    except (TypeError, ValueError) as exc:
+                        raise ReplicationStateUnavailable(
+                            "replication event destination digest is invalid"
+                        ) from exc
+            if index == 0:
+                if (
+                    event_type != "intent_created"
+                    or from_state is not None
+                    or to_state != "pending"
+                    or attempt != 0
+                    or state_version != 0
+                ):
+                    raise ReplicationStateUnavailable("replication event genesis is invalid")
+            elif (
+                from_state != prior_state
+                or (from_state, to_state) not in allowed
+                or state_version != prior_version + 1
+            ):
+                raise ReplicationStateUnavailable("replication event transition is invalid")
+            prior_state = to_state
+            prior_version = state_version
+            prior_sha = event_sha256
+        head = head_rows[intent_id]
+        if head[1] not in {
+            "pending",
+            "copying",
+            "verifying",
+            "retry_wait",
+            "replicated",
+            "dead_letter",
+        }:
+            raise ReplicationStateUnavailable("replication head state is invalid")
+        if (
+            not isinstance(head[2], int)
+            or not isinstance(head[3], int)
+            or head[2] < 0
+            or head[3] < 0
+        ):
+            raise ReplicationStateUnavailable("replication head counters are invalid")
+        if (head[1] in {"copying", "verifying"}) != (head[4] is not None and head[5] is not None):
+            raise ReplicationStateUnavailable("replication head lease is invalid")
+        for timestamp, name in (
+            (head[5], "lease_until"),
+            (head[6], "next_attempt_at"),
+            (head[8], "updated_at"),
+        ):
+            if timestamp is not None:
+                try:
+                    _validate_utc_timestamp(timestamp, name)
+                except (TypeError, ValueError) as exc:
+                    raise ReplicationStateUnavailable(
+                        "replication head timestamp is invalid"
+                    ) from exc
+        if head[7] not in set(get_args(ReplicationReason)):
+            raise ReplicationStateUnavailable("replication head reason is invalid")
+        if head[1] != prior_state or head[2] != prior_version or head[3] != len(rows) - 1:
+            raise ReplicationStateUnavailable("replication head does not replay events")
+
+
+def _open_verified_sqlite_clone(
+    path: Path,
+    *,
+    main_payload: bytes | None = None,
+    main_stat: os.stat_result | None = None,
+) -> tuple[sqlite3.Connection, tempfile.TemporaryDirectory[str]]:
+    """Open a no-follow, read-only SQLite clone without reopening the source path."""
+    path = _physical_path(path)
+    if main_payload is None:
+        main_payload, main_stat = _read_nofollow(path)
+    if main_stat is None:
+        raise ReplicationStateUnavailable("replication sidecar source descriptor is unavailable")
+    wal_path = Path(f"{path}-wal")
+    shm_path = Path(f"{path}-shm")
+    sidecars: list[tuple[str, bytes]] = []
+    for sidecar_path, suffix in ((wal_path, "-wal"), (shm_path, "-shm")):
+        optional = _read_optional_nofollow(sidecar_path, require_private_mode=False)
+        if optional is not None:
+            sidecars.append((suffix, optional[0]))
+    temporary = tempfile.TemporaryDirectory(prefix="stock-eva-replication-read-")
+    clone_root = Path(temporary.name)
+    clone_path = clone_root / "database.sqlite3"
+    try:
+        targets = [(clone_path, main_payload)] + [
+            (Path(f"{clone_path}{suffix}"), data) for suffix, data in sidecars
+        ]
+        clone_parent_fd, clone_descriptors = _open_directory_chain(clone_root)
+        try:
+            for target, payload in targets:
+                fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=clone_parent_fd,
+                )
+                try:
+                    _write_fully(fd, payload)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            _fsync_open_directory(clone_parent_fd)
+        finally:
+            _close_descriptors(clone_descriptors)
+        connection = sqlite3.connect(f"file:{clone_path}?mode=ro", uri=True)
+        current_stat = _stat_nofollow(path)
+        if (main_stat.st_dev, main_stat.st_ino, main_stat.st_size, main_stat.st_mtime_ns) != (
+            current_stat.st_dev,
+            current_stat.st_ino,
+            current_stat.st_size,
+            current_stat.st_mtime_ns,
+        ):
+            connection.close()
+            temporary.cleanup()
+            raise ReplicationStateUnavailable("replication sidecar changed during clone")
+        return connection, temporary
+    except (OSError, sqlite3.Error) as exc:
+        temporary.cleanup()
+        raise ReplicationStateUnavailable("replication sidecar clone is unavailable") from exc
+
+
 class ReplicationSidecarStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
     @staticmethod
     def _connect_writer(path: Path) -> sqlite3.Connection:
+        path = _physical_path(path)
         parent = path.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        _safe_parent(parent)
+        parent_fd, descriptors = _open_directory_chain(parent, create=True)
+        fd: int | None = None
         try:
             fd = os.open(
-                path,
+                path.name,
                 os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
                 0o600,
+                dir_fd=parent_fd,
             )
         except OSError as exc:
+            _close_descriptors(descriptors)
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
-        os.close(fd)
         try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                raise ReplicationDurabilityError("replication sidecar permissions are unsafe")
             connection = sqlite3.connect(path)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             return connection
+        except ReplicationDurabilityError:
+            raise
         except sqlite3.Error as exc:
             raise ReplicationDurabilityError("replication sidecar is not writable") from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
+            _close_descriptors(descriptors)
 
     def initialize(
         self,
@@ -800,17 +1572,16 @@ class ReplicationSidecarStore:
     ) -> None:
         _validate_sha(source_instance_id, "source_instance_id")
         _validate_sha(source_instance_sha256, "source_instance_sha256")
-        try:
-            existing_stat = os.lstat(self.path)
-        except FileNotFoundError:
-            existing_stat = None
-        if existing_stat is not None and stat.S_ISLNK(existing_stat.st_mode):
-            raise ReplicationDurabilityError("replication sidecar path is a symlink")
-        existing = existing_stat is not None and existing_stat.st_size > 0
-        if existing:
+        existing_artifact = _read_optional_nofollow(self.path)
+        if existing_artifact is not None and existing_artifact[1].st_size > 0:
             connection: sqlite3.Connection | None = None
+            temporary: tempfile.TemporaryDirectory[str] | None = None
             try:
-                connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+                connection, temporary = _open_verified_sqlite_clone(
+                    self.path,
+                    main_payload=existing_artifact[0],
+                    main_stat=existing_artifact[1],
+                )
                 meta = connection.execute(
                     """SELECT source_instance_id, source_instance_sha256
                          FROM replication_sidecar_meta"""
@@ -820,6 +1591,8 @@ class ReplicationSidecarStore:
             finally:
                 if connection is not None:
                     connection.close()
+                if temporary is not None:
+                    temporary.cleanup()
             if meta != [(source_instance_id, source_instance_sha256)]:
                 raise ReplicationDurabilityError("replication sidecar source identity conflicts")
             # Existing sidecars are never migrated by initialization.
@@ -843,6 +1616,7 @@ class ReplicationSidecarStore:
                 ),
             )
             connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error as exc:
             connection.rollback()
             raise ReplicationDurabilityError("replication sidecar initialization failed") from exc
@@ -851,20 +1625,10 @@ class ReplicationSidecarStore:
         self._fsync_database()
 
     def _fsync_database(self) -> None:
-        if not self.path.exists():
-            raise ReplicationDurabilityError("replication sidecar disappeared")
-        for candidate in (self.path, Path(f"{self.path}-wal")):
-            if not candidate.exists():
-                continue
-            try:
-                fd = os.open(candidate, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except OSError as exc:
-                raise ReplicationDurabilityError("replication sidecar fsync failed") from exc
-        _fsync_directory(self.path.parent)
+        database_path = _physical_path(self.path)
+        _fsync_nofollow(database_path)
+        _fsync_nofollow(Path(f"{database_path}-wal"), optional=True)
+        _fsync_directory(database_path.parent)
 
     def read_status(
         self,
@@ -873,44 +1637,25 @@ class ReplicationSidecarStore:
         source_instance: SourceInstanceRecord | None = None,
     ) -> ReplicationStatusResponse:
         try:
-            payload, before = _read_nofollow(self.path)
+            payload, main_stat = _read_nofollow(self.path)
         except ReplicationDurabilityError as exc:
             raise ReplicationStateUnavailable from exc
-        del payload
         connection: sqlite3.Connection | None = None
+        temporary: tempfile.TemporaryDirectory[str] | None = None
         try:
-            connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            # The SQLite Python API cannot bind a caller-owned fd.  Deserialize
+            # the already verified no-follow bytes into a private clone rather
+            # than reopening the source pathname.  This preserves WAL frames.
+            connection, temporary = _open_verified_sqlite_clone(
+                self.path,
+                main_payload=payload,
+                main_stat=main_stat,
+            )
             connection.execute("PRAGMA query_only = ON")
-            objects = {
-                (row[0], row[1])
-                for row in connection.execute(
-                    "SELECT type, name FROM sqlite_master WHERE type IN ('table','index','trigger')"
-                )
-            }
-            expected_tables = {
-                "replication_sidecar_meta",
-                "replication_intents",
-                "replication_destination_cache",
-                "replication_attempt_events",
-                "replication_heads",
-            }
-            table_names = {name for kind, name in objects if kind == "table"}
-            expected_triggers = {
-                "replication_sidecar_meta_no_update",
-                "replication_sidecar_meta_no_delete",
-                "replication_intents_no_update",
-                "replication_intents_no_delete",
-                "replication_attempt_events_no_update",
-                "replication_attempt_events_no_delete",
-                "replication_heads_no_delete",
-                "replication_heads_monotonic_cas",
-            }
-            trigger_names = {name for kind, name in objects if kind == "trigger"}
-            if table_names != expected_tables or trigger_names != expected_triggers:
-                raise ReplicationStateUnavailable("replication sidecar schema is incomplete")
+            _validate_sqlite_schema(connection)
             meta = connection.execute(
                 """SELECT schema_version, schema_identity, ddl_sha256, schema_digest,
-                          source_instance_id, source_instance_sha256
+                          source_instance_id, source_instance_sha256, created_at
                      FROM replication_sidecar_meta"""
             ).fetchall()
             if len(meta) != 1 or meta[0][:4] != (
@@ -922,6 +1667,12 @@ class ReplicationSidecarStore:
                 raise ReplicationStateUnavailable("replication sidecar identity is invalid")
             _validate_sha(meta[0][4], "source_instance_id")
             _validate_sha(meta[0][5], "source_instance_sha256")
+            try:
+                _validate_utc_timestamp(meta[0][6], "created_at")
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable(
+                    "replication sidecar timestamp is invalid"
+                ) from exc
             if source_instance is not None and (
                 meta[0][4] != source_instance.source_instance_id
                 or meta[0][5] != source_instance.source_instance_sha256
@@ -942,6 +1693,7 @@ class ReplicationSidecarStore:
             }
             if invalid:
                 raise ReplicationStateUnavailable("replication sidecar state is invalid")
+            _validate_event_reachability(connection)
             replicated = connection.execute(
                 """SELECT i.manifest_canonical_sha256, e.occurred_at
                      FROM replication_heads h
@@ -952,51 +1704,101 @@ class ReplicationSidecarStore:
                     ORDER BY e.occurred_at DESC LIMIT 1"""
             ).fetchone()
             row = connection.execute(
-                """SELECT health_state, health_observed_at
+                """SELECT destination_id, descriptor_sha256, head_sha256,
+                          replication_generation, record_sha256, source_instance_id,
+                          source_sequence, health_state, health_observed_at,
+                          cache_version, updated_at
                      FROM replication_destination_cache
                     ORDER BY updated_at DESC LIMIT 1"""
             ).fetchone()
-            after = os.stat(self.path, follow_symlinks=False)
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
-                raise ReplicationStateUnavailable("replication sidecar changed during read")
         except (sqlite3.Error, OSError) as exc:
             raise ReplicationStateUnavailable from exc
         finally:
             if connection is not None:
                 connection.close()
-        health, observed = row if row else ("unknown", None)
-        return ReplicationStatusResponse(
-            status="ready" if not counts else "degraded",
-            reason_code="NONE",
-            enabled=True,
-            source_ready=True,
-            destination_configured=False,
-            outbox_schema_version=1,
-            pending_count=int(counts.get("pending", 0)),
-            copying_count=int(counts.get("copying", 0)),
-            verifying_count=int(counts.get("verifying", 0)),
-            retry_wait_count=int(counts.get("retry_wait", 0)),
-            dead_letter_count=int(counts.get("dead_letter", 0)),
-            last_replicated_source_manifest_sha256=replicated[0] if replicated else None,
-            last_replicated_at=replicated[1] if replicated else None,
-            local_ready=local_ready,
-            destination_health=health,
-            destination_health_observed_at=observed,
-            queue_lag_seconds=None,
-            lag_seconds=None,
-            effects=ReplicationEffects(
-                writes=False,
-                canonical_writes=False,
-                destination_writes=False,
-                outbox_writes=False,
-                restore_writes=False,
-            ),
-        )
+            if temporary is not None:
+                temporary.cleanup()
+        if row is None:
+            health, observed = "unknown", None
+        else:
+            (
+                destination_id,
+                descriptor_sha256,
+                head_sha256,
+                replication_generation,
+                record_sha256,
+                cache_source_instance_id,
+                source_sequence,
+                health,
+                observed,
+                cache_version,
+                updated_at,
+            ) = row
+            if not isinstance(destination_id, str) or len(destination_id) != 32:
+                raise ReplicationStateUnavailable("replication destination identity is invalid")
+            for digest, name in (
+                (descriptor_sha256, "descriptor_sha256"),
+                (head_sha256, "head_sha256"),
+                (replication_generation, "replication_generation"),
+                (record_sha256, "record_sha256"),
+                (cache_source_instance_id, "source_instance_id"),
+            ):
+                if digest is not None:
+                    try:
+                        _validate_sha(digest, name)
+                    except (TypeError, ValueError) as exc:
+                        raise ReplicationStateUnavailable(
+                            "replication cache digest is invalid"
+                        ) from exc
+            if source_sequence is not None and (
+                not isinstance(source_sequence, int) or source_sequence < 1
+            ):
+                raise ReplicationStateUnavailable("replication cache sequence is invalid")
+            if health not in {"unknown", "healthy", "unavailable", "unsupported"}:
+                raise ReplicationStateUnavailable("replication cache state is invalid")
+            if (health == "unknown") != (observed is None):
+                raise ReplicationStateUnavailable("replication cache timestamp is invalid")
+            for timestamp, name in ((observed, "health_observed_at"), (updated_at, "updated_at")):
+                if timestamp is not None:
+                    try:
+                        _validate_utc_timestamp(timestamp, name)
+                    except (TypeError, ValueError) as exc:
+                        raise ReplicationStateUnavailable(
+                            "replication cache timestamp is invalid"
+                        ) from exc
+            if not isinstance(cache_version, int) or cache_version < 0:
+                raise ReplicationStateUnavailable("replication cache version is invalid")
+        try:
+            result = ReplicationStatusResponse(
+                status="ready" if not counts else "degraded",
+                reason_code="NONE",
+                enabled=True,
+                source_ready=True,
+                destination_configured=False,
+                outbox_schema_version=1,
+                pending_count=int(counts.get("pending", 0)),
+                copying_count=int(counts.get("copying", 0)),
+                verifying_count=int(counts.get("verifying", 0)),
+                retry_wait_count=int(counts.get("retry_wait", 0)),
+                dead_letter_count=int(counts.get("dead_letter", 0)),
+                last_replicated_source_manifest_sha256=replicated[0] if replicated else None,
+                last_replicated_at=replicated[1] if replicated else None,
+                local_ready=local_ready,
+                destination_health=health,
+                destination_health_observed_at=observed,
+                queue_lag_seconds=None,
+                lag_seconds=None,
+                effects=ReplicationEffects(
+                    writes=False,
+                    canonical_writes=False,
+                    destination_writes=False,
+                    outbox_writes=False,
+                    restore_writes=False,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReplicationStateUnavailable("replication status projection is invalid") from exc
+        return result
 
 
 class ReplicationStatusService:
@@ -1010,6 +1812,9 @@ class ReplicationStatusService:
         if self.settings.local_market_dataset_root is None:
             return _unavailable_status("SOURCE_NOT_CONFIGURED", self.local_ready)
         layout = StorageLayout(self.settings)
+        source_instance_path = layout.replication_source_instance
+        if source_instance_path is None:
+            return _unavailable_status("SOURCE_NOT_CONFIGURED", self.local_ready)
         sidecar = ReplicationSidecarStore(layout.replication_database)
         try:
             # Establish sidecar availability first.  A missing/corrupt sidecar
@@ -1021,16 +1826,18 @@ class ReplicationStatusService:
         except ReplicationDurabilityError:
             return _unavailable_status("REPLICATION_STATE_UNAVAILABLE", self.local_ready)
         try:
-            source_instance = SourceInstanceStore(layout.replication_source_instance).read()
+            source_instance = SourceInstanceStore(source_instance_path).read(
+                canonical_root_path=self.settings.local_market_dataset_root
+            )
             status = sidecar.read_status(
                 local_ready=self.local_ready,
                 source_instance=source_instance,
             )
-            return status.model_copy(
-                update={
-                    "destination_configured": self.settings.replication_destination_root is not None
-                }
+            values = status.model_dump()
+            values["destination_configured"] = (
+                self.settings.replication_destination_root is not None
             )
+            return ReplicationStatusResponse.model_validate(values)
         except ReplicationStateUnavailable:
             return _unavailable_status("REPLICATION_STATE_UNAVAILABLE", self.local_ready)
         except ReplicationDurabilityError:
@@ -1069,13 +1876,9 @@ def _disabled_status(local_ready: bool) -> ReplicationStatusResponse:
 
 def _unavailable_status(reason_code: str, local_ready: bool) -> ReplicationStatusResponse:
     result = _disabled_status(local_ready)
-    return result.model_copy(
-        update={
-            "status": "unavailable",
-            "reason_code": reason_code,
-            "enabled": True,
-        }
-    )
+    values = result.model_dump()
+    values.update(status="unavailable", reason_code=reason_code, enabled=True)
+    return ReplicationStatusResponse.model_validate(values)
 
 
 __all__ = [
@@ -1083,6 +1886,10 @@ __all__ = [
     "SIDECAR_DDL",
     "SIDECAR_DDL_SHA256",
     "SIDECAR_SCHEMA_DIGEST",
+    "DATASET_IDENTITY_DOMAIN",
+    "SOURCE_DATASET_DOMAIN",
+    "SOURCE_INSTANCE_DOMAIN",
+    "SOURCE_OBJECT_SET_DOMAIN",
     "JournalRecord",
     "ObjectInventoryEntry",
     "ReplicationDurabilityError",
