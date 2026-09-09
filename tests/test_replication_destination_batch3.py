@@ -1432,6 +1432,118 @@ def test_head_temporary_alias_is_strictly_recovered_on_restart(
     assert not any(path.name.startswith(".head.json.") for path in replication_dir.iterdir())
 
 
+def _prepare_exchange_head_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mount_inspector: _FakeMountInspector | None = None,
+):
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+        mount_inspector=mount_inspector,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor,
+        source_root=source,
+        writer_host_id=descriptor.single_writer_host_id,
+        mount_inspector=mount_inspector,
+    )
+    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    assert first.record is not None
+    first_head = (destination / "_replication" / "head.json").read_bytes()
+    replication_dir = destination / "_replication"
+    replication_identity = replication_dir.stat()
+    original_unlink = replication.os.unlink
+    injected = False
+
+    def leave_exchange_residue(name: object, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            not injected
+            and isinstance(name, str)
+            and name.startswith(".head.json.")
+            and isinstance(dir_fd, int)
+        ):
+            info = os.fstat(dir_fd)
+            if (info.st_dev, info.st_ino) == (
+                replication_identity.st_dev,
+                replication_identity.st_ino,
+            ):
+                injected = True
+                raise OSError(errno.EIO, "injected exchange residue")
+        original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(replication.os, "unlink", leave_exchange_residue)
+    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
+    assert injected
+    assert second.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    residue = [path for path in replication_dir.iterdir() if path.name.startswith(".head.json.")]
+    assert len(residue) == 1
+    assert residue[0].read_bytes() == first_head
+    monkeypatch.setattr(replication.os, "unlink", original_unlink)
+    return writer, checkpoint, destination, residue[0]
+
+
+def test_exchange_head_temporary_alias_recovers_only_with_direct_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(tmp_path, monkeypatch)
+    recovered = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
+    assert recovered.status == "already_replicated"
+    assert recovered.reason_code == "ALREADY_REPLICATED"
+    assert recovered.record is not None
+    assert not residue.exists()
+    assert (destination / "_replication" / "head.json").exists()
+
+
+def test_exchange_head_temporary_bad_predecessor_is_controlled_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(tmp_path, monkeypatch)
+    head = destination / "_replication" / "head.json"
+    current_head = head.read_bytes()
+    residue.write_bytes(b"not-a-head")
+    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.destination_writes is False
+    assert head.read_bytes() == current_head
+    assert residue.exists()
+
+
+def test_exchange_head_temporary_cleanup_boundary_drift_is_controlled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspector = _FakeMountInspector(tmp_path / "nas")
+    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(
+        tmp_path, monkeypatch, mount_inspector=inspector
+    )
+    inspector = writer.mount_inspector
+    assert isinstance(inspector, _FakeMountInspector)
+    original_probe = replication._destination_live_mount_identity
+    probe_count = 0
+
+    def drift_before_unlink(*args: object, **kwargs: object) -> None:
+        nonlocal probe_count
+        probe_count += 1
+        if probe_count == 5:
+            inspector.info = MountInfo(destination, "apfs", ("local", "ro"), "vol-a")
+        original_probe(*args, **kwargs)
+
+    monkeypatch.setattr(replication, "_destination_live_mount_identity", drift_before_unlink)
+    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
+    assert probe_count >= 3
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.destination_writes is False
+    assert residue.exists()
+
+
 def _head_recovery_case(tmp_path: Path, case: str):
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"

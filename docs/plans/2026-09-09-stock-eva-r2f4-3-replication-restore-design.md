@@ -2811,3 +2811,40 @@ The exact offline anchors are
 `tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`,
 `tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`, and
 `tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`.
+
+#### Batch3.7 head-residue predecessor proof and cleanup boundaries (normative)
+
+This amendment supersedes only the restart-residue rules in Batch3.6. It does not change the
+canonical market schema, manifest, pointer, destination record schema, or offline-only boundary.
+Every malformed, mismatched, ambiguous, symlinked, or otherwise unproven `.head.json.*` residue is
+`CONTROL_STATE_UNAVAILABLE`; it is never mapped to `DESTINATION_TRUST_FAILED`, and no residue is
+removed. When no prior operation has linearized a write, the public result has no completion proof
+and reports no new destination effect.
+
+Exactly two residue shapes are admissible. An initial hardlink residue has the exact allowlisted
+basename `.head.json.<24-lower-hex>.tmp`, regular mode `0600`, the same device and inode as the
+visible `head.json`, link count `2` on both names, and bytes exactly equal to the current canonical
+head. An exchange residue has that basename but an independent regular `0600` inode, link count
+`1` on both names, and bytes that parse as a canonical, hash-valid `DestinationHead`. It is
+recoverable only when the strict destination history reader has verified both referenced records
+and the exchange bytes are the exact direct predecessor of the visible head: both head projections
+rebuild byte-for-byte from their records and persisted descriptor; the current record/head parent
+is the predecessor record; source instance identities match; source sequence and head version each
+advance by exactly one; and both checkpoint ids match their records. Missing records, wrong
+predecessors, multiple entries, unknown names, symlinks, wrong link/device/mode/bytes, or any
+canonical/descriptor mismatch are controlled unavailable outcomes with zero cleanup mutation.
+
+Residue cleanup is descriptor-native and lock-bound. The writer freshly verifies the held lock,
+persisted descriptor and independent live mount immediately before unlink, again after unlink before
+the replication-directory fsync, and again after fsync. A boundary failure before unlink leaves the
+residue untouched; a failure after unlink preserves the visible head and reports
+`CONTROL_STATE_UNAVAILABLE`, `destination_writes=true`, and no proof. Cleanup failures retain the
+primary typed reason/effect and only add the sanitized cleanup marker. The exact offline anchors are
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_alias_recovers_only_with_direct_predecessor`,
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_bad_predecessor_is_controlled_without_writes`,
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_cleanup_boundary_drift_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`,
+`tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`, and
+`tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`.

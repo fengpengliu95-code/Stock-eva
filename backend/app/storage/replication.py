@@ -22,7 +22,7 @@ import sqlite3
 import stat
 import sys
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -6420,6 +6420,7 @@ class DestinationArchiveWriter:
         proof_state_version = claim_context.state_version if claim_context is not None else None
         head_committed = False
         destination_write_started = False
+        head_cleanup_boundary_started = False
 
         def mark_effect() -> None:
             """Record an effect monotonically, including outer cleanup failures."""
@@ -6479,27 +6480,63 @@ class DestinationArchiveWriter:
         # tampered empty archive could advance its head and only be noticed by
         # the post-commit reader.
         try:
+            # Detect residue before any nested reader re-validates the root.
+            # If that validation fails, the residue is still unproven and must
+            # be reported as a control-state failure, never as a generic trust
+            # or rebound result.
+            try:
+                head_cleanup_boundary_started = any(
+                    name.startswith(".head.json.") for name in os.listdir(replication_fd)
+                )
+            except OSError as exc:
+                raise ReplicationStateUnavailable(
+                    "destination head temporary namespace is unavailable"
+                ) from exc
             reader.read_sentinel(root_fd)
             reader._validate_history_namespace(root_fd)
             history_records = reader.list_verified_records(root_fd)
             baseline = reader.read_head(root_fd)
+
+            def cleanup_boundary() -> None:
+                """Re-prove lock, descriptor and live mount at a write edge."""
+                nonlocal head_cleanup_boundary_started
+                head_cleanup_boundary_started = True
+                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
+                check_boundary()
+
             if _destination_cleanup_head_temporary_aliases(
                 replication_fd,
                 canonical_json_bytes(baseline.model_dump(mode="json"))
                 if baseline is not None
                 else None,
+                descriptor=self.descriptor,
+                current_head=baseline,
+                history_records=history_records,
+                before_unlink=cleanup_boundary,
             ):
                 # Removing a proven post-linearization alias is itself a
                 # destination effect and must remain visible to the caller.
                 mark_effect()
-                _fsync_open_directory(replication_fd)
+                try:
+                    cleanup_boundary()
+                    _fsync_open_directory(replication_fd)
+                    cleanup_boundary()
+                except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+                    raise ReplicationStateUnavailable(
+                        "destination head temporary cleanup boundary failed"
+                    ) from exc
         except ReplicationStateUnavailable as exc:
-            reason = "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
+            if "head temporary" in str(exc) or head_cleanup_boundary_started:
+                reason = "CONTROL_STATE_UNAVAILABLE"
+            else:
+                reason = (
+                    "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
+                )
             return finish(DestinationReplicationResult("unavailable", reason))
         except ReplicationDurabilityError as exc:
             reason = (
                 "CONTROL_STATE_UNAVAILABLE"
-                if "head temporary" in str(exc)
+                if "head temporary" in str(exc) or head_cleanup_boundary_started
                 else "DESTINATION_TRUST_FAILED"
             )
             return finish(DestinationReplicationResult("unavailable", reason))
@@ -7249,6 +7286,11 @@ def _destination_replace_at(
 def _destination_cleanup_head_temporary_aliases(
     replication_fd: int,
     head_payload: bytes | None,
+    *,
+    descriptor: DestinationDescriptor,
+    current_head: DestinationHead | None,
+    history_records: Iterable[ReplicationRecord],
+    before_unlink: Callable[[], None] | None = None,
 ) -> bool:
     """Remove only a proven hard-link alias left by a completed head install.
 
@@ -7273,37 +7315,139 @@ def _destination_cleanup_head_temporary_aliases(
     try:
         head_info = os.stat("head.json", dir_fd=replication_fd, follow_symlinks=False)
     except OSError as exc:
-        raise ReplicationStateUnavailable("destination head is unavailable") from exc
+        raise ReplicationStateUnavailable(
+            "destination head temporary alias cannot prove current head"
+        ) from exc
     if not stat.S_ISREG(head_info.st_mode) or stat.S_IMODE(head_info.st_mode) != 0o600:
-        raise ReplicationStateUnavailable("destination head is unsafe")
+        raise ReplicationStateUnavailable(
+            "destination head temporary alias cannot prove current head"
+        )
     cleaned = False
-    for name in sorted(aliases):
-        if not re.fullmatch(r"\.head\.json\.[0-9a-f]{24}\.tmp", name):
-            raise ReplicationStateUnavailable("destination head temporary entry is unknown")
-        try:
-            info = os.stat(name, dir_fd=replication_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise ReplicationStateUnavailable(
-                "destination head temporary entry is unavailable"
-            ) from exc
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_dev != head_info.st_dev
-            or info.st_ino != head_info.st_ino
-            or info.st_nlink != 2
-            or head_info.st_nlink != 2
-        ):
-            raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
+    name = aliases[0]
+    if not re.fullmatch(r"\.head\.json\.[0-9a-f]{24}\.tmp", name):
+        raise ReplicationStateUnavailable("destination head temporary entry is unknown")
+    try:
+        info = os.stat(name, dir_fd=replication_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ReplicationStateUnavailable(
+            "destination head temporary entry is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_dev != head_info.st_dev
+    ):
+        raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
+    try:
         current = _destination_read_at(replication_fd, (name,))
-        if current is None or current[0] != head_payload:
-            raise ReplicationStateUnavailable("destination head temporary alias mismatches")
+    except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+        raise ReplicationStateUnavailable("destination head temporary alias proof failed") from exc
+    if current is None:
+        raise ReplicationStateUnavailable("destination head temporary alias is unavailable")
+
+    if (
+        info.st_ino == head_info.st_ino
+        and info.st_nlink == 2
+        and head_info.st_nlink == 2
+        and current[0] == head_payload
+    ):
+        # Initial no-replace head creation leaves a second hardlink to the
+        # current head.  It is safe to remove after the exact inode/bytes
+        # proof above.
+        pass
+    elif info.st_ino != head_info.st_ino and info.st_nlink == 1 and head_info.st_nlink == 1:
+        _destination_verify_head_predecessor(
+            descriptor,
+            current_head=current_head,
+            current_head_payload=head_payload,
+            predecessor_payload=current[0],
+            history_records=history_records,
+        )
+    else:
+        raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
+
+    if before_unlink is not None:
         try:
-            os.unlink(name, dir_fd=replication_fd)
-        except OSError as exc:
-            raise ReplicationDurabilityError("destination head temporary cleanup failed") from exc
-        cleaned = True
+            before_unlink()
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            raise ReplicationStateUnavailable(
+                "destination head temporary cleanup boundary failed"
+            ) from exc
+    try:
+        os.unlink(name, dir_fd=replication_fd)
+    except OSError as exc:
+        raise ReplicationDurabilityError("destination head temporary cleanup failed") from exc
+    cleaned = True
     return cleaned
+
+
+def _destination_verify_head_predecessor(
+    descriptor: DestinationDescriptor,
+    *,
+    current_head: DestinationHead | None,
+    current_head_payload: bytes | None,
+    predecessor_payload: bytes,
+    history_records: Iterable[ReplicationRecord],
+) -> None:
+    """Prove an exchange residue is exactly the direct prior head.
+
+    An atomic exchange leaves the previous head in the temporary basename as
+    an independent inode.  Its bytes are accepted only when both old and new
+    heads are canonical projections of adjacent verified records in the same
+    descriptor-bound lineage.
+    """
+    if current_head is None or current_head_payload is None:
+        raise ReplicationStateUnavailable("destination head temporary predecessor has no head")
+    try:
+        values = json.loads(predecessor_payload)
+        predecessor = DestinationHead.model_validate(values)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplicationStateUnavailable(
+            "destination head temporary predecessor is invalid"
+        ) from exc
+    if canonical_json_bytes(predecessor.model_dump(mode="json")) != predecessor_payload:
+        raise ReplicationStateUnavailable("destination head temporary predecessor is not canonical")
+    predecessor.verify_hash()
+    if predecessor.destination_id != descriptor.destination_id:
+        raise ReplicationStateUnavailable(
+            "destination head temporary predecessor identity is invalid"
+        )
+    records = tuple(history_records)
+    records_by_hash = {record.record_sha256: record for record in records}
+    current_record = records_by_hash.get(current_head.record_sha256)
+    predecessor_record = records_by_hash.get(predecessor.record_sha256)
+    if current_record is None or predecessor_record is None:
+        raise ReplicationStateUnavailable(
+            "destination head temporary predecessor record is missing"
+        )
+    expected_current = _destination_head(
+        descriptor,
+        current_record,
+        head_version=current_head.head_version,
+        updated_at=current_head.updated_at,
+    )
+    expected_predecessor = _destination_head(
+        descriptor,
+        predecessor_record,
+        head_version=predecessor.head_version,
+        updated_at=predecessor.updated_at,
+    )
+    if expected_current != current_head or expected_predecessor != predecessor:
+        raise ReplicationStateUnavailable(
+            "destination head temporary predecessor projection is invalid"
+        )
+    if (
+        current_record.parent_record_hash != predecessor_record.record_sha256
+        or current_head.parent_record_hash != predecessor_record.record_sha256
+        or current_record.source_instance_id != predecessor_record.source_instance_id
+        or current_record.source_instance_sha256 != predecessor_record.source_instance_sha256
+        or current_record.source_sequence != predecessor_record.source_sequence + 1
+        or current_head.source_sequence != predecessor.source_sequence + 1
+        or current_head.head_version != predecessor.head_version + 1
+        or current_head.checkpoint_id != current_record.checkpoint_id
+        or predecessor.checkpoint_id != predecessor_record.checkpoint_id
+    ):
+        raise ReplicationStateUnavailable("destination head temporary predecessor is not direct")
 
 
 def _complete_replication_with_proof(

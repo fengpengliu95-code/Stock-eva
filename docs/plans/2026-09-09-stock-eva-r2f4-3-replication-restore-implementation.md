@@ -2607,3 +2607,38 @@ The exact implementation anchors are
 `tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`,
 `tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`, and
 `tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`.
+
+#### Batch3.7 head-residue predecessor proof and cleanup boundaries (implementation contract)
+
+This amendment supersedes only the implementation's restart-residue handling in Batch3.6. The
+canonical market schema, manifest, pointer, destination record schema and offline-only boundary
+remain unchanged. `_replicate_locked` classifies every malformed, mismatched, ambiguous,
+symlinked, or unproven `.head.json.*` residue as `CONTROL_STATE_UNAVAILABLE`; it never falls back
+to `DESTINATION_TRUST_FAILED` and never deletes an unproven entry. If no earlier operation has
+linearized a write, the result carries `destination_writes=false` and no completion proof.
+
+The implementation accepts exactly two residue proofs. The initial hardlink proof requires the
+allowlisted `.head.json.<24-lower-hex>.tmp` name, regular `0600` files, equal device/inode,
+link count `2`, and bytes equal to the current canonical `head.json`. The exchange proof requires
+independent regular `0600` files on the same device with link count `1`; it strictly parses and
+hash-verifies the residue head, then `_destination_verify_head_predecessor` reconstructs both head
+projections from the descriptor-bound, strictly verified history records. It requires exact
+canonical bytes, destination/descriptor identity, the current record's parent to be the predecessor
+record, equal source-instance identities, source sequence and head-version increments of one, and
+checkpoint ids matching each record. Missing/wrong/ambiguous records or any other shape is a
+controlled unavailable result with no cleanup write.
+
+After either proof, the cleanup path freshly validates the held lock, persisted descriptor and live
+mount immediately before unlink, after unlink before replication-directory fsync, and after fsync.
+Pre-unlink drift leaves the residue untouched; post-unlink drift retains the visible head and
+returns `CONTROL_STATE_UNAVAILABLE`, `destination_writes=true`, `proof=None`. Cleanup failures
+preserve the primary typed result/effect and add only `replication_cleanup=failed`. The exact
+offline anchors are
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_alias_recovers_only_with_direct_predecessor`,
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_bad_predecessor_is_controlled_without_writes`,
+`tests/test_replication_destination_batch3.py::test_exchange_head_temporary_cleanup_boundary_drift_is_controlled`,
+`tests/test_replication_destination_batch3.py::test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_head_temporary_alias_is_strictly_recovered_on_restart`,
+`tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
+`tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`, and
+`tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`.
