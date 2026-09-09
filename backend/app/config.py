@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     local_staging_dir: Path = Path("var/staging")
     local_lock_dir: Path = Path("var/locks")
     local_temp_dir: Path = Path("var/tmp")
+    replication_enabled: bool = False
+    replication_drain_enabled: bool = False
+    replication_destination_root: Path | None = None
+    replication_database_name: str = "replication.sqlite3"
+    replication_journal_root_name: str = "replication-journal"
+    replication_lock_name: str = "replication.lock"
+    replication_source_instance_name: str = "source-instance.json"
+    replication_max_attempts: int = Field(default=6, ge=1, le=6)
+    replication_lease_seconds: int = Field(default=900, ge=60, le=86400)
+    replication_drain_timeout_seconds: int = Field(default=900, ge=1, le=900)
+    replication_direction: str = "local_to_nas"
     provider_evidence_root: Path = Path("var/evidence")
     provider_evidence_enabled: bool = False
     provider_evidence_max_object_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
@@ -200,6 +211,73 @@ class Settings(BaseSettings):
             raise ValueError("Daily Bar shadow calendar root must be absolute")
         return value
 
+    @field_validator("replication_database_name")
+    @classmethod
+    def validate_replication_database_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or not value.endswith(".sqlite3")
+        ):
+            raise ValueError("replication database name must be a local .sqlite3 basename")
+        return value
+
+    @field_validator("replication_journal_root_name", "replication_lock_name")
+    @classmethod
+    def validate_replication_basename(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+        ):
+            raise ValueError("replication path component must be a safe basename")
+        return value
+
+    @field_validator("replication_source_instance_name")
+    @classmethod
+    def validate_replication_source_instance_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate.is_absolute()
+            or candidate.name != value
+            or value != "source-instance.json"
+        ):
+            raise ValueError("replication source instance name is fixed")
+        return value
+
+    @field_validator("replication_destination_root")
+    @classmethod
+    def validate_replication_destination_root(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return value
+        raw = str(value)
+        if (
+            not value.is_absolute()
+            or any(token in raw for token in ("$", "${", "~"))
+            or value == Path("/")
+            or value == Path.home()
+            or Path.home() in value.parents
+        ):
+            raise ValueError(
+                "replication destination root must be an explicit approved absolute path"
+            )
+        return value
+
+    @field_validator("replication_direction")
+    @classmethod
+    def validate_replication_direction(cls, value: str) -> str:
+        if value != "local_to_nas":
+            raise ValueError("replication direction is fixed to local_to_nas")
+        return value
+
     @field_validator("provider_tickflow_token_env_name")
     @classmethod
     def validate_tickflow_token_env_name(cls, value: str) -> str:
@@ -271,6 +349,7 @@ class Settings(BaseSettings):
             self.provider_registry_database_name,
             self.daily_bar_shadow_database_name,
             self.universe_contract_database_name,
+            self.replication_database_name,
         )
         if len({name.casefold() for name in control_databases}) != len(control_databases):
             raise ValueError("local control database names must be distinct")

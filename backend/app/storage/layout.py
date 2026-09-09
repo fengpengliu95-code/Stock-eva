@@ -79,6 +79,43 @@ class StorageLayout:
         )
 
     @property
+    def replication_database(self) -> Path:
+        return self.settings.local_control_dir / self.settings.replication_database_name
+
+    @property
+    def replication_journal_root(self) -> Path:
+        return self.settings.local_control_dir / self.settings.replication_journal_root_name
+
+    @property
+    def replication_lock(self) -> Path:
+        return self.settings.local_lock_dir / self.settings.replication_lock_name
+
+    @property
+    def replication_source_instance(self) -> Path:
+        if self.settings.local_market_dataset_root is None:
+            return Path("_replication") / self.settings.replication_source_instance_name
+        return (
+            self.settings.local_market_dataset_root
+            / "_replication"
+            / self.settings.replication_source_instance_name
+        )
+
+    @property
+    def replication_source_commits(self) -> Path:
+        if self.settings.local_market_dataset_root is None:
+            return Path("_replication") / "source-commits"
+        return self.settings.local_market_dataset_root / "_replication" / "source-commits"
+
+    def ensure_replication_writer_dirs(self) -> None:
+        """Create only local replication parents for an explicit writer operation."""
+        for path in (
+            self.settings.local_control_dir,
+            self.replication_journal_root,
+            self.settings.local_lock_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+    @property
     def daily_bar_shadow_evidence_root(self) -> Path:
         return self.provider_shadow_root / "daily-evidence"
 
