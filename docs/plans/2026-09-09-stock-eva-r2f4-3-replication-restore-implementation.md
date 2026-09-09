@@ -4,7 +4,7 @@
 
 **Date:** 2026-09-09 (Asia/Shanghai)
 
-**Status:** In Review / implementation MUST NOT start before design approval
+**Status:** In Review / NO-GO pending the R2-F4.3.1 amendment; implementation MUST NOT start before design approval
 
 **Reviewers:** Stock EVA architecture, data reliability and operations reviewers
 
@@ -567,6 +567,327 @@ they must be real and passing before implementation review can close. No grouped
 | EC-22 | `tests/test_dataset_replication.py::test_restore_failure_leaves_no_final_root_or_canonical_change` |
 | EC-23 | `tests/test_nas_dataset.py::test_verified_local_mirror_is_idempotent_and_manifest_readable` |
 | EC-24 | `tests/test_dataset_replication.py::test_reverse_replication_and_mount_attempts_are_zero_write` |
+
+## R2-F4.3.1 implementation amendment — H1-H6/M1-M6 closure
+
+This section is the implementation authority for the companion design amendment. It supersedes
+any earlier weaker model, DDL, API serializer or step. It remains a plan only: this worktree must
+not perform implementation, NAS access, mount setup, provider requests or production execution.
+
+### H1 — source reader and main wiring
+
+Implement `LocalCanonicalPointerReader` against the explicit
+`settings.local_market_dataset_root` only. Never use `nas_market_dataset_root`, a generic root,
+current directory or destination fallback. The reader opens the sentinel, `manifest.json` and
+the local control pointer row with `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, fstats before/after, and
+returns `SOURCE_UNAVAILABLE`/`LOCAL_POINTER_MISMATCH` on any mutation; it never initializes or
+migrates a database.
+
+Extend the committed local publication row atomically with `run_id`, `trade_date`, `published_at`,
+`publication_sequence`, `pointer_generation`, `pointer_manifest_identity`,
+`pointer_manifest_bytes_sha256`, `pointer_object_set_sha256` and `pointer_row_sha256`. The reader
+must prove `pointer_generation == manifest.generation`, canonical manifest identity, exact manifest
+bytes hash and complete object-set digest. It returns a `CanonicalPointerSnapshot` containing the
+four pointer digests, visible generation, publication sequence, parent manifest hash and complete
+inventory. The intent contains that snapshot and can copy only the current visible generation.
+Add the reader and service as explicit dependencies in `backend/app/main.py`; construction errors
+are blocked/unavailable and never silently replaced by a NAS reader. Add the four H1 tests named in
+the design amendment before implementation:
+`tests/test_dataset_replication.py::test_local_pointer_reader_binds_row_hash_generation_manifest_and_object_set`,
+`tests/test_dataset_replication.py::test_source_pointer_mismatch_is_fail_closed`,
+`tests/test_dataset_replication.py::test_replication_copies_only_current_visible_generation`, and
+`tests/test_dataset_replication.py::test_main_wires_explicit_local_pointer_reader_without_nas_fallback`.
+
+### H2 — sidecar implementation and strict read-only reader
+
+Replace the earlier single mutable outbox table with the exact four-table sidecar below:
+immutable `replication_sidecar_meta`, immutable `replication_intents`, immutable append-only
+`replication_attempt_events`, and mutable CAS-only `replication_heads`. `schema_identity`,
+`schema_version`, `ddl_sha256` and `schema_digest` must be checked on every writer and reader.
+Each event sequence starts at zero, has a previous-event hash, and is replayed globally: every
+intent has one head, every event references an intent, sequences are contiguous, event hashes and
+head state agree. Orphan, gap, broken-chain or duplicate evidence is unavailable/fail-closed.
+
+```sql
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
+PRAGMA user_version = 1;
+
+CREATE TABLE replication_sidecar_meta (
+    sidecar_id INTEGER PRIMARY KEY NOT NULL CHECK (sidecar_id = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_identity TEXT NOT NULL CHECK (schema_identity = 'stock-eva/r2f4.3/replication-sidecar/v1'),
+    ddl_sha256 TEXT NOT NULL CHECK (length(ddl_sha256) = 64),
+    schema_digest TEXT NOT NULL CHECK (length(schema_digest) = 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE replication_intents (
+    intent_id TEXT PRIMARY KEY NOT NULL CHECK (length(intent_id) = 64),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    operation_day TEXT NOT NULL CHECK (operation_day GLOB '????-??-??'),
+    direction TEXT NOT NULL CHECK (direction = 'local_to_nas'),
+    destination_id TEXT NOT NULL CHECK (length(destination_id) = 64),
+    pointer_row_sha256 TEXT NOT NULL CHECK (length(pointer_row_sha256) = 64),
+    pointer_generation TEXT NOT NULL CHECK (length(pointer_generation) BETWEEN 1 AND 128),
+    pointer_manifest_identity TEXT NOT NULL CHECK (length(pointer_manifest_identity) = 64),
+    pointer_manifest_bytes_sha256 TEXT NOT NULL CHECK (length(pointer_manifest_bytes_sha256) = 64),
+    pointer_object_set_sha256 TEXT NOT NULL CHECK (length(pointer_object_set_sha256) = 64),
+    publication_sequence INTEGER NOT NULL CHECK (publication_sequence >= 1),
+    parent_manifest_sha256 TEXT CHECK (parent_manifest_sha256 IS NULL OR length(parent_manifest_sha256) = 64),
+    source_generation TEXT NOT NULL CHECK (length(source_generation) BETWEEN 1 AND 128),
+    source_manifest_identity TEXT NOT NULL CHECK (length(source_manifest_identity) = 64),
+    source_manifest_bytes_sha256 TEXT NOT NULL CHECK (length(source_manifest_bytes_sha256) = 64),
+    source_snapshot_sha256 TEXT NOT NULL CHECK (length(source_snapshot_sha256) = 64),
+    plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+    intent_sha256 TEXT NOT NULL CHECK (length(intent_sha256) = 64),
+    object_count INTEGER NOT NULL CHECK (object_count >= 0),
+    row_count INTEGER NOT NULL CHECK (row_count >= 0),
+    byte_count INTEGER NOT NULL CHECK (byte_count >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (direction, destination_id, pointer_manifest_identity, plan_sha256)
+) STRICT;
+
+CREATE TABLE replication_attempt_events (
+    event_id TEXT PRIMARY KEY NOT NULL CHECK (length(event_id) = 64),
+    intent_id TEXT NOT NULL REFERENCES replication_intents(intent_id),
+    event_sequence INTEGER NOT NULL CHECK (event_sequence >= 0),
+    prev_event_sha256 TEXT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('intent_created','claim','transition','attempt','terminal')),
+    from_state TEXT,
+    to_state TEXT NOT NULL CHECK (to_state IN ('pending','copying','verifying','retry_wait','replicated','dead_letter')),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0 AND attempt <= 6),
+    reason_code TEXT NOT NULL,
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    occurred_at TEXT NOT NULL,
+    event_sha256 TEXT NOT NULL CHECK (length(event_sha256) = 64),
+    UNIQUE (intent_id, event_sequence)
+) STRICT;
+
+CREATE TABLE replication_heads (
+    intent_id TEXT PRIMARY KEY NOT NULL REFERENCES replication_intents(intent_id),
+    current_state TEXT NOT NULL CHECK (current_state IN ('pending','copying','verifying','retry_wait','replicated','dead_letter')),
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    last_event_sequence INTEGER NOT NULL CHECK (last_event_sequence >= 0),
+    lease_owner TEXT,
+    lease_until TEXT,
+    next_attempt_at TEXT NOT NULL,
+    last_reason_code TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((current_state IN ('copying','verifying') AND lease_owner IS NOT NULL AND lease_until IS NOT NULL)
+        OR current_state NOT IN ('copying','verifying'))
+) STRICT;
+
+CREATE INDEX replication_heads_due_idx ON replication_heads (current_state, next_attempt_at);
+
+CREATE TRIGGER replication_sidecar_meta_no_update
+BEFORE UPDATE ON replication_sidecar_meta BEGIN
+    SELECT RAISE(ABORT, 'replication schema identity is immutable');
+END;
+CREATE TRIGGER replication_sidecar_meta_no_delete
+BEFORE DELETE ON replication_sidecar_meta BEGIN
+    SELECT RAISE(ABORT, 'replication schema identity is immutable');
+END;
+CREATE TRIGGER replication_intents_no_update
+BEFORE UPDATE ON replication_intents BEGIN
+    SELECT RAISE(ABORT, 'replication intent is immutable');
+END;
+CREATE TRIGGER replication_intents_no_delete
+BEFORE DELETE ON replication_intents BEGIN
+    SELECT RAISE(ABORT, 'replication intent is immutable');
+END;
+CREATE TRIGGER replication_attempt_events_no_update
+BEFORE UPDATE ON replication_attempt_events BEGIN
+    SELECT RAISE(ABORT, 'replication event is immutable');
+END;
+CREATE TRIGGER replication_attempt_events_no_delete
+BEFORE DELETE ON replication_attempt_events BEGIN
+    SELECT RAISE(ABORT, 'replication event is immutable');
+END;
+CREATE TRIGGER replication_heads_monotonic_cas
+BEFORE UPDATE ON replication_heads
+WHEN NEW.state_version <> OLD.state_version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'replication head requires state-version CAS');
+END;
+```
+
+Every connection sets WAL/FULL. A head update and event append are one transaction, followed by
+database/WAL and parent-directory fsync. The status reader opens the DB read-only with
+`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, verifies descriptor inode/device before and after SELECT and
+performs no initialization, migration, checkpoint, repair or cleanup. It must preserve sidecar
+bytes/inodes for all status cases. Implement and test global reachability/replay and the zero-write
+status contract before any writer test: `tests/test_dataset_replication.py::test_outbox_global_reachability_and_event_replay`
+and `tests/test_dataset_replication.py::test_status_missing_corrupt_or_locked_outbox_is_zero_write`.
+
+### H3 — destination descriptor and initialization
+
+Use the exact private filename `.stock-eva-replication-destination.json`. Canonical JSON is sorted,
+compact UTF-8 with one final newline and contains exactly `descriptor_schema`, `schema_version`,
+`dataset`, `role`, `direction`, `root_dev`, `root_ino`, `parent_dev`, `parent_ino`, `mount_point`,
+`fs_type`, `mount_generation`, `mount_fingerprint`, `sentinel_sha256`, `created_at` and
+`descriptor_sha256`. The role is `nas_archive`, direction is `local_to_nas`; descriptor hash is
+`domain_sha256('stock-eva/r2f4.3/destination-descriptor/v1', all other fields)`. The descriptor is
+private; serializers omit its path and mount point.
+
+Use descriptor-bound directory fds and `O_NOFOLLOW`; compare root/parent device+inode, mount point,
+filesystem type, mount generation/fingerprint and sentinel hash before each execute boundary.
+Changes are `DESTINATION_REBOUND`, not a retryable success. Implement the standalone command
+`market-replication-init --destination /absolute/new-child --execute --acknowledge
+CREATE_EMPTY_NAS_ARCHIVE_R2F4_3`; only that exact typed ack authorizes initialization. Plan mode,
+including an absent parent, performs zero mkdir/descriptor/sentinel/sidecar/mount work. The exact
+anchors are `tests/test_dataset_replication.py::test_destination_descriptor_canonical_json_and_hash`,
+`tests/test_dataset_replication.py::test_destination_descriptor_binds_root_parent_mount_and_sentinel`,
+`tests/test_dataset_replication.py::test_destination_remount_or_inode_change_fails_closed`, and
+`tests/test_dataset_replication.py::test_destination_init_requires_exact_typed_ack_and_is_dry_run_by_default`.
+
+### H4 — lineage and ordering
+
+Extend the local canonical pointer/manifest lineage with monotonic per-root
+`publication_sequence` and `parent_manifest_sha256`, allocated and committed with the pointer.
+Destination lineage stores sequence, parent hash, source pointer-row/manifest/object-set hashes,
+descriptor identity and plan hash. Implement the partial order: equal sequence and equal hashes is
+idempotent; a source descendant may copy; a destination ahead ancestor returns `DESTINATION_AHEAD`;
+equal-sequence hash/parent disagreement or incomparable chains returns `DESTINATION_CONFLICT`;
+final baseline drift returns `CAS_CONFLICT`. Never sort UUID generations, timestamps, mtimes or
+retry order. The exact anchors are
+`tests/test_dataset_replication.py::test_lineage_publication_sequence_parent_hash_partial_order`
+and `tests/test_dataset_replication.py::test_destination_ahead_divergent_tie_and_cas_are_fail_closed`.
+
+All implementation digests use this exact preimage (including the final newline):
+
+```python
+canonical_json_bytes(value) = (
+    json.dumps(value, ensure_ascii=False, sort_keys=True,
+               separators=(",", ":"), allow_nan=False) + "\n"
+).encode("utf-8")
+domain_sha256(domain, value) = sha256(
+    domain.encode("ascii") + b"\n" + canonical_json_bytes(value)
+).hexdigest()
+```
+
+The source object-set digest is
+`domain_sha256("stock-eva/r2f4.3/object-set/v1", sorted_object_inventory)`;
+`source_snapshot_sha256` is
+`domain_sha256("stock-eva/r2f4.3/source-snapshot/v1", {pointer_row_sha256,
+pointer_generation,pointer_manifest_identity,pointer_manifest_bytes_sha256,
+pointer_object_set_sha256,publication_sequence,parent_manifest_sha256,object_inventory})`;
+`plan_sha256` is
+`domain_sha256("stock-eva/r2f4.3/replication-plan/v1", {direction,destination_id,
+source_snapshot_sha256,object_inventory})`; and `intent_id` is
+`domain_sha256("stock-eva/r2f4.3/replication-intent/v1", {operation_day,direction,
+destination_id,pointer_manifest_identity,plan_sha256})`. `intent_sha256` hashes the complete
+immutable intent row. Descriptor and event hashes use the domains specified in the design
+amendment. Golden vectors and one-byte newline/ordering mutations are mandatory tests.
+
+### H5 — API/CLI effects
+
+Add `mode`, `execution_allowed` and `effects` to every response. `effects` has exactly
+`writes`, `canonical_writes`, `destination_writes`, `outbox_writes` and `restore_writes`; status and
+plan are all false, while execute is populated from observed writer effects. A successful replicate
+claims destination/outbox effects and never returns a plan-shaped all-false response. An idempotent
+execute may report no physical write only with `mode=execute` and proof of no write. Keep
+`provider_requests=0`, `paths_exposed=false`; the exact effects anchor is
+`tests/test_dataset_replication.py::test_execute_response_reports_effects_without_false_dry_run_claim`.
+
+The serializer contract is:
+
+```typescript
+type ReplicationMode = "status" | "plan" | "execute";
+interface Effects { writes: boolean; canonical_writes: boolean;
+  destination_writes: boolean; outbox_writes: boolean; restore_writes: boolean; }
+interface OperationProjection { mode: ReplicationMode; execution_allowed: boolean;
+  effects: Effects; provider_requests: 0; paths_exposed: false; }
+```
+
+`status` and `plan` serialize all five effect flags as false. Execute serializers receive an
+observed-effects object from the writer and cannot reuse the dry-run serializer; every physical
+write is reflected, and a no-write idempotent execute is marked `mode=execute` with proof of no
+write. `ReplicationReason` is a closed union, not `string`; unknown failures map to
+`REPLICATION_STATE_UNAVAILABLE`.
+
+### H6 — restore sequencing
+
+Restore writes a hidden opaque staging root. Before rename, perform every semantic gate: descriptor,
+sentinel, exact schema, no extra/duplicate entries, complete object size/schema/row/hash/date
+checks, counts and representative read-only queries. Fsync and atomically rename to a new root,
+then atomically finalize the typed restore pointer. Readers require that pointer and strict manifest;
+an unreferenced root is not visible. After rename perform only bounded pointer/root/inode/hash
+readback, never another semantic gate. Pointer-finalization failure leaves the root unpublished or
+quarantined. The exact anchors are
+`tests/test_dataset_replication.py::test_restore_semantics_complete_before_atomic_rename`,
+`tests/test_dataset_replication.py::test_restore_pointer_failure_leaves_root_unpublished_or_quarantined`,
+and `tests/test_dataset_replication.py::test_restore_post_rename_readback_is_nonsemantic`.
+
+### M1/M2/M3/M4 — implementation order and failure rules
+
+Use the closed `ReplicationReason` union from the design amendment, including
+`LOCAL_POINTER_MISMATCH`, `DESTINATION_REBOUND`, `DESTINATION_AHEAD` and
+`RESTORE_POINTER_UNPUBLISHED`; map unknown errors to `REPLICATION_STATE_UNAVAILABLE`. Implement
+one priority algorithm: lexical path/direction, sidecar proof, disabled/source proof, destination
+mount/trust, lineage/CAS, copy/readback, retry/dead-letter, then idempotent/ready.
+
+In `backend/app/cli.py`, dispatch replication/status/init/restore before
+`ensure_local_runtime_dirs()` or any factory; lexical validation has no I/O, strict readers are
+read-only, and only execute can create approved local sidecar parents. Explicitly inject
+`local_market_dataset_root`; NAS-only settings return `SOURCE_NOT_CONFIGURED`. Journal writes use
+`<intent_id>.json`, mode `0600`, `O_NOFOLLOW`, complete newline-terminated bytes, fsync(fd),
+same-directory atomic replace and parent fsync. Import validates no-follow fd/inode and hash,
+commits intent/event/head WAL/FULL, fsyncs, then removes the journal; failed removal is safely
+re-importable. The exact early-dispatch/source/journal anchors are
+`tests/test_dataset_replication.py::test_market_replicate_dry_run_parent_absent_creates_nothing`,
+`tests/test_dataset_replication.py::test_market_restore_dry_run_parent_absent_creates_nothing`,
+`tests/test_dataset_replication.py::test_market_replication_status_missing_sidecar_does_not_initialize`,
+`tests/test_dataset_replication.py::test_nas_only_configuration_never_becomes_replication_source`,
+and `tests/test_dataset_replication.py::test_journal_no_follow_fsync_atomic_import_and_crash_recovery`.
+
+### M5/M6 — exact settings, steps and evidence gate
+
+Implement exactly these names/defaults: `replication_enabled` /
+`STOCK_EVA_REPLICATION_ENABLED=false`; `replication_destination_root` /
+`STOCK_EVA_REPLICATION_DESTINATION_ROOT=None`; `replication_database_name` /
+`STOCK_EVA_REPLICATION_DATABASE_NAME=replication.sqlite3`; `replication_journal_root_name` /
+`STOCK_EVA_REPLICATION_JOURNAL_ROOT_NAME=replication-journal`; `replication_max_attempts` /
+`STOCK_EVA_REPLICATION_MAX_ATTEMPTS=6`; `replication_lease_seconds` /
+`STOCK_EVA_REPLICATION_LEASE_SECONDS=900`; `replication_drain_timeout_seconds` /
+`STOCK_EVA_REPLICATION_DRAIN_TIMEOUT_SECONDS=900`; and fixed
+`replication_direction=local_to_nas`. Retry delays are fixed `(60,300,1800,7200,43200)` and not
+environment-configurable. Reject root/home/share/unresolved-env/relative/overlap paths.
+
+Before Step 1, add all H1-H6/M1-M6 RED tests. Step 1 implements settings/layout and early dispatch;
+Step 2 implements pointer/source and descriptor proof; Step 3 implements the exact sidecar,
+journal, digest and replay; Step 4 implements lineage/copy/CAS/retry; Step 5 implements hidden
+restore; Step 6 wires `main.py`, API, CLI and existing automation; Step 7 updates docs/assets and
+proves default-off/TCC behavior; Step 8 runs GREEN focused/full/static/strict gates. Every NFR-1
+through NFR-15 must have the exact anchor below and pass with explicit bytes/inode, no-provider,
+15-minute-budget and hash-golden assertions. No real NAS/SMB, provider, LaunchAgent or production
+path is allowed.
+
+| ID | Exact planned evidence anchor |
+|---|---|
+| NFR-1 | `tests/test_dataset_replication.py::test_dry_run_and_status_are_zero_write_bytes_and_inodes` |
+| NFR-2 | `tests/test_dataset_replication.py::test_strict_snapshot_checks_every_manifest_object` |
+| NFR-3 | `tests/test_dataset_replication.py::test_destination_reader_sees_previous_or_complete_manifest_only` |
+| NFR-4 | `tests/test_dataset_replication.py::test_drain_budget_is_one_intent_six_attempts_and_fifteen_minutes` |
+| NFR-5 | `tests/test_dataset_replication.py::test_retry_schedule_is_exact_and_bounded` |
+| NFR-6 | `tests/test_dataset_replication.py::test_outbox_transition_is_transactional_and_state_versioned` |
+| NFR-7 | `tests/test_dataset_replication.py::test_hash_preimages_are_golden_and_newline_terminated` |
+| NFR-8 | `tests/test_dataset_replication.py::test_status_cli_api_have_no_path_or_secret` |
+| NFR-9 | `tests/test_dataset_replication.py::test_descriptor_bound_reads_reject_symlink_and_toctou` |
+| NFR-10 | `tests/test_dataset_replication.py::test_nas_failure_does_not_change_local_ready_pointer` |
+| NFR-11 | `tests/test_dataset_replication.py::test_status_is_bounded_without_parquet_hash_scan` |
+| NFR-12 | `tests/test_dataset_replication.py::test_failed_restore_has_no_reader_visible_root` |
+| NFR-13 | `tests/test_launchagent_assets.py::test_replication_defaults_off_and_no_provider_in_dry_run` |
+| NFR-14 | `tests/test_nas_dataset.py::test_canonical_manifest_and_pointer_bytes_remain_unchanged` |
+| NFR-15 | `tests/test_dataset_replication.py::test_spec_evidence_uses_no_real_nas_or_provider` |
+
+The full FR/AC/EC crosswalk above and this NFR table MUST remain byte-for-byte identical to the
+companion design crosswalk. Before implementation release, an automated checker must extract both
+tables, assert identical IDs and anchors, assert every anchor node exists, and reject weak grouped
+anchors. The final evidence records exact commands, actual HEAD and clean/diff output; no SPEC or
+production GO is claimed from this document.
 
 ## Review and release boundary
 
