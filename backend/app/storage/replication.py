@@ -385,12 +385,30 @@ def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, lis
         raise ReplicationDurabilityError("replication path ancestor is unavailable") from exc
 
 
-def _close_descriptors(descriptors: list[int]) -> None:
+def _close_fd_best_effort(fd: int, label: str, failures: list[str]) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        failures.append(label)
+
+
+def _cleanup_error(failures: list[str]) -> ReplicationDurabilityError:
+    labels = ",".join(dict.fromkeys(failures))
+    return ReplicationDurabilityError(f"replication cleanup failed: {labels}")
+
+
+def _close_connection_best_effort(connection: sqlite3.Connection, failures: list[str]) -> None:
+    try:
+        connection.close()
+    except BaseException:
+        failures.append("memory_connection")
+
+
+def _close_descriptors(descriptors: list[int], failures: list[str] | None = None) -> list[str]:
+    collected = failures if failures is not None else []
     for descriptor in reversed(descriptors):
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        _close_fd_best_effort(descriptor, "dir_fd", collected)
+    return collected
 
 
 def _read_descriptor(
@@ -566,7 +584,9 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
     parent = path.parent
     parent_fd, descriptors = _open_directory_chain(parent, create=True)
     target_fd: int | None = None
+    temporary_fd: int | None = None
     primary_error: BaseException | None = None
+    cleanup_failures: list[str] = []
     temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
         try:
@@ -583,7 +603,7 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
             try:
                 existing, _ = _read_descriptor(target_fd)
             finally:
-                os.close(target_fd)
+                _close_fd_best_effort(target_fd, "target_fd", cleanup_failures)
                 target_fd = None
             if existing == payload:
                 return path
@@ -591,17 +611,18 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
                 "replication durability conflict: artifact already exists"
             )
 
-        fd = os.open(
+        temporary_fd = os.open(
             temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
             dir_fd=parent_fd,
         )
         try:
-            _write_fully(fd, payload)
-            os.fsync(fd)
+            _write_fully(temporary_fd, payload)
+            os.fsync(temporary_fd)
         finally:
-            os.close(fd)
+            _close_fd_best_effort(temporary_fd, "temporary_fd", cleanup_failures)
+            temporary_fd = None
         try:
             os.link(
                 temporary_name,
@@ -619,7 +640,7 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
             try:
                 existing, _ = _read_descriptor(target_fd)
             finally:
-                os.close(target_fd)
+                _close_fd_best_effort(target_fd, "target_fd", cleanup_failures)
                 target_fd = None
             if existing != payload:
                 raise ReplicationDurabilityError(
@@ -634,24 +655,25 @@ def _install_no_replace(path: Path, payload: bytes) -> Path:
         primary_error = exc
         raise
     finally:
-        cleanup_error: OSError | None = None
+        if temporary_fd is not None:
+            _close_fd_best_effort(temporary_fd, "temporary_fd", cleanup_failures)
         try:
             os.unlink(temporary_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
-        except OSError as exc:
-            cleanup_error = exc
+        except OSError:
+            cleanup_failures.append("temporary_unlink")
         if target_fd is not None:
-            try:
-                os.close(target_fd)
-            except OSError:
-                pass
-        _close_descriptors(descriptors)
-        if cleanup_error is not None:
-            error = ReplicationDurabilityError("replication temporary cleanup failed")
+            _close_fd_best_effort(target_fd, "target_fd", cleanup_failures)
+        descriptor_failures = _close_descriptors(descriptors)
+        if descriptor_failures:
+            cleanup_failures.extend(descriptor_failures)
+        if cleanup_failures:
+            error = _cleanup_error(cleanup_failures)
             if primary_error is not None:
-                raise error from primary_error
-            raise error from cleanup_error
+                primary_error.add_note("replication_cleanup=failed")
+            else:
+                raise error
 
 
 class ReplicationEffects(BaseModel):
@@ -1713,16 +1735,32 @@ class _WriterSession:
     fingerprint: _SqliteFingerprint | None
     lock_fd: int | None = None
     lock_token: _WriterLockToken | None = None
+    auxiliary_fingerprints: tuple[_SqliteFingerprint | None, _SqliteFingerprint | None] = (
+        None,
+        None,
+    )
 
 
 class _WriterLockToken:
     """Opaque proof that a sidecar writer owns its descriptor-bound lock."""
 
-    __slots__ = ("lock_dev", "lock_ino", "released")
+    __slots__ = (
+        "lock_dev",
+        "lock_ino",
+        "lock_nlink",
+        "lock_mode",
+        "parent_dev",
+        "parent_ino",
+        "released",
+    )
 
-    def __init__(self, info: os.stat_result) -> None:
+    def __init__(self, info: os.stat_result, parent_info: os.stat_result) -> None:
         self.lock_dev = info.st_dev
         self.lock_ino = info.st_ino
+        self.lock_nlink = info.st_nlink
+        self.lock_mode = stat.S_IMODE(info.st_mode)
+        self.parent_dev = parent_info.st_dev
+        self.parent_ino = parent_info.st_ino
         self.released = False
 
 
@@ -1746,7 +1784,9 @@ def _acquire_writer_lock(parent_fd: int, lock_name: str) -> tuple[int, _WriterLo
         after = os.fstat(lock_fd)
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             raise ReplicationDurabilityError("replication writer lock changed during acquire")
-        return lock_fd, _WriterLockToken(after)
+        token = _WriterLockToken(after, os.fstat(parent_fd))
+        _verify_writer_lock_entry(parent_fd, lock_name, lock_fd, token)
+        return lock_fd, token
     except ReplicationDurabilityError:
         if lock_fd is not None:
             try:
@@ -1771,18 +1811,75 @@ def _acquire_writer_lock(parent_fd: int, lock_name: str) -> tuple[int, _WriterLo
         raise ReplicationDurabilityError("replication writer lock is unavailable") from exc
 
 
-def _release_writer_lock(lock_fd: int, token: _WriterLockToken) -> None:
+def _release_writer_lock(
+    lock_fd: int, token: _WriterLockToken, failures: list[str] | None = None
+) -> list[str]:
+    collected = failures if failures is not None else []
     if token.released:
-        return
+        return collected
     token.released = True
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
     except OSError:
-        pass
+        collected.append("lock_unlock")
     try:
         os.close(lock_fd)
     except OSError:
-        pass
+        collected.append("lock_fd")
+    return collected
+
+
+def _verify_writer_lock_entry(
+    parent_fd: int,
+    lock_name: str,
+    lock_fd: int,
+    token: _WriterLockToken,
+) -> None:
+    """Prove the fixed lock basename still names the held inode."""
+    entry_fd: int | None = None
+    try:
+        parent_info = os.fstat(parent_fd)
+        if (parent_info.st_dev, parent_info.st_ino) != (token.parent_dev, token.parent_ino):
+            raise ReplicationDurabilityError("replication writer parent descriptor changed")
+        held_info = os.fstat(lock_fd)
+        held_identity = (
+            held_info.st_dev,
+            held_info.st_ino,
+            held_info.st_nlink,
+            stat.S_IMODE(held_info.st_mode),
+        )
+        token_identity = (
+            token.lock_dev,
+            token.lock_ino,
+            token.lock_nlink,
+            token.lock_mode,
+        )
+        if held_identity != token_identity:
+            raise ReplicationDurabilityError("replication writer lock identity changed")
+        entry_fd = os.open(
+            lock_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        entry_info = os.fstat(entry_fd)
+        entry_identity = (
+            entry_info.st_dev,
+            entry_info.st_ino,
+            entry_info.st_nlink,
+            stat.S_IMODE(entry_info.st_mode),
+        )
+        if entry_identity != token_identity:
+            raise ReplicationDurabilityError("replication writer lock entry changed")
+    except ReplicationDurabilityError:
+        raise
+    except OSError as exc:
+        raise ReplicationDurabilityError("replication writer lock entry is unavailable") from exc
+    finally:
+        if entry_fd is not None:
+            try:
+                os.close(entry_fd)
+            except OSError:
+                pass
 
 
 def _require_writer_lock(session: _WriterSession) -> None:
@@ -1794,8 +1891,27 @@ def _require_writer_lock(session: _WriterSession) -> None:
         raise ReplicationDurabilityError("replication writer lock token is released")
     try:
         info = os.fstat(session.lock_fd)
-        if (info.st_dev, info.st_ino) != (token.lock_dev, token.lock_ino):
+        parent_info = os.fstat(session.parent_fd)
+        if (parent_info.st_dev, parent_info.st_ino) != (token.parent_dev, token.parent_ino):
+            raise ReplicationDurabilityError("replication writer parent descriptor changed")
+        if (
+            info.st_dev,
+            info.st_ino,
+            info.st_nlink,
+            stat.S_IMODE(info.st_mode),
+        ) != (
+            token.lock_dev,
+            token.lock_ino,
+            token.lock_nlink,
+            token.lock_mode,
+        ):
             raise ReplicationDurabilityError("replication writer lock identity changed")
+        _verify_writer_lock_entry(
+            session.parent_fd,
+            f"{session.path.name}{_WRITER_LOCK_SUFFIX}",
+            session.lock_fd,
+            token,
+        )
         # LOCK_NB is only a proof check: this descriptor already owns the
         # exclusive lock, and the call never releases or replaces it.
         fcntl.flock(session.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1814,6 +1930,13 @@ def _open_writer_session(path: Path) -> _WriterSession:
     lock_token: _WriterLockToken | None = None
     try:
         lock_fd, lock_token = _acquire_writer_lock(parent_fd, f"{path.name}{_WRITER_LOCK_SUFFIX}")
+        _verify_writer_lock_entry(
+            parent_fd,
+            f"{path.name}{_WRITER_LOCK_SUFFIX}",
+            lock_fd,
+            lock_token,
+        )
+        auxiliary_fingerprints: list[_SqliteFingerprint | None] = []
         for suffix in ("-wal", "-shm"):
             try:
                 auxiliary_stat = _stat_optional_at(parent_fd, f"{path.name}{suffix}")
@@ -1825,6 +1948,7 @@ def _open_writer_session(path: Path) -> _WriterSession:
                 raise ReplicationStateUnavailable(
                     f"replication sidecar {suffix[1:].upper()} is present"
                 )
+            auxiliary_fingerprints.append(_stat_fingerprint(auxiliary_stat))
         try:
             target_fd = os.open(
                 path.name,
@@ -1835,10 +1959,25 @@ def _open_writer_session(path: Path) -> _WriterSession:
             if lock_token is None or lock_fd is None:
                 raise ReplicationDurabilityError("replication writer lock is unavailable") from None
             return _WriterSession(
-                path, parent_fd, descriptors, None, None, None, None, lock_fd, lock_token
+                path,
+                parent_fd,
+                descriptors,
+                None,
+                None,
+                None,
+                None,
+                lock_fd,
+                lock_token,
+                tuple(auxiliary_fingerprints),
             )
         payload, info = _read_descriptor(target_fd)
         fingerprint = _stat_fingerprint(info, payload)
+        _verify_writer_lock_entry(
+            parent_fd,
+            f"{path.name}{_WRITER_LOCK_SUFFIX}",
+            lock_fd,
+            lock_token,
+        )
         if lock_token is None or lock_fd is None:
             raise ReplicationDurabilityError("replication writer lock is unavailable")
         return _WriterSession(
@@ -1851,6 +1990,7 @@ def _open_writer_session(path: Path) -> _WriterSession:
             fingerprint,
             lock_fd,
             lock_token,
+            tuple(auxiliary_fingerprints),
         )
     except BaseException:
         if target_fd is not None:
@@ -1865,14 +2005,16 @@ def _open_writer_session(path: Path) -> _WriterSession:
 
 
 def _close_writer_session(session: _WriterSession) -> None:
+    failures: list[str] = []
     if session.target_fd is not None:
-        try:
-            os.close(session.target_fd)
-        except OSError:
-            pass
+        _close_fd_best_effort(session.target_fd, "target_fd", failures)
     if session.lock_fd is not None and session.lock_token is not None:
-        _release_writer_lock(session.lock_fd, session.lock_token)
-    _close_descriptors(session.descriptors)
+        _release_writer_lock(session.lock_fd, session.lock_token, failures)
+    descriptor_failures = _close_descriptors(session.descriptors)
+    if descriptor_failures:
+        failures.extend(descriptor_failures)
+    if failures:
+        raise _cleanup_error(failures)
 
 
 def _read_writer_target(session: _WriterSession) -> tuple[bytes, os.stat_result]:
@@ -1894,9 +2036,29 @@ def _read_writer_target(session: _WriterSession) -> tuple[bytes, os.stat_result]
             os.close(fd)
 
 
+def _assert_writer_auxiliary_stable(session: _WriterSession, *, phase: str) -> None:
+    """Require WAL/SHM to remain absent for the whole writer operation."""
+    _require_writer_lock(session)
+    for suffix, prior_fingerprint in zip(
+        ("-wal", "-shm"), session.auxiliary_fingerprints, strict=True
+    ):
+        try:
+            current_stat = _stat_optional_at(session.parent_fd, f"{session.path.name}{suffix}")
+        except ReplicationDurabilityError as exc:
+            raise ReplicationStateUnavailable(
+                f"replication sidecar auxiliary state is unavailable during {phase}"
+            ) from exc
+        current_fingerprint = _stat_fingerprint(current_stat)
+        if current_fingerprint != prior_fingerprint:
+            raise ReplicationStateUnavailable(
+                f"replication sidecar auxiliary state changed during {phase}"
+            )
+
+
 def _assert_writer_session_stable(session: _WriterSession) -> None:
     """CAS-check both the held inode and the fixed directory entry."""
     _require_writer_lock(session)
+    _assert_writer_auxiliary_stable(session, phase="pre-install")
     if session.fingerprint is None:
         try:
             _read_writer_target(session)
@@ -1924,6 +2086,7 @@ def _assert_writer_session_stable(session: _WriterSession) -> None:
 def _install_memory_snapshot(session: _WriterSession, payload: bytes) -> None:
     """Persist a private image using the held parent dirfd and a CAS."""
     _require_writer_lock(session)
+    _assert_writer_session_stable(session)
     temporary_name = f".{session.path.name}.{uuid.uuid4().hex}.tmp"
     temporary_fd: int | None = None
     primary_error: BaseException | None = None
@@ -1963,31 +2126,43 @@ def _install_memory_snapshot(session: _WriterSession, payload: bytes) -> None:
             )
         else:
             raise ReplicationDurabilityError("replication sidecar is already initialized")
-        final_payload, _ = _read_writer_target(session)
+        # The atomic install is the visibility point.  Re-prove lock
+        # authority and auxiliary absence before reading the new target; if a
+        # WAL/SHM appeared now, the new image remains visible but the
+        # operation is degraded and must not overwrite it.
+        _require_writer_lock(session)
+        _assert_writer_auxiliary_stable(session, phase="post-install")
+        final_payload, final_stat = _read_writer_target(session)
         if final_payload != payload:
             raise ReplicationDurabilityError("replication sidecar install readback mismatch")
+        installed_fingerprint = _stat_fingerprint(final_stat, final_payload)
+        _require_writer_lock(session)
+        _assert_writer_auxiliary_stable(session, phase="final-readback")
         _fsync_open_directory(session.parent_fd)
+        _require_writer_lock(session)
+        _assert_writer_auxiliary_stable(session, phase="post-fsync")
+        persisted_payload, persisted_stat = _read_writer_target(session)
+        if _stat_fingerprint(persisted_stat, persisted_payload) != installed_fingerprint:
+            raise ReplicationStateUnavailable("replication sidecar changed after parent fsync")
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
+        cleanup_failures: list[str] = []
         if temporary_fd is not None:
-            try:
-                os.close(temporary_fd)
-            except OSError:
-                pass
-        cleanup_error: OSError | None = None
+            _close_fd_best_effort(temporary_fd, "temporary_fd", cleanup_failures)
         try:
             os.unlink(temporary_name, dir_fd=session.parent_fd)
         except FileNotFoundError:
             pass
-        except OSError as exc:
-            cleanup_error = exc
-        if cleanup_error is not None:
-            error = ReplicationDurabilityError("replication temporary cleanup failed")
+        except OSError:
+            cleanup_failures.append("temporary_unlink")
+        if cleanup_failures:
+            error = _cleanup_error(cleanup_failures)
             if primary_error is not None:
-                raise error from primary_error
-            raise error from cleanup_error
+                primary_error.add_note("replication_cleanup=failed")
+            else:
+                raise error
 
 
 class ReplicationSidecarStore:
@@ -1999,6 +2174,8 @@ class ReplicationSidecarStore:
         """Compatibility probe returning an unpersisted descriptor-native image."""
         session = _open_writer_session(path)
         connection: sqlite3.Connection | None = None
+        connection_closed = False
+        primary_error: BaseException | None = None
         try:
             connection = (
                 _deserialize_sqlite_bytes(session.payload)
@@ -2007,24 +2184,56 @@ class ReplicationSidecarStore:
             )
             _assert_writer_session_stable(session)
             return connection
-        except ReplicationStateUnavailable:
+        except ReplicationStateUnavailable as exc:
+            primary_error = exc
             if connection is not None:
-                connection.close()
+                failures: list[str] = []
+                _close_connection_best_effort(connection, failures)
+                connection_closed = True
+                if failures:
+                    primary_error.add_note("replication_cleanup=failed")
             raise
-        except ReplicationDurabilityError:
+        except ReplicationDurabilityError as exc:
+            primary_error = exc
             if connection is not None:
-                connection.close()
+                failures = []
+                _close_connection_best_effort(connection, failures)
+                connection_closed = True
+                if failures:
+                    primary_error.add_note("replication_cleanup=failed")
             raise
         except (OSError, sqlite3.Error) as exc:
+            primary_error = ReplicationDurabilityError("replication sidecar is not writable")
             if connection is not None:
-                connection.close()
-            raise ReplicationDurabilityError("replication sidecar is not writable") from exc
-        except BaseException:
+                failures = []
+                _close_connection_best_effort(connection, failures)
+                connection_closed = True
+                if failures:
+                    primary_error.add_note("replication_cleanup=failed")
+            raise primary_error from exc
+        except BaseException as exc:
+            primary_error = exc
             if connection is not None:
-                connection.close()
+                failures = []
+                _close_connection_best_effort(connection, failures)
+                connection_closed = True
+                if failures:
+                    primary_error.add_note("replication_cleanup=failed")
             raise
         finally:
-            _close_writer_session(session)
+            cleanup_failures: list[str] = []
+            try:
+                _close_writer_session(session)
+            except ReplicationDurabilityError:
+                cleanup_failures.append("writer_session")
+            if cleanup_failures:
+                if connection is not None and not connection_closed:
+                    _close_connection_best_effort(connection, cleanup_failures)
+                    connection_closed = True
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
 
     def initialize(
         self,
@@ -2037,6 +2246,7 @@ class ReplicationSidecarStore:
         _validate_sha(source_instance_sha256, "source_instance_sha256")
         session = _open_writer_session(self.path)
         connection: sqlite3.Connection | None = None
+        primary_error: BaseException | None = None
         try:
             if session.payload:
                 connection = _deserialize_sqlite_bytes(session.payload)
@@ -2072,16 +2282,30 @@ class ReplicationSidecarStore:
             connection.commit()
             payload = connection.serialize(name="main")
             _install_memory_snapshot(session, payload)
-        except ReplicationDurabilityError:
+        except ReplicationDurabilityError as exc:
+            primary_error = exc
             raise
         except (OSError, sqlite3.Error) as exc:
+            primary_error = ReplicationDurabilityError("replication sidecar initialization failed")
             if connection is not None:
                 connection.rollback()
-            raise ReplicationDurabilityError("replication sidecar initialization failed") from exc
+            raise primary_error from exc
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
+            cleanup_failures: list[str] = []
             if connection is not None:
-                connection.close()
-            _close_writer_session(session)
+                _close_connection_best_effort(connection, cleanup_failures)
+            try:
+                _close_writer_session(session)
+            except ReplicationDurabilityError:
+                cleanup_failures.append("writer_session")
+            if cleanup_failures:
+                if primary_error is not None:
+                    primary_error.add_note("replication_cleanup=failed")
+                else:
+                    raise _cleanup_error(cleanup_failures)
 
     def _fsync_database(self) -> None:
         database_path = _physical_path(self.path)

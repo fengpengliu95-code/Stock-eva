@@ -1169,6 +1169,39 @@ fingerprint proof and rejects any WAL/SHM appearance. Required anchors are
 `test_connect_writer_closes_memory_connection_on_durability_error`, in addition to the Batch1.3
 anchors above.
 
+#### Batch1.5 lock-authority and auxiliary-state amendment (normative)
+
+The sidecar writer token MUST retain the trusted parent dirfd identity and the baseline lock-entry
+identity `(st_dev, st_ino, st_nlink, mode)`. At baseline capture, immediately before installation,
+immediately after the atomic install and before final readback, and after final parent-directory
+fsync, the writer MUST use that dirfd plus `O_NOFOLLOW` to reopen the fixed lock basename and prove
+that it still names the held descriptor with the same device, inode, link count and mode; the held
+lock fd and parent fd identities MUST also still match. Any replacement, symlink, link-count/mode
+change or ABA authority change is a typed fail-closed error. No sidecar main-file write may occur
+after a pre-install authority failure. This verification protects the baseline CAS even if an
+uncooperating process installs a new lock basename.
+
+The writer session MUST retain the main absent/present payload and complete fingerprint plus
+explicit `WAL=ABSENT` and `SHM=ABSENT` baseline states. It MUST re-prove those auxiliary states
+before installation, after installation and before final readback, and after parent fsync. Any
+pre-install appearance or change is `CONTROL_STATE_UNAVAILABLE` with zero main publication. An
+appearance after atomic install is a degraded durable result: the installed bytes are preserved,
+the operation fails closed for subsequent use, and no overwrite or rollback attempt is allowed.
+Status remains zero-write and writer-lock-free, but performs the same complete main and auxiliary
+before/after proof.
+
+All cleanup is a best-effort accumulator. Temporary unlink, temporary-fd close, target-fd close,
+each trusted directory-fd close, lock unlock and lock-fd close MUST each be attempted independently.
+Without a primary operation error, any cleanup failure raises a sanitized typed
+`ReplicationDurabilityError`; with a primary error, the primary is preserved and receives only a
+sanitized cleanup note (never a path or raw OS exception). The implementation MUST NOT claim that
+an OS-level close succeeded when it failed. Required anchors are
+`test_sidecar_writer_lock_entry_replacement_is_fail_closed`,
+`test_sidecar_auxiliary_appearance_before_install_is_zero_write`,
+`test_sidecar_auxiliary_appearance_after_install_is_degraded_and_not_overwritten`,
+`test_sidecar_writer_cleanup_reports_unlock_and_fd_failures_after_attempts`, and
+`test_sidecar_concurrent_initializers_have_one_multiprocess_winner`.
+
 The event closed field set is exactly `(event_id,intent_id,event_sequence,prev_event_sha256,
 event_type,from_state,to_state,attempt,reason_code,state_version,occurred_at,
 destination_replication_generation,destination_record_sha256,destination_head_sha256,event_sha256)`;

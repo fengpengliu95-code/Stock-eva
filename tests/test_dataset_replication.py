@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import sqlite3
 import threading
@@ -82,6 +83,18 @@ def _checkpoint_for_journal(
         checkpoint_projection=checkpoint,
         created_at=created_at,
     )
+
+
+def _initialize_sidecar_process(path: str, source_instance_id: str, queue: object) -> None:
+    try:
+        ReplicationSidecarStore(Path(path)).initialize(
+            source_instance_id=source_instance_id,
+            source_instance_sha256="b" * 64,
+        )
+    except ReplicationDurabilityError:
+        queue.put("error")  # type: ignore[attr-defined]
+    else:
+        queue.put("success")  # type: ignore[attr-defined]
 
 
 def test_replication_defaults_off_and_layout_is_local(tmp_path: Path) -> None:
@@ -805,6 +818,121 @@ def test_sidecar_cas_helper_requires_writer_lock_token(tmp_path: Path) -> None:
     )
     with pytest.raises(ReplicationDurabilityError, match="lock token"):
         replication._install_memory_snapshot(session, b"not-a-database")
+
+
+def test_sidecar_writer_lock_entry_replacement_is_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    session = replication._open_writer_session(path)
+    lock_path = path.with_name(f"{path.name}.lock")
+    replacement = path.with_name("replacement.lock")
+    replacement.write_bytes(b"replacement")
+    replacement.chmod(0o600)
+    os.replace(lock_path, path.with_name("old.lock"))
+    os.replace(replacement, lock_path)
+    try:
+        with pytest.raises(ReplicationDurabilityError, match="lock"):
+            replication._install_memory_snapshot(session, b"not-a-database")
+        assert not path.exists()
+    finally:
+        replication._close_writer_session(session)
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_sidecar_auxiliary_appearance_before_install_is_zero_write(
+    tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    path.parent.mkdir(parents=True)
+    path.touch(mode=0o600)
+    session = replication._open_writer_session(path)
+    before = path.read_bytes()
+    auxiliary = path.with_name(path.name + suffix)
+    auxiliary.write_bytes(b"appeared")
+    auxiliary.chmod(0o600)
+    try:
+        with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|auxiliary"):
+            replication._install_memory_snapshot(session, b"not-a-database")
+        assert path.read_bytes() == before
+    finally:
+        replication._close_writer_session(session)
+
+
+def test_sidecar_auxiliary_appearance_after_install_is_degraded_and_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    session = replication._open_writer_session(path)
+    calls = 0
+    real_read_target = replication._read_writer_target
+    payload = b"SQLite format 3\x00" + b"\x00" * 100
+
+    def install_then_appear(current: replication._WriterSession):
+        nonlocal calls
+        calls += 1
+        result = real_read_target(current)
+        if calls == 3:
+            auxiliary = path.with_name(path.name + "-wal")
+            auxiliary.write_bytes(b"appeared-after-install")
+            auxiliary.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(replication, "_read_writer_target", install_then_appear)
+    try:
+        with pytest.raises(ReplicationStateUnavailable, match="WAL|SHM|auxiliary"):
+            replication._install_memory_snapshot(session, payload)
+        assert path.read_bytes() == payload
+    finally:
+        replication._close_writer_session(session)
+
+
+def test_sidecar_writer_cleanup_reports_unlock_and_fd_failures_after_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    session = replication._open_writer_session(path)
+    real_close = replication.os.close
+    real_flock = replication.fcntl.flock
+    close_calls: list[int] = []
+
+    def fail_selected_close(fd: int) -> None:
+        close_calls.append(fd)
+        if fd in {session.target_fd, session.lock_fd}:
+            raise OSError("injected close failure")
+        real_close(fd)
+
+    def fail_unlock(fd: int, operation: int) -> object:
+        if operation == replication.fcntl.LOCK_UN:
+            raise OSError("injected unlock failure")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(replication.os, "close", fail_selected_close)
+    monkeypatch.setattr(replication.fcntl, "flock", fail_unlock)
+    with pytest.raises(ReplicationDurabilityError, match="cleanup"):
+        replication._close_writer_session(session)
+    assert len(close_calls) >= 2
+
+
+def test_sidecar_concurrent_initializers_have_one_multiprocess_winner(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication.sqlite3"
+    path.parent.mkdir(parents=True)
+    path.touch(mode=0o600)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_initialize_sidecar_process,
+            args=(str(path), source_instance_id, queue),
+        )
+        for source_instance_id in ("a" * 64, "c" * 64)
+    ]
+    for process in processes:
+        process.start()
+    outcomes = [queue.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert outcomes.count("success") == 1
+    assert outcomes.count("error") == 1
 
 
 def test_repeated_initialize_reads_held_descriptor_from_offset_zero(tmp_path: Path) -> None:
