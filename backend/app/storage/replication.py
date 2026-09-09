@@ -21,7 +21,7 @@ import stat
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Self, get_args
 
@@ -60,6 +60,24 @@ SIDECAR_GENERATION_WIDTH = 20
 SIDECAR_GENERATION_SUFFIX = ".db"
 
 ReplicationState = Literal["disabled", "ready", "degraded", "unavailable"]
+# These are the private, durable queue states.  They intentionally remain
+# separate from the public status projection above.
+OutboxState = Literal["pending", "copying", "verifying", "retry_wait", "replicated", "dead_letter"]
+RETRY_DELAYS_SECONDS: tuple[int, ...] = (60, 300, 1800, 7200, 43200)
+MAX_REPLICATION_ATTEMPTS = 6
+REPLICATION_LEASE_SECONDS = 900
+_OUTBOX_STATES = frozenset(
+    {"pending", "copying", "verifying", "retry_wait", "replicated", "dead_letter"}
+)
+_RETRYABLE_REASONS = frozenset(
+    {
+        "DESTINATION_UNAVAILABLE",
+        "DESTINATION_MOUNT_UNAVAILABLE",
+        "COPY_FAILED",
+        "VERIFY_FAILED",
+        "RETRY_WAIT",
+    }
+)
 ReplicationReason = Literal[
     "NONE",
     "DISABLED",
@@ -815,6 +833,139 @@ class ReplicationStatusResponse(BaseModel):
         return self
 
 
+class ReplicationIntent(BaseModel):
+    """Closed read model for one immutable local outbox intent."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    intent_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    schema_version: Literal[1] = 1
+    operation_day: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    direction: Literal["local_to_nas"] = "local_to_nas"
+    destination_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    pointer_row_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    pointer_generation: str = Field(min_length=1, max_length=128)
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_trade_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_published_at: str = Field(min_length=20)
+    pointer_db_device: int = Field(gt=0)
+    pointer_db_inode: int = Field(gt=0)
+    pointer_db_schema_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    manifest_canonical_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int = Field(ge=1)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_manifest_bytes_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    plan_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    intent_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    object_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
+    byte_count: int = Field(ge=0)
+    created_at: str = Field(min_length=20)
+
+    _operation_day_is_iso = field_validator("operation_day")(
+        lambda value: _validate_iso_date(value, "operation_day")
+    )
+    _source_trade_date_is_iso = field_validator("source_trade_date")(
+        lambda value: _validate_iso_date(value, "source_trade_date")
+    )
+    _timestamps_are_utc = field_validator("source_published_at", "created_at")(
+        lambda value, info: _validate_utc_timestamp(value, info.field_name)
+    )
+
+
+class ReplicationClaim(BaseModel):
+    """The lease proof returned by a successful state-version CAS claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    intent_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    worker_id: str = Field(min_length=1, max_length=128)
+    current_state: Literal["copying"] = "copying"
+    state_version: int = Field(ge=1)
+    attempt: int = Field(ge=1, le=MAX_REPLICATION_ATTEMPTS)
+    lease_until: str = Field(min_length=20)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int = Field(ge=1)
+    provider_requests: Literal[0] = 0
+
+    _lease_is_utc = field_validator("lease_until")(
+        lambda value: _validate_utc_timestamp(value, "lease_until")
+    )
+
+
+class ReplicationHead(BaseModel):
+    """Sanitized replay projection of one intent head."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    intent_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    current_state: OutboxState
+    state_version: int = Field(ge=0)
+    last_event_sequence: int = Field(ge=0)
+    lease_owner: str | None = Field(default=None, max_length=128)
+    lease_until: str | None = None
+    next_attempt_at: str
+    last_reason_code: ReplicationReason
+    updated_at: str
+    attempt: int = Field(ge=0, le=MAX_REPLICATION_ATTEMPTS)
+    retry_delay_seconds: int = Field(ge=0)
+    provider_requests: Literal[0] = 0
+
+    @model_validator(mode="after")
+    def validate_head_timestamps(self) -> ReplicationHead:
+        _validate_utc_timestamp(self.next_attempt_at, "next_attempt_at")
+        _validate_utc_timestamp(self.updated_at, "updated_at")
+        if self.lease_until is not None:
+            _validate_utc_timestamp(self.lease_until, "lease_until")
+        if self.current_state in {"copying", "verifying"}:
+            if not self.lease_owner or self.lease_until is None:
+                raise ValueError("leased state requires lease owner and expiry")
+        elif self.lease_owner is not None or self.lease_until is not None:
+            raise ValueError("non-leased state cannot retain a lease")
+        return self
+
+
+class ReplicationImportResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    intent_ids: tuple[str, ...]
+    source_sequences: tuple[int, ...]
+    imported_count: int = Field(ge=0)
+    existing_count: int = Field(ge=0)
+    provider_requests: Literal[0] = 0
+
+    @property
+    def intent_id(self) -> str | None:
+        """Convenience projection for the single-checkpoint enqueue case."""
+        return self.intent_ids[0] if len(self.intent_ids) == 1 else None
+
+    @property
+    def source_sequence(self) -> int | None:
+        return self.source_sequences[0] if len(self.source_sequences) == 1 else None
+
+
+class ReplicationOutboxResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    status: Literal["disabled", "queued", "existing", "unavailable"]
+    reason_code: ReplicationReason
+    intent_ids: tuple[str, ...] = ()
+    source_sequences: tuple[int, ...] = ()
+    provider_requests: Literal[0] = 0
+    outbox_writes: bool = False
+
+
+def is_retryable_replication_reason(reason_code: str) -> bool:
+    """Return the closed retry classification used by the local drain."""
+    return reason_code in _RETRYABLE_REASONS
+
+
 class SourceInstanceRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -1440,8 +1591,39 @@ def _validate_intent_rows(
         )
         if intent_id != expected_id:
             raise ReplicationStateUnavailable("replication intent identity is invalid")
+        # operation_day is scheduling metadata and is deliberately excluded
+        # from the immutable row digest.  This is what permits a restart or a
+        # later scheduler slot to observe the same intent without changing
+        # its identity or audit chain.
         intent_preimage = {
-            field: values[field] for field in columns if field not in {"intent_sha256"}
+            field: values[field]
+            for field in (
+                "intent_id",
+                "schema_version",
+                "direction",
+                "destination_id",
+                "checkpoint_id",
+                "pointer_row_sha256",
+                "pointer_generation",
+                "source_run_id",
+                "source_trade_date",
+                "source_published_at",
+                "pointer_db_inode",
+                "pointer_db_device",
+                "pointer_db_schema_digest",
+                "manifest_canonical_sha256",
+                "source_object_set_sha256",
+                "source_instance_id",
+                "source_instance_sha256",
+                "source_sequence",
+                "source_manifest_bytes_sha256",
+                "publication_binding_sha256",
+                "plan_sha256",
+                "object_count",
+                "row_count",
+                "byte_count",
+                "created_at",
+            )
         }
         expected_hash = domain_sha256("stock-eva/r2f4.3/replication-intent-row/v1", intent_preimage)
         if values["intent_sha256"] != expected_hash:
@@ -1633,7 +1815,10 @@ def _validate_event_reachability(
         if head[7] not in set(get_args(ReplicationReason)):
             raise ReplicationStateUnavailable("replication head reason is invalid")
         final_reason = rows[-1][8]
-        final_occurred_at = rows[-1][9]
+        # Event rows include state_version at index 9; occurred_at is index
+        # 10.  Comparing the wrong slot would reject every valid head as a
+        # stale replay projection as soon as an intent is imported.
+        final_occurred_at = rows[-1][10]
         if head[7] != final_reason or head[8] != final_occurred_at:
             raise ReplicationStateUnavailable("replication head replay projection is stale")
         if head[1] != prior_state or head[2] != prior_version or head[3] != len(rows) - 1:
@@ -2413,6 +2598,72 @@ def _generation_payload(
                 raise _cleanup_error(failures)
 
 
+def _rebuild_generation_payload(
+    source: sqlite3.Connection,
+    *,
+    generation_number: int,
+    previous_generation_sha256: str,
+) -> bytes:
+    """Construct a sealed next image without mutating the sealed source image.
+
+    ``replication_sidecar_meta`` is immutable once its payload hash is set.
+    A writer therefore copies the already-mutated private image into a fresh
+    in-memory database, assigns the next generation metadata while its new
+    payload hash is still the construction zero, and seals that image.  The
+    normative trigger remains installed throughout the candidate lifecycle.
+    """
+    _validate_sha(previous_generation_sha256, "previous_generation_sha256")
+    candidate: sqlite3.Connection | None = None
+    primary: BaseException | None = None
+    try:
+        candidate = sqlite3.connect(":memory:")
+        candidate.executescript(SIDECAR_DDL)
+        table_names = (
+            "replication_sidecar_meta",
+            "replication_intents",
+            "replication_attempt_events",
+            "replication_heads",
+            "replication_destination_cache",
+        )
+        for table in table_names:
+            columns = tuple(
+                row[1] for row in source.execute(f'PRAGMA table_info("{table}")').fetchall()
+            )
+            if not columns:
+                raise ReplicationStateUnavailable("replication sidecar table is missing")
+            quoted = ",".join(f'"{column}"' for column in columns)
+            rows = source.execute(f'SELECT {quoted} FROM "{table}" ORDER BY rowid').fetchall()
+            if table == "replication_sidecar_meta":
+                if len(rows) != 1:
+                    raise ReplicationStateUnavailable("replication sidecar metadata is invalid")
+                values = list(rows[0])
+                values[8] = generation_number
+                values[9] = previous_generation_sha256
+                values[10] = ZERO_SHA256
+                rows = [tuple(values)]
+            if rows:
+                placeholders = ",".join("?" * len(columns))
+                candidate.executemany(
+                    f'INSERT INTO "{table}" ({quoted}) VALUES ({placeholders})', rows
+                )
+        candidate.commit()
+        payload_digest = _generation_payload_digest(candidate)
+        candidate.execute(
+            "UPDATE replication_sidecar_meta SET generation_payload_sha256=? WHERE sidecar_id=1",
+            (payload_digest,),
+        )
+        candidate.commit()
+        return candidate.serialize(name="main")
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        if candidate is not None:
+            failures: list[str] = []
+            _close_connection_best_effort(candidate, failures)
+            _finish_cleanup(primary, failures)
+
+
 def _install_generation(session: _GenerationWriterSession, payload: bytes) -> None:
     _assert_generation_lock(session)
     if session.genesis_payload is None or session.genesis is None:
@@ -2507,6 +2758,171 @@ def _close_readonly_generation(root_fd: int, connection: sqlite3.Connection) -> 
     _close_connection_best_effort(connection, failures)
     _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
     _finish_cleanup(None, failures)
+
+
+@dataclass(frozen=True)
+class _MutationOutcome:
+    value: object
+    changed: bool
+
+
+def _timestamp_value(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+    except (TypeError, ValueError) as exc:
+        raise ReplicationDurabilityError("replication timestamp is invalid") from exc
+
+
+def _add_seconds(timestamp: str, seconds: int) -> str:
+    if not isinstance(seconds, int) or seconds < 0:
+        raise ValueError("seconds must be non-negative")
+    return (
+        (_timestamp_value(timestamp).replace(tzinfo=UTC) + timedelta(seconds=seconds))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _intent_hash_preimage(values: Mapping[str, object]) -> dict[str, object]:
+    return {
+        field: values[field]
+        for field in (
+            "intent_id",
+            "schema_version",
+            "direction",
+            "destination_id",
+            "checkpoint_id",
+            "pointer_row_sha256",
+            "pointer_generation",
+            "source_run_id",
+            "source_trade_date",
+            "source_published_at",
+            "pointer_db_inode",
+            "pointer_db_device",
+            "pointer_db_schema_digest",
+            "manifest_canonical_sha256",
+            "source_object_set_sha256",
+            "source_instance_id",
+            "source_instance_sha256",
+            "source_sequence",
+            "source_manifest_bytes_sha256",
+            "publication_binding_sha256",
+            "plan_sha256",
+            "object_count",
+            "row_count",
+            "byte_count",
+            "created_at",
+        )
+    }
+
+
+def _event_values(
+    *,
+    intent_id: str,
+    event_sequence: int,
+    prev_event_sha256: str,
+    event_type: str,
+    from_state: str | None,
+    to_state: str,
+    attempt: int,
+    reason_code: str,
+    state_version: int,
+    occurred_at: str,
+    destination_replication_generation: str | None = None,
+    destination_record_sha256: str | None = None,
+    destination_head_sha256: str | None = None,
+) -> dict[str, object]:
+    event_id = domain_sha256(
+        "stock-eva/r2f4.3/replication-event-id/v1",
+        {
+            "intent_id": intent_id,
+            "event_sequence": event_sequence,
+            "attempt": attempt,
+            "state_version": state_version,
+            "occurred_at": occurred_at,
+        },
+    )
+    values: dict[str, object] = {
+        "event_id": event_id,
+        "intent_id": intent_id,
+        "event_sequence": event_sequence,
+        "prev_event_sha256": prev_event_sha256,
+        "event_type": event_type,
+        "from_state": from_state,
+        "to_state": to_state,
+        "attempt": attempt,
+        "reason_code": reason_code,
+        "state_version": state_version,
+        "occurred_at": occurred_at,
+        "destination_replication_generation": destination_replication_generation,
+        "destination_record_sha256": destination_record_sha256,
+        "destination_head_sha256": destination_head_sha256,
+    }
+    values["event_sha256"] = domain_sha256("stock-eva/r2f4.3/replication-event/v1", values)
+    return values
+
+
+def _intent_row_from_checkpoint(
+    checkpoint: SourceCheckpoint,
+    *,
+    operation_day: str,
+    destination_id: str,
+    source_sequence: int,
+    created_at: str,
+) -> dict[str, object]:
+    inventory = _object_inventory_projection(checkpoint.object_inventory)
+    plan_sha256 = domain_sha256(
+        "stock-eva/r2f4.3/replication-plan/v1",
+        {
+            "direction": "local_to_nas",
+            "destination_id": destination_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "object_inventory": inventory,
+        },
+    )
+    intent_id = domain_sha256(
+        "stock-eva/r2f4.3/replication-intent/v1",
+        {
+            "direction": "local_to_nas",
+            "destination_id": destination_id,
+            "source_instance_id": checkpoint.source_instance_id,
+            "source_sequence": source_sequence,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "plan_sha256": plan_sha256,
+        },
+    )
+    values: dict[str, object] = {
+        "intent_id": intent_id,
+        "schema_version": 1,
+        "operation_day": operation_day,
+        "direction": "local_to_nas",
+        "destination_id": destination_id,
+        "pointer_row_sha256": checkpoint.pointer_row_sha256,
+        "pointer_generation": checkpoint.pointer_generation,
+        "source_run_id": checkpoint.source_run_id,
+        "source_trade_date": checkpoint.source_trade_date,
+        "source_published_at": checkpoint.source_published_at,
+        "pointer_db_device": checkpoint.pointer_db_device,
+        "pointer_db_inode": checkpoint.pointer_db_inode,
+        "pointer_db_schema_digest": checkpoint.pointer_db_schema_digest,
+        "manifest_canonical_sha256": checkpoint.manifest_canonical_sha256,
+        "source_object_set_sha256": checkpoint.source_object_set_sha256,
+        "publication_binding_sha256": checkpoint.publication_binding_sha256,
+        "source_instance_id": checkpoint.source_instance_id,
+        "source_instance_sha256": checkpoint.source_instance_sha256,
+        "source_sequence": source_sequence,
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "source_manifest_bytes_sha256": checkpoint.source_manifest_bytes_sha256,
+        "plan_sha256": plan_sha256,
+        "object_count": len(inventory),
+        "row_count": sum(int(item["row_count"]) for item in inventory),
+        "byte_count": sum(int(item["size_bytes"]) for item in inventory),
+        "created_at": created_at,
+    }
+    values["intent_sha256"] = domain_sha256(
+        "stock-eva/r2f4.3/replication-intent-row/v1", _intent_hash_preimage(values)
+    )
+    return values
 
 
 class ImmutableReplicationSidecarStore:
@@ -2606,6 +3022,835 @@ class ImmutableReplicationSidecarStore:
                     primary.add_note("replication_cleanup=failed")
                 else:
                     raise _cleanup_error(failures)
+
+    def _mutate_generation(self, mutator: object) -> object:
+        """Run one sidecar mutation in a private SQLite image.
+
+        The transaction is equivalent to ``BEGIN IMMEDIATE``: the anchored
+        sidecar lock serializes writers, while the immutable generation link
+        is the durable CAS.  A no-op never installs a new generation.
+        """
+        if not callable(mutator):
+            raise TypeError("sidecar mutator must be callable")
+        # A mutation never bootstraps an empty path.  Initialization is an
+        # explicit writer operation; this guard also keeps an unavailable
+        # sidecar from leaving behind a lock directory as a failure artifact.
+        if not self.path.is_dir() or not (self.path / SIDECAR_GENESIS_NAME).is_file():
+            raise ReplicationStateUnavailable("replication sidecar is uninitialized")
+        session: _GenerationWriterSession | None = None
+        connection: sqlite3.Connection | None = None
+        primary_error: BaseException | None = None
+        try:
+            session = _open_generation_writer_session(self.path)
+            if not session.entries or session.genesis is None:
+                raise ReplicationStateUnavailable("replication sidecar is uninitialized")
+            _assert_generation_lock(session)
+            _compare_generation_snapshot(
+                session.root_fd,
+                genesis_payload=session.genesis_payload or b"",
+                entries=session.entries,
+            )
+            connection = _deserialize_sqlite_bytes(session.entries[-1].payload)
+            _validate_sqlite_schema(connection)
+            meta = connection.execute(
+                "SELECT source_instance_id, source_instance_sha256 FROM replication_sidecar_meta"
+            ).fetchone()
+            if meta != (
+                session.genesis["source_instance_id"],
+                session.genesis["source_instance_sha256"],
+            ):
+                raise ReplicationStateUnavailable("replication sidecar source identity is invalid")
+            _validate_event_reachability(
+                connection,
+                expected_source_instance_id=session.genesis["source_instance_id"],
+                expected_source_instance_sha256=session.genesis["source_instance_sha256"],
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            raw_result = mutator(connection)
+            if not isinstance(raw_result, _MutationOutcome):
+                raise ReplicationDurabilityError("replication mutation result is invalid")
+            if not raw_result.changed:
+                connection.rollback()
+                return raw_result.value
+            # Generation metadata is part of the immutable image, not a
+            # post-install patch.  Build a fresh candidate image with the
+            # deterministic next number/parent and seal its payload digest;
+            # the previous sealed image remains untouched.
+            next_generation = session.latest_sequence + 1
+            previous_generation = hashlib.sha256(session.entries[-1].payload).hexdigest()
+            payload = _rebuild_generation_payload(
+                connection,
+                generation_number=next_generation,
+                previous_generation_sha256=previous_generation,
+            )
+            connection.rollback()
+            _install_generation(session, payload)
+            return raw_result.value
+        except ReplicationCASConflict as exc:
+            primary_error = exc
+            raise
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            primary_error = exc
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        except sqlite3.IntegrityError as exc:
+            primary_error = ReplicationCASConflict("replication outbox CAS conflict")
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise primary_error from exc
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            primary_error = ReplicationDurabilityError("replication outbox mutation failed")
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise primary_error from exc
+        except BaseException as exc:
+            primary_error = exc
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            failures: list[str] = []
+            if connection is not None:
+                _close_connection_best_effort(connection, failures)
+            if session is not None:
+                try:
+                    _close_generation_writer_session(session)
+                except ReplicationDurabilityError:
+                    failures.append("writer_session")
+            _finish_cleanup(primary_error, failures)
+
+    @staticmethod
+    def _validate_operation_inputs(operation_day: str, destination_id: str) -> None:
+        try:
+            _validate_iso_date(operation_day, "operation_day")
+        except (TypeError, ValueError) as exc:
+            raise ReplicationDurabilityError("replication operation day is invalid") from exc
+        if (
+            not isinstance(destination_id, str)
+            or len(destination_id) != 32
+            or any(char not in "0123456789abcdef" for char in destination_id)
+        ):
+            raise ReplicationDurabilityError("replication destination identity is invalid")
+
+    @staticmethod
+    def _validate_checkpoint(
+        connection: sqlite3.Connection,
+        checkpoint: SourceCheckpoint,
+    ) -> None:
+        try:
+            checkpoint.verify_hashes()
+        except (ReplicationDurabilityError, ValueError) as exc:
+            raise ReplicationStateUnavailable("source checkpoint is unavailable") from exc
+        meta = connection.execute(
+            "SELECT source_instance_id, source_instance_sha256 FROM replication_sidecar_meta"
+        ).fetchone()
+        if meta != (checkpoint.source_instance_id, checkpoint.source_instance_sha256):
+            raise ReplicationStateUnavailable("source checkpoint identity conflicts")
+
+    @staticmethod
+    def _insert_intent(
+        connection: sqlite3.Connection,
+        values: Mapping[str, object],
+    ) -> None:
+        columns = tuple(values)
+        connection.execute(
+            f"INSERT INTO replication_intents ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+            tuple(values[column] for column in columns),
+        )
+        event = _event_values(
+            intent_id=str(values["intent_id"]),
+            event_sequence=0,
+            prev_event_sha256=ZERO_SHA256,
+            event_type="intent_created",
+            from_state=None,
+            to_state="pending",
+            attempt=0,
+            reason_code="NONE",
+            state_version=0,
+            occurred_at=str(values["created_at"]),
+        )
+        event_columns = tuple(event)
+        connection.execute(
+            f"INSERT INTO replication_attempt_events ({','.join(event_columns)}) VALUES ({','.join('?' * len(event_columns))})",
+            tuple(event[column] for column in event_columns),
+        )
+        connection.execute(
+            """INSERT INTO replication_heads
+               (intent_id, current_state, state_version, last_event_sequence,
+                lease_owner, lease_until, next_attempt_at, last_reason_code, updated_at)
+               VALUES (?, 'pending', 0, 0, NULL, NULL, ?, 'NONE', ?)""",
+            (values["intent_id"], values["created_at"], values["created_at"]),
+        )
+
+    @staticmethod
+    def _existing_intent(
+        connection: sqlite3.Connection,
+        *,
+        checkpoint_id: str,
+        destination_id: str,
+    ) -> tuple[object, ...] | None:
+        return connection.execute(
+            """SELECT intent_id, source_sequence, source_instance_id,
+                      source_instance_sha256, checkpoint_id, plan_sha256
+                 FROM replication_intents
+                WHERE direction='local_to_nas' AND destination_id=? AND checkpoint_id=?""",
+            (destination_id, checkpoint_id),
+        ).fetchone()
+
+    def _enqueue_checkpoints(
+        self,
+        connection: sqlite3.Connection,
+        checkpoints: Iterable[SourceCheckpoint],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str,
+    ) -> _MutationOutcome:
+        ordered = sorted(
+            checkpoints, key=lambda item: (item.source_published_at, item.checkpoint_id)
+        )
+        unique: list[SourceCheckpoint] = []
+        seen: set[str] = set()
+        for checkpoint in ordered:
+            if checkpoint.checkpoint_id in seen:
+                continue
+            seen.add(checkpoint.checkpoint_id)
+            self._validate_checkpoint(connection, checkpoint)
+            unique.append(checkpoint)
+        max_sequence = connection.execute(
+            "SELECT COALESCE(MAX(source_sequence), 0) FROM replication_intents WHERE source_instance_id=?",
+            (unique[0].source_instance_id,) if unique else ("",),
+        ).fetchone()[0]
+        if not isinstance(max_sequence, int):
+            raise ReplicationStateUnavailable("replication source sequence is invalid")
+        next_sequence = max_sequence + 1
+        intent_ids: list[str] = []
+        source_sequences: list[int] = []
+        imported = 0
+        existing = 0
+        for checkpoint in unique:
+            found = self._existing_intent(
+                connection,
+                checkpoint_id=checkpoint.checkpoint_id,
+                destination_id=destination_id,
+            )
+            if found is not None:
+                (
+                    found_id,
+                    found_sequence,
+                    found_source_id,
+                    found_source_sha,
+                    found_cp,
+                    found_plan,
+                ) = found
+                if (
+                    found_source_id != checkpoint.source_instance_id
+                    or found_source_sha != checkpoint.source_instance_sha256
+                    or found_cp != checkpoint.checkpoint_id
+                ):
+                    raise ReplicationStateUnavailable("replication intent identity conflicts")
+                intent_values = _intent_row_from_checkpoint(
+                    checkpoint,
+                    operation_day=operation_day,
+                    destination_id=destination_id,
+                    source_sequence=int(found_sequence),
+                    created_at=created_at,
+                )
+                if (
+                    found_id != intent_values["intent_id"]
+                    or found_plan != intent_values["plan_sha256"]
+                ):
+                    raise ReplicationStateUnavailable("replication intent identity conflicts")
+                intent_ids.append(str(found_id))
+                source_sequences.append(int(found_sequence))
+                existing += 1
+                continue
+            # A checkpoint has one global source sequence in this sidecar.  A
+            # previously imported destination must therefore be reused rather
+            # than assigned a second sequence.
+            prior = connection.execute(
+                "SELECT intent_id, source_sequence FROM replication_intents WHERE source_instance_id=? AND checkpoint_id=?",
+                (checkpoint.source_instance_id, checkpoint.checkpoint_id),
+            ).fetchone()
+            if prior is not None:
+                raise ReplicationCASConflict(
+                    "replication checkpoint has conflicting destination intent"
+                )
+            values = _intent_row_from_checkpoint(
+                checkpoint,
+                operation_day=operation_day,
+                destination_id=destination_id,
+                source_sequence=next_sequence,
+                created_at=created_at,
+            )
+            self._insert_intent(connection, values)
+            intent_ids.append(str(values["intent_id"]))
+            source_sequences.append(next_sequence)
+            imported += 1
+            next_sequence += 1
+        return _MutationOutcome(
+            ReplicationImportResult(
+                intent_ids=tuple(intent_ids),
+                source_sequences=tuple(source_sequences),
+                imported_count=imported,
+                existing_count=existing,
+            ),
+            imported > 0,
+        )
+
+    def enqueue_checkpoint(
+        self,
+        checkpoint: SourceCheckpoint | Mapping[str, object],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+        plan_sha256: str | None = None,
+    ) -> ReplicationImportResult:
+        """Persist one checkpoint as an immutable, idempotent intent."""
+        self._validate_operation_inputs(operation_day, destination_id)
+        try:
+            normalized = (
+                checkpoint
+                if isinstance(checkpoint, SourceCheckpoint)
+                else SourceCheckpoint.model_validate(checkpoint)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReplicationStateUnavailable("source checkpoint is unavailable") from exc
+        normalized.verify_hashes()
+        if plan_sha256 is not None:
+            expected = _intent_row_from_checkpoint(
+                normalized,
+                operation_day=operation_day,
+                destination_id=destination_id,
+                source_sequence=1,
+                created_at=created_at or _utc_now(),
+            )["plan_sha256"]
+            if plan_sha256 != expected:
+                raise ReplicationDurabilityError("replication plan digest is invalid")
+        result = self._mutate_generation(
+            lambda connection: self._enqueue_checkpoints(
+                connection,
+                [normalized],
+                operation_day=operation_day,
+                destination_id=destination_id,
+                created_at=created_at or _utc_now(),
+            )
+        )
+        if not isinstance(result, ReplicationImportResult):
+            raise ReplicationDurabilityError("replication enqueue result is invalid")
+        return result
+
+    def enqueue(
+        self,
+        checkpoint: SourceCheckpoint | Mapping[str, object],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+    ) -> ReplicationImportResult:
+        return self.enqueue_checkpoint(
+            checkpoint,
+            operation_day=operation_day,
+            destination_id=destination_id,
+            created_at=created_at,
+        )
+
+    def import_journals(
+        self,
+        records: Iterable[JournalRecord],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+    ) -> ReplicationImportResult:
+        """Import complete journals in deterministic order in one transaction."""
+        self._validate_operation_inputs(operation_day, destination_id)
+        normalized: list[SourceCheckpoint] = []
+        for record in records:
+            if not isinstance(record, JournalRecord):
+                raise ReplicationStateUnavailable("replication journal is unavailable")
+            record.verify_hash()
+            record.checkpoint_projection.verify_hashes()
+            normalized.append(record.checkpoint_projection)
+        result = self._mutate_generation(
+            lambda connection: self._enqueue_checkpoints(
+                connection,
+                normalized,
+                operation_day=operation_day,
+                destination_id=destination_id,
+                created_at=created_at or _utc_now(),
+            )
+        )
+        if not isinstance(result, ReplicationImportResult):
+            raise ReplicationDurabilityError("replication journal import result is invalid")
+        return result
+
+    def reconcile(
+        self,
+        current: SourceCheckpoint | JournalRecord | None,
+        *,
+        operation_day: str,
+        destination_id: str,
+        journals: Iterable[JournalRecord] = (),
+        now: str | None = None,
+    ) -> ReplicationImportResult:
+        """Reconcile strict local evidence without any provider request."""
+        records = list(journals)
+        if isinstance(current, JournalRecord):
+            records.append(current)
+        elif isinstance(current, SourceCheckpoint):
+            current.verify_hashes()
+            records.append(
+                build_journal_record(
+                    checkpoint_id=current.checkpoint_id,
+                    source_instance_id=current.source_instance_id,
+                    source_instance_sha256=current.source_instance_sha256,
+                    publication_binding_sha256=current.publication_binding_sha256,
+                    source_published_at=current.source_published_at,
+                    checkpoint_projection=current,
+                    created_at=now,
+                )
+            )
+        return self.import_journals(
+            records,
+            operation_day=operation_day,
+            destination_id=destination_id,
+            created_at=now,
+        )
+
+    @staticmethod
+    def _latest_event(
+        connection: sqlite3.Connection,
+        intent_id: str,
+    ) -> tuple[object, ...]:
+        event = connection.execute(
+            """SELECT event_id, event_sequence, prev_event_sha256, event_type,
+                      from_state, to_state, attempt, reason_code, state_version,
+                      occurred_at, destination_replication_generation,
+                      destination_record_sha256, destination_head_sha256, event_sha256
+                 FROM replication_attempt_events
+                WHERE intent_id=? ORDER BY event_sequence DESC LIMIT 1""",
+            (intent_id,),
+        ).fetchone()
+        if event is None:
+            raise ReplicationStateUnavailable("replication intent event history is missing")
+        return event
+
+    @staticmethod
+    def _head_row(connection: sqlite3.Connection, intent_id: str) -> tuple[object, ...]:
+        head = connection.execute(
+            """SELECT intent_id, current_state, state_version, last_event_sequence,
+                      lease_owner, lease_until, next_attempt_at, last_reason_code,
+                      updated_at
+                 FROM replication_heads WHERE intent_id=?""",
+            (intent_id,),
+        ).fetchone()
+        if head is None:
+            raise ReplicationStateUnavailable("replication intent head is missing")
+        return head
+
+    @classmethod
+    def _head_view(cls, connection: sqlite3.Connection, intent_id: str) -> ReplicationHead:
+        row = cls._head_row(connection, intent_id)
+        event = cls._latest_event(connection, intent_id)
+        attempt = int(event[6])
+        retry_delay = (
+            RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)]
+            if row[1] == "retry_wait" and attempt > 0
+            else 0
+        )
+        try:
+            return ReplicationHead(
+                intent_id=row[0],
+                current_state=row[1],
+                state_version=row[2],
+                last_event_sequence=row[3],
+                lease_owner=row[4],
+                lease_until=row[5],
+                next_attempt_at=row[6],
+                last_reason_code=row[7],
+                updated_at=row[8],
+                attempt=attempt,
+                retry_delay_seconds=retry_delay,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReplicationStateUnavailable("replication intent head is invalid") from exc
+
+    @staticmethod
+    def _append_event_and_update_head(
+        connection: sqlite3.Connection,
+        *,
+        intent_id: str,
+        from_state: str,
+        to_state: str,
+        attempt: int,
+        reason_code: str,
+        occurred_at: str,
+        lease_owner: str | None,
+        lease_until: str | None,
+        next_attempt_at: str,
+        destination_replication_generation: str | None = None,
+        destination_record_sha256: str | None = None,
+        destination_head_sha256: str | None = None,
+        event_type: str | None = None,
+    ) -> None:
+        head = ImmutableReplicationSidecarStore._head_row(connection, intent_id)
+        if head[1] != from_state:
+            raise ReplicationCASConflict("replication intent state changed")
+        latest = ImmutableReplicationSidecarStore._latest_event(connection, intent_id)
+        state_version = int(head[2]) + 1
+        event_sequence = int(head[3]) + 1
+        event = _event_values(
+            intent_id=intent_id,
+            event_sequence=event_sequence,
+            prev_event_sha256=str(latest[13]),
+            event_type=event_type or ("terminal" if to_state == "dead_letter" else "transition"),
+            from_state=from_state,
+            to_state=to_state,
+            attempt=attempt,
+            reason_code=reason_code,
+            state_version=state_version,
+            occurred_at=occurred_at,
+            destination_replication_generation=destination_replication_generation,
+            destination_record_sha256=destination_record_sha256,
+            destination_head_sha256=destination_head_sha256,
+        )
+        columns = tuple(event)
+        connection.execute(
+            f"INSERT INTO replication_attempt_events ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+            tuple(event[column] for column in columns),
+        )
+        connection.execute(
+            """UPDATE replication_heads
+                  SET current_state=?, state_version=?, last_event_sequence=?,
+                      lease_owner=?, lease_until=?, next_attempt_at=?,
+                      last_reason_code=?, updated_at=?
+                WHERE intent_id=? AND state_version=?""",
+            (
+                to_state,
+                state_version,
+                event_sequence,
+                lease_owner,
+                lease_until,
+                next_attempt_at,
+                reason_code,
+                occurred_at,
+                intent_id,
+                int(head[2]),
+            ),
+        )
+        if connection.execute("SELECT changes()").fetchone() != (1,):
+            raise ReplicationCASConflict("replication intent state-version CAS conflict")
+
+    def claim_due(
+        self,
+        *,
+        worker_id: str,
+        now: str | None = None,
+        lease_seconds: int = REPLICATION_LEASE_SECONDS,
+    ) -> ReplicationClaim | None:
+        """Claim at most one due intent with an immutable lease event."""
+        if not isinstance(worker_id, str) or not (1 <= len(worker_id) <= 128):
+            raise ReplicationDurabilityError("replication worker identity is invalid")
+        if not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= 3600:
+            raise ReplicationDurabilityError("replication lease duration is invalid")
+        occurred_at = now or _utc_now()
+        _validate_utc_timestamp(occurred_at, "now")
+
+        def mutate(connection: sqlite3.Connection) -> _MutationOutcome:
+            row = connection.execute(
+                """SELECT h.intent_id, h.current_state, h.state_version,
+                          h.lease_owner, h.lease_until, h.next_attempt_at,
+                          i.checkpoint_id, i.source_sequence
+                     FROM replication_heads h JOIN replication_intents i ON i.intent_id=h.intent_id
+                    WHERE (
+                        (h.current_state IN ('pending','retry_wait') AND h.next_attempt_at <= ?)
+                        OR (h.current_state IN ('copying','verifying') AND h.lease_until <= ?)
+                    )
+                    ORDER BY i.source_published_at, i.checkpoint_id
+                    LIMIT 1""",
+                (occurred_at, occurred_at),
+            ).fetchone()
+            if row is None:
+                return _MutationOutcome(None, False)
+            intent_id, state, _version, _owner, _until, _next, checkpoint_id, sequence = row
+            if state in {"copying", "verifying"}:
+                # A lease expiry is made replayable through the allow-listed
+                # retry path.  The old worker cannot advance after this
+                # state-version change, while the new claim remains bounded
+                # and does not contact a destination or provider.
+                latest = self._latest_event(connection, str(intent_id))
+                self._append_event_and_update_head(
+                    connection,
+                    intent_id=str(intent_id),
+                    from_state=str(state),
+                    to_state="retry_wait",
+                    attempt=int(latest[6]),
+                    reason_code="RETRY_WAIT",
+                    occurred_at=occurred_at,
+                    lease_owner=None,
+                    lease_until=None,
+                    next_attempt_at=occurred_at,
+                )
+                state = "retry_wait"
+            if state == "retry_wait":
+                latest = self._latest_event(connection, str(intent_id))
+                self._append_event_and_update_head(
+                    connection,
+                    intent_id=str(intent_id),
+                    from_state="retry_wait",
+                    to_state="pending",
+                    attempt=int(latest[6]),
+                    reason_code="RETRY_WAIT",
+                    occurred_at=occurred_at,
+                    lease_owner=None,
+                    lease_until=None,
+                    next_attempt_at=occurred_at,
+                )
+            head = self._head_row(connection, str(intent_id))
+            latest = self._latest_event(connection, str(intent_id))
+            attempt = int(latest[6]) + 1
+            if attempt > MAX_REPLICATION_ATTEMPTS:
+                self._append_event_and_update_head(
+                    connection,
+                    intent_id=str(intent_id),
+                    from_state="pending",
+                    to_state="dead_letter",
+                    attempt=MAX_REPLICATION_ATTEMPTS,
+                    reason_code="DEAD_LETTER",
+                    occurred_at=occurred_at,
+                    lease_owner=None,
+                    lease_until=None,
+                    next_attempt_at=occurred_at,
+                )
+                return _MutationOutcome(None, True)
+            lease_until = _add_seconds(occurred_at, lease_seconds)
+            self._append_event_and_update_head(
+                connection,
+                intent_id=str(intent_id),
+                from_state="pending",
+                to_state="copying",
+                attempt=attempt,
+                reason_code="NONE",
+                occurred_at=occurred_at,
+                lease_owner=worker_id,
+                lease_until=lease_until,
+                next_attempt_at=occurred_at,
+                event_type="claim",
+            )
+            head = self._head_row(connection, str(intent_id))
+            try:
+                claim = ReplicationClaim(
+                    intent_id=str(intent_id),
+                    worker_id=worker_id,
+                    current_state="copying",
+                    state_version=head[2],
+                    attempt=attempt,
+                    lease_until=lease_until,
+                    checkpoint_id=str(checkpoint_id),
+                    source_sequence=int(sequence),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ReplicationStateUnavailable("replication claim is invalid") from exc
+            return _MutationOutcome(claim, True)
+
+        result = self._mutate_generation(mutate)
+        if result is not None and not isinstance(result, ReplicationClaim):
+            # A malformed pending row may have been terminalized above; a
+            # caller receives no claim and the durable audit remains visible.
+            return None
+        return result
+
+    def transition(
+        self,
+        *,
+        intent_id: str,
+        worker_id: str,
+        expected_state_version: int,
+        to_state: OutboxState,
+        reason_code: ReplicationReason = "NONE",
+        now: str | None = None,
+        destination_replication_generation: str | None = None,
+        destination_record_sha256: str | None = None,
+        destination_head_sha256: str | None = None,
+    ) -> ReplicationHead:
+        """Append one allow-listed state transition under lease/CAS proof."""
+        _validate_sha(intent_id, "intent_id")
+        if not isinstance(worker_id, str) or not (1 <= len(worker_id) <= 128):
+            raise ReplicationDurabilityError("replication worker identity is invalid")
+        if not isinstance(expected_state_version, int) or expected_state_version < 1:
+            raise ReplicationCASConflict("replication state-version expectation is invalid")
+        if to_state not in _OUTBOX_STATES or to_state == "pending":
+            raise ReplicationDurabilityError("replication transition is not allowed")
+        if reason_code not in set(get_args(ReplicationReason)):
+            raise ReplicationDurabilityError("replication reason is not allowed")
+        occurred_at = now or _utc_now()
+        _validate_utc_timestamp(occurred_at, "now")
+        for value, field in (
+            (destination_replication_generation, "destination_replication_generation"),
+            (destination_record_sha256, "destination_record_sha256"),
+            (destination_head_sha256, "destination_head_sha256"),
+        ):
+            if value is not None:
+                _validate_sha(value, field)
+
+        def mutate(connection: sqlite3.Connection) -> _MutationOutcome:
+            head = self._head_row(connection, intent_id)
+            if head[2] != expected_state_version:
+                raise ReplicationCASConflict("replication state-version CAS conflict")
+            current = str(head[1])
+            if current not in {"copying", "verifying"}:
+                raise ReplicationCASConflict("replication intent is not leased")
+            if head[4] != worker_id or head[5] is None:
+                raise ReplicationCASConflict("replication lease owner mismatch")
+            if _timestamp_value(str(head[5])) <= _timestamp_value(occurred_at):
+                raise ReplicationCASConflict("replication lease has expired")
+            latest = self._latest_event(connection, intent_id)
+            attempt = int(latest[6])
+            next_state = to_state
+            if next_state == "retry_wait":
+                if not is_retryable_replication_reason(reason_code):
+                    raise ReplicationDurabilityError("non-retryable reason cannot enter retry_wait")
+                if attempt >= MAX_REPLICATION_ATTEMPTS:
+                    next_state = "dead_letter"
+                delay = RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)]
+                next_at = _add_seconds(occurred_at, delay)
+            else:
+                next_at = occurred_at
+            if next_state == "verifying" and current != "copying":
+                raise ReplicationCASConflict("replication transition is not allowed")
+            if next_state == "replicated" and current != "verifying":
+                raise ReplicationCASConflict("replication transition is not allowed")
+            if next_state == "dead_letter" and current not in {"copying", "verifying"}:
+                raise ReplicationCASConflict("replication transition is not allowed")
+            lease_owner = worker_id if next_state == "verifying" else None
+            lease_until = str(head[5]) if next_state == "verifying" else None
+            self._append_event_and_update_head(
+                connection,
+                intent_id=intent_id,
+                from_state=current,
+                to_state=next_state,
+                attempt=attempt,
+                reason_code=reason_code,
+                occurred_at=occurred_at,
+                lease_owner=lease_owner,
+                lease_until=lease_until,
+                next_attempt_at=next_at,
+                destination_replication_generation=destination_replication_generation,
+                destination_record_sha256=destination_record_sha256,
+                destination_head_sha256=destination_head_sha256,
+            )
+            return _MutationOutcome(self._head_view(connection, intent_id), True)
+
+        result = self._mutate_generation(mutate)
+        if not isinstance(result, ReplicationHead):
+            raise ReplicationDurabilityError("replication transition result is invalid")
+        return result
+
+    def get_intent(self, intent_id: str) -> ReplicationIntent:
+        """Read one immutable intent from the strict sidecar without writes."""
+        _validate_sha(intent_id, "intent_id")
+        connection, root_fd, genesis_payload, entries = _open_generation_readonly(self.path)
+        primary: BaseException | None = None
+        try:
+            _validate_sqlite_schema(connection)
+            _validate_event_reachability(connection)
+            columns = tuple(ReplicationIntent.model_fields)
+            row = connection.execute(
+                "SELECT " + ",".join(columns) + " FROM replication_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                raise ReplicationStateUnavailable("replication intent is unavailable")
+            return ReplicationIntent.model_validate(dict(zip(columns, row, strict=True)))
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            primary = exc
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            primary = ReplicationStateUnavailable("replication intent is unavailable")
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_connection_best_effort(connection, failures)
+            _close_fd_best_effort(root_fd, "sidecar_root_fd", failures)
+            _finish_cleanup(primary, failures)
+
+    def import_journal_files(
+        self,
+        root: Path,
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+    ) -> ReplicationImportResult:
+        """Read and import no-follow journal files, then best-effort unlink them.
+
+        A failed unlink intentionally leaves the complete journal available for
+        a later idempotent reconciliation; it can never remove a committed
+        intent or rewrite a generation.
+        """
+        root = _physical_path(Path(root))
+        if not root.is_absolute():
+            raise ReplicationDurabilityError("replication journal root must be absolute")
+        root_fd, descriptors = _open_directory_chain(root, create=False)
+        records: list[tuple[JournalRecord, str]] = []
+        primary: BaseException | None = None
+        try:
+            for name in sorted(os.listdir(root_fd)):
+                if not isinstance(name, str) or not re.fullmatch(r"[0-9a-f]{64}\.json", name):
+                    raise ReplicationStateUnavailable("replication journal namespace is invalid")
+                path = root / name
+                record = JournalRecord.read(path)
+                records.append((record, name))
+        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
+            primary = exc
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            primary = ReplicationStateUnavailable("replication journal is unavailable")
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(descriptors, failures)
+            _finish_cleanup(primary, failures)
+        result = self.import_journals(
+            [record for record, _name in records],
+            operation_day=operation_day,
+            destination_id=destination_id,
+            created_at=created_at,
+        )
+        # The generation is already durable.  Unlinking is an optimization and
+        # is deliberately outside the transaction so a crash is harmless.
+        unlink_failures: list[str] = []
+        root_fd, descriptors = _open_directory_chain(root, create=False)
+        try:
+            for _record, name in records:
+                try:
+                    os.unlink(name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    unlink_failures.append("journal_unlink")
+            if not unlink_failures:
+                _fsync_open_directory(root_fd)
+        finally:
+            _close_descriptors(descriptors, unlink_failures)
+        if unlink_failures:
+            raise ReplicationDurabilityError("replication journal cleanup is unavailable")
+        return result
 
     def _fsync_database(self) -> None:
         _fsync_directory(self.path)
@@ -2771,6 +4016,120 @@ class ImmutableReplicationSidecarStore:
 ReplicationSidecarStore = ImmutableReplicationSidecarStore  # noqa: F811
 
 
+class ReplicationOutboxService:
+    """Small local-only facade used by the future publication observer.
+
+    It is intentionally not wired to canonical publication, NAS or a
+    provider in this batch.  The disabled branch returns before touching the
+    sidecar path, which keeps status/automation zero-write by construction.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        enabled: bool = True,
+        source_instance_id: str | None = None,
+        source_instance_sha256: str | None = None,
+    ) -> None:
+        self.path = _sidecar_root(Path(path))
+        self.enabled = enabled
+        self.source_instance_id = source_instance_id
+        self.source_instance_sha256 = source_instance_sha256
+
+    def enqueue(
+        self,
+        checkpoint: SourceCheckpoint | Mapping[str, object],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+    ) -> ReplicationOutboxResult:
+        if not self.enabled:
+            return ReplicationOutboxResult(status="disabled", reason_code="DISABLED")
+        if self.source_instance_id is None or self.source_instance_sha256 is None:
+            return ReplicationOutboxResult(
+                status="unavailable", reason_code="SOURCE_NOT_CONFIGURED"
+            )
+        store = ReplicationSidecarStore(self.path)
+        try:
+            if not (self.path / SIDECAR_GENESIS_NAME).is_file():
+                store.initialize(
+                    source_instance_id=self.source_instance_id,
+                    source_instance_sha256=self.source_instance_sha256,
+                    created_at=created_at,
+                )
+            result = store.enqueue_checkpoint(
+                checkpoint,
+                operation_day=operation_day,
+                destination_id=destination_id,
+                created_at=created_at,
+            )
+        except ReplicationDurabilityError:
+            return ReplicationOutboxResult(
+                status="unavailable", reason_code="OUTBOX_DURABILITY_UNAVAILABLE"
+            )
+        return ReplicationOutboxResult(
+            status="queued" if result.imported_count else "existing",
+            reason_code="NONE",
+            intent_ids=result.intent_ids,
+            source_sequences=result.source_sequences,
+            outbox_writes=bool(result.imported_count),
+        )
+
+    def import_journals(
+        self,
+        records: Iterable[JournalRecord],
+        *,
+        operation_day: str,
+        destination_id: str,
+        created_at: str | None = None,
+    ) -> ReplicationOutboxResult:
+        if not self.enabled:
+            return ReplicationOutboxResult(status="disabled", reason_code="DISABLED")
+        try:
+            if not (self.path / SIDECAR_GENESIS_NAME).is_file():
+                if self.source_instance_id is None or self.source_instance_sha256 is None:
+                    return ReplicationOutboxResult(
+                        status="unavailable", reason_code="SOURCE_NOT_CONFIGURED"
+                    )
+                ReplicationSidecarStore(self.path).initialize(
+                    source_instance_id=self.source_instance_id,
+                    source_instance_sha256=self.source_instance_sha256,
+                    created_at=created_at,
+                )
+            result = ReplicationSidecarStore(self.path).import_journals(
+                records,
+                operation_day=operation_day,
+                destination_id=destination_id,
+                created_at=created_at,
+            )
+        except ReplicationDurabilityError:
+            return ReplicationOutboxResult(
+                status="unavailable", reason_code="OUTBOX_DURABILITY_UNAVAILABLE"
+            )
+        return ReplicationOutboxResult(
+            status="queued" if result.imported_count else "existing",
+            reason_code="NONE",
+            intent_ids=result.intent_ids,
+            source_sequences=result.source_sequences,
+            outbox_writes=bool(result.imported_count),
+        )
+
+    def claim_due(
+        self,
+        *,
+        worker_id: str,
+        now: str | None = None,
+        lease_seconds: int = REPLICATION_LEASE_SECONDS,
+    ) -> ReplicationClaim | None:
+        if not self.enabled:
+            return None
+        return ReplicationSidecarStore(self.path).claim_due(
+            worker_id=worker_id, now=now, lease_seconds=lease_seconds
+        )
+
+
 class ReplicationStatusService:
     def __init__(self, settings: Settings, *, local_ready: bool = False) -> None:
         self.settings = settings
@@ -2866,10 +4225,20 @@ __all__ = [
     "ObjectInventoryEntry",
     "ReplicationDurabilityError",
     "ReplicationCASConflict",
+    "ReplicationClaim",
+    "ReplicationHead",
+    "ReplicationImportResult",
+    "ReplicationIntent",
+    "ReplicationOutboxResult",
+    "ReplicationOutboxService",
     "ReplicationPostCommitConflict",
     "ReplicationEffects",
     "ReplicationReason",
     "ReplicationSidecarStore",
+    "OutboxState",
+    "RETRY_DELAYS_SECONDS",
+    "MAX_REPLICATION_ATTEMPTS",
+    "REPLICATION_LEASE_SECONDS",
     "ReplicationState",
     "ReplicationStateUnavailable",
     "ReplicationStatusResponse",
@@ -2882,6 +4251,7 @@ __all__ = [
     "build_source_checkpoint",
     "canonical_json_bytes",
     "domain_sha256",
+    "is_retryable_replication_reason",
     "normalized_ddl_bytes",
 ]
 

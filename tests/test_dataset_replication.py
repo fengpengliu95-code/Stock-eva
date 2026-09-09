@@ -14,6 +14,8 @@ from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.replication import (
     JournalRecord,
+    ReplicationCASConflict,
+    ReplicationClaim,
     ReplicationDurabilityError,
     ReplicationSidecarStore,
     ReplicationStateUnavailable,
@@ -47,6 +49,7 @@ def _checkpoint_for_journal(
     source_instance_sha256: str = "b" * 64,
     publication_binding_sha256: str = "c" * 64,
     created_at: str = "2026-09-09T00:00:01Z",
+    source_published_at: str = "2026-09-09T00:00:00Z",
 ):
     entry = {
         "relative_path": "bars.parquet",
@@ -65,7 +68,7 @@ def _checkpoint_for_journal(
         pointer_generation="generation-1",
         source_run_id="run-1",
         source_trade_date="2026-09-09",
-        source_published_at="2026-09-09T00:00:00Z",
+        source_published_at=source_published_at,
         pointer_db_device=1,
         pointer_db_inode=2,
         pointer_db_schema_digest="e" * 64,
@@ -110,6 +113,20 @@ def _install_fixed_generation_process(path: str, payload: bytes, queue: object) 
         queue.put("installed")  # type: ignore[attr-defined]
     finally:
         os.close(root_fd)
+
+
+def _claim_sidecar_process(path: str, worker_id: str, queue: object) -> None:
+    try:
+        claim = ReplicationSidecarStore(Path(path)).claim_due(
+            worker_id=worker_id, now="2026-09-09T00:01:00Z", lease_seconds=900
+        )
+    except BaseException as exc:  # pragma: no cover - child diagnostic path
+        queue.put(("error", type(exc).__name__))  # type: ignore[attr-defined]
+    else:
+        if claim is None:
+            queue.put(("none", None))  # type: ignore[attr-defined]
+        else:
+            queue.put(("claimed", claim.intent_id))  # type: ignore[attr-defined]
 
 
 def test_replication_defaults_off_and_layout_is_local(tmp_path: Path) -> None:
@@ -700,6 +717,301 @@ def test_status_rejects_existing_wal_shm_without_writes(tmp_path: Path) -> None:
         for artifact in (root / "00000000000000000000.db", wal_path, shm_path)
     }
     assert after == before
+
+
+def test_checkpoint_journals_import_sorted_by_published_at_and_checkpoint_id(
+    tmp_path: Path,
+) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    first = _checkpoint_for_journal(
+        created_at="2026-09-09T00:00:01Z", source_published_at="2026-09-09T00:00:00Z"
+    )
+    second = _checkpoint_for_journal(
+        created_at="2026-09-09T00:00:02Z", source_published_at="2026-09-09T00:00:01Z"
+    )
+    # The helper above intentionally exercises the public journal import path;
+    # records with equal publication time are ordered by checkpoint id.
+    result = store.import_journals(
+        [second, first],
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:10Z",
+    )
+    assert result.intent_ids
+    assert result.source_sequences == (1, 2)
+    assert (
+        store.import_journals(
+            [first, second],
+            operation_day="2026-09-10",
+            destination_id="1" * 32,
+            created_at="2026-09-09T00:00:11Z",
+        ).intent_ids
+        == result.intent_ids
+    )
+
+
+def test_concurrent_claim_uses_lease_and_state_version_cas(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    intent = store.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:10Z",
+    )
+    winner = store.claim_due(worker_id="worker-a", now="2026-09-09T00:01:00Z", lease_seconds=900)
+    assert isinstance(winner, ReplicationClaim)
+    assert winner.intent_id == intent.intent_ids[0]
+    with pytest.raises(ReplicationCASConflict):
+        store.transition(
+            intent_id=intent.intent_ids[0],
+            worker_id="worker-b",
+            expected_state_version=winner.state_version,
+            to_state="verifying",
+            now="2026-09-09T00:01:01Z",
+        )
+    reclaimed = store.claim_due(worker_id="worker-b", now="2026-09-09T00:17:00Z", lease_seconds=900)
+    assert reclaimed is not None
+    assert reclaimed.state_version > winner.state_version
+    with pytest.raises(ReplicationCASConflict):
+        store.transition(
+            intent_id=intent.intent_ids[0],
+            worker_id="worker-a",
+            expected_state_version=winner.state_version,
+            to_state="verifying",
+            now="2026-09-09T00:17:00Z",
+        )
+
+
+def test_multiprocess_claim_has_one_winner_and_no_provider_requests(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    store.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_sidecar_process,
+            args=(str(store.path), f"worker-{index}", queue),
+        )
+        for index in (1, 2)
+    ]
+    for process in processes:
+        process.start()
+    results = [queue.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert sum(result[0] == "claimed" for result in results) == 1
+    assert sum(result[0] == "none" for result in results) == 1
+    assert all(result[0] != "error" for result in results)
+    assert store.read_status().provider_requests == 0
+
+
+def test_retry_schedule_and_dead_letter_are_bounded(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    intent = store.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    now = "2026-09-09T00:00:00Z"
+    for attempt, delay in enumerate((60, 300, 1800, 7200, 43200), start=1):
+        claim = store.claim_due(worker_id=f"worker-{attempt}", now=now, lease_seconds=900)
+        assert claim is not None
+        next_state = store.transition(
+            intent_id=intent.intent_ids[0],
+            worker_id=f"worker-{attempt}",
+            expected_state_version=claim.state_version,
+            to_state="retry_wait",
+            reason_code="DESTINATION_UNAVAILABLE",
+            now=now,
+        )
+        assert next_state.current_state == "retry_wait"
+        now = next_state.next_attempt_at
+        assert next_state.retry_delay_seconds == delay
+    claim = store.claim_due(worker_id="worker-6", now=now, lease_seconds=900)
+    assert claim is not None
+    terminal = store.transition(
+        intent_id=intent.intent_ids[0],
+        worker_id="worker-6",
+        expected_state_version=claim.state_version,
+        to_state="dead_letter",
+        reason_code="DESTINATION_UNAVAILABLE",
+        now=now,
+    )
+    assert terminal.current_state == "dead_letter"
+    assert terminal.attempt == 6
+    assert store.read_status().dead_letter_count == 1
+
+
+def test_nonretryable_failure_terminalizes_without_retry(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    intent = store.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    claim = store.claim_due(worker_id="worker-a", now="2026-09-09T00:00:00Z")
+    assert claim is not None
+    terminal = store.transition(
+        intent_id=intent.intent_ids[0],
+        worker_id="worker-a",
+        expected_state_version=claim.state_version,
+        to_state="dead_letter",
+        reason_code="DESTINATION_TRUST_FAILED",
+        now="2026-09-09T00:00:01Z",
+    )
+    assert terminal.current_state == "dead_letter"
+    assert terminal.last_reason_code == "DESTINATION_TRUST_FAILED"
+
+
+def test_terminal_audit_is_retained(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    intent = store.enqueue_checkpoint(
+        record.checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    claim = store.claim_due(worker_id="worker-a", now="2026-09-09T00:00:00Z")
+    assert claim is not None
+    store.transition(
+        intent_id=intent.intent_ids[0],
+        worker_id="worker-a",
+        expected_state_version=claim.state_version,
+        to_state="dead_letter",
+        reason_code="DESTINATION_TRUST_FAILED",
+        now="2026-09-09T00:00:01Z",
+    )
+    status = store.read_status()
+    assert status.dead_letter_count == 1
+    connection = _latest_generation_connection(store.path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM replication_attempt_events WHERE intent_id = ?",
+            (intent.intent_ids[0],),
+        ).fetchone() == (3,)
+    finally:
+        connection.close()
+
+
+def test_reconcile_current_checkpoint_without_provider(tmp_path: Path) -> None:
+    store = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    store.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    record = _checkpoint_for_journal()
+    result = store.reconcile(
+        record,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        now="2026-09-09T00:00:00Z",
+    )
+    assert result.intent_ids
+    assert result.provider_requests == 0
+
+
+def test_checkpoint_journal_import_is_sorted_idempotent_before_removal(tmp_path: Path) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    journal_root = tmp_path / "control" / "replication-journal"
+    first = _checkpoint_for_journal(source_published_at="2026-09-09T00:00:00Z")
+    second = _checkpoint_for_journal(source_published_at="2026-09-09T00:00:01Z")
+    first.install(journal_root)
+    second.install(journal_root)
+    result = sidecar.import_journal_files(
+        journal_root,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:01:00Z",
+    )
+    assert result.source_sequences == (1, 2)
+    assert list(journal_root.iterdir()) == []
+    # A crash before cleanup leaves the same journals safe to re-import.  The
+    # already committed generation is reused and no extra generation appears.
+    generation_count = len(list(sidecar.path.glob("[0-9]*.db")))
+    assert (
+        sidecar.import_journals(
+            [first, second],
+            operation_day="2026-09-10",
+            destination_id="1" * 32,
+            created_at="2026-09-09T00:02:00Z",
+        ).imported_count
+        == 0
+    )
+    assert len(list(sidecar.path.glob("[0-9]*.db"))) == generation_count
+
+
+def test_operation_day_is_scheduling_metadata_not_intent_identity(tmp_path: Path) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    checkpoint = _checkpoint_for_journal().checkpoint_projection
+    first = sidecar.enqueue_checkpoint(
+        checkpoint,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    second = sidecar.enqueue_checkpoint(
+        checkpoint,
+        operation_day="2026-09-10",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:01:00Z",
+    )
+    assert second.intent_ids == first.intent_ids
+    assert second.imported_count == 0
+    assert sidecar.get_intent(first.intent_ids[0]).operation_day == "2026-09-09"
+
+
+def test_outbox_transaction_crash_before_generation_install_preserves_prior_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in sidecar.path.iterdir()}
+
+    def crash_before_install(*args: object, **kwargs: object) -> None:
+        raise ReplicationDurabilityError("injected generation crash")
+
+    monkeypatch.setattr(replication, "_install_generation", crash_before_install)
+    with pytest.raises(ReplicationDurabilityError, match="injected generation crash"):
+        sidecar.enqueue_checkpoint(
+            _checkpoint_for_journal().checkpoint_projection,
+            operation_day="2026-09-09",
+            destination_id="1" * 32,
+            created_at="2026-09-09T00:00:00Z",
+        )
+    assert {
+        path.name: (path.stat().st_ino, path.read_bytes()) for path in sidecar.path.iterdir()
+    } == before
+    assert sidecar.read_status().pending_count == 0
+
+
+def test_disabled_outbox_operation_is_zero_write(tmp_path: Path) -> None:
+    path = tmp_path / "control" / "replication-sidecar"
+    result = replication.ReplicationOutboxService(path, enabled=False).enqueue(
+        _checkpoint_for_journal().checkpoint_projection,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+    )
+    assert result.status == "disabled"
+    assert result.provider_requests == 0
+    assert not path.exists()
 
 
 def test_sidecar_sqlite_engine_uses_memory_only(
