@@ -5106,6 +5106,46 @@ def _destination_list_files(dir_fd: int, prefix: str = "") -> set[str]:
     return found
 
 
+def _destination_tree_entries(
+    dir_fd: int, prefix: str = ""
+) -> tuple[set[str], set[str]]:
+    """Return the complete descriptor-bound tree, rejecting links and odd files."""
+    files: set[str] = set()
+    directories: set[str] = set()
+    try:
+        names = os.listdir(dir_fd)
+    except OSError as exc:
+        raise ReplicationStateUnavailable("destination staging listing is unavailable") from exc
+    for name in names:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ReplicationStateUnavailable("destination staging entry is unsafe")
+        relative = f"{prefix}/{name}" if prefix else name
+        try:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ReplicationStateUnavailable("destination staging entry is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ReplicationStateUnavailable("destination staging entry is a symlink")
+        if stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise ReplicationStateUnavailable("destination staging file is hard-linked")
+            files.add(relative)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise ReplicationStateUnavailable("destination staging entry type is invalid")
+        directories.add(relative)
+        child = _destination_open_dir(dir_fd, name)
+        try:
+            child_files, child_directories = _destination_tree_entries(child, relative)
+            files.update(child_files)
+            directories.update(child_directories)
+        finally:
+            failures: list[str] = []
+            _close_fd_best_effort(child, "destination_staging_child_fd", failures)
+            _finish_cleanup(None, failures)
+    return files, directories
+
+
 def _destination_mkdir_at(parent_fd: int, name: str) -> int:
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
@@ -7918,6 +7958,15 @@ class RestoreReport(BaseModel):
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
     source_record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_manifest_canonical_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_object_set_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    publication_binding_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     source_sequence: int = Field(ge=1)
     checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -7928,6 +7977,7 @@ class RestoreReport(BaseModel):
     reason_code: ReplicationReason
     started_at: str
     completed_at: str
+    effects: ReplicationEffects
     report_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
     _timestamps_are_utc = field_validator("started_at", "completed_at")(
@@ -7940,6 +7990,32 @@ class RestoreReport(BaseModel):
         expected = domain_sha256("stock-eva/r2f4.3/restore-report/v1", values)
         if actual != expected:
             raise ReplicationDurabilityError("restore report hash is invalid")
+
+
+class RestoreAuditStore:
+    """Explicit local control-root store for sanitized execute reports."""
+
+    def __init__(self, root: Path) -> None:
+        root = Path(root)
+        if not root.is_absolute() or root == Path("/") or root == Path.home():
+            raise ReplicationDurabilityError("restore audit root is unsafe")
+        raw = str(root)
+        if any(token in raw for token in ("$", "~", "`")):
+            raise ReplicationDurabilityError("restore audit root is unsafe")
+        self.root = _physical_path(root)
+
+    def ensure_ready(self) -> None:
+        """Create/open only the explicitly configured local control root."""
+        fd, descriptors = _open_directory_chain(self.root, create=True)
+        failures: list[str] = []
+        _close_descriptors(descriptors, failures)
+        _finish_cleanup(None, failures)
+
+    def write(self, report: RestoreReport) -> None:
+        report.verify_hash()
+        self.ensure_ready()
+        payload = canonical_json_bytes(report.model_dump(mode="json"))
+        _install_no_replace(self.root / f"{report.report_id}.json", payload)
 
 
 def _restore_destination_path(
@@ -7975,29 +8051,153 @@ def _restore_destination_path(
     raise ReplicationDurabilityError("restore destination already exists")
 
 
-def _validate_staged_restore_dataset(
-    stage: Path,
+def _validate_restore_descriptor_roots(
+    destination: Path,
+    *,
+    archive_root: Path,
+    canonical_roots: Iterable[Path],
+) -> None:
+    """Prove protected-root ancestry by descriptor identity, including aliases."""
+    roots = (Path(archive_root), *(Path(item) for item in canonical_roots))
+    protected: list[tuple[tuple[int, int], set[tuple[int, int]]]] = []
+    for root in roots:
+        current = Path(root.anchor)
+        for component in root.parts[1:]:
+            current /= component
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ReplicationDurabilityError("restore root symlink is unsafe")
+        root_fd, descriptors = _open_directory_chain(root, create=False)
+        try:
+            identities = {
+                (int(os.fstat(fd).st_dev), int(os.fstat(fd).st_ino)) for fd in descriptors
+            }
+            protected.append(
+                ((int(os.fstat(root_fd).st_dev), int(os.fstat(root_fd).st_ino)), identities)
+            )
+        finally:
+            failures: list[str] = []
+            _close_descriptors(descriptors, failures)
+            _finish_cleanup(None, failures)
+    for index, (root_identity, identities) in enumerate(protected):
+        for other_root, other_identities in protected[index + 1 :]:
+            if root_identity in other_identities or other_root in identities:
+                raise ReplicationDurabilityError("protected roots overlap")
+    parent_fd, parent_descriptors = _open_directory_chain(destination.parent, create=False)
+    try:
+        destination_ancestry = {
+            (int(os.fstat(fd).st_dev), int(os.fstat(fd).st_ino))
+            for fd in parent_descriptors
+        }
+        if any(root_identity in destination_ancestry for root_identity, _ in protected):
+            raise ReplicationDurabilityError("restore destination overlaps a protected root")
+    finally:
+        failures = []
+        _close_descriptors(parent_descriptors, failures)
+        _finish_cleanup(None, failures)
+
+
+def _validate_staged_restore_dataset_fd(
+    stage_fd: int,
     record: ReplicationRecord,
     manifest: bytes,
 ) -> None:
-    """Run the strict canonical schema/row/partition checks in staging only."""
+    """Validate staged parquet through descriptors, never an ambient path."""
     _validate_restore_manifest(manifest, record)
+    opened: list[int] = []
     try:
-        from backend.app.storage.dataset import NasMarketStore
+        import duckdb
 
-        for item in record.object_inventory:
-            if not item.relative_path.endswith(".parquet"):
-                raise ReplicationStateUnavailable("restore object is not parquet")
-            NasMarketStore._validate_parquet(
-                stage / item.relative_path,
-                item.row_count,
-                expected_source=item.source,
-                expected_trade_date=datetime.strptime(item.trade_date, "%Y-%m-%d").date(),
-            )
+        from backend.app.storage.dataset import _EXPECTED_PARQUET_TYPES
+
+        connection = duckdb.connect(":memory:")
+        try:
+            for item in record.object_inventory:
+                if not item.relative_path.endswith(".parquet"):
+                    raise ReplicationStateUnavailable("restore object is not parquet")
+                fd, dirs = _destination_open_relative_file(stage_fd, item.relative_path)
+                opened.append(fd)
+                try:
+                    info = os.fstat(fd)
+                    if info.st_nlink != 1 or info.st_size != item.size_bytes:
+                        raise ReplicationStateUnavailable("restore object size or link count changed")
+                    fd_path = f"/dev/fd/{fd}"
+                    schema = tuple(
+                        (row[0], row[1])
+                        for row in connection.execute(
+                            "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false)",
+                            [fd_path],
+                        ).fetchall()
+                    )
+                    if schema != tuple(_EXPECTED_PARQUET_TYPES.items()):
+                        raise ReplicationStateUnavailable("restore object schema is invalid")
+                    rows = int(
+                        connection.execute(
+                            "SELECT count(*) FROM read_parquet(?, hive_partitioning=false)",
+                            [fd_path],
+                        ).fetchone()[0]
+                    )
+                    invalid = int(
+                        connection.execute(
+                            """SELECT count(*) FROM read_parquet(?, hive_partitioning=false)
+                               WHERE source IS DISTINCT FROM ? OR trade_date IS DISTINCT FROM ?""",
+                            [fd_path, item.source, item.trade_date],
+                        ).fetchone()[0]
+                    )
+                    if rows != item.row_count or invalid:
+                        raise ReplicationStateUnavailable("restore object rows are invalid")
+                finally:
+                    failures: list[str] = []
+                    _close_fd_best_effort(fd, "restore_object_fd", failures)
+                    _close_descriptors(dirs, failures)
+                    _finish_cleanup(None, failures)
+                    opened.remove(fd)
+        finally:
+            connection.close()
     except ReplicationStateUnavailable:
         raise
     except Exception as exc:
         raise ReplicationStateUnavailable("restore object schema or rows are invalid") from exc
+    finally:
+        failures = []
+        _close_descriptors(opened, failures)
+        _finish_cleanup(None, failures)
+
+
+def _verify_staged_restore_tree(
+    stage_fd: int,
+    record: ReplicationRecord,
+    manifest: bytes,
+    sentinel: bytes,
+) -> None:
+    """Re-enumerate and prove the exact allowlisted tree immediately pre-rename."""
+    expected_files = {
+        DESTINATION_SENTINEL_NAME,
+        "manifest.json",
+        *(item.relative_path for item in record.object_inventory),
+    }
+    expected_directories = {
+        str(Path(item.relative_path).parent)
+        for item in record.object_inventory
+        if str(Path(item.relative_path).parent) != "."
+    }
+    files, directories = _destination_tree_entries(stage_fd)
+    if files != expected_files or directories != expected_directories:
+        raise ReplicationStateUnavailable("restore staging tree is not exact")
+    metadata = _destination_read_relative(stage_fd, DESTINATION_SENTINEL_NAME)
+    if metadata != sentinel:
+        raise ReplicationStateUnavailable("restore sentinel readback failed")
+    metadata = _destination_read_relative(stage_fd, "manifest.json")
+    if metadata != manifest:
+        raise ReplicationStateUnavailable("restore manifest readback failed")
+    for item in record.object_inventory:
+        payload = _destination_read_relative(stage_fd, item.relative_path)
+        if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+            raise ReplicationStateUnavailable("restore object hash or size readback failed")
+    _validate_staged_restore_dataset_fd(stage_fd, record, manifest)
 
 
 class RestoreService:
@@ -8010,10 +8210,22 @@ class RestoreService:
         mount_inspector: MountInspector | None = None,
         canonical_roots: Iterable[Path] = (),
         representative_query: object | None = None,
+        audit_store: RestoreAuditStore | Path | None = None,
+        audit_root: Path | None = None,
     ) -> None:
+        if audit_store is not None and audit_root is not None:
+            raise ReplicationDurabilityError("restore audit root is configured twice")
         self.reader = DestinationArchiveReader(archive, mount_inspector=mount_inspector)
         self.canonical_roots = tuple(Path(item) for item in canonical_roots)
         self.representative_query = representative_query
+        configured_audit = audit_store if audit_store is not None else audit_root
+        self.audit_store = (
+            configured_audit
+            if isinstance(configured_audit, RestoreAuditStore)
+            else RestoreAuditStore(Path(configured_audit))
+            if configured_audit is not None
+            else None
+        )
 
     def _plan_response(
         self,
@@ -8062,12 +8274,89 @@ class RestoreService:
             return "SYMLINK_UNSAFE"
         if "unsupported" in message or "mount" in message:
             return "MOUNT_UNSUPPORTED"
-        if "object" in message or "manifest" in message or "schema" in message:
+        if (
+            "object" in message
+            or "manifest" in message
+            or "schema" in message
+            or "staging" in message
+            or "tree" in message
+        ):
             return "VERIFY_FAILED"
         return "SOURCE_UNAVAILABLE"
 
     def _snapshot(self, generation: str | None) -> VerifiedArchiveSnapshot:
         return self.reader.read_verified_archive(generation=generation)
+
+    def _validate_audit_root(self, destination: Path) -> None:
+        if self.audit_store is None:
+            raise ReplicationDurabilityError("restore audit root is unavailable")
+        root = _physical_path(self.audit_store.root)
+        destination = _physical_path(destination)
+        protected = (
+            _physical_path(self.reader.descriptor.root_path),
+            *(_physical_path(item) for item in self.canonical_roots),
+        )
+        if any(
+            root == item or root in item.parents or item in root.parents for item in protected
+        ):
+            raise ReplicationDurabilityError("restore audit root overlaps protected data")
+        if root == destination or root in destination.parents or destination in root.parents:
+            raise ReplicationDurabilityError("restore audit root overlaps destination")
+        _safe_parent(root.parent)
+        _validate_restore_descriptor_roots(
+            root,
+            archive_root=self.reader.descriptor.root_path,
+            canonical_roots=self.canonical_roots,
+        )
+
+    @staticmethod
+    def _report(
+        snapshot: VerifiedArchiveSnapshot,
+        *,
+        destination_id: str,
+        effects: ReplicationEffects,
+        status: Literal["verified", "failed"],
+        reason_code: ReplicationReason,
+        started_at: str,
+        completed_at: str,
+    ) -> RestoreReport:
+        values: dict[str, object] = {
+            "report_schema": "stock-eva/r2f4.3/restore-report/v1",
+            "schema_version": 1,
+            "destination_id": destination_id,
+            "source_replication_generation": snapshot.record.replication_generation,
+            "source_record_sha256": snapshot.record.record_sha256,
+            "source_manifest_canonical_sha256": snapshot.record.source_manifest_canonical_sha256,
+            "source_object_set_sha256": snapshot.record.source_object_set_sha256,
+            "publication_binding_sha256": snapshot.record.publication_binding_sha256,
+            "source_instance_id": snapshot.record.source_instance_id,
+            "source_sequence": snapshot.record.source_sequence,
+            "checkpoint_id": snapshot.record.checkpoint_id,
+            "object_count": snapshot.record.object_count,
+            "row_count": snapshot.record.row_count,
+            "byte_count": snapshot.record.byte_count,
+            "verification_state": status,
+            "reason_code": reason_code,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "effects": effects.model_dump(mode="json"),
+        }
+        values["report_id"] = domain_sha256(
+            "stock-eva/r2f4.3/restore-report-id/v1",
+            {
+                "destination_id": destination_id,
+                "source_replication_generation": snapshot.record.replication_generation,
+                "source_record_sha256": snapshot.record.record_sha256,
+                "started_at": started_at,
+            },
+        )
+        values["report_sha256"] = domain_sha256(
+            "stock-eva/r2f4.3/restore-report/v1",
+            {**values, "report_id": values["report_id"]},
+        )
+        report = RestoreReport.model_validate(values)
+        report.verify_hash()
+        return report
 
     def plan(
         self,
@@ -8083,8 +8372,13 @@ class RestoreService:
             restore_writes=False,
         )
         try:
-            _restore_destination_path(
+            normalized = _restore_destination_path(
                 Path(destination),
+                archive_root=self.reader.descriptor.root_path,
+                canonical_roots=self.canonical_roots,
+            )
+            _validate_restore_descriptor_roots(
+                normalized,
                 archive_root=self.reader.descriptor.root_path,
                 canonical_roots=self.canonical_roots,
             )
@@ -8115,6 +8409,7 @@ class RestoreService:
         generation: str | None = None,
         representative_query: object | None = None,
     ) -> RestorePlanResponse:
+        started_at = _utc_now()
         effects = ReplicationEffects(
             writes=False,
             canonical_writes=False,
@@ -8122,6 +8417,15 @@ class RestoreService:
             outbox_writes=False,
             restore_writes=False,
         )
+        if self.audit_store is None:
+            return self._plan_response(
+                snapshot=None,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code="OUTBOX_DURABILITY_UNAVAILABLE",
+                effects=effects,
+            )
         destination = Path(destination)
         try:
             final = _restore_destination_path(
@@ -8129,6 +8433,23 @@ class RestoreService:
                 archive_root=self.reader.descriptor.root_path,
                 canonical_roots=self.canonical_roots,
             )
+            _validate_restore_descriptor_roots(
+                final,
+                archive_root=self.reader.descriptor.root_path,
+                canonical_roots=self.canonical_roots,
+            )
+            self._validate_audit_root(final)
+        except (ReplicationDurabilityError, ValueError, OSError) as exc:
+            return self._plan_response(
+                snapshot=None,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code=self._reason(exc),
+                effects=effects,
+            )
+        try:
+            self.audit_store.ensure_ready()
             snapshot = self._snapshot(generation)
         except (ReplicationDurabilityError, ValueError, OSError) as exc:
             return self._plan_response(
@@ -8145,6 +8466,9 @@ class RestoreService:
         stage_fd: int | None = None
         published = False
         restore_writes = False
+        cleanup_failed = False
+        result: RestorePlanResponse | None = None
+        reason_code: ReplicationReason = "NONE"
         try:
             try:
                 os.mkdir(stage_name, mode=0o700, dir_fd=parent_fd)
@@ -8187,16 +8511,20 @@ class RestoreService:
                     # immutable object has passed source and staging readback.
                     _destination_write_at(stage_fd, DESTINATION_SENTINEL_NAME, snapshot.sentinel_bytes)
                     _destination_write_at(stage_fd, "manifest.json", snapshot.manifest_bytes)
-                    _validate_staged_restore_dataset(
-                        final.parent / stage_name,
-                        snapshot.record,
-                        snapshot.manifest_bytes,
+                    _verify_staged_restore_tree(
+                        stage_fd, snapshot.record, snapshot.manifest_bytes, snapshot.sentinel_bytes
                     )
+                    stage_identity = _directory_fingerprint(os.fstat(stage_fd))
                     callback = representative_query or self.representative_query
                     if callback is not None:
                         if not callable(callback):
                             raise ReplicationDurabilityError("restore query validator is invalid")
                         callback(final.parent / stage_name)
+                    # The callback is untrusted and may mutate the staging
+                    # tree.  This descriptor proof is the final authority.
+                    _verify_staged_restore_tree(
+                        stage_fd, snapshot.record, snapshot.manifest_bytes, snapshot.sentinel_bytes
+                    )
                 finally:
                     failures = []
                     _close_descriptors(generation_dirs, failures)
@@ -8207,32 +8535,34 @@ class RestoreService:
             if fresh.record.record_sha256 != snapshot.record.record_sha256:
                 raise ReplicationStateUnavailable("restore source changed")
             _assert_directory_fingerprint(parent_fd, parent_identity)
+            _assert_directory_fingerprint(stage_fd, stage_identity)
             _fsync_open_directory(stage_fd)
-            os.close(stage_fd)
-            stage_fd = None
             _fsync_open_directory(parent_fd)
             _destination_rename_noreplace(parent_fd, stage_name, final.name)
             published = True
             _fsync_open_directory(parent_fd)
-            # Post-rename verification is intentionally non-semantic: all
-            # schema/count/query gates completed before this exchange.
-            final_fd, final_dirs = _open_directory_chain(final, create=False)
+            # Keep the original staging fd across the exchange.  The final
+            # namespace proof uses the held parent fd and O_NOFOLLOW.
+            _assert_directory_fingerprint(stage_fd, stage_identity)
+            final_fd = os.open(final.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
             try:
-                result = _destination_read_at(final_fd, ("manifest.json",), require_private_mode=False)
-                if result is None or result[0] != snapshot.manifest_bytes:
-                    raise ReplicationStateUnavailable("restore publication readback changed")
+                if _directory_fingerprint(os.fstat(final_fd)) != stage_identity:
+                    raise ReplicationStateUnavailable("restore publication identity changed")
+                _verify_staged_restore_tree(
+                    final_fd, snapshot.record, snapshot.manifest_bytes, snapshot.sentinel_bytes
+                )
             finally:
                 failures = []
-                _close_descriptors(final_dirs, failures)
+                _close_fd_best_effort(final_fd, "restore_final_fd", failures)
                 _finish_cleanup(None, failures)
             effects = ReplicationEffects(
                 writes=True,
                 canonical_writes=False,
-                destination_writes=False,
+                destination_writes=True,
                 outbox_writes=False,
                 restore_writes=True,
             )
-            return self._plan_response(
+            result = self._plan_response(
                 snapshot=snapshot,
                 mode="execute",
                 allowed=True,
@@ -8242,19 +8572,20 @@ class RestoreService:
                 rename_allowed=True,
             )
         except Exception as exc:
+            reason_code = "CONTROL_STATE_UNAVAILABLE" if published else self._reason(exc)
             effects = ReplicationEffects(
                 writes=restore_writes,
                 canonical_writes=False,
-                destination_writes=False,
+                destination_writes=published,
                 outbox_writes=False,
                 restore_writes=restore_writes,
             )
-            return self._plan_response(
+            result = self._plan_response(
                 snapshot=snapshot,
                 mode="execute",
                 allowed=True,
                 status="unavailable",
-                reason_code=self._reason(exc),
+                reason_code=reason_code,
                 effects=effects,
             )
         finally:
@@ -8266,8 +8597,67 @@ class RestoreService:
                     _destination_remove_tree_at(parent_fd, stage_name)
                 except (ReplicationDurabilityError, OSError):
                     failures.append("restore_staging_cleanup")
+                    cleanup_failed = True
             _close_descriptors(parent_dirs, failures)
-            _finish_cleanup(None, failures)
+            try:
+                _finish_cleanup(None, failures)
+            except ReplicationDurabilityError:
+                cleanup_failed = True
+
+        if result is None:
+            # The bounded preflight above should make this unreachable, but a
+            # missing result is a control-state failure rather than readiness.
+            result = self._plan_response(
+                snapshot=snapshot,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                effects=effects,
+            )
+        if cleanup_failed and result.status == "ready":
+            effects = ReplicationEffects(
+                writes=True,
+                canonical_writes=False,
+                destination_writes=True,
+                outbox_writes=False,
+                restore_writes=True,
+            )
+            result = self._plan_response(
+                snapshot=snapshot,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                effects=effects,
+            )
+        report_reason = result.reason_code
+        report_status: Literal["verified", "failed"] = (
+            "verified" if result.status == "ready" else "failed"
+        )
+        try:
+            report = self._report(
+                snapshot,
+                destination_id=secrets.token_hex(16),
+                effects=result.effects,
+                status=report_status,
+                reason_code=report_reason,
+                started_at=started_at,
+                completed_at=_utc_now(),
+            )
+            self.audit_store.write(report)
+        except Exception:
+            # Audit failure is itself a control-state failure.  The report's
+            # primary status/reason was never exposed as a path or payload.
+            return self._plan_response(
+                snapshot=snapshot,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code="CONTROL_STATE_UNAVAILABLE",
+                effects=result.effects,
+            )
+        return result
 
     def nas_to_temporary_root(
         self,
@@ -8365,6 +8755,7 @@ __all__ = [
     "normalized_ddl_bytes",
     "RestorePlanResponse",
     "RestoreReport",
+    "RestoreAuditStore",
     "VerifiedArchiveSnapshot",
     "RestoreService",
     "VerifiedRestoreService",

@@ -8,6 +8,7 @@ import pytest
 import backend.app.storage.replication as replication
 from backend.app.storage.replication import (
     DestinationArchiveWriter,
+    RestoreAuditStore,
     RestoreService,
     build_source_checkpoint,
     canonical_json_bytes,
@@ -128,11 +129,24 @@ def test_restore_plan_is_zero_write_and_sanitized(tmp_path: Path) -> None:
     assert sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")) == before
 
 
+def test_execute_requires_explicit_audit_root_before_copy(tmp_path: Path) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+
+    result = RestoreService(archive).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "OUTBOX_DURABILITY_UNAVAILABLE"
+    assert not destination.exists()
+
+
 def test_verified_restore_publishes_once_after_all_semantic_checks(tmp_path: Path) -> None:
     archive, _descriptor, record = _archive(tmp_path)
     destination = tmp_path / "restore"
 
-    result = RestoreService(archive).execute(destination)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
 
     assert result.status == "ready"
     assert result.reason_code == "NONE"
@@ -159,7 +173,9 @@ def test_corrupt_archive_leaves_no_final_restore_root(tmp_path: Path) -> None:
     )
     (generation / "bars.parquet").write_bytes(b"corrupt")
 
-    result = RestoreService(archive).execute(destination)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
 
     assert result.status == "unavailable"
     assert result.reason_code in {"VERIFY_FAILED", "SOURCE_UNAVAILABLE"}
@@ -172,6 +188,7 @@ def test_restore_query_failure_is_before_visibility(tmp_path: Path) -> None:
 
     result = RestoreService(
         archive,
+        audit_store=RestoreAuditStore(tmp_path / "audit"),
         representative_query=lambda _root: (_ for _ in ()).throw(RuntimeError("query failed")),
     ).execute(destination)
 
@@ -194,11 +211,54 @@ def test_restore_final_exists_race_never_overwrites(
         original(parent_fd, source, target)
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", race)
-    result = RestoreService(archive).execute(destination)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
 
     assert result.status == "unavailable"
     assert result.reason_code in {"DESTINATION_CONFLICT", "PATH_CHANGED"}
     assert destination.read_text() == "attacker"
+
+
+def test_staging_extra_after_query_is_rejected_and_audit_is_sanitized(tmp_path: Path) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    audit = RestoreAuditStore(tmp_path / "audit")
+
+    def add_extra(stage: Path) -> None:
+        (stage / "unexpected.txt").write_text("not part of the inventory")
+
+    result = RestoreService(
+        archive, audit_store=audit, representative_query=add_extra
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "VERIFY_FAILED"
+    assert not destination.exists()
+    reports = list((tmp_path / "audit").glob("*.json"))
+    assert len(reports) == 1
+    report = reports[0].read_text()
+    assert str(tmp_path) not in report
+    assert "unexpected.txt" not in report
+
+
+def test_symlinked_canonical_root_is_rejected_without_copy(tmp_path: Path) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    alias = tmp_path / "canonical-alias"
+    alias.symlink_to(canonical, target_is_directory=True)
+    destination = tmp_path / "restore"
+
+    result = RestoreService(
+        archive,
+        canonical_roots=(alias,),
+        audit_store=RestoreAuditStore(tmp_path / "audit"),
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "SYMLINK_UNSAFE"
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("unsafe", [Path("relative"), Path("~")])
@@ -206,6 +266,8 @@ def test_restore_rejects_non_absolute_destination_without_writes(
     tmp_path: Path, unsafe: Path
 ) -> None:
     archive, _descriptor, _record = _archive(tmp_path)
-    result = RestoreService(archive).execute(unsafe)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(unsafe)
     assert result.status == "unavailable"
     assert result.reason_code == "PATH_INVALID"
