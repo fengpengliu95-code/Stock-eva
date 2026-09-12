@@ -622,6 +622,8 @@ real passing test/static check before an implementation release is considered.
 | FR-25 | `tests/test_dataset_replication.py::test_nas_unavailable_does_not_change_local_ready_or_pointer` |
 | FR-26 | `tests/test_dataset_replication.py::test_replication_evidence_replays_without_provider` |
 | FR-27 | `tests/test_nas_dataset.py::test_verified_local_mirror_is_idempotent_and_manifest_readable` |
+| FR-28 | `tests/test_replication_destination_batch3.py::test_head_history_three_updates_retain_predecessors_in_fixed_slots` |
+| FR-29 | `tests/test_replication_destination_batch3.py::test_head_history_concurrent_same_sequence_has_one_immutable_winner` |
 | AC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | AC-2 | `tests/test_dataset_replication.py::test_publication_is_atomic_under_one_manifest_publication_lock` |
 | AC-3 | `tests/test_dataset_replication.py::test_pointer_unchanged_after_binding_crash_is_recoverable` |
@@ -650,6 +652,9 @@ real passing test/static check before an implementation release is considered.
 | AC-26 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure`; `tests/test_market_backfill.py::test_cli_nas_lineage_gap_or_extra_is_zero_provider_zero_write` |
 | AC-27 | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
 | AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence`; `tests/test_market_backfill.py::test_cli_nas_valid_lineage_all_dates_admitted_before_first_provider_fetch` |
+| AC-29 | `tests/test_replication_destination_batch3.py::test_head_history_three_updates_retain_predecessors_in_fixed_slots` |
+| AC-30 | `tests/test_replication_destination_batch3.py::test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume` |
+| AC-31 | `tests/test_replication_destination_batch3.py::test_head_history_post_exchange_crash_is_resumable_without_residue` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | EC-2 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
 | EC-3 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
@@ -687,6 +692,40 @@ real passing test/static check before an implementation release is considered.
 | EC-35 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_failure_preserves_manifest_and_pointer`; `tests/test_market_backfill.py::test_backfill_service_dataset_preflight_fails_before_audit_or_provider` |
 | EC-36 | `tests/test_dataset_replication.py::test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance` |
 | EC-37 | `tests/test_dataset_replication.py::test_missing_lineage_reader_returns_source_unavailable_before_mutation` |
+| EC-38 | `tests/test_replication_destination_batch3.py::test_head_history_slot_tamper_and_gap_fail_closed_without_unlink` |
+| EC-39 | `tests/test_replication_destination_batch3.py::test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume` |
+| EC-40 | `tests/test_replication_destination_batch3.py::test_head_history_post_exchange_crash_is_resumable_without_residue` |
+
+> Final Batch3.8 precedence: the deterministic `head-history/slot-<20 digits>.json` contract
+> above is authoritative for all head publication and recovery behavior; older Batch3.4-Batch3.7
+> random-residue/unlink wording is historical and superseded.
+
+#### Batch3.8 immutable deterministic head history (normative)
+
+This amendment supersedes the Batch3.6 and Batch3.7 temporary-head-residue cleanup contracts
+below wherever they permit random `.head.json.*` names or unlink-based recovery.
+
+The mutable head projection is backed by the fixed allowlisted directory
+`_replication/head-history/`. Its only entries are regular mode-0600 files named exactly
+`slot-<20 decimal digits>.json`; arbitrary temporary head names, random aliases and automatic
+unlink recovery are forbidden. A first publication writes and fsyncs `slot-00000000000000000001.json`
+with the canonical head bytes, then installs `head.json` with an exclusive no-replace hard link.
+For source sequence `N > 1`, the writer pre-seals `slot-N` with the new canonical head and then
+atomically exchanges that slot with `head.json` across the held directory descriptors. The
+exchange leaves the old head permanently retained in `slot-N`; slots `1` and `2` therefore both
+refer to the genesis head after the second publication, while each later slot retains the
+immediately preceding head. No slot is ever rewritten or deleted.
+
+Readers validate the complete continuous chain before trusting `head.json`: exact slot names and
+permissions, no symlinks or extras, canonical JSON and head hashes, descriptor identity, record
+identity, parent hashes, source instance identity, source sequence and head-version continuity.
+The visible chain must contain records and slots for every sequence from one through the current
+head, with at most one explicit next-sequence presealed slot accepted only by a locked writer
+resuming a crash. Missing, unknown, gapped, tampered, replaced or symlinked slots fail closed.
+Pre-exchange crash state (sealed next slot plus old head) resumes through the same deterministic
+slot; post-exchange state (new head plus old head retained in that slot) is already committed and
+is read back without cleanup. The contract is offline-only and does not authorize real NAS,
+provider, restore or production operations.
 
 ## R2-F4.3.2 normative amendment — single-authority release-candidate closure
 

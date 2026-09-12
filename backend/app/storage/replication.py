@@ -22,7 +22,7 @@ import sqlite3
 import stat
 import sys
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -4558,9 +4558,11 @@ DESTINATION_DESCRIPTOR_NAME = ".stock-eva-replication-destination.json"
 DESTINATION_SENTINEL_NAME = ".stock-eva-dataset.json"
 DESTINATION_REPLICATION_DIR = "_replication"
 DESTINATION_HISTORY_DIR = "history"
+DESTINATION_HEAD_HISTORY_DIR = "head-history"
 DESTINATION_STAGING_DIR = ".staging"
 DESTINATION_LOCK_NAME = ".writer.lock"
 DESTINATION_INIT_ACK = "CREATE_EMPTY_NAS_ARCHIVE_R2F4_3"
+DESTINATION_HEAD_SLOT_PATTERN = r"slot-[0-9]{20}\.json"
 _DESTINATION_CONTROL_NAMES = frozenset(
     {
         DESTINATION_DESCRIPTOR_NAME,
@@ -5315,14 +5317,8 @@ def _destination_rename_noreplace(parent_fd: int, source: str, target: str) -> N
         raise ReplicationDurabilityError("destination generation cleanup failed") from exc
 
 
-def _destination_exchange(parent_fd: int, source: str, target: str) -> bool:
-    """Atomically swap a staged regular file with an existing target.
-
-    Head replacement is the only mutable destination projection.  It must not
-    use a path-based unconditional overwrite.  The native exchange primitive
-    preserves the target's atomic visibility and lets the caller unlink the
-    old bytes only after the swap and directory fsync.
-    """
+def _destination_exchange_at(source_fd: int, source: str, target_fd: int, target: str) -> bool:
+    """Atomically exchange two regular files through their held dirfds."""
     if not source or not target or "/" in source or "/" in target:
         raise ReplicationDurabilityError("destination head name is unsafe")
     try:
@@ -5342,9 +5338,9 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> bool:
         ]
         renameat2.restype = ctypes.c_int
         result = renameat2(
-            parent_fd,
+            source_fd,
             source.encode("utf-8"),
-            parent_fd,
+            target_fd,
             target.encode("utf-8"),
             0x00000002,  # RENAME_EXCHANGE
         )
@@ -5363,9 +5359,9 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> bool:
         ]
         renameatx_np.restype = ctypes.c_int
         result = renameatx_np(
-            parent_fd,
+            source_fd,
             source.encode("utf-8"),
-            parent_fd,
+            target_fd,
             target.encode("utf-8"),
             0x00000002,  # RENAME_SWAP
         )
@@ -5375,7 +5371,6 @@ def _destination_exchange(parent_fd: int, source: str, target: str) -> bool:
         if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOENT}:
             raise ReplicationDurabilityError("destination head exchange failed")
     raise ReplicationDurabilityError("destination head exchange unsupported")
-
 
 @contextmanager
 def _destination_root_session(
@@ -5551,10 +5546,11 @@ def initialize_destination(
     )
     replication_path = bound / DESTINATION_REPLICATION_DIR
     history = replication_path / DESTINATION_HISTORY_DIR
+    head_history = replication_path / DESTINATION_HEAD_HISTORY_DIR
     staging = replication_path / DESTINATION_STAGING_DIR
     # All ancestors are created by no-follow descriptor traversal; none of
     # these operations resolve a user-controlled pathname after validation.
-    for directory in (replication_path, history, staging):
+    for directory in (replication_path, history, head_history, staging):
         _fd, descriptors = _open_directory_chain(directory, create=True)
         failures: list[str] = []
         _close_descriptors(descriptors, failures)
@@ -5780,14 +5776,25 @@ class DestinationArchiveReader:
                 raise ReplicationStateUnavailable("destination sentinel schema is invalid")
             return SentinelProjection.model_validate(sentinel_values)
 
-    def read_head(self, root_dirfd: int | None = None) -> DestinationHead | None:
+    def read_head(
+        self,
+        root_dirfd: int | None = None,
+        *,
+        allow_pending_slot: bool = False,
+    ) -> DestinationHead | None:
         with self._root_or_bound(root_dirfd) as root_fd:
+            self._validate_replication_namespace(root_fd)
             result = _destination_read_at(
                 root_fd,
                 (DESTINATION_REPLICATION_DIR, "head.json"),
                 optional=True,
             )
             if result is None:
+                self._validate_head_history(
+                    root_fd,
+                    None,
+                    allow_pending_slot=allow_pending_slot,
+                )
                 return None
             payload, _ = result
             try:
@@ -5803,7 +5810,316 @@ class DestinationArchiveReader:
                 or head.descriptor_sha256 != self.descriptor.descriptor_sha256
             ):
                 raise ReplicationStateUnavailable("destination head trust identity is invalid")
+            self._validate_head_history(
+                root_fd,
+                head,
+                allow_pending_slot=allow_pending_slot,
+            )
             return head
+
+    def _validate_replication_namespace(self, root_fd: int) -> None:
+        """Reject random head residues and unknown replication entries."""
+        replication_fd, dirs = _destination_open_dirs(root_fd, (DESTINATION_REPLICATION_DIR,))
+        primary: BaseException | None = None
+        try:
+            allowed = {
+                DESTINATION_LOCK_NAME,
+                DESTINATION_HISTORY_DIR,
+                DESTINATION_HEAD_HISTORY_DIR,
+                DESTINATION_STAGING_DIR,
+                "head.json",
+            }
+            names = os.listdir(replication_fd)
+            for name in names:
+                if name not in allowed:
+                    raise ReplicationStateUnavailable(
+                        "destination replication namespace contains an unknown entry"
+                    )
+                info = os.stat(name, dir_fd=replication_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise ReplicationStateUnavailable(
+                        "destination replication namespace contains a symlink"
+                    )
+                if name in {
+                    DESTINATION_HISTORY_DIR,
+                    DESTINATION_HEAD_HISTORY_DIR,
+                    DESTINATION_STAGING_DIR,
+                }:
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ReplicationStateUnavailable(
+                            "destination replication namespace directory is invalid"
+                        )
+                elif name == "head.json" or name == DESTINATION_LOCK_NAME:
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ReplicationStateUnavailable(
+                            "destination replication namespace file is invalid"
+                        )
+        except ReplicationStateUnavailable as exc:
+            primary = exc
+            raise
+        except OSError as exc:
+            primary = ReplicationStateUnavailable(
+                "destination replication namespace is unavailable"
+            )
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(primary, failures)
+
+    def _validate_head_history(
+        self,
+        root_fd: int,
+        current_head: DestinationHead | None,
+        *,
+        allow_pending_slot: bool = False,
+        history_records: tuple[ReplicationRecord, ...] | None = None,
+    ) -> None:
+        """Validate deterministic immutable head-history slots end-to-end."""
+        if history_records is None:
+            history_records = self.list_verified_records(root_fd)
+        records_by_sequence: dict[int, ReplicationRecord] = {}
+        for record in history_records:
+            if record.source_sequence in records_by_sequence:
+                raise ReplicationStateUnavailable(
+                    "destination head history has duplicate source sequence"
+                )
+            records_by_sequence[record.source_sequence] = record
+
+        head_history_fd, dirs = _destination_open_dirs(
+            root_fd, (DESTINATION_REPLICATION_DIR, DESTINATION_HEAD_HISTORY_DIR)
+        )
+        primary: BaseException | None = None
+        try:
+            names = os.listdir(head_history_fd)
+            slot_sequences: dict[int, str] = {}
+            for name in names:
+                if not re.fullmatch(DESTINATION_HEAD_SLOT_PATTERN, name):
+                    raise ReplicationStateUnavailable("destination head history entry is unknown")
+                info = os.stat(name, dir_fd=head_history_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise ReplicationStateUnavailable("destination head history entry is unsafe")
+                if stat.S_IMODE(info.st_mode) != 0o600:
+                    raise ReplicationStateUnavailable(
+                        "destination head history entry mode is invalid"
+                    )
+                sequence = int(name[5:25])
+                if sequence < 1 or sequence in slot_sequences:
+                    raise ReplicationStateUnavailable("destination head history slot is duplicated")
+                slot_sequences[sequence] = name
+
+            current_sequence = current_head.source_sequence if current_head is not None else 0
+            expected_sequences = set(range(1, current_sequence + 1))
+            actual_sequences = set(slot_sequences)
+            pending_sequence = current_sequence + 1
+            if allow_pending_slot and pending_sequence in actual_sequences:
+                pending = {pending_sequence}
+                if len(actual_sequences - expected_sequences) != 1:
+                    raise ReplicationStateUnavailable(
+                        "destination head history has ambiguous pending slot"
+                    )
+                actual_sequences -= pending
+            elif actual_sequences - expected_sequences:
+                raise ReplicationStateUnavailable(
+                    "destination head history has an incomplete pending slot"
+                )
+            if actual_sequences != expected_sequences:
+                raise ReplicationStateUnavailable("destination head history has a gap")
+
+            # A complete reader view contains exactly the records represented by
+            # the visible slot chain.  The only exception is the one deterministic
+            # presealed next record, which a locked writer may resume.  Random
+            # orphan generations are never silently ignored.
+            record_sequences = set(records_by_sequence)
+            expected_record_sequences = set(expected_sequences)
+            if allow_pending_slot and pending_sequence in slot_sequences:
+                expected_record_sequences.add(pending_sequence)
+            if record_sequences != expected_record_sequences:
+                raise ReplicationStateUnavailable(
+                    "destination head history records are incomplete or contain an orphan"
+                )
+            for sequence in sorted(expected_record_sequences):
+                record = records_by_sequence[sequence]
+                if sequence == 1:
+                    if record.parent_record_hash != ZERO_SHA256:
+                        raise ReplicationStateUnavailable(
+                            "destination head history genesis parent is invalid"
+                        )
+                    continue
+                predecessor_record = records_by_sequence.get(sequence - 1)
+                if (
+                    predecessor_record is None
+                    or record.parent_record_hash != predecessor_record.record_sha256
+                    or record.source_instance_id != predecessor_record.source_instance_id
+                    or record.source_instance_sha256 != predecessor_record.source_instance_sha256
+                ):
+                    raise ReplicationStateUnavailable(
+                        "destination head history record parent is invalid"
+                    )
+
+            parsed_slots: dict[int, tuple[DestinationHead, os.stat_result, bytes]] = {}
+            for sequence, name in slot_sequences.items():
+                if sequence == pending_sequence and sequence not in expected_sequences:
+                    if not allow_pending_slot:
+                        raise ReplicationStateUnavailable(
+                            "destination head history has an incomplete pending slot"
+                        )
+                result = _destination_read_at(head_history_fd, (name,))
+                if result is None:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot is unavailable"
+                    )
+                payload, info = result
+                try:
+                    slot = DestinationHead.model_validate(json.loads(payload))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot is invalid"
+                    ) from exc
+                if canonical_json_bytes(slot.model_dump(mode="json")) != payload:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot is not canonical"
+                    )
+                try:
+                    slot.verify_hash()
+                except ReplicationDurabilityError as exc:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot hash is invalid"
+                    ) from exc
+                if (
+                    slot.destination_id != self.descriptor.destination_id
+                    or slot.descriptor_sha256 != self.descriptor.descriptor_sha256
+                ):
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot trust identity is invalid"
+                    )
+                parsed_slots[sequence] = (slot, info, payload)
+
+            def verify_projection(slot: DestinationHead, record: ReplicationRecord) -> None:
+                expected = _destination_head(
+                    self.descriptor,
+                    record,
+                    head_version=slot.head_version,
+                    updated_at=slot.updated_at,
+                )
+                if expected != slot:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot projection is invalid"
+                    )
+
+            for sequence in sorted(expected_sequences):
+                slot, _info, _payload = parsed_slots[sequence]
+                record_sequence = sequence if sequence == 1 else sequence - 1
+                record = records_by_sequence.get(record_sequence)
+                if record is None:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot record is missing"
+                    )
+                if slot.source_sequence != record_sequence:
+                    raise ReplicationStateUnavailable(
+                        "destination head history slot sequence is invalid"
+                    )
+                verify_projection(slot, record)
+
+            if current_head is not None:
+                current_record = records_by_sequence.get(current_head.source_sequence)
+                if current_record is None:
+                    raise ReplicationStateUnavailable(
+                        "destination head history current record is missing"
+                    )
+                verify_projection(current_head, current_record)
+                if current_head.head_version != current_head.source_sequence:
+                    raise ReplicationStateUnavailable("destination head history version is invalid")
+                if current_head.source_sequence == 1:
+                    slot, slot_info, slot_payload = parsed_slots[1]
+                    replication_fd = dirs[0]
+                    head_info = os.stat("head.json", dir_fd=replication_fd, follow_symlinks=False)
+                    if (
+                        slot.source_sequence != 1
+                        or slot_payload
+                        != canonical_json_bytes(current_head.model_dump(mode="json"))
+                        or slot_info.st_ino != head_info.st_ino
+                        or slot_info.st_dev != head_info.st_dev
+                        or slot_info.st_nlink != 2
+                        or head_info.st_nlink != 2
+                    ):
+                        raise ReplicationStateUnavailable(
+                            "destination head history genesis hardlink is invalid"
+                        )
+                elif 2 in parsed_slots:
+                    first_slot, first_info, first_payload = parsed_slots[1]
+                    second_slot, second_info, second_payload = parsed_slots[2]
+                    if (
+                        first_payload != second_payload
+                        or first_info.st_ino != second_info.st_ino
+                        or first_info.st_dev != second_info.st_dev
+                        or first_info.st_nlink != 2
+                        or second_info.st_nlink != 2
+                    ):
+                        raise ReplicationStateUnavailable(
+                            "destination head history genesis hardlink is invalid"
+                        )
+                    if first_slot != second_slot:
+                        raise ReplicationStateUnavailable(
+                            "destination head history genesis projection is inconsistent"
+                        )
+
+                if current_head.source_sequence >= 2:
+                    predecessor = parsed_slots[current_head.source_sequence][0]
+                    if (
+                        predecessor.source_sequence != current_head.source_sequence - 1
+                        or current_head.parent_record_hash != predecessor.record_sha256
+                        or current_head.source_instance_id != predecessor.source_instance_id
+                        or current_head.source_instance_sha256 != predecessor.source_instance_sha256
+                    ):
+                        raise ReplicationStateUnavailable(
+                            "destination head history current parent is invalid"
+                        )
+            if allow_pending_slot and pending_sequence in parsed_slots:
+                candidate, _info, _payload = parsed_slots[pending_sequence]
+                record = records_by_sequence.get(pending_sequence)
+                if record is None:
+                    raise ReplicationStateUnavailable(
+                        "destination head history pending record is missing"
+                    )
+                verify_projection(candidate, record)
+                if candidate.source_sequence != pending_sequence:
+                    raise ReplicationStateUnavailable(
+                        "destination head history pending sequence is invalid"
+                    )
+                if current_head is None:
+                    if (
+                        candidate.head_version != 1
+                        or candidate.parent_record_hash != ZERO_SHA256
+                        or candidate.source_sequence != 1
+                    ):
+                        raise ReplicationStateUnavailable(
+                            "destination head history pending genesis is invalid"
+                        )
+                elif (
+                    pending_sequence != current_head.source_sequence + 1
+                    or candidate.head_version != current_head.head_version + 1
+                    or candidate.parent_record_hash != current_head.record_sha256
+                    or candidate.source_instance_id != current_head.source_instance_id
+                    or candidate.source_instance_sha256 != current_head.source_instance_sha256
+                    or record.parent_record_hash != current_head.record_sha256
+                    or record.source_sequence != current_head.source_sequence + 1
+                    or record.source_instance_id != current_head.source_instance_id
+                    or record.source_instance_sha256 != current_head.source_instance_sha256
+                ):
+                    raise ReplicationStateUnavailable(
+                        "destination head history pending parent is invalid"
+                    )
+        except ReplicationStateUnavailable as exc:
+            primary = exc
+            raise
+        except OSError as exc:
+            primary = ReplicationStateUnavailable("destination head history is unavailable")
+            raise primary from exc
+        finally:
+            failures: list[str] = []
+            _close_descriptors(dirs, failures)
+            _finish_cleanup(primary, failures)
 
     def _open_generation(self, root_fd: int, generation: str) -> tuple[int, list[int]]:
         if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation):
@@ -5978,10 +6294,11 @@ class DestinationArchiveReader:
         state_version: int | None = None,
         destination_generation: str | None = None,
         now: str | None = None,
+        allow_pending_slot: bool = False,
     ) -> VerifiedDestinationCommitProof:
         with self.root_session() as root_fd:
             self.read_sentinel(root_fd)
-            head = self.read_head(root_fd)
+            head = self.read_head(root_fd, allow_pending_slot=allow_pending_slot)
             if head is None:
                 raise ReplicationStateUnavailable("destination head is unavailable")
             if head.checkpoint_id != checkpoint_id or head.source_sequence != source_sequence:
@@ -6420,7 +6737,6 @@ class DestinationArchiveWriter:
         proof_state_version = claim_context.state_version if claim_context is not None else None
         head_committed = False
         destination_write_started = False
-        head_cleanup_boundary_started = False
 
         def mark_effect() -> None:
             """Record an effect monotonically, including outer cleanup failures."""
@@ -6438,13 +6754,25 @@ class DestinationArchiveWriter:
             persisted = _destination_verify_persisted_descriptor(self.descriptor, root_fd)
             _destination_live_mount_identity(persisted, root_fd, self.mount_inspector)
 
-        def install_head(payload: bytes, *, expected: bytes | None) -> None:
-            """Install head through one linearization-aware wrapper."""
+        def install_head(
+            payload: bytes,
+            *,
+            expected: bytes | None,
+            slot_name: str,
+        ) -> None:
+            """Publish a presealed deterministic head-history slot."""
             nonlocal head_committed
+            head_history_fd = _destination_open_dir(
+                replication_fd, DESTINATION_HEAD_HISTORY_DIR
+            )
+            cleanup_failures: list[str] = []
+            completed = False
+            outcome: DestinationHeadInstallResult | None = None
             try:
-                outcome = _destination_replace_at(
+                outcome = _destination_install_head_from_slot(
                     replication_fd,
-                    "head.json",
+                    head_history_fd,
+                    slot_name,
                     payload,
                     expected=expected,
                 )
@@ -6453,6 +6781,9 @@ class DestinationArchiveWriter:
                         "destination head install did not linearize",
                         linearized=False,
                     )
+                completed = True
+                head_committed = True
+                mark_effect()
             except DestinationHeadInstallError as exc:
                 if exc.cleanup_failed:
                     effect_context.cleanup_failed = True
@@ -6460,8 +6791,73 @@ class DestinationArchiveWriter:
                     head_committed = True
                     mark_effect()
                 raise
-            head_committed = True
-            mark_effect()
+            finally:
+                _close_fd_best_effort(
+                    head_history_fd, "destination_head_history_fd", cleanup_failures
+                )
+                if cleanup_failures:
+                    effect_context.cleanup_failed = True
+                    if completed:
+                        raise DestinationHeadInstallError(
+                            "destination head descriptor cleanup failed",
+                            linearized=bool(outcome and outcome.linearized),
+                            cleanup_failed=True,
+                        )
+
+        def prepare_head_slot(head: DestinationHead) -> tuple[str, bytes]:
+            """Create or reuse the fixed, pre-fsynced candidate slot."""
+            payload = canonical_json_bytes(head.model_dump(mode="json"))
+            slot_name = _destination_head_slot_name(head.source_sequence)
+            head_history_fd = _destination_open_dir(
+                replication_fd, DESTINATION_HEAD_HISTORY_DIR
+            )
+            cleanup_failures: list[str] = []
+            try:
+                try:
+                    created = _destination_write_head_slot(
+                        head_history_fd, slot_name, payload
+                    )
+                except ReplicationCASConflict:
+                    # A crash can leave a fully sealed deterministic candidate
+                    # with an earlier ``updated_at``.  Reuse it only when its
+                    # canonical projection is exactly the same immutable
+                    # record/head identity; never rewrite a slot in place.
+                    existing = _destination_read_at(head_history_fd, (slot_name,))
+                    if existing is None:
+                        raise
+                    try:
+                        existing_head = DestinationHead.model_validate(
+                            json.loads(existing[0])
+                        )
+                        existing_head.verify_hash()
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise ReplicationCASConflict(
+                            "destination head history slot conflicts"
+                        ) from exc
+                    if (
+                        canonical_json_bytes(existing_head.model_dump(mode="json"))
+                        != existing[0]
+                        or existing_head.destination_id != head.destination_id
+                        or existing_head.descriptor_sha256 != head.descriptor_sha256
+                        or existing_head.source_sequence != head.source_sequence
+                        or existing_head.head_version != head.head_version
+                        or existing_head.record_sha256 != head.record_sha256
+                        or existing_head.parent_record_hash != head.parent_record_hash
+                    ):
+                        raise ReplicationCASConflict(
+                            "destination head history slot conflicts"
+                        ) from None
+                    payload = existing[0]
+                    created = False
+                if created:
+                    mark_effect()
+            finally:
+                _close_fd_best_effort(
+                    head_history_fd, "destination_head_history_fd", cleanup_failures
+                )
+                if cleanup_failures:
+                    effect_context.cleanup_failed = True
+            return slot_name, payload
 
         _destination_assert_lock(replication_fd, lock_fd, lock_identity)
         try:
@@ -6480,65 +6876,16 @@ class DestinationArchiveWriter:
         # tampered empty archive could advance its head and only be noticed by
         # the post-commit reader.
         try:
-            # Detect residue before any nested reader re-validates the root.
-            # If that validation fails, the residue is still unproven and must
-            # be reported as a control-state failure, never as a generic trust
-            # or rebound result.
-            try:
-                head_cleanup_boundary_started = any(
-                    name.startswith(".head.json.") for name in os.listdir(replication_fd)
-                )
-            except OSError as exc:
-                raise ReplicationStateUnavailable(
-                    "destination head temporary namespace is unavailable"
-                ) from exc
+            reader._validate_replication_namespace(root_fd)
             reader.read_sentinel(root_fd)
             reader._validate_history_namespace(root_fd)
             history_records = reader.list_verified_records(root_fd)
-            baseline = reader.read_head(root_fd)
-
-            def cleanup_boundary() -> None:
-                """Re-prove lock, descriptor and live mount at a write edge."""
-                nonlocal head_cleanup_boundary_started
-                head_cleanup_boundary_started = True
-                _destination_assert_lock(replication_fd, lock_fd, lock_identity)
-                check_boundary()
-
-            if _destination_cleanup_head_temporary_aliases(
-                replication_fd,
-                canonical_json_bytes(baseline.model_dump(mode="json"))
-                if baseline is not None
-                else None,
-                descriptor=self.descriptor,
-                current_head=baseline,
-                history_records=history_records,
-                before_unlink=cleanup_boundary,
-            ):
-                # Removing a proven post-linearization alias is itself a
-                # destination effect and must remain visible to the caller.
-                mark_effect()
-                try:
-                    cleanup_boundary()
-                    _fsync_open_directory(replication_fd)
-                    cleanup_boundary()
-                except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
-                    raise ReplicationStateUnavailable(
-                        "destination head temporary cleanup boundary failed"
-                    ) from exc
+            baseline = reader.read_head(root_fd, allow_pending_slot=True)
         except ReplicationStateUnavailable as exc:
-            if "head temporary" in str(exc) or head_cleanup_boundary_started:
-                reason = "CONTROL_STATE_UNAVAILABLE"
-            else:
-                reason = (
-                    "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
-                )
+            reason = "DESTINATION_CONFLICT" if "lineage" in str(exc) else "DESTINATION_TRUST_FAILED"
             return finish(DestinationReplicationResult("unavailable", reason))
-        except ReplicationDurabilityError as exc:
-            reason = (
-                "CONTROL_STATE_UNAVAILABLE"
-                if "head temporary" in str(exc) or head_cleanup_boundary_started
-                else "DESTINATION_TRUST_FAILED"
-            )
+        except ReplicationDurabilityError:
+            reason = "DESTINATION_TRUST_FAILED"
             return finish(DestinationReplicationResult("unavailable", reason))
 
         def matches_checkpoint(candidate: ReplicationRecord, parent_record_hash: str) -> bool:
@@ -6592,9 +6939,11 @@ class DestinationArchiveWriter:
                 recovered_head = _destination_head(
                     self.descriptor, orphan, head_version=1, updated_at=now
                 )
+                slot_name, recovered_payload = prepare_head_slot(recovered_head)
                 install_head(
-                    canonical_json_bytes(recovered_head.model_dump(mode="json")),
+                    recovered_payload,
                     expected=None,
+                    slot_name=slot_name,
                 )
                 try:
                     check_boundary()
@@ -6644,6 +6993,7 @@ class DestinationArchiveWriter:
                 checkpoint_id=baseline.checkpoint_id,
                 source_sequence=baseline.source_sequence,
                 now=now,
+                allow_pending_slot=True,
             )
             baseline_chain_hashes: set[str] = set()
             current_record = baseline_record
@@ -6690,9 +7040,11 @@ class DestinationArchiveWriter:
                     updated_at=now,
                 )
                 baseline_bytes = canonical_json_bytes(baseline.model_dump(mode="json"))
+                slot_name, recovered_payload = prepare_head_slot(recovered_head)
                 install_head(
-                    canonical_json_bytes(recovered_head.model_dump(mode="json")),
+                    recovered_payload,
                     expected=baseline_bytes,
+                    slot_name=slot_name,
                 )
                 try:
                     check_boundary()
@@ -6881,6 +7233,7 @@ class DestinationArchiveWriter:
                 head_version=baseline.head_version + 1 if baseline is not None else 1,
                 updated_at=now,
             )
+            slot_name, head_payload = prepare_head_slot(head)
             current_head_bytes = _destination_read_at(replication_fd, ("head.json",), optional=True)
             baseline_bytes = (
                 canonical_json_bytes(baseline.model_dump(mode="json"))
@@ -6893,8 +7246,9 @@ class DestinationArchiveWriter:
                 raise ReplicationCASConflict("destination head CAS conflict")
             check_boundary()
             install_head(
-                canonical_json_bytes(head.model_dump(mode="json")),
+                head_payload,
                 expected=baseline_bytes,
+                slot_name=slot_name,
             )
             check_boundary()
             _destination_assert_lock(replication_fd, lock_fd, lock_identity)
@@ -7175,279 +7529,115 @@ def build_destination_descriptor(
     )
 
 
-def _destination_replace_at(
-    parent_fd: int, name: str, payload: bytes, *, expected: bytes | None
-) -> DestinationHeadInstallResult:
-    """CAS-install a regular pointer without unconditional overwrite.
+def _destination_head_slot_name(source_sequence: int) -> str:
+    """Return the deterministic immutable slot for a source sequence."""
+    if not isinstance(source_sequence, int) or not 1 <= source_sequence < 10**20:
+        raise ReplicationDurabilityError("destination head history sequence is invalid")
+    return f"slot-{source_sequence:020d}.json"
 
-    A missing pointer uses exclusive hard-link installation.  Replacing an
-    existing pointer uses the platform's atomic exchange primitive; a
-    filesystem without either capability is explicitly unsupported.
+
+def _destination_write_head_slot(head_history_fd: int, slot_name: str, payload: bytes) -> bool:
+    """O_EXCL-create and fsync one fixed head-history candidate slot.
+
+    A pre-existing slot is reusable only when its descriptor-native bytes are
+    identical.  There is deliberately no temporary basename and no unlink in
+    this operation; a crash leaves a deterministic candidate for the next
+    locked writer to validate and resume.
     """
-    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+    if not re.fullmatch(DESTINATION_HEAD_SLOT_PATTERN, slot_name):
+        raise ReplicationDurabilityError("destination head history slot name is unsafe")
     fd: int | None = None
-    linearized = False
-    primary_error: BaseException | None = None
+    primary: BaseException | None = None
     try:
-        current = _destination_read_at(parent_fd, (name,), optional=True)
-        current_bytes = current[0] if current is not None else None
-        if current_bytes != expected:
-            raise ReplicationCASConflict("destination head CAS conflict")
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent_fd,
-        )
+        try:
+            fd = os.open(
+                slot_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=head_history_fd,
+            )
+        except FileExistsError:
+            existing = _destination_read_at(head_history_fd, (slot_name,))
+            if existing is None or existing[0] != payload:
+                raise ReplicationCASConflict("destination head history slot conflicts") from None
+            return False
         _write_fully(fd, payload)
         os.fsync(fd)
         os.close(fd)
         fd = None
-        current = _destination_read_at(parent_fd, (name,), optional=True)
+        _fsync_open_directory(head_history_fd)
+        return True
+    except (ReplicationCASConflict, ReplicationDurabilityError) as exc:
+        primary = exc
+        raise
+    except OSError as exc:
+        primary = ReplicationDurabilityError("destination head history slot install failed")
+        raise primary from exc
+    finally:
+        failures: list[str] = []
+        if fd is not None:
+            _close_fd_best_effort(fd, "destination_head_history_slot_fd", failures)
+        _finish_cleanup(primary, failures)
+
+
+def _destination_install_head_from_slot(
+    replication_fd: int,
+    head_history_fd: int,
+    slot_name: str,
+    payload: bytes,
+    *,
+    expected: bytes | None,
+) -> DestinationHeadInstallResult:
+    """Publish a fixed candidate slot without creating/deleting a residue."""
+    if not re.fullmatch(DESTINATION_HEAD_SLOT_PATTERN, slot_name):
+        raise ReplicationDurabilityError("destination head history slot name is unsafe")
+    linearized = False
+    try:
+        current = _destination_read_at(replication_fd, ("head.json",), optional=True)
         if (current[0] if current is not None else None) != expected:
             raise ReplicationCASConflict("destination head CAS conflict")
+        candidate = _destination_read_at(head_history_fd, (slot_name,))
+        if candidate is None or candidate[0] != payload:
+            raise ReplicationCASConflict("destination head history candidate changed")
         if expected is None:
-            try:
-                os.link(
-                    temporary,
-                    name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                raise ReplicationCASConflict("destination head CAS conflict") from exc
-            except OSError as exc:
-                if exc.errno in {errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EPERM}:
-                    raise ReplicationDurabilityError(
-                        "destination head install unsupported"
-                    ) from exc
-                raise ReplicationDurabilityError("destination head install failed") from exc
-            linearized = True
+            os.link(
+                slot_name,
+                "head.json",
+                src_dir_fd=head_history_fd,
+                dst_dir_fd=replication_fd,
+                follow_symlinks=False,
+            )
         else:
-            _destination_exchange(parent_fd, temporary, name)
-            # _destination_exchange returns only after its atomic exchange
-            # syscall succeeds.  From this point a later fsync/readback
-            # failure must retain the committed-head semantics.
-            linearized = True
-        _fsync_open_directory(parent_fd)
-        readback = _destination_read_at(parent_fd, (name,), optional=False)
+            _destination_exchange_at(
+                head_history_fd,
+                slot_name,
+                replication_fd,
+                "head.json",
+            )
+        # The link or exchange syscall is the unique linearization point.
+        linearized = True
+        _fsync_open_directory(head_history_fd)
+        _fsync_open_directory(replication_fd)
+        readback = _destination_read_at(replication_fd, ("head.json",))
         if readback is None or readback[0] != payload:
             raise ReplicationDurabilityError("destination head readback failed")
         return DestinationHeadInstallResult(linearized=True)
-    except ReplicationCASConflict as exc:
-        primary_error = exc
-        raise
-    except DestinationHeadInstallError as exc:
-        primary_error = exc
+    except ReplicationCASConflict:
         raise
     except ReplicationDurabilityError as exc:
-        reason_code: ReplicationReason = (
-            "MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED"
-        )
-        primary_error = DestinationHeadInstallError(
+        primary = DestinationHeadInstallError(
             "destination head install failed",
             linearized=linearized,
-            reason_code=reason_code,
+            reason_code="MOUNT_UNSUPPORTED" if "unsupported" in str(exc) else "COPY_FAILED",
         )
-        raise primary_error from exc
+        raise primary from exc
     except OSError as exc:
-        primary_error = DestinationHeadInstallError(
-            "destination head install failed",
-            linearized=linearized,
+        primary = DestinationHeadInstallError(
+            "destination head install failed", linearized=linearized
         )
-        raise primary_error from exc
-    finally:
-        cleanup_failures: list[str] = []
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                cleanup_failures.append("destination_head_fd_close")
-        try:
-            os.unlink(temporary, dir_fd=parent_fd)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            cleanup_failures.append("destination_head_temporary_unlink")
-        if cleanup_failures:
-            if primary_error is not None:
-                primary_error.add_note("replication_cleanup=failed")
-                if isinstance(primary_error, DestinationHeadInstallError):
-                    primary_error.cleanup_failed = True
-            else:
-                raise DestinationHeadInstallError(
-                    "destination head cleanup failed",
-                    linearized=linearized,
-                    cleanup_failed=True,
-                )
+        raise primary from exc
 
 
-def _destination_cleanup_head_temporary_aliases(
-    replication_fd: int,
-    head_payload: bytes | None,
-    *,
-    descriptor: DestinationDescriptor,
-    current_head: DestinationHead | None,
-    history_records: Iterable[ReplicationRecord],
-    before_unlink: Callable[[], None] | None = None,
-) -> bool:
-    """Remove only a proven hard-link alias left by a completed head install.
-
-    A failed best-effort unlink after the head exchange leaves the temporary
-    name as a second link to the now-visible head.  On restart that alias is
-    recoverable only when every part of that proof is exact.  An unknown,
-    private, mismatched, or non-hard-link entry remains fail-closed.
-    """
-    try:
-        names = os.listdir(replication_fd)
-    except OSError as exc:
-        raise ReplicationStateUnavailable(
-            "destination head temporary namespace is unavailable"
-        ) from exc
-    aliases = [name for name in names if name.startswith(".head.json.")]
-    if not aliases:
-        return False
-    if len(aliases) != 1:
-        raise ReplicationStateUnavailable("destination head temporary aliases are unsafe")
-    if head_payload is None:
-        raise ReplicationStateUnavailable("destination head temporary alias has no head")
-    try:
-        head_info = os.stat("head.json", dir_fd=replication_fd, follow_symlinks=False)
-    except OSError as exc:
-        raise ReplicationStateUnavailable(
-            "destination head temporary alias cannot prove current head"
-        ) from exc
-    if not stat.S_ISREG(head_info.st_mode) or stat.S_IMODE(head_info.st_mode) != 0o600:
-        raise ReplicationStateUnavailable(
-            "destination head temporary alias cannot prove current head"
-        )
-    cleaned = False
-    name = aliases[0]
-    if not re.fullmatch(r"\.head\.json\.[0-9a-f]{24}\.tmp", name):
-        raise ReplicationStateUnavailable("destination head temporary entry is unknown")
-    try:
-        info = os.stat(name, dir_fd=replication_fd, follow_symlinks=False)
-    except OSError as exc:
-        raise ReplicationStateUnavailable(
-            "destination head temporary entry is unavailable"
-        ) from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or info.st_dev != head_info.st_dev
-    ):
-        raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
-    try:
-        current = _destination_read_at(replication_fd, (name,))
-    except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
-        raise ReplicationStateUnavailable("destination head temporary alias proof failed") from exc
-    if current is None:
-        raise ReplicationStateUnavailable("destination head temporary alias is unavailable")
-
-    if (
-        info.st_ino == head_info.st_ino
-        and info.st_nlink == 2
-        and head_info.st_nlink == 2
-        and current[0] == head_payload
-    ):
-        # Initial no-replace head creation leaves a second hardlink to the
-        # current head.  It is safe to remove after the exact inode/bytes
-        # proof above.
-        pass
-    elif info.st_ino != head_info.st_ino and info.st_nlink == 1 and head_info.st_nlink == 1:
-        _destination_verify_head_predecessor(
-            descriptor,
-            current_head=current_head,
-            current_head_payload=head_payload,
-            predecessor_payload=current[0],
-            history_records=history_records,
-        )
-    else:
-        raise ReplicationStateUnavailable("destination head temporary alias is unsafe")
-
-    if before_unlink is not None:
-        try:
-            before_unlink()
-        except (ReplicationStateUnavailable, ReplicationDurabilityError) as exc:
-            raise ReplicationStateUnavailable(
-                "destination head temporary cleanup boundary failed"
-            ) from exc
-    try:
-        os.unlink(name, dir_fd=replication_fd)
-    except OSError as exc:
-        raise ReplicationDurabilityError("destination head temporary cleanup failed") from exc
-    cleaned = True
-    return cleaned
-
-
-def _destination_verify_head_predecessor(
-    descriptor: DestinationDescriptor,
-    *,
-    current_head: DestinationHead | None,
-    current_head_payload: bytes | None,
-    predecessor_payload: bytes,
-    history_records: Iterable[ReplicationRecord],
-) -> None:
-    """Prove an exchange residue is exactly the direct prior head.
-
-    An atomic exchange leaves the previous head in the temporary basename as
-    an independent inode.  Its bytes are accepted only when both old and new
-    heads are canonical projections of adjacent verified records in the same
-    descriptor-bound lineage.
-    """
-    if current_head is None or current_head_payload is None:
-        raise ReplicationStateUnavailable("destination head temporary predecessor has no head")
-    try:
-        values = json.loads(predecessor_payload)
-        predecessor = DestinationHead.model_validate(values)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ReplicationStateUnavailable(
-            "destination head temporary predecessor is invalid"
-        ) from exc
-    if canonical_json_bytes(predecessor.model_dump(mode="json")) != predecessor_payload:
-        raise ReplicationStateUnavailable("destination head temporary predecessor is not canonical")
-    predecessor.verify_hash()
-    if predecessor.destination_id != descriptor.destination_id:
-        raise ReplicationStateUnavailable(
-            "destination head temporary predecessor identity is invalid"
-        )
-    records = tuple(history_records)
-    records_by_hash = {record.record_sha256: record for record in records}
-    current_record = records_by_hash.get(current_head.record_sha256)
-    predecessor_record = records_by_hash.get(predecessor.record_sha256)
-    if current_record is None or predecessor_record is None:
-        raise ReplicationStateUnavailable(
-            "destination head temporary predecessor record is missing"
-        )
-    expected_current = _destination_head(
-        descriptor,
-        current_record,
-        head_version=current_head.head_version,
-        updated_at=current_head.updated_at,
-    )
-    expected_predecessor = _destination_head(
-        descriptor,
-        predecessor_record,
-        head_version=predecessor.head_version,
-        updated_at=predecessor.updated_at,
-    )
-    if expected_current != current_head or expected_predecessor != predecessor:
-        raise ReplicationStateUnavailable(
-            "destination head temporary predecessor projection is invalid"
-        )
-    if (
-        current_record.parent_record_hash != predecessor_record.record_sha256
-        or current_head.parent_record_hash != predecessor_record.record_sha256
-        or current_record.source_instance_id != predecessor_record.source_instance_id
-        or current_record.source_instance_sha256 != predecessor_record.source_instance_sha256
-        or current_record.source_sequence != predecessor_record.source_sequence + 1
-        or current_head.source_sequence != predecessor.source_sequence + 1
-        or current_head.head_version != predecessor.head_version + 1
-        or current_head.checkpoint_id != current_record.checkpoint_id
-        or predecessor.checkpoint_id != predecessor_record.checkpoint_id
-    ):
-        raise ReplicationStateUnavailable("destination head temporary predecessor is not direct")
 
 
 def _complete_replication_with_proof(

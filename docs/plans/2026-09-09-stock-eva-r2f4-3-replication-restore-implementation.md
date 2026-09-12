@@ -633,6 +633,8 @@ they must be real and passing before implementation review can close. No grouped
 | FR-25 | `tests/test_dataset_replication.py::test_nas_unavailable_does_not_change_local_ready_or_pointer` |
 | FR-26 | `tests/test_dataset_replication.py::test_replication_evidence_replays_without_provider` |
 | FR-27 | `tests/test_nas_dataset.py::test_verified_local_mirror_is_idempotent_and_manifest_readable` |
+| FR-28 | `tests/test_replication_destination_batch3.py::test_head_history_three_updates_retain_predecessors_in_fixed_slots` |
+| FR-29 | `tests/test_replication_destination_batch3.py::test_head_history_concurrent_same_sequence_has_one_immutable_winner` |
 | AC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | AC-2 | `tests/test_dataset_replication.py::test_publication_is_atomic_under_one_manifest_publication_lock` |
 | AC-3 | `tests/test_dataset_replication.py::test_pointer_unchanged_after_binding_crash_is_recoverable` |
@@ -661,6 +663,9 @@ they must be real and passing before implementation review can close. No grouped
 | AC-26 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_batch_is_atomic_on_lineage_failure`; `tests/test_market_backfill.py::test_cli_nas_lineage_gap_or_extra_is_zero_provider_zero_write` |
 | AC-27 | `tests/test_dataset_replication.py::test_manifest_only_invalid_pointer_identity_fails_closed` |
 | AC-28 | `tests/test_dataset_replication.py::test_modern_backfill_requires_exact_lineage_or_resolver_evidence`; `tests/test_market_backfill.py::test_cli_nas_valid_lineage_all_dates_admitted_before_first_provider_fetch` |
+| AC-29 | `tests/test_replication_destination_batch3.py::test_head_history_three_updates_retain_predecessors_in_fixed_slots` |
+| AC-30 | `tests/test_replication_destination_batch3.py::test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume` |
+| AC-31 | `tests/test_replication_destination_batch3.py::test_head_history_post_exchange_crash_is_resumable_without_residue` |
 | EC-1 | `tests/test_dataset_replication.py::test_replication_disabled_is_zero_work` |
 | EC-2 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
 | EC-3 | `tests/test_dataset_replication.py::test_path_validation_rejects_root_home_env_symlink_and_overlap` |
@@ -698,6 +703,38 @@ they must be real and passing before implementation review can close. No grouped
 | EC-35 | `tests/test_dataset_replication.py::test_backfill_service_multi_date_failure_preserves_manifest_and_pointer`; `tests/test_market_backfill.py::test_backfill_service_dataset_preflight_fails_before_audit_or_provider` |
 | EC-36 | `tests/test_dataset_replication.py::test_lineage_resolver_rejects_labels_bars_and_unverified_inheritance` |
 | EC-37 | `tests/test_dataset_replication.py::test_missing_lineage_reader_returns_source_unavailable_before_mutation` |
+| EC-38 | `tests/test_replication_destination_batch3.py::test_head_history_slot_tamper_and_gap_fail_closed_without_unlink` |
+| EC-39 | `tests/test_replication_destination_batch3.py::test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume` |
+| EC-40 | `tests/test_replication_destination_batch3.py::test_head_history_post_exchange_crash_is_resumable_without_residue` |
+
+> Final Batch3.8 precedence: the deterministic `head-history/slot-<20 digits>.json` contract
+> above is authoritative for all head publication and recovery behavior; older Batch3.4-Batch3.7
+> random-residue/unlink wording is historical and superseded.
+
+#### Batch3.8 immutable deterministic head history (implementation contract)
+
+This amendment supersedes the Batch3.6 and Batch3.7 temporary-head-residue cleanup contracts
+below wherever they permit random `.head.json.*` names or unlink-based recovery.
+
+The implementation uses `_replication/head-history/` as an immutable, fixed-name head lineage.
+The namespace accepts only regular mode-0600 `slot-<20 decimal digits>.json` files. Head
+publication never creates a random temporary basename and never automatically unlinks a head
+residue. Genesis pre-seals slot 1 and installs `head.json` with an exclusive cross-directory
+hard link. Every later update pre-seals slot N, fsyncs it, and atomically exchanges the held slot
+descriptor with the held `head.json` descriptor; the exchanged old head remains permanently in
+slot N. This gives the intentional mapping slot 1 -> record 1 and slot N (N > 1) -> record N-1,
+while the visible head maps to record N. Existing slots are compare-and-reused only when their
+canonical bytes and immutable record/head identity match; they are never overwritten.
+
+`DestinationArchiveReader._validate_head_history` proves the full continuous record/slot chain,
+including canonical JSON, head and record hashes, descriptor and destination identity, parent
+record hashes, source-instance identity, source sequence, head version and checkpoint projection.
+Normal reads reject a pending next slot; the locked writer may admit exactly one presealed next
+slot and matching next record to resume a pre-exchange crash. A post-exchange crash is already a
+valid committed state and must not trigger cleanup. Unknown/gapped/tampered/replaced/symlinked
+slots and random `.head.json.*` names fail closed with no residue deletion. Focused RED/GREEN
+evidence is provided by the four `test_head_history_*` anchors in the companion crosswalk; all
+validation remains offline fake-root only.
 
 ## R2-F4.3.2 implementation amendment — single-authority H1-H6/M1-M6 closure
 
