@@ -2920,14 +2920,23 @@ descriptor records a null identity and unavailable outcome. Offline anchors:
 
 The destination parent is additionally an ambient descriptor authority. Execute
 holds the filesystem-root-to-parent chain, binding each parent/basename edge to
-the opened directory's device, inode and mode (and its stable ancestor link
-count). It revalidates the chain through the held descriptors immediately
+the opened directory's device, inode and mode while recording link counts in
+the sanitized authority projection. It revalidates the chain through the held descriptors immediately
 before no-replace publication and after post-publication readback; a rename,
 replacement or symlink cannot redirect publication into a detached old path.
-The active target parent link count remains mutable so unrelated sibling and
+Recorded link counts remain informational so unrelated sibling and
 different-target restores can proceed concurrently. Offline anchors include
 the base and intermediate rename/recreate and symlink-replacement cases in
 `tests/test_replication_restore_batch4.py`.
+
+No-replace rename is provisional until that ambient proof succeeds. If it
+fails, the held original parent is used to prove and remove only the attempt's
+exact final inode, followed by parent fsync and absence readback; an inode
+mismatch leaves an unknown orphan untouched. The response is
+`CONTROL_STATE_UNAVAILABLE`, `restore_writes=true`, `published=false`, with a
+sanitized `orphan_cleanup_status`. STARTED stores only ancestry and basename
+hashes, and restart reconciliation emits a manual-orphan unknown report when
+the exact authority cannot be reopened.
 
 ### Final Batch4 gate — unified terminalization and locked audit namespace
 

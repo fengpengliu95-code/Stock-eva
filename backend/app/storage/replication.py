@@ -2306,15 +2306,33 @@ class _HeldDirectoryAncestry:
             raise ReplicationDurabilityError("restore destination parent is unavailable")
         return self.tokens[-1].parent_fd
 
+    def digest(self) -> str:
+        return domain_sha256(
+            "stock-eva/r2f4.3/restore-ancestry/v1",
+            [
+                {
+                    "device": token.device,
+                    "inode": token.inode,
+                    "mode": token.mode,
+                    # Link counts are mutable when an unrelated sibling,
+                    # audit root, or nested restore is created.  They remain
+                    # recorded for the authority projection but are not part
+                    # of the stable ancestry identity hash.
+                    "nlink": None,
+                }
+                for token in self.tokens
+            ],
+        )
+
     def assert_bound(self) -> None:
         """Reprove every path edge through the held parent descriptors.
 
-        The last directory's link count is intentionally not authoritative:
-        sibling restore staging directories are expected to change it.  Its
-        descriptor identity and mode remain authoritative, as do all link
-        counts for ancestors outside the active target parent.
+        Link counts are recorded for the sanitized authority projection but
+        are intentionally not authoritative: unrelated sibling restore or
+        audit directories may change them. Descriptor identity and mode remain
+        authoritative for every edge.
         """
-        for index, token in enumerate(self.tokens):
+        for token in self.tokens:
             try:
                 listed = os.stat(token.basename, dir_fd=token.parent_fd, follow_symlinks=False)
                 if stat.S_ISLNK(listed.st_mode) or not stat.S_ISDIR(listed.st_mode):
@@ -2329,10 +2347,6 @@ class _HeldDirectoryAncestry:
                     )
                     expected = (token.device, token.inode, token.mode)
                     if identity != expected:
-                        raise ReplicationStateUnavailable(
-                            "restore destination ancestry changed"
-                        )
-                    if index < len(self.tokens) - 1 and int(current.st_nlink) != token.nlink:
                         raise ReplicationStateUnavailable(
                             "restore destination ancestry changed"
                         )
@@ -8048,6 +8062,9 @@ class RestorePlanResponse(BaseModel):
     execution_allowed: bool
     effects: ReplicationEffects
     audit_status: Literal["not_started", "started", "terminal", "unavailable"] = "not_started"
+    orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
+        "not_attempted"
+    )
     provider_requests: Literal[0] = 0
     paths_exposed: Literal[False] = False
 
@@ -8100,6 +8117,9 @@ class RestoreReport(BaseModel):
     started_at: str
     completed_at: str
     effects: ReplicationEffects
+    orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
+        "not_attempted"
+    )
     start_event_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     report_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
@@ -8128,6 +8148,15 @@ class RestoreAuditEvent(BaseModel):
     phase: Literal["STARTED"] = "STARTED"
     destination_id: str | None = Field(
         default=None, min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$"
+    )
+    destination_ancestry_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    attempt_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    final_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
     started_at: str
     event_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -8163,6 +8192,9 @@ class RestoreTerminalEvent(BaseModel):
     started_at: str
     completed_at: str
     effects: ReplicationEffects
+    orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
+        "not_attempted"
+    )
     event_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
     _timestamps_are_utc = field_validator("started_at", "completed_at")(
@@ -8359,7 +8391,15 @@ class RestoreAuditStore:
         with self._locked_namespace():
             return
 
-    def write_started(self, *, destination_id: str | None, started_at: str) -> RestoreAuditEvent:
+    def write_started(
+        self,
+        *,
+        destination_id: str | None,
+        started_at: str,
+        destination_ancestry_sha256: str | None = None,
+        attempt_basename_sha256: str | None = None,
+        final_basename_sha256: str | None = None,
+    ) -> RestoreAuditEvent:
         with self._locked_namespace() as (root_fd, staging_fd):
             audit_id = secrets.token_hex(32)
             values: dict[str, object] = {
@@ -8368,6 +8408,9 @@ class RestoreAuditStore:
                 "audit_id": audit_id,
                 "phase": "STARTED",
                 "destination_id": destination_id,
+                "destination_ancestry_sha256": destination_ancestry_sha256,
+                "attempt_basename_sha256": attempt_basename_sha256,
+                "final_basename_sha256": final_basename_sha256,
                 "started_at": started_at,
             }
             values["event_sha256"] = domain_sha256(
@@ -8426,6 +8469,11 @@ class RestoreAuditStore:
                 audit_id = event.audit_id
                 if audit_id in terminals:
                     continue
+                # Execute attempts carry an authority projection, but the
+                # sanitized audit record intentionally carries no path. A
+                # restart cannot safely reopen that exact ancestry here, so
+                # the terminal below is an explicit manual-orphan report;
+                # it never claims readiness or deletes an unknown root.
                 event.verify_hash()
                 now = _utc_now()
                 effects = ReplicationEffects(
@@ -8457,6 +8505,7 @@ class RestoreAuditStore:
                     "started_at": event.started_at,
                     "completed_at": now,
                     "effects": effects.model_dump(mode="json"),
+                    "orphan_cleanup_status": "unknown",
                     "start_event_sha256": event.event_sha256,
                 }
                 values["report_sha256"] = domain_sha256(
@@ -8681,6 +8730,29 @@ def _assert_staging_name_binding(
         raise ReplicationStateUnavailable("restore staging name changed") from exc
 
 
+def _assert_owned_final_binding(
+    parent_fd: int,
+    final_name: str,
+    held_stage_fd: int,
+    expected: tuple[int, int, int, int],
+) -> None:
+    """Prove a post-rename target is this attempt's held staging inode."""
+    if _directory_fingerprint(os.fstat(held_stage_fd)) != expected:
+        raise ReplicationStateUnavailable("restore final ownership is unknown")
+    try:
+        info = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ReplicationStateUnavailable("restore final ownership is unknown")
+        bound_fd = os.open(final_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        try:
+            if _directory_fingerprint(os.fstat(bound_fd)) != expected:
+                raise ReplicationStateUnavailable("restore final ownership is unknown")
+        finally:
+            os.close(bound_fd)
+    except OSError as exc:
+        raise ReplicationStateUnavailable("restore final ownership is unknown") from exc
+
+
 class RestoreService:
     """Descriptor-bound NAS-to-new-temporary-root restore operation."""
 
@@ -8831,6 +8903,7 @@ class RestoreService:
             "started_at": started_at,
             "completed_at": completed_at,
             "effects": effects.model_dump(mode="json"),
+            "orphan_cleanup_status": "not_attempted",
             "start_event_sha256": start_event_sha256,
         }
         values["report_id"] = report_id
@@ -8926,6 +8999,7 @@ class RestoreService:
             "started_at": started_at,
             "completed_at": _utc_now(),
             "effects": result.effects.model_dump(mode="json"),
+            "orphan_cleanup_status": result.orphan_cleanup_status,
         }
         try:
             terminal_values["event_sha256"] = domain_sha256(
@@ -9019,11 +9093,32 @@ class RestoreService:
                 reason_code=self._reason(exc),
                 effects=effects,
             )
+        attempt_stage_name = f".{final.name}.restore-{secrets.token_hex(16)}.staging"
+        try:
+            authority_fd, authority_dirs = _open_directory_chain(final.parent, create=False)
+            try:
+                authority = _bind_directory_ancestry(final.parent, authority_dirs)
+                authority_digest = authority.digest()
+            finally:
+                failures: list[str] = []
+                _close_descriptors(authority_dirs, failures)
+        except Exception as exc:
+            return self._plan_response(
+                snapshot=None,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code=self._reason(exc),
+                effects=effects,
+            )
         try:
             self.audit_store.ensure_ready()
             start = self.audit_store.write_started(
                 destination_id=self.reader.descriptor.destination_id,
                 started_at=started_at,
+                destination_ancestry_sha256=authority_digest,
+                attempt_basename_sha256=_sha256_bytes(attempt_stage_name.encode("utf-8")),
+                final_basename_sha256=_sha256_bytes(final.name.encode("utf-8")),
             )
         except Exception:
             return self._plan_response(
@@ -9039,6 +9134,8 @@ class RestoreService:
             generation=generation,
             representative_query=representative_query,
             start_event=start,
+            expected_ancestry_sha256=authority_digest,
+            attempt_stage_name=attempt_stage_name,
         )
         return self._finalize_execute(result, start=start, started_at=started_at)
 
@@ -9049,6 +9146,8 @@ class RestoreService:
         generation: str | None = None,
         representative_query: object | None = None,
         start_event: RestoreAuditEvent | None = None,
+        expected_ancestry_sha256: str | None = None,
+        attempt_stage_name: str | None = None,
     ) -> RestorePlanResponse:
         effects = ReplicationEffects(
             writes=False,
@@ -9096,6 +9195,8 @@ class RestoreService:
             # later path replacement cannot redirect this operation.
             parent_fd, parent_dirs = _open_directory_chain(final.parent, create=False)
             ancestry = _bind_directory_ancestry(final.parent, parent_dirs)
+            if expected_ancestry_sha256 is not None and ancestry.digest() != expected_ancestry_sha256:
+                raise ReplicationStateUnavailable("restore destination ancestry changed")
         except Exception as exc:
             if parent_dirs:
                 failures: list[str] = []
@@ -9122,7 +9223,7 @@ class RestoreService:
                 reason_code=self._reason(exc),
                 effects=effects,
             )
-        stage_name = f".{final.name}.restore-{secrets.token_hex(16)}.staging"
+        stage_name = attempt_stage_name or f".{final.name}.restore-{secrets.token_hex(16)}.staging"
         stage_fd: int | None = None
         # Keep every descriptor in parent_dirs held until staging cleanup has
         # completed; the ancestry proof is invalid once any edge is closed.
@@ -9130,6 +9231,11 @@ class RestoreService:
         restore_writes = False
         stage_identity: tuple[int, int, int, int] | None = None
         cleanup_failed = False
+        authority_failure = False
+        target_baseline_absent = False
+        orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
+            "not_attempted"
+        )
         result: RestorePlanResponse | None = None
         reason_code: ReplicationReason = "NONE"
         try:
@@ -9203,6 +9309,7 @@ class RestoreService:
             # authoritative.  Sibling restores and audit activity may change
             # the parent directory while this restore is in flight.
             _assert_destination_absent(parent_fd, final.name)
+            target_baseline_absent = True
             if stage_identity is None:
                 raise ReplicationStateUnavailable("restore staging identity is unavailable")
             _assert_staging_name_binding(parent_fd, stage_name, stage_fd, stage_identity)
@@ -9210,9 +9317,37 @@ class RestoreService:
             _fsync_open_directory(stage_fd)
             _fsync_open_directory(parent_fd)
             _destination_rename_noreplace(parent_fd, stage_name, final.name)
+            # A successful rename is only provisional.  The requested path
+            # may have been replaced while the held parent fd remained valid;
+            # prove ambient ancestry before treating the final as visible.
+            try:
+                ancestry.assert_bound()
+            except Exception as ancestry_exc:
+                authority_failure = True
+                try:
+                    if not target_baseline_absent:
+                        raise ReplicationStateUnavailable("restore final ownership is unknown")
+                    _assert_owned_final_binding(parent_fd, final.name, stage_fd, stage_identity)
+                    _destination_remove_tree_at(parent_fd, final.name)
+                    _fsync_open_directory(parent_fd)
+                    try:
+                        os.stat(final.name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        orphan_cleanup_status = "removed"
+                    else:
+                        raise ReplicationStateUnavailable(
+                            "restore provisional final remains"
+                        )
+                except Exception as cleanup_exc:
+                    orphan_cleanup_status = "unknown"
+                    raise ReplicationStateUnavailable(
+                        "restore publication authority unavailable"
+                    ) from cleanup_exc
+                raise ReplicationStateUnavailable(
+                    "restore publication authority unavailable"
+                ) from ancestry_exc
             published = True
             _fsync_open_directory(parent_fd)
-            ancestry.assert_bound()
             _assert_directory_identity(parent_fd, parent_identity)
             # Keep the original staging fd across the exchange.  The final
             # namespace proof uses the held parent fd and O_NOFOLLOW.
@@ -9250,7 +9385,11 @@ class RestoreService:
                 rename_allowed=True,
             )
         except Exception as exc:
-            reason_code = "CONTROL_STATE_UNAVAILABLE" if published else self._reason(exc)
+            reason_code = (
+                "CONTROL_STATE_UNAVAILABLE"
+                if published or authority_failure
+                else self._reason(exc)
+            )
             effects = ReplicationEffects(
                 writes=restore_writes,
                 canonical_writes=False,
@@ -9265,7 +9404,7 @@ class RestoreService:
                 status="unavailable",
                 reason_code=reason_code,
                 effects=effects,
-            )
+            ).model_copy(update={"orphan_cleanup_status": orphan_cleanup_status})
         finally:
             failures: list[str] = []
             if not published:

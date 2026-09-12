@@ -2725,6 +2725,17 @@ the lock, and installs canonical records with O_EXCL staging/link semantics.
 Generation selectors are validated before the reader can perform a mapping or
 regex operation, and malformed selectors still receive a terminal record.
 
+The no-replace rename is provisional until the held destination ancestry is
+immediately revalidated. If that proof fails, the implementation proves the
+final basename is this attempt's held staging inode and removes only that
+owned detached tree through the original parent descriptor, fsyncing and
+checking absence. A proof mismatch leaves the unknown object untouched and
+reports `CONTROL_STATE_UNAVAILABLE` with `orphan_cleanup_status=unknown`.
+STARTED records carry only ancestry and basename hashes; restart reconciliation
+emits a manual-orphan `CONTROL_STATE_UNAVAILABLE` terminal report when the
+exact authority cannot be reopened, never claiming readiness or deleting an
+unknown root.
+
 The restore now holds a descriptor-native ancestry chain from the filesystem
 root through the requested destination parent. Every edge is revalidated with
 `O_NOFOLLOW` through its held parent descriptor before rename and after final

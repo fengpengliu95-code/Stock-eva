@@ -262,6 +262,9 @@ def test_restore_audit_is_two_phase_descriptor_bound_and_effects_are_split(
     started = next((tmp_path / "audit").glob("*.started.json"))
     terminal = next((tmp_path / "audit").glob("*.terminal.json"))
     assert f'"destination_id":"{descriptor.destination_id}"' in started.read_text()
+    assert '"destination_ancestry_sha256":"' in started.read_text()
+    assert '"attempt_basename_sha256":"' in started.read_text()
+    assert '"final_basename_sha256":"' in started.read_text()
     assert '"start_event_sha256"' in terminal.read_text()
 
 
@@ -344,6 +347,72 @@ def test_restore_destination_intermediate_replacement_is_rejected_before_publish
     assert result.reason_code in {"PATH_INVALID", "SOURCE_UNAVAILABLE"}
     assert not destination.exists()
     assert not (outer.with_name("outer.moved") / "inner" / "restore").exists()
+
+
+@pytest.mark.parametrize("replacement", ["recreate", "symlink"])
+def test_restore_ambient_swap_after_rename_is_compensated_by_held_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    base = tmp_path / "base"
+    base.mkdir()
+    destination = base / "restore"
+    original_rename = replication._destination_rename_noreplace
+
+    def rename_with_ambient_swap(parent_fd: int, source: str, target: str) -> None:
+        moved = base.with_name("base.moved")
+        base.rename(moved)
+        if replacement == "recreate":
+            base.mkdir()
+        else:
+            base.symlink_to(moved, target_is_directory=True)
+        original_rename(parent_fd, source, target)
+
+    monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_with_ambient_swap)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.effects.restore_writes is True
+    assert result.orphan_cleanup_status == "removed"
+    assert not destination.exists()
+    assert not (base.with_name("base.moved") / "restore").exists()
+    terminal = next((tmp_path / "audit").glob("*.terminal.json"))
+    assert '"orphan_cleanup_status":"removed"' in terminal.read_text()
+
+
+def test_restore_ambient_swap_inode_mismatch_never_deletes_detached_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    base = tmp_path / "base"
+    base.mkdir()
+    destination = base / "restore"
+    original_rename = replication._destination_rename_noreplace
+
+    def rename_with_ambient_swap(parent_fd: int, source: str, target: str) -> None:
+        moved = base.with_name("base.moved")
+        base.rename(moved)
+        base.mkdir()
+        original_rename(parent_fd, source, target)
+
+    def reject_owned_final(*args: object, **kwargs: object) -> None:
+        raise replication.ReplicationStateUnavailable("injected final inode mismatch")
+
+    monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_with_ambient_swap)
+    monkeypatch.setattr(replication, "_assert_owned_final_binding", reject_owned_final)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.effects.restore_writes is True
+    assert result.orphan_cleanup_status == "unknown"
+    assert not destination.exists()
+    assert (base.with_name("base.moved") / "restore").is_dir()
 
 
 def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun(
@@ -479,6 +548,24 @@ def test_restore_audit_reconcile_closes_crash_started_record(tmp_path: Path) -> 
 
     assert audit.reconcile() == 1
     assert (tmp_path / "audit" / f"{started.audit_id}.terminal.json").exists()
+
+
+def test_restore_audit_reconcile_reports_unknown_orphan_without_deletion(
+    tmp_path: Path,
+) -> None:
+    audit = RestoreAuditStore(tmp_path / "audit")
+    started = audit.write_started(
+        destination_id="a" * 32,
+        started_at="2026-09-12T00:00:00Z",
+        destination_ancestry_sha256="b" * 64,
+        attempt_basename_sha256="c" * 64,
+        final_basename_sha256="d" * 64,
+    )
+
+    assert audit.reconcile() == 1
+    terminal = (tmp_path / "audit" / f"{started.audit_id}.terminal.json").read_text()
+    assert '"orphan_cleanup_status":"unknown"' in terminal
+    assert '"reason_code":"CONTROL_STATE_UNAVAILABLE"' in terminal
 
 
 def test_restore_unreadable_descriptor_audits_null_destination_identity(
