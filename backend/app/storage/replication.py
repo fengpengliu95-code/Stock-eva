@@ -8065,6 +8065,10 @@ class RestorePlanResponse(BaseModel):
     orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
         "not_attempted"
     )
+    manual_intervention_required: bool = False
+    observed_final_inode_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     provider_requests: Literal[0] = 0
     paths_exposed: Literal[False] = False
 
@@ -8076,6 +8080,7 @@ class RestorePlanResponse(BaseModel):
             (self.publication_binding_sha256, "publication_binding_sha256"),
             (self.source_instance_id, "source_instance_id"),
             (self.checkpoint_id, "checkpoint_id"),
+            (self.observed_final_inode_sha256, "observed_final_inode_sha256"),
         ):
             if value is not None:
                 _validate_sha(value, field)
@@ -8119,6 +8124,19 @@ class RestoreReport(BaseModel):
     effects: ReplicationEffects
     orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
         "not_attempted"
+    )
+    manual_intervention_required: bool = False
+    observed_final_inode_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    destination_ancestry_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    attempt_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    final_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
     start_event_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     report_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -8194,6 +8212,19 @@ class RestoreTerminalEvent(BaseModel):
     effects: ReplicationEffects
     orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
         "not_attempted"
+    )
+    manual_intervention_required: bool = False
+    destination_ancestry_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    attempt_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    final_basename_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    observed_final_inode_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
     event_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
@@ -8506,6 +8537,11 @@ class RestoreAuditStore:
                     "completed_at": now,
                     "effects": effects.model_dump(mode="json"),
                     "orphan_cleanup_status": "unknown",
+                    "manual_intervention_required": True,
+                    "observed_final_inode_sha256": None,
+                    "destination_ancestry_sha256": event.destination_ancestry_sha256,
+                    "attempt_basename_sha256": event.attempt_basename_sha256,
+                    "final_basename_sha256": event.final_basename_sha256,
                     "start_event_sha256": event.event_sha256,
                 }
                 values["report_sha256"] = domain_sha256(
@@ -8753,6 +8789,25 @@ def _assert_owned_final_binding(
         raise ReplicationStateUnavailable("restore final ownership is unknown") from exc
 
 
+def _inode_identity_sha256(info: os.stat_result) -> str:
+    return domain_sha256(
+        "stock-eva/r2f4.3/restore-inode/v1",
+        {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "mode": int(stat.S_IMODE(info.st_mode)),
+            "nlink": int(info.st_nlink),
+        },
+    )
+
+
+def _observed_inode_sha256(parent_fd: int, name: str) -> str | None:
+    try:
+        return _inode_identity_sha256(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+    except (FileNotFoundError, OSError):
+        return None
+
+
 class RestoreService:
     """Descriptor-bound NAS-to-new-temporary-root restore operation."""
 
@@ -8904,6 +8959,11 @@ class RestoreService:
             "completed_at": completed_at,
             "effects": effects.model_dump(mode="json"),
             "orphan_cleanup_status": "not_attempted",
+            "manual_intervention_required": False,
+            "observed_final_inode_sha256": None,
+            "destination_ancestry_sha256": None,
+            "attempt_basename_sha256": None,
+            "final_basename_sha256": None,
             "start_event_sha256": start_event_sha256,
         }
         values["report_id"] = report_id
@@ -9000,6 +9060,11 @@ class RestoreService:
             "completed_at": _utc_now(),
             "effects": result.effects.model_dump(mode="json"),
             "orphan_cleanup_status": result.orphan_cleanup_status,
+            "manual_intervention_required": result.manual_intervention_required,
+            "destination_ancestry_sha256": start.destination_ancestry_sha256,
+            "attempt_basename_sha256": start.attempt_basename_sha256,
+            "final_basename_sha256": start.final_basename_sha256,
+            "observed_final_inode_sha256": result.observed_final_inode_sha256,
         }
         try:
             terminal_values["event_sha256"] = domain_sha256(
@@ -9233,6 +9298,8 @@ class RestoreService:
         cleanup_failed = False
         authority_failure = False
         target_baseline_absent = False
+        final_identity_mismatch = False
+        observed_final_inode_sha256: str | None = None
         orphan_cleanup_status: Literal["not_attempted", "removed", "unknown", "failed"] = (
             "not_attempted"
         )
@@ -9355,6 +9422,10 @@ class RestoreService:
             final_fd = os.open(final.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
             try:
                 if _directory_fingerprint(os.fstat(final_fd)) != stage_identity:
+                    final_identity_mismatch = True
+                    authority_failure = True
+                    published = False
+                    observed_final_inode_sha256 = _inode_identity_sha256(os.fstat(final_fd))
                     raise ReplicationStateUnavailable("restore publication identity changed")
                 _verify_staged_restore_tree(
                     final_fd,
@@ -9363,7 +9434,16 @@ class RestoreService:
                     snapshot.sentinel_bytes,
                     semantic=False,
                 )
-                ancestry.assert_bound()
+                try:
+                    _assert_owned_final_binding(parent_fd, final.name, stage_fd, stage_identity)
+                except Exception as mismatch_exc:
+                    final_identity_mismatch = True
+                    authority_failure = True
+                    published = False
+                    observed_final_inode_sha256 = _observed_inode_sha256(parent_fd, final.name)
+                    raise ReplicationStateUnavailable(
+                        "restore publication identity changed"
+                    ) from mismatch_exc
             finally:
                 failures = []
                 _close_fd_best_effort(final_fd, "restore_final_fd", failures)
@@ -9404,7 +9484,15 @@ class RestoreService:
                 status="unavailable",
                 reason_code=reason_code,
                 effects=effects,
-            ).model_copy(update={"orphan_cleanup_status": orphan_cleanup_status})
+            ).model_copy(
+                update={
+                    "orphan_cleanup_status": (
+                        "unknown" if final_identity_mismatch else orphan_cleanup_status
+                    ),
+                    "manual_intervention_required": final_identity_mismatch,
+                    "observed_final_inode_sha256": observed_final_inode_sha256,
+                }
+            )
         finally:
             failures: list[str] = []
             if not published:

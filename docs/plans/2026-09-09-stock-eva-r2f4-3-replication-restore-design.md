@@ -2938,6 +2938,15 @@ sanitized `orphan_cleanup_status`. STARTED stores only ancestry and basename
 hashes, and restart reconciliation emits a manual-orphan unknown report when
 the exact authority cannot be reopened.
 
+If the final basename no longer names the held staging inode after the
+provisional rename, the final is an unknown orphan: it is never semantically
+validated, removed, or moved. The result is unavailable with
+`CONTROL_STATE_UNAVAILABLE`, `restore_writes=true`, `published=false`,
+`orphan_cleanup_status=unknown`, and `manual_intervention_required=true`.
+The linked terminal audit records only the STARTED ancestry/attempt/final
+basename hashes plus an observed inode identity hash; the attacker inode and
+any detached owned final remain untouched.
+
 ### Final Batch4 gate — unified terminalization and locked audit namespace
 
 After a `STARTED` record is durable, every execute branch (descriptor/source

@@ -2736,6 +2736,12 @@ emits a manual-orphan `CONTROL_STATE_UNAVAILABLE` terminal report when the
 exact authority cannot be reopened, never claiming readiness or deleting an
 unknown root.
 
+If the final basename no longer names the held staging inode after the
+provisional rename, the final is an unknown manual orphan: it is never
+semantically validated, removed, or moved. The linked terminal audit records
+only ancestry/attempt/final basename hashes and an observed inode identity
+hash, with `manual_intervention_required=true`.
+
 The restore now holds a descriptor-native ancestry chain from the filesystem
 root through the requested destination parent. Every edge is revalidated with
 `O_NOFOLLOW` through its held parent descriptor before rename and after final

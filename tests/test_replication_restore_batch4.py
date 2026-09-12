@@ -443,6 +443,77 @@ def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun
     assert calls == 2
 
 
+def test_restore_final_inode_swap_is_unknown_manual_orphan_without_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    attacker = tmp_path / "restore.attacker"
+    original = replication._verify_staged_restore_tree
+    swapped = False
+
+    def swap_after_final_readback(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        original(*args, **kwargs)
+        if kwargs.get("semantic", True) is False and not swapped:
+            swapped = True
+            destination.rename(attacker)
+            destination.mkdir()
+
+    monkeypatch.setattr(replication, "_verify_staged_restore_tree", swap_after_final_readback)
+    audit_root = tmp_path / "audit"
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(audit_root)
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.effects.restore_writes is True
+    assert result.orphan_cleanup_status == "unknown"
+    assert result.manual_intervention_required is True
+    assert result.observed_final_inode_sha256 is not None
+    assert destination.is_dir()
+    assert attacker.is_dir()
+    terminal = next(audit_root.glob("*.terminal.json"))
+    payload = terminal.read_text()
+    assert '"manual_intervention_required":true' in payload
+    assert '"orphan_cleanup_status":"unknown"' in payload
+    assert '"destination_ancestry_sha256":"' in payload
+    assert '"attempt_basename_sha256":"' in payload
+    assert '"final_basename_sha256":"' in payload
+    assert '"observed_final_inode_sha256":"' in payload
+    assert str(tmp_path) not in payload
+
+
+def test_restore_final_inode_swap_immediately_after_rename_keeps_attacker_and_staging_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    attacker = tmp_path / "restore.attacker"
+    original = replication._destination_rename_noreplace
+
+    def rename_then_replace_final(parent_fd: int, source: str, target: str) -> None:
+        original(parent_fd, source, target)
+        destination.rename(attacker)
+        destination.mkdir()
+
+    monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_then_replace_final)
+    audit_root = tmp_path / "audit"
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(audit_root)
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.orphan_cleanup_status == "unknown"
+    assert result.manual_intervention_required is True
+    assert destination.is_dir()
+    assert attacker.is_dir()
+    assert len(list(tmp_path.glob(".restore-*.staging"))) == 0
+    assert len(list(audit_root.glob("*.terminal.json"))) == 1
+
+
 def test_restore_corrupt_archive_has_started_and_terminal_audit(
     tmp_path: Path,
 ) -> None:
