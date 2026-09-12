@@ -719,6 +719,12 @@ immediately preceding head. No slot is ever rewritten or deleted.
 Readers validate the complete continuous chain before trusting `head.json`: exact slot names and
 permissions, no symlinks or extras, canonical JSON and head hashes, descriptor identity, record
 identity, parent hashes, source instance identity, source sequence and head-version continuity.
+Head-version continuity is an independent positional proof: the visible head for source sequence
+`N` has `head_version=N`; slot 1 (genesis) has `head_version=1`; retained slot `S>1`, which
+contains the direct predecessor record `S-1`, has `head_version=S-1`; and an admitted pending
+candidate slot `S` has `head_version=S`. Validation derives these expected versions from the
+slot/record position and never from the serialized slot value before comparison; a rehashed
+wrong-version slot, visible head, or pending candidate fails closed.
 The visible chain must contain records and slots for every sequence from one through the current
 head, with at most one explicit next-sequence presealed slot accepted only by a locked writer
 resuming a crash. Missing, unknown, gapped, tampered, replaced or symlinked slots fail closed.

@@ -5372,6 +5372,7 @@ def _destination_exchange_at(source_fd: int, source: str, target_fd: int, target
             raise ReplicationDurabilityError("destination head exchange failed")
     raise ReplicationDurabilityError("destination head exchange unsupported")
 
+
 @contextmanager
 def _destination_root_session(
     descriptor: DestinationDescriptor,
@@ -5995,11 +5996,22 @@ class DestinationArchiveReader:
                     )
                 parsed_slots[sequence] = (slot, info, payload)
 
-            def verify_projection(slot: DestinationHead, record: ReplicationRecord) -> None:
+            def verify_projection(
+                slot: DestinationHead,
+                record: ReplicationRecord,
+                *,
+                expected_head_version: int,
+            ) -> None:
+                # The slot name/record position is trusted lineage structure;
+                # the serialized version is not.  Compare it independently
+                # before rebuilding the expected projection so a rehashed
+                # attacker cannot make an invalid slot self-consistent.
+                if slot.head_version != expected_head_version:
+                    raise ReplicationStateUnavailable("destination head history version is invalid")
                 expected = _destination_head(
                     self.descriptor,
                     record,
-                    head_version=slot.head_version,
+                    head_version=expected_head_version,
                     updated_at=slot.updated_at,
                 )
                 if expected != slot:
@@ -6019,7 +6031,11 @@ class DestinationArchiveReader:
                     raise ReplicationStateUnavailable(
                         "destination head history slot sequence is invalid"
                     )
-                verify_projection(slot, record)
+                verify_projection(
+                    slot,
+                    record,
+                    expected_head_version=record_sequence,
+                )
 
             if current_head is not None:
                 current_record = records_by_sequence.get(current_head.source_sequence)
@@ -6027,7 +6043,11 @@ class DestinationArchiveReader:
                     raise ReplicationStateUnavailable(
                         "destination head history current record is missing"
                     )
-                verify_projection(current_head, current_record)
+                verify_projection(
+                    current_head,
+                    current_record,
+                    expected_head_version=current_head.source_sequence,
+                )
                 if current_head.head_version != current_head.source_sequence:
                     raise ReplicationStateUnavailable("destination head history version is invalid")
                 if current_head.source_sequence == 1:
@@ -6082,7 +6102,11 @@ class DestinationArchiveReader:
                     raise ReplicationStateUnavailable(
                         "destination head history pending record is missing"
                     )
-                verify_projection(candidate, record)
+                verify_projection(
+                    candidate,
+                    record,
+                    expected_head_version=pending_sequence,
+                )
                 if candidate.source_sequence != pending_sequence:
                     raise ReplicationStateUnavailable(
                         "destination head history pending sequence is invalid"
@@ -6762,9 +6786,7 @@ class DestinationArchiveWriter:
         ) -> None:
             """Publish a presealed deterministic head-history slot."""
             nonlocal head_committed
-            head_history_fd = _destination_open_dir(
-                replication_fd, DESTINATION_HEAD_HISTORY_DIR
-            )
+            head_history_fd = _destination_open_dir(replication_fd, DESTINATION_HEAD_HISTORY_DIR)
             cleanup_failures: list[str] = []
             completed = False
             outcome: DestinationHeadInstallResult | None = None
@@ -6808,15 +6830,11 @@ class DestinationArchiveWriter:
             """Create or reuse the fixed, pre-fsynced candidate slot."""
             payload = canonical_json_bytes(head.model_dump(mode="json"))
             slot_name = _destination_head_slot_name(head.source_sequence)
-            head_history_fd = _destination_open_dir(
-                replication_fd, DESTINATION_HEAD_HISTORY_DIR
-            )
+            head_history_fd = _destination_open_dir(replication_fd, DESTINATION_HEAD_HISTORY_DIR)
             cleanup_failures: list[str] = []
             try:
                 try:
-                    created = _destination_write_head_slot(
-                        head_history_fd, slot_name, payload
-                    )
+                    created = _destination_write_head_slot(head_history_fd, slot_name, payload)
                 except ReplicationCASConflict:
                     # A crash can leave a fully sealed deterministic candidate
                     # with an earlier ``updated_at``.  Reuse it only when its
@@ -6826,17 +6844,14 @@ class DestinationArchiveWriter:
                     if existing is None:
                         raise
                     try:
-                        existing_head = DestinationHead.model_validate(
-                            json.loads(existing[0])
-                        )
+                        existing_head = DestinationHead.model_validate(json.loads(existing[0]))
                         existing_head.verify_hash()
                     except (TypeError, ValueError, json.JSONDecodeError) as exc:
                         raise ReplicationCASConflict(
                             "destination head history slot conflicts"
                         ) from exc
                     if (
-                        canonical_json_bytes(existing_head.model_dump(mode="json"))
-                        != existing[0]
+                        canonical_json_bytes(existing_head.model_dump(mode="json")) != existing[0]
                         or existing_head.destination_id != head.destination_id
                         or existing_head.descriptor_sha256 != head.descriptor_sha256
                         or existing_head.source_sequence != head.source_sequence
@@ -7636,8 +7651,6 @@ def _destination_install_head_from_slot(
             "destination head install failed", linearized=linearized
         )
         raise primary from exc
-
-
 
 
 def _complete_replication_with_proof(

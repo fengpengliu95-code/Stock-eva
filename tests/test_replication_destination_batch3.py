@@ -436,55 +436,6 @@ def test_orphan_generation_is_recovered_without_recopied_source(tmp_path: Path) 
     assert (destination / "_replication" / "head.json").exists()
 
 
-@pytest.mark.skip(reason="superseded by Batch3.8 immutable head-history chain")
-def test_orphan_child_generation_is_recovered_without_recopied_source(
-    tmp_path: Path,
-) -> None:
-    source, checkpoint, sentinel = _source_fixture(tmp_path)
-    destination = tmp_path / "nas"
-    destination.mkdir()
-    descriptor = initialize_destination(
-        destination,
-        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
-        sentinel_bytes=sentinel,
-    )
-    writer = DestinationArchiveWriter(
-        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
-    )
-    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-    assert first.record is not None
-    head_path = destination / "_replication" / "head.json"
-    first_head = head_path.read_bytes()
-    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
-    assert second.record is not None
-    head_path.write_bytes(first_head)
-    source_identity = (source.stat().st_dev, source.stat().st_ino)
-    original_read = replication._destination_read_relative
-
-    def fail_source_read(fd: int, relative_path: str) -> bytes:
-        info = replication.os.fstat(fd)
-        if (info.st_dev, info.st_ino) == source_identity and relative_path in {
-            "bars.parquet",
-            "manifest.json",
-            ".stock-eva-dataset.json",
-        }:
-            raise AssertionError("orphan recovery recopied source")
-        return original_read(fd, relative_path)
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(replication, "_destination_read_relative", fail_source_read)
-    try:
-        recovered = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
-    finally:
-        monkeypatch.undo()
-    assert recovered.reason_code == "NONE"
-    assert recovered.record is not None
-    assert recovered.record.replication_generation == second.record.replication_generation
-    assert DestinationArchiveReader(descriptor).read_head().replication_generation == (
-        second.record.replication_generation
-    )
-
-
 def test_destination_object_hash_failure_never_advances_head(tmp_path: Path) -> None:
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"
@@ -789,7 +740,6 @@ def test_mount_identity_drift_after_staging_is_degraded_with_effect(
     assert not (destination / "_replication" / "head.json").exists()
 
 
-@pytest.mark.skip(reason="superseded by deterministic slot install fault tests")
 def test_mount_identity_drift_after_head_commit_preserves_head_as_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -803,22 +753,23 @@ def test_mount_identity_drift_after_head_commit_preserves_head_as_degraded(
         sentinel_bytes=sentinel,
         mount_inspector=inspector,
     )
-    original = replication._destination_replace_at
+    original = replication._destination_exchange_at
 
-    def install_then_remount(
-        parent_fd: int, name: str, payload: bytes, *, expected: bytes | None
-    ) -> None:
-        original(parent_fd, name, payload, expected=expected)
-        if name == "head.json":
-            inspector.info = MountInfo(destination, "apfs", ("local", "ro"), "vol-a")
+    def install_then_remount(*args: object, **kwargs: object) -> bool:
+        del kwargs
+        result = original(*args)
+        inspector.info = MountInfo(destination, "apfs", ("local", "ro"), "vol-a")
+        return result
 
-    monkeypatch.setattr(replication, "_destination_replace_at", install_then_remount)
-    result = DestinationArchiveWriter(
+    writer = DestinationArchiveWriter(
         descriptor,
         source_root=source,
         writer_host_id=descriptor.single_writer_host_id,
         mount_inspector=inspector,
-    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    )
+    assert writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z").record
+    monkeypatch.setattr(replication, "_destination_exchange_at", install_then_remount)
+    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert result.destination_writes is True
     assert (destination / "_replication" / "head.json").exists()
@@ -948,7 +899,6 @@ def test_claim_context_checkpoint_mismatch_is_zero_write(tmp_path: Path) -> None
     assert source_result.destination_writes is False
 
 
-@pytest.mark.skip(reason="superseded by deterministic slot install fault tests")
 def test_cas_conflict_after_generation_install_reports_destination_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -960,17 +910,20 @@ def test_cas_conflict_after_generation_install_reports_destination_effect(
         acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
         sentinel_bytes=sentinel,
     )
-    original = replication._destination_replace_at
+    original = replication._destination_exchange_at
 
-    def reject_head(parent_fd: int, name: str, payload: bytes, *, expected: bytes | None) -> None:
-        if name == "head.json":
+    def reject_head(*args: object, **kwargs: object) -> bool:
+        del kwargs
+        if args:
             raise replication.ReplicationCASConflict("destination head CAS conflict")
-        original(parent_fd, name, payload, expected=expected)
+        return original(*args)
 
-    monkeypatch.setattr(replication, "_destination_replace_at", reject_head)
-    result = DestinationArchiveWriter(
+    writer = DestinationArchiveWriter(
         descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
-    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+    )
+    assert writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z").record
+    monkeypatch.setattr(replication, "_destination_exchange_at", reject_head)
+    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
     assert result.reason_code == "CAS_CONFLICT"
     assert result.destination_writes is True
 
@@ -1172,8 +1125,7 @@ def test_orphan_recovery_mount_drift_after_verifier_preserves_head_as_degraded(
     assert head.exists()
 
 
-@pytest.mark.skip(reason="superseded by Batch3.8 predecessor/tamper fail-closed tests")
-def test_orphan_child_recovery_mount_drift_after_verifier_preserves_head(
+def test_recovered_child_mount_drift_after_verifier_preserves_head_as_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source, checkpoint, sentinel = _source_fixture(tmp_path)
@@ -1194,17 +1146,22 @@ def test_orphan_child_recovery_mount_drift_after_verifier_preserves_head(
     )
     first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert first.record is not None
-    head = destination / "_replication" / "head.json"
-    first_head = head.read_bytes()
-    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
-    assert second.record is not None
-    head.write_bytes(first_head)
-    original = replication.DestinationArchiveReader.verify_commit
+    original_exchange = replication._destination_exchange_at
+
+    def fail_before_exchange(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        raise OSError(errno.EIO, "injected pre-exchange crash")
+
+    monkeypatch.setattr(replication, "_destination_exchange_at", fail_before_exchange)
+    failed = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
+    assert failed.reason_code == "COPY_FAILED"
+    monkeypatch.setattr(replication, "_destination_exchange_at", original_exchange)
+    original_verify = replication.DestinationArchiveReader.verify_commit
 
     def verify_then_remount(
         reader: DestinationArchiveReader, *args: object, **kwargs: object
     ) -> VerifiedDestinationCommitProof:
-        refreshed = original(reader, *args, **kwargs)
+        refreshed = original_verify(reader, *args, **kwargs)
         if kwargs.get("destination_generation") is not None:
             inspector.info = MountInfo(destination, "apfs", ("local", "ro"), "vol-a")
         return refreshed
@@ -1213,7 +1170,9 @@ def test_orphan_child_recovery_mount_drift_after_verifier_preserves_head(
     recovered = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
     assert recovered.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert recovered.destination_writes is True
+    head = destination / "_replication" / "head.json"
     assert head.exists()
+    assert json.loads(head.read_bytes())["source_sequence"] == 2
 
 
 def test_cleanup_failure_preserves_primary_copy_reason_and_effect(
@@ -1238,54 +1197,6 @@ def test_cleanup_failure_preserves_primary_copy_reason_and_effect(
     ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
     assert result.reason_code == "COPY_FAILED"
     assert result.destination_writes is True
-
-
-@pytest.mark.skip(reason="superseded: Batch3.8 never creates or unlinks head residues")
-def test_head_temporary_cleanup_failure_after_success_degrades_without_losing_head(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, checkpoint, sentinel = _source_fixture(tmp_path)
-    destination = tmp_path / "nas"
-    destination.mkdir()
-    descriptor = initialize_destination(
-        destination,
-        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
-        sentinel_bytes=sentinel,
-    )
-    replication_dir = destination / "_replication"
-    replication_identity = replication_dir.stat()
-    original_unlink = replication.os.unlink
-    injected = False
-
-    def fail_head_temporary_cleanup(name: object, *args: object, **kwargs: object) -> None:
-        nonlocal injected
-        dir_fd = kwargs.get("dir_fd")
-        if (
-            not injected
-            and isinstance(name, str)
-            and name.startswith(".head.json.")
-            and isinstance(dir_fd, int)
-        ):
-            info = os.fstat(dir_fd)
-            if (info.st_dev, info.st_ino) == (
-                replication_identity.st_dev,
-                replication_identity.st_ino,
-            ):
-                injected = True
-                raise OSError(errno.EIO, "injected head temporary cleanup failure")
-        original_unlink(name, *args, **kwargs)
-
-    monkeypatch.setattr(replication.os, "unlink", fail_head_temporary_cleanup)
-    result = DestinationArchiveWriter(
-        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
-    ).replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-    assert injected
-    assert result.status == "unavailable"
-    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
-    assert result.proof is None
-    assert result.destination_writes is True
-    assert (replication_dir / "head.json").exists()
-    assert any(path.name.startswith(".head.json.") for path in replication_dir.iterdir())
 
 
 def test_head_readback_close_failure_after_success_degrades_without_losing_head(
@@ -1394,166 +1305,6 @@ def test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails(
     assert result.destination_writes is True
 
 
-@pytest.mark.skip(reason="superseded: Batch3.8 never creates or unlinks head residues")
-def test_head_temporary_alias_is_strictly_recovered_on_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, checkpoint, sentinel = _source_fixture(tmp_path)
-    destination = tmp_path / "nas"
-    destination.mkdir()
-    descriptor = initialize_destination(
-        destination,
-        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
-        sentinel_bytes=sentinel,
-    )
-    writer = DestinationArchiveWriter(
-        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
-    )
-    replication_dir = destination / "_replication"
-    original_unlink = replication.os.unlink
-    injected = False
-
-    def leave_head_temporary_alias(name: object, *args: object, **kwargs: object) -> None:
-        nonlocal injected
-        if (
-            not injected
-            and isinstance(name, str)
-            and name.startswith(".head.json.")
-            and isinstance(kwargs.get("dir_fd"), int)
-        ):
-            injected = True
-            raise OSError(errno.EIO, "injected restart residue")
-        original_unlink(name, *args, **kwargs)
-
-    monkeypatch.setattr(replication.os, "unlink", leave_head_temporary_alias)
-    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-    assert first.reason_code == "CONTROL_STATE_UNAVAILABLE"
-    assert injected
-    residue = [path for path in replication_dir.iterdir() if path.name.startswith(".head.json.")]
-    assert len(residue) == 1
-
-    monkeypatch.setattr(replication.os, "unlink", original_unlink)
-    second = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:02:00Z")
-    assert second.reason_code == "ALREADY_REPLICATED"
-    assert second.record is not None
-    assert not any(path.name.startswith(".head.json.") for path in replication_dir.iterdir())
-
-
-def _prepare_exchange_head_residue(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    mount_inspector: _FakeMountInspector | None = None,
-):
-    source, checkpoint, sentinel = _source_fixture(tmp_path)
-    destination = tmp_path / "nas"
-    destination.mkdir()
-    descriptor = initialize_destination(
-        destination,
-        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
-        sentinel_bytes=sentinel,
-        mount_inspector=mount_inspector,
-    )
-    writer = DestinationArchiveWriter(
-        descriptor,
-        source_root=source,
-        writer_host_id=descriptor.single_writer_host_id,
-        mount_inspector=mount_inspector,
-    )
-    first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-    assert first.record is not None
-    first_head = (destination / "_replication" / "head.json").read_bytes()
-    replication_dir = destination / "_replication"
-    replication_identity = replication_dir.stat()
-    original_unlink = replication.os.unlink
-    injected = False
-
-    def leave_exchange_residue(name: object, *args: object, **kwargs: object) -> None:
-        nonlocal injected
-        dir_fd = kwargs.get("dir_fd")
-        if (
-            not injected
-            and isinstance(name, str)
-            and name.startswith(".head.json.")
-            and isinstance(dir_fd, int)
-        ):
-            info = os.fstat(dir_fd)
-            if (info.st_dev, info.st_ino) == (
-                replication_identity.st_dev,
-                replication_identity.st_ino,
-            ):
-                injected = True
-                raise OSError(errno.EIO, "injected exchange residue")
-        original_unlink(name, *args, **kwargs)
-
-    monkeypatch.setattr(replication.os, "unlink", leave_exchange_residue)
-    second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
-    assert injected
-    assert second.reason_code == "CONTROL_STATE_UNAVAILABLE"
-    residue = [path for path in replication_dir.iterdir() if path.name.startswith(".head.json.")]
-    assert len(residue) == 1
-    assert residue[0].read_bytes() == first_head
-    monkeypatch.setattr(replication.os, "unlink", original_unlink)
-    return writer, checkpoint, destination, residue[0]
-
-
-@pytest.mark.skip(reason="superseded: Batch3.8 retains predecessor in deterministic slot")
-def test_exchange_head_temporary_alias_recovers_only_with_direct_predecessor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(tmp_path, monkeypatch)
-    recovered = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
-    assert recovered.status == "already_replicated"
-    assert recovered.reason_code == "ALREADY_REPLICATED"
-    assert recovered.record is not None
-    assert not residue.exists()
-    assert (destination / "_replication" / "head.json").exists()
-
-
-@pytest.mark.skip(reason="superseded: Batch3.8 retains predecessor in deterministic slot")
-def test_exchange_head_temporary_bad_predecessor_is_controlled_without_writes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(tmp_path, monkeypatch)
-    head = destination / "_replication" / "head.json"
-    current_head = head.read_bytes()
-    residue.write_bytes(b"not-a-head")
-    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
-    assert result.status == "unavailable"
-    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
-    assert result.destination_writes is False
-    assert head.read_bytes() == current_head
-    assert residue.exists()
-
-
-@pytest.mark.skip(reason="superseded: Batch3.8 retains predecessor in deterministic slot")
-def test_exchange_head_temporary_cleanup_boundary_drift_is_controlled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    inspector = _FakeMountInspector(tmp_path / "nas")
-    writer, checkpoint, destination, residue = _prepare_exchange_head_residue(
-        tmp_path, monkeypatch, mount_inspector=inspector
-    )
-    inspector = writer.mount_inspector
-    assert isinstance(inspector, _FakeMountInspector)
-    original_probe = replication._destination_live_mount_identity
-    probe_count = 0
-
-    def drift_before_unlink(*args: object, **kwargs: object) -> None:
-        nonlocal probe_count
-        probe_count += 1
-        if probe_count == 5:
-            inspector.info = MountInfo(destination, "apfs", ("local", "ro"), "vol-a")
-        original_probe(*args, **kwargs)
-
-    monkeypatch.setattr(replication, "_destination_live_mount_identity", drift_before_unlink)
-    result = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:03:00Z")
-    assert probe_count >= 3
-    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
-    assert result.destination_writes is False
-    assert residue.exists()
-
-
 def _head_recovery_case(tmp_path: Path, case: str):
     source, checkpoint, sentinel = _source_fixture(tmp_path)
     destination = tmp_path / "nas"
@@ -1567,24 +1318,40 @@ def _head_recovery_case(tmp_path: Path, case: str):
         descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
     )
     sequence = 1
-    if case == "genesis_orphan":
-        first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-        assert first.record is not None
-        (destination / "_replication" / "head.json").unlink()
-    elif case == "child_orphan":
-        first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
-        assert first.record is not None
-        first_head = (destination / "_replication" / "head.json").read_bytes()
-        second = writer.replicate(checkpoint, source_sequence=2, now="2026-09-09T00:02:00Z")
-        assert second.record is not None
-        (destination / "_replication" / "head.json").write_bytes(first_head)
-        sequence = 2
+    if case in {"genesis_orphan", "child_orphan"}:
+        if case == "child_orphan":
+            first = writer.replicate(checkpoint, source_sequence=1, now="2026-09-09T00:01:00Z")
+            assert first.record is not None
+            sequence = 2
+        pending = pytest.MonkeyPatch()
+
+        def fail_before_exchange(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise OSError(errno.EIO, "injected pre-exchange crash")
+
+        pending.setattr(replication, "_destination_exchange_at", fail_before_exchange)
+        if case == "genesis_orphan":
+
+            def fail_before_genesis_link(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+                raise OSError(errno.EIO, "injected pre-link crash")
+
+            pending.setattr(replication.os, "link", fail_before_genesis_link)
+        try:
+            failed = writer.replicate(
+                checkpoint,
+                source_sequence=sequence,
+                now="2026-09-09T00:02:00Z",
+            )
+        finally:
+            pending.undo()
+        assert failed.reason_code == "COPY_FAILED"
+        assert (destination / "_replication" / "head-history").exists()
     elif case != "normal":
         raise AssertionError(f"unknown head case {case}")
     return writer, checkpoint, destination, sequence
 
 
-@pytest.mark.skip(reason="superseded by deterministic slot crash-resume tests")
 @pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
 def test_head_install_parent_fsync_failure_after_linearization_is_controlled(
     tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
@@ -1614,37 +1381,46 @@ def test_head_install_parent_fsync_failure_after_linearization_is_controlled(
     assert (destination / "_replication" / "head.json").exists()
 
 
-@pytest.mark.skip(reason="superseded by deterministic slot crash-resume tests")
 @pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
 def test_head_install_readback_failure_after_linearization_is_controlled(
     tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     writer, checkpoint, destination, sequence = _head_recovery_case(tmp_path, case)
     original = replication._destination_read_at
+    baseline = (
+        (destination / "_replication" / "head.json").read_bytes()
+        if (destination / "_replication" / "head.json").exists()
+        else None
+    )
     read_count = 0
-    failure_at = 4 if case == "normal" else 3
+    injected = False
 
     def fail_head_readback(
         root_fd: int,
         components: tuple[str, ...],
         **kwargs: object,
     ):
-        nonlocal read_count
+        nonlocal read_count, injected
         if components == ("head.json",):
             read_count += 1
-            if read_count == failure_at:
+            current = (
+                (destination / "_replication" / "head.json").read_bytes()
+                if (destination / "_replication" / "head.json").exists()
+                else None
+            )
+            if not injected and current != baseline:
+                injected = True
                 raise ReplicationDurabilityError("injected head readback failure")
         return original(root_fd, components, **kwargs)
 
     monkeypatch.setattr(replication, "_destination_read_at", fail_head_readback)
     result = writer.replicate(checkpoint, source_sequence=sequence, now="2026-09-09T00:03:00Z")
-    assert read_count >= failure_at
+    assert injected
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert result.destination_writes is True
     assert (destination / "_replication" / "head.json").exists()
 
 
-@pytest.mark.skip(reason="superseded by deterministic slot crash-resume tests")
 @pytest.mark.parametrize("case", ["normal", "genesis_orphan", "child_orphan"])
 def test_head_install_lock_failure_after_linearization_is_controlled(
     tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
@@ -1719,8 +1495,7 @@ def test_head_history_three_updates_retain_predecessors_in_fixed_slots(tmp_path:
         "slot-00000000000000000003.json",
     ]
     assert not any(
-        path.name.startswith(".head.json.")
-        for path in (destination / "_replication").iterdir()
+        path.name.startswith(".head.json.") for path in (destination / "_replication").iterdir()
     )
     head = DestinationArchiveReader(descriptor).read_head()
     assert head is not None and head.source_sequence == 3
@@ -1761,6 +1536,95 @@ def test_head_history_slot_tamper_and_gap_fail_closed_without_unlink(tmp_path: P
     slot_three.write_bytes(slot_three_bytes)
 
 
+def _rewrite_head_version(path: Path, head_version: int) -> None:
+    values = json.loads(path.read_bytes())
+    values["head_version"] = head_version
+    values.pop("head_sha256")
+    values["head_sha256"] = domain_sha256("stock-eva/r2f4.3/replication-head/v1", values)
+    path.write_bytes(canonical_json_bytes(values))
+
+
+@pytest.mark.parametrize(
+    ("name", "bad_version"),
+    [
+        ("slot-00000000000000000001.json", 2),
+        ("slot-00000000000000000002.json", 2),
+        ("slot-00000000000000000003.json", 3),
+    ],
+)
+def test_head_history_rehashed_retained_slot_bad_version_fails_closed(
+    tmp_path: Path, name: str, bad_version: int
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    for sequence in range(1, 4):
+        assert writer.replicate(checkpoint, source_sequence=sequence).reason_code == "NONE"
+
+    _rewrite_head_version(destination / "_replication" / "head-history" / name, bad_version)
+    with pytest.raises(ReplicationStateUnavailable):
+        DestinationArchiveReader(descriptor).read_head()
+
+
+def test_head_history_rehashed_current_head_bad_version_fails_closed(tmp_path: Path) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    for sequence in range(1, 4):
+        assert writer.replicate(checkpoint, source_sequence=sequence).reason_code == "NONE"
+
+    _rewrite_head_version(destination / "_replication" / "head.json", 2)
+    with pytest.raises(ReplicationStateUnavailable):
+        DestinationArchiveReader(descriptor).read_head()
+
+
+def test_head_history_rehashed_pending_head_bad_version_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, checkpoint, sentinel = _source_fixture(tmp_path)
+    destination = tmp_path / "nas"
+    destination.mkdir()
+    descriptor = initialize_destination(
+        destination,
+        acknowledgement="CREATE_EMPTY_NAS_ARCHIVE_R2F4_3",
+        sentinel_bytes=sentinel,
+    )
+    writer = DestinationArchiveWriter(
+        descriptor, source_root=source, writer_host_id=descriptor.single_writer_host_id
+    )
+    for sequence in range(1, 4):
+        assert writer.replicate(checkpoint, source_sequence=sequence).reason_code == "NONE"
+    original_exchange = replication._destination_exchange_at
+
+    def fail_before_exchange(*args: object, **kwargs: object) -> bool:
+        raise OSError(errno.EIO, "injected pre-exchange crash")
+
+    monkeypatch.setattr(replication, "_destination_exchange_at", fail_before_exchange)
+    failed = writer.replicate(checkpoint, source_sequence=4)
+    assert failed.reason_code == "COPY_FAILED"
+    pending = destination / "_replication" / "head-history" / "slot-00000000000000000004.json"
+    _rewrite_head_version(pending, 3)
+    with pytest.raises(ReplicationStateUnavailable):
+        DestinationArchiveReader(descriptor).read_head(allow_pending_slot=True)
+    monkeypatch.setattr(replication, "_destination_exchange_at", original_exchange)
+
+
 def test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1786,10 +1650,7 @@ def test_head_history_pre_exchange_crash_leaves_fixed_pending_slot_for_resume(
     assert failed.reason_code == "COPY_FAILED"
     assert (destination / "_replication" / "head.json").exists()
     assert (
-        destination
-        / "_replication"
-        / "head-history"
-        / "slot-00000000000000000002.json"
+        destination / "_replication" / "head-history" / "slot-00000000000000000002.json"
     ).exists()
     monkeypatch.setattr(replication, "_destination_exchange_at", original_exchange)
     resumed = writer.replicate(checkpoint, source_sequence=2)
@@ -1834,8 +1695,7 @@ def test_head_history_post_exchange_crash_is_resumable_without_residue(
     resumed = writer.replicate(checkpoint, source_sequence=2)
     assert resumed.status == "already_replicated"
     assert not any(
-        path.name.startswith(".head.json.")
-        for path in (destination / "_replication").iterdir()
+        path.name.startswith(".head.json.") for path in (destination / "_replication").iterdir()
     )
 
 
@@ -1859,11 +1719,8 @@ def test_head_history_concurrent_same_sequence_has_one_immutable_winner(tmp_path
         results = list(executor.map(publish, range(2)))
     assert sum(result.status == "replicated" for result in results) == 1
     assert all(
-        result.status in {"replicated", "already_replicated", "unavailable"}
-        for result in results
+        result.status in {"replicated", "already_replicated", "unavailable"} for result in results
     )
     slot_dir = destination / "_replication" / "head-history"
-    assert [path.name for path in slot_dir.iterdir()] == [
-        "slot-00000000000000000001.json"
-    ]
+    assert [path.name for path in slot_dir.iterdir()] == ["slot-00000000000000000001.json"]
     assert DestinationArchiveReader(descriptor).read_head() is not None

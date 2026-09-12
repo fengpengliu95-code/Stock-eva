@@ -726,6 +726,13 @@ slot N. This gives the intentional mapping slot 1 -> record 1 and slot N (N > 1)
 while the visible head maps to record N. Existing slots are compare-and-reused only when their
 canonical bytes and immutable record/head identity match; they are never overwritten.
 
+Head-version continuity is an independent positional proof: the visible head for source sequence
+`N` has `head_version=N`; slot 1 (genesis) has `head_version=1`; retained slot `S>1`, which
+contains the direct predecessor record `S-1`, has `head_version=S-1`; and an admitted pending
+candidate slot `S` has `head_version=S`. Validation derives these expected versions from the
+slot/record position and never from the serialized slot value before comparison; a rehashed
+wrong-version slot, visible head, or pending candidate fails closed.
+
 `DestinationArchiveReader._validate_head_history` proves the full continuous record/slot chain,
 including canonical JSON, head and record hashes, descriptor and destination identity, parent
 record hashes, source-instance identity, source sequence, head version and checkpoint projection.
