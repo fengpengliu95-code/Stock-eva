@@ -287,6 +287,65 @@ def test_restore_staging_basename_swap_does_not_delete_attacker_or_publish(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("replacement", ["recreate", "symlink"])
+def test_restore_destination_base_replacement_is_rejected_before_publish(
+    tmp_path: Path, replacement: str
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    base = tmp_path / "base"
+    base.mkdir()
+    destination = base / "restore"
+
+    def replace_base(stage: Path) -> None:
+        moved = base.with_name("base.moved")
+        base.rename(moved)
+        if replacement == "recreate":
+            base.mkdir()
+        else:
+            base.symlink_to(moved, target_is_directory=True)
+
+    result = RestoreService(
+        archive,
+        audit_store=RestoreAuditStore(tmp_path / "audit"),
+        representative_query=replace_base,
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code in {"PATH_INVALID", "SOURCE_UNAVAILABLE"}
+    assert not destination.exists()
+    assert not (base.with_name("base.moved") / "restore").exists()
+
+
+@pytest.mark.parametrize("replacement", ["recreate", "symlink"])
+def test_restore_destination_intermediate_replacement_is_rejected_before_publish(
+    tmp_path: Path, replacement: str
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    destination = inner / "restore"
+
+    def replace_intermediate(stage: Path) -> None:
+        moved = outer.with_name("outer.moved")
+        outer.rename(moved)
+        if replacement == "recreate":
+            outer.mkdir()
+        else:
+            outer.symlink_to(moved, target_is_directory=True)
+
+    result = RestoreService(
+        archive,
+        audit_store=RestoreAuditStore(tmp_path / "audit"),
+        representative_query=replace_intermediate,
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code in {"PATH_INVALID", "SOURCE_UNAVAILABLE"}
+    assert not destination.exists()
+    assert not (outer.with_name("outer.moved") / "inner" / "restore").exists()
+
+
 def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

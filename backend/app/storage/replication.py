@@ -2284,6 +2284,90 @@ def _assert_destination_absent(parent_fd: int, name: str) -> None:
     raise ReplicationDurabilityError("restore destination exists")
 
 
+@dataclass(frozen=True)
+class _HeldDirectoryToken:
+    """One immutable parent/name binding in a requested destination path."""
+
+    parent_fd: int
+    basename: str
+    device: int
+    inode: int
+    mode: int
+    nlink: int
+
+
+@dataclass(frozen=True)
+class _HeldDirectoryAncestry:
+    tokens: tuple[_HeldDirectoryToken, ...]
+
+    @property
+    def parent_fd(self) -> int:
+        if not self.tokens:
+            raise ReplicationDurabilityError("restore destination parent is unavailable")
+        return self.tokens[-1].parent_fd
+
+    def assert_bound(self) -> None:
+        """Reprove every path edge through the held parent descriptors.
+
+        The last directory's link count is intentionally not authoritative:
+        sibling restore staging directories are expected to change it.  Its
+        descriptor identity and mode remain authoritative, as do all link
+        counts for ancestors outside the active target parent.
+        """
+        for index, token in enumerate(self.tokens):
+            try:
+                listed = os.stat(token.basename, dir_fd=token.parent_fd, follow_symlinks=False)
+                if stat.S_ISLNK(listed.st_mode) or not stat.S_ISDIR(listed.st_mode):
+                    raise ReplicationStateUnavailable("restore destination ancestry changed")
+                child_fd = os.open(token.basename, _DIRECTORY_FLAGS, dir_fd=token.parent_fd)
+                try:
+                    current = os.fstat(child_fd)
+                    identity = (
+                        int(current.st_dev),
+                        int(current.st_ino),
+                        int(stat.S_IMODE(current.st_mode)),
+                    )
+                    expected = (token.device, token.inode, token.mode)
+                    if identity != expected:
+                        raise ReplicationStateUnavailable(
+                            "restore destination ancestry changed"
+                        )
+                    if index < len(self.tokens) - 1 and int(current.st_nlink) != token.nlink:
+                        raise ReplicationStateUnavailable(
+                            "restore destination ancestry changed"
+                        )
+                finally:
+                    os.close(child_fd)
+            except OSError as exc:
+                raise ReplicationStateUnavailable(
+                    "restore destination ancestry changed"
+                ) from exc
+
+
+def _bind_directory_ancestry(path: Path, descriptors: list[int]) -> _HeldDirectoryAncestry:
+    """Bind every component of an already-open absolute directory chain."""
+    path = _physical_path(path)
+    components = path.parts[1:]
+    if not path.is_absolute() or len(descriptors) != len(components) + 1:
+        raise ReplicationDurabilityError("restore destination ancestry is invalid")
+    tokens: list[_HeldDirectoryToken] = []
+    for index, component in enumerate(components):
+        info = os.fstat(descriptors[index + 1])
+        if not stat.S_ISDIR(info.st_mode):
+            raise ReplicationDurabilityError("restore destination ancestry is invalid")
+        tokens.append(
+            _HeldDirectoryToken(
+                parent_fd=descriptors[index],
+                basename=component,
+                device=int(info.st_dev),
+                inode=int(info.st_ino),
+                mode=int(stat.S_IMODE(info.st_mode)),
+                nlink=int(info.st_nlink),
+            )
+        )
+    return _HeldDirectoryAncestry(tuple(tokens))
+
+
 def _ensure_staging_directory(root_fd: int) -> int:
     """Open the fixed staging namespace through the already-held root dirfd."""
     try:
@@ -9004,10 +9088,18 @@ class RestoreService:
                 reason_code=self._reason(exc),
                 effects=effects,
             )
+        parent_dirs: list[int] = []
+        ancestry: _HeldDirectoryAncestry
         try:
-            self.audit_store.ensure_ready()
-            snapshot = self._snapshot(generation)
-        except (ReplicationDurabilityError, ValueError, OSError) as exc:
+            # Bind the requested parent before reading the archive.  The
+            # descriptors stay held through publication and cleanup, so a
+            # later path replacement cannot redirect this operation.
+            parent_fd, parent_dirs = _open_directory_chain(final.parent, create=False)
+            ancestry = _bind_directory_ancestry(final.parent, parent_dirs)
+        except Exception as exc:
+            if parent_dirs:
+                failures: list[str] = []
+                _close_descriptors(parent_dirs, failures)
             return self._plan_response(
                 snapshot=None,
                 mode="execute",
@@ -9016,12 +9108,14 @@ class RestoreService:
                 reason_code=self._reason(exc),
                 effects=effects,
             )
-
         try:
-            parent_fd, parent_dirs = _open_directory_chain(final.parent, create=False)
-        except Exception as exc:
+            self.audit_store.ensure_ready()
+            snapshot = self._snapshot(generation)
+        except (ReplicationDurabilityError, ValueError, OSError) as exc:
+            failures: list[str] = []
+            _close_descriptors(parent_dirs, failures)
             return self._plan_response(
-                snapshot=snapshot,
+                snapshot=None,
                 mode="execute",
                 allowed=True,
                 status="unavailable",
@@ -9030,6 +9124,8 @@ class RestoreService:
             )
         stage_name = f".{final.name}.restore-{secrets.token_hex(16)}.staging"
         stage_fd: int | None = None
+        # Keep every descriptor in parent_dirs held until staging cleanup has
+        # completed; the ancestry proof is invalid once any edge is closed.
         published = False
         restore_writes = False
         stage_identity: tuple[int, int, int, int] | None = None
@@ -9101,6 +9197,7 @@ class RestoreService:
             fresh = self._snapshot(snapshot.record.replication_generation)
             if fresh.record.record_sha256 != snapshot.record.record_sha256:
                 raise ReplicationStateUnavailable("restore source changed")
+            ancestry.assert_bound()
             _assert_directory_identity(parent_fd, parent_identity)
             # Only this target basename and this writer's staging basename are
             # authoritative.  Sibling restores and audit activity may change
@@ -9115,6 +9212,7 @@ class RestoreService:
             _destination_rename_noreplace(parent_fd, stage_name, final.name)
             published = True
             _fsync_open_directory(parent_fd)
+            ancestry.assert_bound()
             _assert_directory_identity(parent_fd, parent_identity)
             # Keep the original staging fd across the exchange.  The final
             # namespace proof uses the held parent fd and O_NOFOLLOW.
@@ -9130,6 +9228,7 @@ class RestoreService:
                     snapshot.sentinel_bytes,
                     semantic=False,
                 )
+                ancestry.assert_bound()
             finally:
                 failures = []
                 _close_fd_best_effort(final_fd, "restore_final_fd", failures)

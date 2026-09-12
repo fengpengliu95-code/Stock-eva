@@ -2918,6 +2918,17 @@ descriptor records a null identity and unavailable outcome. Offline anchors:
 `test_restore_audit_reconcile_closes_crash_started_record`, and
 `test_restore_unreadable_descriptor_audits_null_destination_identity`.
 
+The destination parent is additionally an ambient descriptor authority. Execute
+holds the filesystem-root-to-parent chain, binding each parent/basename edge to
+the opened directory's device, inode and mode (and its stable ancestor link
+count). It revalidates the chain through the held descriptors immediately
+before no-replace publication and after post-publication readback; a rename,
+replacement or symlink cannot redirect publication into a detached old path.
+The active target parent link count remains mutable so unrelated sibling and
+different-target restores can proceed concurrently. Offline anchors include
+the base and intermediate rename/recreate and symlink-replacement cases in
+`tests/test_replication_restore_batch4.py`.
+
 ### Final Batch4 gate — unified terminalization and locked audit namespace
 
 After a `STARTED` record is durable, every execute branch (descriptor/source

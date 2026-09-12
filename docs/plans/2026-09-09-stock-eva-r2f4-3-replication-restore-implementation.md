@@ -2724,3 +2724,11 @@ started/terminal names, validates/reconciles strict staging temp files under
 the lock, and installs canonical records with O_EXCL staging/link semantics.
 Generation selectors are validated before the reader can perform a mapping or
 regex operation, and malformed selectors still receive a terminal record.
+
+The restore now holds a descriptor-native ancestry chain from the filesystem
+root through the requested destination parent. Every edge is revalidated with
+`O_NOFOLLOW` through its held parent descriptor before rename and after final
+readback, so base/intermediate rename, replacement and symlink attacks fail
+closed without publishing into a detached path. The active target parent may
+gain unrelated sibling staging entries, preserving concurrent different-target
+restores. Coverage is in the Batch4 ancestry replacement tests.
