@@ -497,8 +497,13 @@ def _open_directory_chain(path: Path, *, create: bool = False) -> tuple[int, lis
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(component, mode=0o700, dir_fd=current)
-                created = True
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current)
+                    created = True
+                except FileExistsError:
+                    # Another creator won the mkdir race; reopen it with
+                    # O_NOFOLLOW and retain the same descriptor authority.
+                    pass
                 child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
             if created:
                 # A newly-created directory is not durable until both the
@@ -6535,6 +6540,10 @@ class DestinationArchiveReader:
         must name it explicitly and it must be present in the fully verified
         head/history chain.
         """
+        if generation is not None and (
+            not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)
+        ):
+            raise ReplicationDurabilityError("destination generation is invalid")
         with self.root_session() as root_fd:
             sentinel = self.read_sentinel(root_fd)
             sentinel_result = _destination_read_at(
@@ -6553,8 +6562,6 @@ class DestinationArchiveReader:
             if selected_generation not in records_by_generation:
                 raise ReplicationStateUnavailable("destination generation is unavailable")
             record = records_by_generation[selected_generation]
-            if generation is not None and not isinstance(generation, str):
-                raise ReplicationDurabilityError("destination generation is invalid")
             # Validate the complete selected generation, including its own
             # sentinel, manifest and exact object inventory, after validating
             # every record in the chain above.
@@ -7927,6 +7934,7 @@ class RestorePlanResponse(BaseModel):
     mode: Literal["plan", "execute"]
     execution_allowed: bool
     effects: ReplicationEffects
+    audit_status: Literal["not_started", "started", "terminal", "unavailable"] = "not_started"
     provider_requests: Literal[0] = 0
     paths_exposed: Literal[False] = False
 
@@ -8068,88 +8076,219 @@ class RestoreAuditStore:
             raise ReplicationDurabilityError("restore audit root is unsafe")
         self.root = _physical_path(root)
 
+    @contextmanager
+    def _locked_namespace(self):
+        root_fd, descriptors = _open_directory_chain(self.root, create=True)
+        lock_fd: int | None = None
+        staging_fd: int | None = None
+        primary: BaseException | None = None
+        try:
+            for _attempt in range(3):
+                try:
+                    lock_fd = os.open(
+                        ".writer.lock",
+                        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=root_fd,
+                    )
+                    break
+                except FileNotFoundError:
+                    if _attempt == 2:
+                        raise
+            lock_info = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or stat.S_IMODE(lock_info.st_mode) != 0o600
+                or lock_info.st_nlink != 1
+            ):
+                raise ReplicationDurabilityError("restore audit lock is unsafe")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                os.mkdir(".staging", mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            staging_fd = os.open(
+                ".staging", _DIRECTORY_FLAGS, dir_fd=root_fd
+            )
+            staging_info = os.fstat(staging_fd)
+            if not stat.S_ISDIR(staging_info.st_mode) or stat.S_IMODE(staging_info.st_mode) != 0o700:
+                raise ReplicationDurabilityError("restore audit staging is unsafe")
+            self._validate_namespace_locked(root_fd, staging_fd)
+            yield root_fd, staging_fd
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            failures: list[str] = []
+            if staging_fd is not None:
+                _close_fd_best_effort(staging_fd, "restore_audit_staging_fd", failures)
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    failures.append("restore_audit_unlock")
+                _close_fd_best_effort(lock_fd, "restore_audit_lock_fd", failures)
+            _close_descriptors(descriptors, failures)
+            _finish_cleanup(primary, failures)
+
+    @staticmethod
+    def _validate_namespace_locked(root_fd: int, staging_fd: int) -> None:
+        starts: set[str] = set()
+        terminals: set[str] = set()
+        start_hashes: dict[str, str] = {}
+        terminal_links: dict[str, str] = {}
+        for name in os.listdir(root_fd):
+            if name in {".writer.lock", ".staging"}:
+                continue
+            if not re.fullmatch(r"[0-9a-f]{64}\.(?:started|terminal)\.json", name):
+                raise ReplicationDurabilityError("restore audit namespace is not allowlisted")
+            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ReplicationDurabilityError("restore audit entry is unsafe")
+            payload = _destination_read_relative(root_fd, name)
+            if name.endswith(".started.json"):
+                starts.add(name[:64])
+                event = RestoreAuditEvent.model_validate_json(payload)
+                if event.audit_id != name[:64]:
+                    raise ReplicationDurabilityError("restore audit start identity is invalid")
+                event.verify_hash()
+                start_hashes[event.audit_id] = event.event_sha256
+            else:
+                terminals.add(name[:64])
+                try:
+                    report = RestoreReport.model_validate_json(payload)
+                    if report.report_id != name[:64]:
+                        raise ReplicationDurabilityError("restore audit terminal identity is invalid")
+                    report.verify_hash()
+                    terminal_links[report.report_id] = report.start_event_sha256
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    event = RestoreTerminalEvent.model_validate_json(payload)
+                    if event.audit_id != name[:64]:
+                        raise ReplicationDurabilityError(
+                            "restore audit terminal identity is invalid"
+                        ) from None
+                    event.verify_hash()
+                    terminal_links[event.audit_id] = event.start_event_sha256
+        for name in os.listdir(staging_fd):
+            if not re.fullmatch(r"\.audit-[0-9a-f]{32}\.tmp", name):
+                raise ReplicationDurabilityError("restore audit staging entry is unknown")
+            info = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+            ):
+                raise ReplicationDurabilityError("restore audit staging entry is unsafe")
+            payload, _ = _read_at(staging_fd, name)
+            try:
+                values = json.loads(payload)
+                parsed: BaseModel
+                if isinstance(values, Mapping) and values.get("phase") == "STARTED":
+                    parsed = RestoreAuditEvent.model_validate(values)
+                elif isinstance(values, Mapping) and values.get("phase") == "TERMINAL":
+                    try:
+                        parsed = RestoreReport.model_validate(values)
+                    except (TypeError, ValueError):
+                        parsed = RestoreTerminalEvent.model_validate(values)
+                else:
+                    raise ReplicationDurabilityError("restore audit staging payload is invalid")
+                if canonical_json_bytes(parsed.model_dump(mode="json")) != payload:
+                    raise ReplicationDurabilityError("restore audit staging payload is not canonical")
+                if hasattr(parsed, "verify_hash"):
+                    parsed.verify_hash()
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ReplicationDurabilityError("restore audit staging payload is invalid") from exc
+            os.unlink(name, dir_fd=staging_fd)
+        if not terminals <= starts:
+            raise ReplicationDurabilityError("restore audit terminal is unlinked")
+        if any(start_hashes.get(audit_id) != link for audit_id, link in terminal_links.items()):
+            raise ReplicationDurabilityError("restore audit terminal binding is invalid")
+
+    @staticmethod
+    def _install_at(root_fd: int, staging_fd: int, name: str, payload: bytes) -> None:
+        temporary = f".audit-{secrets.token_hex(16)}.tmp"
+        temporary_fd: int | None = None
+        try:
+            temporary_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=staging_fd,
+            )
+            _write_fully(temporary_fd, payload)
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = None
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=staging_fd,
+                    dst_dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                existing = _destination_read_relative(root_fd, name)
+                if existing != payload:
+                    raise ReplicationDurabilityError("restore audit record conflict") from exc
+            _fsync_open_directory(root_fd)
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            try:
+                os.unlink(temporary, dir_fd=staging_fd)
+            except FileNotFoundError:
+                pass
+
     def ensure_ready(self) -> None:
         """Create and strictly validate only the configured audit namespace."""
-        fd, descriptors = _open_directory_chain(self.root, create=True)
-        failures: list[str] = []
-        try:
-            names = os.listdir(fd)
-            starts: set[str] = set()
-            terminals: set[str] = set()
-            start_hashes: dict[str, str] = {}
-            terminal_links: dict[str, str] = {}
-            for name in names:
-                if not re.fullmatch(r"[0-9a-f]{64}\.(?:started|terminal)\.json", name):
-                    raise ReplicationDurabilityError("restore audit namespace is not allowlisted")
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                    raise ReplicationDurabilityError("restore audit entry is unsafe")
-                payload = _destination_read_relative(fd, name)
-                if name.endswith(".started.json"):
-                    starts.add(name[:64])
-                    event = RestoreAuditEvent.model_validate_json(payload)
-                    if event.audit_id != name[:64]:
-                        raise ReplicationDurabilityError("restore audit start identity is invalid")
-                    event.verify_hash()
-                    start_hashes[event.audit_id] = event.event_sha256
-                else:
-                    terminals.add(name[:64])
-                    try:
-                        report = RestoreReport.model_validate_json(payload)
-                        if report.report_id != name[:64]:
-                            raise ReplicationDurabilityError("restore audit terminal identity is invalid")
-                        report.verify_hash()
-                        terminal_links[report.report_id] = report.start_event_sha256
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        event = RestoreTerminalEvent.model_validate_json(payload)
-                        if event.audit_id != name[:64]:
-                            raise ReplicationDurabilityError(
-                                "restore audit terminal identity is invalid"
-                            ) from None
-                        event.verify_hash()
-                        terminal_links[event.audit_id] = event.start_event_sha256
-            if not terminals <= starts:
-                raise ReplicationDurabilityError("restore audit terminal is unlinked")
-            if any(start_hashes.get(audit_id) != link for audit_id, link in terminal_links.items()):
-                raise ReplicationDurabilityError("restore audit terminal binding is invalid")
-        finally:
-            _close_descriptors(descriptors, failures)
-            _finish_cleanup(None, failures)
+        with self._locked_namespace():
+            return
 
     def write_started(self, *, destination_id: str | None, started_at: str) -> RestoreAuditEvent:
-        self.ensure_ready()
-        audit_id = secrets.token_hex(32)
-        values: dict[str, object] = {
-            "audit_schema": "stock-eva/r2f4.3/restore-audit/v1",
-            "schema_version": 1,
-            "audit_id": audit_id,
-            "phase": "STARTED",
-            "destination_id": destination_id,
-            "started_at": started_at,
-        }
-        values["event_sha256"] = domain_sha256(
-            "stock-eva/r2f4.3/restore-audit-start/v1", values
-        )
-        event = RestoreAuditEvent.model_validate(values)
-        event.verify_hash()
-        _install_no_replace(
-            self.root / f"{audit_id}.started.json", canonical_json_bytes(event.model_dump(mode="json"))
-        )
-        return event
+        with self._locked_namespace() as (root_fd, staging_fd):
+            audit_id = secrets.token_hex(32)
+            values: dict[str, object] = {
+                "audit_schema": "stock-eva/r2f4.3/restore-audit/v1",
+                "schema_version": 1,
+                "audit_id": audit_id,
+                "phase": "STARTED",
+                "destination_id": destination_id,
+                "started_at": started_at,
+            }
+            values["event_sha256"] = domain_sha256(
+                "stock-eva/r2f4.3/restore-audit-start/v1", values
+            )
+            event = RestoreAuditEvent.model_validate(values)
+            event.verify_hash()
+            self._install_at(
+                root_fd,
+                staging_fd,
+                f"{audit_id}.started.json",
+                canonical_json_bytes(event.model_dump(mode="json")),
+            )
+            return event
 
     def write_terminal(self, report: RestoreReport) -> None:
-        report.verify_hash()
-        self.ensure_ready()
-        payload = canonical_json_bytes(report.model_dump(mode="json"))
-        _install_no_replace(self.root / f"{report.report_id}.terminal.json", payload)
+        with self._locked_namespace() as (root_fd, staging_fd):
+            report.verify_hash()
+            self._install_at(
+                root_fd,
+                staging_fd,
+                f"{report.report_id}.terminal.json",
+                canonical_json_bytes(report.model_dump(mode="json")),
+            )
 
     def write_terminal_event(self, event: RestoreTerminalEvent) -> None:
-        event.verify_hash()
-        self.ensure_ready()
-        _install_no_replace(
-            self.root / f"{event.audit_id}.terminal.json",
-            canonical_json_bytes(event.model_dump(mode="json")),
-        )
+        with self._locked_namespace() as (root_fd, staging_fd):
+            event.verify_hash()
+            self._install_at(
+                root_fd,
+                staging_fd,
+                f"{event.audit_id}.terminal.json",
+                canonical_json_bytes(event.model_dump(mode="json")),
+            )
 
     def write(self, report: RestoreReport) -> None:
         """Compatibility alias for terminal evidence."""
@@ -8157,67 +8296,70 @@ class RestoreAuditStore:
 
     def reconcile(self) -> int:
         """Close valid STARTED records lacking a terminal during restart recovery."""
-        self.ensure_ready()
-        fd, descriptors = _open_directory_chain(self.root, create=False)
-        starts: list[RestoreAuditEvent] = []
-        terminals: set[str] = set()
-        try:
-            for name in os.listdir(fd):
+        with self._locked_namespace() as (root_fd, staging_fd):
+            starts: list[RestoreAuditEvent] = []
+            terminals: set[str] = set()
+            for name in os.listdir(root_fd):
                 if name.endswith(".started.json"):
-                    starts.append(RestoreAuditEvent.model_validate_json(_destination_read_relative(fd, name)))
+                    starts.append(
+                        RestoreAuditEvent.model_validate_json(
+                            _destination_read_relative(root_fd, name)
+                        )
+                    )
                 elif name.endswith(".terminal.json"):
                     terminals.add(name[:64])
-        finally:
-            failures: list[str] = []
-            _close_descriptors(descriptors, failures)
-            _finish_cleanup(None, failures)
-        closed = 0
-        for event in starts:
-            audit_id = event.audit_id
-            if audit_id in terminals:
-                continue
-            event.verify_hash()
-            now = _utc_now()
-            effects = ReplicationEffects(
-                writes=True,
-                canonical_writes=False,
-                destination_writes=False,
-                outbox_writes=False,
-                restore_writes=True,
-                audit_writes=True,
-            )
-            values: dict[str, object] = {
-                "report_schema": "stock-eva/r2f4.3/restore-report/v1",
-                "schema_version": 1,
-                "report_id": audit_id,
-                "destination_id": event.destination_id or ("0" * 32),
-                "source_replication_generation": "0" * 64,
-                "source_record_sha256": "0" * 64,
-                "source_manifest_canonical_sha256": "0" * 64,
-                "source_object_set_sha256": "0" * 64,
-                "publication_binding_sha256": "0" * 64,
-                "source_instance_id": "0" * 64,
-                "source_sequence": 1,
-                "checkpoint_id": "0" * 64,
-                "object_count": 0,
-                "row_count": 0,
-                "byte_count": 0,
-                "verification_state": "failed",
-                "reason_code": "CONTROL_STATE_UNAVAILABLE",
-                "started_at": event.started_at,
-                "completed_at": now,
-                "effects": effects.model_dump(mode="json"),
-                "start_event_sha256": event.event_sha256,
-            }
-            values["report_sha256"] = domain_sha256(
-                "stock-eva/r2f4.3/restore-report/v1", values
-            )
-            report = RestoreReport.model_validate(values)
-            report.verify_hash()
-            payload = canonical_json_bytes(report.model_dump(mode="json"))
-            _install_no_replace(self.root / f"{audit_id}.terminal.json", payload)
-            closed += 1
-        return closed
+            closed = 0
+            for event in starts:
+                audit_id = event.audit_id
+                if audit_id in terminals:
+                    continue
+                event.verify_hash()
+                now = _utc_now()
+                effects = ReplicationEffects(
+                    writes=True,
+                    canonical_writes=False,
+                    destination_writes=False,
+                    outbox_writes=False,
+                    restore_writes=True,
+                    audit_writes=True,
+                )
+                values: dict[str, object] = {
+                    "report_schema": "stock-eva/r2f4.3/restore-report/v1",
+                    "schema_version": 1,
+                    "report_id": audit_id,
+                    "destination_id": event.destination_id or ("0" * 32),
+                    "source_replication_generation": "0" * 64,
+                    "source_record_sha256": "0" * 64,
+                    "source_manifest_canonical_sha256": "0" * 64,
+                    "source_object_set_sha256": "0" * 64,
+                    "publication_binding_sha256": "0" * 64,
+                    "source_instance_id": "0" * 64,
+                    "source_sequence": 1,
+                    "checkpoint_id": "0" * 64,
+                    "object_count": 0,
+                    "row_count": 0,
+                    "byte_count": 0,
+                    "verification_state": "failed",
+                    "reason_code": "CONTROL_STATE_UNAVAILABLE",
+                    "started_at": event.started_at,
+                    "completed_at": now,
+                    "effects": effects.model_dump(mode="json"),
+                    "start_event_sha256": event.event_sha256,
+                }
+                values["report_sha256"] = domain_sha256(
+                    "stock-eva/r2f4.3/restore-report/v1", values
+                )
+                report = RestoreReport.model_validate(values)
+                report.verify_hash()
+                payload = canonical_json_bytes(report.model_dump(mode="json"))
+                self._install_at(
+                    root_fd,
+                    staging_fd,
+                    f"{audit_id}.terminal.json",
+                    payload,
+                )
+                closed += 1
+            return closed
 
 
 def _restore_destination_path(
@@ -8702,7 +8844,7 @@ class RestoreService:
                     effects=effects.model_copy(
                         update={"writes": True, "audit_writes": True}
                     ),
-                )
+                ).model_copy(update={"audit_status": "terminal"})
             except Exception:
                 return self._plan_response(
                     snapshot=None,
@@ -8711,7 +8853,7 @@ class RestoreService:
                     status="unavailable",
                     reason_code="CONTROL_STATE_UNAVAILABLE",
                     effects=effects,
-                )
+                ).model_copy(update={"audit_status": "unavailable"})
         try:
             final = _restore_destination_path(
                 Path(destination),
@@ -8747,7 +8889,7 @@ class RestoreService:
                 status="unavailable",
                 reason_code="CONTROL_STATE_UNAVAILABLE",
                 effects=effects,
-            )
+            ).model_copy(update={"audit_status": "unavailable"})
         result = self._execute_core(
             destination,
             generation=generation,
@@ -8756,6 +8898,7 @@ class RestoreService:
         )
         result = result.model_copy(
             update={
+                "audit_status": "started",
                 "effects": result.effects.model_copy(
                     update={
                         "writes": True,
@@ -8777,12 +8920,12 @@ class RestoreService:
             "completed_at": _utc_now(),
             "effects": result.effects.model_dump(mode="json"),
         }
-        terminal_values["event_sha256"] = domain_sha256(
-            "stock-eva/r2f4.3/restore-terminal/v1", terminal_values
-        )
-        terminal = RestoreTerminalEvent.model_validate(terminal_values)
-        terminal.verify_hash()
         try:
+            terminal_values["event_sha256"] = domain_sha256(
+                "stock-eva/r2f4.3/restore-terminal/v1", terminal_values
+            )
+            terminal = RestoreTerminalEvent.model_validate(terminal_values)
+            terminal.verify_hash()
             self.audit_store.write_terminal_event(terminal)
         except Exception:
             if result.status == "ready":
@@ -8793,9 +8936,9 @@ class RestoreService:
                     status="unavailable",
                     reason_code="CONTROL_STATE_UNAVAILABLE",
                     effects=result.effects,
-                )
-            return result
-        return result
+                ).model_copy(update={"audit_status": "unavailable"})
+            return result.model_copy(update={"audit_status": "unavailable"})
+        return result.model_copy(update={"audit_status": "terminal"})
 
     def _execute_core(
         self,

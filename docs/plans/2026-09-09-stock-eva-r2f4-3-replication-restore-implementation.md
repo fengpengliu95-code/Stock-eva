@@ -2708,3 +2708,19 @@ callback are never rerun. The relevant offline anchors are the Batch4 review
 tests in `tests/test_replication_restore_batch4.py` covering pathname swap,
 post-rename failure, two-phase audit, strict namespace rejection, primary
 reason preservation and descriptor identity.
+
+#### Final Batch4 gate (implementation contract)
+
+Execute uses one terminalization boundary after `STARTED` persistence. The
+boundary is applied to typed descriptor, input/generation, source snapshot,
+query, copy, rename and post-publish failures. If terminal durability fails,
+the primary failure/status/effects are preserved; only an otherwise successful
+publish becomes `CONTROL_STATE_UNAVAILABLE`. `audit_writes` remains true once
+the start record exists, while `destination_writes` remains false for restore.
+
+`RestoreAuditStore` owns a fixed descriptor-native writer lock and `.staging/`
+namespace. Its scanner allowlists the lock, staging directory and canonical
+started/terminal names, validates/reconciles strict staging temp files under
+the lock, and installs canonical records with O_EXCL staging/link semantics.
+Generation selectors are validated before the reader can perform a mapping or
+regex operation, and malformed selectors still receive a terminal record.

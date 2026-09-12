@@ -2917,3 +2917,23 @@ descriptor records a null identity and unavailable outcome. Offline anchors:
 `test_restore_corrupt_archive_has_started_and_terminal_audit`,
 `test_restore_audit_reconcile_closes_crash_started_record`, and
 `test_restore_unreadable_descriptor_audits_null_destination_identity`.
+
+### Final Batch4 gate — unified terminalization and locked audit namespace
+
+After a `STARTED` record is durable, every execute branch (descriptor/source
+failure, typed generation rejection, query/copy failure, pre-rename failure,
+and post-publish control failure) attempts the linked terminal record. A
+terminal-audit failure never replaces a primary failure reason/effect; a
+successful publish degrades to `CONTROL_STATE_UNAVAILABLE` while retaining
+the visible restore and `audit_writes=true`. Restore effects keep
+`destination_writes=false` and distinguish staging/final mutation from audit
+mutation.
+
+The audit root is serialized by a fixed descriptor-native `.writer.lock`.
+Top-level entries are limited to that lock, `.staging/`, and canonical
+started/terminal records. O_EXCL temporary records exist only in `.staging/`,
+are validated/recovered under the lock, and cannot overwrite a canonical
+record. Invalid generation selectors are typed before archive lookup and are
+still terminalized after `STARTED`. The crosswalk anchors include the
+malformed-generation, corrupt-descriptor, concurrent-writer and primary
+terminal-audit-failure tests in `test_replication_restore_batch4.py`.

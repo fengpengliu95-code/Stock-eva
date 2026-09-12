@@ -1,5 +1,6 @@
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -256,6 +257,7 @@ def test_restore_audit_is_two_phase_descriptor_bound_and_effects_are_split(
     assert result.effects.destination_writes is False
     assert result.effects.restore_writes is True
     assert result.effects.audit_writes is True
+    assert result.audit_status == "terminal"
     started = next((tmp_path / "audit").glob("*.started.json"))
     terminal = next((tmp_path / "audit").glob("*.terminal.json"))
     assert f'"destination_id":"{descriptor.destination_id}"' in started.read_text()
@@ -307,6 +309,7 @@ def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert result.effects.destination_writes is False
+    assert result.audit_status == "terminal"
     assert destination.is_dir()
     assert calls == 2
 
@@ -346,7 +349,23 @@ def test_restore_audit_namespace_extras_fail_before_start(
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
     assert not (tmp_path / "restore").exists()
-    assert list(audit_root.iterdir()) == [audit_root / "unexpected"]
+    assert not list(audit_root.glob("*.started.json"))
+    assert not list(audit_root.glob("*.terminal.json"))
+
+
+def test_restore_malformed_audit_staging_temp_fails_closed(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    audit = RestoreAuditStore(tmp_path / "audit")
+    audit.ensure_ready()
+    (tmp_path / "audit" / ".staging" / (".audit-" + "a" * 32 + ".tmp")).write_bytes(b"{}")
+
+    result = RestoreService(archive, audit_store=audit).execute(tmp_path / "restore")
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert not list((tmp_path / "audit").glob("*.started.json"))
 
 
 def test_restore_terminal_audit_failure_preserves_primary_reason(
@@ -391,6 +410,38 @@ def test_restore_unreadable_descriptor_audits_null_destination_identity(
     started = next((tmp_path / "audit").glob("*.started.json"))
     assert '"destination_id":null' in started.read_text()
     assert descriptor.destination_id not in started.read_text()
+
+
+def test_restore_malformed_generation_is_typed_and_terminalized(tmp_path: Path) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(tmp_path / "restore", generation=[])
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "SOURCE_UNAVAILABLE"
+    assert result.effects.audit_writes is True
+    assert result.audit_status == "terminal"
+    assert len(list((tmp_path / "audit").glob("*.started.json"))) == 1
+    assert len(list((tmp_path / "audit").glob("*.terminal.json"))) == 1
+
+
+def test_restore_audit_concurrent_writers_serialize_without_overwrite(tmp_path: Path) -> None:
+    audit = RestoreAuditStore(tmp_path / "audit")
+
+    def write_one(index: int) -> str:
+        event = audit.write_started(
+            destination_id=f"{index:032x}", started_at="2026-09-12T00:00:00Z"
+        )
+        return event.audit_id
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        audit_ids = list(pool.map(write_one, range(8)))
+
+    assert len(set(audit_ids)) == 8
+    assert len(list((tmp_path / "audit").glob("*.started.json"))) == 8
+    assert len(list((tmp_path / "audit").glob("*.terminal.json"))) == 0
 
 
 def test_symlinked_canonical_root_is_rejected_without_copy(tmp_path: Path) -> None:
