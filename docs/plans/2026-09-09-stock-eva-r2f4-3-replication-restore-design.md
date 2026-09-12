@@ -2947,6 +2947,12 @@ The linked terminal audit records only the STARTED ancestry/attempt/final
 basename hashes plus an observed inode identity hash; the attacker inode and
 any detached owned final remain untouched.
 
+Any post-rename final-name observation failure, including `O_NOFOLLOW`
+symlink loops, missing names, non-directories, permission errors, or failed
+identity reads, follows the same unknown-orphan result. The linked terminal
+audit retains the observed identity hash when one can be read and otherwise
+records only the expected STARTED hashes.
+
 ### Final Batch4 gate — unified terminalization and locked audit namespace
 
 After a `STARTED` record is durable, every execute branch (descriptor/source

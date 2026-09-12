@@ -9414,19 +9414,28 @@ class RestoreService:
                     "restore publication authority unavailable"
                 ) from ancestry_exc
             published = True
-            _fsync_open_directory(parent_fd)
-            _assert_directory_identity(parent_fd, parent_identity)
-            # Keep the original staging fd across the exchange.  The final
-            # namespace proof uses the held parent fd and O_NOFOLLOW.
-            _assert_directory_fingerprint(stage_fd, stage_identity)
-            final_fd = os.open(final.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            # Until the final basename is proven to name the held staging
+            # inode, every namespace observation is an unknown-orphan window.
+            final_fd: int | None = None
             try:
+                _fsync_open_directory(parent_fd)
+                _assert_directory_identity(parent_fd, parent_identity)
+                # Keep the original staging fd across the exchange.  The
+                # final namespace proof uses the held parent fd and O_NOFOLLOW.
+                _assert_directory_fingerprint(stage_fd, stage_identity)
+                final_fd = os.open(final.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
                 if _directory_fingerprint(os.fstat(final_fd)) != stage_identity:
-                    final_identity_mismatch = True
-                    authority_failure = True
-                    published = False
-                    observed_final_inode_sha256 = _inode_identity_sha256(os.fstat(final_fd))
                     raise ReplicationStateUnavailable("restore publication identity changed")
+            except Exception as identity_exc:
+                final_identity_mismatch = True
+                authority_failure = True
+                published = False
+                observed_final_inode_sha256 = _observed_inode_sha256(parent_fd, final.name)
+                raise ReplicationStateUnavailable(
+                    "restore final identity is unknown"
+                ) from identity_exc
+
+            try:
                 _verify_staged_restore_tree(
                     final_fd,
                     snapshot.record,

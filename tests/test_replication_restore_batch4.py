@@ -514,6 +514,50 @@ def test_restore_final_inode_swap_immediately_after_rename_keeps_attacker_and_st
     assert len(list(audit_root.glob("*.terminal.json"))) == 1
 
 
+@pytest.mark.parametrize("replacement", ["symlink", "file", "missing"])
+def test_restore_final_observation_error_is_unknown_manual_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    attacker = tmp_path / "restore.attacker"
+    original = replication._destination_rename_noreplace
+
+    def rename_then_replace_final(parent_fd: int, source: str, target: str) -> None:
+        original(parent_fd, source, target)
+        destination.rename(attacker)
+        if replacement == "symlink":
+            destination.symlink_to(attacker, target_is_directory=True)
+        elif replacement == "file":
+            destination.write_text("attacker")
+
+    monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_then_replace_final)
+    audit_root = tmp_path / "audit"
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(audit_root)
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.rename_allowed is False
+    assert result.effects.restore_writes is True
+    assert result.orphan_cleanup_status == "unknown"
+    assert result.manual_intervention_required is True
+    assert attacker.is_dir()
+    if replacement == "symlink":
+        assert destination.is_symlink()
+    elif replacement == "file":
+        assert destination.is_file()
+    else:
+        assert not destination.exists()
+    assert len(list(tmp_path.glob(".restore-*.staging"))) == 0
+    terminal = next(audit_root.glob("*.terminal.json"))
+    payload = terminal.read_text()
+    assert '"manual_intervention_required":true' in payload
+    assert '"orphan_cleanup_status":"unknown"' in payload
+    assert str(tmp_path) not in payload
+
+
 def test_restore_corrupt_archive_has_started_and_terminal_audit(
     tmp_path: Path,
 ) -> None:

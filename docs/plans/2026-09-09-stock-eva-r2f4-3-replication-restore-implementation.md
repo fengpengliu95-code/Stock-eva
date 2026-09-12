@@ -2742,6 +2742,10 @@ semantically validated, removed, or moved. The linked terminal audit records
 only ancestry/attempt/final basename hashes and an observed inode identity
 hash, with `manual_intervention_required=true`.
 
+Final `lstat`/`O_NOFOLLOW` open, `fstat`, and identity-read errors after the
+rename are all quarantined identically, including symlink, missing, file, and
+permission races; no unknown final name is removed.
+
 The restore now holds a descriptor-native ancestry chain from the filesystem
 root through the requested destination parent. Every edge is revalidated with
 `O_NOFOLLOW` through its held parent descriptor before rename and after final
