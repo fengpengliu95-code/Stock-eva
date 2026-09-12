@@ -2255,6 +2255,35 @@ def _assert_directory_fingerprint(fd: int, expected: tuple[int, int, int, int]) 
         raise ReplicationStateUnavailable("replication directory changed during read")
 
 
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    """Return the held directory identity without observing mutable entries."""
+    if not stat.S_ISDIR(info.st_mode):
+        raise ReplicationDurabilityError("replication directory is not a directory")
+    return (int(info.st_dev), int(info.st_ino), int(stat.S_IMODE(info.st_mode)))
+
+
+def _assert_directory_identity(fd: int, expected: tuple[int, int, int]) -> None:
+    try:
+        actual = _directory_identity(os.fstat(fd))
+    except OSError as exc:
+        raise ReplicationStateUnavailable("replication directory identity changed") from exc
+    if actual != expected:
+        raise ReplicationStateUnavailable("replication directory identity changed")
+
+
+def _assert_destination_absent(parent_fd: int, name: str) -> None:
+    """Bind the target basename, without making sibling changes authoritative."""
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReplicationStateUnavailable("restore destination path changed") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise ReplicationStateUnavailable("restore destination path changed")
+    raise ReplicationDurabilityError("restore destination exists")
+
+
 def _ensure_staging_directory(root_fd: int) -> int:
     """Open the fixed staging namespace through the already-held root dirfd."""
     try:
@@ -8782,6 +8811,58 @@ class RestoreService:
             rename_allowed=True,
         )
 
+    def _finalize_execute(
+        self,
+        result: RestorePlanResponse,
+        *,
+        start: RestoreAuditEvent,
+        started_at: str,
+    ) -> RestorePlanResponse:
+        """Write the terminal audit record while preserving the primary result."""
+        result = result.model_copy(
+            update={
+                "audit_status": "started",
+                "effects": result.effects.model_copy(
+                    update={
+                        "writes": True,
+                        "destination_writes": False,
+                        "audit_writes": True,
+                    }
+                ),
+            }
+        )
+        terminal_values: dict[str, object] = {
+            "audit_schema": "stock-eva/r2f4.3/restore-terminal/v1",
+            "schema_version": 1,
+            "audit_id": start.audit_id,
+            "phase": "TERMINAL",
+            "destination_id": start.destination_id,
+            "start_event_sha256": start.event_sha256,
+            "reason_code": result.reason_code,
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+            "effects": result.effects.model_dump(mode="json"),
+        }
+        try:
+            terminal_values["event_sha256"] = domain_sha256(
+                "stock-eva/r2f4.3/restore-terminal/v1", terminal_values
+            )
+            terminal = RestoreTerminalEvent.model_validate(terminal_values)
+            terminal.verify_hash()
+            self.audit_store.write_terminal_event(terminal)
+        except Exception:
+            if result.status == "ready":
+                return self._plan_response(
+                    snapshot=None,
+                    mode="execute",
+                    allowed=True,
+                    status="unavailable",
+                    reason_code="CONTROL_STATE_UNAVAILABLE",
+                    effects=result.effects,
+                ).model_copy(update={"audit_status": "unavailable"})
+            return result.model_copy(update={"audit_status": "unavailable"})
+        return result.model_copy(update={"audit_status": "terminal"})
+
     def execute(
         self,
         destination: Path,
@@ -8815,36 +8896,15 @@ class RestoreService:
                     destination_id=None,
                     started_at=started_at,
                 )
-                terminal_values: dict[str, object] = {
-                    "audit_schema": "stock-eva/r2f4.3/restore-terminal/v1",
-                    "schema_version": 1,
-                    "audit_id": start.audit_id,
-                    "phase": "TERMINAL",
-                    "destination_id": None,
-                    "start_event_sha256": start.event_sha256,
-                    "reason_code": "SOURCE_UNAVAILABLE",
-                    "started_at": started_at,
-                    "completed_at": _utc_now(),
-                    "effects": effects.model_copy(
-                        update={"writes": True, "audit_writes": True}
-                    ).model_dump(mode="json"),
-                }
-                terminal_values["event_sha256"] = domain_sha256(
-                    "stock-eva/r2f4.3/restore-terminal/v1", terminal_values
-                )
-                self.audit_store.write_terminal_event(
-                    RestoreTerminalEvent.model_validate(terminal_values)
-                )
-                return self._plan_response(
+                primary = self._plan_response(
                     snapshot=None,
                     mode="execute",
                     allowed=True,
                     status="unavailable",
                     reason_code="SOURCE_UNAVAILABLE",
-                    effects=effects.model_copy(
-                        update={"writes": True, "audit_writes": True}
-                    ),
-                ).model_copy(update={"audit_status": "terminal"})
+                    effects=effects,
+                )
+                return self._finalize_execute(primary, start=start, started_at=started_at)
             except Exception:
                 return self._plan_response(
                     snapshot=None,
@@ -8896,49 +8956,7 @@ class RestoreService:
             representative_query=representative_query,
             start_event=start,
         )
-        result = result.model_copy(
-            update={
-                "audit_status": "started",
-                "effects": result.effects.model_copy(
-                    update={
-                        "writes": True,
-                        "destination_writes": False,
-                        "audit_writes": True,
-                    }
-                )
-            }
-        )
-        terminal_values: dict[str, object] = {
-            "audit_schema": "stock-eva/r2f4.3/restore-terminal/v1",
-            "schema_version": 1,
-            "audit_id": start.audit_id,
-            "phase": "TERMINAL",
-            "destination_id": start.destination_id,
-            "start_event_sha256": start.event_sha256,
-            "reason_code": result.reason_code,
-            "started_at": started_at,
-            "completed_at": _utc_now(),
-            "effects": result.effects.model_dump(mode="json"),
-        }
-        try:
-            terminal_values["event_sha256"] = domain_sha256(
-                "stock-eva/r2f4.3/restore-terminal/v1", terminal_values
-            )
-            terminal = RestoreTerminalEvent.model_validate(terminal_values)
-            terminal.verify_hash()
-            self.audit_store.write_terminal_event(terminal)
-        except Exception:
-            if result.status == "ready":
-                return self._plan_response(
-                    snapshot=None,
-                    mode="execute",
-                    allowed=True,
-                    status="unavailable",
-                    reason_code="CONTROL_STATE_UNAVAILABLE",
-                    effects=result.effects,
-                ).model_copy(update={"audit_status": "unavailable"})
-            return result.model_copy(update={"audit_status": "unavailable"})
-        return result.model_copy(update={"audit_status": "terminal"})
+        return self._finalize_execute(result, start=start, started_at=started_at)
 
     def _execute_core(
         self,
@@ -9024,7 +9042,7 @@ class RestoreService:
             except FileExistsError as exc:
                 raise ReplicationDurabilityError("restore staging conflict") from exc
             restore_writes = True
-            parent_identity = _directory_fingerprint(os.fstat(parent_fd))
+            parent_identity = _directory_identity(os.fstat(parent_fd))
             stage_fd = _destination_open_dir(parent_fd, stage_name)
             with self.reader.root_session() as source_root_fd:
                 generation_fd, generation_dirs = self.reader._open_generation(
@@ -9083,7 +9101,11 @@ class RestoreService:
             fresh = self._snapshot(snapshot.record.replication_generation)
             if fresh.record.record_sha256 != snapshot.record.record_sha256:
                 raise ReplicationStateUnavailable("restore source changed")
-            _assert_directory_fingerprint(parent_fd, parent_identity)
+            _assert_directory_identity(parent_fd, parent_identity)
+            # Only this target basename and this writer's staging basename are
+            # authoritative.  Sibling restores and audit activity may change
+            # the parent directory while this restore is in flight.
+            _assert_destination_absent(parent_fd, final.name)
             if stage_identity is None:
                 raise ReplicationStateUnavailable("restore staging identity is unavailable")
             _assert_staging_name_binding(parent_fd, stage_name, stage_fd, stage_identity)
@@ -9093,6 +9115,7 @@ class RestoreService:
             _destination_rename_noreplace(parent_fd, stage_name, final.name)
             published = True
             _fsync_open_directory(parent_fd)
+            _assert_directory_identity(parent_fd, parent_identity)
             # Keep the original staging fd across the exchange.  The final
             # namespace proof uses the held parent fd and O_NOFOLLOW.
             _assert_directory_fingerprint(stage_fd, stage_identity)

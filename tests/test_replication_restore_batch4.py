@@ -1,5 +1,6 @@
 import hashlib
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -387,6 +388,32 @@ def test_restore_terminal_audit_failure_preserves_primary_reason(
     assert result.reason_code == "VERIFY_FAILED"
 
 
+def test_unreadable_descriptor_terminal_failure_preserves_source_primary(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    (archive / replication.DESTINATION_DESCRIPTOR_NAME).write_bytes(b"corrupt")
+
+    class FailingTerminalAudit(RestoreAuditStore):
+        def write_terminal_event(self, event: object) -> None:
+            raise RuntimeError("injected terminal audit failure")
+
+    audit_root = tmp_path / "audit"
+    result = RestoreService(
+        archive, audit_store=FailingTerminalAudit(audit_root)
+    ).execute(tmp_path / "restore")
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "SOURCE_UNAVAILABLE"
+    assert result.audit_status == "unavailable"
+    assert result.effects.audit_writes is True
+    assert result.effects.restore_writes is False
+    assert result.effects.destination_writes is False
+    assert len(list(audit_root.glob("*.started.json"))) == 1
+    assert len(list(audit_root.glob("*.terminal.json"))) == 0
+    assert not (tmp_path / "restore").exists()
+
+
 def test_restore_audit_reconcile_closes_crash_started_record(tmp_path: Path) -> None:
     audit = RestoreAuditStore(tmp_path / "audit")
     started = audit.write_started(destination_id="a" * 32, started_at="2026-09-12T00:00:00Z")
@@ -442,6 +469,52 @@ def test_restore_audit_concurrent_writers_serialize_without_overwrite(tmp_path: 
     assert len(set(audit_ids)) == 8
     assert len(list((tmp_path / "audit").glob("*.started.json"))) == 8
     assert len(list((tmp_path / "audit").glob("*.terminal.json"))) == 0
+
+
+def test_concurrent_restores_different_targets_allow_unrelated_parent_changes(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    barrier = threading.Barrier(2)
+
+    def run(index: int) -> object:
+        return RestoreService(
+            archive,
+            audit_store=RestoreAuditStore(tmp_path / f"audit-{index}"),
+            representative_query=lambda _stage: barrier.wait(timeout=10),
+        ).execute(tmp_path / f"restore-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, range(2)))
+
+    assert [result.status for result in results] == ["ready", "ready"]
+    assert all((tmp_path / f"restore-{index}").is_dir() for index in range(2))
+
+
+def test_concurrent_restores_same_target_have_one_atomic_winner(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    barrier = threading.Barrier(2)
+    destination = tmp_path / "restore"
+
+    def run(index: int) -> object:
+        return RestoreService(
+            archive,
+            audit_store=RestoreAuditStore(tmp_path / f"audit-same-{index}"),
+            representative_query=lambda _stage: barrier.wait(timeout=10),
+        ).execute(destination)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, range(2)))
+
+    assert sorted(result.status for result in results) == ["ready", "unavailable"]
+    assert destination.is_dir()
+    assert all(
+        result.reason_code == "NONE"
+        or result.reason_code in {"DESTINATION_CONFLICT", "PATH_CHANGED"}
+        for result in results
+    )
 
 
 def test_symlinked_canonical_root_is_rejected_without_copy(tmp_path: Path) -> None:
