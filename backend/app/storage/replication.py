@@ -6483,6 +6483,70 @@ class DestinationArchiveReader:
                 return True
         return False
 
+    def read_verified_archive(
+        self,
+        generation: str | None = None,
+    ) -> VerifiedArchiveSnapshot:
+        """Read one complete archive generation through one trusted session.
+
+        ``generation`` is deliberately optional only for the current head.  A
+        historical generation is never selected as a stale fallback: callers
+        must name it explicitly and it must be present in the fully verified
+        head/history chain.
+        """
+        with self.root_session() as root_fd:
+            sentinel = self.read_sentinel(root_fd)
+            sentinel_result = _destination_read_at(
+                root_fd, (DESTINATION_SENTINEL_NAME,), require_private_mode=False
+            )
+            if sentinel_result is None:
+                raise ReplicationStateUnavailable("destination sentinel is unavailable")
+            head = self.read_head(root_fd)
+            if head is None:
+                raise ReplicationStateUnavailable("destination head is unavailable")
+            records = self.list_verified_records(root_fd)
+            records_by_generation = {item.replication_generation: item for item in records}
+            selected_generation = (
+                head.replication_generation if generation is None else generation
+            )
+            if selected_generation not in records_by_generation:
+                raise ReplicationStateUnavailable("destination generation is unavailable")
+            record = records_by_generation[selected_generation]
+            if generation is not None and not isinstance(generation, str):
+                raise ReplicationDurabilityError("destination generation is invalid")
+            # Validate the complete selected generation, including its own
+            # sentinel, manifest and exact object inventory, after validating
+            # every record in the chain above.
+            self.verify_record(root_fd, selected_generation)
+            generation_fd, dirs = self._open_generation(root_fd, selected_generation)
+            try:
+                manifest = self.read_manifest(generation_fd)
+                if _sha256_bytes(manifest) != record.destination_manifest_bytes_sha256:
+                    raise ReplicationStateUnavailable("destination manifest hash mismatch")
+                _validate_restore_manifest(manifest, record)
+                for item in record.object_inventory:
+                    payload = _destination_read_relative(generation_fd, item.relative_path)
+                    if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+                        raise ReplicationStateUnavailable("destination object verification failed")
+            finally:
+                failures: list[str] = []
+                _close_descriptors(dirs, failures)
+                _finish_cleanup(None, failures)
+            checkpoint = _checkpoint_from_record(record)
+            checkpoint.verify_hashes()
+            if checkpoint.checkpoint_id != record.checkpoint_id:
+                raise ReplicationStateUnavailable("destination source checkpoint is invalid")
+            return VerifiedArchiveSnapshot(
+                sentinel=sentinel,
+                sentinel_bytes=sentinel_result[0],
+                head=head,
+                record=record,
+                manifest_bytes=manifest,
+                checkpoint=checkpoint,
+            )
+
+    read_restore_snapshot = read_verified_archive
+
 
 class DestinationCommitVerifier:
     """Fresh, descriptor-native verifier used by sidecar completion."""
@@ -6535,6 +6599,88 @@ class DestinationCommitVerifier:
                 "destination completion boundary is unavailable"
             ) from exc
         return refreshed
+
+
+@dataclass(frozen=True)
+class VerifiedArchiveSnapshot:
+    """Self-contained, descriptor-verified archive input for restore."""
+
+    sentinel: SentinelProjection
+    sentinel_bytes: bytes
+    head: DestinationHead
+    record: ReplicationRecord
+    manifest_bytes: bytes
+    checkpoint: SourceCheckpoint
+
+
+def _checkpoint_from_record(record: ReplicationRecord) -> SourceCheckpoint:
+    """Reconstruct the source checkpoint without SQLite or provider access."""
+    return build_source_checkpoint(
+        source_instance_id=record.source_instance_id,
+        source_instance_sha256=record.source_instance_sha256,
+        publication_binding_sha256=record.publication_binding_sha256,
+        pointer_row_sha256=record.pointer_row_sha256,
+        pointer_generation=record.pointer_generation,
+        source_run_id=record.source_run_id,
+        source_trade_date=record.source_trade_date,
+        source_published_at=record.source_published_at,
+        pointer_db_device=record.pointer_db_device,
+        pointer_db_inode=record.pointer_db_inode,
+        pointer_db_schema_digest=record.pointer_db_schema_digest,
+        manifest_canonical_sha256=record.source_manifest_canonical_sha256,
+        source_manifest_bytes_sha256=record.source_manifest_bytes_sha256,
+        source_object_set_sha256=record.source_object_set_sha256,
+        object_inventory=record.object_inventory,
+    )
+
+
+def _validate_restore_manifest(payload: bytes, record: ReplicationRecord) -> None:
+    """Validate the canonical dataset manifest against the closed inventory."""
+    values = _parse_destination_manifest(payload, expected_sha256=record.destination_manifest_bytes_sha256)
+    if values.get("dataset") != "stock-eva-market" or values.get("schema_version") != 2:
+        raise ReplicationStateUnavailable("destination manifest schema is invalid")
+    if set(values) != {"dataset", "schema_version", "generation", "files"}:
+        raise ReplicationStateUnavailable("destination manifest schema is invalid")
+    if not isinstance(values.get("generation"), str) or not values["generation"]:
+        raise ReplicationStateUnavailable("destination manifest generation is invalid")
+    files = values.get("files")
+    if not isinstance(files, list) or not files:
+        raise ReplicationStateUnavailable("destination manifest inventory is invalid")
+    actual_by_path = {item.relative_path: item for item in record.object_inventory}
+    if len(actual_by_path) != len(record.object_inventory) or len(files) != len(actual_by_path):
+        raise ReplicationStateUnavailable("destination manifest inventory is incomplete")
+    seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise ReplicationStateUnavailable("destination manifest file entry is invalid")
+        try:
+            relative = str(item["path"])
+            if relative in seen:
+                raise ReplicationStateUnavailable("destination manifest contains duplicate objects")
+            seen.add(relative)
+            expected = actual_by_path[relative]
+            if (
+                item.get("sha256") != expected.object_sha256
+                or type(item.get("row_count")) is not int
+                or item.get("row_count") != expected.row_count
+                or item.get("trade_date") != expected.trade_date
+                or item.get("source") != expected.source
+            ):
+                raise ReplicationStateUnavailable("destination manifest object metadata mismatch")
+            ObjectInventoryEntry.model_validate(
+                {
+                    "relative_path": relative,
+                    "object_sha256": expected.object_sha256,
+                    "size_bytes": expected.size_bytes,
+                    "row_count": expected.row_count,
+                    "trade_date": expected.trade_date,
+                    "source": expected.source,
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReplicationStateUnavailable("destination manifest file entry is invalid") from exc
+    if seen != set(actual_by_path):
+        raise ReplicationStateUnavailable("destination manifest inventory is incomplete")
 
 
 @contextmanager
@@ -7720,6 +7866,428 @@ def _complete_replication_with_proof(
     return result
 
 
+class RestorePlanResponse(BaseModel):
+    """Bounded, path-free restore plan/effect projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    status: Literal["dry_run", "ready", "unavailable"]
+    reason_code: ReplicationReason
+    source_manifest_canonical_sha256: str | None = None
+    source_object_set_sha256: str | None = None
+    publication_binding_sha256: str | None = None
+    source_instance_id: str | None = None
+    source_sequence: int | None = Field(default=None, ge=1)
+    checkpoint_id: str | None = None
+    object_count: int = Field(ge=0, default=0)
+    row_count: int = Field(ge=0, default=0)
+    byte_count: int = Field(ge=0, default=0)
+    rename_allowed: bool = False
+    mode: Literal["plan", "execute"]
+    execution_allowed: bool
+    effects: ReplicationEffects
+    provider_requests: Literal[0] = 0
+    paths_exposed: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_digests(self) -> RestorePlanResponse:
+        for value, field in (
+            (self.source_manifest_canonical_sha256, "source_manifest_canonical_sha256"),
+            (self.source_object_set_sha256, "source_object_set_sha256"),
+            (self.publication_binding_sha256, "publication_binding_sha256"),
+            (self.source_instance_id, "source_instance_id"),
+            (self.checkpoint_id, "checkpoint_id"),
+        ):
+            if value is not None:
+                _validate_sha(value, field)
+        return self
+
+
+class RestoreReport(BaseModel):
+    """Sanitized immutable restore evidence; it intentionally has no path."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    report_schema: Literal["stock-eva/r2f4.3/restore-report/v1"] = (
+        "stock-eva/r2f4.3/restore-report/v1"
+    )
+    schema_version: Literal[1] = 1
+    report_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    destination_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    source_replication_generation: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_record_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int = Field(ge=1)
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    object_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
+    byte_count: int = Field(ge=0)
+    verification_state: Literal["verified", "failed"]
+    reason_code: ReplicationReason
+    started_at: str
+    completed_at: str
+    report_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    _timestamps_are_utc = field_validator("started_at", "completed_at")(
+        lambda value, info: _validate_utc_timestamp(value, info.field_name)
+    )
+
+    def verify_hash(self) -> None:
+        values = self.model_dump(mode="json")
+        actual = values.pop("report_sha256")
+        expected = domain_sha256("stock-eva/r2f4.3/restore-report/v1", values)
+        if actual != expected:
+            raise ReplicationDurabilityError("restore report hash is invalid")
+
+
+def _restore_destination_path(
+    path: Path,
+    *,
+    archive_root: Path,
+    canonical_roots: Iterable[Path],
+) -> Path:
+    """Validate a new temporary child without touching or creating it."""
+    raw = str(path)
+    if (
+        not path.is_absolute()
+        or any(token in raw for token in ("$", "~", "`"))
+        or path == Path("/")
+        or path == Path.home()
+    ):
+        raise ReplicationDurabilityError("restore destination path is invalid")
+    normalized = _physical_path(Path(os.path.normpath(path)))
+    roots = [_physical_path(Path(os.path.normpath(archive_root)))]
+    roots.extend(_physical_path(Path(os.path.normpath(item))) for item in canonical_roots)
+    for root in roots:
+        if normalized == root or normalized in root.parents or root in normalized.parents:
+            raise ReplicationDurabilityError("restore destination overlaps a protected root")
+    _safe_parent(normalized.parent)
+    try:
+        info = os.lstat(normalized)
+    except FileNotFoundError:
+        return normalized
+    except OSError as exc:
+        raise ReplicationDurabilityError("restore destination is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ReplicationDurabilityError("restore destination is unsafe")
+    raise ReplicationDurabilityError("restore destination already exists")
+
+
+def _validate_staged_restore_dataset(
+    stage: Path,
+    record: ReplicationRecord,
+    manifest: bytes,
+) -> None:
+    """Run the strict canonical schema/row/partition checks in staging only."""
+    _validate_restore_manifest(manifest, record)
+    try:
+        from backend.app.storage.dataset import NasMarketStore
+
+        for item in record.object_inventory:
+            if not item.relative_path.endswith(".parquet"):
+                raise ReplicationStateUnavailable("restore object is not parquet")
+            NasMarketStore._validate_parquet(
+                stage / item.relative_path,
+                item.row_count,
+                expected_source=item.source,
+                expected_trade_date=datetime.strptime(item.trade_date, "%Y-%m-%d").date(),
+            )
+    except ReplicationStateUnavailable:
+        raise
+    except Exception as exc:
+        raise ReplicationStateUnavailable("restore object schema or rows are invalid") from exc
+
+
+class RestoreService:
+    """Descriptor-bound NAS-to-new-temporary-root restore operation."""
+
+    def __init__(
+        self,
+        archive: DestinationDescriptor | Path,
+        *,
+        mount_inspector: MountInspector | None = None,
+        canonical_roots: Iterable[Path] = (),
+        representative_query: object | None = None,
+    ) -> None:
+        self.reader = DestinationArchiveReader(archive, mount_inspector=mount_inspector)
+        self.canonical_roots = tuple(Path(item) for item in canonical_roots)
+        self.representative_query = representative_query
+
+    def _plan_response(
+        self,
+        *,
+        snapshot: VerifiedArchiveSnapshot | None,
+        mode: Literal["plan", "execute"],
+        allowed: bool,
+        status: Literal["dry_run", "ready", "unavailable"],
+        reason_code: ReplicationReason,
+        effects: ReplicationEffects,
+        rename_allowed: bool = False,
+    ) -> RestorePlanResponse:
+        record = snapshot.record if snapshot is not None else None
+        return RestorePlanResponse(
+            status=status,
+            reason_code=reason_code,
+            source_manifest_canonical_sha256=(
+                record.source_manifest_canonical_sha256 if record is not None else None
+            ),
+            source_object_set_sha256=record.source_object_set_sha256 if record is not None else None,
+            publication_binding_sha256=(
+                record.publication_binding_sha256 if record is not None else None
+            ),
+            source_instance_id=record.source_instance_id if record is not None else None,
+            source_sequence=record.source_sequence if record is not None else None,
+            checkpoint_id=record.checkpoint_id if record is not None else None,
+            object_count=record.object_count if record is not None else 0,
+            row_count=record.row_count if record is not None else 0,
+            byte_count=record.byte_count if record is not None else 0,
+            rename_allowed=rename_allowed,
+            mode=mode,
+            execution_allowed=allowed,
+            effects=effects,
+        )
+
+    @staticmethod
+    def _reason(exc: BaseException) -> ReplicationReason:
+        message = str(exc).lower()
+        if "query" in message:
+            return "VERIFY_FAILED"
+        if "conflict" in message:
+            return "DESTINATION_CONFLICT"
+        if "path" in message or "overlap" in message or "exists" in message:
+            return "PATH_CHANGED" if "exists" in message else "PATH_INVALID"
+        if "symlink" in message or "unsafe" in message:
+            return "SYMLINK_UNSAFE"
+        if "unsupported" in message or "mount" in message:
+            return "MOUNT_UNSUPPORTED"
+        if "object" in message or "manifest" in message or "schema" in message:
+            return "VERIFY_FAILED"
+        return "SOURCE_UNAVAILABLE"
+
+    def _snapshot(self, generation: str | None) -> VerifiedArchiveSnapshot:
+        return self.reader.read_verified_archive(generation=generation)
+
+    def plan(
+        self,
+        destination: Path,
+        *,
+        generation: str | None = None,
+    ) -> RestorePlanResponse:
+        effects = ReplicationEffects(
+            writes=False,
+            canonical_writes=False,
+            destination_writes=False,
+            outbox_writes=False,
+            restore_writes=False,
+        )
+        try:
+            _restore_destination_path(
+                Path(destination),
+                archive_root=self.reader.descriptor.root_path,
+                canonical_roots=self.canonical_roots,
+            )
+            snapshot = self._snapshot(generation)
+        except Exception as exc:
+            return self._plan_response(
+                snapshot=None,
+                mode="plan",
+                allowed=False,
+                status="unavailable",
+                reason_code=self._reason(exc),
+                effects=effects,
+            )
+        return self._plan_response(
+            snapshot=snapshot,
+            mode="plan",
+            allowed=False,
+            status="dry_run",
+            reason_code="NONE",
+            effects=effects,
+            rename_allowed=True,
+        )
+
+    def execute(
+        self,
+        destination: Path,
+        *,
+        generation: str | None = None,
+        representative_query: object | None = None,
+    ) -> RestorePlanResponse:
+        effects = ReplicationEffects(
+            writes=False,
+            canonical_writes=False,
+            destination_writes=False,
+            outbox_writes=False,
+            restore_writes=False,
+        )
+        destination = Path(destination)
+        try:
+            final = _restore_destination_path(
+                destination,
+                archive_root=self.reader.descriptor.root_path,
+                canonical_roots=self.canonical_roots,
+            )
+            snapshot = self._snapshot(generation)
+        except (ReplicationDurabilityError, ValueError, OSError) as exc:
+            return self._plan_response(
+                snapshot=None,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code=self._reason(exc),
+                effects=effects,
+            )
+
+        parent_fd, parent_dirs = _open_directory_chain(final.parent, create=False)
+        stage_name = f".{final.name}.restore-{secrets.token_hex(16)}.staging"
+        stage_fd: int | None = None
+        published = False
+        restore_writes = False
+        try:
+            try:
+                os.mkdir(stage_name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise ReplicationDurabilityError("restore staging conflict") from exc
+            restore_writes = True
+            parent_identity = _directory_fingerprint(os.fstat(parent_fd))
+            stage_fd = _destination_open_dir(parent_fd, stage_name)
+            with self.reader.root_session() as source_root_fd:
+                generation_fd, generation_dirs = self.reader._open_generation(
+                    source_root_fd, snapshot.record.replication_generation
+                )
+                try:
+                    for item in snapshot.record.object_inventory:
+                        payload = _destination_read_relative(generation_fd, item.relative_path)
+                        if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+                            raise ReplicationStateUnavailable("restore source object changed")
+                        target_fd = stage_fd
+                        target_dirs: list[int] = []
+                        parts = tuple(item.relative_path.split("/"))
+                        try:
+                            for part in parts[:-1]:
+                                target_fd = _destination_mkdir_at(target_fd, part)
+                                target_dirs.append(target_fd)
+                            _destination_write_at(target_fd, parts[-1], payload)
+                            readback = _destination_read_at(
+                                target_fd, (parts[-1],), require_private_mode=False
+                            )
+                            if (
+                                readback is None
+                                or len(readback[0]) != item.size_bytes
+                                or _sha256_bytes(readback[0]) != item.object_sha256
+                            ):
+                                raise ReplicationStateUnavailable("restore object readback failed")
+                        finally:
+                            failures: list[str] = []
+                            _close_descriptors(target_dirs, failures)
+                            _finish_cleanup(None, failures)
+                    # The publication metadata is written only after every
+                    # immutable object has passed source and staging readback.
+                    _destination_write_at(stage_fd, DESTINATION_SENTINEL_NAME, snapshot.sentinel_bytes)
+                    _destination_write_at(stage_fd, "manifest.json", snapshot.manifest_bytes)
+                    _validate_staged_restore_dataset(
+                        final.parent / stage_name,
+                        snapshot.record,
+                        snapshot.manifest_bytes,
+                    )
+                    callback = representative_query or self.representative_query
+                    if callback is not None:
+                        if not callable(callback):
+                            raise ReplicationDurabilityError("restore query validator is invalid")
+                        callback(final.parent / stage_name)
+                finally:
+                    failures = []
+                    _close_descriptors(generation_dirs, failures)
+                    _finish_cleanup(None, failures)
+            # Re-read the archive after copy.  This catches source drift before
+            # the only visibility point without relying on mutable path state.
+            fresh = self._snapshot(snapshot.record.replication_generation)
+            if fresh.record.record_sha256 != snapshot.record.record_sha256:
+                raise ReplicationStateUnavailable("restore source changed")
+            _assert_directory_fingerprint(parent_fd, parent_identity)
+            _fsync_open_directory(stage_fd)
+            os.close(stage_fd)
+            stage_fd = None
+            _fsync_open_directory(parent_fd)
+            _destination_rename_noreplace(parent_fd, stage_name, final.name)
+            published = True
+            _fsync_open_directory(parent_fd)
+            # Post-rename verification is intentionally non-semantic: all
+            # schema/count/query gates completed before this exchange.
+            final_fd, final_dirs = _open_directory_chain(final, create=False)
+            try:
+                result = _destination_read_at(final_fd, ("manifest.json",), require_private_mode=False)
+                if result is None or result[0] != snapshot.manifest_bytes:
+                    raise ReplicationStateUnavailable("restore publication readback changed")
+            finally:
+                failures = []
+                _close_descriptors(final_dirs, failures)
+                _finish_cleanup(None, failures)
+            effects = ReplicationEffects(
+                writes=True,
+                canonical_writes=False,
+                destination_writes=False,
+                outbox_writes=False,
+                restore_writes=True,
+            )
+            return self._plan_response(
+                snapshot=snapshot,
+                mode="execute",
+                allowed=True,
+                status="ready",
+                reason_code="NONE",
+                effects=effects,
+                rename_allowed=True,
+            )
+        except Exception as exc:
+            effects = ReplicationEffects(
+                writes=restore_writes,
+                canonical_writes=False,
+                destination_writes=False,
+                outbox_writes=False,
+                restore_writes=restore_writes,
+            )
+            return self._plan_response(
+                snapshot=snapshot,
+                mode="execute",
+                allowed=True,
+                status="unavailable",
+                reason_code=self._reason(exc),
+                effects=effects,
+            )
+        finally:
+            failures: list[str] = []
+            if stage_fd is not None:
+                _close_fd_best_effort(stage_fd, "restore_staging_fd", failures)
+            if not published:
+                try:
+                    _destination_remove_tree_at(parent_fd, stage_name)
+                except (ReplicationDurabilityError, OSError):
+                    failures.append("restore_staging_cleanup")
+            _close_descriptors(parent_dirs, failures)
+            _finish_cleanup(None, failures)
+
+    def nas_to_temporary_root(
+        self,
+        destination: Path,
+        *,
+        execute: bool = False,
+        generation: str | None = None,
+        representative_query: object | None = None,
+    ) -> RestorePlanResponse:
+        return self.execute(destination, generation=generation, representative_query=representative_query) if execute else self.plan(destination, generation=generation)
+
+
+VerifiedRestoreService = RestoreService
+RestoreVerifier = RestoreService
+VerifiedRestore = RestoreService
+RestoreResult = RestorePlanResponse
+RestorePlan = RestorePlanResponse
+nas_to_temporary_root = RestoreService
+
+
 __all__ = [
     "Effects",
     "SIDECAR_DDL",
@@ -7795,6 +8363,16 @@ __all__ = [
     "domain_sha256",
     "is_retryable_replication_reason",
     "normalized_ddl_bytes",
+    "RestorePlanResponse",
+    "RestoreReport",
+    "VerifiedArchiveSnapshot",
+    "RestoreService",
+    "VerifiedRestoreService",
+    "RestoreVerifier",
+    "VerifiedRestore",
+    "RestoreResult",
+    "RestorePlan",
+    "nas_to_temporary_root",
 ]
 
 
