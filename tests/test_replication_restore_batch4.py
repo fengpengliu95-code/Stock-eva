@@ -236,10 +236,161 @@ def test_staging_extra_after_query_is_rejected_and_audit_is_sanitized(tmp_path: 
     assert result.reason_code == "VERIFY_FAILED"
     assert not destination.exists()
     reports = list((tmp_path / "audit").glob("*.json"))
-    assert len(reports) == 1
-    report = reports[0].read_text()
-    assert str(tmp_path) not in report
-    assert "unexpected.txt" not in report
+    assert len(reports) == 2
+    for report_path in reports:
+        report = report_path.read_text()
+        assert str(tmp_path) not in report
+        assert "unexpected.txt" not in report
+
+
+def test_restore_audit_is_two_phase_descriptor_bound_and_effects_are_split(
+    tmp_path: Path,
+) -> None:
+    archive, descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    audit = RestoreAuditStore(tmp_path / "audit")
+
+    result = RestoreService(archive, audit_store=audit).execute(destination)
+
+    assert result.status == "ready"
+    assert result.effects.destination_writes is False
+    assert result.effects.restore_writes is True
+    assert result.effects.audit_writes is True
+    started = next((tmp_path / "audit").glob("*.started.json"))
+    terminal = next((tmp_path / "audit").glob("*.terminal.json"))
+    assert f'"destination_id":"{descriptor.destination_id}"' in started.read_text()
+    assert '"start_event_sha256"' in terminal.read_text()
+
+
+def test_restore_staging_basename_swap_does_not_delete_attacker_or_publish(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+
+    def swap(stage: Path) -> None:
+        moved = stage.with_name(stage.name + ".moved")
+        stage.rename(moved)
+        stage.symlink_to(moved, target_is_directory=True)
+
+    result = RestoreService(
+        archive,
+        audit_store=RestoreAuditStore(tmp_path / "audit"),
+        representative_query=swap,
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code in {"VERIFY_FAILED", "SOURCE_UNAVAILABLE"}
+    assert not destination.exists()
+
+
+def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    destination = tmp_path / "restore"
+    calls = 0
+    original = replication._verify_staged_restore_tree
+
+    def fail_after_rename(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        if kwargs.get("semantic", True) is False:
+            raise replication.ReplicationStateUnavailable("post-rename identity failure")
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(replication, "_verify_staged_restore_tree", fail_after_rename)
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(destination)
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.effects.destination_writes is False
+    assert destination.is_dir()
+    assert calls == 2
+
+
+def test_restore_corrupt_archive_has_started_and_terminal_audit(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    generation = next(
+        path
+        for path in (archive / "_replication" / "history").iterdir()
+        if not path.name.startswith(".")
+    )
+    (generation / "bars.parquet").write_bytes(b"corrupt")
+
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(tmp_path / "restore")
+
+    assert result.status == "unavailable"
+    assert len(list((tmp_path / "audit").glob("*.started.json"))) == 1
+    assert len(list((tmp_path / "audit").glob("*.terminal.json"))) == 1
+
+
+def test_restore_audit_namespace_extras_fail_before_start(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+    (audit_root / "unexpected").write_text("x")
+
+    result = RestoreService(archive, audit_store=RestoreAuditStore(audit_root)).execute(
+        tmp_path / "restore"
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert not (tmp_path / "restore").exists()
+    assert list(audit_root.iterdir()) == [audit_root / "unexpected"]
+
+
+def test_restore_terminal_audit_failure_preserves_primary_reason(
+    tmp_path: Path,
+) -> None:
+    archive, _descriptor, _record = _archive(tmp_path)
+
+    class FailingTerminalAudit(RestoreAuditStore):
+        def write_terminal_event(self, event: object) -> None:
+            raise RuntimeError("audit terminal failed")
+
+    result = RestoreService(
+        archive,
+        audit_store=FailingTerminalAudit(tmp_path / "audit"),
+        representative_query=lambda _root: (_ for _ in ()).throw(RuntimeError("query failed")),
+    ).execute(tmp_path / "restore")
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "VERIFY_FAILED"
+
+
+def test_restore_audit_reconcile_closes_crash_started_record(tmp_path: Path) -> None:
+    audit = RestoreAuditStore(tmp_path / "audit")
+    started = audit.write_started(destination_id="a" * 32, started_at="2026-09-12T00:00:00Z")
+
+    assert audit.reconcile() == 1
+    assert (tmp_path / "audit" / f"{started.audit_id}.terminal.json").exists()
+
+
+def test_restore_unreadable_descriptor_audits_null_destination_identity(
+    tmp_path: Path,
+) -> None:
+    archive, descriptor, _record = _archive(tmp_path)
+    (archive / replication.DESTINATION_DESCRIPTOR_NAME).write_bytes(b"corrupt")
+
+    result = RestoreService(
+        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
+    ).execute(tmp_path / "restore")
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "SOURCE_UNAVAILABLE"
+    started = next((tmp_path / "audit").glob("*.started.json"))
+    assert '"destination_id":null' in started.read_text()
+    assert descriptor.destination_id not in started.read_text()
 
 
 def test_symlinked_canonical_root_is_rejected_without_copy(tmp_path: Path) -> None:

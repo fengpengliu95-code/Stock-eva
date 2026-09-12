@@ -2893,3 +2893,27 @@ primary typed reason/effect and only add the sanitized cleanup marker. The exact
 `tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
 `tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`, and
 `tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`.
+
+### Batch4 review closure — held staging identity and two-phase audit
+
+The verified restore boundary holds the staging descriptor and parent directory
+descriptor through the no-replace rename. Immediately before rename it proves
+that the staging basename still names the held inode; cleanup never removes a
+rebound basename. After rename it proves only identity, exact-tree membership,
+sentinel/manifest/object hashes and sizes; no representative callback or full
+schema query runs after visibility. A post-linearization proof failure leaves
+the final root visible and returns `CONTROL_STATE_UNAVAILABLE` with
+`destination_writes=false` and `restore_writes=true`.
+
+Execute uses an explicit descriptor-bound audit namespace. It validates the
+allowlist before writing a `STARTED` record, writes a linked immutable
+`TERMINAL` record for every normal outcome, and supports deterministic
+restart reconciliation of an orphaned start. Audit writes are represented by
+the separate `audit_writes` effect; destination/archive writes remain false.
+The persisted descriptor digest supplies `destination_id`; an unreadable
+descriptor records a null identity and unavailable outcome. Offline anchors:
+`tests/test_replication_restore_batch4.py::test_restore_staging_basename_swap_does_not_delete_attacker_or_publish`,
+`test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun`,
+`test_restore_corrupt_archive_has_started_and_terminal_audit`,
+`test_restore_audit_reconcile_closes_crash_started_record`, and
+`test_restore_unreadable_descriptor_audits_null_destination_identity`.

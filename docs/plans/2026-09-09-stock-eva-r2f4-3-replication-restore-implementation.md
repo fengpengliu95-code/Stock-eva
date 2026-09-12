@@ -2686,3 +2686,25 @@ offline anchors are
 `tests/test_replication_destination_batch3.py::test_head_readback_close_failure_after_success_degrades_without_losing_head`,
 `tests/test_replication_destination_batch3.py::test_already_replicated_unlock_cleanup_failure_degrades_and_hides_proof`, and
 `tests/test_replication_destination_batch3.py::test_primary_failure_keeps_reason_when_unlock_cleanup_also_fails`.
+
+#### Batch4 review closure (implementation contract)
+
+Restore execute validates the strict local audit namespace and durably installs
+an immutable `STARTED` event before archive snapshot/copy. Every normal
+failure or success receives a linked immutable `TERMINAL` event; terminal audit
+failure preserves a primary failure reason/effect and degrades only a primary
+success. Restart reconciliation closes valid orphaned starts. `audit_writes`
+is separate from `restore_writes`; restore execution never claims
+`destination_writes` for archive or canonical data. Destination identity is
+the persisted descriptor digest, with null identity for an unreadable
+descriptor.
+
+The staging basename is re-opened with `O_NOFOLLOW` through the held parent
+dirfd and compared to the held staging inode after all pre-rename semantic
+checks. A rebound basename is never deleted. The final root is opened through
+the same parent dirfd and compared to the held inode. Post-rename checks are
+identity/control/readback hash checks only; the semantic validator and query
+callback are never rerun. The relevant offline anchors are the Batch4 review
+tests in `tests/test_replication_restore_batch4.py` covering pathname swap,
+post-rename failure, two-phase audit, strict namespace rejection, primary
+reason preservation and descriptor identity.
