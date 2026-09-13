@@ -3,6 +3,7 @@ import json
 import os
 import re
 import signal
+import stat
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -45,7 +46,6 @@ from backend.app.market.automation import (
 from backend.app.market.backfill import (
     BackfillService,
     minimum_effective_days,
-    resolve_effective_window,
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import build_live_trading_calendar, get_trading_calendar
@@ -121,7 +121,11 @@ from backend.app.regime.snapshots import (
 )
 from backend.app.regime.store import MarketReadUnavailable, market_regime_store_from_settings
 from backend.app.storage.dataset import DatasetError, NasMarketStore
-from backend.app.storage.factory import build_nas_market_store, read_dataset_lineage_mode
+from backend.app.storage.factory import (
+    build_nas_market_store,
+    build_replication_drain_worker,
+    read_dataset_lineage_mode,
+)
 from backend.app.storage.initialize import (
     DatasetInitializationError,
     EmptyDatasetInitializer,
@@ -129,16 +133,8 @@ from backend.app.storage.initialize import (
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.storage.replication import (
-    DESTINATION_DESCRIPTOR_NAME,
-    DestinationArchiveWriter,
-    DestinationCommitVerifier,
-    DestinationDescriptor,
-    JournalRecord,
-    ReplicationDrainWorker,
-    ReplicationOutboxService,
     ReplicationStatusService,
     RestoreService,
-    SourceInstanceStore,
 )
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
@@ -147,6 +143,14 @@ from backend.app.user.store import UserStore
 
 class _CliArgumentError(ValueError):
     """An allowlisted parse failure that carries no user input."""
+
+
+class _BackfillLineageInputInvalid(ValueError):
+    pass
+
+
+class _BackfillLineageInputUnavailable(OSError):
+    pass
 
 
 class _SanitizedArgumentParser(argparse.ArgumentParser):
@@ -159,24 +163,27 @@ def _read_backfill_lineage_file(
 ) -> tuple[tuple[date, dict[str, object]], ...]:
     """Read ordered lineage JSON without following symlinks or duplicate keys."""
     if not path.is_absolute() or path == Path("/"):
-        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+        raise _BackfillLineageInputInvalid("invalid lineage input")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    except OSError as exc:
+        raise _BackfillLineageInputUnavailable("lineage input unavailable") from exc
     try:
         stat_result = os.fstat(descriptor)
-        if not os.path.isfile(path) or stat_result.st_size > 1024 * 1024:
-            raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+        if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_size > 1024 * 1024:
+            raise _BackfillLineageInputInvalid("invalid lineage input")
         payload = os.read(descriptor, stat_result.st_size + 1)
     finally:
         os.close(descriptor)
     if len(payload) > 1024 * 1024:
-        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+        raise _BackfillLineageInputInvalid("invalid lineage input")
 
     def pairs(items):
         result = {}
         for key, value in items:
             if key in result:
-                raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+                raise _BackfillLineageInputInvalid("invalid lineage input")
             result[key] = value
         return result
 
@@ -193,10 +200,10 @@ def _read_backfill_lineage_file(
                 raise ValueError
             parsed.append((date.fromisoformat(item["trade_date"]), item["lineage_input"]))
     except Exception as exc:
-        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID") from exc
+        raise _BackfillLineageInputInvalid("invalid lineage input") from exc
     expected = tuple(expected_dates)
     if tuple(item[0] for item in parsed) != expected:
-        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+        raise _BackfillLineageInputInvalid("invalid lineage input")
     return tuple(parsed)
 
 
@@ -2151,6 +2158,44 @@ def main() -> int:
         return exit_code
     settings = get_settings()
     prevalidated_lineage_pairs = None
+    local_effective_dates = None
+    # Effective-day planning is a local calendar decision.  Resolve it before
+    # constructing BaoStockProvider so an unavailable calendar is a strict
+    # zero-provider/zero-write result.
+    if args.command == "backfill" and args.effective_days is not None:
+        if args.effective_days < 1:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "SOURCE_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        calendar_start = args.end - timedelta(days=args.effective_days * 3)
+        local_confirmed = (
+            get_trading_calendar().snapshot().confirmed_open_sessions(calendar_start, args.end)
+        )
+        if local_confirmed is None or len(local_confirmed) < args.effective_days:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "SOURCE_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        local_effective_dates = list(local_confirmed[-args.effective_days :])
     # A local lineage file is a preflight input, not a provider-side hint.  Do
     # this validation before StoragePreflight, pointer reconciliation, or
     # provider construction so malformed/forged input is a strict zero-write
@@ -2171,7 +2216,7 @@ def main() -> int:
                 )
             )
             return 2
-        if args.start is None:
+        if args.start is None and local_effective_dates is None:
             print(
                 json.dumps(
                     {
@@ -2185,8 +2230,10 @@ def main() -> int:
                 )
             )
             return 2
-        confirmed = get_trading_calendar().snapshot().confirmed_open_sessions(
-            args.start, args.end
+        confirmed = (
+            tuple(local_effective_dates)
+            if local_effective_dates is not None
+            else get_trading_calendar().snapshot().confirmed_open_sessions(args.start, args.end)
         )
         if confirmed is None:
             print(
@@ -2203,9 +2250,21 @@ def main() -> int:
             )
             return 1
         try:
-            prevalidated_lineage_pairs = _read_backfill_lineage_file(
-                args.lineage_input, confirmed
+            prevalidated_lineage_pairs = _read_backfill_lineage_file(args.lineage_input, confirmed)
+        except _BackfillLineageInputInvalid:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_INVALID",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
             )
+            return 2
         except (OSError, ValueError):
             print(
                 json.dumps(
@@ -2251,9 +2310,11 @@ def main() -> int:
                 )
             )
             return 2
-        if args.start is not None:
-            confirmed = get_trading_calendar().snapshot().confirmed_open_sessions(
-                args.start, args.end
+        if args.start is not None or local_effective_dates is not None:
+            confirmed = (
+                get_trading_calendar()
+                .snapshot()
+                .confirmed_open_sessions(args.start or local_effective_dates[0], args.end)
             )
             if confirmed is None:
                 print(
@@ -2334,6 +2395,15 @@ def main() -> int:
                 )
             )
             return 0
+        if not (settings.replication_enabled and settings.replication_drain_enabled):
+            print(
+                json.dumps(
+                    {"status": "disabled", "writes": False, "provider_requests": 0},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
         source_root = configured_market_dataset_root(settings)
         if source_root is None:
             payload = {
@@ -2345,39 +2415,11 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
         try:
-            descriptor_path = args.destination / DESTINATION_DESCRIPTOR_NAME
-            descriptor_record = DestinationDescriptor.read(descriptor_path)
-            descriptor = DestinationArchiveWriter(
-                descriptor_record,
-                source_root=source_root,
-                writer_host_id=descriptor_record.single_writer_host_id,
-            )
-            source_instance_path = source_root / "_replication" / "source-instance.json"
-            source_instance = SourceInstanceStore(source_instance_path).read(
-                canonical_root_path=source_root
-            )
-            outbox = ReplicationOutboxService(
-                layout.replication_sidecar_root,
-                enabled=True,
-                source_instance_id=source_instance.source_instance_id,
-                source_instance_sha256=source_instance.source_instance_sha256,
-                destination_verifier=DestinationCommitVerifier(descriptor_record),
-            )
-            journals = {
-                record.checkpoint_id: record.checkpoint_projection
-                for record in (
-                    JournalRecord.read(path)
-                    for path in sorted(layout.replication_journal_root.glob("*.json"))
-                )
-            }
-            worker = ReplicationDrainWorker(
-                outbox,
-                descriptor,
-                replication_enabled=True,
-                replication_drain_enabled=args.execute,
-                checkpoint_reader=journals.get,
-            )
-            payload = worker.run_once()
+            worker = build_replication_drain_worker(settings, layout=layout)
+            if worker is None:
+                payload = {"status": "disabled", "writes": False, "provider_requests": 0}
+            else:
+                payload = worker.run_once()
         except Exception:
             payload = {
                 "status": "unavailable",
@@ -3199,6 +3241,20 @@ def main() -> int:
                 return 1
             try:
                 lineage_pairs = _read_backfill_lineage_file(args.lineage_input, confirmed)
+            except _BackfillLineageInputInvalid:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "BACKFILL_LINEAGE_INPUT_INVALID",
+                            "provider_requests": 0,
+                            "writes": False,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 2
             except (OSError, ValueError):
                 print(
                     json.dumps(
@@ -3219,23 +3275,7 @@ def main() -> int:
         selected_dates = None
         start_date = args.start
         if args.effective_days is not None:
-            try:
-                selected_dates = resolve_effective_window(
-                    provider,
-                    end_date=args.end,
-                    effective_days=args.effective_days,
-                )
-            except Exception:
-                print(
-                    json.dumps(
-                        {
-                            "status": "error",
-                            "quality_issues": ["calendar_or_plan_error"],
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-                return 1
+            selected_dates = local_effective_dates
             start_date = selected_dates[0]
         service = BackfillService(store, provider)
         try:

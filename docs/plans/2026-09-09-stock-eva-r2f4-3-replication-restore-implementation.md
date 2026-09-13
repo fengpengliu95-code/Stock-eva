@@ -2758,3 +2758,19 @@ readback, so base/intermediate rename, replacement and symlink attacks fail
 closed without publishing into a detached path. The active target parent may
 gain unrelated sibling staging entries, preserving concurrent different-target
 restores. Coverage is in the Batch4 ancestry replacement tests.
+
+## Batch5 rescue crosswalk (2026-09-13)
+
+The Batch5 integration anchors are collected in
+`tests/test_replication_integration_batch5.py`. The implementation crosswalk is:
+
+| Contract closure | Implementation anchor | Test anchor |
+|---|---|---|
+| Manifest-only is manifest/object readback only | `ManifestPublicationCoordinator.publish_manifest_only` | `test_manifest_only_does_not_create_binding_or_pointer_sidecar` |
+| Exact tagged pointer identity and canonical schema | `NasMarketStore._pointer_identity`, `canonical_control_schema_digest` | `test_pointer_identity_rejects_extra_table_and_column` |
+| Immutable binding reuse | `NasMarketStore._binding_for_generation` | `test_binding_reuse_requires_exact_immutable_fields` |
+| Resolver-admitted lineage and corrupt-manifest fail-closed | `BackfillService.execute`, `LineageResolver` | existing Batch5 lineage/corruption anchors |
+| Two-gate bounded drain with persisted descriptor | `build_replication_drain_worker` | replication worker contract tests |
+
+This crosswalk records code/test coverage only; it does not authorize NAS,
+provider, production, or App Store Connect activity.

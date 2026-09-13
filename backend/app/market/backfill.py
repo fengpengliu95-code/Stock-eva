@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
-from backend.app.storage.replication import LineageInput, LineageResolver
+from backend.app.storage.replication import LineageInput
 
 
 class BackfillBatchPlan(BaseModel):
@@ -58,6 +58,7 @@ class BackfillRunRecord(BaseModel):
     coverage_ratio: float
     started_at: datetime
     completed_at: datetime | None
+    error_code: str | None = None
 
 
 def minimum_effective_days(rule: dict[str, object]) -> int:
@@ -313,7 +314,10 @@ class BackfillService:
             store.path,
             temp_directory=store.temp_directory,
         )
-        self.lineage_resolver = LineageResolver()
+        # Dataset production callers inject the store's resolver, which is
+        # backed by the retained F4.2 reader.  Plain MarketStore never enters
+        # this seam and keeps its existing behavior.
+        self.lineage_resolver = getattr(store, "lineage_resolver", None)
 
     def plan(
         self,
@@ -440,10 +444,13 @@ class BackfillService:
         if min_request_interval_seconds < 0:
             raise ValueError("request interval cannot be negative")
         dataset_mode = any(batch.lineage_by_trade_date for batch in plan.batches)
+        resolved_inputs: dict[tuple[int, str], LineageInput] = {}
         # Resolve every date in a dataset batch before constructing an audit
         # writer, requesting provider data or mutating a manifest.  One bad
         # date rejects the whole batch atomically.
         if dataset_mode:
+            if self.lineage_resolver is None:
+                raise ValueError("SOURCE_UNAVAILABLE")
             for batch in plan.batches:
                 for trade_date in sorted(batch.trading_dates):
                     lineage_input = batch.lineage_by_trade_date.get(trade_date.isoformat())
@@ -452,21 +459,28 @@ class BackfillService:
                     existing_mode = "empty"
                     try:
                         manifest = self.store._manifest()  # type: ignore[attr-defined]
-                        entries = manifest.get("files", [])
-                        present = [
-                            item
-                            for item in entries
-                            if item.get("trade_date") == trade_date.isoformat()
-                        ]
-                        if present:
-                            fields = set().union(*(set(item) for item in present))
-                            existing_mode = (
-                                "modern"
-                                if any(field in fields for field in ("candidate_id", "evidence_id"))
-                                else "legacy"
-                            )
+                        existing_mode = self.store.coordinator._existing_lineage_mode(manifest)  # type: ignore[attr-defined]
                     except Exception:
-                        existing_mode = "empty"
+                        # A corrupt/unreadable manifest is unavailable, never
+                        # an empty manifest that could admit a write.
+                        return BackfillRunRecord(
+                            run_id=plan.run_id,
+                            request_key=plan.request_key,
+                            status="error",
+                            start_date=plan.start_date,
+                            end_date=plan.end_date,
+                            symbols=plan.symbols,
+                            trading_dates=plan.trading_dates,
+                            total_batches=plan.total_batches,
+                            completed_batches=0,
+                            failed_batches=plan.total_batches,
+                            requested_points=plan.requested_points,
+                            loaded_points=0,
+                            coverage_ratio=0.0,
+                            started_at=datetime.now(UTC),
+                            completed_at=datetime.now(UTC),
+                            error_code="SOURCE_UNAVAILABLE",
+                        )
                     resolved = self.lineage_resolver.resolve(
                         lineage_input, trade_date.isoformat(), existing_mode
                     )
@@ -487,7 +501,13 @@ class BackfillService:
                             coverage_ratio=0.0,
                             started_at=datetime.now(UTC),
                             completed_at=datetime.now(UTC),
+                            error_code="SOURCE_UNAVAILABLE",
                         )
+                    resolved_inputs[(batch.index, trade_date.isoformat())] = (
+                        LineageInput(mode="legacy")
+                        if resolved.kind == "LEGACY"
+                        else LineageInput(mode="modern", exact=resolved.lineage)
+                    )
         self.audit.initialize(plan)
         self.audit.mark_running(plan.run_id)
         ready_indexes = self.audit.ready_batch_indexes(plan.run_id)
@@ -511,7 +531,14 @@ class BackfillService:
                         if date_bars:
                             self.store.upsert_bars(
                                 date_bars,
-                                lineage_input=batch.lineage_by_trade_date[trade_date.isoformat()],
+                                # Pass the exact resolver-admitted model, not
+                                # the original unverified caller payload.
+                                lineage_input=resolved_inputs[
+                                    (
+                                        batch.index,
+                                        trade_date.isoformat(),
+                                    )
+                                ],
                             )
                 else:
                     self.store.upsert_bars(result.bars)

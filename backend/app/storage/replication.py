@@ -436,6 +436,7 @@ class LineageResolver:
                 else None
             ),
             lineage_sha256=lineage_sha,
+            selection=selection,
         )
 
 
@@ -4832,8 +4833,7 @@ class ReplicationOutboxService:
         if self.journal_root is not None:
             try:
                 records = [
-                    JournalRecord.read(path)
-                    for path in sorted(self.journal_root.glob("*.json"))
+                    JournalRecord.read(path) for path in sorted(self.journal_root.glob("*.json"))
                 ]
                 if records:
                     if self.source_instance_id is None or self.source_instance_sha256 is None:
@@ -4920,7 +4920,9 @@ class ReplicationOutboxService:
                 # Pointer publication is already linearized.  Preserve it and
                 # install an immutable journal when configured so the next
                 # guard/startup can reconcile without a provider request.
-                reason = "OUTBOX_JOURNALED" if self.journal_root is not None else "OUTBOX_ENQUEUE_FAILED"
+                reason = (
+                    "OUTBOX_JOURNALED" if self.journal_root is not None else "OUTBOX_ENQUEUE_FAILED"
+                )
                 state = "journaled" if self.journal_root is not None else "unavailable"
                 checkpoint_id = source_commit.source_commit_sha256
                 if self.journal_root is not None:

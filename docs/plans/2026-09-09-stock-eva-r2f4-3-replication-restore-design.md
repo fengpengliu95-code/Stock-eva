@@ -2532,6 +2532,14 @@ compatible; and assert the plain-store option rejection occurs before provider c
 The two crosswalks above are updated to reference these exact anchors. The R2-F4.3 status remains
 `In Review / NO-GO`; this amendment does not claim implementation or production enablement.
 
+## Batch5 rescue crosswalk (2026-09-13)
+
+Batch5 acceptance anchors live in `tests/test_replication_integration_batch5.py` and cover
+manifest-only no-binding behavior, exact immutable binding reuse, strict pointer schema
+classification, resolver/corrupt-manifest fail-closed behavior, and the gated bounded drain
+factory. This is a test/spec crosswalk only and does not authorize real NAS/provider or
+production execution.
+
 #### Batch1.7 immutable-generation integrity and threat-model amendment (normative)
 
 This amendment supersedes conflicting Batch1.6 sidecar-generation wording. Batch1.7 protects the

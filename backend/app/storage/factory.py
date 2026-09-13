@@ -2,14 +2,74 @@
 
 from backend.app.config import Settings
 from backend.app.market.store import MarketStore
-from backend.app.storage.dataset import NasMarketStore
+from backend.app.storage.dataset import NasMarketStore, canonical_control_schema_digest
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import configured_market_dataset_root
 from backend.app.storage.replication import (
+    DESTINATION_DESCRIPTOR_NAME,
+    DestinationArchiveWriter,
+    DestinationCommitVerifier,
+    DestinationDescriptor,
+    JournalRecord,
+    LineageResolver,
+    ReplicationDrainWorker,
     ReplicationOutboxService,
     SourceInstanceStore,
-    domain_sha256,
 )
+
+
+class ReplicationDrainConfigurationError(RuntimeError):
+    """Typed failure for missing/invalid persisted local destination setup."""
+
+
+def build_replication_drain_worker(
+    settings: Settings, *, layout: StorageLayout | None = None
+) -> ReplicationDrainWorker | None:
+    """Construct one bounded drain worker only after both gates and descriptor proof."""
+    if not (settings.replication_enabled and settings.replication_drain_enabled):
+        return None
+    if settings.replication_destination_root is None:
+        raise ReplicationDrainConfigurationError("replication destination binding is unavailable")
+    layout = layout or StorageLayout(settings)
+    source_root = configured_market_dataset_root(settings)
+    if source_root is None:
+        raise ReplicationDrainConfigurationError("replication source dataset is unavailable")
+    descriptor_path = settings.replication_destination_root / DESTINATION_DESCRIPTOR_NAME
+    try:
+        descriptor_record = DestinationDescriptor.read(descriptor_path)
+        descriptor = DestinationArchiveWriter(
+            descriptor_record,
+            source_root=source_root,
+            writer_host_id=descriptor_record.single_writer_host_id,
+        )
+        source_instance = SourceInstanceStore(
+            source_root / "_replication" / "source-instance.json"
+        ).read(canonical_root_path=source_root)
+        outbox = ReplicationOutboxService(
+            layout.replication_sidecar_root,
+            enabled=True,
+            source_instance_id=source_instance.source_instance_id,
+            source_instance_sha256=source_instance.source_instance_sha256,
+            destination_verifier=DestinationCommitVerifier(descriptor_record),
+        )
+        journals = {
+            record.checkpoint_id: record.checkpoint_projection
+            for record in (
+                JournalRecord.read(path)
+                for path in sorted(layout.replication_journal_root.glob("*.json"))
+            )
+        }
+    except Exception as exc:
+        raise ReplicationDrainConfigurationError(
+            "replication destination binding is invalid"
+        ) from exc
+    return ReplicationDrainWorker(
+        outbox,
+        descriptor,
+        replication_enabled=True,
+        replication_drain_enabled=True,
+        checkpoint_reader=journals.get,
+    )
 
 
 def build_nas_market_store(
@@ -17,6 +77,7 @@ def build_nas_market_store(
     *,
     read_only: bool = False,
     layout: StorageLayout | None = None,
+    lineage_resolver: LineageResolver | None = None,
 ) -> NasMarketStore | None:
     """Build every NAS/local-dataset store through one replication-aware seam."""
     layout = layout or StorageLayout(settings)
@@ -37,18 +98,9 @@ def build_nas_market_store(
             elif read_only:
                 source = None
             else:
-                connection = control._connect()
-                try:
-                    rows = connection.execute(
-                        "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema='main' ORDER BY table_name"
-                    ).fetchall()
-                finally:
-                    connection.close()
-                schema_digest = domain_sha256(
-                    "stock-eva/r2f4.3/canonical-control-schema/v1",
-                    [str(row[0]) for row in rows],
-                )
+                # Persist the descriptor-stable canonical schema contract,
+                # never a table-name-only hash.
+                schema_digest = canonical_control_schema_digest()
                 source = SourceInstanceStore(source_path).create(
                     canonical_root_path=root,
                     canonical_schema_digest=schema_digest,
@@ -69,12 +121,11 @@ def build_nas_market_store(
         layout.local_paths.staging,
         replication_enabled=settings.replication_enabled,
         replication_service=service,
+        lineage_resolver=lineage_resolver or LineageResolver(),
     )
 
 
-def read_dataset_lineage_mode(
-    settings: Settings, *, layout: StorageLayout | None = None
-) -> str:
+def read_dataset_lineage_mode(settings: Settings, *, layout: StorageLayout | None = None) -> str:
     """Read the incumbent manifest mode without initializing writer state."""
     store = build_nas_market_store(settings, read_only=True, layout=layout)
     if store is None:
