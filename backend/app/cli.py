@@ -46,6 +46,7 @@ from backend.app.market.automation import (
 from backend.app.market.backfill import (
     BackfillService,
     minimum_effective_days,
+    resolve_effective_window,
 )
 from backend.app.market.baostock import BaoStockProvider
 from backend.app.market.calendar import build_live_trading_calendar, get_trading_calendar
@@ -2159,10 +2160,15 @@ def main() -> int:
     settings = get_settings()
     prevalidated_lineage_pairs = None
     local_effective_dates = None
+    configured_backfill_root = configured_market_dataset_root(settings)
     # Effective-day planning is a local calendar decision.  Resolve it before
     # constructing BaoStockProvider so an unavailable calendar is a strict
     # zero-provider/zero-write result.
-    if args.command == "backfill" and args.effective_days is not None:
+    if (
+        args.command == "backfill"
+        and args.effective_days is not None
+        and configured_backfill_root is not None
+    ):
         if args.effective_days < 1:
             print(
                 json.dumps(
@@ -2201,8 +2207,7 @@ def main() -> int:
     # provider construction so malformed/forged input is a strict zero-write
     # and zero-request rejection.
     if args.command == "backfill" and args.lineage_input is not None:
-        configured_root = configured_market_dataset_root(settings)
-        if configured_root is None:
+        if configured_backfill_root is None:
             print(
                 json.dumps(
                     {
@@ -2279,7 +2284,7 @@ def main() -> int:
                 )
             )
             return 2
-    elif args.command == "backfill" and configured_market_dataset_root(settings) is not None:
+    elif args.command == "backfill" and configured_backfill_root is not None:
         try:
             incumbent_mode = read_dataset_lineage_mode(settings)
         except Exception:
@@ -3145,6 +3150,15 @@ def main() -> int:
                 ).verify_publication_context,
             )
             outcome = service.run_due_once(now)
+            if settings.replication_enabled and settings.replication_drain_enabled:
+                try:
+                    worker = build_replication_drain_worker(settings, layout=layout)
+                    if worker is not None:
+                        worker.run_once()
+                except Exception:
+                    # Drain failures are typed/observational and must never
+                    # rewrite the canonical automation result.
+                    pass
             provider_health = health_store.provider_health()
         except Exception as error:
             failure = market_failure_from_exception(error, stage="fetch")
@@ -3275,8 +3289,25 @@ def main() -> int:
         selected_dates = None
         start_date = args.start
         if args.effective_days is not None:
-            selected_dates = local_effective_dates
-            start_date = selected_dates[0]
+            if local_effective_dates is not None:
+                selected_dates = local_effective_dates
+                start_date = selected_dates[0]
+            else:
+                try:
+                    selected_dates = resolve_effective_window(
+                        provider,
+                        end_date=args.end,
+                        effective_days=args.effective_days,
+                    )
+                except Exception:
+                    print(
+                        json.dumps(
+                            {"status": "error", "quality_issues": ["calendar_or_plan_error"]},
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 1
+                start_date = selected_dates[0]
         service = BackfillService(store, provider)
         try:
             if lineage_pairs is not None:

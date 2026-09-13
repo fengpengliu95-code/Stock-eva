@@ -539,6 +539,12 @@ class MarketStore:
         connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS quality_issues JSON DEFAULT '[]'"
         )
+        # Legacy databases that lost these columns must be restored to the
+        # same nullability/default contract as a newly-created canonical
+        # schema before descriptor-bound pointer reads.
+        connection.execute("ALTER TABLE refresh_runs ALTER COLUMN run_kind SET NOT NULL")
+        connection.execute("ALTER TABLE refresh_runs ALTER COLUMN quality_issues SET NOT NULL")
+        connection.execute("ALTER TABLE refresh_runs ALTER COLUMN quality_issues DROP DEFAULT")
         connection.execute(
             "ALTER TABLE refresh_runs ADD COLUMN IF NOT EXISTS failure_stage VARCHAR"
         )

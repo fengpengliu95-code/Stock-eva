@@ -3235,11 +3235,17 @@ async def run_automation_loop(
     *,
     clock,
     poll_seconds: float = 60,
+    replication_drain=None,
 ) -> None:
     """Re-check regularly so process start and wake both perform catch-up."""
     while not stop.is_set():
         try:
             await run_blocking_drained(service.run_due_once, clock())
+            if replication_drain is not None:
+                # One bounded claim at most, after the refresh slot. Drain
+                # failures are observational and cannot alter canonical
+                # refresh success.
+                await run_blocking_drained(replication_drain.run_once)
         except Exception:
             _log_event(
                 logging.ERROR,

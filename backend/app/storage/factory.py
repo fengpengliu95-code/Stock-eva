@@ -14,6 +14,7 @@ from backend.app.storage.replication import (
     LineageResolver,
     ReplicationDrainWorker,
     ReplicationOutboxService,
+    RetainedEvidenceLineageReader,
     SourceInstanceStore,
 )
 
@@ -115,13 +116,16 @@ def build_nas_market_store(
                 )
         except Exception:
             service = None
+    resolver = lineage_resolver or LineageResolver(
+        RetainedEvidenceLineageReader(settings.provider_evidence_root)
+    )
     return NasMarketStore(
         control,
         root,
         layout.local_paths.staging,
         replication_enabled=settings.replication_enabled,
         replication_service=service,
-        lineage_resolver=lineage_resolver or LineageResolver(),
+        lineage_resolver=resolver,
     )
 
 

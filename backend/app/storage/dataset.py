@@ -616,6 +616,7 @@ class ManifestPublicationCoordinator:
         result = values.get("result", kwargs.get("result"))
         selection = values.get("selection", kwargs.get("selection"))
         dataset_already_ready = bool(values.get("dataset_already_ready", False))
+        skip_binding = bool(values.get("skip_binding", False))
         lineage_input = values.get("lineage_input", kwargs.get("lineage_input"))
         self.store._ensure_writable()
         if result is None:
@@ -682,7 +683,7 @@ class ManifestPublicationCoordinator:
                 if existing_binding.model_dump(mode="json") != binding.model_dump(mode="json"):
                     raise DatasetError("publication binding conflict")
                 binding = existing_binding
-            else:
+            elif not skip_binding:
                 self.store._write_binding(binding)
             # The manifest bytes/hash tuple is the final CAS boundary.  A
             # binding is never allowed to outlive a manifest that changed
@@ -1062,14 +1063,45 @@ class NasMarketStore:
 
     def _binding_for_generation(self, generation: str) -> SourcePublicationBinding | None:
         root = self.root / "_replication" / "source-commits"
+        matches: list[SourcePublicationBinding] = []
         try:
             for path in root.glob("*.json"):
                 payload = _read_bounded_json(path)
                 if isinstance(payload, dict) and payload.get("manifest_generation") == generation:
-                    return SourcePublicationBinding.model_validate(payload)
-        except (DatasetError, OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        return None
+                    matches.append(SourcePublicationBinding.model_validate(payload))
+        except (DatasetError, OSError, UnicodeError, json.JSONDecodeError, ValidationError) as exc:
+            raise DatasetError("publication binding is unavailable") from exc
+        if len(matches) > 1:
+            raise DatasetError("duplicate publication bindings for manifest generation")
+        return matches[0] if matches else None
+
+    def _verify_binding_for_manifest(
+        self,
+        binding: SourcePublicationBinding,
+        manifest: dict[str, object],
+    ) -> tuple[str, str, str]:
+        raw_sha, canonical_sha, object_sha = self.coordinator._manifest_hashes(manifest, self.root)
+        if (
+            binding.manifest_generation != str(manifest.get("generation"))
+            or binding.manifest_bytes_sha256 != raw_sha
+            or binding.manifest_canonical_sha256 != canonical_sha
+            or binding.source_object_set_sha256 != object_sha
+        ):
+            raise DatasetError("publication binding does not match manifest")
+        for item in manifest.get("files", []):
+            if not isinstance(item, dict):
+                raise DatasetError("published manifest is invalid")
+            lineage_fields = set(_R2F2_LINEAGE_FIELDS)
+            present = lineage_fields & set(item)
+            if present and present != lineage_fields:
+                raise DatasetError("publication binding lineage is incomplete")
+            if present:
+                if binding.lineage_sha256 != domain_sha256(
+                    "stock-eva/r2f4.2/publication-lineage/v2",
+                    {field: item[field] for field in _R2F2_LINEAGE_FIELDS},
+                ):
+                    raise DatasetError("publication binding lineage does not match manifest")
+        return raw_sha, canonical_sha, object_sha
 
     def _source_commit(
         self, result, binding, pointer, object_sha, raw_sha, canonical_sha, manifest
@@ -1547,6 +1579,11 @@ class NasMarketStore:
             return None
         latest = max(entries, key=lambda item: item["trade_date"])
         trade_date = date.fromisoformat(latest["trade_date"])
+        existing_binding = self._binding_for_generation(str(manifest["generation"]))
+        if existing_binding is not None:
+            self._verify_binding_for_manifest(existing_binding, manifest)
+            if existing_binding.trade_date != trade_date.isoformat():
+                raise DatasetError("publication binding trade date does not match manifest")
         current = self.control.published_refresh()
         if current is not None and current.requested_date == trade_date:
             return current
@@ -1558,10 +1595,22 @@ class NasMarketStore:
             raise DatasetError("published parquet checksum mismatch during reconciliation")
         self._validate_parquet(path, latest["row_count"])
 
-        request_key = f"nas-manifest-reconcile:{source}:{trade_date.isoformat()}:{latest['sha256']}"
-        now = datetime.now(UTC)
+        request_key = (
+            existing_binding.run_id
+            if existing_binding is not None
+            else f"nas-manifest-reconcile:{source}:{trade_date.isoformat()}:{latest['sha256']}"
+        )
+        now = (
+            datetime.fromisoformat(existing_binding.published_at)
+            if existing_binding is not None
+            else datetime.now(UTC)
+        )
         result = RefreshResult(
-            run_id=hashlib.sha256(request_key.encode()).hexdigest()[:24],
+            run_id=(
+                existing_binding.run_id
+                if existing_binding is not None
+                else hashlib.sha256(request_key.encode()).hexdigest()[:24]
+            ),
             request_key=request_key,
             run_kind="backfill",
             requested_date=trade_date,
@@ -1573,14 +1622,24 @@ class NasMarketStore:
             started_at=now,
             completed_at=now,
         )
+        lineage_input: LineageInput | dict[str, object]
+        lineage_fields = set(_R2F2_LINEAGE_FIELDS)
+        if lineage_fields <= set(latest):
+            lineage_input = {
+                "mode": "modern",
+                "exact": {field: latest[field] for field in _R2F2_LINEAGE_FIELDS},
+            }
+        else:
+            lineage_input = {"mode": "legacy"}
         self.coordinator.publish_dataset_and_pointer(
             {
                 "bars": self.canonical_bars(trade_date, source),
                 "source": source,
                 "result": result,
                 "selection": None,
-                "lineage_input": {"mode": "legacy"},
+                "lineage_input": lineage_input,
                 "dataset_already_ready": True,
+                "skip_binding": existing_binding is None,
             }
         )
         return result

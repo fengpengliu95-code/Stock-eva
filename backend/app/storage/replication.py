@@ -418,7 +418,7 @@ class LineageResolver:
             ):
                 return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
             resolved_selection_sha256 = selection.selection_sha256
-        except (TypeError, ValueError, ValidationError, AttributeError):
+        except (TypeError, ValueError, ValidationError, AttributeError, OSError, RuntimeError):
             return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         assert value.exact is not None
         lineage = value.exact
@@ -438,6 +438,81 @@ class LineageResolver:
             lineage_sha256=lineage_sha,
             selection=selection,
         )
+
+
+class RetainedEvidenceLineageReader:
+    """Read one complete retained F4.2 evidence/candidate/selection bundle.
+
+    This is a read-only adapter over the existing descriptor-bound stores.  It
+    intentionally has no fallback reader: missing or incomplete retained
+    evidence is an unavailable modern lineage, never an inferred legacy one.
+    """
+
+    def __init__(self, evidence_root: Path | str) -> None:
+        self.root = Path(evidence_root)
+
+    def __call__(self, input_value, trade_date: str) -> Mapping[str, object]:
+        from backend.app.market.candidates import CandidateStore
+        from backend.app.market.evidence import EvidenceReader
+
+        candidate_id = getattr(input_value, "candidate_id", None)
+        evidence_id = getattr(input_value, "evidence_id", None)
+        exact = getattr(input_value, "exact", None)
+        if exact is not None:
+            candidate_id = exact.candidate_id
+            evidence_id = exact.evidence_id
+        if not isinstance(candidate_id, str) or not isinstance(evidence_id, str):
+            raise ValueError("retained lineage references are unavailable")
+        evidence = EvidenceReader(self.root).read(evidence_id)
+        candidate_store = CandidateStore(self.root)
+        with candidate_store._bound_root() as (root_fd, _identity):
+            candidate = json.loads(
+                candidate_store._readback(root_fd, f"bundles/{candidate_id}/candidate.json")
+            )
+            gate_report = json.loads(
+                candidate_store._readback(root_fd, f"bundles/{candidate_id}/gate.json")
+            )
+            selection = json.loads(
+                candidate_store._readback(root_fd, f"bundles/{candidate_id}/selection.json")
+            )
+        if evidence.manifest.trade_date.isoformat() != trade_date:
+            raise ValueError("retained evidence date mismatch")
+        from backend.app.market.candidates import (
+            CandidateGateReport,
+            CandidateManifest,
+            SessionSelection,
+        )
+
+        candidate_model = CandidateManifest.model_validate(candidate)
+        gate_model = CandidateGateReport.model_validate(gate_report)
+        selection_model = SessionSelection.model_validate(selection)
+        derived_lineage = {
+            "mode": "modern",
+            "exact": {
+                "provider_id": candidate_model.provider_id.value,
+                "universe_id": candidate_model.universe_id,
+                "evidence_id": candidate_model.evidence_id,
+                "evidence_sha256": candidate_model.evidence_sha256,
+                "candidate_id": candidate_model.candidate_id,
+                "candidate_manifest_sha256": candidate_model.manifest_sha256,
+                "gate_report_sha256": gate_model.aggregate_sha256,
+                "adapter_version": candidate_model.adapter_version,
+                "source_schema_version": candidate_model.source_schema_version,
+            },
+        }
+        if selection_model.selected_candidate_id != candidate_model.candidate_id:
+            raise ValueError("retained selection candidate mismatch")
+        lineage = {
+            "mode": "modern",
+            "exact": exact if exact is not None else derived_lineage["exact"],
+        }
+        return {
+            "candidate": candidate,
+            "gate_report": gate_report,
+            "selection": selection,
+            "evidence": evidence,
+            "lineage": lineage,
+        }
 
 
 def normalized_ddl_bytes(ddl: str) -> bytes:
@@ -10299,6 +10374,9 @@ __all__ = [
     "RestoreResult",
     "RestorePlan",
     "nas_to_temporary_root",
+    "LineageInput",
+    "LineageResolver",
+    "RetainedEvidenceLineageReader",
 ]
 
 

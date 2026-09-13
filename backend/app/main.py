@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -44,7 +45,10 @@ from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.market.universe import UniverseSidecarStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
-from backend.app.storage.factory import build_nas_market_store
+from backend.app.storage.factory import (
+    build_nas_market_store,
+    build_replication_drain_worker,
+)
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight
 from backend.app.user.store import UserStore
@@ -300,6 +304,12 @@ async def lifespan(_: FastAPI):
             layout.provider_evidence_root
         ).verify_publication_context,
     )
+    replication_drain = None
+    if settings.replication_enabled and settings.replication_drain_enabled:
+        try:
+            replication_drain = build_replication_drain_worker(settings, layout=layout)
+        except Exception:
+            logging.getLogger(__name__).error("replication drain setup unavailable", exc_info=True)
     calendar_sync_path = layout.local_paths.control / settings.calendar_sync_database_name
     calendar_service = CalendarSyncService(
         # The loop may plan a repair before calendar control state exists.  Its reader must
@@ -334,6 +344,7 @@ async def lifespan(_: FastAPI):
             service,
             stop,
             clock=get_market_clock(),
+            replication_drain=replication_drain,
         )
     )
     calendar_task = asyncio.create_task(

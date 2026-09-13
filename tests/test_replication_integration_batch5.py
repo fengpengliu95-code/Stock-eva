@@ -7,6 +7,10 @@ import pytest
 from backend.app.market.backfill import BackfillService
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.factory import (
+    ReplicationDrainConfigurationError,
+    build_replication_drain_worker,
+)
 from backend.app.storage.replication import LineageResolver
 from tests.test_market_backfill import RangeProvider, trading_days
 from tests.test_nas_dataset import _bars, _ready_result
@@ -187,3 +191,40 @@ def test_binding_reuse_requires_exact_immutable_fields(tmp_path) -> None:
         }
     )
     assert binding_path.read_text(encoding="utf-8") == original
+
+
+def test_reconcile_rejects_duplicate_generation_bindings(tmp_path) -> None:
+    root = _dataset(tmp_path)
+    publisher = NasMarketStore(MarketStore(tmp_path / "control.duckdb"), root, tmp_path / "staging")
+    publisher.save_refresh(_bars(), _ready_result(), publish=True)
+    binding_path = next((root / "_replication" / "source-commits").glob("*.json"))
+    duplicate = binding_path.with_name("duplicate.json")
+    duplicate.write_bytes(binding_path.read_bytes())
+
+    with pytest.raises(DatasetError, match="duplicate publication bindings"):
+        NasMarketStore(
+            MarketStore(tmp_path / "reconcile.duckdb"), root, tmp_path / "reconcile-staging"
+        ).reconcile_control_pointer()
+
+
+def test_drain_factory_double_gate_short_circuits_before_destination(tmp_path) -> None:
+    from backend.app.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        local_market_dataset_root=tmp_path / "dataset",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "tmp",
+        replication_enabled=False,
+        replication_drain_enabled=False,
+    )
+    assert build_replication_drain_worker(settings) is None
+    assert not (tmp_path / "control" / "replication-sidecar").exists()
+
+    enabled = settings.model_copy(
+        update={"replication_enabled": True, "replication_drain_enabled": True}
+    )
+    with pytest.raises(ReplicationDrainConfigurationError):
+        build_replication_drain_worker(enabled)
