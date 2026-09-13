@@ -1,6 +1,8 @@
 """Strict current-document crosswalk checks for the R2-F4.3 RC."""
 
 import ast
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -11,10 +13,15 @@ DOCS = (
 )
 ID_PATTERN = re.compile(r"\b(?:FR|NFR|AC|EC)-[0-9]+[a-z]?\b")
 ROW_PATTERN = re.compile(
-    r"^\| ((?:FR|NFR|AC|EC)-[0-9]+[a-z]?) \| .* \| (test_[A-Za-z0-9_]+) \|$",
+    r"^\| ((?:FR|NFR|AC|EC)-[0-9]+[a-z]?) \| (.*?) \| (test_[A-Za-z0-9_]+) \|$",
     re.MULTILINE,
 )
 EXPECTED_COUNTS = {"FR": 42, "NFR": 16, "AC": 31, "EC": 40}
+# Approved digest of the effective semantic matrix recovered from the
+# pre-consolidation contract and its implemented supersessions.  This catches
+# a return to one generic placeholder description while allowing anchors to be
+# reused across requirements.
+SEMANTIC_MATRIX_SHA256 = "5aac85dbc263abf4dae42a27856579c1b5c117d743cde6e37b5a81613eb6db59"
 
 
 def _test_names() -> set[str]:
@@ -53,7 +60,7 @@ def test_current_docs_repeat_the_same_exact_anchor_set() -> None:
 
 def test_normative_corpus_has_exact_unique_ids_and_real_crosswalk_rows() -> None:
     names = _test_names()
-    parsed: list[tuple[set[str], list[tuple[str, str]]]] = []
+    parsed: list[tuple[set[str], list[tuple[str, str, str]]]] = []
     for path in DOCS:
         text = path.read_text(encoding="utf-8")
         ids = ID_PATTERN.findall(text)
@@ -61,10 +68,14 @@ def test_normative_corpus_has_exact_unique_ids_and_real_crosswalk_rows() -> None
         assert len(ids) == sum(EXPECTED_COUNTS.values())
         assert len(set(ids)) == len(ids)
         assert len(rows) == sum(EXPECTED_COUNTS.values())
-        assert {anchor for _id, anchor in rows} <= names
-        assert set(ids) == {row_id for row_id, _anchor in rows}
+        assert {anchor for _id, _description, anchor in rows} <= names
+        assert set(ids) == {row_id for row_id, _description, _anchor in rows}
+        descriptions = [description for _id, description, _anchor in rows]
+        assert len(set(descriptions)) >= 120
         for prefix, count in EXPECTED_COUNTS.items():
             assert sum(item.startswith(prefix + "-") for item in ids) == count
+        matrix = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+        assert hashlib.sha256(matrix.encode()).hexdigest() == SEMANTIC_MATRIX_SHA256
         parsed.append((set(ids), rows))
     assert parsed[0][0] == parsed[1][0]
     assert parsed[0][1] == parsed[1][1]

@@ -4396,6 +4396,7 @@ class ImmutableReplicationSidecarStore:
                         datetime.fromisoformat(f"{operation_day}T23:59:59.999999+08:00")
                         .astimezone(UTC)
                         .isoformat()
+                        .replace("+00:00", "Z")
                     )
                 except ValueError as exc:
                     raise ReplicationDurabilityError("operation day is invalid") from exc

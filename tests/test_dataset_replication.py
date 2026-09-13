@@ -1084,29 +1084,35 @@ def test_operation_day_is_scheduling_metadata_not_intent_identity(tmp_path: Path
 
 
 def test_claim_due_operation_day_filters_source_publication_with_fake_clock(tmp_path: Path) -> None:
-    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
-    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
-    checkpoint = _checkpoint_for_journal().checkpoint_projection
-    sidecar.enqueue_checkpoint(
-        checkpoint,
-        operation_day="2026-09-09",
-        destination_id="1" * 32,
-        created_at="2026-09-09T00:00:00Z",
-    )
-    assert (
-        sidecar.claim_due(
-            worker_id="worker-before",
-            now="2026-09-09T00:01:00Z",
-            operation_day="2026-09-08",
+    cutoff = "2026-09-09T15:59:59.999999Z"  # 23:59:59.999999 Asia/Shanghai
+    claims = []
+    for index, published_at in enumerate(
+        (
+            "2026-09-09T15:59:59.999998Z",
+            cutoff,
+            "2026-09-09T16:00:00Z",
+        ),
+        start=1,
+    ):
+        sidecar = ReplicationSidecarStore(tmp_path / "control" / f"replication-sidecar-{index}")
+        sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+        sidecar.enqueue_checkpoint(
+            _checkpoint_for_journal(source_published_at=published_at).checkpoint_projection,
+            operation_day="2026-09-09",
+            destination_id=f"{index:02d}" * 16,
+            created_at="2026-09-09T00:00:00Z",
         )
-        is None
-    )
-    claim = sidecar.claim_due(
-        worker_id="worker-on-day",
-        now="2026-09-09T00:01:00Z",
-        operation_day="2026-09-09",
-    )
-    assert claim is not None
+
+        claims.append(
+            sidecar.claim_due(
+                worker_id=f"worker-{index}",
+                now="2026-09-10T00:01:00Z",
+                operation_day="2026-09-09",
+            )
+        )
+    assert claims[0] is not None
+    assert claims[1] is not None
+    assert claims[2] is None
 
 
 def test_outbox_transaction_crash_before_generation_install_preserves_prior_state(
