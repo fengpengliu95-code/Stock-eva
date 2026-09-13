@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.storage.replication import LineageInput, LineageResolver
 
 
 class BackfillBatchPlan(BaseModel):
@@ -23,6 +24,7 @@ class BackfillBatchPlan(BaseModel):
     symbols: list[str]
     requested_points: int
     estimated_provider_requests: int
+    lineage_by_trade_date: dict[str, LineageInput] = {}
 
 
 class BackfillPlan(BaseModel):
@@ -311,6 +313,7 @@ class BackfillService:
             store.path,
             temp_directory=store.temp_directory,
         )
+        self.lineage_resolver = LineageResolver()
 
     def plan(
         self,
@@ -372,6 +375,62 @@ class BackfillService:
             batches=batches,
         )
 
+    def plan_dataset(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        symbols: list[str],
+        symbol_batch_size: int,
+        date_batch_size: int,
+        max_batches: int,
+        trading_dates: list[date],
+        lineage_pairs: list[dict[str, object] | tuple[str, object]],
+    ) -> BackfillPlan:
+        """Build a dataset plan only after ordered, exact lineage admission."""
+        from backend.app.storage.dataset import NasMarketStore
+
+        if not isinstance(self.store, NasMarketStore):
+            raise ValueError("dataset plan requires NasMarketStore")
+        expected = sorted(set(trading_dates))
+        if not expected:
+            raise ValueError("dataset plan requires confirmed trading dates")
+        seen: set[str] = set()
+        mapping: dict[str, LineageInput] = {}
+        for pair in lineage_pairs:
+            if isinstance(pair, tuple):
+                trade_date, raw_input = pair
+            elif isinstance(pair, dict) and set(pair) == {"trade_date", "lineage_input"}:
+                trade_date, raw_input = pair["trade_date"], pair["lineage_input"]
+            else:
+                raise ValueError("dataset lineage pairs are invalid")
+            key = trade_date.isoformat() if isinstance(trade_date, date) else str(trade_date)
+            if key in seen:
+                raise ValueError("dataset lineage dates are duplicated")
+            seen.add(key)
+            mapping[key] = (
+                raw_input
+                if isinstance(raw_input, LineageInput)
+                else LineageInput.model_validate(raw_input)
+            )
+        expected_keys = [item.isoformat() for item in expected]
+        if list(mapping) != expected_keys or set(mapping) != set(expected_keys):
+            raise ValueError("dataset lineage dates must exactly match trading dates")
+        plan = self.plan(
+            start_date=start_date,
+            end_date=end_date,
+            symbols=symbols,
+            symbol_batch_size=symbol_batch_size,
+            date_batch_size=date_batch_size,
+            max_batches=max_batches,
+            trading_dates=expected,
+        )
+        for batch in plan.batches:
+            batch.lineage_by_trade_date = {
+                item.isoformat(): mapping[item.isoformat()] for item in batch.trading_dates
+            }
+        return plan
+
     def execute(
         self,
         plan: BackfillPlan,
@@ -380,6 +439,55 @@ class BackfillService:
     ) -> BackfillRunRecord:
         if min_request_interval_seconds < 0:
             raise ValueError("request interval cannot be negative")
+        dataset_mode = any(batch.lineage_by_trade_date for batch in plan.batches)
+        # Resolve every date in a dataset batch before constructing an audit
+        # writer, requesting provider data or mutating a manifest.  One bad
+        # date rejects the whole batch atomically.
+        if dataset_mode:
+            for batch in plan.batches:
+                for trade_date in sorted(batch.trading_dates):
+                    lineage_input = batch.lineage_by_trade_date.get(trade_date.isoformat())
+                    if lineage_input is None:
+                        raise ValueError("SOURCE_UNAVAILABLE")
+                    existing_mode = "empty"
+                    try:
+                        manifest = self.store._manifest()  # type: ignore[attr-defined]
+                        entries = manifest.get("files", [])
+                        present = [
+                            item
+                            for item in entries
+                            if item.get("trade_date") == trade_date.isoformat()
+                        ]
+                        if present:
+                            fields = set().union(*(set(item) for item in present))
+                            existing_mode = (
+                                "modern"
+                                if any(field in fields for field in ("candidate_id", "evidence_id"))
+                                else "legacy"
+                            )
+                    except Exception:
+                        existing_mode = "empty"
+                    resolved = self.lineage_resolver.resolve(
+                        lineage_input, trade_date.isoformat(), existing_mode
+                    )
+                    if resolved.kind == "UNAVAILABLE":
+                        return BackfillRunRecord(
+                            run_id=plan.run_id,
+                            request_key=plan.request_key,
+                            status="error",
+                            start_date=plan.start_date,
+                            end_date=plan.end_date,
+                            symbols=plan.symbols,
+                            trading_dates=plan.trading_dates,
+                            total_batches=plan.total_batches,
+                            completed_batches=0,
+                            failed_batches=plan.total_batches,
+                            requested_points=plan.requested_points,
+                            loaded_points=0,
+                            coverage_ratio=0.0,
+                            started_at=datetime.now(UTC),
+                            completed_at=datetime.now(UTC),
+                        )
         self.audit.initialize(plan)
         self.audit.mark_running(plan.run_id)
         ready_indexes = self.audit.ready_batch_indexes(plan.run_id)
@@ -397,7 +505,16 @@ class BackfillService:
                     symbols=batch.symbols,
                 )
                 self._validate_provider_batch(batch, result)
-                self.store.upsert_bars(result.bars)
+                if dataset_mode:
+                    for trade_date in batch.trading_dates:
+                        date_bars = [item for item in result.bars if item.trade_date == trade_date]
+                        if date_bars:
+                            self.store.upsert_bars(
+                                date_bars,
+                                lineage_input=batch.lineage_by_trade_date[trade_date.isoformat()],
+                            )
+                else:
+                    self.store.upsert_bars(result.bars)
                 loaded = len(
                     {
                         (item.trade_date, item.symbol)

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import signal
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -126,6 +127,7 @@ from backend.app.storage.initialize import (
 )
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
+from backend.app.storage.replication import ReplicationStatusService
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
 from backend.app.user.store import UserStore
@@ -138,6 +140,52 @@ class _CliArgumentError(ValueError):
 class _SanitizedArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         raise _CliArgumentError("invalid CLI arguments")
+
+
+def _read_backfill_lineage_file(
+    path: Path, expected_dates: tuple[date, ...]
+) -> tuple[tuple[date, dict[str, object]], ...]:
+    """Read ordered lineage JSON without following symlinks or duplicate keys."""
+    if not path.is_absolute() or path == Path("/"):
+        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    try:
+        stat_result = os.fstat(descriptor)
+        if not os.path.isfile(path) or stat_result.st_size > 1024 * 1024:
+            raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+        payload = os.read(descriptor, stat_result.st_size + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > 1024 * 1024:
+        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+            result[key] = value
+        return result
+
+    try:
+        root = json.loads(payload.decode("utf-8"), object_pairs_hook=pairs)
+        if (
+            set(root) != {"schema", "entries"}
+            or root["schema"] != "stock-eva/r2f4.3/backfill-lineage/v1"
+        ):
+            raise ValueError
+        parsed = []
+        for item in root["entries"]:
+            if set(item) != {"trade_date", "lineage_input"}:
+                raise ValueError
+            parsed.append((date.fromisoformat(item["trade_date"]), item["lineage_input"]))
+    except Exception as exc:
+        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID") from exc
+    expected = tuple(expected_dates)
+    if tuple(item[0] for item in parsed) != expected:
+        raise ValueError("BACKFILL_LINEAGE_INPUT_INVALID")
+    return tuple(parsed)
 
 
 def _provider_health_payload(health: ProviderHealth) -> dict[str, object]:
@@ -374,6 +422,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="perform network requests; omitted means dry-run",
+    )
+    backfill.add_argument(
+        "--lineage-input",
+        type=Path,
+        help="local ordered lineage JSON for dataset-backed backfill",
+    )
+    replicate = subparsers.add_parser(
+        "market-replicate",
+        help="plan or explicitly execute local-to-NAS immutable replication",
+    )
+    replicate.add_argument("--destination", required=True, type=Path)
+    replicate.add_argument("--execute", action="store_true")
+    restore = subparsers.add_parser(
+        "market-restore",
+        help="plan or explicitly execute a verified NAS restore to a temporary root",
+    )
+    restore.add_argument("--source", required=True, type=Path)
+    restore.add_argument("--destination", required=True, type=Path)
+    restore.add_argument("--execute", action="store_true")
+    subparsers.add_parser(
+        "market-replication-status",
+        help="read-only local replication status",
     )
     full_history = subparsers.add_parser(
         "full-market-backfill",
@@ -2070,6 +2140,54 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return exit_code
     settings = get_settings()
+    if args.command == "market-replication-status":
+        try:
+            result = ReplicationStatusService(settings).read()
+            print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
+            return 0 if result.status in {"ready", "disabled"} else 1
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "unavailable",
+                        "reason_code": "REPLICATION_STATE_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+    if args.command in {"market-replicate", "market-restore"}:
+        # These are intentionally plan-first.  Transfer/restore is admitted
+        # only by an explicit execute request and remains unavailable until a
+        # trusted descriptor-bound service is configured; dry-run performs no
+        # path probe, mount, provider or sidecar work.
+        if not args.execute:
+            payload = {
+                "mode": "plan",
+                "status": "dry-run",
+                "reason_code": "NONE",
+                "provider_requests": 0,
+                "writes": False,
+                "destination_writes": False,
+                "restore_writes": False,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+        print(
+            json.dumps(
+                {
+                    "status": "unavailable",
+                    "reason_code": "DESTINATION_UNAVAILABLE",
+                    "provider_requests": 0,
+                    "writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 1
     if args.command == "market-regime-snapshots":
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         if args.end < args.start or args.start > today or args.end > today:
@@ -2851,6 +2969,53 @@ def main() -> int:
                 )
             )
             return 2
+        lineage_pairs = None
+        if args.lineage_input is not None and not isinstance(store, NasMarketStore):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_NOT_SUPPORTED_FOR_PLAIN_STORE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if args.lineage_input is not None and args.start is not None:
+            confirmed = (
+                get_trading_calendar().snapshot().confirmed_open_sessions(args.start, args.end)
+            )
+            if confirmed is None:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "SOURCE_UNAVAILABLE",
+                            "provider_requests": 0,
+                            "writes": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            try:
+                lineage_pairs = _read_backfill_lineage_file(args.lineage_input, confirmed)
+            except (OSError, ValueError):
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "BACKFILL_LINEAGE_INPUT_UNAVAILABLE",
+                            "provider_requests": 0,
+                            "writes": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
         provider = BaoStockProvider(
             min_request_interval_seconds=max(args.min_request_interval, 0.2),
             socket_timeout_seconds=socket_timeout_seconds,
@@ -2878,15 +3043,29 @@ def main() -> int:
             start_date = selected_dates[0]
         service = BackfillService(store, provider)
         try:
-            plan = service.plan(
-                start_date=start_date,
-                end_date=args.end,
-                symbols=args.symbols,
-                symbol_batch_size=args.symbol_batch_size,
-                date_batch_size=args.date_batch_size,
-                max_batches=args.max_batches,
-                trading_dates=selected_dates,
-            )
+            if lineage_pairs is not None:
+                plan = service.plan_dataset(
+                    start_date=start_date,
+                    end_date=args.end,
+                    symbols=args.symbols,
+                    symbol_batch_size=args.symbol_batch_size,
+                    date_batch_size=args.date_batch_size,
+                    max_batches=args.max_batches,
+                    trading_dates=selected_dates or [item[0] for item in lineage_pairs],
+                    lineage_pairs=[
+                        {"trade_date": item[0], "lineage_input": item[1]} for item in lineage_pairs
+                    ],
+                )
+            else:
+                plan = service.plan(
+                    start_date=start_date,
+                    end_date=args.end,
+                    symbols=args.symbols,
+                    symbol_batch_size=args.symbol_batch_size,
+                    date_batch_size=args.date_batch_size,
+                    max_batches=args.max_batches,
+                    trading_dates=selected_dates,
+                )
         except Exception:
             print(
                 json.dumps(

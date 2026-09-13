@@ -29,7 +29,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from backend.app.config import Settings
 from backend.app.storage.layout import StorageLayout
@@ -55,6 +63,23 @@ GENERATION_PAYLOAD_DOMAIN: Literal["stock-eva/r2f4.3/replication-generation-payl
 )
 GENERATION_TRUST_SCOPE: Literal["LOCAL_CHAIN_ONLY"] = "LOCAL_CHAIN_ONLY"
 JOURNAL_SCHEMA_VERSION = 1
+
+# Batch5 publication contracts.  These are deliberately private-to-local
+# value objects: they contain hashes and identifiers only, never paths or
+# provider payloads.  Keeping the contracts here lets the dataset publisher
+# and the outbox share one canonical hash implementation without coupling the
+# plain MarketStore to replication.
+LINEAGE_FIELDS = (
+    "provider_id",
+    "universe_id",
+    "evidence_id",
+    "evidence_sha256",
+    "candidate_id",
+    "candidate_manifest_sha256",
+    "gate_report_sha256",
+    "adapter_version",
+    "source_schema_version",
+)
 
 # The replication sidecar is an immutable generation log.  The former
 # ``replication.sqlite3`` file is deliberately not part of this namespace.
@@ -234,6 +259,118 @@ def domain_sha256(domain: str, value: object) -> str:
     if not domain or any(ord(char) > 127 for char in domain):
         raise ValueError("hash domain must be non-empty ASCII")
     return hashlib.sha256(domain.encode("ascii") + b"\n" + canonical_json_bytes(value)).hexdigest()
+
+
+LEGACY_SELECTION_SHA256 = domain_sha256("stock-eva/r2f4.3/selection-null/v1", None)
+LEGACY_LINEAGE_SHA256 = domain_sha256("stock-eva/r2f4.3/lineage-null/v1", None)
+
+
+class PublicationLineage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider_id: str = Field(min_length=1)
+    universe_id: str = Field(min_length=1)
+    evidence_id: str = Field(min_length=1)
+    evidence_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    candidate_id: str = Field(min_length=1)
+    candidate_manifest_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    gate_report_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    adapter_version: str = Field(min_length=1)
+    source_schema_version: str = Field(min_length=1)
+
+
+class LineageInput(BaseModel):
+    """Discriminated local lineage input accepted by dataset writers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    mode: Literal["legacy", "modern"]
+    exact: PublicationLineage | None = None
+    candidate_id: str | None = None
+    evidence_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> LineageInput:
+        if self.mode == "legacy":
+            if (
+                self.exact is not None
+                or self.candidate_id is not None
+                or self.evidence_id is not None
+            ):
+                raise ValueError("legacy lineage input must not carry modern references")
+        elif self.exact is not None and (
+            self.candidate_id is not None or self.evidence_id is not None
+        ):
+            raise ValueError("modern lineage input must use exact lineage or references")
+        elif self.exact is None and (self.candidate_id is None or self.evidence_id is None):
+            raise ValueError("modern lineage input requires exact lineage or references")
+        return self
+
+
+class LineageResolveResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    kind: Literal["LEGACY", "MODERN", "UNAVAILABLE"]
+    selection_sha256: str | None = None
+    lineage_sha256: str | None = None
+    lineage: PublicationLineage | None = None
+    selection: object | None = None
+    reason_code: Literal["SOURCE_UNAVAILABLE"] | None = None
+
+
+class LineageResolver:
+    """Strict, provider-free resolver used before dataset mutation.
+
+    The ID form intentionally remains unavailable until an allowlisted local
+    evidence reader is injected.  It never guesses lineage from bars/labels.
+    """
+
+    def __init__(self, evidence_reader=None) -> None:
+        self.evidence_reader = evidence_reader
+
+    def resolve(
+        self,
+        input_value: LineageInput | Mapping[str, object],
+        trade_date: str,
+        existing_mode: Literal["empty", "legacy", "modern"] = "empty",
+    ) -> LineageResolveResult:
+        try:
+            value = (
+                input_value
+                if isinstance(input_value, LineageInput)
+                else LineageInput.model_validate(input_value)
+            )
+            _validate_iso_date(trade_date, "trade_date")
+        except (TypeError, ValueError, ValidationError):
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        if existing_mode == "legacy" and value.mode != "legacy":
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        if existing_mode == "modern" and value.mode != "modern":
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        if value.mode == "legacy":
+            return LineageResolveResult(
+                kind="LEGACY",
+                selection_sha256=LEGACY_SELECTION_SHA256,
+                lineage_sha256=LEGACY_LINEAGE_SHA256,
+            )
+        if value.exact is None:
+            if self.evidence_reader is None:
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            try:
+                value = LineageInput.model_validate(self.evidence_reader(value, trade_date))
+            except (TypeError, ValueError, ValidationError):
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        assert value.exact is not None
+        lineage = value.exact
+        lineage_sha = domain_sha256("stock-eva/r2f4.2/publication-lineage/v2", lineage.model_dump())
+        return LineageResolveResult(
+            kind="MODERN",
+            lineage=lineage,
+            # A SessionSelection is required for a modern pointer publication;
+            # manifest-only backfill can carry the exact lineage digest without
+            # manufacturing a selection object.
+            lineage_sha256=lineage_sha,
+        )
 
 
 def normalized_ddl_bytes(ddl: str) -> bytes:
@@ -880,6 +1017,113 @@ class ReplicationEffects(BaseModel):
     outbox_writes: bool
     restore_writes: bool
     audit_writes: bool = False
+
+
+class SourcePublicationBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    binding_schema: Literal["stock-eva/r2f4.3/source-publication-binding/v1"] = (
+        "stock-eva/r2f4.3/source-publication-binding/v1"
+    )
+    schema_version: Literal[1] = 1
+    run_id: str = Field(min_length=1)
+    trade_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    published_at: str = Field(min_length=20)
+    manifest_generation: str = Field(min_length=1)
+    manifest_bytes_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    manifest_canonical_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    selection_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    lineage_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    def hash_preimage(self) -> dict[str, object]:
+        value = self.model_dump(mode="json")
+        value.pop("binding_sha256")
+        return value
+
+    def verify_hash(self) -> None:
+        expected = domain_sha256(
+            "stock-eva/r2f4.3/source-publication-binding/v1", self.hash_preimage()
+        )
+        if expected != self.binding_sha256:
+            raise ReplicationDurabilityError("publication binding hash is invalid")
+
+
+class SourceCommit(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    source_commit_schema: Literal["stock-eva/r2f4.3/source-commit/v1"] = (
+        "stock-eva/r2f4.3/source-commit/v1"
+    )
+    pointer_row_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    pointer_generation: str = Field(min_length=1)
+    source_run_id: str = Field(min_length=1)
+    source_trade_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_published_at: str = Field(min_length=20)
+    pointer_db_device: int = Field(gt=0)
+    pointer_db_inode: int = Field(gt=0)
+    pointer_db_schema_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    manifest_canonical_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_manifest_bytes_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    object_inventory: tuple[dict[str, object], ...] = ()
+    publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    publication_binding_manifest_generation: str = Field(min_length=1)
+    publication_binding_selection_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    publication_binding_lineage_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    committed_at: str = Field(min_length=20)
+    source_commit_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    def hash_preimage(self) -> dict[str, object]:
+        value = self.model_dump(mode="json")
+        value.pop("source_commit_sha256")
+        return value
+
+    def verify_hash(self) -> None:
+        expected = domain_sha256("stock-eva/r2f4.3/source-commit/v1", self.hash_preimage())
+        if expected != self.source_commit_sha256:
+            raise ReplicationDurabilityError("source commit hash is invalid")
+
+
+class ReplicationObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    observation_schema: Literal["stock-eva/r2f4.3/replication-observation/v1"] = (
+        "stock-eva/r2f4.3/replication-observation/v1"
+    )
+    source_commit_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_sequence: int | None = Field(default=None, ge=1)
+    intent_id: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    enqueue_state: str = Field(min_length=1)
+    reason_code: ReplicationReason
+    effects: ReplicationEffects
+    observed_at: str = Field(min_length=20)
+    observation_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+    def hash_preimage(self) -> dict[str, object]:
+        value = self.model_dump(mode="json")
+        value.pop("observation_sha256")
+        return value
+
+    def verify_hash(self) -> None:
+        expected = domain_sha256(
+            "stock-eva/r2f4.3/replication-observation/v1", self.hash_preimage()
+        )
+        if expected != self.observation_sha256:
+            raise ReplicationDurabilityError("replication observation hash is invalid")
 
 
 class ReplicationStatusResponse(BaseModel):
@@ -4502,6 +4746,55 @@ class ReplicationOutboxService:
         self.enabled = enabled
         self.source_instance_id = source_instance_id
         self.source_instance_sha256 = source_instance_sha256
+
+    def pre_publication_guard(self, current_checkpoint: SourceCheckpoint | None = None) -> str:
+        """Prove local durability before a subsequent pointer commit.
+
+        The first publication has no prior singleton and is therefore allowed;
+        an existing checkpoint must be readable or the next commit is blocked.
+        """
+        if not self.enabled:
+            return "DISABLED"
+        if current_checkpoint is None:
+            return "NONE"
+        try:
+            current_checkpoint.verify_hashes()
+            return "NONE"
+        except ReplicationDurabilityError:
+            return "OUTBOX_DURABILITY_UNAVAILABLE"
+
+    def on_canonical_committed(self, source_commit: SourceCommit) -> ReplicationObservation:
+        """Typed post-commit seam; never changes the canonical result."""
+        if not self.enabled:
+            reason: ReplicationReason = "DISABLED"
+            state = "disabled"
+        elif self.source_instance_id is None or self.source_instance_sha256 is None:
+            reason = "SOURCE_NOT_CONFIGURED"
+            state = "not_configured"
+        else:
+            reason = "OUTBOX_ENQUEUE_FAILED"
+            state = "unavailable"
+        values: dict[str, object] = {
+            "source_commit_sha256": source_commit.source_commit_sha256,
+            "checkpoint_id": source_commit.source_commit_sha256,
+            "source_instance_id": self.source_instance_id or "0" * 64,
+            "source_sequence": None,
+            "intent_id": None,
+            "enqueue_state": state,
+            "reason_code": reason,
+            "effects": ReplicationEffects(
+                writes=False,
+                canonical_writes=True,
+                destination_writes=False,
+                outbox_writes=False,
+                restore_writes=False,
+            ),
+            "observed_at": _utc_now(),
+        }
+        values["observation_sha256"] = domain_sha256(
+            "stock-eva/r2f4.3/replication-observation/v1", values
+        )
+        return ReplicationObservation.model_validate(values)
 
     def enqueue(
         self,
