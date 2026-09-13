@@ -356,11 +356,31 @@ def test_ec25_publication_fault_points_never_report_partial_success(
     old_pointer = store.control.published_refresh()
     assert old_pointer is not None
     control_path = store.control.path
-    old_control = (control_path.stat().st_ino, control_path.read_bytes())
     binding_root = root / "_replication" / "source-commits"
-    old_bindings = {
-        path.name: (path.stat().st_ino, path.read_bytes()) for path in binding_root.glob("*.json")
-    }
+
+    def physical(path: Path):
+        if not path.exists():
+            return None
+        items = [path]
+        items.extend(sorted(path.rglob("*")))
+        return tuple(
+            (
+                str(item.relative_to(path.parent if item == path else path)),
+                "symlink" if item.is_symlink() else "dir" if item.is_dir() else "file",
+                item.lstat().st_ino,
+                item.lstat().st_size,
+                item.lstat().st_mtime_ns,
+                None
+                if item.is_dir() or item.is_symlink()
+                else hashlib.sha256(item.read_bytes()).hexdigest(),
+            )
+            for item in items
+        )
+
+    old_control = physical(control_path)
+    old_manifest = physical(root)
+    old_bindings = physical(binding_root)
+    old_bindings_names = [path.name for path in binding_root.glob("*.json")]
     incoming = _bars()
     incoming[0] = incoming[0].model_copy(update={"close": incoming[0].close + 0.01})
     second = first.model_copy(update={"run_id": "nas-ready-2", "request_key": "nas-ready-2"})
@@ -422,15 +442,27 @@ def test_ec25_publication_fault_points_never_report_partial_success(
     assert pointer.status == "ready"
     if fault_point == "postcommit":
         assert pointer.run_id == second.run_id
-        assert (control_path.stat().st_ino, control_path.read_bytes()) != old_control
+        assert physical(control_path) != old_control
+        assert physical(root) != old_manifest
         assert store.reconcile_control_pointer().run_id == second.run_id
     else:
         assert pointer.model_dump() == old_pointer.model_dump()
-        assert (control_path.stat().st_ino, control_path.read_bytes()) == old_control
+        assert physical(control_path) == old_control
         assert store.reconcile_control_pointer().model_dump() == old_pointer.model_dump()
-    assert {
-        path.name: (path.stat().st_ino, path.read_bytes()) for path in binding_root.glob("*.json")
-    }.items() >= old_bindings.items()
+        if fault_point == "manifest_mutation":
+            assert physical(root) == old_manifest
+        else:
+            assert physical(root) != old_manifest
+    after_bindings = physical(binding_root)
+    if fault_point in {"manifest_mutation", "binding_install"}:
+        assert after_bindings == old_bindings
+    else:
+        binding_names = sorted(path.name for path in binding_root.glob("*.json"))
+        assert binding_names == sorted([*old_bindings_names, f"{second.run_id}.json"])
+        assert (
+            json.loads((binding_root / f"{second.run_id}.json").read_text())["run_id"]
+            == second.run_id
+        )
     assert store.control.published_refresh().status == "ready"
     if fault_point == "postcommit":
         assert (
@@ -461,14 +493,22 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
     def fingerprint(path: Path):
         if not path.exists():
             return None
+        root_stat = path.stat()
         return tuple(
-            (
-                str(item.relative_to(path)),
-                item.is_dir(),
-                item.stat().st_ino,
-                None if item.is_dir() else item.read_bytes(),
-            )
-            for item in sorted(path.rglob("*"))
+            [(".", "dir", root_stat.st_ino, root_stat.st_size, root_stat.st_mtime_ns, None)]
+            + [
+                (
+                    str(item.relative_to(path)),
+                    "symlink" if item.is_symlink() else "dir" if item.is_dir() else "file",
+                    item.lstat().st_ino,
+                    item.lstat().st_size,
+                    item.lstat().st_mtime_ns,
+                    None
+                    if item.is_dir() or item.is_symlink()
+                    else hashlib.sha256(item.read_bytes()).hexdigest(),
+                )
+                for item in sorted(path.rglob("*"))
+            ]
         )
 
     def http_status(settings):
@@ -507,10 +547,13 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
                     ),
                 )
                 result = ReplicationStatusService(settings).read()
+                http_before = fingerprint(layout.replication_sidecar_root)
                 response = http_status(settings)
+                assert fingerprint(layout.replication_sidecar_root) == http_before
             assert response.status_code == 200
             assert str(tmp_path) not in response.text
             assert response.json()["provider_requests"] == 0
+            assert response.json() == result.model_dump(mode="json")
             assert (
                 result.status,
                 result.reason_code,
@@ -624,11 +667,13 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
         if state == "replicated":
             assert result.last_replicated_source_manifest_sha256 == "4" * 64
             assert result.last_replicated_at == "2026-09-09T00:00:03Z"
+        http_before = fingerprint(layout.replication_sidecar_root)
         response = http_status(settings)
+        http_after = fingerprint(layout.replication_sidecar_root)
+        assert http_after == http_before
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == result.status
-        assert body["reason_code"] == result.reason_code
+        assert body == result.model_dump(mode="json")
         assert body["provider_requests"] == 0
         assert body["effects"]["writes"] is False
         assert str(tmp_path) not in response.text
