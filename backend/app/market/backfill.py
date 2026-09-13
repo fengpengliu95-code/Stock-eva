@@ -392,8 +392,8 @@ class BackfillService:
 
         if not isinstance(self.store, NasMarketStore):
             raise ValueError("dataset plan requires NasMarketStore")
-        expected = sorted(set(trading_dates))
-        if not expected:
+        expected = list(trading_dates)
+        if not expected or len(set(expected)) != len(expected) or expected != sorted(expected):
             raise ValueError("dataset plan requires confirmed trading dates")
         seen: set[str] = set()
         mapping: dict[str, LineageInput] = {}

@@ -14,8 +14,8 @@ from backend.app.alert.service import AlertService
 from backend.app.alert.store import AlertStore
 from backend.app.config import Settings
 from backend.app.market.automation import RefreshAlreadyRunning, RefreshRunLock
-from backend.app.market.store import MarketStore
-from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.dataset import DatasetError
+from backend.app.storage.factory import build_nas_market_store
 from backend.app.storage.preflight import StoragePreflight
 from backend.app.strategy.dsl import validate_rule
 from backend.app.strategy.run import StrategyRunService
@@ -212,7 +212,6 @@ def main() -> int:
         with RefreshRunLock(args.refresh_lock):
             with TemporaryDirectory(prefix="stock-eva-real-e2e-control-") as raw:
                 workspace = Path(raw)
-                dataset_root = args.local_dataset_root or args.nas_root
                 settings = Settings(
                     _env_file=None,
                     market_data_dir=workspace / "market",
@@ -227,15 +226,9 @@ def main() -> int:
                 readiness = StoragePreflight(settings).inspect()
                 if not readiness.market_data_available:
                     raise AcceptanceError("market_storage_not_ready")
-                control = MarketStore(
-                    workspace / "control" / "market.duckdb",
-                    temp_directory=workspace / "tmp" / "duckdb",
-                )
-                market = NasMarketStore(
-                    control,
-                    dataset_root,
-                    workspace / "staging",
-                )
+                market = build_nas_market_store(settings)
+                if market is None:
+                    raise AcceptanceError("market_storage_not_ready")
                 market.validate_readiness()
                 market.reconcile_control_pointer()
                 report = run_real_e2e_acceptance(

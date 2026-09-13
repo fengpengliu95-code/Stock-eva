@@ -121,6 +121,7 @@ from backend.app.regime.snapshots import (
 )
 from backend.app.regime.store import MarketReadUnavailable, market_regime_store_from_settings
 from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.factory import build_nas_market_store, read_dataset_lineage_mode
 from backend.app.storage.initialize import (
     DatasetInitializationError,
     EmptyDatasetInitializer,
@@ -128,6 +129,7 @@ from backend.app.storage.initialize import (
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.storage.replication import (
+    DESTINATION_DESCRIPTOR_NAME,
     DestinationArchiveWriter,
     DestinationCommitVerifier,
     DestinationDescriptor,
@@ -1099,11 +1101,9 @@ def _market_continuity_command(args: argparse.Namespace) -> int:
             temp_directory=layout.duckdb_temporary,
             read_only=True,
         )
-        immutable_store = NasMarketStore(
-            read_control,
-            dataset_root,
-            layout.local_paths.staging,
-        )
+        immutable_store = build_nas_market_store(settings, read_only=True, layout=layout)
+        if immutable_store is None:
+            raise DatasetError("dataset store is unavailable")
         scanner = ContinuityInventory(
             calendar=calendar_snapshot,
             inventory_reader=immutable_store,
@@ -2221,19 +2221,56 @@ def main() -> int:
             )
             return 2
     elif args.command == "backfill" and configured_market_dataset_root(settings) is not None:
-        print(
-            json.dumps(
-                {
-                    "status": "error",
-                    "error_code": "BACKFILL_LINEAGE_INPUT_REQUIRED_FOR_DATASET_STORE",
-                    "provider_requests": 0,
-                    "writes": False,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+        try:
+            incumbent_mode = read_dataset_lineage_mode(settings)
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "CONTROL_STATE_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
             )
-        )
-        return 2
+            return 1
+        if incumbent_mode != "legacy":
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_REQUIRED_FOR_DATASET_STORE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if args.start is not None:
+            confirmed = get_trading_calendar().snapshot().confirmed_open_sessions(
+                args.start, args.end
+            )
+            if confirmed is None:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "SOURCE_UNAVAILABLE",
+                            "provider_requests": 0,
+                            "writes": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            prevalidated_lineage_pairs = tuple(
+                (trade_date, {"mode": "legacy"}) for trade_date in confirmed
+            )
     if args.command == "market-replication-status":
         try:
             result = ReplicationStatusService(settings).read()
@@ -2308,7 +2345,7 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 1
         try:
-            descriptor_path = args.destination / "destination-descriptor.json"
+            descriptor_path = args.destination / DESTINATION_DESCRIPTOR_NAME
             descriptor_record = DestinationDescriptor.read(descriptor_path)
             descriptor = DestinationArchiveWriter(
                 descriptor_record,
@@ -2793,15 +2830,10 @@ def main() -> int:
         layout.local_paths.market_database,
         temp_directory=layout.duckdb_temporary,
     )
-    dataset_root = configured_market_dataset_root(settings)
+    configured_store = build_nas_market_store(settings, layout=layout)
     store = (
-        NasMarketStore(
-            control_store,
-            dataset_root,
-            layout.local_paths.staging,
-            replication_enabled=settings.replication_enabled,
-        )
-        if readiness.mode in {"nas", "local_dataset"} and dataset_root is not None
+        configured_store
+        if readiness.mode in {"nas", "local_dataset"} and configured_store is not None
         else control_store
     )
     if isinstance(store, NasMarketStore):

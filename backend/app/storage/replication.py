@@ -353,33 +353,75 @@ class LineageResolver:
                 selection_sha256=LEGACY_SELECTION_SHA256,
                 lineage_sha256=LEGACY_LINEAGE_SHA256,
             )
+        # Modern lineage is only admissible from the retained-success reader;
+        # caller-supplied hashes alone are not evidence.
+        if self.evidence_reader is None:
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         reader_value = None
         resolved_selection_sha256: str | None = None
-        if self.evidence_reader is not None:
-            try:
-                reader_value = self.evidence_reader(value, trade_date)
-                if isinstance(reader_value, Mapping):
-                    selection = reader_value.get("selection")
-                    if isinstance(selection, Mapping):
-                        resolved_selection_sha256 = selection.get("selection_sha256")
-                    elif selection is not None:
-                        resolved_selection_sha256 = getattr(selection, "selection_sha256", None)
-                if isinstance(reader_value, Mapping) and "lineage_input" in reader_value:
-                    reader_value = reader_value["lineage_input"]
-                if isinstance(reader_value, Mapping) and "lineage" in reader_value:
-                    reader_value = reader_value["lineage"]
-                if isinstance(reader_value, PublicationLineage):
-                    value = LineageInput(mode="modern", exact=reader_value)
-                else:
-                    value = LineageInput.model_validate(reader_value)
-            except (TypeError, ValueError, ValidationError):
+        try:
+            reader_value = self.evidence_reader(value, trade_date)
+            if not isinstance(reader_value, Mapping):
                 return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
-        elif value.exact is None:
+            selection = reader_value.get("selection")
+            candidate = reader_value.get("candidate")
+            gate_report = reader_value.get("gate_report")
+            evidence = reader_value.get("evidence")
+            if hasattr(selection, "selection"):
+                selection = selection.selection
+            from backend.app.market.candidates import (
+                CandidateGateReport,
+                CandidateManifest,
+                SessionSelection,
+            )
+
+            selection = SessionSelection.model_validate(selection)
+            candidate = CandidateManifest.model_validate(candidate)
+            gate_report = CandidateGateReport.model_validate(gate_report)
+            if evidence is None:
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            evidence_manifest = getattr(evidence, "manifest", None)
+            evidence_id = getattr(evidence_manifest, "evidence_id", None)
+            evidence_sha = getattr(evidence_manifest, "manifest_sha256", None)
+            if evidence_id is None or evidence_sha is None:
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            completions = getattr(evidence_manifest, "request_completions", ())
+            if not completions or any(
+                str(getattr(item.final_outcome, "value", item.final_outcome)) != "success"
+                for item in completions
+            ):
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            lineage_value = reader_value.get("lineage", reader_value.get("lineage_input"))
+            value = LineageInput.model_validate(lineage_value)
+            if value.mode != "modern" or value.exact is None:
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            lineage = value.exact
+            if (
+                candidate.status != "accepted"
+                or candidate.trade_date.isoformat() != trade_date
+                or candidate.evidence_id != evidence_id
+                or candidate.evidence_sha256 != evidence_sha
+                or candidate.candidate_id != selection.selected_candidate_id
+                or candidate.manifest_sha256 != selection.candidate_manifest_sha256
+                or candidate.gate_report_sha256 != gate_report.aggregate_sha256
+                or selection.gate_report_sha256 != gate_report.aggregate_sha256
+                or selection.evidence_sha256 != candidate.evidence_sha256
+                or lineage.provider_id != candidate.provider_id.value
+                or lineage.universe_id != candidate.universe_id
+                or lineage.evidence_id != candidate.evidence_id
+                or lineage.evidence_sha256 != candidate.evidence_sha256
+                or lineage.candidate_id != candidate.candidate_id
+                or lineage.candidate_manifest_sha256 != candidate.manifest_sha256
+                or lineage.gate_report_sha256 != gate_report.aggregate_sha256
+                or lineage.adapter_version != candidate.adapter_version
+                or lineage.source_schema_version != candidate.source_schema_version
+            ):
+                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+            resolved_selection_sha256 = selection.selection_sha256
+        except (TypeError, ValueError, ValidationError, AttributeError):
             return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         assert value.exact is not None
         lineage = value.exact
-        if lineage.provider_id != "baostock":
-            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         lineage_sha = domain_sha256("stock-eva/r2f4.2/publication-lineage/v2", lineage.model_dump())
         return LineageResolveResult(
             kind="MODERN",
@@ -4918,6 +4960,58 @@ class ReplicationOutboxService:
             "stock-eva/r2f4.3/replication-observation/v1", values
         )
         return ReplicationObservation.model_validate(values)
+
+    def journal_publication(
+        self,
+        *,
+        binding: SourcePublicationBinding,
+        pointer,
+        result,
+        manifest: Mapping[str, object],
+        root: Path,
+    ) -> None:
+        """Install a replayable checkpoint journal after pointer linearization."""
+        if self.journal_root is None or self.source_instance_id is None:
+            return
+        inventory = tuple(
+            ObjectInventoryEntry.model_validate(
+                {
+                    "relative_path": str(item["path"]),
+                    "object_sha256": str(item["sha256"]),
+                    "size_bytes": int((root / str(item["path"])).stat().st_size),
+                    "row_count": int(item["row_count"]),
+                    "trade_date": str(item["trade_date"]),
+                    "source": str(item["source"]),
+                }
+            )
+            for item in sorted(manifest.get("files", ()), key=lambda value: str(value["path"]))
+        )
+        checkpoint = build_source_checkpoint(
+            source_instance_id=self.source_instance_id,
+            source_instance_sha256=self.source_instance_sha256 or "0" * 64,
+            publication_binding_sha256=binding.binding_sha256,
+            pointer_row_sha256=pointer.row_sha256 or "0" * 64,
+            pointer_generation=binding.manifest_generation,
+            source_run_id=result.run_id,
+            source_trade_date=result.requested_date.isoformat(),
+            source_published_at=binding.published_at,
+            pointer_db_device=pointer.device or 1,
+            pointer_db_inode=pointer.inode or 1,
+            pointer_db_schema_digest=pointer.schema_digest or "0" * 64,
+            manifest_canonical_sha256=binding.manifest_canonical_sha256,
+            source_manifest_bytes_sha256=binding.manifest_bytes_sha256,
+            source_object_set_sha256=binding.source_object_set_sha256,
+            object_inventory=inventory,
+        )
+        build_journal_record(
+            checkpoint_id=checkpoint.checkpoint_id,
+            source_instance_id=checkpoint.source_instance_id,
+            source_instance_sha256=checkpoint.source_instance_sha256,
+            publication_binding_sha256=binding.binding_sha256,
+            source_published_at=checkpoint.source_published_at,
+            checkpoint_projection=checkpoint,
+            created_at=binding.published_at,
+        ).install(self.journal_root)
 
     def enqueue(
         self,

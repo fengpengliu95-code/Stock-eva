@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import threading
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -273,6 +274,10 @@ class ManifestPublicationLock(_ManifestLock):
 
     _held = threading.local()
 
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.close_error: BaseException | None = None
+
     def __enter__(self):
         if getattr(self._held, "path", None) == str(self.path):
             raise DatasetPublicationBusy("dataset publication lock is non-reentrant")
@@ -281,8 +286,11 @@ class ManifestPublicationLock(_ManifestLock):
         return PublicationLockToken(self)
 
     def __exit__(self, *args) -> None:
+        self.close_error = None
         try:
             super().__exit__(*args)
+        except BaseException as exc:
+            self.close_error = exc
         finally:
             self._held.path = None
 
@@ -324,7 +332,12 @@ class PointerIdentity:
 
     def as_dict(self) -> dict[str, object]:
         if self.kind == "ABSENT":
-            return {"kind": "ABSENT"}
+            return {
+                "kind": "ABSENT",
+                "device": self.device,
+                "inode": self.inode,
+                "schema_digest": self.schema_digest,
+            }
         if self.kind == "INVALID":
             return {"kind": "INVALID", "reason_code": "CONTROL_STATE_UNAVAILABLE"}
         return {
@@ -436,7 +449,7 @@ class ManifestPublicationCoordinator:
             "intent_id": None,
             "enqueue_state": "degraded",
             "reason_code": "CONTROL_STATE_UNAVAILABLE",
-            "effects": ReplicationEffects(
+                "effects": ReplicationEffects(
                 writes=True,
                 canonical_writes=True,
                 destination_writes=False,
@@ -445,6 +458,7 @@ class ManifestPublicationCoordinator:
             ),
             "observed_at": datetime.now(UTC).isoformat(),
         }
+        values["effects"] = values["effects"].model_dump(mode="json")
         values["observation_sha256"] = domain_sha256(
             "stock-eva/r2f4.3/replication-observation/v1", values
         )
@@ -538,6 +552,26 @@ class ManifestPublicationCoordinator:
                 raise DatasetError("control pointer changed during manifest publication")
             manifest = self.store._manifest()
             raw_sha, canonical_sha, object_sha = self._manifest_hashes(manifest, self.store.root)
+            binding_values = {
+                "run_id": f"manifest-{manifest['generation']}",
+                "trade_date": min(dates).isoformat(),
+                "published_at": datetime.now(UTC).isoformat(),
+                "manifest_generation": str(manifest["generation"]),
+                "manifest_bytes_sha256": raw_sha,
+                "manifest_canonical_sha256": canonical_sha,
+                "source_object_set_sha256": object_sha,
+                "selection_sha256": _selection_sha,
+                "lineage_sha256": _lineage_sha,
+            }
+            binding_values["binding_sha256"] = domain_sha256(
+                "stock-eva/r2f4.3/source-publication-binding/v1",
+                {
+                    "binding_schema": "stock-eva/r2f4.3/source-publication-binding/v1",
+                    "schema_version": 1,
+                    **binding_values,
+                },
+            )
+            self.store._write_binding(SourcePublicationBinding.model_validate(binding_values))
         return ManifestOnlyResult(
             manifest_generation=str(manifest["generation"]),
             manifest_bytes_sha256=raw_sha,
@@ -612,7 +646,12 @@ class ManifestPublicationCoordinator:
                 },
             )
             binding = SourcePublicationBinding.model_validate(binding_values)
-            if self.store.replication_enabled:
+            # Publication binding is local dataset integrity evidence.  It is
+            # independent of whether the replication outbox/destination is
+            # enabled.
+            if not dataset_already_ready or not self.store._has_binding_for_generation(
+                binding.manifest_generation
+            ):
                 self.store._write_binding(binding)
             # The manifest bytes/hash tuple is the final CAS boundary.  A
             # binding is never allowed to outlive a manifest that changed
@@ -624,14 +663,38 @@ class ManifestPublicationCoordinator:
                 object_sha,
             ):
                 raise DatasetError("published manifest changed before pointer commit")
-            if (
-                baseline_pointer.kind == "PRESENT"
-                and self.store._pointer_identity() != baseline_pointer
-            ):
+            if self.store._pointer_identity() != baseline_pointer:
                 raise DatasetError("control pointer changed before pointer commit")
             self.store.control.save_external_publication(result)
             pointer = self.store._pointer_identity()
             if pointer.kind != "PRESENT":
+                return {
+                    "manifest_generation": binding.manifest_generation,
+                    "publication_binding": binding,
+                    "source_commit": None,
+                    "observation": self._control_unavailable_observation(binding),
+                }
+            try:
+                pointer_row = self.store.control.published_refresh()
+                if (
+                    pointer_row is None
+                    or pointer_row.run_id != result.run_id
+                    or pointer_row.requested_date != result.requested_date
+                    or pointer_row.completed_at != datetime.fromisoformat(binding.published_at)
+                ):
+                    raise DatasetError("published pointer readback is not bound")
+            except Exception:
+                if self.store.replication_service is not None:
+                    try:
+                        self.store.replication_service.journal_publication(
+                            binding=binding,
+                            pointer=pointer,
+                            result=result,
+                            manifest=manifest,
+                            root=self.store.root,
+                        )
+                    except Exception:
+                        pass
                 return {
                     "manifest_generation": binding.manifest_generation,
                     "publication_binding": binding,
@@ -649,13 +712,26 @@ class ManifestPublicationCoordinator:
                     manifest,
                 )
             except Exception:
+                if self.store.replication_service is not None:
+                    try:
+                        self.store.replication_service.journal_publication(
+                            binding=binding,
+                            pointer=pointer,
+                            result=result,
+                            manifest=manifest,
+                            root=self.store.root,
+                        )
+                    except Exception:
+                        pass
                 return {
                     "manifest_generation": binding.manifest_generation,
                     "publication_binding": binding,
                     "source_commit": None,
                     "observation": self._control_unavailable_observation(binding),
                 }
-        if self.store.replication_service is not None:
+        if self.lock.close_error is not None:
+            observation = self._control_unavailable_observation(binding)
+        elif self.store.replication_service is not None:
             observation = self.store.replication_service.on_canonical_committed(source_commit)
         else:
             observation = ReplicationObservation(
@@ -729,10 +805,41 @@ class NasMarketStore:
             before = os.fstat(descriptor)
             if not stat.S_ISREG(before.st_mode):
                 return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
-            connection = self.control._connect_reader()
-            if connection is None:
-                return PointerIdentity("ABSENT")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            payload = bytearray()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > 256 * 1024 * 1024:
+                    return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+            after_read = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after_read.st_dev,
+                after_read.st_ino,
+                after_read.st_size,
+                after_read.st_mtime_ns,
+            ):
+                return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+            payload_sha = hashlib.sha256(payload).digest()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            reread = bytearray()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                reread.extend(chunk)
+            if hashlib.sha256(reread).digest() != payload_sha:
+                return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+            clone_fd, clone_path = tempfile.mkstemp(prefix="stock-eva-pointer-", suffix=".duckdb")
+            connection = None
             try:
+                os.write(clone_fd, payload)
+                os.fsync(clone_fd)
+                os.close(clone_fd)
+                clone_fd = -1
+                connection = duckdb.connect(clone_path, read_only=True)
                 tables = {str(row[0]) for row in connection.execute("SHOW TABLES").fetchall()}
                 required_tables = {
                     "daily_bars",
@@ -765,20 +872,71 @@ class NasMarketStore:
                     after.st_mtime_ns,
                 ):
                     return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
-                schema = domain_sha256(
-                    "stock-eva/r2f4.3/pointer-db-schema/v1",
-                    sorted(
+                expected_columns = {
+                    "daily_bars": {"trade_date", "symbol", "source", "close"},
+                    "refresh_runs": {
+                        "run_id", "requested_date", "source", "status", "completed_at"
+                    },
+                    "published_snapshots": {
+                        "singleton", "run_id", "trade_date", "published_at"
+                    },
+                    "published_daily_bars": {
+                        "publication_run_id", "trade_date", "symbol", "source"
+                    },
+                    "market_automation_state": {"singleton", "refresh_state", "calendar_status"},
+                }
+                schema_rows = []
+                expected_types = {
+                    "published_snapshots": {
+                        "singleton": "INTEGER",
+                        "run_id": "VARCHAR",
+                        "trade_date": "DATE",
+                    },
+                    "refresh_runs": {
+                        "run_id": "VARCHAR",
+                        "requested_date": "DATE",
+                        "source": "VARCHAR",
+                    },
+                }
+                for table in sorted(tables):
+                    described = connection.execute(f'DESCRIBE "{table}"').fetchall()
+                    names = {str(row[0]) for row in described}
+                    if table in expected_columns and not expected_columns[table] <= names:
+                        return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+                    types = {str(row[0]): str(row[1]).upper() for row in described}
+                    if table in expected_types and any(
+                        not types[name].startswith(expected)
+                        for name, expected in expected_types[table].items()
+                    ):
+                        return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+                    schema_rows.extend(
+                        (table, str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]))
+                        for row in described
+                    )
+                for row in connection.execute("SELECT * FROM duckdb_constraints()").fetchall():
+                    schema_rows.append(
                         (
-                            str(row[0]),
-                            str(row[1]),
-                            str(row[2]),
-                            str(row[3]),
+                            "constraint",
+                            str(row[4]),
+                            str(row[7]),
+                            str(row[8]),
+                            str(row[11]),
+                            str(row[12]),
                         )
-                        for row in connection.execute(
-                            "SELECT type, name, tbl_name, sql FROM sqlite_master "
-                            "WHERE type IN ('table','index','trigger')"
-                        ).fetchall()
-                    ),
+                    )
+                for row in connection.execute("SELECT * FROM duckdb_indexes()").fetchall():
+                    schema_rows.append(
+                        (
+                            "index",
+                            str(row[6]),
+                            str(row[4]),
+                            str(row[10]),
+                            str(row[11]),
+                            str(row[13]),
+                        )
+                    )
+                schema = domain_sha256(
+                    "stock-eva/r2f4.3/pointer-db-schema/v2", sorted(schema_rows)
                 )
                 return (
                     PointerIdentity(
@@ -789,10 +947,19 @@ class NasMarketStore:
                         schema_digest=schema,
                     )
                     if state.get("kind") != "ABSENT"
-                    else PointerIdentity("ABSENT")
+                    else PointerIdentity(
+                        "ABSENT",
+                        device=int(before.st_dev),
+                        inode=int(before.st_ino),
+                        schema_digest=schema,
+                    )
                 )
             finally:
-                connection.close()
+                if connection is not None:
+                    connection.close()
+                if clone_fd >= 0:
+                    os.close(clone_fd)
+                Path(clone_path).unlink(missing_ok=True)
         except Exception:
             return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
         finally:
@@ -801,7 +968,6 @@ class NasMarketStore:
 
     def _write_binding(self, binding: SourcePublicationBinding) -> Path:
         root = self.root / "_replication" / "source-commits"
-        root.mkdir(parents=True, exist_ok=True)
         path = root / f"{binding.run_id}.json"
         payload = canonical_json_bytes(binding.model_dump(mode="json"))
         try:
@@ -810,6 +976,17 @@ class NasMarketStore:
             if "already exists" in str(exc):
                 raise DatasetError("publication binding conflict") from exc
             raise
+
+    def _has_binding_for_generation(self, generation: str) -> bool:
+        root = self.root / "_replication" / "source-commits"
+        try:
+            for path in root.glob("*.json"):
+                payload = _read_bounded_json(path)
+                if isinstance(payload, dict) and payload.get("manifest_generation") == generation:
+                    return True
+        except (DatasetError, OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return False
 
     def _source_commit(
         self, result, binding, pointer, object_sha, raw_sha, canonical_sha, manifest

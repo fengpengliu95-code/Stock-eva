@@ -70,6 +70,7 @@ from backend.app.market.universe_status import (
     parse_universe_trade_date,
 )
 from backend.app.storage.dataset import DatasetError, NasMarketStore
+from backend.app.storage.factory import build_nas_market_store
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.models import StorageReadiness
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
@@ -455,13 +456,9 @@ def get_market_store(
         read_only=True,
     )
     if readiness.mode in {"nas", "local_dataset"}:
-        dataset_root = configured_market_dataset_root(settings)
-        assert dataset_root is not None
-        store = NasMarketStore(
-            control,
-            dataset_root,
-            layout.local_paths.staging,
-        )
+        store = build_nas_market_store(settings, read_only=True, layout=layout)
+        if store is None:
+            raise HTTPException(status_code=503, detail={"code": "market_storage_unavailable"})
         try:
             store.ensure_readiness()
         except (DatasetError, OSError) as exc:
