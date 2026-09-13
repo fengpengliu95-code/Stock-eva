@@ -7,29 +7,30 @@ LaunchAgent installation, or production operation occurred.
 
 ## Reviewed commits
 
-reviewed_implementation_spec_commit: c5bf25283e0d8bc94852e08a0a4bd4d8d005d52c
-evidence_base_commit: c5bf25283e0d8bc94852e08a0a4bd4d8d005d52c
+reviewed_implementation_spec_commit: 9cf91afb55c64940419e45dfc1d2a71e2b4051c9
+evidence_base_commit: 9cf91afb55c64940419e45dfc1d2a71e2b4051c9
 
-X5 is the implementation/spec/test closure commit, reviewed and tested from
-its clean tree. It strengthens NFR-11 with one immutable sidecar generation
-containing 10,000 terminal dead-letter heads/intents/events, public status
-warmup and five monotonic samples with p95 below 500 ms, plus a whole-sidecar
-physical fingerprint before/after proving zero writes. The public status
-matrix now covers missing, corrupt, locked, empty, healthy, retry-wait,
-dead-lettered, and replicated states, including exact replicated digest/time
-fields, and exercises the HTTP GET serializer for every state with no path
-disclosure and zero provider requests. EC-25 starts from an existing ready
-pointer/binding and strictly distinguishes pre-linearization preservation from
-post-commit recovery across five injected fault points. EC-38 reruns both CLI
-dry-run commands for every configured mutable-root direct, symlink descendant,
-and symlink ancestor alias. Both normative specs remain exactly equal to the
+X6 is the implementation/spec/test closure commit, reviewed and tested from
+its clean tree. It retains NFR-11's one immutable sidecar generation with
+10,000 terminal dead-letter heads/intents/events, public status warmup and
+five monotonic samples below 500 ms, with a whole-sidecar physical
+fingerprint before/after proving zero writes. Every missing, corrupt, locked,
+empty, healthy, retry-wait, dead-lettered, and replicated case now receives a
+real HTTP GET with before/after sidecar fingerprints, exact full JSON equality,
+replicated digest/time checks, redaction, and zero provider requests. EC-25
+starts from an existing ready pointer/binding and strictly fingerprints
+manifest, binding, and pointer artifacts, distinguishing exact prior-state
+preservation from the one expected new ready state across five fault points.
+EC-38 independently runs both CLI dry-run commands for each configured root in
+direct, symlink-descendant, and symlink-ancestor scenarios, with full-tree
+fingerprint equality. Both normative specs remain exactly equal to the
 129-row matrix projection.
 
-Y5 is this evidence-only successor. Its own hash is deliberately not embedded;
-after committing Y5, `git diff c5bf25283e0d8bc94852e08a0a4bd4d8d005d52c..Y5
+Y6 is this evidence-only successor. Its own hash is deliberately not embedded;
+after committing Y6, `git diff 9cf91afb55c64940419e45dfc1d2a71e2b4051c..Y6
 --name-only` is the proof that only this document changed.
 
-## Traceability evidence at X5
+## Traceability evidence at X6
 
 The authoritative matrix contains 129 rows (42 FR, 16 NFR, 31 AC, 40 EC),
 90 distinct direct anchors, 154 requirement-to-anchor mappings, and maximum
@@ -41,14 +42,15 @@ That digest is a drift guard, not semantic proof: the matrix's requirement
 summaries, reviewed test bodies, direct rationales and manual review remain
 the evidence. The validator's body-token check is explicitly heuristic.
 
-Generated from the matrix and AST catalog on X5:
+Generated from the matrix and AST catalog on X6:
 
-    ./.venv/bin/pytest -q $(awk -F'::' '{split($1,a,":"); print a[1] "::" $2}' /tmp/r2mapped_nodes_x5.txt)
+    ./.venv/bin/pytest -q -rA $(awk -F'::' '{split($1,a,":"); print a[1] "::" $2}' /tmp/r2mapped_nodes_x6.txt)
 
-This collected 90 concrete mapped pytest nodes and all 90 passed. The focused
+This catalog contained 90 concrete mapped anchors and the generated command
+executed 100 parameterized pytest cases; all 100 passed. The focused
 replication/restore/CLI/spec command collected 219 nodes and all 219 passed.
 
-## Full and static verification at X5
+## Full and static verification at X6
 
     ./.venv/bin/pytest -q -rA 2>&1 | rg '^PASSED ' | wc -l
     2961
@@ -72,7 +74,7 @@ failure.
 
 ## CLI and safety boundary
 
-Offline CLI probes at X5 cover typed `dry_run`, explicit execute dispatch to
+Offline CLI probes at X6 cover typed `dry_run`, explicit execute dispatch to
 the injected central worker with `operation_day`, rejected mutable-root/path
 aliases across every configured mutable root, acknowledged init semantics,
 and sanitized status JSON. The status matrix asserts eight public states are
@@ -84,4 +86,4 @@ The real-NAS follow-up checklist remains: independently review descriptor and
 mount authorization, perform a controlled destination initialization, run one
 bounded claim under both gates, capture descriptor/readback/audit evidence,
 and verify rollback/manual unknown-orphan handling. No such operation is part
-of X5/Y5. Status remains Candidate / NO-GO pending the next independent audit.
+of X6/Y6. Status remains Candidate / NO-GO pending the next independent audit.
