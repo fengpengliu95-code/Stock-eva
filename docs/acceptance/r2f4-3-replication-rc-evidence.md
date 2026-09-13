@@ -1,53 +1,93 @@
-# R2-F4.3 RC acceptance evidence (draft)
+# R2-F4.3 RC acceptance evidence
 
-Status: Candidate / NO-GO pending independent audit; no independent QUALITY
-GO is claimed. Execution boundary: `LOCAL_CHAIN_ONLY`, disabled replication,
-no real NAS/provider/production operation.
+Status: Candidate / NO-GO pending the next independent SPEC and QUALITY audit.
+No independent GO is claimed. The evidence boundary is LOCAL_CHAIN_ONLY:
+replication is disabled and this record claims no real NAS/SMB, provider,
+LaunchAgent, credential, or production operation.
 
-## Commit and commands
+## Reviewed commits and scope
 
-The audited implementation commit is
-`implementation_commit: 46bde46d3effc19db11c955b45706423439bd00d`.
-The evidence-base commit is
-`evidence_base_commit: bbd96e642a76da11f0c1e5f0d1d9e0f58e60f7a7`.
-The evidence commit is a documentation/test-only successor, so the report
-does not make an impossible self-referential commit claim.
+reviewed_implementation_spec_commit: b1a5492de25e29d6bc3d4a5b807cefa864568a6c
 
-Commands and results to record:
+Commit X above is the clean semantic-spec/test implementation commit reviewed by
+the commands below. It restores the effective 42 FR, 16 NFR, 31 AC, and 40 EC
+matrix, adds the semantic-matrix digest guard, and tests the Asia/Shanghai
+operation-day cutoff immediately before, at, and after the boundary.
 
-```text
-focused pytest at evidence base: PASS, 196 tests
-full pytest at evidence base: PASS, 2938 tests
-current closure focused RC scope: PASS, 98 tests collected
-current closure full suite: PASS, 2942 tests; an earlier spawn-contention flake in
-test_eight_processes_same_bundle_identity_are_idempotent was rerun successfully.
-ruff baseline at parent HEAD `0f90c3a8820995d32b5bdde6ae31c7c1322e65e0`: 13 existing
-errors in `replace_markdown_kline.py` and `scripts/markdown_to_pdf.py` (the
-untracked RC validator is excluded from that baseline). These unrelated
-legacy errors are a documented non-regression waiver; changed backend/tests
-files must still be clean.
-ruff backend/tests and changed files: PASS (scoped changed-file run; 13 unrelated baseline errors waived)
-ruff format --check: PASS
-compileall: PASS
-crosswalk/spec validator: PASS (129 IDs, 129 real anchors, exact docs equality)
-git diff --check: PASS
-```
+evidence_base_commit: b1a5492de25e29d6bc3d4a5b807cefa864568a6c
 
-Audited command forms were `./.venv/bin/pytest -q` (2938 passed at the
-evidence base) and the focused replication/restore/static command set (196
-passed). The current closure reruns the same gates plus the new RC tests; all
-focused RC tests pass, and the final current `./.venv/bin/pytest -q` completed
-with 2942 passed.
+Commit Y is this metadata-only evidence successor. Its own hash is intentionally
+not embedded in its content: after committing Y, git diff X..Y --name-only is the
+non-self-referential proof that only this acceptance evidence file changed.
+The historical implementation/evidence pair remains
+46bde46d3effc19db11c955b45706423439bd00d /
+bbd96e642a76da11f0c1e5f0d1d9e0f58e60f7a7; it is retained only as prior audit
+context, not as the reviewed spec commit for this record.
 
-The release record must include `git rev-parse HEAD`, `git status --short`,
-and `git diff --stat`, plus the sanitized CLI dry-run payloads showing typed
-`dry_run`, no writes, and zero provider requests. It must explicitly retain
-the disabled/no-real-NAS boundary and the `LOCAL_CHAIN_ONLY` residual.
+Commit X diff scope was exactly:
+
+backend/app/storage/replication.py
+docs/plans/2026-09-09-stock-eva-r2f4-3-replication-restore-design.md
+docs/plans/2026-09-09-stock-eva-r2f4-3-replication-restore-implementation.md
+tests/test_dataset_replication.py
+tests/test_r2f4_3_spec_crosswalk.py
+
+## Exact commands and observed results at X
+
+./.venv/bin/pytest -q
+2942 tests passed; exit 0. Warnings were deprecations only.
+
+./.venv/bin/pytest -q tests/test_r2f4_3_spec_crosswalk.py tests/test_replication_cli_contract.py tests/test_replication_integration_batch5.py tests/test_dataset_replication.py
+98 tests collected and passed; exit 0.
+
+./.venv/bin/pytest -q tests/test_dataset_replication.py::test_claim_due_operation_day_filters_source_publication_with_fake_clock
+1 test passed; before-cutoff and exact-cutoff claims were eligible, after-cutoff was not.
+
+./.venv/bin/ruff check backend tests
+All checks passed; exit 0.
+./.venv/bin/ruff check backend/app/storage/replication.py tests/test_dataset_replication.py tests/test_r2f4_3_spec_crosswalk.py
+All checks passed; exit 0.
+./.venv/bin/ruff format --check backend/app/storage/replication.py tests/test_dataset_replication.py tests/test_r2f4_3_spec_crosswalk.py
+3 files already formatted; exit 0.
+./.venv/bin/python -m compileall -q backend tests
+exit 0.
+git diff --check
+exit 0.
+
+The pre-RC parent audit recorded a 13-error unrelated Ruff baseline and a
+non-regression waiver for it. A fresh direct ruff check backend tests at X is
+clean, so no current changed-file waiver is needed; the historical note remains
+for audit traceability.
+
+The crosswalk validator observed 129 unique IDs, 129 real AST anchors, identical
+rows in both normative documents, at least 120 distinct descriptions, and the
+approved semantic matrix SHA-256
+5aac85dbc263abf4dae42a27856579c1b5c117d743cde6e37b5a81613eb6db59.
+
+## Sanitized CLI probes
+
+market-replicate --destination /tmp/r2f4-opday --operation-day 2026-09-14 --json
+returned status=dry_run, operation_day=2026-09-14, writes=false,
+destination_writes=false, and provider_requests=0 with exit 0.
+
+market-replication-init --destination <tmp-child> --json returned
+status=dry_run, writes=false, and provider_requests=0 with exit 0; the
+destination child remained absent.
+
+market-replication-status --json returned sanitized mode=status,
+status=disabled, reason_code=DISABLED, provider_requests=0, all effects false,
+paths_exposed=false, and trust_scope=LOCAL_CHAIN_ONLY with exit 0.
+
+At X, git rev-parse HEAD returned the reviewed commit above, git status --short
+was empty, and git diff --stat was empty. After Y, git diff X..Y --name-only must
+contain only this evidence file and git status --short must again be empty.
 
 ## Residual and rollback
 
-Unknown/orphan destination state is a manual-review condition. Preserve the
-canonical ready pointer, immutable binding, and journal; quarantine only under
-an approved recovery operation. No automatic rollback may replace a newer
-valid canonical generation. A later real-NAS window must follow the runbook
-checklist and obtain a new explicit approval.
+Unknown/orphan destination state is a manual-review or quarantine condition.
+Preserve the canonical ready pointer, immutable binding, and journal. Manual
+rollback must never replace a newer valid canonical generation. A later real-NAS
+window requires a separate approval, exact-commit recheck, controlled empty-child
+destination, descriptor/mount validation, one bounded operation, and post-run
+manifest/pointer/inode/byte readback. This record is not authorization for that
+window.
