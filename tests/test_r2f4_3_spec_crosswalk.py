@@ -27,7 +27,7 @@ MATRIX_ROW_PATTERN = re.compile(
 EXPECTED_COUNTS = {"FR": 42, "NFR": 16, "AC": 31, "EC": 40}
 # Approved effective-matrix drift guard. This digest is not semantic proof; the
 # matrix's reviewed summaries, references, bodies, and rationales are the proof.
-SEMANTIC_MATRIX_SHA256 = "b8f147c5ff45568a241f7c36047b28ca0d73a0e4d3cc9a6922cf07d8cb0b5bb3"
+SEMANTIC_MATRIX_SHA256 = "1e822a4b9c35a09cc8d7694ea2ade614713c7f90a6c16f568f39d9e1b5548731"
 PLACEHOLDER_TEXT = {
     "effective latest contract remains fail-closed",
     "todo",

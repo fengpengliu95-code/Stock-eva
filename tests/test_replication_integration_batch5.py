@@ -1,15 +1,18 @@
 """Final R2-F4.3 Batch5 integration anchors and adversarial inputs."""
 
 import ast
+import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 
 import pytest
+from fastapi.testclient import TestClient
 
 import backend.app.storage.replication as replication
-from backend.app.config import Settings
+from backend.app.config import Settings, get_settings
+from backend.app.main import app
 from backend.app.market.backfill import BackfillService
 from backend.app.market.candidates import CandidateStore, SessionSelection
 from backend.app.market.models import DailyBar, RefreshResult
@@ -345,9 +348,22 @@ def test_ec16_postcommit_enqueue_and_journal_failures_reconcile_without_duplicat
 def test_ec25_publication_fault_points_never_report_partial_success(
     tmp_path, monkeypatch, fault_point
 ) -> None:
-    """EC-25: each publication crash boundary is fail-closed and recoverable."""
+    """EC-25: faults preserve the prior proof, or expose one new ready proof."""
     root = _dataset(tmp_path)
     store = NasMarketStore(MarketStore(tmp_path / "control.duckdb"), root, tmp_path / "staging")
+    first = _ready_result()
+    store.save_refresh(_bars(), first, publish=True, lineage_input={"mode": "legacy"})
+    old_pointer = store.control.published_refresh()
+    assert old_pointer is not None
+    control_path = store.control.path
+    old_control = (control_path.stat().st_ino, control_path.read_bytes())
+    binding_root = root / "_replication" / "source-commits"
+    old_bindings = {
+        path.name: (path.stat().st_ino, path.read_bytes()) for path in binding_root.glob("*.json")
+    }
+    incoming = _bars()
+    incoming[0] = incoming[0].model_copy(update={"close": incoming[0].close + 0.01})
+    second = first.model_copy(update={"run_id": "nas-ready-2", "request_key": "nas-ready-2"})
     original_hashes = store.coordinator._manifest_hashes
     original_pointer = store._pointer_identity
     hash_calls = 0
@@ -397,19 +413,29 @@ def test_ec25_publication_fault_points_never_report_partial_success(
         monkeypatch.setattr(store, "_pointer_identity", fail_postcommit)
 
     if fault_point in {"pointer_transaction", "postcommit"}:
-        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+        store.save_refresh(incoming, second, publish=True, lineage_input={"mode": "legacy"})
     else:
         with pytest.raises(DatasetError):
-            store.save_refresh(
-                _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
-            )
+            store.save_refresh(incoming, second, publish=True, lineage_input={"mode": "legacy"})
     pointer = store.control.published_refresh()
-    assert pointer is None or pointer.status == "ready"
+    assert pointer is not None
+    assert pointer.status == "ready"
     if fault_point == "postcommit":
-        assert store.coordinator.lock.result_payload["observation"].reason_code in {
-            "CONTROL_STATE_UNAVAILABLE",
-            "SOURCE_NOT_CONFIGURED",
-        }
+        assert pointer.run_id == second.run_id
+        assert (control_path.stat().st_ino, control_path.read_bytes()) != old_control
+        assert store.reconcile_control_pointer().run_id == second.run_id
+    else:
+        assert pointer.model_dump() == old_pointer.model_dump()
+        assert (control_path.stat().st_ino, control_path.read_bytes()) == old_control
+        assert store.reconcile_control_pointer().model_dump() == old_pointer.model_dump()
+    assert {
+        path.name: (path.stat().st_ino, path.read_bytes()) for path in binding_root.glob("*.json")
+    }.items() >= old_bindings.items()
+    assert store.control.published_refresh().status == "ready"
+    if fault_point == "postcommit":
+        assert (
+            store.coordinator.lock.result_payload["observation"].enqueue_state == "not_configured"
+        )
 
 
 def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeypatch) -> None:
@@ -429,6 +455,7 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
         "healthy": ("ready", "NONE", 0, 0, 0),
         "retry_wait": ("degraded", "NONE", 0, 1, 0),
         "dead_lettered": ("degraded", "NONE", 0, 0, 1),
+        "replicated": ("degraded", "NONE", 0, 0, 0),
     }
 
     def fingerprint(path: Path):
@@ -443,6 +470,13 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
             )
             for item in sorted(path.rglob("*"))
         )
+
+    def http_status(settings):
+        app.dependency_overrides[get_settings] = lambda settings=settings: settings
+        try:
+            return TestClient(app).get("/api/v1/storage/replication")
+        finally:
+            app.dependency_overrides.clear()
 
     for state in expected:
         settings = Settings(
@@ -473,6 +507,10 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
                     ),
                 )
                 result = ReplicationStatusService(settings).read()
+                response = http_status(settings)
+            assert response.status_code == 200
+            assert str(tmp_path) not in response.text
+            assert response.json()["provider_requests"] == 0
             assert (
                 result.status,
                 result.reason_code,
@@ -483,7 +521,7 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
             assert result.provider_requests == 0
             assert result.effects.writes is False
             continue
-        elif state in {"empty", "healthy", "retry_wait", "dead_lettered"}:
+        elif state in {"empty", "healthy", "retry_wait", "dead_lettered", "replicated"}:
             source_path = layout.replication_source_instance
             assert source_path is not None
             source = SourceInstanceStore(source_path).create(
@@ -497,7 +535,7 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
                 source_instance_sha256=source.source_instance_sha256,
             )
             sidecar = ReplicationSidecarStore(layout.replication_sidecar_root)
-            if state in {"retry_wait", "dead_lettered"}:
+            if state in {"retry_wait", "dead_lettered", "replicated"}:
                 checkpoint = build_source_checkpoint(
                     source_instance_id=source.source_instance_id,
                     source_instance_sha256=source.source_instance_sha256,
@@ -522,23 +560,51 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
                     created_at="2026-09-09T00:00:00Z",
                 )
 
+                if state == "replicated":
+                    claim = sidecar.claim_due(worker_id="status-worker", now="2026-09-09T00:00:01Z")
+                    assert claim is not None
+                    sidecar.transition(
+                        intent_id=claim.intent_id,
+                        worker_id="status-worker",
+                        expected_state_version=claim.state_version,
+                        to_state="verifying",
+                        now="2026-09-09T00:00:02Z",
+                    )
+
                 def terminalize(connection, state=state):
                     intent_id = str(
                         connection.execute("SELECT intent_id FROM replication_heads").fetchone()[0]
                     )
-                    to_state = "retry_wait" if state == "retry_wait" else "dead_letter"
+                    to_state = (
+                        "retry_wait"
+                        if state == "retry_wait"
+                        else "dead_letter"
+                        if state == "dead_lettered"
+                        else "replicated"
+                    )
                     replication.ImmutableReplicationSidecarStore._append_event_and_update_head(
                         connection,
                         intent_id=intent_id,
-                        from_state="pending",
+                        from_state="verifying" if state == "replicated" else "pending",
                         to_state=to_state,
                         attempt=1,
-                        reason_code="RETRY_WAIT" if to_state == "retry_wait" else "DEAD_LETTER",
-                        occurred_at="2026-09-09T00:00:01Z",
+                        reason_code=(
+                            "NONE"
+                            if to_state == "replicated"
+                            else "RETRY_WAIT"
+                            if to_state == "retry_wait"
+                            else "DEAD_LETTER"
+                        ),
+                        occurred_at="2026-09-09T00:00:03Z",
                         lease_owner=None,
                         lease_until=None,
                         next_attempt_at="2026-09-09T00:00:02Z",
-                        event_type="transition" if to_state == "retry_wait" else "terminal",
+                        event_type="transition" if to_state != "dead_letter" else "terminal",
+                        destination_replication_generation=(
+                            "7" * 64 if state == "replicated" else None
+                        ),
+                        destination_record_sha256=("8" * 64 if state == "replicated" else None),
+                        destination_head_sha256=("9" * 64 if state == "replicated" else None),
                     )
                     return replication._MutationOutcome(None, True)
 
@@ -555,6 +621,17 @@ def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeyp
         ) == expected[state]
         assert result.provider_requests == 0
         assert result.effects.writes is False
+        if state == "replicated":
+            assert result.last_replicated_source_manifest_sha256 == "4" * 64
+            assert result.last_replicated_at == "2026-09-09T00:00:03Z"
+        response = http_status(settings)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == result.status
+        assert body["reason_code"] == result.reason_code
+        assert body["provider_requests"] == 0
+        assert body["effects"]["writes"] is False
+        assert str(tmp_path) not in response.text
 
 
 def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
@@ -658,6 +735,21 @@ def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
 
     sidecar._mutate_generation(terminalize)
     public_status = ReplicationStatusService(settings)
+
+    def physical_fingerprint(path: Path):
+        return tuple(
+            (
+                str(item.relative_to(path)),
+                "dir" if item.is_dir() else "file",
+                item.stat().st_ino,
+                item.stat().st_size,
+                item.stat().st_mtime_ns,
+                None if item.is_dir() else hashlib.sha256(item.read_bytes()).hexdigest(),
+            )
+            for item in sorted(path.rglob("*"))
+        )
+
+    before = physical_fingerprint(sidecar.path)
     public_status.read()  # warmup
     samples = []
     for _ in range(5):
@@ -670,6 +762,7 @@ def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
         assert status.provider_requests == 0
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1]
     assert p95 < 0.5, f"status p95={p95:.3f}s samples={samples!r}"
+    assert physical_fingerprint(sidecar.path) == before
 
 
 def test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper(tmp_path) -> None:
