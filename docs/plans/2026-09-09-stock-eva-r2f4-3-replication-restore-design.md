@@ -1,6 +1,7 @@
 # R2-F4.3 replication and restore — authoritative normative specification
 
-Status: RC / Candidate/NO-GO pending next independent audit. This document is the
+Status: Delivered / GO. Independent audit recorded SPEC GO and QUALITY GO against
+reviewed X6 and evidence Y6; this metadata-only signoff commit is not audited. This document is the
 single current normative truth for the release candidate. It contains no historical
 amendment corpus. Scope is LOCAL_CHAIN_ONLY: no real NAS/SMB mount, provider,
 LaunchAgent, credential, or production operation may run from this worktree.
@@ -197,8 +198,13 @@ directly asserts the mapped requirement.
 
 ## Release boundary
 
-The implementation and evidence commits are separate: implementation_commit is the
-code commit and evidence_base_commit is its doc/test-only successor. This candidate
-does not claim independent SPEC or QUALITY GO. The final audit must inspect the exact
-commit, all IDs and anchors, full/static/no-write results, and the runbook before any
-real-NAS change window.
+The implementation and evidence commits are separate: reviewed implementation/spec
+commit X6 is `9cf91afb55c64940419e45dfc1d2a71e2b4051c9`, and evidence commit Y6 is
+`ff82667a3d1ec9f1de1ebd8f5cec4fd16655ef84`. The final independent result is SPEC GO /
+QUALITY GO with H0=0, M0=0, L3=3; the gates recorded 90 mapped anchors / 100
+executed cases, 219 focused tests, 2961 full-suite tests, and scoped static checks.
+The signoff commit carrying this status is metadata-only and is not claimed as
+audited. The former `RC / Candidate/NO-GO pending next independent audit` state is
+retained only as closed-gate provenance, not current status. All evidence remains
+LOCAL_CHAIN_ONLY and does not validate a real NAS, provider, LaunchAgent, or
+production operation.

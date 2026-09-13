@@ -1,14 +1,15 @@
 # R2-F4.3 RC acceptance evidence
 
-Status: Candidate / NO-GO pending the next independent SPEC and QUALITY audit.
-No independent GO is claimed. The boundary is LOCAL_CHAIN_ONLY: all commands
-used local temporary fixtures and fakes; no real NAS/SMB, provider, credential,
-LaunchAgent installation, or production operation occurred.
+Status: Delivered / GO. Independent audit recorded SPEC GO and QUALITY GO against
+X6 implementation/spec and Y6 evidence; this metadata-only signoff commit is not
+itself audited. The boundary is LOCAL_CHAIN_ONLY: all commands used local
+temporary fixtures and fakes; no real NAS/SMB, provider, credential, LaunchAgent
+installation, or production operation occurred.
 
 ## Reviewed commits
 
 reviewed_implementation_spec_commit: 9cf91afb55c64940419e45dfc1d2a71e2b4051c9
-evidence_base_commit: 9cf91afb55c64940419e45dfc1d2a71e2b4051c9
+evidence_base_commit: ff82667a3d1ec9f1de1ebd8f5cec4fd16655ef84
 
 X6 is the implementation/spec/test closure commit, reviewed and tested from
 its clean tree. It retains NFR-11's one immutable sidecar generation with
@@ -26,7 +27,8 @@ direct, symlink-descendant, and symlink-ancestor scenarios, with full-tree
 fingerprint equality. Both normative specs remain exactly equal to the
 129-row matrix projection.
 
-Y6 is this evidence-only successor. Its own hash is deliberately not embedded;
+Y6 is the audited evidence-only successor to X6. The final signoff commit is
+metadata-only, is not itself audited, and its own hash is deliberately not embedded;
 after committing Y6, `git diff 9cf91afb55c64940419e45dfc1d2a71e2b4051c..Y6
 --name-only` is the proof that only this document changed.
 
@@ -82,8 +84,15 @@ exactly projected without writes or provider requests. Unknown/orphan state
 remains manual-review or quarantine only; manual rollback must never replace
 a newer valid canonical generation.
 
+Independent signoff: SPEC GO / QUALITY GO; H0=0, M0=0, L3=3. The audited gates
+are 90 mapped anchors / 100 executed cases, 219 focused tests, 2961 full-suite
+tests, and scoped static checks. The repository-wide Ruff 13/14 baseline/waiver
+remains preserved; changed-file/backend/tests checks were clean. The semantic
+validator remains a drift guard and heuristic review aid, not semantic proof.
+
 The real-NAS follow-up checklist remains: independently review descriptor and
 mount authorization, perform a controlled destination initialization, run one
 bounded claim under both gates, capture descriptor/readback/audit evidence,
 and verify rollback/manual unknown-orphan handling. No such operation is part
-of X6/Y6. Status remains Candidate / NO-GO pending the next independent audit.
+of X6/Y6 or this signoff. Status is Delivered / GO based on the recorded local
+independent audit only.

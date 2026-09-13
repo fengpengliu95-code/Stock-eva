@@ -1,8 +1,14 @@
 # R2-F4.3 RC runbook
 
-Status: Candidate / NO-GO pending independent audit. Scope is
-`LOCAL_CHAIN_ONLY`; never run against a real NAS, SMB mount, provider, launch
-agent, or production path from this worktree.
+Status: Delivered / GO after independent SPEC GO and QUALITY GO. Reviewed X6:
+`9cf91afb55c64940419e45dfc1d2a71e2b4051c9`; evidence Y6:
+`ff82667a3d1ec9f1de1ebd8f5cec4fd16655ef84`; H0=0, M0=0, L3=3. The signoff
+commit containing this status is metadata-only and is not claimed as part of
+the independent audit. Scope is `LOCAL_CHAIN_ONLY`; never run against a real
+NAS, SMB mount, provider, launch agent, or production path from this worktree.
+Recorded gates are 90 mapped anchors / 100 executed cases, 219 focused tests,
+2961 full-suite tests, and scoped static checks. The repository-wide Ruff 13/14
+baseline/waiver remains preserved; changed-file/backend/tests checks were clean.
 
 ## Verification
 
