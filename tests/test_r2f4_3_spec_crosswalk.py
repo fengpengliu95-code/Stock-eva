@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import re
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -16,7 +17,7 @@ DOCS = (
 MATRIX = ROOT / "docs/acceptance/r2f4-3-requirement-evidence-matrix.md"
 ID_PATTERN = re.compile(r"\b(?:FR|NFR|AC|EC)-[0-9]+[a-z]?\b")
 ROW_PATTERN = re.compile(
-    r"^\| ((?:FR|NFR|AC|EC)-[0-9]+[a-z]?) \| (.*?) \| (test_[A-Za-z0-9_]+) \|$",
+    r"^\| ((?:FR|NFR|AC|EC)-[0-9]+[a-z]?) \| (.*?) \| (.*?) \| (.*?) \|$",
     re.MULTILINE,
 )
 MATRIX_ROW_PATTERN = re.compile(
@@ -26,7 +27,7 @@ MATRIX_ROW_PATTERN = re.compile(
 EXPECTED_COUNTS = {"FR": 42, "NFR": 16, "AC": 31, "EC": 40}
 # Approved effective-matrix drift guard. This digest is not semantic proof; the
 # matrix's reviewed summaries, references, bodies, and rationales are the proof.
-SEMANTIC_MATRIX_SHA256 = "2f7d16fbdb385682cb64a1eb813fbd5b23c772a810ebfd383e65b5d981ad0505"
+SEMANTIC_MATRIX_SHA256 = "83df3978d39c0142529199f3f1b72a6f0aec63779421fa802ff20941e58d19dc"
 PLACEHOLDER_TEXT = {
     "effective latest contract remains fail-closed",
     "todo",
@@ -85,19 +86,32 @@ def test_current_docs_repeat_the_same_exact_anchor_set() -> None:
 
 def test_normative_corpus_has_exact_unique_ids_and_semantic_digest() -> None:
     catalog = _test_catalog()
-    parsed: list[list[tuple[str, str, str]]] = []
+    matrix_rows = _matrix_rows()
+    matrix_projection = [row[:4] for row in matrix_rows]
+    parsed: list[list[tuple[str, str, str, str]]] = []
     for path in DOCS:
         text = path.read_text(encoding="utf-8")
-        ids = ID_PATTERN.findall(text)
         rows = ROW_PATTERN.findall(text)
-        assert len(ids) == sum(EXPECTED_COUNTS.values())
-        assert len(set(ids)) == len(ids)
         assert len(rows) == sum(EXPECTED_COUNTS.values())
-        assert {anchor for _id, _description, anchor in rows} <= set(catalog)
-        assert set(ids) == {row_id for row_id, _description, _anchor in rows}
+        ids = [row_id for row_id, _description, _refs, _tests in rows]
+        assert len(set(ids)) == len(ids)
+        assert all(_anchors(test_cell) for _id, _description, _refs, test_cell in rows)
+        assert all(
+            _anchors(test_cell) <= set(catalog) for _id, _description, _refs, test_cell in rows
+        )
         assert _counts(ids) == EXPECTED_COUNTS
-        descriptions = [description for _id, description, _anchor in rows]
+        assert rows == matrix_projection
+        descriptions = [description for _id, description, _refs, _tests in rows]
         assert len(set(descriptions)) >= 120
+        for requirement_id, description, refs, tests in rows:
+            assert description.strip() and "()" not in description
+            assert "``" not in description
+            assert "`" not in refs
+            test_names = _anchors(tests)
+            assert test_names
+            if requirement_id.startswith("AC-"):
+                parent_refs = ID_PATTERN.findall(refs)
+                assert parent_refs and all(ref.startswith(("FR-", "NFR-")) for ref in parent_refs)
         matrix = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
         assert hashlib.sha256(matrix.encode()).hexdigest() == SEMANTIC_MATRIX_SHA256
         parsed.append(rows)
@@ -116,8 +130,9 @@ def test_requirement_matrix_has_direct_bodies_refs_rationales_and_bounded_reuse(
     for _requirement_id, summary, _refs, anchors, rationale in rows:
         assert summary.strip()
         assert rationale.strip()
-        assert "placeholder" not in summary.lower()
-        assert "placeholder" not in rationale.lower()
+        combined = f"{summary}\n{rationale}".lower()
+        assert not any(token in combined for token in PLACEHOLDER_TEXT)
+        assert "()" not in combined and "``" not in combined
         assert not summary.strip().endswith("—")
         anchor_names = _anchors(anchors)
         assert anchor_names
@@ -126,6 +141,34 @@ def test_requirement_matrix_has_direct_bodies_refs_rationales_and_bounded_reuse(
             anchor_use[anchor] = anchor_use.get(anchor, 0) + 1
     assert len(anchor_use) >= 60
     assert max(anchor_use.values()) <= 4
+
+
+def test_matrix_rationales_and_anchor_bodies_are_reviewable_heuristics() -> None:
+    """The token check is a review aid, never a substitute for manual proof."""
+    catalog = _test_catalog()
+    for requirement_id, summary, _refs, anchors, rationale in _matrix_rows():
+        assert rationale.strip()
+        assert rationale.strip() not in {"—", "n/a", "evidence"}
+        summary_tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", summary)
+            if token.lower() not in {"must", "shall", "given", "when", "then", "local"}
+        }
+        for anchor in _anchors(anchors):
+            assert anchor in catalog
+            body = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (ROOT / "tests").glob("**/*.py")
+                if path.relative_to(ROOT).as_posix() in catalog[anchor]
+            )
+            # Heuristic only: semantic review remains required and is stated
+            # in the matrix header/evidence report. Do not promote this token
+            # overlap into a claim of semantic proof.
+            if not summary_tokens & set(re.findall(r"[A-Za-z][A-Za-z0-9_-]+", body.lower())):
+                warnings.warn(
+                    f"manual semantic review required for {requirement_id}/{anchor}",
+                    stacklevel=1,
+                )
 
 
 def test_acceptance_refs_are_known_and_overlap_direct_fr_nfr_evidence() -> None:

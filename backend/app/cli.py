@@ -2580,7 +2580,12 @@ def main() -> int:
             destination = _replication_cli_path(
                 destination,
                 label="destination",
-                protected_roots=_replication_protected_roots(settings),
+                # The configured destination is the one mutable root this
+                # command is authorized to operate on; all other configured
+                # roots remain protected from overlap.
+                protected_roots=tuple(
+                    root for root in _replication_protected_roots(settings) if root != destination
+                ),
             )
         except _CliArgumentError as exc:
             return _replication_cli_error(exc)

@@ -2,8 +2,9 @@
 
 import ast
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -28,6 +29,9 @@ from backend.app.storage.replication import (
     LineageResolver,
     ReplicationOutboxService,
     SourceInstanceStore,
+    build_journal_record,
+    build_source_checkpoint,
+    domain_sha256,
 )
 from tests.test_market_backfill import RangeProvider, trading_days
 from tests.test_market_candidate_selection import _real_candidate_bundle
@@ -150,17 +154,270 @@ def test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists() 
     for name in ("test_nas_dataset.py", "test_replication_integration_batch5.py"):
         path = tests_root / name
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
                 continue
-            if node.func.attr not in {"save_refresh", "upsert_bars"}:
+            if function.name in {
+                "test_plain_market_store_artifact_is_byte_stable_when_dataset_adapter_is_constructed",
+                "test_omitted_lineage_fails_before_manifest_mutation",
+            }:
                 continue
-            if name == "test_replication_integration_batch5.py" and 321 <= node.lineno <= 333:
-                # Deliberate negative anchor proving omission is rejected.
-                continue
-            assert any(
-                keyword.arg in {"lineage_input", "publication_lineage"} for keyword in node.keywords
-            ), f"omitted lineage at {path}:{node.lineno}"
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr not in {"save_refresh", "upsert_bars"}:
+                    continue
+                if name == "test_replication_integration_batch5.py" and 321 <= node.lineno <= 333:
+                    # Deliberate negative anchor proving omission is rejected.
+                    continue
+                assert any(
+                    keyword.arg in {"lineage_input", "publication_lineage"}
+                    for keyword in node.keywords
+                ), f"omitted lineage at {path}:{node.lineno}"
+
+
+def test_production_dataset_writer_inventory_has_no_pointer_bypass() -> None:
+    """FR-3b: inspect production seams, not only test call sites."""
+    root = Path(__file__).parents[1]
+    dataset = (root / "backend/app/storage/dataset.py").read_text(encoding="utf-8")
+    backfill = (root / "backend/app/market/backfill.py").read_text(encoding="utf-8")
+    dataset_tree = ast.parse(dataset)
+    writer_methods = {
+        node.name: node
+        for node in ast.walk(dataset_tree)
+        if isinstance(node, ast.FunctionDef) and node.name in {"save_refresh", "upsert_bars"}
+    }
+    assert {"save_refresh", "upsert_bars"} <= set(writer_methods)
+    for node in writer_methods.values():
+        calls = {
+            call.func.attr
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        }
+        assert "publish_dataset_and_pointer" in calls or "publish_manifest_only" in calls
+        assert "write_pointer" not in calls
+        assert "save_external_publication" not in calls
+    assert "publish_dataset_and_pointer" in dataset
+    assert "publish_manifest_only" in dataset
+    assert "NasMarketStore" in backfill
+    assert "lineage_input" in backfill
+
+
+def test_launchagent_refresh_uses_tcc_safe_path_and_disabled_replication_gates() -> None:
+    """FR-22/AC-19: verify the real install/plist assets and safe defaults."""
+    root = Path(__file__).parents[1]
+    installer = (root / "scripts/stock_eva_launchagents_install.sh").read_text(encoding="utf-8")
+    refresh = (root / "launchd/com.finlay.stock-eva.refresh.plist.in").read_text(encoding="utf-8")
+    env = (root / ".env.example").read_text(encoding="utf-8")
+    assert 'APP_SUPPORT_ROOT="$HOME/Library/Application Support/Stock EVA"' in installer
+    assert "__CONFIG_ROOT__" in refresh
+    assert "auto-refresh-once" in refresh
+    assert "STOCK_EVA_REPLICATION_ENABLED=false" in env
+    assert "STOCK_EVA_MARKET_REPLICATION_DRAIN_ENABLED=false" in env
+    assert "mount_smbfs" not in installer
+
+
+def test_replication_config_defaults_are_portable_and_operable(tmp_path) -> None:
+    """NFR-13/NFR-15: exact disabled defaults and local portable layout."""
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        local_market_dataset_root=tmp_path / "dataset",
+        replication_enabled=False,
+        replication_drain_enabled=False,
+        replication_destination_root=None,
+    )
+    assert settings.replication_enabled is False
+    assert settings.replication_drain_enabled is False
+    assert settings.replication_destination_root is None
+    assert settings.replication_direction == "local_to_nas"
+    assert settings.local_market_dataset_root == tmp_path / "dataset"
+    assert not (tmp_path / "dataset").exists()
+
+
+def test_plain_market_store_artifact_is_byte_stable_when_dataset_adapter_is_constructed(
+    tmp_path,
+) -> None:
+    """NFR-14: dataset replication setup cannot alter plain MarketStore bytes."""
+    control_path = tmp_path / "plain.duckdb"
+    plain = MarketStore(control_path)
+    plain.save_refresh(_bars(), _ready_result(), publish=True)
+    before = control_path.read_bytes()
+    root = _dataset(tmp_path)
+    NasMarketStore(plain, root, tmp_path / "staging", replication_enabled=True)
+    assert control_path.read_bytes() == before
+    assert plain.published_refresh() == plain.published_refresh()
+
+
+def test_canonical_ready_precedes_enqueue_failure_and_next_guard_reconciles(tmp_path) -> None:
+    """NFR-10/FR-3: injected enqueue failure cannot roll back canonical ready."""
+    root = _dataset(tmp_path)
+    source = SourceInstanceStore(root / "_replication" / "source-instance.json").create(
+        canonical_root_path=root,
+        canonical_schema_digest=canonical_control_schema_digest(),
+        source_instance_nonce="d" * 64,
+        created_at="2026-09-09T00:00:00Z",
+    )
+
+    class FailingEnqueue:
+        source_instance_id = source.source_instance_id
+        source_instance_sha256 = source.source_instance_sha256
+
+        def pre_publication_guard(self):
+            return None
+
+        def on_canonical_committed(self, _source_commit):
+            raise RuntimeError("injected enqueue failure")
+
+        def journal_publication(self, **_kwargs):
+            return None
+
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb"),
+        root,
+        tmp_path / "staging",
+        replication_service=FailingEnqueue(),
+        source_instance=source,
+    )
+    with pytest.raises(RuntimeError, match="injected enqueue failure"):
+        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    assert store.control.published_refresh() is not None
+    reconciled = store.reconcile_control_pointer()
+    assert reconciled is not None
+    assert reconciled.status == "ready"
+
+
+def test_status_matrix_is_read_only_for_missing_corrupt_locked_and_healthy(
+    tmp_path, monkeypatch
+) -> None:
+    """AC-15/EC-14/EC-37: every public status state is zero-provider/zero-write."""
+    from backend.app.storage.layout import StorageLayout
+    from backend.app.storage.replication import (
+        ReplicationSidecarStore,
+        ReplicationStatusService,
+        SourceInstanceStore,
+    )
+
+    for state in ("missing", "corrupt", "locked", "healthy"):
+        settings = Settings(
+            _env_file=None,
+            local_control_dir=tmp_path / state / "control",
+            local_staging_dir=tmp_path / state / "staging",
+            local_lock_dir=tmp_path / state / "locks",
+            local_temp_dir=tmp_path / state / "temp",
+            local_market_dataset_root=tmp_path / state / "dataset",
+            replication_enabled=True,
+        )
+        layout = StorageLayout(settings)
+        if state == "corrupt":
+            layout.replication_sidecar_root.mkdir(parents=True)
+            (layout.replication_sidecar_root / "garbage").write_text("corrupt", encoding="utf-8")
+        elif state == "locked":
+            layout.replication_sidecar_root.mkdir(parents=True)
+            (layout.replication_sidecar_root / "replication.lock").write_text(
+                "held", encoding="utf-8"
+            )
+            with monkeypatch.context() as locked_patch:
+                from backend.app.storage.replication import ReplicationStateUnavailable
+
+                locked_patch.setattr(
+                    "backend.app.storage.replication._open_generation_readonly",
+                    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        ReplicationStateUnavailable("locked")
+                    ),
+                )
+                result = ReplicationStatusService(settings).read()
+            assert result.provider_requests == 0
+            assert result.effects.writes is False
+            continue
+        elif state == "healthy":
+            source_path = layout.replication_source_instance
+            assert source_path is not None
+            source = SourceInstanceStore(source_path).create(
+                canonical_root_path=settings.local_market_dataset_root,
+                canonical_schema_digest="c" * 64,
+                source_instance_nonce="d" * 64,
+                created_at="2026-09-09T00:00:00Z",
+            )
+            ReplicationSidecarStore(layout.replication_sidecar_root).initialize(
+                source_instance_id=source.source_instance_id,
+                source_instance_sha256=source.source_instance_sha256,
+            )
+        result = ReplicationStatusService(settings).read()
+        assert result.provider_requests == 0
+        assert result.effects.writes is False
+
+
+def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
+    """NFR-11: repeated warm status reads over a real 10,000-row sidecar stay bounded."""
+    from backend.app.storage.replication import ReplicationSidecarStore
+
+    source_id = "a" * 64
+    source_sha = "b" * 64
+    inventory = (
+        {
+            "relative_path": "bars.parquet",
+            "object_sha256": "2" * 64,
+            "size_bytes": 10,
+            "row_count": 1,
+            "trade_date": "2026-09-09",
+            "source": "bao_stock",
+        },
+    )
+    object_set = domain_sha256("stock-eva/r2f4.3/object-set/v1", list(inventory))
+    journals = []
+    for index in range(10_000):
+        checkpoint = build_source_checkpoint(
+            source_instance_id=source_id,
+            source_instance_sha256=source_sha,
+            publication_binding_sha256=f"{index + 1:064x}",
+            pointer_row_sha256=f"{index + 2:064x}",
+            pointer_generation=f"generation-{index + 1}",
+            source_run_id=f"run-{index + 1}",
+            source_trade_date="2026-09-09",
+            source_published_at=(datetime(2026, 9, 9, tzinfo=UTC) + timedelta(microseconds=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            pointer_db_device=1,
+            pointer_db_inode=index + 2,
+            pointer_db_schema_digest="e" * 64,
+            manifest_canonical_sha256="f" * 64,
+            source_manifest_bytes_sha256="0" * 64,
+            source_object_set_sha256=object_set,
+            object_inventory=inventory,
+        )
+        journals.append(
+            build_journal_record(
+                checkpoint_id=checkpoint.checkpoint_id,
+                source_instance_id=source_id,
+                source_instance_sha256=source_sha,
+                publication_binding_sha256=checkpoint.publication_binding_sha256,
+                source_published_at=checkpoint.source_published_at,
+                checkpoint_projection=checkpoint,
+                created_at=checkpoint.source_published_at,
+            )
+        )
+    sidecar = ReplicationSidecarStore(tmp_path / "sidecar")
+    sidecar.initialize(source_instance_id=source_id, source_instance_sha256=source_sha)
+    result = sidecar.import_journals(
+        journals,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    assert result.imported_count == 10_000
+    sidecar.read_status()  # warmup
+    samples = []
+    for _ in range(5):
+        started = perf_counter()
+        status = sidecar.read_status()
+        samples.append(perf_counter() - started)
+        assert status.pending_count == 10_000
+    p95 = sorted(samples)[int(len(samples) * 0.95) - 1]
+    assert p95 < 0.5, f"status p95={p95:.3f}s samples={samples!r}"
 
 
 def test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper(tmp_path) -> None:

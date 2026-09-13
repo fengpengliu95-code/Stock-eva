@@ -137,3 +137,45 @@ def test_operation_day_is_typed_in_dry_run_and_status_json_is_sanitized(
     assert status["mode"] == "status"
     assert status["provider_requests"] == 0
     assert status["paths_exposed"] is False
+
+
+def test_market_replicate_execute_calls_the_injected_worker_with_operation_day(
+    monkeypatch, tmp_path, capsys
+):
+    destination = tmp_path / "archive"
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "replication_enabled": True,
+            "replication_drain_enabled": True,
+            "replication_destination_root": destination,
+        }
+    )
+    calls = []
+
+    class Worker:
+        def run_once(self, *, operation_day=None):
+            calls.append(operation_day)
+            return {"status": "idle", "writes": False, "provider_requests": 0}
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "build_replication_drain_worker", lambda settings, layout: Worker())
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "stock-eva",
+            "market-replicate",
+            "--destination",
+            str(destination),
+            "--operation-day",
+            "2026-09-14",
+            "--execute",
+            "--json",
+        ],
+    )
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "idle"
+    assert payload["mode"] == "execute"
+    assert payload["operation_day"] == "2026-09-14"
+    assert calls == ["2026-09-14"]
+    assert not destination.exists()

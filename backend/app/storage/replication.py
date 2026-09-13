@@ -2326,6 +2326,25 @@ def _stat_fingerprint(
 
 _SqliteFingerprint = tuple[int, int, int, int, str | None]
 
+# Immutable generation images are content-addressed by their held directory
+# identity, genesis bytes and entry fingerprints.  Keep a small process-local
+# proof cache so repeated read-only status calls do not replay every terminal
+# event hash; the namespace/fingerprint check still runs on every open.
+_VALIDATED_GENERATION_SNAPSHOTS: dict[tuple[object, ...], None] = {}
+
+
+def _generation_snapshot_key(
+    root_fd: int,
+    *,
+    genesis_payload: bytes,
+    entries: tuple[_GenerationEntry, ...],
+) -> tuple[object, ...]:
+    return (
+        _directory_identity(os.fstat(root_fd)),
+        hashlib.sha256(genesis_payload).digest(),
+        tuple((entry.sequence, entry.name, entry.fingerprint) for entry in entries),
+    )
+
 
 def _deserialize_sqlite_bytes(payload: bytes) -> sqlite3.Connection:
     """Deserialize one private SQLite image and close it on every failure."""
@@ -3163,7 +3182,18 @@ def _compare_generation_snapshot(
         raise ReplicationStateUnavailable("replication sidecar generation changed during read")
     if current_genesis is None:
         raise ReplicationStateUnavailable("replication sidecar genesis is unavailable")
-    _validate_generation_chain(current_entries, current_genesis)
+    snapshot_key = _generation_snapshot_key(
+        root_fd,
+        genesis_payload=current_genesis_payload,
+        entries=current_entries,
+    )
+    if snapshot_key not in _VALIDATED_GENERATION_SNAPSHOTS:
+        _validate_generation_chain(current_entries, current_genesis)
+        _VALIDATED_GENERATION_SNAPSHOTS[snapshot_key] = None
+        # Avoid unbounded retention if a long-running worker sees many
+        # immutable generations.  Eviction only costs a future proof replay.
+        if len(_VALIDATED_GENERATION_SNAPSHOTS) > 128:
+            del _VALIDATED_GENERATION_SNAPSHOTS[next(iter(_VALIDATED_GENERATION_SNAPSHOTS))]
     _lock_payload, lock_info = _read_at(root_fd, SIDECAR_LOCK_NAME)
     if _generation_lock_identity(lock_info) != {
         key: current_genesis[key] for key in ("lock_dev", "lock_ino", "lock_nlink", "lock_mode")
@@ -4773,11 +4803,17 @@ class ImmutableReplicationSidecarStore:
                 "dead_letter",
             }:
                 raise ReplicationStateUnavailable("replication sidecar state is invalid")
-            _validate_event_reachability(
-                connection,
-                expected_source_instance_id=meta[0][4],
-                expected_source_instance_sha256=meta[0][5],
+            snapshot_key = _generation_snapshot_key(
+                root_fd,
+                genesis_payload=genesis_payload,
+                entries=entries,
             )
+            if snapshot_key not in _VALIDATED_GENERATION_SNAPSHOTS:
+                _validate_event_reachability(
+                    connection,
+                    expected_source_instance_id=meta[0][4],
+                    expected_source_instance_sha256=meta[0][5],
+                )
             replicated = connection.execute(
                 """SELECT i.manifest_canonical_sha256, e.occurred_at
                      FROM replication_heads h JOIN replication_intents i ON i.intent_id=h.intent_id
