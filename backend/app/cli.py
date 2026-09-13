@@ -127,7 +127,17 @@ from backend.app.storage.initialize import (
 )
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
-from backend.app.storage.replication import ReplicationStatusService
+from backend.app.storage.replication import (
+    DestinationArchiveWriter,
+    DestinationCommitVerifier,
+    DestinationDescriptor,
+    JournalRecord,
+    ReplicationDrainWorker,
+    ReplicationOutboxService,
+    ReplicationStatusService,
+    RestoreService,
+    SourceInstanceStore,
+)
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
 from backend.app.user.store import UserStore
@@ -2140,6 +2150,90 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return exit_code
     settings = get_settings()
+    prevalidated_lineage_pairs = None
+    # A local lineage file is a preflight input, not a provider-side hint.  Do
+    # this validation before StoragePreflight, pointer reconciliation, or
+    # provider construction so malformed/forged input is a strict zero-write
+    # and zero-request rejection.
+    if args.command == "backfill" and args.lineage_input is not None:
+        configured_root = configured_market_dataset_root(settings)
+        if configured_root is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_NOT_SUPPORTED_FOR_PLAIN_STORE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if args.start is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_REQUIRES_EXPLICIT_START",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        confirmed = get_trading_calendar().snapshot().confirmed_open_sessions(
+            args.start, args.end
+        )
+        if confirmed is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "SOURCE_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        try:
+            prevalidated_lineage_pairs = _read_backfill_lineage_file(
+                args.lineage_input, confirmed
+            )
+        except (OSError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "BACKFILL_LINEAGE_INPUT_UNAVAILABLE",
+                        "provider_requests": 0,
+                        "writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+    elif args.command == "backfill" and configured_market_dataset_root(settings) is not None:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "BACKFILL_LINEAGE_INPUT_REQUIRED_FOR_DATASET_STORE",
+                    "provider_requests": 0,
+                    "writes": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
     if args.command == "market-replication-status":
         try:
             result = ReplicationStatusService(settings).read()
@@ -2159,35 +2253,104 @@ def main() -> int:
             )
             return 1
     if args.command in {"market-replicate", "market-restore"}:
-        # These are intentionally plan-first.  Transfer/restore is admitted
-        # only by an explicit execute request and remains unavailable until a
-        # trusted descriptor-bound service is configured; dry-run performs no
-        # path probe, mount, provider or sidecar work.
+        layout = StorageLayout(settings)
+        if args.command == "market-restore":
+            service = RestoreService(
+                args.source,
+                canonical_roots=tuple(
+                    root
+                    for root in (
+                        settings.local_market_dataset_root,
+                        settings.nas_market_dataset_root,
+                    )
+                    if root is not None
+                ),
+                audit_root=(
+                    (Path.cwd() / layout.local_paths.control).resolve() / "restore-audit"
+                    if args.execute
+                    else None
+                ),
+            )
+            result = (
+                service.execute(args.destination)
+                if args.execute
+                else service.plan(args.destination)
+            )
+            payload = result.model_dump(mode="json")
+            payload.update({"provider_requests": 0, "writes": result.effects.writes})
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0 if result.status in {"dry_run", "ready"} else 1
+
         if not args.execute:
+            print(
+                json.dumps(
+                    {
+                        "mode": "plan",
+                        "status": "dry-run",
+                        "reason_code": "NONE",
+                        "provider_requests": 0,
+                        "writes": False,
+                        "destination_writes": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        source_root = configured_market_dataset_root(settings)
+        if source_root is None:
             payload = {
-                "mode": "plan",
-                "status": "dry-run",
-                "reason_code": "NONE",
+                "status": "unavailable",
+                "reason_code": "SOURCE_NOT_CONFIGURED",
                 "provider_requests": 0,
                 "writes": False,
-                "destination_writes": False,
-                "restore_writes": False,
             }
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-            return 0
-        print(
-            json.dumps(
-                {
-                    "status": "unavailable",
-                    "reason_code": "DESTINATION_UNAVAILABLE",
-                    "provider_requests": 0,
-                    "writes": False,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+            return 1
+        try:
+            descriptor_path = args.destination / "destination-descriptor.json"
+            descriptor_record = DestinationDescriptor.read(descriptor_path)
+            descriptor = DestinationArchiveWriter(
+                descriptor_record,
+                source_root=source_root,
+                writer_host_id=descriptor_record.single_writer_host_id,
             )
-        )
-        return 1
+            source_instance_path = source_root / "_replication" / "source-instance.json"
+            source_instance = SourceInstanceStore(source_instance_path).read(
+                canonical_root_path=source_root
+            )
+            outbox = ReplicationOutboxService(
+                layout.replication_sidecar_root,
+                enabled=True,
+                source_instance_id=source_instance.source_instance_id,
+                source_instance_sha256=source_instance.source_instance_sha256,
+                destination_verifier=DestinationCommitVerifier(descriptor_record),
+            )
+            journals = {
+                record.checkpoint_id: record.checkpoint_projection
+                for record in (
+                    JournalRecord.read(path)
+                    for path in sorted(layout.replication_journal_root.glob("*.json"))
+                )
+            }
+            worker = ReplicationDrainWorker(
+                outbox,
+                descriptor,
+                replication_enabled=True,
+                replication_drain_enabled=args.execute,
+                checkpoint_reader=journals.get,
+            )
+            payload = worker.run_once()
+        except Exception:
+            payload = {
+                "status": "unavailable",
+                "reason_code": "SOURCE_CHECKPOINT_UNAVAILABLE",
+                "provider_requests": 0,
+                "writes": False,
+            }
+        payload.setdefault("mode", "execute" if args.execute else "plan")
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if payload.get("status") in {"idle", "replicated", "already_replicated"} else 1
     if args.command == "market-regime-snapshots":
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         if args.end < args.start or args.start > today or args.end > today:
@@ -2636,6 +2799,7 @@ def main() -> int:
             control_store,
             dataset_root,
             layout.local_paths.staging,
+            replication_enabled=settings.replication_enabled,
         )
         if readiness.mode in {"nas", "local_dataset"} and dataset_root is not None
         else control_store
@@ -2969,7 +3133,7 @@ def main() -> int:
                 )
             )
             return 2
-        lineage_pairs = None
+        lineage_pairs = prevalidated_lineage_pairs
         if args.lineage_input is not None and not isinstance(store, NasMarketStore):
             print(
                 json.dumps(
@@ -2984,7 +3148,7 @@ def main() -> int:
                 )
             )
             return 2
-        if args.lineage_input is not None and args.start is not None:
+        if args.lineage_input is not None and args.start is not None and lineage_pairs is None:
             confirmed = (
                 get_trading_calendar().snapshot().confirmed_open_sessions(args.start, args.end)
             )

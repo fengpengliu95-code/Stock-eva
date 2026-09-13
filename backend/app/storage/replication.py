@@ -353,15 +353,33 @@ class LineageResolver:
                 selection_sha256=LEGACY_SELECTION_SHA256,
                 lineage_sha256=LEGACY_LINEAGE_SHA256,
             )
-        if value.exact is None:
-            if self.evidence_reader is None:
-                return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        reader_value = None
+        resolved_selection_sha256: str | None = None
+        if self.evidence_reader is not None:
             try:
-                value = LineageInput.model_validate(self.evidence_reader(value, trade_date))
+                reader_value = self.evidence_reader(value, trade_date)
+                if isinstance(reader_value, Mapping):
+                    selection = reader_value.get("selection")
+                    if isinstance(selection, Mapping):
+                        resolved_selection_sha256 = selection.get("selection_sha256")
+                    elif selection is not None:
+                        resolved_selection_sha256 = getattr(selection, "selection_sha256", None)
+                if isinstance(reader_value, Mapping) and "lineage_input" in reader_value:
+                    reader_value = reader_value["lineage_input"]
+                if isinstance(reader_value, Mapping) and "lineage" in reader_value:
+                    reader_value = reader_value["lineage"]
+                if isinstance(reader_value, PublicationLineage):
+                    value = LineageInput(mode="modern", exact=reader_value)
+                else:
+                    value = LineageInput.model_validate(reader_value)
             except (TypeError, ValueError, ValidationError):
                 return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
+        elif value.exact is None:
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         assert value.exact is not None
         lineage = value.exact
+        if lineage.provider_id != "baostock":
+            return LineageResolveResult(kind="UNAVAILABLE", reason_code="SOURCE_UNAVAILABLE")
         lineage_sha = domain_sha256("stock-eva/r2f4.2/publication-lineage/v2", lineage.model_dump())
         return LineageResolveResult(
             kind="MODERN",
@@ -369,6 +387,12 @@ class LineageResolver:
             # A SessionSelection is required for a modern pointer publication;
             # manifest-only backfill can carry the exact lineage digest without
             # manufacturing a selection object.
+            selection_sha256=(
+                resolved_selection_sha256
+                if isinstance(resolved_selection_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", resolved_selection_sha256)
+                else None
+            ),
             lineage_sha256=lineage_sha,
         )
 
@@ -4741,11 +4765,19 @@ class ReplicationOutboxService:
         enabled: bool = True,
         source_instance_id: str | None = None,
         source_instance_sha256: str | None = None,
+        destination_id: str = "0" * 32,
+        journal_root: Path | None = None,
+        destination_verifier: object | None = None,
     ) -> None:
         self.path = _sidecar_root(Path(path))
         self.enabled = enabled
         self.source_instance_id = source_instance_id
         self.source_instance_sha256 = source_instance_sha256
+        if not re.fullmatch(r"[0-9a-f]{32}", destination_id):
+            raise ValueError("destination id is invalid")
+        self.destination_id = destination_id
+        self.journal_root = journal_root
+        self.destination_verifier = destination_verifier
 
     def pre_publication_guard(self, current_checkpoint: SourceCheckpoint | None = None) -> str:
         """Prove local durability before a subsequent pointer commit.
@@ -4755,6 +4787,36 @@ class ReplicationOutboxService:
         """
         if not self.enabled:
             return "DISABLED"
+        if self.journal_root is not None:
+            try:
+                records = [
+                    JournalRecord.read(path)
+                    for path in sorted(self.journal_root.glob("*.json"))
+                ]
+                if records:
+                    if self.source_instance_id is None or self.source_instance_sha256 is None:
+                        return "OUTBOX_DURABILITY_UNAVAILABLE"
+                    ReplicationSidecarStore(self.path).import_journals(
+                        records,
+                        operation_day=records[-1].source_published_at[:10],
+                        destination_id=self.destination_id,
+                    )
+                    for record in records:
+                        try:
+                            record_path = self.journal_root / f"{record.checkpoint_id}.json"
+                            record_path.unlink()
+                        except OSError:
+                            pass
+            except Exception:
+                return "OUTBOX_DURABILITY_UNAVAILABLE"
+        # An existing sidecar is part of the pre-publication durability
+        # contract.  A missing sidecar is valid for the first publication;
+        # a present but unreadable generation blocks the pointer commit.
+        if (self.path / SIDECAR_GENESIS_NAME).is_file():
+            try:
+                ReplicationSidecarStore(self.path).read_status()
+            except Exception:
+                return "OUTBOX_DURABILITY_UNAVAILABLE"
         if current_checkpoint is None:
             return "NONE"
         try:
@@ -4772,11 +4834,72 @@ class ReplicationOutboxService:
             reason = "SOURCE_NOT_CONFIGURED"
             state = "not_configured"
         else:
-            reason = "OUTBOX_ENQUEUE_FAILED"
-            state = "unavailable"
+            try:
+                inventory = tuple(
+                    ObjectInventoryEntry.model_validate(item)
+                    for item in source_commit.object_inventory
+                )
+                object_set = domain_sha256(
+                    SOURCE_OBJECT_SET_DOMAIN,
+                    _object_inventory_projection(inventory),
+                )
+                if object_set != source_commit.source_object_set_sha256:
+                    raise ReplicationDurabilityError("source object inventory changed")
+                checkpoint = build_source_checkpoint(
+                    source_instance_id=self.source_instance_id,
+                    source_instance_sha256=self.source_instance_sha256,
+                    publication_binding_sha256=source_commit.publication_binding_sha256,
+                    pointer_row_sha256=source_commit.pointer_row_sha256,
+                    pointer_generation=source_commit.pointer_generation,
+                    source_run_id=source_commit.source_run_id,
+                    source_trade_date=source_commit.source_trade_date,
+                    source_published_at=source_commit.source_published_at,
+                    pointer_db_device=source_commit.pointer_db_device,
+                    pointer_db_inode=source_commit.pointer_db_inode,
+                    pointer_db_schema_digest=source_commit.pointer_db_schema_digest,
+                    manifest_canonical_sha256=source_commit.manifest_canonical_sha256,
+                    source_manifest_bytes_sha256=source_commit.source_manifest_bytes_sha256,
+                    source_object_set_sha256=source_commit.source_object_set_sha256,
+                    object_inventory=inventory,
+                )
+                result = self.enqueue(
+                    checkpoint,
+                    operation_day=source_commit.source_trade_date,
+                    destination_id=self.destination_id,
+                    created_at=source_commit.committed_at,
+                )
+                if result.status in {"queued", "existing"}:
+                    reason = "NONE"
+                    state = result.status
+                    checkpoint_id = checkpoint.checkpoint_id
+                else:
+                    raise ReplicationDurabilityError(result.reason_code)
+            except Exception:
+                # Pointer publication is already linearized.  Preserve it and
+                # install an immutable journal when configured so the next
+                # guard/startup can reconcile without a provider request.
+                reason = "OUTBOX_JOURNALED" if self.journal_root is not None else "OUTBOX_ENQUEUE_FAILED"
+                state = "journaled" if self.journal_root is not None else "unavailable"
+                checkpoint_id = source_commit.source_commit_sha256
+                if self.journal_root is not None:
+                    try:
+                        journal = build_journal_record(
+                            checkpoint_id=checkpoint.checkpoint_id,
+                            source_instance_id=checkpoint.source_instance_id,
+                            source_instance_sha256=checkpoint.source_instance_sha256,
+                            publication_binding_sha256=checkpoint.publication_binding_sha256,
+                            source_published_at=checkpoint.source_published_at,
+                            checkpoint_projection=checkpoint,
+                            created_at=source_commit.committed_at,
+                        )
+                        journal.install(self.journal_root)
+                    except Exception:
+                        reason = "OUTBOX_ENQUEUE_FAILED"
+                        state = "unavailable"
+        checkpoint_id = locals().get("checkpoint_id", source_commit.source_commit_sha256)
         values: dict[str, object] = {
             "source_commit_sha256": source_commit.source_commit_sha256,
-            "checkpoint_id": source_commit.source_commit_sha256,
+            "checkpoint_id": checkpoint_id,
             "source_instance_id": self.source_instance_id or "0" * 64,
             "source_sequence": None,
             "intent_id": None,
@@ -4887,6 +5010,98 @@ class ReplicationOutboxService:
         return ReplicationSidecarStore(self.path).claim_due(
             worker_id=worker_id, now=now, lease_seconds=lease_seconds
         )
+
+    def complete(self, proof: VerifiedDestinationCommitProof) -> ReplicationHead:
+        if not self.enabled:
+            raise ReplicationDurabilityError("replication drain is disabled")
+        return ReplicationSidecarStore(
+            self.path, destination_verifier=self.destination_verifier
+        ).complete_replication(proof)
+
+
+class ReplicationDrainWorker:
+    """Bounded one-claim drain from the local outbox to a trusted destination.
+
+    The worker deliberately owns at most one claim per invocation.  A caller
+    may schedule it repeatedly, but disabled configurations return before
+    opening the sidecar or constructing a destination writer.
+    """
+
+    def __init__(
+        self,
+        outbox: ReplicationOutboxService,
+        writer: "DestinationArchiveWriter",  # noqa: UP037
+        *,
+        replication_enabled: bool,
+        replication_drain_enabled: bool = False,
+        worker_id: str = "market-replication-drain",
+        checkpoint_reader=None,
+        lease_seconds: int = REPLICATION_LEASE_SECONDS,
+    ) -> None:
+        self.outbox = outbox
+        self.writer = writer
+        self.replication_enabled = replication_enabled
+        self.replication_drain_enabled = replication_drain_enabled
+        self.worker_id = worker_id
+        self.checkpoint_reader = checkpoint_reader
+        self.lease_seconds = lease_seconds
+
+    def run_once(self, *, now: str | None = None) -> dict[str, object]:
+        if not (self.replication_enabled and self.replication_drain_enabled):
+            return {"status": "disabled", "writes": False, "provider_requests": 0}
+        if self.checkpoint_reader is None:
+            return {
+                "status": "unavailable",
+                "reason_code": "SOURCE_CHECKPOINT_UNAVAILABLE",
+                "writes": False,
+                "provider_requests": 0,
+            }
+        claim = self.outbox.claim_due(
+            worker_id=self.worker_id,
+            now=now,
+            lease_seconds=self.lease_seconds,
+        )
+        if claim is None:
+            return {"status": "idle", "writes": False, "provider_requests": 0}
+        try:
+            checkpoint = self.checkpoint_reader(claim.checkpoint_id)
+            if not isinstance(checkpoint, SourceCheckpoint):
+                checkpoint = SourceCheckpoint.model_validate(checkpoint)
+            checkpoint.verify_hashes()
+            context = ReplicationClaimContext(
+                intent_id=claim.intent_id,
+                worker_id=claim.worker_id,
+                state_version=claim.state_version,
+                checkpoint_id=claim.checkpoint_id,
+                source_instance_id=checkpoint.source_instance_id,
+                source_instance_sha256=checkpoint.source_instance_sha256,
+            )
+            result = self.writer.replicate(
+                checkpoint,
+                source_sequence=claim.source_sequence,
+                claim_context=context,
+            )
+            if result.status not in {"replicated", "already_replicated"} or result.proof is None:
+                return {
+                    "status": "unavailable",
+                    "reason_code": result.reason_code,
+                    "writes": result.destination_writes,
+                    "provider_requests": 0,
+                }
+            self.outbox.complete(result.proof)
+            return {
+                "status": result.status,
+                "reason_code": "NONE",
+                "writes": result.destination_writes,
+                "provider_requests": 0,
+            }
+        except Exception:
+            return {
+                "status": "unavailable",
+                "reason_code": "CONTROL_STATE_UNAVAILABLE",
+                "writes": False,
+                "provider_requests": 0,
+            }
 
 
 class ReplicationStatusService:

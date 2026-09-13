@@ -46,6 +46,11 @@ from backend.app.orchestration.adapters import build_after_close_pipeline
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
+from backend.app.storage.replication import (
+    ReplicationOutboxService,
+    SourceInstanceStore,
+    domain_sha256,
+)
 from backend.app.user.store import UserStore
 
 settings = get_settings()
@@ -144,17 +149,58 @@ async def lifespan(_: FastAPI):
         temp_directory=layout.duckdb_temporary,
     )
     dataset_root = configured_market_dataset_root(settings)
+    replication_service = None
+    if settings.replication_enabled and dataset_root is not None:
+        source_instance_path = layout.replication_source_instance
+        if source_instance_path is not None:
+            try:
+                if source_instance_path.exists():
+                    source_instance = SourceInstanceStore(source_instance_path).read(
+                        canonical_root_path=dataset_root
+                    )
+                else:
+                    schema_connection = control_store._connect()
+                    try:
+                        schema_rows = schema_connection.execute(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema='main' ORDER BY table_name"
+                        ).fetchall()
+                    finally:
+                        schema_connection.close()
+                    schema_digest = domain_sha256(
+                        "stock-eva/r2f4.3/canonical-control-schema/v1",
+                        [str(row[0]) for row in schema_rows],
+                    )
+                    source_instance = SourceInstanceStore(source_instance_path).create(
+                        canonical_root_path=dataset_root,
+                        canonical_schema_digest=schema_digest,
+                    )
+                replication_service = ReplicationOutboxService(
+                    layout.replication_sidecar_root,
+                    enabled=True,
+                    source_instance_id=source_instance.source_instance_id,
+                    source_instance_sha256=source_instance.source_instance_sha256,
+                    journal_root=layout.replication_journal_root,
+                )
+            except Exception:
+                replication_service = None
     market_store = (
         NasMarketStore(
             control_store,
             dataset_root,
             layout.local_paths.staging,
+            replication_enabled=settings.replication_enabled,
+            replication_service=replication_service,
         )
         if readiness.mode in {"nas", "local_dataset"} and dataset_root is not None
         else control_store
     )
     if isinstance(market_store, NasMarketStore):
         try:
+            if replication_service is not None:
+                guard_reason = replication_service.pre_publication_guard()
+                if guard_reason not in {None, "NONE", True}:
+                    raise DatasetError("replication durability guard is unavailable")
             market_store.validate_readiness()
             market_store.reconcile_control_pointer()
         except DatasetError:

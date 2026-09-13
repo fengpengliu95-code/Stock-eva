@@ -40,6 +40,7 @@ from backend.app.storage.replication import (
     ReplicationObservation,
     SourceCommit,
     SourcePublicationBinding,
+    _install_no_replace,
     canonical_json_bytes,
     domain_sha256,
 )
@@ -184,9 +185,19 @@ def _read_bounded_json(path: Path) -> object:
 
 
 def _atomic_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.partial")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    with temporary.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _safe_relative(value: str) -> Path:
@@ -372,20 +383,48 @@ class ManifestPublicationCoordinator:
         self.lineage_resolver = LineageResolver()
         self.durability_guard = None
 
-    @staticmethod
     def _lineage_values(
+        self,
         lineage_input: LineageInput | dict[str, object] | None,
+        *,
+        trade_date: date,
+        existing_mode: Literal["empty", "legacy", "modern"] = "empty",
+        selection: object | None = None,
     ) -> tuple[dict[str, object], str, str]:
         if lineage_input is None:
             lineage_input = {"mode": "legacy"}
-        resolved = LineageResolver().resolve(lineage_input, "2000-01-01", "empty")
+        resolved = self.lineage_resolver.resolve(
+            lineage_input, trade_date.isoformat(), existing_mode
+        )
         if resolved.kind == "UNAVAILABLE":
             raise DatasetError("source lineage is unavailable")
         if resolved.kind == "LEGACY":
             return {}, LEGACY_SELECTION_SHA256, LEGACY_LINEAGE_SHA256
         assert resolved.lineage is not None
         values = resolved.lineage.model_dump(mode="json")
-        return values, LEGACY_SELECTION_SHA256, resolved.lineage_sha256 or LEGACY_LINEAGE_SHA256
+        selection_sha = resolved.selection_sha256
+        if selection is not None:
+            selected = getattr(selection, "selection", selection)
+            selection_sha = getattr(selected, "selection_sha256", None)
+        if not isinstance(selection_sha, str) or not _SHA256.fullmatch(selection_sha):
+            raise DatasetError("source selection evidence is unavailable")
+        return (
+            values,
+            selection_sha,
+            resolved.lineage_sha256 or LEGACY_LINEAGE_SHA256,
+        )
+
+    def _existing_lineage_mode(
+        self, manifest: dict[str, object]
+    ) -> Literal["empty", "legacy", "modern"]:
+        files = manifest.get("files", [])
+        if not files:
+            return "empty"
+        present = [item for item in files if isinstance(item, dict)]
+        modern = [any(field in item for field in _R2F2_LINEAGE_FIELDS) for item in present]
+        if any(modern) and not all(modern):
+            raise DatasetError("source lineage is unavailable")
+        return "modern" if all(modern) else "legacy"
 
     @staticmethod
     def _manifest_hashes(
@@ -449,14 +488,21 @@ class ManifestPublicationCoordinator:
         bars = values.get("bars", kwargs.get("bars", []))
         lineage_input = values.get("lineage_input", kwargs.get("lineage_input"))
         source = values.get("source", kwargs.get("source", "baostock"))
-        self.store._ensure_writable()
-        before = self.store._pointer_identity()
-        if before.kind == "INVALID":
-            raise DatasetError("control state unavailable")
-        lineage, _selection_sha, _lineage_sha = self._lineage_values(lineage_input)
         with self.lock as token:
             token.validate()
+            self.store._ensure_writable()
+            before = self.store._pointer_identity()
+            if before.kind == "INVALID":
+                raise DatasetError("control state unavailable")
             baseline = self.store._manifest()
+            dates = {bar.trade_date for bar in bars}
+            if not dates:
+                raise DatasetError("manifest-only publication requires one trade date")
+            lineage, _selection_sha, _lineage_sha = self._lineage_values(
+                lineage_input,
+                trade_date=min(dates),
+                existing_mode=self._existing_lineage_mode(baseline),
+            )
             grouped = defaultdict(list)
             for bar in bars:
                 grouped[(bar.trade_date, bar.source or source)].append(bar)
@@ -484,26 +530,37 @@ class ManifestPublicationCoordinator:
         values = self._input_values(input_value, kwargs)
         bars = values.get("bars", kwargs.get("bars", []))
         result = values.get("result", kwargs.get("result"))
+        selection = values.get("selection", kwargs.get("selection"))
+        dataset_already_ready = bool(values.get("dataset_already_ready", False))
         lineage_input = values.get("lineage_input", kwargs.get("lineage_input"))
         self.store._ensure_writable()
         if result is None:
             raise DatasetError("dataset pointer publication requires refresh result")
-        lineage, selection_sha, lineage_sha = self._lineage_values(lineage_input)
-        if lineage:
-            self.store._validate_publication_lineage(lineage)
         with self.lock as token:
             token.validate()
+            baseline_pointer = self.store._pointer_identity()
+            if baseline_pointer.kind == "INVALID":
+                raise DatasetError("control state unavailable")
             if self.durability_guard is not None:
                 reason = self.durability_guard()
                 if reason not in (None, "NONE", True):
                     raise DatasetError(str(reason))
             baseline = self.store._manifest()
+            lineage, selection_sha, lineage_sha = self._lineage_values(
+                lineage_input,
+                trade_date=result.requested_date,
+                existing_mode=self._existing_lineage_mode(baseline),
+                selection=selection,
+            )
+            if lineage:
+                self.store._validate_publication_lineage(lineage)
             grouped = defaultdict(list)
             for bar in bars:
                 grouped[(bar.trade_date, bar.source)].append(bar)
             if not grouped:
                 raise DatasetError("cannot publish an empty bar set")
-            self.store._publish_locked(grouped, baseline["generation"], lineage=lineage)
+            if not dataset_already_ready:
+                self.store._publish_locked(grouped, baseline["generation"], lineage=lineage)
             manifest = self.store._manifest()
             raw_sha, canonical_sha, object_sha = self._manifest_hashes(manifest, self.store.root)
             published_at = (
@@ -531,36 +588,61 @@ class ManifestPublicationCoordinator:
                 },
             )
             binding = SourcePublicationBinding.model_validate(binding_values)
-            self.store._write_binding(binding)
+            if self.store.replication_enabled:
+                self.store._write_binding(binding)
+            # The manifest bytes/hash tuple is the final CAS boundary.  A
+            # binding is never allowed to outlive a manifest that changed
+            # after the immutable publication completed.
+            final_manifest = self.store._manifest()
+            if self._manifest_hashes(final_manifest, self.store.root) != (
+                raw_sha,
+                canonical_sha,
+                object_sha,
+            ):
+                raise DatasetError("published manifest changed before pointer commit")
+            if (
+                baseline_pointer.kind == "PRESENT"
+                and self.store._pointer_identity() != baseline_pointer
+            ):
+                raise DatasetError("control pointer changed before pointer commit")
             self.store.control.save_external_publication(result)
             pointer = self.store._pointer_identity()
             source_commit = self.store._source_commit(
-                result, binding, pointer, object_sha, raw_sha, canonical_sha
+                result,
+                binding,
+                pointer,
+                object_sha,
+                raw_sha,
+                canonical_sha,
+                manifest,
             )
-        observation = ReplicationObservation(
-            source_commit_sha256=source_commit.source_commit_sha256,
-            checkpoint_id=source_commit.source_commit_sha256,
-            source_instance_id=source_commit.source_instance_id,
-            enqueue_state="not_configured",
-            reason_code="SOURCE_NOT_CONFIGURED",
-            effects=ReplicationEffects(
-                writes=False,
-                canonical_writes=True,
-                destination_writes=False,
-                outbox_writes=False,
-                restore_writes=False,
-            ),
-            observed_at=datetime.now(UTC).isoformat(),
-            observation_sha256="0" * 64,
-        )
-        observation = observation.model_copy(
-            update={
-                "observation_sha256": domain_sha256(
-                    "stock-eva/r2f4.3/replication-observation/v1",
-                    observation.model_dump(exclude={"observation_sha256"}),
-                )
-            }
-        )
+        if self.store.replication_service is not None:
+            observation = self.store.replication_service.on_canonical_committed(source_commit)
+        else:
+            observation = ReplicationObservation(
+                source_commit_sha256=source_commit.source_commit_sha256,
+                checkpoint_id=source_commit.source_commit_sha256,
+                source_instance_id=source_commit.source_instance_id,
+                enqueue_state="not_configured",
+                reason_code="SOURCE_NOT_CONFIGURED",
+                effects=ReplicationEffects(
+                    writes=False,
+                    canonical_writes=True,
+                    destination_writes=False,
+                    outbox_writes=False,
+                    restore_writes=False,
+                ),
+                observed_at=datetime.now(UTC).isoformat(),
+                observation_sha256="0" * 64,
+            )
+            observation = observation.model_copy(
+                update={
+                    "observation_sha256": domain_sha256(
+                        "stock-eva/r2f4.3/replication-observation/v1",
+                        observation.model_dump(exclude={"observation_sha256"}),
+                    )
+                }
+            )
         return {
             "manifest_generation": binding.manifest_generation,
             "publication_binding": binding,
@@ -579,14 +661,20 @@ class NasMarketStore:
         staging_root: Path,
         *,
         manifest_lock_path: Path | None = None,
+        replication_enabled: bool = False,
+        replication_service=None,
     ) -> None:
         self.control = control
         self.root = root
         self.staging_root = staging_root
         self.manifest_lock_path = manifest_lock_path or staging_root / "nas-manifest.lock"
+        self.replication_enabled = replication_enabled
+        self.replication_service = replication_service
         self.publisher = DatasetPublication()
         self.coordinator = ManifestPublicationCoordinator(self)
         self.lineage_resolver = self.coordinator.lineage_resolver
+        if replication_service is not None:
+            self.coordinator.durability_guard = replication_service.pre_publication_guard
 
     def _ensure_writable(self) -> None:
         if self.control.read_only:
@@ -595,13 +683,26 @@ class NasMarketStore:
     def _pointer_identity(self) -> PointerIdentity:
         if not self.control.path.exists():
             return PointerIdentity("ABSENT")
+        descriptor = -1
         try:
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.control.path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
             connection = self.control._connect_reader()
             if connection is None:
                 return PointerIdentity("ABSENT")
             try:
                 tables = {str(row[0]) for row in connection.execute("SHOW TABLES").fetchall()}
-                if "published_snapshots" not in tables:
+                required_tables = {
+                    "daily_bars",
+                    "refresh_runs",
+                    "published_snapshots",
+                    "published_daily_bars",
+                    "market_automation_state",
+                }
+                if not required_tables.issubset(tables):
                     return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
                 rows = connection.execute(
                     "SELECT singleton, run_id, trade_date, published_at FROM published_snapshots"
@@ -617,17 +718,35 @@ class NasMarketStore:
                         "trade_date": str(rows[0][2]),
                         "published_at": str(rows[0][3]),
                     }
-                db = os.stat(self.control.path, follow_symlinks=False)
+                after = os.fstat(descriptor)
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ):
+                    return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
                 schema = domain_sha256(
                     "stock-eva/r2f4.3/pointer-db-schema/v1",
-                    sorted(tables),
+                    sorted(
+                        (
+                            str(row[0]),
+                            str(row[1]),
+                            str(row[2]),
+                            str(row[3]),
+                        )
+                        for row in connection.execute(
+                            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                            "WHERE type IN ('table','index','trigger')"
+                        ).fetchall()
+                    ),
                 )
                 return (
                     PointerIdentity(
                         "PRESENT" if state.get("kind") != "ABSENT" else "ABSENT",
                         row_sha256=domain_sha256("stock-eva/r2f4.3/pointer-row/v1", state),
-                        device=int(db.st_dev),
-                        inode=int(db.st_ino),
+                        device=int(before.st_dev),
+                        inode=int(before.st_ino),
                         schema_digest=schema,
                     )
                     if state.get("kind") != "ABSENT"
@@ -637,29 +756,36 @@ class NasMarketStore:
                 connection.close()
         except Exception:
             return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _write_binding(self, binding: SourcePublicationBinding) -> Path:
         root = self.root / "_replication" / "source-commits"
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{binding.run_id}.json"
         payload = canonical_json_bytes(binding.model_dump(mode="json"))
-        if path.exists():
-            if path.read_bytes() != payload:
-                raise DatasetError("publication binding conflict")
-            return path
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.partial")
-        temporary.write_bytes(payload)
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        return path
+            return _install_no_replace(path, payload)
+        except Exception as exc:
+            if "already exists" in str(exc):
+                raise DatasetError("publication binding conflict") from exc
+            raise
 
-    def _source_commit(self, result, binding, pointer, object_sha, raw_sha, canonical_sha):
+    def _source_commit(
+        self, result, binding, pointer, object_sha, raw_sha, canonical_sha, manifest
+    ):
+        inventory = tuple(
+            {
+                "relative_path": str(item["path"]),
+                "object_sha256": str(item["sha256"]),
+                "size_bytes": int((self.root / str(item["path"])).stat().st_size),
+                "row_count": int(item["row_count"]),
+                "trade_date": str(item["trade_date"]),
+                "source": str(item["source"]),
+            }
+            for item in sorted(manifest.get("files", []), key=lambda value: str(value["path"]))
+        )
         values = {
             "pointer_row_sha256": pointer.row_sha256 or "0" * 64,
             "pointer_generation": binding.manifest_generation,
@@ -672,7 +798,7 @@ class NasMarketStore:
             "manifest_canonical_sha256": canonical_sha,
             "source_manifest_bytes_sha256": raw_sha,
             "source_object_set_sha256": object_sha,
-            "object_inventory": (),
+            "object_inventory": inventory,
             "publication_binding_sha256": binding.binding_sha256,
             "publication_binding_manifest_generation": binding.manifest_generation,
             "publication_binding_selection_sha256": binding.selection_sha256,
@@ -681,8 +807,16 @@ class NasMarketStore:
             "source_instance_sha256": "0" * 64,
             "committed_at": datetime.now(UTC).isoformat(),
         }
-        values["source_commit_sha256"] = domain_sha256("stock-eva/r2f4.3/source-commit/v1", values)
-        return SourceCommit.model_validate(values)
+        # Hash the exact canonical Pydantic preimage (tuple inventory is
+        # serialized as a JSON array); hashing the construction dictionary
+        # directly would produce a different domain value.
+        commit = SourceCommit.model_validate({**values, "source_commit_sha256": "0" * 64})
+        values["source_commit_sha256"] = domain_sha256(
+            "stock-eva/r2f4.3/source-commit/v1", commit.hash_preimage()
+        )
+        commit = SourceCommit.model_validate(values)
+        commit.verify_hash()
+        return commit
 
     @staticmethod
     def _validate_publication_lineage(lineage: dict[str, object] | None) -> dict[str, object]:
@@ -1147,6 +1281,7 @@ class NasMarketStore:
                 "result": result,
                 "selection": None,
                 "lineage_input": {"mode": "legacy"},
+                "dataset_already_ready": True,
             }
         )
         return result
