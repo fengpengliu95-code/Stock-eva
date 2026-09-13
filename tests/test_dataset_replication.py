@@ -1083,6 +1083,32 @@ def test_operation_day_is_scheduling_metadata_not_intent_identity(tmp_path: Path
     assert sidecar.get_intent(first.intent_ids[0]).operation_day == "2026-09-09"
 
 
+def test_claim_due_operation_day_filters_source_publication_with_fake_clock(tmp_path: Path) -> None:
+    sidecar = ReplicationSidecarStore(tmp_path / "control" / "replication-sidecar")
+    sidecar.initialize(source_instance_id="a" * 64, source_instance_sha256="b" * 64)
+    checkpoint = _checkpoint_for_journal().checkpoint_projection
+    sidecar.enqueue_checkpoint(
+        checkpoint,
+        operation_day="2026-09-09",
+        destination_id="1" * 32,
+        created_at="2026-09-09T00:00:00Z",
+    )
+    assert (
+        sidecar.claim_due(
+            worker_id="worker-before",
+            now="2026-09-09T00:01:00Z",
+            operation_day="2026-09-08",
+        )
+        is None
+    )
+    claim = sidecar.claim_due(
+        worker_id="worker-on-day",
+        now="2026-09-09T00:01:00Z",
+        operation_day="2026-09-09",
+    )
+    assert claim is not None
+
+
 def test_outbox_transaction_crash_before_generation_install_preserves_prior_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

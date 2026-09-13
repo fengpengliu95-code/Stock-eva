@@ -1,96 +1,200 @@
-# R2-F4.3 replication and restore — current normative design
+# R2-F4.3 replication and restore — authoritative normative specification
 
-Status: **RC / pending final independent gate**. This is a candidate design,
-not a production or QUALITY GO. No NAS/SMB mount, provider request,
-LaunchAgent, credential, or production operation is permitted from this
-worktree. The only accepted trust scope is `LOCAL_CHAIN_ONLY`.
+Status: RC / Candidate/NO-GO pending next independent audit. This document is the
+single current normative truth for the release candidate. It contains no historical
+amendment corpus. Scope is LOCAL_CHAIN_ONLY: no real NAS/SMB mount, provider,
+LaunchAgent, credential, or production operation may run from this worktree.
 
-## Contract
+## Safety contract
 
-The local canonical publication is the sole source of truth. Manifest-only
-publication mutates and fsyncs only the manifest and verifies its readback;
-it never creates a pointer, binding, source commit, sidecar, outbox, or guard.
-Dataset-plus-pointer publication creates one immutable binding even when
-replication is disabled. An existing exact generation binding is verified and
-reused; duplicate or conflicting bindings fail closed. All binding reads call
-`SourcePublicationBinding.verify_hash()` before field use.
+Canonical local publication is the source of truth. Manifest-only publication mutates,
+fsyncs, and reads back only the manifest/object projection; it never creates a binding,
+pointer, source commit, guard, sidecar, or outbox. Dataset-plus-pointer publication
+creates or byte-identically reuses one immutable binding, verifies its hash before
+reading fields, then commits the pointer. A binding conflict, duplicate generation,
+manifest drift, pointer proof failure, lock close failure, or journal failure cannot
+roll back a durable ready pointer; reconciliation evidence is journaled when possible.
 
-The source commit is optional when replication is not configured. It must
-never contain zero identities. When configured, the coordinator reads one
-immutable `SourceInstanceRecord` whose canonical root and descriptor-stable
-schema digest match the local control database; the commit records its exact
-`source_instance_id` and `source_instance_sha256` and verifies both identities.
-Post-pointer proof, close, unlock, and journal failures preserve the ready
-pointer and durably journal reconciliation evidence when possible.
+When configured, the coordinator reads one immutable SourceInstanceRecord bound to the
+explicit dataset root and descriptor-stable canonical schema digest. SourceCommit carries
+the exact source-instance ID and digest and never invents an all-zero identity. When
+replication is not configured, SourceCommit is optional and the observation is the
+typed SOURCE_NOT_CONFIGURED projection.
 
-`PointerIdentity` is an exact tagged union. ABSENT means a missing database or
-an exact canonical schema with no singleton row and no extra payload fields;
-PRESENT includes the exact row, device, inode, and schema digest; all schema,
-constraint, index, duplicate, unreadable, missing, extra, or type drift is
-INVALID. Its descriptor-stable schema digest is shared by factory and reader.
+PointerIdentity is an exact tagged union: ABSENT is only a missing database or a full
+canonical schema with no singleton and no extra payload; PRESENT includes the exact row,
+device, inode, and schema digest; every unknown table/column, missing column, type,
+constraint/index/schema drift, duplicate, unreadable, or malformed state is INVALID.
+Factory and reader share one descriptor-stable schema contract.
 
-Modern lineage is admitted only from retained successful terminal evidence,
-candidate/gate records, and an exact `SessionSelection`: date, universe,
-provider, IDs, and all hashes must agree. Missing, forged, unknown, partial,
-mixed, or corrupt lineage is unavailable. Legacy is explicit and only allowed
-after a read-only proof of an existing legacy manifest. Ordered dates are not
-deduplicated. Effective-day planning uses a proven local calendar before any
-provider call.
+Modern lineage requires retained successful terminal evidence, candidate/gate records,
+and an exact SessionSelection relation (trade date, universe, provider, IDs, and all
+hashes). Missing, forged, partial, mixed, unknown, or corrupt lineage is unavailable.
+Legacy is explicit and only follows a read-only proof of an existing legacy manifest.
+Ordered dates are not deduplicated; effective-day planning uses a proven local calendar
+before any provider request.
 
-Replication automation has two gates (`replication_enabled` and
-`replication_drain_enabled`) plus an approved local destination descriptor and
-writer lock. Disabled paths short-circuit before sidecar/NAS access. CLI
-operations are explicit, default to zero-write `dry_run`, validate absolute
-non-root/non-home/non-overlapping paths lexically and by descriptor, and
-sanitize output. Init additionally requires the exact acknowledgement
-`CREATE_EMPTY_NAS_ARCHIVE_R2F4_3`.
+Automation calls at most one bounded drain worker only when both replication gates are
+true and an approved local destination descriptor/lock is available. CLI commands are
+explicit and default to typed dry_run; lexical and descriptor-native checks reject
+relative, root, home, unresolved, symlink-alias, mutable-root, and overlap paths.
+Init requires CREATE_EMPTY_NAS_ARCHIVE_R2F4_3. Operation-day visibility uses the
+Asia/Shanghai end-of-day cutoff for source publication and selected restore heads.
+Status is read-only, sanitized, mode=status, and returns no paths/secrets.
 
-## Integrity and threat boundaries
+## Integrity and threat limitations
 
-All wire records use strict Pydantic schemas (`extra=forbid`), canonical JSON,
-domain-separated SHA-256 preimages, no-follow descriptor traversal, exclusive
-create/no-replace installation, fsync of files and parent directories, and
-descriptor/inode/fingerprint readback. Destination state is local-only and
-must not be confused with provider evidence. Unknown or orphan state is
-quarantined or reported unavailable; rollback is manual and never replaces a
-valid canonical pointer. Secrets, paths, credentials, and provider payloads
-are absent from public status.
+Wire records use strict extra-forbidden schemas, canonical UTF-8 JSON, domain-separated
+SHA-256 preimages, no-follow descriptor traversal, exclusive no-replace installation,
+file/parent fsync, immutable event history, state-version CAS, bounded retries, and
+exact byte/inode/fingerprint readback. Destination staging is never reader-visible;
+unknown/orphan state is preserved for manual review/quarantine. Rollback is manual and
+cannot replace a newer valid canonical generation. Canonical manifest/pointer schemas,
+plain MarketStore behavior, and prior mirror compatibility remain unchanged. Public
+responses expose only allowlisted state, reason codes, counts, hashes, bounded timestamps,
+effects, and LOCAL_CHAIN_ONLY.
 
-## Requirements and evidence crosswalk
+## Requirements and exact evidence
 
-The following exact anchors are the current executable evidence. The companion
-implementation plan repeats this table; the validator rejects any anchor that
-is not an actual test function.
+Exactly 42 FR, 16 NFR, 31 AC, and 40 EC IDs are authoritative below. Each ID occurs
+once and maps to one real AST-discoverable test function; evidence anchors may be reused.
 
-| Requirement | Exact evidence anchor |
-|---|---|
-| manifest-only isolation | `test_manifest_only_does_not_create_binding_or_pointer_sidecar` |
-| disabled binding and no zero source identity | `test_disabled_replication_still_seals_local_publication_binding` |
-| pointer tagged union | `test_pointer_identity_distinguishes_valid_absent_from_invalid_partial` |
-| pointer schema extras invalid | `test_pointer_identity_rejects_extra_table_and_column` |
-| retained evidence resolver | `test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper` |
-| explicit NAS writer callsites | `test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists` |
-| unavailable modern lineage | `test_modern_lineage_requires_retained_success_evidence_reader` |
-| explicit writer lineage | `test_omitted_lineage_fails_before_manifest_mutation` |
-| corrupt manifest | `test_manifest_corruption_is_not_treated_as_empty` |
-| ordered dataset plan | `test_dataset_plan_rejects_duplicate_and_out_of_order_dates` |
-| binding exact reuse | `test_binding_reuse_requires_exact_immutable_fields` |
-| duplicate bindings | `test_reconcile_rejects_duplicate_generation_bindings` |
-| binding hash verification | `test_mutated_binding_hash_rejects_reconcile_without_pointer_change` |
-| post-pointer journal | `test_postcommit_invalid_pointer_journals_exact_context` |
-| automation double gate | `test_drain_factory_double_gate_short_circuits_before_destination` |
-| source record immutability | `test_source_instance_record_is_immutable_and_fsynced` |
-| source identity preimage | `test_source_instance_identity_golden_preimage_binds_nonce_and_only_dataset_identity` |
-| source root binding | `test_source_instance_read_binds_current_canonical_root` |
-| disabled sidecar zero work | `test_disabled_outbox_operation_is_zero_write` |
-| local chain trust scope | `test_public_status_exposes_fixed_local_chain_trust_scope` |
-| explicit destination status | `test_replication_status_missing_sidecar_is_unavailable_without_initialization` |
-| canonical manifest/pointer safety | `test_failed_readback_never_moves_manifest_or_published_pointer` |
+| ID | Effective latest semantics | Exact evidence anchor |
+|---|---|---|
+| FR-1 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| FR-1a | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| FR-2 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| FR-2a | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| FR-3 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| FR-3a | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| FR-3b | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| FR-3c | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| FR-3d | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| FR-3e | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| FR-3f | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| FR-3g | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| FR-3h | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| FR-4 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| FR-5 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| FR-5a | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| FR-6 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| FR-7 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| FR-8 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| FR-9 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| FR-10 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| FR-11 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| FR-12 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| FR-13 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| FR-14 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| FR-15 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| FR-16 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| FR-17 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| FR-18 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| FR-19 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| FR-20 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| FR-21 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| FR-22 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| FR-23 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| FR-24 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| FR-25 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| FR-26 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| FR-27 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| FR-3i | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| FR-3j | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| FR-28 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| FR-29 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| NFR-1 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| NFR-2 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| NFR-3 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| NFR-4 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| NFR-5 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| NFR-6 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| NFR-7 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| NFR-8 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| NFR-9 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| NFR-10 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| NFR-11 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| NFR-12 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| NFR-13 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| NFR-14 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| NFR-15 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| NFR-16 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| AC-1 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| AC-2 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| AC-3 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| AC-4 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| AC-5 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| AC-6 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| AC-7 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| AC-8 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| AC-9 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| AC-10 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| AC-11 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| AC-12 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| AC-13 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| AC-14 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| AC-15 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| AC-16 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| AC-17 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| AC-18 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| AC-19 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| AC-20 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| AC-21 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| AC-22 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| AC-23 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| AC-24 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| AC-25 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| AC-26 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| AC-27 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| AC-28 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| AC-29 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| AC-30 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| AC-31 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| EC-1 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| EC-2 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| EC-3 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| EC-4 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| EC-5 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| EC-6 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| EC-7 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| EC-8 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| EC-9 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| EC-10 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| EC-11 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| EC-12 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| EC-13 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| EC-14 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| EC-15 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| EC-16 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| EC-17 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| EC-25 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| EC-26 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| EC-27 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| EC-28 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| EC-29 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| EC-30 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| EC-31 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
+| EC-32 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_disabled_outbox_operation_is_zero_write |
+| EC-33 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_sidecar_normative_ddl_identity_and_immutable_event_history |
+| EC-34 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_source_checkpoint_recomputes_object_set_digest_and_rejects_mismatch |
+| EC-35 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_status_missing_sidecar_is_unavailable_without_initialization |
+| EC-36 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_verified_local_mirror_is_idempotent_and_manifest_readable |
+| EC-37 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_retry_schedule_and_dead_letter_are_bounded |
+| EC-38 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_only_does_not_create_binding_or_pointer_sidecar |
+| EC-39 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_pointer_identity_rejects_extra_table_and_column |
+| EC-40 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper |
+| EC-18 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_manifest_corruption_is_not_treated_as_empty |
+| EC-19 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_postcommit_invalid_pointer_journals_exact_context |
+| EC-20 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_cli_rejects_lexical_paths_before_any_write |
+| EC-21 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_market_replicate_defaults_to_typed_zero_write_dry_run |
+| EC-22 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_replication_init_requires_exact_ack_and_dry_run_is_zero_write |
+| EC-23 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_failed_readback_never_moves_manifest_or_published_pointer |
+| EC-24 | Effective latest contract remains fail-closed, deterministic, local-first, and preserves canonical ready state on failure. | test_drain_factory_double_gate_short_circuits_before_destination |
 
 ## Release boundary
 
-The final independent audit must inspect the exact commit, diff, validator
-output, full test output, and disabled/no-real-NAS evidence. Candidate status
-remains **Candidate/NO-GO pending audit** until that gate is separately
-recorded. Unknown-orphan remediation and any real-NAS controlled operation
-require a new explicit window and the runbook checklist.
+The implementation and evidence commits are separate: implementation_commit is the
+code commit and evidence_base_commit is its doc/test-only successor. This candidate
+does not claim independent SPEC or QUALITY GO. The final audit must inspect the exact
+commit, all IDs and anchors, full/static/no-write results, and the runbook before any
+real-NAS change window.

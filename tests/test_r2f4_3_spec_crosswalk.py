@@ -9,6 +9,12 @@ DOCS = (
     ROOT / "docs/plans/2026-09-09-stock-eva-r2f4-3-replication-restore-design.md",
     ROOT / "docs/plans/2026-09-09-stock-eva-r2f4-3-replication-restore-implementation.md",
 )
+ID_PATTERN = re.compile(r"\b(?:FR|NFR|AC|EC)-[0-9]+[a-z]?\b")
+ROW_PATTERN = re.compile(
+    r"^\| ((?:FR|NFR|AC|EC)-[0-9]+[a-z]?) \| .* \| (test_[A-Za-z0-9_]+) \|$",
+    re.MULTILINE,
+)
+EXPECTED_COUNTS = {"FR": 42, "NFR": 16, "AC": 31, "EC": 40}
 
 
 def _test_names() -> set[str]:
@@ -29,7 +35,7 @@ def test_current_docs_have_only_real_test_anchors_and_shared_release_boundary() 
     anchors = []
     for path in DOCS:
         text = path.read_text(encoding="utf-8")
-        assert "RC / pending final independent gate" in text
+        assert "RC / Candidate/NO-GO pending next independent audit" in text
         assert "LOCAL_CHAIN_ONLY" in text
         assert "Candidate/NO-GO pending" in text
         anchors.extend(re.findall(r"(?<![A-Za-z0-9_])test_[A-Za-z0-9_]+", text))
@@ -43,3 +49,22 @@ def test_current_docs_repeat_the_same_exact_anchor_set() -> None:
         for path in DOCS
     ]
     assert sets[0] == sets[1]
+
+
+def test_normative_corpus_has_exact_unique_ids_and_real_crosswalk_rows() -> None:
+    names = _test_names()
+    parsed: list[tuple[set[str], list[tuple[str, str]]]] = []
+    for path in DOCS:
+        text = path.read_text(encoding="utf-8")
+        ids = ID_PATTERN.findall(text)
+        rows = ROW_PATTERN.findall(text)
+        assert len(ids) == sum(EXPECTED_COUNTS.values())
+        assert len(set(ids)) == len(ids)
+        assert len(rows) == sum(EXPECTED_COUNTS.values())
+        assert {anchor for _id, anchor in rows} <= names
+        assert set(ids) == {row_id for row_id, _anchor in rows}
+        for prefix, count in EXPECTED_COUNTS.items():
+            assert sum(item.startswith(prefix + "-") for item in ids) == count
+        parsed.append((set(ids), rows))
+    assert parsed[0][0] == parsed[1][0]
+    assert parsed[0][1] == parsed[1][1]

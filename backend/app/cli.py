@@ -478,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "market-replication-status",
         help="read-only local replication status",
-    )
+    ).add_argument("--json", action="store_true")
     full_history = subparsers.add_parser(
         "full-market-backfill",
         help="plan or execute resumable full-main-board history into NAS",
@@ -1553,7 +1553,12 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
         )
 
 
-def _replication_cli_path(value: Path, *, label: str, local_root: Path | None = None) -> Path:
+def _replication_cli_path(
+    value: Path,
+    *,
+    label: str,
+    protected_roots: tuple[Path, ...] = (),
+) -> Path:
     """Validate replication paths lexically before any operation-specific I/O."""
     raw = os.fspath(value)
     if not raw or "${" in raw or "$" in raw or "%" in raw:
@@ -1564,12 +1569,33 @@ def _replication_cli_path(value: Path, *, label: str, local_root: Path | None = 
     home = Path.home()
     if candidate == home or home in candidate.parents:
         raise _CliArgumentError(f"{label} path overlaps the user home")
-    if local_root is not None:
-        left = candidate.absolute()
-        right = local_root.absolute()
+    left = Path(os.path.realpath(candidate))
+    for protected in protected_roots:
+        right = Path(os.path.realpath(protected))
         if left == right or left in right.parents or right in left.parents:
             raise _CliArgumentError(f"{label} path overlaps local storage")
     return candidate
+
+
+def _replication_protected_roots(settings: Settings) -> tuple[Path, ...]:
+    return tuple(
+        path
+        for path in (
+            settings.local_market_dataset_root,
+            settings.nas_market_dataset_root,
+            settings.local_control_dir,
+            settings.local_staging_dir,
+            settings.local_lock_dir,
+            settings.local_temp_dir,
+            settings.market_data_dir,
+            settings.user_data_dir,
+            settings.supplemental_data_dir,
+            settings.provider_evidence_root,
+            settings.provider_shadow_root,
+            settings.replication_destination_root,
+        )
+        if path is not None
+    )
 
 
 def _replication_cli_error(error: Exception) -> int:
@@ -1586,6 +1612,19 @@ def _replication_cli_error(error: Exception) -> int:
         )
     )
     return 2
+
+
+def _operation_day_visible(published_at: str, operation_day: date) -> bool:
+    try:
+        published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        if published.tzinfo is None:
+            return False
+        cutoff = datetime.fromisoformat(
+            f"{operation_day.isoformat()}T23:59:59.999999+08:00"
+        ).astimezone(UTC)
+        return published.astimezone(UTC) <= cutoff
+    except (TypeError, ValueError):
+        return False
 
 
 def main() -> int:
@@ -2413,7 +2452,7 @@ def main() -> int:
             destination = _replication_cli_path(
                 args.destination,
                 label="destination",
-                local_root=settings.local_market_dataset_root,
+                protected_roots=_replication_protected_roots(settings),
             )
         except _CliArgumentError as exc:
             return _replication_cli_error(exc)
@@ -2475,12 +2514,12 @@ def main() -> int:
                 _replication_cli_path(
                     args.source,
                     label="source",
-                    local_root=settings.local_market_dataset_root,
+                    protected_roots=_replication_protected_roots(settings),
                 )
                 _replication_cli_path(
                     args.destination,
                     label="destination",
-                    local_root=settings.local_market_dataset_root,
+                    protected_roots=_replication_protected_roots(settings),
                 )
             except _CliArgumentError as exc:
                 return _replication_cli_error(exc)
@@ -2506,9 +2545,33 @@ def main() -> int:
                 else service.plan(args.destination)
             )
             payload = result.model_dump(mode="json")
-            payload.update({"provider_requests": 0, "writes": result.effects.writes})
+            payload.update(
+                {
+                    "provider_requests": 0,
+                    "writes": result.effects.writes,
+                    "operation_day": (
+                        args.operation_day.isoformat() if args.operation_day is not None else None
+                    ),
+                }
+            )
+            if args.operation_day is not None:
+                try:
+                    snapshot = service._snapshot(None)
+                    visible = _operation_day_visible(
+                        snapshot.record.source_published_at,
+                        args.operation_day,
+                    )
+                except Exception:
+                    visible = False
+                if not visible:
+                    payload.update({"status": "unavailable", "reason_code": "SOURCE_UNAVAILABLE"})
+                    return_code = 1
+                else:
+                    return_code = 0 if result.status in {"dry_run", "ready"} else 1
+            else:
+                return_code = 0 if result.status in {"dry_run", "ready"} else 1
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-            return 0 if result.status in {"dry_run", "ready"} else 1
+            return return_code
 
         try:
             destination = args.destination or settings.replication_destination_root
@@ -2517,7 +2580,7 @@ def main() -> int:
             destination = _replication_cli_path(
                 destination,
                 label="destination",
-                local_root=settings.local_market_dataset_root,
+                protected_roots=_replication_protected_roots(settings),
             )
         except _CliArgumentError as exc:
             return _replication_cli_error(exc)
@@ -2531,6 +2594,11 @@ def main() -> int:
                         "provider_requests": 0,
                         "writes": False,
                         "destination_writes": False,
+                        "operation_day": (
+                            args.operation_day.isoformat()
+                            if args.operation_day is not None
+                            else None
+                        ),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -2540,7 +2608,16 @@ def main() -> int:
         if not (settings.replication_enabled and settings.replication_drain_enabled):
             print(
                 json.dumps(
-                    {"status": "disabled", "writes": False, "provider_requests": 0},
+                    {
+                        "status": "disabled",
+                        "writes": False,
+                        "provider_requests": 0,
+                        "operation_day": (
+                            args.operation_day.isoformat()
+                            if args.operation_day is not None
+                            else None
+                        ),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 )
@@ -2564,7 +2641,11 @@ def main() -> int:
             if worker is None:
                 payload = {"status": "disabled", "writes": False, "provider_requests": 0}
             else:
-                payload = worker.run_once()
+                payload = worker.run_once(
+                    operation_day=(
+                        args.operation_day.isoformat() if args.operation_day is not None else None
+                    )
+                )
         except Exception:
             payload = {
                 "status": "unavailable",
@@ -2573,6 +2654,10 @@ def main() -> int:
                 "writes": False,
             }
         payload.setdefault("mode", "execute" if args.execute else "plan")
+        payload.setdefault(
+            "operation_day",
+            args.operation_day.isoformat() if args.operation_day is not None else None,
+        )
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0 if payload.get("status") in {"idle", "replicated", "already_replicated"} else 1
     if args.command == "market-regime-snapshots":

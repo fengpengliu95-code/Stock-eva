@@ -4378,6 +4378,7 @@ class ImmutableReplicationSidecarStore:
         worker_id: str,
         now: str | None = None,
         lease_seconds: int = REPLICATION_LEASE_SECONDS,
+        operation_day: str | None = None,
     ) -> ReplicationClaim | None:
         """Claim at most one due intent with an immutable lease event."""
         if not isinstance(worker_id, str) or not (1 <= len(worker_id) <= 128):
@@ -4388,19 +4389,30 @@ class ImmutableReplicationSidecarStore:
         _validate_utc_timestamp(occurred_at, "now")
 
         def mutate(connection: sqlite3.Connection) -> _MutationOutcome:
-            row = connection.execute(
-                """SELECT h.intent_id, h.current_state, h.state_version,
+            cutoff = None
+            if operation_day is not None:
+                try:
+                    cutoff = (
+                        datetime.fromisoformat(f"{operation_day}T23:59:59.999999+08:00")
+                        .astimezone(UTC)
+                        .isoformat()
+                    )
+                except ValueError as exc:
+                    raise ReplicationDurabilityError("operation day is invalid") from exc
+            query = """SELECT h.intent_id, h.current_state, h.state_version,
                           h.lease_owner, h.lease_until, h.next_attempt_at,
                           i.checkpoint_id, i.source_sequence
                      FROM replication_heads h JOIN replication_intents i ON i.intent_id=h.intent_id
                     WHERE (
                         (h.current_state IN ('pending','retry_wait') AND h.next_attempt_at <= ?)
                         OR (h.current_state IN ('copying','verifying') AND h.lease_until <= ?)
-                    )
-                    ORDER BY i.source_published_at, i.checkpoint_id
-                    LIMIT 1""",
-                (occurred_at, occurred_at),
-            ).fetchone()
+                    )"""
+            params: list[object] = [occurred_at, occurred_at]
+            if cutoff is not None:
+                query += " AND i.source_published_at <= ?"
+                params.append(cutoff)
+            query += " ORDER BY i.source_published_at, i.checkpoint_id LIMIT 1"
+            row = connection.execute(query, params).fetchone()
             if row is None:
                 return _MutationOutcome(None, False)
             intent_id, state, _version, _owner, _until, _next, checkpoint_id, sequence = row
@@ -5194,11 +5206,15 @@ class ReplicationOutboxService:
         worker_id: str,
         now: str | None = None,
         lease_seconds: int = REPLICATION_LEASE_SECONDS,
+        operation_day: str | None = None,
     ) -> ReplicationClaim | None:
         if not self.enabled:
             return None
         return ReplicationSidecarStore(self.path).claim_due(
-            worker_id=worker_id, now=now, lease_seconds=lease_seconds
+            worker_id=worker_id,
+            now=now,
+            lease_seconds=lease_seconds,
+            operation_day=operation_day,
         )
 
     def complete(self, proof: VerifiedDestinationCommitProof) -> ReplicationHead:
@@ -5236,7 +5252,9 @@ class ReplicationDrainWorker:
         self.checkpoint_reader = checkpoint_reader
         self.lease_seconds = lease_seconds
 
-    def run_once(self, *, now: str | None = None) -> dict[str, object]:
+    def run_once(
+        self, *, now: str | None = None, operation_day: str | None = None
+    ) -> dict[str, object]:
         if not (self.replication_enabled and self.replication_drain_enabled):
             return {"status": "disabled", "writes": False, "provider_requests": 0}
         if self.checkpoint_reader is None:
@@ -5250,6 +5268,7 @@ class ReplicationDrainWorker:
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
+            operation_day=operation_day,
         )
         if claim is None:
             return {"status": "idle", "writes": False, "provider_requests": 0}

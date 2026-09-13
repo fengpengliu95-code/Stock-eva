@@ -15,6 +15,10 @@ def _settings(tmp_path: Path) -> Settings:
         local_staging_dir=tmp_path / "staging",
         local_lock_dir=tmp_path / "locks",
         local_temp_dir=tmp_path / "tmp",
+        market_data_dir=tmp_path / "market-data",
+        user_data_dir=tmp_path / "user-data",
+        provider_evidence_root=tmp_path / "provider-evidence",
+        provider_shadow_root=tmp_path / "provider-shadow",
         replication_enabled=False,
         replication_drain_enabled=False,
     )
@@ -72,3 +76,64 @@ def test_replication_init_requires_exact_ack_and_dry_run_is_zero_write(
     )
     assert cli.main() == 2
     assert not destination.exists()
+
+
+def test_replication_paths_reject_every_configured_mutable_root_alias(
+    monkeypatch, tmp_path, capsys
+):
+    settings = _settings(tmp_path)
+    roots = (
+        settings.local_market_dataset_root,
+        settings.local_control_dir,
+        settings.local_staging_dir,
+        settings.local_lock_dir,
+        settings.local_temp_dir,
+        settings.market_data_dir,
+        settings.user_data_dir,
+        settings.provider_evidence_root,
+        settings.provider_shadow_root,
+    )
+    for index, root in enumerate(roots):
+        root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(cli, "get_settings", lambda settings=settings: settings)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["stock-eva", "market-replicate", "--destination", str(root / f"child-{index}")],
+        )
+        assert cli.main() == 2
+        assert json.loads(capsys.readouterr().out)["reason_code"] == "INVALID_PATH"
+
+    alias = tmp_path / "canonical-alias"
+    alias.symlink_to(settings.local_market_dataset_root, target_is_directory=True)
+    monkeypatch.setattr("sys.argv", ["stock-eva", "market-replicate", "--destination", str(alias)])
+    assert cli.main() == 2
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "INVALID_PATH"
+
+
+def test_operation_day_is_typed_in_dry_run_and_status_json_is_sanitized(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(cli, "get_settings", lambda: _settings(tmp_path))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "stock-eva",
+            "market-replicate",
+            "--destination",
+            "/tmp/r2f4-3-operation-day",
+            "--operation-day",
+            "2026-09-14",
+            "--json",
+        ],
+    )
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry_run"
+    assert payload["operation_day"] == "2026-09-14"
+
+    monkeypatch.setattr("sys.argv", ["stock-eva", "market-replication-status", "--json"])
+    assert cli.main() == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["mode"] == "status"
+    assert status["provider_requests"] == 0
+    assert status["paths_exposed"] is False
