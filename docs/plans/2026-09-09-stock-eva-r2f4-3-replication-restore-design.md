@@ -2953,6 +2953,12 @@ identity reads, follows the same unknown-orphan result. The linked terminal
 audit retains the observed identity hash when one can be read and otherwise
 records only the expected STARTED hashes.
 
+Loss of the staging basename authority immediately before rename is a distinct
+`StagingAuthorityLost` control failure, including a symlink, file, directory,
+missing name, or failed `lstat`/open/fstat. It is never downgraded to ordinary
+content or query verification failure, and cleanup may proceed only after an
+independent held-fd binding proof.
+
 ### Final Batch4 gate — unified terminalization and locked audit namespace
 
 After a `STARTED` record is durable, every execute branch (descriptor/source

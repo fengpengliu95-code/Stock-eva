@@ -89,9 +89,7 @@ def _dataset_source(tmp_path: Path):
         pointer_db_schema_digest="e" * 64,
         manifest_canonical_sha256=hashlib.sha256(manifest).hexdigest(),
         source_manifest_bytes_sha256=hashlib.sha256(manifest).hexdigest(),
-        source_object_set_sha256=domain_sha256(
-            "stock-eva/r2f4.3/object-set/v1", inventory
-        ),
+        source_object_set_sha256=domain_sha256("stock-eva/r2f4.3/object-set/v1", inventory),
         object_inventory=inventory,
     )
     return source, checkpoint, sentinel
@@ -146,9 +144,9 @@ def test_verified_restore_publishes_once_after_all_semantic_checks(tmp_path: Pat
     archive, _descriptor, record = _archive(tmp_path)
     destination = tmp_path / "restore"
 
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "ready"
     assert result.reason_code == "NONE"
@@ -175,9 +173,9 @@ def test_corrupt_archive_leaves_no_final_restore_root(tmp_path: Path) -> None:
     )
     (generation / "bars.parquet").write_bytes(b"corrupt")
 
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code in {"VERIFY_FAILED", "SOURCE_UNAVAILABLE"}
@@ -213,9 +211,9 @@ def test_restore_final_exists_race_never_overwrites(
         original(parent_fd, source, target)
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", race)
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code in {"DESTINATION_CONFLICT", "PATH_CHANGED"}
@@ -230,9 +228,9 @@ def test_staging_extra_after_query_is_rejected_and_audit_is_sanitized(tmp_path: 
     def add_extra(stage: Path) -> None:
         (stage / "unexpected.txt").write_text("not part of the inventory")
 
-    result = RestoreService(
-        archive, audit_store=audit, representative_query=add_extra
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=audit, representative_query=add_extra).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "VERIFY_FAILED"
@@ -268,16 +266,27 @@ def test_restore_audit_is_two_phase_descriptor_bound_and_effects_are_split(
     assert '"start_event_sha256"' in terminal.read_text()
 
 
+@pytest.mark.parametrize("replacement", ["symlink", "file", "dir", "missing"])
 def test_restore_staging_basename_swap_does_not_delete_attacker_or_publish(
-    tmp_path: Path,
+    tmp_path: Path, replacement: str
 ) -> None:
     archive, _descriptor, _record = _archive(tmp_path)
     destination = tmp_path / "restore"
+    moved_path: Path | None = None
+    stage_path: Path | None = None
 
     def swap(stage: Path) -> None:
+        nonlocal moved_path, stage_path
+        stage_path = stage
         moved = stage.with_name(stage.name + ".moved")
+        moved_path = moved
         stage.rename(moved)
-        stage.symlink_to(moved, target_is_directory=True)
+        if replacement == "symlink":
+            stage.symlink_to(moved, target_is_directory=True)
+        elif replacement == "file":
+            stage.write_text("attacker")
+        elif replacement == "dir":
+            stage.mkdir()
 
     result = RestoreService(
         archive,
@@ -286,8 +295,27 @@ def test_restore_staging_basename_swap_does_not_delete_attacker_or_publish(
     ).execute(destination)
 
     assert result.status == "unavailable"
-    assert result.reason_code in {"VERIFY_FAILED", "SOURCE_UNAVAILABLE"}
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.rename_allowed is False
+    assert result.effects.restore_writes is True
+    assert result.orphan_cleanup_status == "unknown"
+    assert result.manual_intervention_required is True
     assert not destination.exists()
+    assert moved_path is not None
+    assert stage_path is not None
+    assert moved_path.is_dir()
+    if replacement == "symlink":
+        assert stage_path.is_symlink()
+    elif replacement == "file":
+        assert stage_path.is_file()
+    elif replacement == "dir":
+        assert stage_path.is_dir()
+    else:
+        assert not stage_path.exists()
+    terminal = next((tmp_path / "audit").glob("*.terminal.json"))
+    payload = terminal.read_text()
+    assert '"manual_intervention_required":true' in payload
+    assert str(tmp_path) not in payload
 
 
 @pytest.mark.parametrize("replacement", ["recreate", "symlink"])
@@ -369,9 +397,9 @@ def test_restore_ambient_swap_after_rename_is_compensated_by_held_parent(
         original_rename(parent_fd, source, target)
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_with_ambient_swap)
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -403,9 +431,9 @@ def test_restore_ambient_swap_inode_mismatch_never_deletes_detached_final(
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_with_ambient_swap)
     monkeypatch.setattr(replication, "_assert_owned_final_binding", reject_owned_final)
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -431,9 +459,9 @@ def test_restore_post_rename_failure_keeps_visible_root_and_skips_semantic_rerun
         return original(*args, **kwargs)
 
     monkeypatch.setattr(replication, "_verify_staged_restore_tree", fail_after_rename)
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        destination
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -462,9 +490,7 @@ def test_restore_final_inode_swap_is_unknown_manual_orphan_without_deletion(
 
     monkeypatch.setattr(replication, "_verify_staged_restore_tree", swap_after_final_readback)
     audit_root = tmp_path / "audit"
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(audit_root)
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(audit_root)).execute(destination)
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -500,9 +526,7 @@ def test_restore_final_inode_swap_immediately_after_rename_keeps_attacker_and_st
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_then_replace_final)
     audit_root = tmp_path / "audit"
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(audit_root)
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(audit_root)).execute(destination)
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -533,9 +557,7 @@ def test_restore_final_observation_error_is_unknown_manual_orphan(
 
     monkeypatch.setattr(replication, "_destination_rename_noreplace", rename_then_replace_final)
     audit_root = tmp_path / "audit"
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(audit_root)
-    ).execute(destination)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(audit_root)).execute(destination)
 
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
@@ -569,9 +591,9 @@ def test_restore_corrupt_archive_has_started_and_terminal_audit(
     )
     (generation / "bars.parquet").write_bytes(b"corrupt")
 
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(tmp_path / "restore")
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        tmp_path / "restore"
+    )
 
     assert result.status == "unavailable"
     assert len(list((tmp_path / "audit").glob("*.started.json"))) == 1
@@ -642,9 +664,9 @@ def test_unreadable_descriptor_terminal_failure_preserves_source_primary(
             raise RuntimeError("injected terminal audit failure")
 
     audit_root = tmp_path / "audit"
-    result = RestoreService(
-        archive, audit_store=FailingTerminalAudit(audit_root)
-    ).execute(tmp_path / "restore")
+    result = RestoreService(archive, audit_store=FailingTerminalAudit(audit_root)).execute(
+        tmp_path / "restore"
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "SOURCE_UNAVAILABLE"
@@ -689,9 +711,9 @@ def test_restore_unreadable_descriptor_audits_null_destination_identity(
     archive, descriptor, _record = _archive(tmp_path)
     (archive / replication.DESTINATION_DESCRIPTOR_NAME).write_bytes(b"corrupt")
 
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(tmp_path / "restore")
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        tmp_path / "restore"
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "SOURCE_UNAVAILABLE"
@@ -703,9 +725,9 @@ def test_restore_unreadable_descriptor_audits_null_destination_identity(
 def test_restore_malformed_generation_is_typed_and_terminalized(tmp_path: Path) -> None:
     archive, _descriptor, _record = _archive(tmp_path)
 
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(tmp_path / "restore", generation=[])
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        tmp_path / "restore", generation=[]
+    )
 
     assert result.status == "unavailable"
     assert result.reason_code == "SOURCE_UNAVAILABLE"
@@ -802,8 +824,8 @@ def test_restore_rejects_non_absolute_destination_without_writes(
     tmp_path: Path, unsafe: Path
 ) -> None:
     archive, _descriptor, _record = _archive(tmp_path)
-    result = RestoreService(
-        archive, audit_store=RestoreAuditStore(tmp_path / "audit")
-    ).execute(unsafe)
+    result = RestoreService(archive, audit_store=RestoreAuditStore(tmp_path / "audit")).execute(
+        unsafe
+    )
     assert result.status == "unavailable"
     assert result.reason_code == "PATH_INVALID"

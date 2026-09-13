@@ -149,6 +149,10 @@ class ReplicationStateUnavailable(ReplicationDurabilityError):
     """The local sidecar is missing, corrupt, or cannot be proven consistent."""
 
 
+class StagingAuthorityLost(ReplicationStateUnavailable):
+    """The restore staging basename no longer proves this attempt's inode."""
+
+
 class ReplicationCASConflict(ReplicationDurabilityError):
     """A deterministic next generation already exists with no overwrite allowed."""
 
@@ -2347,15 +2351,11 @@ class _HeldDirectoryAncestry:
                     )
                     expected = (token.device, token.inode, token.mode)
                     if identity != expected:
-                        raise ReplicationStateUnavailable(
-                            "restore destination ancestry changed"
-                        )
+                        raise ReplicationStateUnavailable("restore destination ancestry changed")
                 finally:
                     os.close(child_fd)
             except OSError as exc:
-                raise ReplicationStateUnavailable(
-                    "restore destination ancestry changed"
-                ) from exc
+                raise ReplicationStateUnavailable("restore destination ancestry changed") from exc
 
 
 def _bind_directory_ancestry(path: Path, descriptors: list[int]) -> _HeldDirectoryAncestry:
@@ -5239,9 +5239,7 @@ def _destination_list_files(dir_fd: int, prefix: str = "") -> set[str]:
     return found
 
 
-def _destination_tree_entries(
-    dir_fd: int, prefix: str = ""
-) -> tuple[set[str], set[str]]:
+def _destination_tree_entries(dir_fd: int, prefix: str = "") -> tuple[set[str], set[str]]:
     """Return the complete descriptor-bound tree, rejecting links and odd files."""
     files: set[str] = set()
     directories: set[str] = set()
@@ -6683,9 +6681,7 @@ class DestinationArchiveReader:
                 raise ReplicationStateUnavailable("destination head is unavailable")
             records = self.list_verified_records(root_fd)
             records_by_generation = {item.replication_generation: item for item in records}
-            selected_generation = (
-                head.replication_generation if generation is None else generation
-            )
+            selected_generation = head.replication_generation if generation is None else generation
             if selected_generation not in records_by_generation:
                 raise ReplicationStateUnavailable("destination generation is unavailable")
             record = records_by_generation[selected_generation]
@@ -6701,7 +6697,10 @@ class DestinationArchiveReader:
                 _validate_restore_manifest(manifest, record)
                 for item in record.object_inventory:
                     payload = _destination_read_relative(generation_fd, item.relative_path)
-                    if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+                    if (
+                        len(payload) != item.size_bytes
+                        or _sha256_bytes(payload) != item.object_sha256
+                    ):
                         raise ReplicationStateUnavailable("destination object verification failed")
             finally:
                 failures: list[str] = []
@@ -6811,7 +6810,9 @@ def _checkpoint_from_record(record: ReplicationRecord) -> SourceCheckpoint:
 
 def _validate_restore_manifest(payload: bytes, record: ReplicationRecord) -> None:
     """Validate the canonical dataset manifest against the closed inventory."""
-    values = _parse_destination_manifest(payload, expected_sha256=record.destination_manifest_bytes_sha256)
+    values = _parse_destination_manifest(
+        payload, expected_sha256=record.destination_manifest_bytes_sha256
+    )
     if values.get("dataset") != "stock-eva-market" or values.get("schema_version") != 2:
         raise ReplicationStateUnavailable("destination manifest schema is invalid")
     if set(values) != {"dataset", "schema_version", "generation", "files"}:
@@ -8105,12 +8106,8 @@ class RestoreReport(BaseModel):
     source_manifest_canonical_sha256: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
-    source_object_set_sha256: str = Field(
-        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
-    publication_binding_sha256: str = Field(
-        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
+    source_object_set_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    publication_binding_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     source_instance_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     source_sequence: int = Field(ge=1)
     checkpoint_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -8158,9 +8155,7 @@ class RestoreAuditEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    audit_schema: Literal["stock-eva/r2f4.3/restore-audit/v1"] = (
-        "stock-eva/r2f4.3/restore-audit/v1"
-    )
+    audit_schema: Literal["stock-eva/r2f4.3/restore-audit/v1"] = "stock-eva/r2f4.3/restore-audit/v1"
     schema_version: Literal[1] = 1
     audit_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     phase: Literal["STARTED"] = "STARTED"
@@ -8283,11 +8278,12 @@ class RestoreAuditStore:
                 os.mkdir(".staging", mode=0o700, dir_fd=root_fd)
             except FileExistsError:
                 pass
-            staging_fd = os.open(
-                ".staging", _DIRECTORY_FLAGS, dir_fd=root_fd
-            )
+            staging_fd = os.open(".staging", _DIRECTORY_FLAGS, dir_fd=root_fd)
             staging_info = os.fstat(staging_fd)
-            if not stat.S_ISDIR(staging_info.st_mode) or stat.S_IMODE(staging_info.st_mode) != 0o700:
+            if (
+                not stat.S_ISDIR(staging_info.st_mode)
+                or stat.S_IMODE(staging_info.st_mode) != 0o700
+            ):
                 raise ReplicationDurabilityError("restore audit staging is unsafe")
             self._validate_namespace_locked(root_fd, staging_fd)
             yield root_fd, staging_fd
@@ -8334,7 +8330,9 @@ class RestoreAuditStore:
                 try:
                     report = RestoreReport.model_validate_json(payload)
                     if report.report_id != name[:64]:
-                        raise ReplicationDurabilityError("restore audit terminal identity is invalid")
+                        raise ReplicationDurabilityError(
+                            "restore audit terminal identity is invalid"
+                        )
                     report.verify_hash()
                     terminal_links[report.report_id] = report.start_event_sha256
                 except (TypeError, ValueError, json.JSONDecodeError):
@@ -8370,11 +8368,15 @@ class RestoreAuditStore:
                 else:
                     raise ReplicationDurabilityError("restore audit staging payload is invalid")
                 if canonical_json_bytes(parsed.model_dump(mode="json")) != payload:
-                    raise ReplicationDurabilityError("restore audit staging payload is not canonical")
+                    raise ReplicationDurabilityError(
+                        "restore audit staging payload is not canonical"
+                    )
                 if hasattr(parsed, "verify_hash"):
                     parsed.verify_hash()
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise ReplicationDurabilityError("restore audit staging payload is invalid") from exc
+                raise ReplicationDurabilityError(
+                    "restore audit staging payload is invalid"
+                ) from exc
             os.unlink(name, dir_fd=staging_fd)
         if not terminals <= starts:
             raise ReplicationDurabilityError("restore audit terminal is unlinked")
@@ -8631,8 +8633,7 @@ def _validate_restore_descriptor_roots(
     parent_fd, parent_descriptors = _open_directory_chain(destination.parent, create=False)
     try:
         destination_ancestry = {
-            (int(os.fstat(fd).st_dev), int(os.fstat(fd).st_ino))
-            for fd in parent_descriptors
+            (int(os.fstat(fd).st_dev), int(os.fstat(fd).st_ino)) for fd in parent_descriptors
         }
         if any(root_identity in destination_ancestry for root_identity, _ in protected):
             raise ReplicationDurabilityError("restore destination overlaps a protected root")
@@ -8665,7 +8666,9 @@ def _validate_staged_restore_dataset_fd(
                 try:
                     info = os.fstat(fd)
                     if info.st_nlink != 1 or info.st_size != item.size_bytes:
-                        raise ReplicationStateUnavailable("restore object size or link count changed")
+                        raise ReplicationStateUnavailable(
+                            "restore object size or link count changed"
+                        )
                     fd_path = f"/dev/fd/{fd}"
                     schema = tuple(
                         (row[0], row[1])
@@ -8755,15 +8758,15 @@ def _assert_staging_name_binding(
     try:
         info = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ReplicationStateUnavailable("restore staging name changed")
+            raise StagingAuthorityLost("restore staging name changed")
         bound_fd = os.open(stage_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         try:
             if _directory_fingerprint(os.fstat(bound_fd)) != expected:
-                raise ReplicationStateUnavailable("restore staging name changed")
+                raise StagingAuthorityLost("restore staging name changed")
         finally:
             os.close(bound_fd)
     except OSError as exc:
-        raise ReplicationStateUnavailable("restore staging name changed") from exc
+        raise StagingAuthorityLost("restore staging name changed") from exc
 
 
 def _assert_owned_final_binding(
@@ -8823,7 +8826,9 @@ class RestoreService:
     ) -> None:
         if audit_store is not None and audit_root is not None:
             raise ReplicationDurabilityError("restore audit root is configured twice")
-        self._archive_input = Path(archive) if not isinstance(archive, DestinationDescriptor) else None
+        self._archive_input = (
+            Path(archive) if not isinstance(archive, DestinationDescriptor) else None
+        )
         self._descriptor_error: BaseException | None = None
         try:
             self.reader = DestinationArchiveReader(archive, mount_inspector=mount_inspector)
@@ -8861,7 +8866,9 @@ class RestoreService:
             source_manifest_canonical_sha256=(
                 record.source_manifest_canonical_sha256 if record is not None else None
             ),
-            source_object_set_sha256=record.source_object_set_sha256 if record is not None else None,
+            source_object_set_sha256=record.source_object_set_sha256
+            if record is not None
+            else None,
             publication_binding_sha256=(
                 record.publication_binding_sha256 if record is not None else None
             ),
@@ -8912,9 +8919,7 @@ class RestoreService:
             _physical_path(self.reader.descriptor.root_path),
             *(_physical_path(item) for item in self.canonical_roots),
         )
-        if any(
-            root == item or root in item.parents or item in root.parents for item in protected
-        ):
+        if any(root == item or root in item.parents or item in root.parents for item in protected):
             raise ReplicationDurabilityError("restore audit root overlaps protected data")
         if root == destination or root in destination.parents or destination in root.parents:
             raise ReplicationDurabilityError("restore audit root overlaps destination")
@@ -9260,7 +9265,10 @@ class RestoreService:
             # later path replacement cannot redirect this operation.
             parent_fd, parent_dirs = _open_directory_chain(final.parent, create=False)
             ancestry = _bind_directory_ancestry(final.parent, parent_dirs)
-            if expected_ancestry_sha256 is not None and ancestry.digest() != expected_ancestry_sha256:
+            if (
+                expected_ancestry_sha256 is not None
+                and ancestry.digest() != expected_ancestry_sha256
+            ):
                 raise ReplicationStateUnavailable("restore destination ancestry changed")
         except Exception as exc:
             if parent_dirs:
@@ -9297,6 +9305,7 @@ class RestoreService:
         stage_identity: tuple[int, int, int, int] | None = None
         cleanup_failed = False
         authority_failure = False
+        staging_authority_lost = False
         target_baseline_absent = False
         final_identity_mismatch = False
         observed_final_inode_sha256: str | None = None
@@ -9320,7 +9329,10 @@ class RestoreService:
                 try:
                     for item in snapshot.record.object_inventory:
                         payload = _destination_read_relative(generation_fd, item.relative_path)
-                        if len(payload) != item.size_bytes or _sha256_bytes(payload) != item.object_sha256:
+                        if (
+                            len(payload) != item.size_bytes
+                            or _sha256_bytes(payload) != item.object_sha256
+                        ):
                             raise ReplicationStateUnavailable("restore source object changed")
                         target_fd = stage_fd
                         target_dirs: list[int] = []
@@ -9345,7 +9357,9 @@ class RestoreService:
                             _finish_cleanup(None, failures)
                     # The publication metadata is written only after every
                     # immutable object has passed source and staging readback.
-                    _destination_write_at(stage_fd, DESTINATION_SENTINEL_NAME, snapshot.sentinel_bytes)
+                    _destination_write_at(
+                        stage_fd, DESTINATION_SENTINEL_NAME, snapshot.sentinel_bytes
+                    )
                     _destination_write_at(stage_fd, "manifest.json", snapshot.manifest_bytes)
                     _verify_staged_restore_tree(
                         stage_fd, snapshot.record, snapshot.manifest_bytes, snapshot.sentinel_bytes
@@ -9402,9 +9416,7 @@ class RestoreService:
                     except FileNotFoundError:
                         orphan_cleanup_status = "removed"
                     else:
-                        raise ReplicationStateUnavailable(
-                            "restore provisional final remains"
-                        )
+                        raise ReplicationStateUnavailable("restore provisional final remains")
                 except Exception as cleanup_exc:
                     orphan_cleanup_status = "unknown"
                     raise ReplicationStateUnavailable(
@@ -9474,9 +9486,12 @@ class RestoreService:
                 rename_allowed=True,
             )
         except Exception as exc:
+            if isinstance(exc, StagingAuthorityLost):
+                staging_authority_lost = True
+                authority_failure = True
             reason_code = (
                 "CONTROL_STATE_UNAVAILABLE"
-                if published or authority_failure
+                if published or authority_failure or staging_authority_lost
                 else self._reason(exc)
             )
             effects = ReplicationEffects(
@@ -9496,9 +9511,13 @@ class RestoreService:
             ).model_copy(
                 update={
                     "orphan_cleanup_status": (
-                        "unknown" if final_identity_mismatch else orphan_cleanup_status
+                        "unknown"
+                        if final_identity_mismatch or staging_authority_lost
+                        else orphan_cleanup_status
                     ),
-                    "manual_intervention_required": final_identity_mismatch,
+                    "manual_intervention_required": (
+                        final_identity_mismatch or staging_authority_lost
+                    ),
                     "observed_final_inode_sha256": observed_final_inode_sha256,
                 }
             )
@@ -9570,7 +9589,13 @@ class RestoreService:
         generation: str | None = None,
         representative_query: object | None = None,
     ) -> RestorePlanResponse:
-        return self.execute(destination, generation=generation, representative_query=representative_query) if execute else self.plan(destination, generation=generation)
+        return (
+            self.execute(
+                destination, generation=generation, representative_query=representative_query
+            )
+            if execute
+            else self.plan(destination, generation=generation)
+        )
 
 
 VerifiedRestoreService = RestoreService
@@ -9616,6 +9641,7 @@ __all__ = [
     "REPLICATION_LEASE_SECONDS",
     "ReplicationState",
     "ReplicationStateUnavailable",
+    "StagingAuthorityLost",
     "ReplicationStatusResponse",
     "ReplicationStatus",
     "ReplicationStatusService",

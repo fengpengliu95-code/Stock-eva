@@ -2746,6 +2746,11 @@ Final `lstat`/`O_NOFOLLOW` open, `fstat`, and identity-read errors after the
 rename are all quarantined identically, including symlink, missing, file, and
 permission races; no unknown final name is removed.
 
+The immediate pre-rename staging binding uses the typed
+`StagingAuthorityLost` error. Symlink/file/directory/missing staging basename
+loss is therefore classified as a manual unknown orphan, while ordinary
+content/schema/query failures retain `VERIFY_FAILED`.
+
 The restore now holds a descriptor-native ancestry chain from the filesystem
 root through the requested destination parent. Every edge is revalidated with
 `O_NOFOLLOW` through its held parent descriptor before rename and after final
