@@ -427,6 +427,30 @@ class ManifestPublicationCoordinator:
         return "modern" if all(modern) else "legacy"
 
     @staticmethod
+    def _control_unavailable_observation(binding: SourcePublicationBinding):
+        values: dict[str, object] = {
+            "source_commit_sha256": binding.binding_sha256,
+            "checkpoint_id": binding.binding_sha256,
+            "source_instance_id": "0" * 64,
+            "source_sequence": None,
+            "intent_id": None,
+            "enqueue_state": "degraded",
+            "reason_code": "CONTROL_STATE_UNAVAILABLE",
+            "effects": ReplicationEffects(
+                writes=True,
+                canonical_writes=True,
+                destination_writes=False,
+                outbox_writes=False,
+                restore_writes=False,
+            ),
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
+        values["observation_sha256"] = domain_sha256(
+            "stock-eva/r2f4.3/replication-observation/v1", values
+        )
+        return ReplicationObservation.model_validate(values)
+
+    @staticmethod
     def _manifest_hashes(
         manifest: dict[str, object], root: Path | None = None
     ) -> tuple[str, str, str]:
@@ -607,15 +631,30 @@ class ManifestPublicationCoordinator:
                 raise DatasetError("control pointer changed before pointer commit")
             self.store.control.save_external_publication(result)
             pointer = self.store._pointer_identity()
-            source_commit = self.store._source_commit(
-                result,
-                binding,
-                pointer,
-                object_sha,
-                raw_sha,
-                canonical_sha,
-                manifest,
-            )
+            if pointer.kind != "PRESENT":
+                return {
+                    "manifest_generation": binding.manifest_generation,
+                    "publication_binding": binding,
+                    "source_commit": None,
+                    "observation": self._control_unavailable_observation(binding),
+                }
+            try:
+                source_commit = self.store._source_commit(
+                    result,
+                    binding,
+                    pointer,
+                    object_sha,
+                    raw_sha,
+                    canonical_sha,
+                    manifest,
+                )
+            except Exception:
+                return {
+                    "manifest_generation": binding.manifest_generation,
+                    "publication_binding": binding,
+                    "source_commit": None,
+                    "observation": self._control_unavailable_observation(binding),
+                }
         if self.store.replication_service is not None:
             observation = self.store.replication_service.on_canonical_committed(source_commit)
         else:
