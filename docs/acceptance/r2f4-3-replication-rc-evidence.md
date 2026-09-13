@@ -6,8 +6,8 @@ no real NAS/provider/production operation.
 
 ## Commit and commands
 
-The exact reviewed commit placeholder is updated after the implementation
-commit: `reviewed_commit: <UPDATED_AFTER_COMMIT>`.
+The exact implementation commit recorded after the implementation commit is
+`reviewed_commit: 46bde46d3effc19db11c955b45706423439bd00d`.
 
 Commands and results to record:
 
