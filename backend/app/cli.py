@@ -134,8 +134,10 @@ from backend.app.storage.initialize import (
 from backend.app.storage.layout import StorageLayout
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 from backend.app.storage.replication import (
+    DESTINATION_INIT_ACK,
     ReplicationStatusService,
     RestoreService,
+    initialize_destination,
 )
 from backend.app.strategy.store import StrategyStore
 from backend.app.user.backup import PrivateBackupError, PrivateBackupSetService
@@ -452,8 +454,10 @@ def build_parser() -> argparse.ArgumentParser:
         "market-replicate",
         help="plan or explicitly execute local-to-NAS immutable replication",
     )
-    replicate.add_argument("--destination", required=True, type=Path)
+    replicate.add_argument("--destination", type=Path)
+    replicate.add_argument("--operation-day", type=date.fromisoformat)
     replicate.add_argument("--execute", action="store_true")
+    replicate.add_argument("--json", action="store_true")
     restore = subparsers.add_parser(
         "market-restore",
         help="plan or explicitly execute a verified NAS restore to a temporary root",
@@ -461,6 +465,16 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--source", required=True, type=Path)
     restore.add_argument("--destination", required=True, type=Path)
     restore.add_argument("--execute", action="store_true")
+    restore.add_argument("--operation-day", type=date.fromisoformat)
+    restore.add_argument("--json", action="store_true")
+    init = subparsers.add_parser(
+        "market-replication-init",
+        help="plan or explicitly initialize a new empty local replication destination",
+    )
+    init.add_argument("--destination", required=True, type=Path)
+    init.add_argument("--execute", action="store_true")
+    init.add_argument("--acknowledge")
+    init.add_argument("--json", action="store_true")
     subparsers.add_parser(
         "market-replication-status",
         help="read-only local replication status",
@@ -1539,6 +1553,41 @@ def _market_provider_daily_shadow_command(args: argparse.Namespace) -> int:
         )
 
 
+def _replication_cli_path(value: Path, *, label: str, local_root: Path | None = None) -> Path:
+    """Validate replication paths lexically before any operation-specific I/O."""
+    raw = os.fspath(value)
+    if not raw or "${" in raw or "$" in raw or "%" in raw:
+        raise _CliArgumentError(f"{label} path is unresolved")
+    candidate = Path(raw)
+    if not candidate.is_absolute() or candidate == Path("/"):
+        raise _CliArgumentError(f"{label} path must be an absolute non-root path")
+    home = Path.home()
+    if candidate == home or home in candidate.parents:
+        raise _CliArgumentError(f"{label} path overlaps the user home")
+    if local_root is not None:
+        left = candidate.absolute()
+        right = local_root.absolute()
+        if left == right or left in right.parents or right in left.parents:
+            raise _CliArgumentError(f"{label} path overlaps local storage")
+    return candidate
+
+
+def _replication_cli_error(error: Exception) -> int:
+    print(
+        json.dumps(
+            {
+                "status": "error",
+                "reason_code": "INVALID_PATH",
+                "writes": False,
+                "provider_requests": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 2
+
+
 def main() -> int:
     try:
         args = build_parser().parse_args()
@@ -2359,9 +2408,82 @@ def main() -> int:
                 )
             )
             return 1
+    if args.command == "market-replication-init":
+        try:
+            destination = _replication_cli_path(
+                args.destination,
+                label="destination",
+                local_root=settings.local_market_dataset_root,
+            )
+        except _CliArgumentError as exc:
+            return _replication_cli_error(exc)
+        if not args.execute:
+            print(
+                json.dumps(
+                    {
+                        "mode": "plan",
+                        "status": "dry_run",
+                        "reason_code": "NONE",
+                        "writes": False,
+                        "provider_requests": 0,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.acknowledge != DESTINATION_INIT_ACK:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "reason_code": "ACKNOWLEDGEMENT_REQUIRED",
+                        "writes": False,
+                        "provider_requests": 0,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        try:
+            descriptor = initialize_destination(
+                destination,
+                acknowledgement=DESTINATION_INIT_ACK,
+                local_root=settings.local_market_dataset_root,
+            )
+        except Exception:
+            return _replication_cli_error(RuntimeError("destination initialization failed"))
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason_code": "NONE",
+                    "descriptor_sha256": descriptor.descriptor_sha256,
+                    "writes": True,
+                    "provider_requests": 0,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command in {"market-replicate", "market-restore"}:
         layout = StorageLayout(settings)
         if args.command == "market-restore":
+            try:
+                _replication_cli_path(
+                    args.source,
+                    label="source",
+                    local_root=settings.local_market_dataset_root,
+                )
+                _replication_cli_path(
+                    args.destination,
+                    label="destination",
+                    local_root=settings.local_market_dataset_root,
+                )
+            except _CliArgumentError as exc:
+                return _replication_cli_error(exc)
             service = RestoreService(
                 args.source,
                 canonical_roots=tuple(
@@ -2388,12 +2510,23 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 0 if result.status in {"dry_run", "ready"} else 1
 
+        try:
+            destination = args.destination or settings.replication_destination_root
+            if destination is None:
+                raise _CliArgumentError("destination is required")
+            destination = _replication_cli_path(
+                destination,
+                label="destination",
+                local_root=settings.local_market_dataset_root,
+            )
+        except _CliArgumentError as exc:
+            return _replication_cli_error(exc)
         if not args.execute:
             print(
                 json.dumps(
                     {
                         "mode": "plan",
-                        "status": "dry-run",
+                        "status": "dry_run",
                         "reason_code": "NONE",
                         "provider_requests": 0,
                         "writes": False,
@@ -2413,6 +2546,9 @@ def main() -> int:
                 )
             )
             return 0
+        if destination != settings.replication_destination_root:
+            settings = settings.model_copy(update={"replication_destination_root": destination})
+            layout = StorageLayout(settings)
         source_root = configured_market_dataset_root(settings)
         if source_root is None:
             payload = {

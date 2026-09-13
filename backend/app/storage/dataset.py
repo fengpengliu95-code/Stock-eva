@@ -41,6 +41,7 @@ from backend.app.storage.replication import (
     ReplicationEffects,
     ReplicationObservation,
     SourceCommit,
+    SourceInstanceRecord,
     SourcePublicationBinding,
     _install_no_replace,
     canonical_json_bytes,
@@ -478,10 +479,15 @@ class ManifestPublicationCoordinator:
 
     @staticmethod
     def _control_unavailable_observation(binding: SourcePublicationBinding):
+        # This is a control-state marker, not a fabricated source identity.
+        unavailable_source_id = domain_sha256(
+            "stock-eva/r2f4.3/unconfigured-source-instance/v1",
+            {"binding_sha256": binding.binding_sha256},
+        )
         values: dict[str, object] = {
             "source_commit_sha256": binding.binding_sha256,
             "checkpoint_id": binding.binding_sha256,
-            "source_instance_id": "0" * 64,
+            "source_instance_id": unavailable_source_id,
             "source_sequence": None,
             "intent_id": None,
             "enqueue_state": "degraded",
@@ -826,10 +832,26 @@ class ManifestPublicationCoordinator:
         elif self.store.replication_service is not None:
             observation = self.store.replication_service.on_canonical_committed(source_commit)
         else:
+            unavailable_source_id = domain_sha256(
+                "stock-eva/r2f4.3/unconfigured-source-instance/v1",
+                {"binding_sha256": binding.binding_sha256},
+            )
             observation = ReplicationObservation(
-                source_commit_sha256=source_commit.source_commit_sha256,
-                checkpoint_id=source_commit.source_commit_sha256,
-                source_instance_id=source_commit.source_instance_id,
+                source_commit_sha256=(
+                    source_commit.source_commit_sha256
+                    if source_commit is not None
+                    else binding.binding_sha256
+                ),
+                checkpoint_id=(
+                    source_commit.source_commit_sha256
+                    if source_commit is not None
+                    else binding.binding_sha256
+                ),
+                source_instance_id=(
+                    source_commit.source_instance_id
+                    if source_commit is not None
+                    else unavailable_source_id
+                ),
                 enqueue_state="not_configured",
                 reason_code="SOURCE_NOT_CONFIGURED",
                 effects=ReplicationEffects(
@@ -932,6 +954,7 @@ class NasMarketStore:
         manifest_lock_path: Path | None = None,
         replication_enabled: bool = False,
         replication_service=None,
+        source_instance: SourceInstanceRecord | None = None,
         lineage_resolver: LineageResolver | None = None,
     ) -> None:
         self.control = control
@@ -940,6 +963,7 @@ class NasMarketStore:
         self.manifest_lock_path = manifest_lock_path or staging_root / "nas-manifest.lock"
         self.replication_enabled = replication_enabled
         self.replication_service = replication_service
+        self.source_instance = source_instance
         self.lineage_resolver = lineage_resolver or LineageResolver()
         self.publisher = DatasetPublication()
         self.coordinator = ManifestPublicationCoordinator(self)
@@ -1147,14 +1171,14 @@ class NasMarketStore:
             for item in sorted(manifest.get("files", []), key=lambda value: str(value["path"]))
         )
         values = {
-            "pointer_row_sha256": pointer.row_sha256 or "0" * 64,
+            "pointer_row_sha256": pointer.row_sha256,
             "pointer_generation": binding.manifest_generation,
             "source_run_id": result.run_id,
             "source_trade_date": result.requested_date.isoformat(),
             "source_published_at": binding.published_at,
-            "pointer_db_device": pointer.device or 1,
-            "pointer_db_inode": pointer.inode or 1,
-            "pointer_db_schema_digest": pointer.schema_digest or "0" * 64,
+            "pointer_db_device": pointer.device,
+            "pointer_db_inode": pointer.inode,
+            "pointer_db_schema_digest": pointer.schema_digest,
             "manifest_canonical_sha256": canonical_sha,
             "source_manifest_bytes_sha256": raw_sha,
             "source_object_set_sha256": object_sha,
@@ -1163,10 +1187,32 @@ class NasMarketStore:
             "publication_binding_manifest_generation": binding.manifest_generation,
             "publication_binding_selection_sha256": binding.selection_sha256,
             "publication_binding_lineage_sha256": binding.lineage_sha256,
-            "source_instance_id": "0" * 64,
-            "source_instance_sha256": "0" * 64,
+            "source_instance_id": (
+                self.source_instance.source_instance_id
+                if self.source_instance is not None
+                else None
+            ),
+            "source_instance_sha256": (
+                self.source_instance.source_instance_sha256
+                if self.source_instance is not None
+                else None
+            ),
             "committed_at": datetime.now(UTC).isoformat(),
         }
+        if self.source_instance is None:
+            if self.replication_service is not None:
+                raise ReplicationDurabilityError("source instance identity is unavailable")
+            return None
+        self.source_instance.verify_hash()
+        self.source_instance.verify_identity()
+        if self.source_instance.canonical_root_path != str(self.root.resolve()):
+            raise ReplicationDurabilityError("source instance canonical root mismatch")
+        if self.replication_service is not None and (
+            self.replication_service.source_instance_id != self.source_instance.source_instance_id
+            or self.replication_service.source_instance_sha256
+            != self.source_instance.source_instance_sha256
+        ):
+            raise ReplicationDurabilityError("replication source identity mismatch")
         # Hash the exact canonical Pydantic preimage (tuple inventory is
         # serialized as a JSON array); hashing the construction dictionary
         # directly would produce a different domain value.

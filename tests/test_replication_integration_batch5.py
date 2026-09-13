@@ -12,13 +12,23 @@ from backend.app.market.backfill import BackfillService
 from backend.app.market.candidates import CandidateStore, SessionSelection
 from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
-from backend.app.storage.dataset import DatasetError, NasMarketStore, PointerIdentity
+from backend.app.storage.dataset import (
+    DatasetError,
+    NasMarketStore,
+    PointerIdentity,
+    canonical_control_schema_digest,
+)
 from backend.app.storage.factory import (
     ReplicationDrainConfigurationError,
     build_nas_market_store,
     build_replication_drain_worker,
 )
-from backend.app.storage.replication import LineageInput, LineageResolver
+from backend.app.storage.replication import (
+    LineageInput,
+    LineageResolver,
+    ReplicationOutboxService,
+    SourceInstanceStore,
+)
 from tests.test_market_backfill import RangeProvider, trading_days
 from tests.test_market_candidate_selection import _real_candidate_bundle
 from tests.test_nas_dataset import _bars, _ready_result
@@ -52,6 +62,48 @@ def test_disabled_replication_still_seals_local_publication_binding(tmp_path) ->
     bindings = tuple((root / "_replication" / "source-commits").glob("*.json"))
     assert len(bindings) == 1
     assert not (tmp_path / "control" / "replication").exists()
+
+
+def test_source_commit_uses_exact_immutable_source_instance_or_is_optional(tmp_path) -> None:
+    root = _dataset(tmp_path)
+    source = SourceInstanceStore(root / "_replication" / "source-instance.json").create(
+        canonical_root_path=root,
+        canonical_schema_digest=canonical_control_schema_digest(),
+        source_instance_nonce="d" * 64,
+    )
+    service = ReplicationOutboxService(
+        tmp_path / "sidecar",
+        source_instance_id=source.source_instance_id,
+        source_instance_sha256=source.source_instance_sha256,
+    )
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+        replication_enabled=True,
+        replication_service=service,
+        source_instance=source,
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    payload = store.coordinator.lock.result_payload
+    assert payload is not None
+    commit = payload["source_commit"]
+    assert commit.source_instance_id == source.source_instance_id
+    assert commit.source_instance_sha256 == source.source_instance_sha256
+
+    (tmp_path / "disabled").mkdir()
+    disabled_root = _dataset(tmp_path / "disabled")
+    disabled = NasMarketStore(
+        MarketStore(tmp_path / "disabled-control" / "market.duckdb"),
+        disabled_root,
+        tmp_path / "disabled-staging",
+        replication_enabled=False,
+    )
+    disabled.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    disabled_payload = disabled.coordinator.lock.result_payload
+    assert disabled_payload is not None
+    assert disabled_payload["source_commit"] is None
+    assert disabled_payload["observation"].source_instance_id != "0" * 64
 
 
 def test_pointer_identity_distinguishes_valid_absent_from_invalid_partial(tmp_path) -> None:
@@ -103,7 +155,7 @@ def test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists() 
                 continue
             if node.func.attr not in {"save_refresh", "upsert_bars"}:
                 continue
-            if name == "test_replication_integration_batch5.py" and 268 <= node.lineno <= 280:
+            if name == "test_replication_integration_batch5.py" and 321 <= node.lineno <= 333:
                 # Deliberate negative anchor proving omission is rejected.
                 continue
             assert any(

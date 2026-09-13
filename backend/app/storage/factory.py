@@ -91,6 +91,7 @@ def build_nas_market_store(
         read_only=read_only,
     )
     service = None
+    source = None
     if settings.replication_enabled:
         source_path = root / "_replication" / "source-instance.json"
         try:
@@ -125,6 +126,7 @@ def build_nas_market_store(
         layout.local_paths.staging,
         replication_enabled=settings.replication_enabled,
         replication_service=service,
+        source_instance=source,
         lineage_resolver=resolver,
     )
 

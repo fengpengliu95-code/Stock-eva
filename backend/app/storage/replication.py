@@ -5022,7 +5022,11 @@ class ReplicationOutboxService:
         values: dict[str, object] = {
             "source_commit_sha256": source_commit.source_commit_sha256,
             "checkpoint_id": checkpoint_id,
-            "source_instance_id": self.source_instance_id or "0" * 64,
+            "source_instance_id": self.source_instance_id
+            or domain_sha256(
+                "stock-eva/r2f4.3/unconfigured-source-instance/v1",
+                {"source_commit_sha256": source_commit.source_commit_sha256},
+            ),
             "source_sequence": None,
             "intent_id": None,
             "enqueue_state": state,
@@ -5037,7 +5041,11 @@ class ReplicationOutboxService:
             "observed_at": _utc_now(),
         }
         values["observation_sha256"] = domain_sha256(
-            "stock-eva/r2f4.3/replication-observation/v1", values
+            "stock-eva/r2f4.3/replication-observation/v1",
+            {
+                **values,
+                "effects": values["effects"].model_dump(mode="json"),
+            },
         )
         return ReplicationObservation.model_validate(values)
 
@@ -5051,7 +5059,15 @@ class ReplicationOutboxService:
         root: Path,
     ) -> None:
         """Install a replayable checkpoint journal after pointer linearization."""
-        if self.journal_root is None or self.source_instance_id is None:
+        if (
+            self.journal_root is None
+            or self.source_instance_id is None
+            or self.source_instance_sha256 is None
+            or pointer.row_sha256 is None
+            or pointer.device is None
+            or pointer.inode is None
+            or pointer.schema_digest is None
+        ):
             return
         inventory = tuple(
             ObjectInventoryEntry.model_validate(
@@ -5068,16 +5084,16 @@ class ReplicationOutboxService:
         )
         checkpoint = build_source_checkpoint(
             source_instance_id=self.source_instance_id,
-            source_instance_sha256=self.source_instance_sha256 or "0" * 64,
+            source_instance_sha256=self.source_instance_sha256,
             publication_binding_sha256=binding.binding_sha256,
-            pointer_row_sha256=pointer.row_sha256 or "0" * 64,
+            pointer_row_sha256=pointer.row_sha256,
             pointer_generation=binding.manifest_generation,
             source_run_id=result.run_id,
             source_trade_date=result.requested_date.isoformat(),
             source_published_at=binding.published_at,
-            pointer_db_device=pointer.device or 1,
-            pointer_db_inode=pointer.inode or 1,
-            pointer_db_schema_digest=pointer.schema_digest or "0" * 64,
+            pointer_db_device=pointer.device,
+            pointer_db_inode=pointer.inode,
+            pointer_db_schema_digest=pointer.schema_digest,
             manifest_canonical_sha256=binding.manifest_canonical_sha256,
             source_manifest_bytes_sha256=binding.manifest_bytes_sha256,
             source_object_set_sha256=binding.source_object_set_sha256,
@@ -9199,6 +9215,10 @@ class RestoreAuditStore:
                     restore_writes=True,
                     audit_writes=True,
                 )
+                unavailable_source_id = domain_sha256(
+                    "stock-eva/r2f4.3/unconfigured-source-instance/v1",
+                    {"audit_id": audit_id},
+                )
                 values: dict[str, object] = {
                     "report_schema": "stock-eva/r2f4.3/restore-report/v1",
                     "schema_version": 1,
@@ -9209,7 +9229,7 @@ class RestoreAuditStore:
                     "source_manifest_canonical_sha256": "0" * 64,
                     "source_object_set_sha256": "0" * 64,
                     "publication_binding_sha256": "0" * 64,
-                    "source_instance_id": "0" * 64,
+                    "source_instance_id": unavailable_source_id,
                     "source_sequence": 1,
                     "checkpoint_id": "0" * 64,
                     "object_count": 0,
