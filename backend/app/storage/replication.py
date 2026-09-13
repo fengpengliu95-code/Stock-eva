@@ -399,6 +399,9 @@ class LineageResolver:
             if (
                 candidate.status != "accepted"
                 or candidate.trade_date.isoformat() != trade_date
+                or selection.trade_date.isoformat() != trade_date
+                or selection.universe_id != candidate.universe_id
+                or selection.selected_provider_id.value != candidate.provider_id.value
                 or candidate.evidence_id != evidence_id
                 or candidate.evidence_sha256 != evidence_sha
                 or candidate.candidate_id != selection.selected_candidate_id

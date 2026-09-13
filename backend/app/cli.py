@@ -2160,7 +2160,11 @@ def main() -> int:
     settings = get_settings()
     prevalidated_lineage_pairs = None
     local_effective_dates = None
-    configured_backfill_root = configured_market_dataset_root(settings)
+    configured_backfill_root = None
+    if args.command == "backfill":
+        # Dataset-root discovery is market/backfill-only.  Private backups and
+        # unrelated commands must not probe NAS/local market configuration.
+        configured_backfill_root = configured_market_dataset_root(settings)
     # Effective-day planning is a local calendar decision.  Resolve it before
     # constructing BaoStockProvider so an unavailable calendar is a strict
     # zero-provider/zero-write result.

@@ -37,6 +37,7 @@ from backend.app.storage.replication import (
     LEGACY_SELECTION_SHA256,
     LineageInput,
     LineageResolver,
+    ReplicationDurabilityError,
     ReplicationEffects,
     ReplicationObservation,
     SourceCommit,
@@ -423,7 +424,7 @@ class ManifestPublicationCoordinator:
         selection: object | None = None,
     ) -> tuple[dict[str, object], str, str]:
         if lineage_input is None:
-            lineage_input = {"mode": "legacy"}
+            raise DatasetError("source lineage input is required")
         resolved = self.lineage_resolver.resolve(
             lineage_input, trade_date.isoformat(), existing_mode
         )
@@ -726,6 +727,22 @@ class ManifestPublicationCoordinator:
                 )
             pointer = self.store._pointer_identity()
             if pointer.kind != "PRESENT":
+                # The canonical manifest/binding may already be durable even
+                # when the control pointer is unreadable.  Persist the exact
+                # reconciliation context before returning the degraded
+                # observation; a journal failure is itself observable through
+                # the unchanged control-unavailable result.
+                if self.store.replication_service is not None:
+                    try:
+                        self.store.replication_service.journal_publication(
+                            binding=binding,
+                            pointer=pointer,
+                            result=result,
+                            manifest=manifest,
+                            root=self.store.root,
+                        )
+                    except Exception:
+                        pass
                 return self._remember_result(
                     {
                         "manifest_generation": binding.manifest_generation,
@@ -1048,6 +1065,7 @@ class NasMarketStore:
                 os.close(descriptor)
 
     def _write_binding(self, binding: SourcePublicationBinding) -> Path:
+        binding.verify_hash()
         root = self.root / "_replication" / "source-commits"
         path = root / f"{binding.run_id}.json"
         payload = canonical_json_bytes(binding.model_dump(mode="json"))
@@ -1067,9 +1085,19 @@ class NasMarketStore:
         try:
             for path in root.glob("*.json"):
                 payload = _read_bounded_json(path)
-                if isinstance(payload, dict) and payload.get("manifest_generation") == generation:
-                    matches.append(SourcePublicationBinding.model_validate(payload))
-        except (DatasetError, OSError, UnicodeError, json.JSONDecodeError, ValidationError) as exc:
+                if isinstance(payload, dict):
+                    binding = SourcePublicationBinding.model_validate(payload)
+                    binding.verify_hash()
+                    if binding.manifest_generation == generation:
+                        matches.append(binding)
+        except (
+            DatasetError,
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValidationError,
+            ReplicationDurabilityError,
+        ) as exc:
             raise DatasetError("publication binding is unavailable") from exc
         if len(matches) > 1:
             raise DatasetError("duplicate publication bindings for manifest generation")
@@ -1080,6 +1108,7 @@ class NasMarketStore:
         binding: SourcePublicationBinding,
         manifest: dict[str, object],
     ) -> tuple[str, str, str]:
+        binding.verify_hash()
         raw_sha, canonical_sha, object_sha = self.coordinator._manifest_hashes(manifest, self.root)
         if (
             binding.manifest_generation != str(manifest.get("generation"))
@@ -1819,11 +1848,13 @@ class NasMarketStore:
         lineage_input: LineageInput | dict[str, object] | None = None,
     ) -> None:
         self._ensure_writable()
+        if lineage_input is None:
+            raise DatasetError("source lineage input is required")
         self.coordinator.publish_manifest_only(
             {
                 "bars": bars,
                 "source": bars[0].source if bars else "baostock",
-                "lineage_input": lineage_input or {"mode": "legacy"},
+                "lineage_input": lineage_input,
             }
         )
 
@@ -1834,11 +1865,17 @@ class NasMarketStore:
         *,
         publish: bool | None = None,
         publication_lineage: dict[str, object] | None = None,
+        lineage_input: LineageInput | dict[str, object] | None = None,
         selection: PublishedSelection | None = None,
     ) -> None:
         self._ensure_writable()
         publish = result.status == "ready" if publish is None else publish
         if publish:
+            if lineage_input is None:
+                if publication_lineage is not None:
+                    lineage_input = {"mode": "modern", "exact": publication_lineage}
+                else:
+                    raise DatasetError("source lineage input is required")
             MarketStore._validate_ready_publication(result)
             MarketStore._validate_local_publication_bars(bars, result)
             if publication_lineage is not None:
@@ -1863,11 +1900,7 @@ class NasMarketStore:
                     "source": result.source,
                     "result": result,
                     "selection": selection,
-                    "lineage_input": (
-                        {"mode": "legacy"}
-                        if publication_lineage is None
-                        else {"mode": "modern", "exact": publication_lineage}
-                    ),
+                    "lineage_input": lineage_input,
                 }
             )
         else:
