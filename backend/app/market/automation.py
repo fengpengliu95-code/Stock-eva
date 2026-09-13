@@ -101,6 +101,7 @@ from backend.app.market.universe import (
     source_version_digest,
     validate_calendar_authority,
 )
+from backend.app.storage.dataset import DatasetError, LineageInput, NasMarketStore
 from backend.app.user.store import UserStore
 
 logger = logging.getLogger("stock_eva.market.automation")
@@ -2415,8 +2416,11 @@ def run_publication_refresh(
     run_kind: Literal["daily", "backfill", "repair"] = "daily",
     before_store: Callable[[], None] | None = None,
     normalized_batch=None,
+    lineage_input: LineageInput | dict[str, object] | None = None,
 ) -> RefreshResult:
     """Fetch to canonical staging, validate all gates, then move the pointer."""
+    if isinstance(store, NasMarketStore) and lineage_input is None:
+        raise DatasetError("source lineage input is required for NAS publication")
     started_at = datetime.now(UTC)
     request_key = request_key or (f"daily:baostock:{trade_date.isoformat()}:all-main-board")
     request_prefix = hashlib.sha256(request_key.encode()).hexdigest()[:12]
@@ -2463,7 +2467,15 @@ def run_publication_refresh(
         if failure.failure_stage != "publish":
             try:
                 finalize_provider_audit()
-                store.save_refresh([], result, publish=False)
+                if isinstance(store, NasMarketStore):
+                    store.save_refresh(
+                        [],
+                        result,
+                        publish=False,
+                        lineage_input=lineage_input,
+                    )
+                else:
+                    store.save_refresh([], result, publish=False)
             except Exception as error:
                 storage_failure = market_failure_from_exception(
                     error,
@@ -2560,11 +2572,21 @@ def run_publication_refresh(
         # rows behind an existing published pointer for the same session.
         failure_stage = "publish"
         finalize_provider_audit()
-        store.save_refresh(
-            batch.bars if status == "ready" else [],
-            result,
-            publish=status == "ready",
-        )
+        if isinstance(store, NasMarketStore):
+            if status == "ready" and lineage_input is None:
+                raise DatasetError("source lineage input is required for NAS publication")
+            store.save_refresh(
+                batch.bars if status == "ready" else [],
+                result,
+                publish=status == "ready",
+                lineage_input=lineage_input,
+            )
+        else:
+            store.save_refresh(
+                batch.bars if status == "ready" else [],
+                result,
+                publish=status == "ready",
+            )
         _log_event(
             logging.INFO if status == "ready" else logging.WARNING,
             "market_publication_finished",
@@ -2911,6 +2933,7 @@ class MarketAutomationService:
                         request_key=request_key,
                         run_id=refresh_id,
                         before_store=collector.resolve_touched_endpoints,
+                        lineage_input={"mode": "legacy"},
                     )
             collector.resolve_touched_endpoints()
         if result.status == "ready":

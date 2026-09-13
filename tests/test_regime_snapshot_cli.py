@@ -210,7 +210,7 @@ def _published_settings(tmp_path: Path) -> tuple[Settings, tuple[date, ...]]:
         MarketStore(settings.market_data_dir / settings.market_database_name),
         dataset_root,
         settings.local_staging_dir,
-    ).upsert_bars(bars)
+    ).upsert_bars(bars, lineage_input={"mode": "legacy"})
     return settings, dates
 
 

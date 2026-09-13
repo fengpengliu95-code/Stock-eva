@@ -2812,6 +2812,7 @@ def test_enqueue_service_corrupt_object_while_waiting_fails_before_control_write
         [continuity_bar(session)],
         ready_refresh(session),
         publish=True,
+        lineage_input={"mode": "legacy"},
     )
     scanner = module.ContinuityInventory(
         calendar=RecordingConfirmedCalendar({session: "open"}),

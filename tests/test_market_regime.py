@@ -509,6 +509,7 @@ def test_published_cache_revalidates_same_generation_object_mutation(
             completed_at=datetime(2026, 7, 29, 1, tzinfo=UTC),
         ),
         publish=True,
+        lineage_input={"mode": "legacy"},
     )
     manifest = json.loads((dataset_root / "manifest.json").read_text(encoding="utf-8"))
     parquet = dataset_root / manifest["files"][0]["path"]
@@ -633,6 +634,7 @@ def test_published_snapshot_binds_query_to_verified_manifest_view(tmp_path: Path
                 completed_at=datetime(2026, 7, 29, 1, tzinfo=UTC),
             ),
             publish=True,
+            lineage_input={"mode": "legacy"},
         )
 
     publish(10, "snapshot-a")
@@ -680,7 +682,7 @@ def test_snapshot_backfill_fails_closed_before_insert_on_future_bound_input(
         dataset_root,
         tmp_path / "staging",
     )
-    publisher.upsert_bars([_bar(AS_OF, "sh.600000")])
+    publisher.upsert_bars([_bar(AS_OF, "sh.600000")], lineage_input={"mode": "legacy"})
     reader = store_module.PublishedDatasetMarketReader(
         control_path=tmp_path / "control.duckdb",
         control_temp=tmp_path / "reader-temp",
@@ -739,7 +741,9 @@ def test_snapshot_backfill_selects_twenty_manifest_dates_with_one_checksum_pass(
         dataset_root,
         tmp_path / "staging",
     )
-    publisher.upsert_bars([_bar(trade_date, "sh.600000") for trade_date in dates])
+    publisher.upsert_bars(
+        [_bar(trade_date, "sh.600000") for trade_date in dates], lineage_input={"mode": "legacy"}
+    )
     reader = store_module.PublishedDatasetMarketReader(
         control_path=tmp_path / "control.duckdb",
         control_temp=tmp_path / "reader-temp",
@@ -809,7 +813,7 @@ def test_snapshot_backfill_does_not_insert_when_bound_object_changes_during_quer
         dataset_root,
         tmp_path / "staging",
     )
-    publisher.upsert_bars([_bar(AS_OF, "sh.600000")])
+    publisher.upsert_bars([_bar(AS_OF, "sh.600000")], lineage_input={"mode": "legacy"})
     reader = store_module.PublishedDatasetMarketReader(
         control_path=tmp_path / "control.duckdb",
         control_temp=tmp_path / "reader-temp",

@@ -456,7 +456,7 @@ def test_legacy_baostock_rows_and_manifests_decode_without_rewrite(tmp_path):
         started_at=datetime(2026, 7, 24, 10, tzinfo=UTC),
         completed_at=datetime(2026, 7, 24, 10, 1, tzinfo=UTC),
     )
-    store.save_refresh(bars, result, publish=True)
+    store.save_refresh(bars, result, publish=True, lineage_input={"mode": "legacy"})
     manifest_path = dataset_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     for item in manifest["files"]:

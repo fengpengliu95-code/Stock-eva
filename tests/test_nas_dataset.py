@@ -221,6 +221,7 @@ def test_verified_ready_inventory_enumerates_all_current_manifest_partitions(
             _bars_on(session),
             _ready_result_on(session),
             publish=True,
+            lineage_input={"mode": "legacy"},
         )
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     verified_at = datetime(2026, 8, 13, 9, 30, tzinfo=UTC)
@@ -251,7 +252,7 @@ def test_verified_ready_inventory_rejects_missing_or_wrong_hash_object(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     store.verified_ready_session_inventory()
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -281,7 +282,7 @@ def test_verified_ready_inventory_rejects_wrong_schema_and_row_count(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     store.verified_ready_session_inventory()
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -331,6 +332,7 @@ def test_verified_ready_inventory_is_bound_to_one_manifest_snapshot(
             _bars_on(session),
             _ready_result_on(session),
             publish=True,
+            lineage_input={"mode": "legacy"},
         )
     manifest_path = root / "manifest.json"
     captured = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -373,7 +375,7 @@ def test_lightweight_manifest_dates_is_not_the_continuity_inventory_contract(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     store.verified_ready_session_inventory()
     parquet = next((root / "bars").rglob("*.parquet"))
     parquet.write_bytes(b"corrupt-after-inventory")
@@ -449,7 +451,7 @@ def test_continuity_scan_rejects_corrupt_strict_inventory_before_writer_construc
     root = _root(tmp_path)
     control = MarketStore(tmp_path / "control" / "market.duckdb")
     store = NasMarketStore(control, root, tmp_path / "staging")
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     published = root / manifest["files"][0]["path"]
@@ -506,7 +508,7 @@ def test_verified_ready_inventory_rejects_symlink_escape_without_writes(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     published = root / manifest["files"][0]["path"]
@@ -560,7 +562,7 @@ def test_verified_ready_inventory_rejects_atomic_symlink_swap_after_containment(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     published = root / manifest["files"][0]["path"]
     outside = tmp_path / "outside-hardlink.parquet"
@@ -623,7 +625,7 @@ def test_verified_ready_inventory_rejects_rows_outside_manifest_partition(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     _replace_manifest_partition_from_query(
         root,
         name="mixed-partition",
@@ -659,7 +661,7 @@ def test_verified_ready_inventory_requires_exact_canonical_schema(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     _replace_manifest_partition_from_query(
         root,
         name="wrong-schema",
@@ -712,7 +714,9 @@ def test_verified_local_mirror_is_idempotent_and_manifest_readable(tmp_path: Pat
         source,
         tmp_path / "source-staging",
     )
-    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    source_store.save_refresh(
+        _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+    )
     destination = tmp_path / "local-mirror"
 
     first = MarketDatasetMirror(source, destination).sync()
@@ -744,7 +748,9 @@ def test_older_archive_never_replaces_a_newer_local_dataset(tmp_path: Path) -> N
         source,
         tmp_path / "source-staging",
     )
-    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    source_store.save_refresh(
+        _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+    )
     destination = tmp_path / "local-mirror"
     MarketDatasetMirror(source, destination).sync()
     destination_store = NasMarketStore(
@@ -756,6 +762,7 @@ def test_older_archive_never_replaces_a_newer_local_dataset(tmp_path: Path) -> N
         _bars_on(date(2026, 7, 24)),
         _ready_result_on(date(2026, 7, 24)),
         publish=True,
+        lineage_input={"mode": "legacy"},
     )
 
     result = MarketDatasetMirror(source, destination).sync()
@@ -777,7 +784,9 @@ def test_interrupted_mirror_keeps_the_previous_manifest(
         source,
         tmp_path / "source-staging",
     )
-    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    source_store.save_refresh(
+        _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+    )
     destination = tmp_path / "local-mirror"
     MarketDatasetMirror(source, destination).sync()
     original_manifest = (destination / "manifest.json").read_bytes()
@@ -785,6 +794,7 @@ def test_interrupted_mirror_keeps_the_previous_manifest(
         _bars_on(date(2026, 7, 24)),
         _ready_result_on(date(2026, 7, 24)),
         publish=True,
+        lineage_input={"mode": "legacy"},
     )
     real_replace = os.replace
 
@@ -815,7 +825,9 @@ def test_invalid_source_never_replaces_a_valid_local_mirror(tmp_path: Path) -> N
         source,
         tmp_path / "source-staging",
     )
-    source_store.save_refresh(_bars(), _ready_result(), publish=True)
+    source_store.save_refresh(
+        _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+    )
     destination = tmp_path / "local-mirror"
     MarketDatasetMirror(source, destination).sync()
     original = (destination / "manifest.json").read_bytes()
@@ -838,7 +850,7 @@ def test_nas_manifest_publication_is_readable_and_control_pointer_is_local(tmp_p
     control = MarketStore(tmp_path / "control" / "market.duckdb")
     store = NasMarketStore(control, root, tmp_path / "staging")
 
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
 
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest["files"]) == 1
@@ -865,7 +877,7 @@ def test_reader_reuses_a_validated_generation_across_requests(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     original = NasMarketStore._validate_parquet
     calls = 0
 
@@ -902,7 +914,7 @@ def test_failed_readback_never_moves_manifest_or_published_pointer(
 
     monkeypatch.setattr(store.publisher, "readback_and_verify", interrupted)
     with pytest.raises(DatasetError, match="simulated_readback_failure"):
-        store.save_refresh(_bars(), _ready_result(), publish=True)
+        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
 
     assert (root / "manifest.json").read_text(encoding="utf-8") == original_manifest
     assert control.published_refresh() is None
@@ -950,7 +962,7 @@ def test_multi_date_publication_replaces_manifest_once(tmp_path: Path, monkeypat
         return original_publish(*args, **kwargs)
 
     monkeypatch.setattr(store.publisher, "publish_manifest", record_publish)
-    store.upsert_bars([first, second])
+    store.upsert_bars([first, second], lineage_input={"mode": "legacy"})
 
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert calls == 1
@@ -964,7 +976,7 @@ def test_api_maps_tampered_nas_dataset_to_safe_503(tmp_path: Path) -> None:
     root = _root(tmp_path)
     control = MarketStore(tmp_path / "control" / "market.duckdb")
     store = NasMarketStore(control, root, tmp_path / "staging")
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     manifest["files"][0]["sha256"] = "0" * 64
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1010,7 +1022,7 @@ def test_reader_rejects_required_manifest_integrity_metadata(
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     mutation(manifest["files"][0])
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1026,7 +1038,7 @@ def test_reader_rejects_schema_mismatch_and_export_revalidates(tmp_path: Path) -
         root,
         tmp_path / "staging",
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     bad_file = root / "bars" / "bad.parquet"
     bad_file.parent.mkdir(parents=True, exist_ok=True)
     import duckdb
@@ -1076,7 +1088,7 @@ def test_manifest_lock_and_generation_cas_prevent_lost_updates(tmp_path: Path, m
     )
     with _ManifestLock(store.manifest_lock_path):
         with pytest.raises(DatasetError, match="already running"):
-            store.upsert_bars([_bars()[0]])
+            store.upsert_bars([_bars()[0]], lineage_input={"mode": "legacy"})
 
     original_readback = store.publisher.readback_and_verify
 
@@ -1088,7 +1100,7 @@ def test_manifest_lock_and_generation_cas_prevent_lost_updates(tmp_path: Path, m
 
     monkeypatch.setattr(store.publisher, "readback_and_verify", change_generation)
     with pytest.raises(DatasetError, match="changed during staging"):
-        store.upsert_bars([_bars()[0]])
+        store.upsert_bars([_bars()[0]], lineage_input={"mode": "legacy"})
     assert json.loads((root / "manifest.json").read_text(encoding="utf-8"))["generation"] == (
         "generation-interloper"
     )

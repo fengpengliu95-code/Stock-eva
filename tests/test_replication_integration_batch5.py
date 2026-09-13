@@ -1,19 +1,26 @@
 """Final R2-F4.3 Batch5 integration anchors and adversarial inputs."""
 
+import ast
 import json
-from datetime import date
+from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
+from backend.app.config import Settings
 from backend.app.market.backfill import BackfillService
+from backend.app.market.candidates import CandidateStore, SessionSelection
+from backend.app.market.models import DailyBar, RefreshResult
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import DatasetError, NasMarketStore, PointerIdentity
 from backend.app.storage.factory import (
     ReplicationDrainConfigurationError,
+    build_nas_market_store,
     build_replication_drain_worker,
 )
-from backend.app.storage.replication import LineageResolver
+from backend.app.storage.replication import LineageInput, LineageResolver
 from tests.test_market_backfill import RangeProvider, trading_days
+from tests.test_market_candidate_selection import _real_candidate_bundle
 from tests.test_nas_dataset import _bars, _ready_result
 
 
@@ -83,6 +90,116 @@ def test_modern_lineage_requires_retained_success_evidence_reader() -> None:
     result = LineageResolver().resolve(modern, "2026-07-23")
     assert result.kind == "UNAVAILABLE"
     assert result.reason_code == "SOURCE_UNAVAILABLE"
+
+
+def test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists() -> None:
+    tests_root = Path(__file__).parent
+    assert not (tests_root / "conftest.py").exists()
+    for name in ("test_nas_dataset.py", "test_replication_integration_batch5.py"):
+        path = tests_root / name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"save_refresh", "upsert_bars"}:
+                continue
+            if name == "test_replication_integration_batch5.py" and 268 <= node.lineno <= 280:
+                # Deliberate negative anchor proving omission is rejected.
+                continue
+            assert any(
+                keyword.arg in {"lineage_input", "publication_lineage"} for keyword in node.keywords
+            ), f"omitted lineage at {path}:{node.lineno}"
+
+
+def test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper(tmp_path) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence, report, candidate = _real_candidate_bundle(tmp_path)
+    bundle = evidence_root / "bundles" / candidate.candidate_id
+    selection = SessionSelection.model_validate(
+        json.loads((bundle / "selection.json").read_text(encoding="utf-8"))
+    )
+    capability = CandidateStore(evidence_root).publish_chain(
+        report=report,
+        candidate=candidate,
+        selection=selection,
+        evidence=evidence,
+        normalized_payload=(bundle / "normalized.json").read_bytes(),
+    )
+    bars = [
+        DailyBar.model_validate(item)
+        for item in json.loads((bundle / "normalized.json").read_text(encoding="utf-8"))
+    ]
+    (tmp_path / "valid").mkdir()
+    root = _dataset(tmp_path / "valid")
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "valid-control",
+        local_staging_dir=tmp_path / "valid-staging",
+        local_lock_dir=tmp_path / "valid-locks",
+        local_temp_dir=tmp_path / "valid-temp",
+        local_market_dataset_root=root,
+        provider_evidence_root=evidence_root,
+    )
+    store = build_nas_market_store(settings)
+    assert store is not None
+    result = RefreshResult(
+        run_id="retained-success",
+        request_key="retained-success",
+        requested_date=candidate.trade_date,
+        source="baostock",
+        status="ready",
+        requested_count=len(bars),
+        succeeded_count=len(bars),
+        coverage_ratio=1,
+        started_at=datetime(2026, 8, 20, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 20, 1, tzinfo=UTC),
+    )
+    store.save_refresh(
+        bars,
+        result,
+        publish=True,
+        lineage_input=LineageInput(
+            mode="modern",
+            candidate_id=candidate.candidate_id,
+            evidence_id=candidate.evidence_id,
+        ),
+        selection=capability,
+    )
+    binding = next((root / "_replication" / "source-commits").glob("*.json"))
+    binding_payload = json.loads(binding.read_text(encoding="utf-8"))
+    assert binding_payload["selection_sha256"] == selection.selection_sha256
+    assert binding_payload["lineage_sha256"] != "0" * 64
+
+    tampered = tmp_path / "tampered"
+    tampered.mkdir()
+    tampered_root = _dataset(tampered)
+    tampered_settings = settings.model_copy(
+        update={
+            "local_market_dataset_root": tampered_root,
+            "local_control_dir": tmp_path / "tampered-control",
+            "local_staging_dir": tmp_path / "tampered-staging",
+        }
+    )
+    candidate_path = bundle / "candidate.json"
+    candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+    candidate_payload["manifest_sha256"] = "0" * 64
+    candidate_path.write_text(json.dumps(candidate_payload), encoding="utf-8")
+    tampered_store = build_nas_market_store(tampered_settings)
+    assert tampered_store is not None
+    before = (tampered_root / "manifest.json").read_bytes()
+    with pytest.raises(DatasetError, match="source lineage is unavailable"):
+        tampered_store.save_refresh(
+            bars,
+            result,
+            publish=True,
+            lineage_input=LineageInput(
+                mode="modern",
+                candidate_id=candidate.candidate_id,
+                evidence_id=candidate.evidence_id,
+            ),
+        )
+    assert (tampered_root / "manifest.json").read_bytes() == before
+    evidence.close()
 
 
 def test_dataset_plan_rejects_duplicate_and_out_of_order_dates(tmp_path) -> None:

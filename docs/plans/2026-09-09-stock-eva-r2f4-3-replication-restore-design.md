@@ -2534,11 +2534,24 @@ The two crosswalks above are updated to reference these exact anchors. The R2-F4
 
 ## Batch5 rescue crosswalk (2026-09-13)
 
-Batch5 acceptance anchors live in `tests/test_replication_integration_batch5.py` and cover
-manifest-only no-binding behavior, exact immutable binding reuse, strict pointer schema
-classification, resolver/corrupt-manifest fail-closed behavior, and the gated bounded drain
-factory. This is a test/spec crosswalk only and does not authorize real NAS/provider or
+Batch5 acceptance anchors live in `tests/test_replication_integration_batch5.py` and are named
+explicitly below. This is a test/spec crosswalk only and does not authorize real NAS/provider or
 production execution.
+
+| Contract | Exact test anchor |
+|---|---|
+| Disabled replication still seals a local binding | `test_disabled_replication_still_seals_local_publication_binding` |
+| Manifest-only has no binding/pointer sidecar | `test_manifest_only_does_not_create_binding_or_pointer_sidecar` |
+| Pointer identity rejects extra schema state | `test_pointer_identity_rejects_extra_table_and_column` |
+| Retained resolver is required for modern lineage | `test_modern_lineage_requires_retained_success_evidence_reader` |
+| Factory publishes exact retained selection and rejects tamper | `test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper` |
+| Corrupt manifest is not empty | `test_manifest_corruption_is_not_treated_as_empty` |
+| Omitted lineage fails before mutation | `test_omitted_lineage_fails_before_manifest_mutation` |
+| Binding reuse and duplicate rejection | `test_binding_reuse_requires_exact_immutable_fields`, `test_reconcile_rejects_duplicate_generation_bindings` |
+| Binding hash tamper preserves pointer | `test_mutated_binding_hash_rejects_reconcile_without_pointer_change` |
+| Post-commit invalid pointer journals context | `test_postcommit_invalid_pointer_journals_exact_context` |
+| NAS writer callsites have no global shim | `test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists` |
+| Drain double-gate short-circuits | `test_drain_factory_double_gate_short_circuits_before_destination` |
 
 #### Batch1.7 immutable-generation integrity and threat-model amendment (normative)
 

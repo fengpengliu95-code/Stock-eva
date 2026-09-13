@@ -10,12 +10,22 @@ from backend.app.market.failures import (
 )
 from backend.app.market.models import RefreshResult
 from backend.app.market.store import MarketStore
+from backend.app.storage.dataset import DatasetError, LineageInput, NasMarketStore
 
 
 class MarketRefreshService:
-    def __init__(self, store: MarketStore, provider: BaoStockProvider | None = None) -> None:
+    def __init__(
+        self,
+        store: MarketStore,
+        provider: BaoStockProvider | None = None,
+        *,
+        lineage_input: LineageInput | dict[str, object] | None = None,
+    ) -> None:
         self.store = store
         self.provider = provider or BaoStockProvider()
+        if isinstance(store, NasMarketStore) and lineage_input is None:
+            raise DatasetError("source lineage input is required for NAS publication")
+        self.lineage_input = lineage_input
 
     def refresh(self, trade_date: date, symbols: list[str] | None = None) -> RefreshResult:
         started_at = datetime.now(UTC)
@@ -48,7 +58,12 @@ class MarketRefreshService:
             )
             if failure.failure_stage != "publish":
                 try:
-                    self.store.save_refresh([], result, publish=False)
+                    if isinstance(self.store, NasMarketStore):
+                        self.store.save_refresh(
+                            [], result, publish=False, lineage_input=self.lineage_input
+                        )
+                    else:
+                        self.store.save_refresh([], result, publish=False)
                 except Exception as error:
                     storage_failure = market_failure_from_exception(
                         error,
@@ -111,7 +126,15 @@ class MarketRefreshService:
                 completed_at=datetime.now(UTC),
             )
             failure_stage = "publish"
-            self.store.save_refresh(batch.bars, result, publish=False)
+            if isinstance(self.store, NasMarketStore):
+                self.store.save_refresh(
+                    batch.bars,
+                    result,
+                    publish=False,
+                    lineage_input=self.lineage_input,
+                )
+            else:
+                self.store.save_refresh(batch.bars, result, publish=False)
             return result
         except Exception as error:
             failure = market_failure_from_exception(

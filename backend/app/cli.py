@@ -3561,6 +3561,7 @@ def main() -> int:
                     provider,
                     trade_date=args.trade_date,
                     required_symbols=collect_required_symbols(user_store),
+                    lineage_input={"mode": "legacy"},
                 )
         except RefreshAlreadyRunning:
             print(
@@ -3587,6 +3588,7 @@ def main() -> int:
             result = MarketRefreshService(
                 store,
                 BaoStockProvider(socket_timeout_seconds=socket_timeout_seconds),
+                lineage_input={"mode": "legacy"} if isinstance(store, NasMarketStore) else None,
             ).refresh(args.trade_date, symbols=args.symbols)
         except Exception as error:
             failure = market_failure_from_exception(error, stage="fetch")

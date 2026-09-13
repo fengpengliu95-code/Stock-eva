@@ -1897,6 +1897,7 @@ class ContinuityRepairExecutor:
                             run_id=run_id,
                             run_kind="repair",
                             before_store=before_store,
+                            lineage_input={"mode": "legacy"},
                         )
                 except Exception:
                     result = self._unexpected_failure(

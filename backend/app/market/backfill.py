@@ -572,7 +572,7 @@ class BackfillService:
                     error_code="provider_error",
                 )
         loaded_points = len(self.store.present_points(plan.trading_dates, plan.symbols))
-        self._save_daily_audits(plan)
+        self._save_daily_audits(plan, resolved_inputs)
         return self.audit.finalize(plan, loaded_points=loaded_points)
 
     @staticmethod
@@ -601,7 +601,13 @@ class BackfillService:
                 raise ValueError("provider backfill batch identity is invalid")
             points.add(point)
 
-    def _save_daily_audits(self, plan: BackfillPlan) -> None:
+    def _save_daily_audits(
+        self,
+        plan: BackfillPlan,
+        resolved_inputs: dict[tuple[int, str], LineageInput],
+    ) -> None:
+        from backend.app.storage.dataset import NasMarketStore
+
         present = self.store.present_points(plan.trading_dates, plan.symbols)
         now = datetime.now(UTC)
         for trade_date in plan.trading_dates:
@@ -612,22 +618,41 @@ class BackfillService:
             loaded = len(loaded_symbols)
             status = "ready" if not failures else "partial" if loaded else "error"
             request_key = f"{plan.request_key}:date:{trade_date}"
-            self.store.save_refresh(
-                [],
-                RefreshResult(
-                    run_id=hashlib.sha256(request_key.encode()).hexdigest()[:24],
-                    request_key=request_key,
-                    run_kind="backfill",
-                    requested_date=trade_date,
-                    source="baostock",
-                    status=status,
-                    requested_count=len(plan.symbols),
-                    succeeded_count=loaded,
-                    coverage_ratio=loaded / len(plan.symbols),
-                    failed_symbols=failures,
-                    quality_issues=[] if not failures else ["incomplete_symbol_coverage"],
-                    started_at=now,
-                    completed_at=datetime.now(UTC),
-                ),
-                publish=False,
+            refresh = RefreshResult(
+                run_id=hashlib.sha256(request_key.encode()).hexdigest()[:24],
+                request_key=request_key,
+                run_kind="backfill",
+                requested_date=trade_date,
+                source="baostock",
+                status=status,
+                requested_count=len(plan.symbols),
+                succeeded_count=loaded,
+                coverage_ratio=loaded / len(plan.symbols),
+                failed_symbols=failures,
+                quality_issues=[] if not failures else ["incomplete_symbol_coverage"],
+                started_at=now,
+                completed_at=datetime.now(UTC),
             )
+            if isinstance(self.store, NasMarketStore):
+                lineage_input = next(
+                    (
+                        value
+                        for (batch_index, resolved_date), value in resolved_inputs.items()
+                        if resolved_date == trade_date.isoformat()
+                    ),
+                    None,
+                )
+                if lineage_input is None:
+                    raise ValueError("SOURCE_UNAVAILABLE")
+                self.store.save_refresh(
+                    [],
+                    refresh,
+                    publish=False,
+                    lineage_input=lineage_input,
+                )
+            else:
+                self.store.save_refresh(
+                    [],
+                    refresh,
+                    publish=False,
+                )

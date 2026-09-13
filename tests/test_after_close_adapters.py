@@ -242,7 +242,7 @@ def test_factory_ready_manifest_captures_one_derived_snapshot_idempotently(tmp_p
         started_at=datetime(2026, 7, 24, tzinfo=UTC),
         completed_at=datetime(2026, 7, 24, 1, tzinfo=UTC),
     )
-    store.save_refresh([bar], result, publish=True)
+    store.save_refresh([bar], result, publish=True, lineage_input={"mode": "legacy"})
     user_database = settings.user_data_dir / settings.user_database_name
     pipeline = build_after_close_pipeline(user_database, store, settings=settings)
     assert pipeline.run_after_publication(result).status == "completed"

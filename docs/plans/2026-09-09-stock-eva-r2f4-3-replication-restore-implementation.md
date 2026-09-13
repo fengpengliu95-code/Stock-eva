@@ -2769,7 +2769,9 @@ The Batch5 integration anchors are collected in
 | Manifest-only is manifest/object readback only | `ManifestPublicationCoordinator.publish_manifest_only` | `test_manifest_only_does_not_create_binding_or_pointer_sidecar` |
 | Exact tagged pointer identity and canonical schema | `NasMarketStore._pointer_identity`, `canonical_control_schema_digest` | `test_pointer_identity_rejects_extra_table_and_column` |
 | Immutable binding reuse | `NasMarketStore._binding_for_generation` | `test_binding_reuse_requires_exact_immutable_fields` |
-| Resolver-admitted lineage and corrupt-manifest fail-closed | `BackfillService.execute`, `LineageResolver` | existing Batch5 lineage/corruption anchors |
+| Retained resolver admission | `BackfillService.execute`, `LineageResolver` | `test_modern_lineage_requires_retained_success_evidence_reader`, `test_factory_resolver_publishes_exact_retained_selection_and_rejects_tamper` |
+| Corrupt-manifest fail-closed | `NasMarketStore._manifest` | `test_manifest_corruption_is_not_treated_as_empty` |
+| Explicit NAS lineage callsites | `NasMarketStore.save_refresh`, `NasMarketStore.upsert_bars`, `run_publication_refresh` | `test_nas_writer_call_sites_are_explicit_and_no_global_lineage_shim_exists`, `test_omitted_lineage_fails_before_manifest_mutation` |
 | Two-gate bounded drain with persisted descriptor | `build_replication_drain_worker` | replication worker contract tests |
 
 This crosswalk records code/test coverage only; it does not authorize NAS,

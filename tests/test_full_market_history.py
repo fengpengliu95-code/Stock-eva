@@ -108,6 +108,7 @@ def test_plan_and_execution_resume_from_manifest_without_replacing_dates(
         fixture_bars(dates[0]),
         ready_result(dates[0]),
         publish=True,
+        lineage_input={"mode": "legacy"},
     )
     provider = FullProvider(dates)
     service = FullMarketHistoryService(store, provider)

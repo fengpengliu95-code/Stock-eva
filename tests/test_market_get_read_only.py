@@ -651,7 +651,7 @@ def _publish_fixture(settings: Settings, dataset_root: Path) -> Path:
         dataset_root,
         settings.local_staging_dir,
     )
-    store.save_refresh(_bars(), _ready_result(), publish=True)
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     calendar_path = settings.local_control_dir / settings.calendar_sync_database_name
     CalendarSyncStore(calendar_path)
     with sqlite3.connect(calendar_path) as connection:
@@ -1746,7 +1746,12 @@ def test_explicit_writer_and_reconciler_still_own_schema_and_pointer(tmp_path: P
         dataset_root,
         tmp_path / "publisher-staging",
     )
-    publisher.save_refresh(_bars(), _ready_result(run_id="dataset-ready"), publish=True)
+    publisher.save_refresh(
+        _bars(),
+        _ready_result(run_id="dataset-ready"),
+        publish=True,
+        lineage_input={"mode": "legacy"},
+    )
     repaired_control = MarketStore(tmp_path / "repaired" / "market.duckdb")
 
     repaired = NasMarketStore(
@@ -2161,7 +2166,7 @@ def test_read_only_dataset_store_rejects_writer_lifecycle_before_any_mutation(
     before = _tree(dataset_root)
 
     with pytest.raises(RuntimeError, match="read-only market store"):
-        store.save_refresh(_bars(), _ready_result(), publish=True)
+        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     with pytest.raises(RuntimeError, match="read-only market store"):
         store.reconcile_control_pointer()
 

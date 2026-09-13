@@ -118,6 +118,7 @@ class FullMarketHistoryService:
                 request_key=self.daily_request_key(plan, trade_date),
                 run_id=self.daily_run_id(plan, trade_date),
                 run_kind="backfill",
+                lineage_input={"mode": "legacy"},
             )
             results.append(result)
             if result.status == "ready":

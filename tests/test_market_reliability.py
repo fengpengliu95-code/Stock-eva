@@ -447,6 +447,7 @@ def test_suspended_rows_without_factor_can_form_a_complete_publication(
         incident_provider,
         trade_date=date(2026, 8, 11),
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
 
     assert result.quality_issues == []
@@ -508,6 +509,7 @@ def test_factor_is_required_for_every_non_suspended_stock(tmp_path: Path) -> Non
         provider,
         trade_date=date(2026, 7, 23),
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
 
     assert result.status == "partial"
@@ -539,6 +541,7 @@ def test_active_row_without_factor_still_blocks_publication(
         provider,
         trade_date=date(2026, 8, 11),
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
 
     assert result.status == "partial"
@@ -564,6 +567,7 @@ def test_failed_incident_candidate_preserves_existing_pointer_and_objects(
         baseline_provider,
         trade_date=date(2026, 7, 23),
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
     assert published.status == "ready"
     pointer_before = store.published_refresh().model_dump(mode="json")
@@ -593,6 +597,7 @@ def test_failed_incident_candidate_preserves_existing_pointer_and_objects(
         failed_provider,
         trade_date=date(2026, 8, 11),
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
 
     assert failed.status == "partial"
@@ -627,6 +632,7 @@ def test_older_repair_extends_manifest_without_regressing_latest_pointer(
         latest_provider,
         trade_date=latest,
         required_symbols={"sh.600000"},
+        lineage_input={"mode": "legacy"},
     )
     assert published.status == "ready"
 
@@ -638,6 +644,7 @@ def test_older_repair_extends_manifest_without_regressing_latest_pointer(
         request_key=repair_request_key(older),
         run_id="repair-2026-08-10-attempt-1",
         run_kind="repair",
+        lineage_input={"mode": "legacy"},
     )
 
     assert repaired.status == "ready"
