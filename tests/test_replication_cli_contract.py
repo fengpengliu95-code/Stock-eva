@@ -110,6 +110,76 @@ def test_replication_paths_reject_every_configured_mutable_root_alias(
     assert json.loads(capsys.readouterr().out)["reason_code"] == "INVALID_PATH"
 
 
+def test_ec38_all_mutable_root_symlink_ancestor_descendant_dry_runs_are_zero_write(
+    monkeypatch, tmp_path, capsys
+):
+    """EC-38: every path-guard root rejects aliases and overlap before writes."""
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "nas_market_dataset_root": tmp_path / "nas-dataset",
+            "supplemental_data_dir": tmp_path / "supplemental",
+            "replication_destination_root": tmp_path / "destination",
+        }
+    )
+    roots = tuple(
+        root
+        for root in (
+            settings.local_market_dataset_root,
+            settings.nas_market_dataset_root,
+            settings.local_control_dir,
+            settings.local_staging_dir,
+            settings.local_lock_dir,
+            settings.local_temp_dir,
+            settings.market_data_dir,
+            settings.user_data_dir,
+            settings.supplemental_data_dir,
+            settings.provider_evidence_root,
+            settings.provider_shadow_root,
+            settings.replication_destination_root,
+        )
+        if root is not None
+    )
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    for index, root in enumerate(roots):
+        for command in ("market-replicate", "market-replication-init"):
+            candidate = root / f"candidate-{index}"
+            monkeypatch.setattr(
+                "sys.argv", ["stock-eva", command, "--destination", str(candidate), "--json"]
+            )
+            assert cli.main() == 2
+            payload = json.loads(capsys.readouterr().out)
+            assert payload == {
+                "provider_requests": 0,
+                "reason_code": "INVALID_PATH",
+                "status": "error",
+                "writes": False,
+            }
+            assert not candidate.exists()
+        alias = tmp_path / f"alias-{index}"
+        alias.symlink_to(root, target_is_directory=True)
+        candidate = alias / "descendant"
+        monkeypatch.setattr(
+            "sys.argv", ["stock-eva", "market-replicate", "--destination", str(candidate)]
+        )
+        assert cli.main() == 2
+        assert json.loads(capsys.readouterr().out)["reason_code"] == "INVALID_PATH"
+        assert not candidate.exists()
+
+    ancestor = tmp_path / "mutable-ancestor"
+    (ancestor / "configured-child").mkdir(parents=True)
+    ancestor_settings = settings.model_copy(
+        update={"local_temp_dir": ancestor / "configured-child"}
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: ancestor_settings)
+    monkeypatch.setattr(
+        "sys.argv", ["stock-eva", "market-replicate", "--destination", str(ancestor)]
+    )
+    assert cli.main() == 2
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "INVALID_PATH"
+
+
 def test_operation_day_is_typed_in_dry_run_and_status_json_is_sanitized(
     monkeypatch, tmp_path, capsys
 ):

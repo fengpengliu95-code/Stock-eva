@@ -8,6 +8,7 @@ from time import perf_counter
 
 import pytest
 
+import backend.app.storage.replication as replication
 from backend.app.config import Settings
 from backend.app.market.backfill import BackfillService
 from backend.app.market.candidates import CandidateStore, SessionSelection
@@ -282,17 +283,136 @@ def test_canonical_ready_precedes_enqueue_failure_and_next_guard_reconciles(tmp_
         replication_service=FailingEnqueue(),
         source_instance=source,
     )
-    with pytest.raises(RuntimeError, match="injected enqueue failure"):
-        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
     assert store.control.published_refresh() is not None
+    assert (
+        store.coordinator.lock.result_payload["observation"].reason_code
+        == "CONTROL_STATE_UNAVAILABLE"
+    )
     reconciled = store.reconcile_control_pointer()
     assert reconciled is not None
     assert reconciled.status == "ready"
 
 
-def test_status_matrix_is_read_only_for_missing_corrupt_locked_and_healthy(
-    tmp_path, monkeypatch
+def test_ec16_postcommit_enqueue_and_journal_failures_reconcile_without_duplicate(tmp_path) -> None:
+    """EC-16: ready wins over both post-commit durability failures."""
+    root = _dataset(tmp_path)
+    source = SourceInstanceStore(root / "_replication" / "source-instance.json").create(
+        canonical_root_path=root,
+        canonical_schema_digest=canonical_control_schema_digest(),
+        source_instance_nonce="e" * 64,
+    )
+    calls = {"enqueue": 0, "journal": 0}
+
+    class BrokenPostCommit:
+        source_instance_id = source.source_instance_id
+        source_instance_sha256 = source.source_instance_sha256
+
+        def pre_publication_guard(self):
+            return None
+
+        def on_canonical_committed(self, _source_commit):
+            calls["enqueue"] += 1
+            raise RuntimeError("outbox unavailable")
+
+        def journal_publication(self, **_kwargs):
+            calls["journal"] += 1
+            raise OSError("journal unavailable")
+
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control.duckdb"),
+        root,
+        tmp_path / "staging",
+        replication_service=BrokenPostCommit(),
+        source_instance=source,
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    assert store.control.published_refresh() is not None
+    observation = store.coordinator.lock.result_payload["observation"]
+    assert observation.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert observation.effects.canonical_writes is True
+    assert observation.effects.outbox_writes is False
+    assert calls == {"enqueue": 1, "journal": 1}
+    assert store.reconcile_control_pointer() is not None
+    assert len(tuple((root / "_replication" / "source-commits").glob("*.json"))) == 1
+    assert calls == {"enqueue": 1, "journal": 1}
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    ("manifest_mutation", "binding_install", "pre_pointer", "pointer_transaction", "postcommit"),
+)
+def test_ec25_publication_fault_points_never_report_partial_success(
+    tmp_path, monkeypatch, fault_point
 ) -> None:
+    """EC-25: each publication crash boundary is fail-closed and recoverable."""
+    root = _dataset(tmp_path)
+    store = NasMarketStore(MarketStore(tmp_path / "control.duckdb"), root, tmp_path / "staging")
+    original_hashes = store.coordinator._manifest_hashes
+    original_pointer = store._pointer_identity
+    hash_calls = 0
+    pointer_calls = 0
+
+    if fault_point == "manifest_mutation":
+        monkeypatch.setattr(
+            store,
+            "_publish_locked",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DatasetError("manifest mutation crash")
+            ),
+        )
+    elif fault_point == "binding_install":
+        monkeypatch.setattr(
+            store,
+            "_write_binding",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(DatasetError("binding install crash")),
+        )
+    elif fault_point == "pre_pointer":
+
+        def fail_final_manifest(*args, **kwargs):
+            nonlocal hash_calls
+            hash_calls += 1
+            if hash_calls == 2:
+                raise DatasetError("pre-pointer CAS crash")
+            return original_hashes(*args, **kwargs)
+
+        monkeypatch.setattr(store.coordinator, "_manifest_hashes", fail_final_manifest)
+    elif fault_point == "pointer_transaction":
+        monkeypatch.setattr(
+            store.control,
+            "save_external_publication",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DatasetError("pointer transaction crash")
+            ),
+        )
+    else:
+
+        def fail_postcommit(*args, **kwargs):
+            nonlocal pointer_calls
+            pointer_calls += 1
+            if pointer_calls >= 4:
+                return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+            return original_pointer(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_pointer_identity", fail_postcommit)
+
+    if fault_point in {"pointer_transaction", "postcommit"}:
+        store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+    else:
+        with pytest.raises(DatasetError):
+            store.save_refresh(
+                _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+            )
+    pointer = store.control.published_refresh()
+    assert pointer is None or pointer.status == "ready"
+    if fault_point == "postcommit":
+        assert store.coordinator.lock.result_payload["observation"].reason_code in {
+            "CONTROL_STATE_UNAVAILABLE",
+            "SOURCE_NOT_CONFIGURED",
+        }
+
+
+def test_status_matrix_covers_all_public_states_without_writes(tmp_path, monkeypatch) -> None:
     """AC-15/EC-14/EC-37: every public status state is zero-provider/zero-write."""
     from backend.app.storage.layout import StorageLayout
     from backend.app.storage.replication import (
@@ -301,7 +421,30 @@ def test_status_matrix_is_read_only_for_missing_corrupt_locked_and_healthy(
         SourceInstanceStore,
     )
 
-    for state in ("missing", "corrupt", "locked", "healthy"):
+    expected = {
+        "missing": ("unavailable", "REPLICATION_STATE_UNAVAILABLE", 0, 0, 0),
+        "corrupt": ("unavailable", "REPLICATION_STATE_UNAVAILABLE", 0, 0, 0),
+        "locked": ("unavailable", "REPLICATION_STATE_UNAVAILABLE", 0, 0, 0),
+        "empty": ("ready", "NONE", 0, 0, 0),
+        "healthy": ("ready", "NONE", 0, 0, 0),
+        "retry_wait": ("degraded", "NONE", 0, 1, 0),
+        "dead_lettered": ("degraded", "NONE", 0, 0, 1),
+    }
+
+    def fingerprint(path: Path):
+        if not path.exists():
+            return None
+        return tuple(
+            (
+                str(item.relative_to(path)),
+                item.is_dir(),
+                item.stat().st_ino,
+                None if item.is_dir() else item.read_bytes(),
+            )
+            for item in sorted(path.rglob("*"))
+        )
+
+    for state in expected:
         settings = Settings(
             _env_file=None,
             local_control_dir=tmp_path / state / "control",
@@ -330,10 +473,17 @@ def test_status_matrix_is_read_only_for_missing_corrupt_locked_and_healthy(
                     ),
                 )
                 result = ReplicationStatusService(settings).read()
+            assert (
+                result.status,
+                result.reason_code,
+                result.pending_count,
+                result.retry_wait_count,
+                result.dead_letter_count,
+            ) == expected[state]
             assert result.provider_requests == 0
             assert result.effects.writes is False
             continue
-        elif state == "healthy":
+        elif state in {"empty", "healthy", "retry_wait", "dead_lettered"}:
             source_path = layout.replication_source_instance
             assert source_path is not None
             source = SourceInstanceStore(source_path).create(
@@ -346,17 +496,94 @@ def test_status_matrix_is_read_only_for_missing_corrupt_locked_and_healthy(
                 source_instance_id=source.source_instance_id,
                 source_instance_sha256=source.source_instance_sha256,
             )
+            sidecar = ReplicationSidecarStore(layout.replication_sidecar_root)
+            if state in {"retry_wait", "dead_lettered"}:
+                checkpoint = build_source_checkpoint(
+                    source_instance_id=source.source_instance_id,
+                    source_instance_sha256=source.source_instance_sha256,
+                    publication_binding_sha256="1" * 64,
+                    pointer_row_sha256="2" * 64,
+                    pointer_generation="generation-status",
+                    source_run_id="status-run",
+                    source_trade_date="2026-09-09",
+                    source_published_at="2026-09-09T00:00:00Z",
+                    pointer_db_device=1,
+                    pointer_db_inode=2,
+                    pointer_db_schema_digest="3" * 64,
+                    manifest_canonical_sha256="4" * 64,
+                    source_manifest_bytes_sha256="5" * 64,
+                    source_object_set_sha256=domain_sha256("stock-eva/r2f4.3/object-set/v1", []),
+                    object_inventory=(),
+                )
+                sidecar.enqueue(
+                    checkpoint,
+                    operation_day="2026-09-09",
+                    destination_id="6" * 32,
+                    created_at="2026-09-09T00:00:00Z",
+                )
+
+                def terminalize(connection, state=state):
+                    intent_id = str(
+                        connection.execute("SELECT intent_id FROM replication_heads").fetchone()[0]
+                    )
+                    to_state = "retry_wait" if state == "retry_wait" else "dead_letter"
+                    replication.ImmutableReplicationSidecarStore._append_event_and_update_head(
+                        connection,
+                        intent_id=intent_id,
+                        from_state="pending",
+                        to_state=to_state,
+                        attempt=1,
+                        reason_code="RETRY_WAIT" if to_state == "retry_wait" else "DEAD_LETTER",
+                        occurred_at="2026-09-09T00:00:01Z",
+                        lease_owner=None,
+                        lease_until=None,
+                        next_attempt_at="2026-09-09T00:00:02Z",
+                        event_type="transition" if to_state == "retry_wait" else "terminal",
+                    )
+                    return replication._MutationOutcome(None, True)
+
+                sidecar._mutate_generation(terminalize)
+        before = fingerprint(layout.replication_sidecar_root)
         result = ReplicationStatusService(settings).read()
+        assert fingerprint(layout.replication_sidecar_root) == before
+        assert (
+            result.status,
+            result.reason_code,
+            result.pending_count,
+            result.retry_wait_count,
+            result.dead_letter_count,
+        ) == expected[state]
         assert result.provider_requests == 0
         assert result.effects.writes is False
 
 
 def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
-    """NFR-11: repeated warm status reads over a real 10,000-row sidecar stay bounded."""
-    from backend.app.storage.replication import ReplicationSidecarStore
+    """NFR-11: warm public status reads over 10,000 terminal rows stay bounded."""
+    from backend.app.storage.layout import StorageLayout
+    from backend.app.storage.replication import (
+        ImmutableReplicationSidecarStore,
+        ReplicationSidecarStore,
+        ReplicationStatusService,
+    )
 
-    source_id = "a" * 64
-    source_sha = "b" * 64
+    settings = Settings(
+        _env_file=None,
+        local_market_dataset_root=tmp_path / "dataset",
+        local_control_dir=tmp_path / "control",
+        local_staging_dir=tmp_path / "staging",
+        local_lock_dir=tmp_path / "locks",
+        local_temp_dir=tmp_path / "temp",
+        replication_enabled=True,
+    )
+    settings.local_market_dataset_root.mkdir()
+    layout = StorageLayout(settings)
+    source = SourceInstanceStore(layout.replication_source_instance).create(
+        canonical_root_path=settings.local_market_dataset_root,
+        canonical_schema_digest="c" * 64,
+        source_instance_nonce="d" * 64,
+    )
+    source_id = source.source_instance_id
+    source_sha = source.source_instance_sha256
     inventory = (
         {
             "relative_path": "bars.parquet",
@@ -400,7 +627,7 @@ def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
                 created_at=checkpoint.source_published_at,
             )
         )
-    sidecar = ReplicationSidecarStore(tmp_path / "sidecar")
+    sidecar = ReplicationSidecarStore(layout.replication_sidecar_root)
     sidecar.initialize(source_instance_id=source_id, source_instance_sha256=source_sha)
     result = sidecar.import_journals(
         journals,
@@ -409,13 +636,38 @@ def test_nfr11_status_read_p95_with_10000_local_rows(tmp_path) -> None:
         created_at="2026-09-09T00:00:00Z",
     )
     assert result.imported_count == 10_000
-    sidecar.read_status()  # warmup
+
+    def terminalize(connection):
+        for (intent_id,) in connection.execute(
+            "SELECT intent_id FROM replication_heads ORDER BY intent_id"
+        ).fetchall():
+            ImmutableReplicationSidecarStore._append_event_and_update_head(
+                connection,
+                intent_id=str(intent_id),
+                from_state="pending",
+                to_state="dead_letter",
+                attempt=1,
+                reason_code="DEAD_LETTER",
+                occurred_at="2026-09-09T00:01:00Z",
+                lease_owner=None,
+                lease_until=None,
+                next_attempt_at="2026-09-09T00:01:00Z",
+                event_type="terminal",
+            )
+        return replication._MutationOutcome(None, True)
+
+    sidecar._mutate_generation(terminalize)
+    public_status = ReplicationStatusService(settings)
+    public_status.read()  # warmup
     samples = []
     for _ in range(5):
         started = perf_counter()
-        status = sidecar.read_status()
+        status = public_status.read()
         samples.append(perf_counter() - started)
-        assert status.pending_count == 10_000
+        assert status.dead_letter_count == 10_000
+        assert status.pending_count == 0
+        assert status.effects.writes is False
+        assert status.provider_requests == 0
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1]
     assert p95 < 0.5, f"status p95={p95:.3f}s samples={samples!r}"
 

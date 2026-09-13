@@ -830,7 +830,26 @@ class ManifestPublicationCoordinator:
                     pass
             observation = self._control_unavailable_observation(binding)
         elif self.store.replication_service is not None:
-            observation = self.store.replication_service.on_canonical_committed(source_commit)
+            try:
+                observation = self.store.replication_service.on_canonical_committed(source_commit)
+            except Exception:
+                # The canonical pointer is already linearized.  A broken
+                # enqueue implementation must never turn that ready result
+                # into a reported failure or roll it back.  Journal the
+                # exact binding/source context for the next strict guard;
+                # journal errors are intentionally observable only through
+                # the typed degraded observation.
+                try:
+                    self.store.replication_service.journal_publication(
+                        binding=binding,
+                        pointer=self.store._pointer_identity(),
+                        result=result,
+                        manifest=manifest,
+                        root=self.store.root,
+                    )
+                except Exception:
+                    pass
+                observation = self._control_unavailable_observation(binding)
         else:
             unavailable_source_id = domain_sha256(
                 "stock-eva/r2f4.3/unconfigured-source-instance/v1",
