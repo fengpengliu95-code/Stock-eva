@@ -209,6 +209,43 @@ def _digest(field_path: str, root: dict[str, Any]) -> str:
     return hashlib.sha256(_domain_prefix(contract) + _canonical_json(preimage)).hexdigest()
 
 
+def _compute_digest_from_contract_and_disk(
+    contract: dict[str, Any], descriptor: dict[str, Any]
+) -> str:
+    """Independent disk oracle: contract grammar, root bytes and external leaf bytes."""
+
+    evidence_root = descriptor["__evidence_root"]
+    root_path = evidence_root / descriptor["root_path"]
+    root = json.loads(root_path.read_bytes().decode("utf-8"))
+    object_path = evidence_root / descriptor["object_path"]
+    raw = object_path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == descriptor["artifact_sha256"]
+    projected: dict[str, Any] = {}
+    for path in contract["included_field_paths"]:
+        if "." not in path and "[]." not in path:
+            projected[path] = root[path]
+        elif "[]." in path:
+            collection, child = path.split("[].", 1)
+            projected[collection] = [
+                {child: item[child] for child in root[collection]} for item in root[collection]
+            ]
+        else:
+            first, child = path.split(".", 1)
+            projected.setdefault(first, {})[child] = root[first][child]
+    canonical = (
+        json.dumps(
+            projected,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    prefix = contract["domain_separation_prefix"][:-2].encode("utf-8") + b"\0"
+    return hashlib.sha256(prefix + canonical).hexdigest()
+
+
 def _interface_fields(name: str) -> tuple[str, ...]:
     match = re.search(
         rf"interface {re.escape(name)}(?:<T>)? \{{(.*?)\n\}}", _design_text(), re.DOTALL
@@ -2511,6 +2548,8 @@ def _validate_window(
     tuple_fields = set(MODELS["ErrorHandlingObservation"]["tuple_item_schemas"]["events"])
     for event, forced_class in zip(events, expected_classes, strict=True):
         assert set(event) == tuple_fields
+        assert event["expected_class"] == event["forced_error_class"] == event["observed_class"]
+        assert event["normalized_result"] == "unavailable"
         _validate_source(
             validator,
             "ErrorHandlingObservation.events.evidence_sha256",
@@ -2898,6 +2937,42 @@ def _mutate_formal_leaf(golden: GoldenTree, field_path: str, *, mode: str) -> No
         raise AssertionError(mode)
 
 
+def _mutate_contract_preimage(golden: GoldenTree, field_path: str) -> tuple[str, str]:
+    """Change one included AST path in the actual disk model root."""
+
+    object_path, descriptor_path = golden.leaf_files[field_path]
+    descriptor = _read_json(descriptor_path)
+    root_path = golden.evidence / descriptor["root_path"]
+    root = _read_json(root_path)
+    contract = DIGESTS[field_path]
+    candidate = next(
+        path
+        for path in contract["included_field_paths"]
+        if path in root and path not in contract["excluded_fields"]
+    )
+    value = root[candidate]
+    if isinstance(value, bool):
+        root[candidate] = not value
+    elif isinstance(value, int):
+        root[candidate] = value + 1
+    elif isinstance(value, list):
+        root[candidate] = value + [value[-1]] if value else ["mutation"]
+    elif isinstance(value, dict):
+        first = next(iter(value))
+        value[first] = "mutation" if isinstance(value[first], str) else value[first]
+        root[candidate] = value
+    else:
+        root[candidate] = f"{value}-mutation"
+    before = _compute_digest_from_contract_and_disk(
+        contract, {**descriptor, "__evidence_root": golden.evidence}
+    )
+    _write_json(root_path, root)
+    after = _compute_digest_from_contract_and_disk(
+        contract, {**descriptor, "__evidence_root": golden.evidence}
+    )
+    return before, after
+
+
 def _drop_window_child(golden: GoldenTree, child_name: str) -> None:
     path = golden.evidence / "window.json"
     window = _read_json(path)
@@ -2988,6 +3063,12 @@ def _mutate_error_events(golden: GoldenTree, mutation: str) -> None:
         events[1]["forced_error_class"] = events[0]["forced_error_class"]
     elif mutation == "error_missing_class":
         events.pop()
+    elif mutation == "error_observed_mismatch":
+        events[0]["observed_class"] = "auth"
+    elif mutation == "error_expected_mismatch":
+        events[0]["expected_class"] = "auth"
+    elif mutation == "error_normalized_mismatch":
+        events[0]["normalized_result"] = "success"
     elif mutation == "error_reason_outside_enum":
         events[0]["sanitized_reason"] = "NOT_AN_APPROVED_REASON"
     elif mutation == "error_sensitive_text":
@@ -4828,6 +4909,11 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
             len(events) == CARDINALITY["error_classes"]
             and set(classes) == {"timeout", "auth", "rate", "schema", "coverage", "storage"}
             and len(classes) == len(set(classes))
+            and all(
+                event["expected_class"] == event["forced_error_class"] == event["observed_class"]
+                and event["normalized_result"] == "unavailable"
+                for event in events
+            )
             and all(event["sanitized_reason"] in REASONS for event in events)
             and all(
                 not any(
@@ -5061,6 +5147,36 @@ def test_r2f5_descriptor_negative_cases_fail_closed(golden: GoldenTree, mode: st
     assert object_path.is_file()
 
 
+def test_r2f5_independent_disk_oracle_matches_all_materialized_contracts(
+    golden: GoldenTree,
+) -> None:
+    values: dict[str, str] = {}
+    for field_path, (_object_path, descriptor_path) in golden.leaf_files.items():
+        descriptor = _read_json(descriptor_path)
+        descriptor["__evidence_root"] = golden.evidence
+        value = _compute_digest_from_contract_and_disk(DIGESTS[field_path], descriptor)
+        assert value == descriptor["contract_digest"]
+        values[field_path] = value
+    assert len(values) == 39
+    assert len(set(values.values())) > 1
+
+
+@pytest.mark.parametrize("field_path", tuple(sorted(DIGESTS)))
+def test_r2f5_contract_preimage_mutations_change_independent_oracle(
+    golden: GoldenTree, field_path: str
+) -> None:
+    if field_path in golden.leaf_files:
+        before, after = _mutate_contract_preimage(golden, field_path)
+        assert before != after
+    else:
+        # Internal/public ancestor contracts use their actual report model
+        # root; the future reader must expose the corresponding failure path.
+        report = _evaluate(golden.request)
+        pointers = _resolve_contract_paths(report, field_path)
+        assert pointers
+        assert _read_public_pointer(report, pointers[0]) is not None
+
+
 @pytest.mark.parametrize(
     ("mutation", "target", "reason"),
     (
@@ -5238,16 +5354,27 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     """Each contract is exercised through a concrete disk/public binding."""
 
     assert field_path in DIGESTS
+    leaf = golden.leaf_files.get(field_path)
+    descriptor = _read_json(leaf[1]) if leaf is not None else None
+    if descriptor is not None:
+        descriptor["__evidence_root"] = golden.evidence
+        expected = _compute_digest_from_contract_and_disk(DIGESTS[field_path], descriptor)
+        assert expected == descriptor["contract_digest"]
+        root = _read_json(golden.evidence / descriptor["root_path"])
+        object_bytes = (golden.evidence / descriptor["object_path"]).read_bytes()
+    else:
+        expected = None
+        root = None
+        object_bytes = b""
     baseline_report = _evaluate(golden.request)
     pointers = _resolve_contract_paths(baseline_report, field_path)
     assert pointers, field_path
     pointer = pointers[0]
     parent_pointer = pointer.rsplit(".", 1)[0]
-    root = _read_public_pointer(baseline_report, parent_pointer)
-    expected = _read_public_pointer(baseline_report, pointer)
-    leaf = golden.leaf_files.get(field_path)
-    descriptor = _read_json(leaf[1]) if leaf is not None else None
-    object_bytes = leaf[0].read_bytes() if leaf is not None else _canonical_json(root)
+    report_root = _read_public_pointer(baseline_report, parent_pointer)
+    if expected is None:
+        expected = _read_public_pointer(baseline_report, pointer)
+        root = report_root
     # The approved future seam consumes the actual model/root and its disk
     # descriptor bytes; a callable-only/no-op implementation is insufficient.
     module = _red_reader()
@@ -5307,6 +5434,21 @@ def test_r2f5_noop_validator_mutant_is_killed() -> None:
         )
 
 
+def test_r2f5_wrong_algorithm_mutant_is_killed() -> None:
+    contract = DIGESTS["CalendarRawFacts.raw_facts_sha256"]
+    root = {
+        "source_sequence": ["2026-08-03"],
+        "generation": "calendar-g20",
+        "confirmed": True,
+        "unknown_state": False,
+        "conflict_state": False,
+    }
+    wrong = hashlib.sha256(_canonical_json(root["source_sequence"])).hexdigest()
+    expected = _digest("CalendarRawFacts.raw_facts_sha256", root)
+    assert wrong != expected
+    assert contract["domain_separation_prefix"] != ""
+
+
 def test_r2f5_fixed_public_pointer_mutant_is_killed() -> None:
     report = {"snapshot_identity": {"snapshot_sha256": "expected"}}
     assert _read_public_pointer(report, "$.snapshot_identity.snapshot_sha256") == "expected"
@@ -5336,6 +5478,9 @@ def test_r2f5_reducer_ast_never_reads_case_expectations_or_assigns_observed() ->
     (
         "error_duplicate",
         "error_missing_class",
+        "error_observed_mismatch",
+        "error_expected_mismatch",
+        "error_normalized_mismatch",
         "error_reason_outside_enum",
         "error_sensitive_text",
         "error_hash_invalid",
@@ -5366,6 +5511,9 @@ def test_r2f5_error_any_reason_mutant_is_killed(golden: GoldenTree) -> None:
     (
         "error_duplicate",
         "error_missing_class",
+        "error_observed_mismatch",
+        "error_expected_mismatch",
+        "error_normalized_mismatch",
         "error_reason_outside_enum",
         "error_sensitive_text",
         "error_hash_invalid",
@@ -5684,15 +5832,11 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
         connection.execute("INSERT INTO calendar_official_object VALUES (?, ?)", (old_hash, b"old"))
 
     def rowset_digest() -> str:
-        with sqlite3.connect(f"file:{database}?mode=ro&immutable=false", uri=True) as connection:
-            rows = connection.execute(
-                "SELECT body_sha256,body FROM calendar_official_object ORDER BY body_sha256"
-            ).fetchall()
-        encoded = b"".join(_sqlite_record(tuple(row), ("TEXT", "BLOB")) for row in rows)
-        return hashlib.sha256(b"r2f5/calendar-rowset-v1\0" + encoded).hexdigest()
+        return _sqlite_logical_digest(database, "calendar_generation")
 
     old_rowset_digest = rowset_digest()
     old_fingerprint = _fingerprint("calendar", database)[0]
+    assert old_fingerprint["captured_content_bytes"] == f"sqlite-logical:{old_rowset_digest}"
     real_connect = sqlite3.connect
     start_writer = threading.Event()
     writer_done = threading.Event()
@@ -5754,6 +5898,7 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
     new_fingerprint = _fingerprint("calendar", database)[0]
     new_rowset_digest = rowset_digest()
     assert old_rowset_digest != new_rowset_digest
+    assert new_fingerprint["captured_content_bytes"] == f"sqlite-logical:{new_rowset_digest}"
     expected_fingerprint = (
         new_fingerprint if commit_timing == "before_transaction" else old_fingerprint
     )
