@@ -8,7 +8,7 @@
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
-**X7 revision base:** `97283a5ce6d67d925d84a9d4b759a8ebe98b3af9` (clean X6)
+**X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
 **Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
 
@@ -229,7 +229,7 @@ distinct consecutive sessions, then the report selects those dates in order and 
 Given 19, 21, duplicate, future or missing-middle sessions, when evaluation runs, then the report
 is `not_ready` or `unavailable` with an allowlisted reason and never silently pads the window.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-2: Shanghai cutoff arithmetic (FR-8, FR-9)
 
@@ -237,7 +237,7 @@ Given timezone-aware publication times, when a session is published at 21:15 and
 08:00 Asia/Shanghai, then both boundary observations count. When they occur at 21:16 or 08:01,
 then the corresponding metric fails and the report cannot be ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-3: Frozen version set and drift (FR-7, NFR-8)
 
@@ -245,7 +245,7 @@ Given 20 session observations with one frozen version vector, when any provider,
 policy, calendar, universe, replication, restore or schema identity changes, then the report is
 `not_ready` with `VERSION_DRIFT` and the exact source state remains untouched.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-4: Coverage and source purity (FR-9, FR-12)
 
@@ -253,7 +253,7 @@ Given legal-universe counts and canonical partition source identities, when ever
 coverage and zero mixed-source rows, then those metrics pass. When any unknown/count mismatch or
 mixed provider partition exists, then the report is not ready and names only the sanitized reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-5: Evidence lineage and replay (FR-10, FR-11)
 
@@ -262,7 +262,7 @@ the bounded offline sample replays semantically identically, then provenance and
 Given a missing hash, wrong binding, corrupt object or replay mismatch, then no publication state is
 changed and the relevant metric is unavailable/not ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-6: Replication and restore evidence (FR-13, FR-17)
 
@@ -271,7 +271,7 @@ proof satisfy the declared evidence contract, then the metrics pass. Given lag, 
 locked/corrupt sidecar or unverified generation, then the report is not ready/unavailable and does
 not start a drain or restore.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-7: Read-only snapshot and fingerprints (FR-1, FR-3, FR-4, NFR-3)
 
@@ -279,7 +279,7 @@ Given an existing private fixture, when CLI/API evaluation succeeds or fails, th
 fingerprint is byte/metadata identical before and after, no missing control DB is initialized, and
 the captured snapshot is closed after use.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-8: Path validation and redaction (FR-2, NFR-4, NFR-5)
 
@@ -287,7 +287,7 @@ Given relative, root, home, mutable-root, symlink, unresolved-variable or overla
 the CLI/API is invoked, then it rejects before enumeration with exit 2/HTTP 422 and no path is
 echoed. Given corrupt or permission-denied input, then the response contains only a closed reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-9: API/CLI parity (FR-15, FR-16, FR-17)
 
@@ -295,7 +295,7 @@ Given identical configured roots, dates, frozen clock and fixture, when CLI and 
 then their report status, selected sessions, metric results, reason order, `provider_requests` and
 `writes` agree; the API performs no provider or store initialization.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-10: Mandatory metric gate (FR-9, FR-14, NFR-2)
 
@@ -303,7 +303,7 @@ Given all mandatory metrics pass for exactly 20 sessions, when the report is bui
 `ready`. Given any mandatory metric fails, then status is `not_ready`; given a required source is
 unprovable, then status is `unavailable`. No optional observation can override this mapping.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-11: Bounded evaluation (NFR-6, NFR-7)
 
@@ -311,14 +311,14 @@ Given a 20-session fixture within the declared row/object/sample bounds, when ev
 it records elapsed/read/replay counts and completes within 10,000 ms on the reference gate. Given
 an over-bound object or row set, then it stops with unavailable rather than unboundedly reading.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-12: Protected compatibility (NFR-1, NFR-9)
 
 Given the R2-F2 golden fixture and R2-F4 readers, when the crosswalk/focused checks run, then their
 bytes and public response shapes remain compatible and no protected production module is widened.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-13: Production boundary (FR-18, NFR-10)
 
@@ -326,7 +326,7 @@ Given any offline ready report, when a reviewer inspects metadata, then it state
 `production_window_started=false`, Task 20 pending and R2-F5.0 NO-GO. No report can authorize a
 provider call, installation, LaunchAgent, NAS action or Release 2 re-entry.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-14: Deterministic and sanitized errors (FR-14, FR-17, NFR-2, NFR-4)
 
@@ -334,7 +334,7 @@ Given identical bytes and clock, when evaluation is repeated across success, mis
 locked fixtures, then JSON is deterministic, reason precedence is stable, diagnostics are bounded,
 and all results include zero provider requests/writes.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-15: Complete SLO metric inventory (FR-9, FR-19, NFR-11)
 
@@ -343,7 +343,7 @@ present as separate `MetricResult` fields with exact targets and anchors. Missin
 availability, canonical integrity, recovery, failover, adjustment, error handling, local/NAS,
 replication, restore or read-boundary evidence cannot be hidden behind another metric.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-16: Secondary qualification and failover (FR-20, FR-21)
 
@@ -352,7 +352,7 @@ when evaluation runs, then failover is `not_ready`/`unavailable` and top-level r
 Given a qualified admission and complete drill record, then failover passes only when selection,
 manifest, pointer and all rows agree with zero mixed-source rows.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-17: Remote trust and restore snapshot (FR-22, NFR-12)
 
@@ -361,7 +361,7 @@ verification, trust scope and reviewed numeric thresholds, when the strict snaps
 then it can pass. Given `LOCAL_CHAIN_ONLY`, missing threshold, locked sidecar or writer/reconcile
 only evidence, then the metric is unavailable/not ready and no destination operation starts.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-18: Offline replay identity (FR-11, FR-23)
 
@@ -369,7 +369,7 @@ Given immutable bytes and an exact frozen offline adapter/normalizer identity, w
 then it performs deterministic normalization and zero provider/network requests. Given unknown,
 mismatched or default login-capable identity, then replay is unavailable before adapter construction.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-19: Full version vector (FR-7, FR-24)
 
@@ -377,7 +377,7 @@ Given 20 observations, when the frozen vector is captured, then every required i
 and equal across all observations. Missing RELEASE, config, qualification/admission, primary/
 secondary, kill-switch/priority, policy or replication/restore evidence prevents ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-20: Raw sequence and snapshot identity (FR-3, FR-25, NFR-8, NFR-13)
 
@@ -386,7 +386,7 @@ rejects duplicates/out-of-order data before deriving sorted unique confirmed ses
 returns a digest-bound SnapshotIdentity and observation refs; any concurrent input change invalidates
 the whole report.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-21: Semantic determinism (FR-26, FR-27, NFR-14)
 
@@ -394,14 +394,14 @@ Given identical captured bytes, clock and arguments, when evaluation repeats, th
 per-session observations/refs and byte-identical semantic JSON/digest are returned. Changing only
 elapsed/counter diagnostics MUST NOT change the semantic digest.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-22: Closed bounded report types (FR-28, NFR-3)
 
 Given invalid enum, reason, hash, ID, negative counter, oversized quality issue or null ready
 version, when report validation runs, then it rejects the report with a sanitized unavailable result.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-23: Additive compatibility (NFR-1, NFR-15)
 
@@ -409,7 +409,7 @@ Given existing market, universe, evidence, calendar, replication and restore API
 the new acceptance endpoint/CLI is evaluated, then predecessor payloads/schemas remain unchanged;
 the new fields exist only in the acceptance report.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ## Edge Cases
 
@@ -1096,7 +1096,7 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `WindowEvidenceBundle` | bundle cardinality | exactly one immutable bundle per evaluation | all window-level records are present or typed unavailable; no per-session duplication claim |
 | `PreCaptureFailurePayloadV1` | pre-capture failure | typed sanitized payload | canonical payload hash is the semantic report hash; no path or fabricated observation |
 
-Every `sha256`/`digest` field in these models is listed exactly once in the X7
+Every `sha256`/`digest` field in these models is listed exactly once in the X8
 `digest_contracts` block. A contract names its canonicalization version, root object, exact
 included paths, excluded self/digest/envelope fields, ordering, null/absence encoding and
 domain-separation prefix; “complete object” is not an admissible implementation description.
@@ -1145,206 +1145,3684 @@ Reason precedence MUST be deterministic and exact, in this order: (1) `INVALID_A
 The report retains all applicable metric failures in metric order even when top-level status is
 unavailable.
 
-<!-- R2F5_X7_CONTRACTS_JSON -->
+<!-- R2F5_X8_CONTRACTS_JSON -->
 ```json
 {
-  "contract_version": "r2f5-x7",
-  "roadmap_dimensions": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "restore", "read_boundary"],
-  "metric_fields": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary"],
+  "contract_version": "r2f5-x8",
+  "roadmap_dimensions": [
+    "continuity",
+    "next_morning_availability",
+    "same_evening_availability",
+    "coverage",
+    "canonical_integrity",
+    "source_purity",
+    "recovery",
+    "failover",
+    "provenance",
+    "replay",
+    "adjustment",
+    "calendar",
+    "universe",
+    "error_handling",
+    "local_nas_isolation",
+    "restore",
+    "read_boundary"
+  ],
+  "metric_fields": [
+    "continuity",
+    "next_morning_availability",
+    "same_evening_availability",
+    "coverage",
+    "canonical_integrity",
+    "source_purity",
+    "recovery",
+    "failover",
+    "provenance",
+    "replay",
+    "adjustment",
+    "calendar",
+    "universe",
+    "error_handling",
+    "local_nas_isolation",
+    "replication",
+    "restore",
+    "read_boundary"
+  ],
   "reason_partitions": {
-    "failure": ["CONTINUITY_FAILED", "AVAILABILITY_CUTOFF_FAILED", "COVERAGE_FAILED", "SOURCE_PURITY_FAILED", "CANONICAL_INTEGRITY_FAILED", "RECOVERY_FAILED", "ERROR_HANDLING_FAILED", "LOCAL_NAS_ISOLATION_FAILED", "REPLICATION_LAG", "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED", "CALENDAR_CONFLICT", "UNIVERSE_UNKNOWN_NONZERO", "UNIVERSE_COUNT_MISMATCH", "VERSION_DRIFT", "LINEAGE_INVALID"],
-    "unavailable": ["INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE", "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "LINEAGE_UNAVAILABLE", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE", "REPLICATION_UNAVAILABLE", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED", "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE", "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED", "RETRY_WAIT", "DEAD_LETTER", "INPUT_LIMIT_EXCEEDED"]
+    "failure": [
+      "CONTINUITY_FAILED",
+      "AVAILABILITY_CUTOFF_FAILED",
+      "COVERAGE_FAILED",
+      "SOURCE_PURITY_FAILED",
+      "CANONICAL_INTEGRITY_FAILED",
+      "RECOVERY_FAILED",
+      "ERROR_HANDLING_FAILED",
+      "LOCAL_NAS_ISOLATION_FAILED",
+      "REPLICATION_LAG",
+      "REPLAY_SEMANTIC_MISMATCH",
+      "READ_BOUNDARY_FAILED",
+      "CALENDAR_CONFLICT",
+      "UNIVERSE_UNKNOWN_NONZERO",
+      "UNIVERSE_COUNT_MISMATCH",
+      "VERSION_DRIFT",
+      "LINEAGE_INVALID"
+    ],
+    "unavailable": [
+      "INVALID_ARGUMENTS",
+      "PATH_INVALID",
+      "SNAPSHOT_CHANGED",
+      "CONTROL_STATE_UNAVAILABLE",
+      "PIT_VISIBILITY_INVALID",
+      "CALENDAR_UNAVAILABLE",
+      "SESSION_SEQUENCE_INVALID",
+      "SESSION_COUNT_NOT_20",
+      "LINEAGE_UNAVAILABLE",
+      "FAILOVER_UNAVAILABLE",
+      "REPLAY_UNAVAILABLE",
+      "ADJUSTMENT_UNAVAILABLE",
+      "REPLICATION_UNAVAILABLE",
+      "REMOTE_PROOF_MISSING",
+      "RESTORE_UNAVAILABLE",
+      "NONE",
+      "DISABLED",
+      "SOURCE_NOT_CONFIGURED",
+      "SOURCE_UNAVAILABLE",
+      "LOCAL_POINTER_MISMATCH",
+      "REPLICATION_STATE_UNAVAILABLE",
+      "DESTINATION_UNAVAILABLE",
+      "DESTINATION_TRUST_FAILED",
+      "COPY_FAILED",
+      "VERIFY_FAILED",
+      "RETRY_WAIT",
+      "DEAD_LETTER",
+      "INPUT_LIMIT_EXCEEDED"
+    ]
   },
   "status_reason_matrix": {
-    "pass": [null],
-    "fail": ["failure"],
-    "unavailable": ["unavailable"]
+    "pass": [
+      null
+    ],
+    "fail": [
+      "failure"
+    ],
+    "unavailable": [
+      "unavailable"
+    ]
   },
   "metric_reducers": {
-    "continuity": ["session.session", "session.ordinal"],
-    "next_morning_availability": ["session.next_morning_published_at"],
-    "same_evening_availability": ["session.same_evening_published_at"],
-    "coverage": ["session.required_count", "session.loaded_count", "session.unknown_count"],
-    "canonical_integrity": ["session.pointer_reconciliation", "session.evidence.manifest_sha256", "session.evidence.object_sha256"],
-    "source_purity": ["session.canonical_provider_ids"],
-    "recovery": ["window.recovery_observation.payload"],
-    "failover": ["window.failover_observation.payload"],
-    "provenance": ["session.evidence"],
-    "replay": ["window.replay_sample.payload"],
-    "adjustment": ["window.adjustment_equivalence.payload"],
-    "calendar": ["session.calendar_raw_facts"],
-    "universe": ["session.required_count", "session.loaded_count", "session.suspension_count", "session.not_listed_count", "session.delisted_count", "session.unknown_count"],
-    "error_handling": ["window.error_handling_observation.payload"],
-    "local_nas_isolation": ["window.local_nas_isolation_observation.payload"],
-    "replication": ["session.replication_observation", "frozen_versions.replication_policy_version"],
-    "restore": ["window.restore_observation.payload"],
-    "read_boundary": ["session.read_boundary_raw_facts"]
+    "continuity": [
+      "session.session",
+      "session.ordinal"
+    ],
+    "next_morning_availability": [
+      "session.next_morning_published_at"
+    ],
+    "same_evening_availability": [
+      "session.same_evening_published_at"
+    ],
+    "coverage": [
+      "session.required_count",
+      "session.loaded_count",
+      "session.unknown_count"
+    ],
+    "canonical_integrity": [
+      "session.pointer_reconciliation",
+      "session.evidence.manifest_sha256",
+      "session.evidence.object_sha256"
+    ],
+    "source_purity": [
+      "session.canonical_provider_ids"
+    ],
+    "recovery": [
+      "window.recovery_observation.payload"
+    ],
+    "failover": [
+      "window.failover_observation.payload"
+    ],
+    "provenance": [
+      "session.evidence"
+    ],
+    "replay": [
+      "window.replay_sample.payload"
+    ],
+    "adjustment": [
+      "window.adjustment_equivalence.payload"
+    ],
+    "calendar": [
+      "session.calendar_raw_facts"
+    ],
+    "universe": [
+      "session.required_count",
+      "session.loaded_count",
+      "session.suspension_count",
+      "session.not_listed_count",
+      "session.delisted_count",
+      "session.unknown_count"
+    ],
+    "error_handling": [
+      "window.error_handling_observation.payload"
+    ],
+    "local_nas_isolation": [
+      "window.local_nas_isolation_observation.payload"
+    ],
+    "replication": [
+      "session.replication_observation",
+      "frozen_versions.replication_policy_version"
+    ],
+    "restore": [
+      "window.restore_observation.payload"
+    ],
+    "read_boundary": [
+      "session.read_boundary_raw_facts"
+    ]
   },
-  "cardinality": {"sessions": 20, "window_bundle": 1, "error_classes": 6, "input_roles_max": 32, "tree_entries_max": 100000, "input_bytes_max": 536870912},
-  "artifact_envelope_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"],
+  "cardinality": {
+    "sessions": 20,
+    "window_bundle": 1,
+    "error_classes": 6,
+    "input_roles_max": 32,
+    "tree_entries_max": 100000,
+    "input_bytes_max": 536870912
+  },
+  "artifact_envelope_fields": [
+    "artifact_id",
+    "artifact_ref",
+    "schema_version",
+    "creator_kind",
+    "creator_version",
+    "created_at",
+    "payload",
+    "canonicalization_version",
+    "payload_sha256",
+    "envelope_sha256"
+  ],
   "date_time_formats": {
     "session_date": "YYYY-MM-DD / ^\\d{4}-\\d{2}-\\d{2}$ plus calendar-valid date",
     "rfc3339_utc": "RFC3339 with seconds or micros, normalized to UTC Z",
     "as_of": "UTC instant converted to Asia/Shanghai for civil-day cutoffs"
   },
   "metric_value_kinds": {
-    "continuity": {"observed": "count", "target": "count", "unavailable_null": true, "range": "[0,20]"},
-    "next_morning_availability": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
-    "same_evening_availability": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
-    "coverage": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
-    "canonical_integrity": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "source_purity": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "recovery": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "failover": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "provenance": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "replay": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "adjustment": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "calendar": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "universe": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "error_handling": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "local_nas_isolation": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "replication": {"observed": "duration_seconds", "target": "duration_seconds", "unavailable_null": true, "range": "[0,2147483647]"},
-    "restore": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
-    "read_boundary": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"}
+    "continuity": {
+      "observed": "count",
+      "target": "count",
+      "unavailable_null": true,
+      "range": "[0,20]"
+    },
+    "next_morning_availability": {
+      "observed": "ratio",
+      "target": "ratio",
+      "unavailable_null": true,
+      "range": "[0,1]"
+    },
+    "same_evening_availability": {
+      "observed": "ratio",
+      "target": "ratio",
+      "unavailable_null": true,
+      "range": "[0,1]"
+    },
+    "coverage": {
+      "observed": "ratio",
+      "target": "ratio",
+      "unavailable_null": true,
+      "range": "[0,1]"
+    },
+    "canonical_integrity": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "source_purity": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "recovery": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "failover": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "provenance": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "replay": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "adjustment": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "calendar": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "universe": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "error_handling": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "local_nas_isolation": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "replication": {
+      "observed": "duration_seconds",
+      "target": "duration_seconds",
+      "unavailable_null": true,
+      "range": "[0,2147483647]"
+    },
+    "restore": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    },
+    "read_boundary": {
+      "observed": "bool",
+      "target": "bool",
+      "unavailable_null": true,
+      "range": "boolean"
+    }
   },
   "creator_allowlist": {
     "production_creator_kind": "task20_writer",
-    "test_envelope": {"schema_version": "r2f5-test-envelope-v1", "creator_kind": "test_fixture", "production_reader_accepts": false},
-    "production_envelope_payloads": {"WindowEvidenceBundlePayload": ["task20_writer"], "RecoveryObservation": ["task20_writer"], "WholeSessionFailoverDrill": ["task20_writer"], "ReplaySampleEvidence": ["task20_writer"], "AdjustmentEquivalenceEvidence": ["task20_writer"], "ErrorHandlingObservation": ["task20_writer"], "LocalNasIsolationObservation": ["task20_writer"], "RestoreDrillEvidence": ["task20_writer"]},
-    "reader_projections": {"SecondaryQualificationProjection": [], "CompletedReplicationRestoreSnapshotV1": []},
-    "synthetic_envelope_only": ["test_fixture"],
-    "reader_never_creates": ["r2f5_reader", "r2f4_writer"]
+    "test_envelope": {
+      "schema_version": "r2f5-test-envelope-v1",
+      "creator_kind": "test_fixture",
+      "production_reader_accepts": false
+    },
+    "production_envelope_payloads": {
+      "WindowEvidenceBundlePayload": [
+        "task20_writer"
+      ],
+      "RecoveryObservation": [
+        "task20_writer"
+      ],
+      "WholeSessionFailoverDrill": [
+        "task20_writer"
+      ],
+      "ReplaySampleEvidence": [
+        "task20_writer"
+      ],
+      "AdjustmentEquivalenceEvidence": [
+        "task20_writer"
+      ],
+      "ErrorHandlingObservation": [
+        "task20_writer"
+      ],
+      "LocalNasIsolationObservation": [
+        "task20_writer"
+      ],
+      "RestoreDrillEvidence": [
+        "task20_writer"
+      ]
+    },
+    "reader_projections": {
+      "SecondaryQualificationProjection": [],
+      "CompletedReplicationRestoreSnapshotV1": []
+    },
+    "synthetic_envelope_only": [
+      "test_fixture"
+    ],
+    "reader_never_creates": [
+      "r2f5_reader",
+      "r2f4_writer"
+    ]
   },
-  "limits": {"max_entries": 100000, "max_input_bytes": 536870912, "max_db_rows": 1000000, "max_input_roots": 32, "max_sessions": 20, "max_replay_samples": 3, "max_elapsed_ms": 10000},
+  "limits": {
+    "max_entries": 100000,
+    "max_input_bytes": 536870912,
+    "max_db_rows": 1000000,
+    "max_input_roots": 32,
+    "max_sessions": 20,
+    "max_replay_samples": 3,
+    "max_elapsed_ms": 10000
+  },
   "model_schema_ast": {
-    "ImmutableObservationEnvelopeV1": {"object_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"], "tuple_item_schemas": {}},
-    "TestEnvelope": {"object_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"], "tuple_item_schemas": {}},
-    "PreCaptureFailurePayloadV1": {"object_fields": ["schema_version", "reason_code", "requested_start", "requested_end", "as_of_utc", "descriptor_states", "semantic_report_sha256"], "tuple_item_schemas": {}},
-    "CalendarRawFacts": {"object_fields": ["source_sequence", "generation", "confirmed", "unknown_state", "conflict_state", "raw_facts_sha256"], "tuple_item_schemas": {}},
-    "ReadBoundaryRawFacts": {"object_fields": ["requested_as_of", "max_visible_session", "future_rows_seen", "future_rows_count", "query_count", "write_count", "probe_schema_digest"], "tuple_item_schemas": {}},
-    "SessionEvidenceBinding": {"object_fields": ["evidence_id", "evidence_sha256", "candidate_id", "candidate_sha256", "gate_report_id", "gate_report_sha256", "manifest_id", "manifest_sha256", "object_id", "object_sha256", "selection_id", "selection_sha256", "binding_sha256"], "tuple_item_schemas": {}},
-    "PointerReconciliation": {"object_fields": ["pointer_id", "pointer_sha256", "manifest_sha256", "object_sha256", "pointer_manifest_object_match", "descriptor_sha256"], "tuple_item_schemas": {}},
-    "ReplicationObservation": {"object_fields": ["immutable", "state", "checkpoint_id", "source_commit_sha256", "intent_id", "enqueue_state", "reason_code", "observed_at", "lag_seconds", "trust_scope", "destination_generation", "destination_record_sha256", "destination_head_sha256", "observation_sha256"], "tuple_item_schemas": {}},
-    "RecoveryObservation": {"object_fields": ["immutable", "event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count", "duplicate_proof_sha256", "observed_at", "observation_sha256"], "tuple_item_schemas": {}},
-    "ErrorHandlingObservation": {"object_fields": ["immutable", "events", "observation_sha256"], "tuple_item_schemas": {"events": ["event_id", "forced_error_class", "sanitized_reason", "normalized_result", "attempt_id", "expected_class", "observed_class", "evidence_sha256", "observed_at"]}},
-    "LocalNasIsolationObservation": {"object_fields": ["immutable", "event_id", "local_publication_ready", "local_publication_id", "local_pointer_sha256", "outage_start", "outage_end", "backlog_before_ids", "backlog_after_ids", "backlog_before_count", "backlog_after_count", "lag_seconds", "lag_threshold_seconds", "retryable", "retry_state", "retry_transition", "nas_failure_did_not_block_local", "attempt_id", "observed_at", "observation_sha256"], "tuple_item_schemas": {}},
-    "SessionObservation": {"object_fields": ["session", "ordinal", "frozen_versions_sha256", "same_evening_published_at", "next_morning_published_at", "required_count", "loaded_count", "suspension_count", "not_listed_count", "delisted_count", "unknown_count", "canonical_provider_ids", "evidence", "pointer_reconciliation", "replication_observation", "calendar_raw_facts", "read_boundary_raw_facts", "schema_policy_versions", "schema_policy_digest", "cutoff_results", "coverage", "canonical_integrity", "source_purity", "provenance", "calendar", "universe", "replication", "read_boundary", "observation_sha256"], "tuple_item_schemas": {}},
-    "SnapshotIdentity": {"object_fields": ["requested_start", "requested_end", "as_of_utc", "as_of_timezone", "input_fingerprints", "frozen_versions", "input_fingerprint_sha256", "frozen_version_vector_sha256", "snapshot_sha256"], "tuple_item_schemas": {}},
-    "R2FAcceptanceReport": {"object_fields": ["status", "window_start", "window_end", "selected_sessions", "frozen_versions", "continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary", "quality_issues", "snapshot_identity", "session_observations", "observation_refs", "window_evidence_bundle", "window_evidence_refs", "pre_capture_failure", "semantic_report_sha256", "provider_requests", "writes", "restore_started", "production_window_started"], "tuple_item_schemas": {}},
-    "SnapshotFingerprint": {"object_fields": ["descriptor_role", "descriptor_id", "descriptor_state", "device", "inode", "size_bytes", "mtime_ns", "ctime_ns", "fingerprint_kind", "hash_scope", "sha256"], "tuple_item_schemas": {}},
-    "ReadonlyEvidenceDescriptor": {"object_fields": ["descriptor_id", "object_sha256", "descriptor_sha256", "immutable", "completed", "source_generation"], "tuple_item_schemas": {}},
-    "CompletedReplicationRestoreSnapshotV1": {"object_fields": ["trust_scope", "destination_generation", "destination_head_sha256", "destination_record_sha256", "checkpoint_id", "replication_policy_version", "restore_policy_version", "replication_observation_sha256", "restore_report_sha256", "policy_thresholds"], "tuple_item_schemas": {}},
-    "WholeSessionFailoverDrill": {"object_fields": ["source_schema", "primary_unavailable", "qualified_secondary_provider_id", "qualification_proof_status", "session", "selected_provider_id", "selection_sha256", "manifest_sha256", "pointer_sha256", "readback_sha256", "mixed_source_rows"], "tuple_item_schemas": {}},
-    "ReplaySampleEvidence": {"object_fields": ["sample_object_sha256", "candidate_sha256", "semantic_equal", "offline_context"], "tuple_item_schemas": {}},
-    "RestoreDrillEvidence": {"object_fields": ["source_schema", "sentinel_sha256", "destination_id", "destination_generation", "destination_head_sha256", "record_sha256", "manifest_sha256", "checkpoint_id", "restore_report_id", "restore_report_sha256", "schema_version", "row_count", "api_readback_sha256", "verification_state"], "tuple_item_schemas": {}},
-    "OfflineReplayContext": {"object_fields": ["adapter_id", "adapter_version", "normalizer_id", "normalizer_version", "implementation_sha256", "network_allowed", "provider_requests"], "tuple_item_schemas": {}},
-    "EvidenceObject": {"object_fields": ["evidence_id", "immutable_evidence_bytes"], "tuple_item_schemas": {}},
-    "ObjectEvidence": {"object_fields": ["object_id", "immutable_object_bytes"], "tuple_item_schemas": {}},
-    "CandidateObject": {"object_fields": ["candidate_id", "immutable_candidate_bytes"], "tuple_item_schemas": {}},
-    "GateReport": {"object_fields": ["gate_report_id", "immutable_gate_report_bytes"], "tuple_item_schemas": {}},
-    "Manifest": {"object_fields": ["manifest_id", "immutable_manifest_bytes"], "tuple_item_schemas": {}},
-    "SessionSelection": {"object_fields": ["selection_id", "immutable_selection_bytes"], "tuple_item_schemas": {}},
-    "PointerRecord": {"object_fields": ["pointer_id", "immutable_pointer_bytes"], "tuple_item_schemas": {}},
-    "InputDescriptor": {"object_fields": ["descriptor_id", "descriptor_metadata"], "tuple_item_schemas": {}},
-    "ReplicationRecord": {"object_fields": ["source_commit_id", "source_commit_bytes", "destination_record_id", "destination_record_bytes", "destination_generation", "immutable_destination_record_bytes"], "tuple_item_schemas": {}},
-    "DestinationHead": {"object_fields": ["destination_generation", "destination_head_bytes", "immutable_destination_head_bytes"], "tuple_item_schemas": {}},
-    "RecoveryProof": {"object_fields": ["event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count"], "tuple_item_schemas": {}},
-    "ForcedErrorEvidence": {"object_fields": ["event_id", "forced_error_class", "immutable_evidence_bytes"], "tuple_item_schemas": {}},
-    "LocalPublicationPointer": {"object_fields": ["local_publication_id", "immutable_pointer_bytes"], "tuple_item_schemas": {}},
-    "ReplaySample": {"object_fields": ["sample_object_id", "immutable_sample_bytes"], "tuple_item_schemas": {}},
-    "RestoreSentinel": {"object_fields": ["sentinel_id", "immutable_sentinel_bytes"], "tuple_item_schemas": {}},
-    "RestoreRecord": {"object_fields": ["record_id", "immutable_record_bytes"], "tuple_item_schemas": {}},
-    "RestoreReport": {"object_fields": ["restore_report_id", "immutable_restore_report_bytes"], "tuple_item_schemas": {}},
-    "RestoreApiReadback": {"object_fields": ["readback_id", "immutable_readback_bytes"], "tuple_item_schemas": {}},
-    "FingerprintSubject": {"object_fields": ["descriptor_role", "descriptor_id", "descriptor_state", "device", "inode", "size_bytes", "mtime_ns", "ctime_ns", "fingerprint_kind", "hash_scope", "captured_content_bytes"], "tuple_item_schemas": {}},
-    "AcceptanceConfig": {"object_fields": ["dataset_root_descriptor", "evidence_root_descriptor", "control_store_descriptor", "clock_policy", "cutoff_policy", "limits", "replay_policy", "replication_policy", "restore_policy", "redaction_policy"], "tuple_item_schemas": {}},
-    "SchemaPolicyVector": {"object_fields": ["schema_policy_versions"], "tuple_item_schemas": {}},
-    "InstalledRelease": {"object_fields": ["release_identity", "immutable_release_bytes"], "tuple_item_schemas": {}},
-    "CalendarGeneration": {"object_fields": ["calendar_generation", "immutable_calendar_bytes"], "tuple_item_schemas": {}},
-    "UniverseGeneration": {"object_fields": ["universe_generation", "immutable_universe_bytes"], "tuple_item_schemas": {}},
-    "OfflineImplementation": {"object_fields": ["adapter_id", "adapter_version", "normalizer_id", "normalizer_version", "immutable_implementation_bytes"], "tuple_item_schemas": {}},
-    "FrozenReliabilityVersions": {"object_fields": ["git_commit", "installed_release", "installed_release_sha256", "dataset_generation", "canonical_schema", "evidence_schema", "primary_provider_id", "secondary_provider_id", "qualification_window_id", "qualification_proof_status", "adapter_hash", "endpoint_contract_hash", "source_schema_hash", "normalizer_hash", "reconciliation_policy_version", "selection_policy_version", "config_digest", "auto_failover_enabled", "failover_kill_switch", "provider_priority", "continuity_start_date", "repair_policy_version", "calendar_generation", "calendar_sha256", "universe_generation", "universe_sha256", "replication_policy_version", "replication_evidence_version", "replication_trust_scope", "destination_generation", "destination_head_sha256", "remote_proof_artifact_ref", "restore_policy_version", "restore_evidence_version"], "tuple_item_schemas": {}},
-    "FailoverReadback": {"object_fields": ["readback_id", "immutable_readback_bytes"], "tuple_item_schemas": {}},
-    "ReadonlyEvidenceObject": {"object_fields": ["descriptor_id", "immutable_object_bytes"], "tuple_item_schemas": {}},
-    "R2FAcceptanceReport semantic payload": {"object_fields": ["status", "window_start", "window_end", "selected_sessions", "frozen_versions", "continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary", "quality_issues", "snapshot_identity", "session_observations", "observation_refs", "window_evidence_bundle", "window_evidence_refs", "pre_capture_failure", "provider_requests", "writes", "restore_started", "production_window_started"], "tuple_item_schemas": {}},
-    "SnapshotFingerprint[]": {"object_fields": ["input_fingerprints"], "tuple_item_schemas": {}}
+    "ImmutableObservationEnvelopeV1": {
+      "object_fields": [
+        "artifact_id",
+        "artifact_ref",
+        "schema_version",
+        "creator_kind",
+        "creator_version",
+        "created_at",
+        "payload",
+        "canonicalization_version",
+        "payload_sha256",
+        "envelope_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "TestEnvelope": {
+      "object_fields": [
+        "artifact_id",
+        "artifact_ref",
+        "schema_version",
+        "creator_kind",
+        "creator_version",
+        "created_at",
+        "payload",
+        "canonicalization_version",
+        "payload_sha256",
+        "envelope_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "PreCaptureFailurePayloadV1": {
+      "object_fields": [
+        "schema_version",
+        "reason_code",
+        "requested_start",
+        "requested_end",
+        "as_of_utc",
+        "descriptor_states",
+        "semantic_report_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "CalendarRawFacts": {
+      "object_fields": [
+        "source_sequence",
+        "generation",
+        "confirmed",
+        "unknown_state",
+        "conflict_state",
+        "raw_facts_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReadBoundaryRawFacts": {
+      "object_fields": [
+        "requested_as_of",
+        "max_visible_session",
+        "future_rows_seen",
+        "future_rows_count",
+        "query_count",
+        "write_count",
+        "probe_schema_digest"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SessionEvidenceBinding": {
+      "object_fields": [
+        "evidence_id",
+        "evidence_sha256",
+        "candidate_id",
+        "candidate_sha256",
+        "gate_report_id",
+        "gate_report_sha256",
+        "manifest_id",
+        "manifest_sha256",
+        "object_id",
+        "object_sha256",
+        "selection_id",
+        "selection_sha256",
+        "binding_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "PointerReconciliation": {
+      "object_fields": [
+        "pointer_id",
+        "pointer_sha256",
+        "manifest_sha256",
+        "object_sha256",
+        "pointer_manifest_object_match",
+        "descriptor_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReplicationObservation": {
+      "object_fields": [
+        "immutable",
+        "state",
+        "checkpoint_id",
+        "source_commit_sha256",
+        "intent_id",
+        "enqueue_state",
+        "reason_code",
+        "observed_at",
+        "lag_seconds",
+        "trust_scope",
+        "destination_generation",
+        "destination_record_sha256",
+        "destination_head_sha256",
+        "observation_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RecoveryObservation": {
+      "object_fields": [
+        "immutable",
+        "event_id",
+        "attempt_id",
+        "before_generation",
+        "after_generation",
+        "queue_identity",
+        "restart_boundary",
+        "exactly_once_publication_id",
+        "after_manifest_sha256",
+        "after_pointer_sha256",
+        "after_selection_sha256",
+        "publication_count",
+        "duplicate_proof_sha256",
+        "observed_at",
+        "observation_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ErrorHandlingObservation": {
+      "object_fields": [
+        "immutable",
+        "events",
+        "observation_sha256"
+      ],
+      "tuple_item_schemas": {
+        "events": [
+          "event_id",
+          "forced_error_class",
+          "sanitized_reason",
+          "normalized_result",
+          "attempt_id",
+          "expected_class",
+          "observed_class",
+          "evidence_sha256",
+          "observed_at"
+        ]
+      }
+    },
+    "LocalNasIsolationObservation": {
+      "object_fields": [
+        "immutable",
+        "event_id",
+        "local_publication_ready",
+        "local_publication_id",
+        "local_pointer_sha256",
+        "outage_start",
+        "outage_end",
+        "backlog_before_ids",
+        "backlog_after_ids",
+        "backlog_before_count",
+        "backlog_after_count",
+        "lag_seconds",
+        "lag_threshold_seconds",
+        "retryable",
+        "retry_state",
+        "retry_transition",
+        "nas_failure_did_not_block_local",
+        "attempt_id",
+        "observed_at",
+        "observation_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SessionObservation": {
+      "object_fields": [
+        "session",
+        "ordinal",
+        "frozen_versions_sha256",
+        "same_evening_published_at",
+        "next_morning_published_at",
+        "required_count",
+        "loaded_count",
+        "suspension_count",
+        "not_listed_count",
+        "delisted_count",
+        "unknown_count",
+        "canonical_provider_ids",
+        "evidence",
+        "pointer_reconciliation",
+        "replication_observation",
+        "calendar_raw_facts",
+        "read_boundary_raw_facts",
+        "schema_policy_versions",
+        "schema_policy_digest",
+        "cutoff_results",
+        "coverage",
+        "canonical_integrity",
+        "source_purity",
+        "provenance",
+        "calendar",
+        "universe",
+        "replication",
+        "read_boundary",
+        "observation_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SnapshotIdentity": {
+      "object_fields": [
+        "requested_start",
+        "requested_end",
+        "as_of_utc",
+        "as_of_timezone",
+        "input_fingerprints",
+        "frozen_versions",
+        "input_fingerprint_sha256",
+        "frozen_version_vector_sha256",
+        "snapshot_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "R2FAcceptanceReport": {
+      "object_fields": [
+        "status",
+        "window_start",
+        "window_end",
+        "selected_sessions",
+        "frozen_versions",
+        "continuity",
+        "next_morning_availability",
+        "same_evening_availability",
+        "coverage",
+        "canonical_integrity",
+        "source_purity",
+        "recovery",
+        "failover",
+        "provenance",
+        "replay",
+        "adjustment",
+        "calendar",
+        "universe",
+        "error_handling",
+        "local_nas_isolation",
+        "replication",
+        "restore",
+        "read_boundary",
+        "quality_issues",
+        "snapshot_identity",
+        "session_observations",
+        "observation_refs",
+        "window_evidence_bundle",
+        "window_evidence_refs",
+        "pre_capture_failure",
+        "semantic_report_sha256",
+        "provider_requests",
+        "writes",
+        "restore_started",
+        "production_window_started"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SnapshotFingerprint": {
+      "object_fields": [
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "ctime_ns",
+        "fingerprint_kind",
+        "hash_scope",
+        "sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReadonlyEvidenceDescriptor": {
+      "object_fields": [
+        "descriptor_id",
+        "object_sha256",
+        "descriptor_sha256",
+        "immutable",
+        "completed",
+        "source_generation"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "CompletedReplicationRestoreSnapshotV1": {
+      "object_fields": [
+        "trust_scope",
+        "destination_generation",
+        "destination_head_sha256",
+        "destination_record_sha256",
+        "checkpoint_id",
+        "replication_policy_version",
+        "restore_policy_version",
+        "replication_observation_sha256",
+        "restore_report_sha256",
+        "policy_thresholds"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "WholeSessionFailoverDrill": {
+      "object_fields": [
+        "source_schema",
+        "primary_unavailable",
+        "qualified_secondary_provider_id",
+        "qualification_proof_status",
+        "session",
+        "selected_provider_id",
+        "selection_sha256",
+        "manifest_sha256",
+        "pointer_sha256",
+        "readback_sha256",
+        "mixed_source_rows"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReplaySampleEvidence": {
+      "object_fields": [
+        "sample_object_sha256",
+        "candidate_sha256",
+        "semantic_equal",
+        "offline_context"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RestoreDrillEvidence": {
+      "object_fields": [
+        "source_schema",
+        "sentinel_sha256",
+        "destination_id",
+        "destination_generation",
+        "destination_head_sha256",
+        "record_sha256",
+        "manifest_sha256",
+        "checkpoint_id",
+        "restore_report_id",
+        "restore_report_sha256",
+        "schema_version",
+        "row_count",
+        "api_readback_sha256",
+        "verification_state"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "OfflineReplayContext": {
+      "object_fields": [
+        "adapter_id",
+        "adapter_version",
+        "normalizer_id",
+        "normalizer_version",
+        "implementation_sha256",
+        "network_allowed",
+        "provider_requests"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "EvidenceObject": {
+      "object_fields": [
+        "evidence_id",
+        "immutable_evidence_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ObjectEvidence": {
+      "object_fields": [
+        "object_id",
+        "immutable_object_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "CandidateObject": {
+      "object_fields": [
+        "candidate_id",
+        "immutable_candidate_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "GateReport": {
+      "object_fields": [
+        "gate_report_id",
+        "immutable_gate_report_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "Manifest": {
+      "object_fields": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SessionSelection": {
+      "object_fields": [
+        "selection_id",
+        "immutable_selection_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "PointerRecord": {
+      "object_fields": [
+        "pointer_id",
+        "immutable_pointer_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "InputDescriptor": {
+      "object_fields": [
+        "descriptor_id",
+        "descriptor_metadata"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReplicationRecord": {
+      "object_fields": [
+        "source_commit_id",
+        "source_commit_bytes",
+        "destination_record_id",
+        "destination_record_bytes",
+        "destination_generation",
+        "immutable_destination_record_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "DestinationHead": {
+      "object_fields": [
+        "destination_generation",
+        "destination_head_bytes",
+        "immutable_destination_head_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RecoveryProof": {
+      "object_fields": [
+        "event_id",
+        "attempt_id",
+        "before_generation",
+        "after_generation",
+        "queue_identity",
+        "restart_boundary",
+        "exactly_once_publication_id",
+        "after_manifest_sha256",
+        "after_pointer_sha256",
+        "after_selection_sha256",
+        "publication_count"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ForcedErrorEvidence": {
+      "object_fields": [
+        "event_id",
+        "forced_error_class",
+        "immutable_evidence_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "LocalPublicationPointer": {
+      "object_fields": [
+        "local_publication_id",
+        "immutable_pointer_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReplaySample": {
+      "object_fields": [
+        "sample_object_id",
+        "immutable_sample_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RestoreSentinel": {
+      "object_fields": [
+        "sentinel_id",
+        "immutable_sentinel_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RestoreRecord": {
+      "object_fields": [
+        "record_id",
+        "immutable_record_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RestoreReport": {
+      "object_fields": [
+        "restore_report_id",
+        "immutable_restore_report_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "RestoreApiReadback": {
+      "object_fields": [
+        "readback_id",
+        "immutable_readback_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "FingerprintSubject": {
+      "object_fields": [
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "ctime_ns",
+        "fingerprint_kind",
+        "hash_scope",
+        "captured_content_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "AcceptanceConfig": {
+      "object_fields": [
+        "dataset_root_descriptor",
+        "evidence_root_descriptor",
+        "control_store_descriptor",
+        "clock_policy",
+        "cutoff_policy",
+        "limits",
+        "replay_policy",
+        "replication_policy",
+        "restore_policy",
+        "redaction_policy"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SchemaPolicyVector": {
+      "object_fields": [
+        "schema_policy_versions"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "InstalledRelease": {
+      "object_fields": [
+        "release_identity",
+        "immutable_release_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "CalendarGeneration": {
+      "object_fields": [
+        "calendar_generation",
+        "immutable_calendar_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "UniverseGeneration": {
+      "object_fields": [
+        "universe_generation",
+        "immutable_universe_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "OfflineImplementation": {
+      "object_fields": [
+        "adapter_id",
+        "adapter_version",
+        "normalizer_id",
+        "normalizer_version",
+        "immutable_implementation_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "FrozenReliabilityVersions": {
+      "object_fields": [
+        "git_commit",
+        "installed_release",
+        "installed_release_sha256",
+        "dataset_generation",
+        "canonical_schema",
+        "evidence_schema",
+        "primary_provider_id",
+        "secondary_provider_id",
+        "qualification_window_id",
+        "qualification_proof_status",
+        "adapter_hash",
+        "endpoint_contract_hash",
+        "source_schema_hash",
+        "normalizer_hash",
+        "reconciliation_policy_version",
+        "selection_policy_version",
+        "config_digest",
+        "auto_failover_enabled",
+        "failover_kill_switch",
+        "provider_priority",
+        "continuity_start_date",
+        "repair_policy_version",
+        "calendar_generation",
+        "calendar_sha256",
+        "universe_generation",
+        "universe_sha256",
+        "replication_policy_version",
+        "replication_evidence_version",
+        "replication_trust_scope",
+        "destination_generation",
+        "destination_head_sha256",
+        "remote_proof_artifact_ref",
+        "restore_policy_version",
+        "restore_evidence_version"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "FailoverReadback": {
+      "object_fields": [
+        "readback_id",
+        "immutable_readback_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "ReadonlyEvidenceObject": {
+      "object_fields": [
+        "descriptor_id",
+        "immutable_object_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "R2FAcceptanceReport semantic payload": {
+      "object_fields": [
+        "status",
+        "window_start",
+        "window_end",
+        "selected_sessions",
+        "frozen_versions",
+        "continuity",
+        "next_morning_availability",
+        "same_evening_availability",
+        "coverage",
+        "canonical_integrity",
+        "source_purity",
+        "recovery",
+        "failover",
+        "provenance",
+        "replay",
+        "adjustment",
+        "calendar",
+        "universe",
+        "error_handling",
+        "local_nas_isolation",
+        "replication",
+        "restore",
+        "read_boundary",
+        "quality_issues",
+        "snapshot_identity",
+        "session_observations",
+        "observation_refs",
+        "window_evidence_bundle",
+        "window_evidence_refs",
+        "pre_capture_failure",
+        "provider_requests",
+        "writes",
+        "restore_started",
+        "production_window_started"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SnapshotFingerprint[]": {
+      "object_fields": [
+        "input_fingerprints"
+      ],
+      "tuple_item_schemas": {}
+    }
   },
-  "digest_fields_by_model": {"CalendarRawFacts": ["raw_facts_sha256"], "CompletedReplicationRestoreSnapshotV1": ["replication_observation_sha256", "restore_report_sha256", "destination_record_sha256", "destination_head_sha256"], "ErrorHandlingObservation": ["observation_sha256"], "ErrorHandlingObservation.events": ["evidence_sha256"], "FrozenReliabilityVersions": ["config_digest", "installed_release_sha256", "calendar_sha256", "universe_sha256", "destination_head_sha256"], "ImmutableObservationEnvelopeV1": ["payload_sha256", "envelope_sha256"], "LocalNasIsolationObservation": ["observation_sha256", "local_pointer_sha256"], "OfflineReplayContext": ["implementation_sha256"], "PointerReconciliation": ["pointer_sha256", "manifest_sha256", "object_sha256", "descriptor_sha256"], "PreCaptureFailurePayloadV1": ["semantic_report_sha256"], "R2FAcceptanceReport": ["semantic_report_sha256"], "ReadBoundaryRawFacts": ["probe_schema_digest"], "ReadonlyEvidenceDescriptor": ["object_sha256", "descriptor_sha256"], "RecoveryObservation": ["duplicate_proof_sha256", "observation_sha256", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256"], "ReplaySampleEvidence": ["sample_object_sha256", "candidate_sha256"], "ReplicationObservation": ["source_commit_sha256", "destination_record_sha256", "destination_head_sha256", "observation_sha256"], "RestoreDrillEvidence": ["sentinel_sha256", "destination_head_sha256", "record_sha256", "manifest_sha256", "restore_report_sha256", "api_readback_sha256"], "SessionEvidenceBinding": ["evidence_sha256", "candidate_sha256", "gate_report_sha256", "manifest_sha256", "object_sha256", "selection_sha256", "binding_sha256"], "SessionObservation": ["frozen_versions_sha256", "schema_policy_digest", "observation_sha256"], "SnapshotFingerprint": ["sha256"], "SnapshotIdentity": ["input_fingerprint_sha256", "frozen_version_vector_sha256", "snapshot_sha256"], "WholeSessionFailoverDrill": ["selection_sha256", "manifest_sha256", "pointer_sha256", "readback_sha256"]},
+  "digest_fields_by_model": {
+    "CalendarRawFacts": [
+      "raw_facts_sha256"
+    ],
+    "CompletedReplicationRestoreSnapshotV1": [
+      "replication_observation_sha256",
+      "restore_report_sha256",
+      "destination_record_sha256",
+      "destination_head_sha256"
+    ],
+    "ErrorHandlingObservation": [
+      "observation_sha256"
+    ],
+    "ErrorHandlingObservation.events": [
+      "evidence_sha256"
+    ],
+    "FrozenReliabilityVersions": [
+      "config_digest",
+      "installed_release_sha256",
+      "calendar_sha256",
+      "universe_sha256",
+      "destination_head_sha256"
+    ],
+    "ImmutableObservationEnvelopeV1": [
+      "payload_sha256",
+      "envelope_sha256"
+    ],
+    "LocalNasIsolationObservation": [
+      "observation_sha256",
+      "local_pointer_sha256"
+    ],
+    "OfflineReplayContext": [
+      "implementation_sha256"
+    ],
+    "PointerReconciliation": [
+      "pointer_sha256",
+      "manifest_sha256",
+      "object_sha256",
+      "descriptor_sha256"
+    ],
+    "PreCaptureFailurePayloadV1": [
+      "semantic_report_sha256"
+    ],
+    "R2FAcceptanceReport": [
+      "semantic_report_sha256"
+    ],
+    "ReadBoundaryRawFacts": [
+      "probe_schema_digest"
+    ],
+    "ReadonlyEvidenceDescriptor": [
+      "object_sha256",
+      "descriptor_sha256"
+    ],
+    "RecoveryObservation": [
+      "duplicate_proof_sha256",
+      "observation_sha256",
+      "after_manifest_sha256",
+      "after_pointer_sha256",
+      "after_selection_sha256"
+    ],
+    "ReplaySampleEvidence": [
+      "sample_object_sha256",
+      "candidate_sha256"
+    ],
+    "ReplicationObservation": [
+      "source_commit_sha256",
+      "destination_record_sha256",
+      "destination_head_sha256",
+      "observation_sha256"
+    ],
+    "RestoreDrillEvidence": [
+      "sentinel_sha256",
+      "destination_head_sha256",
+      "record_sha256",
+      "manifest_sha256",
+      "restore_report_sha256",
+      "api_readback_sha256"
+    ],
+    "SessionEvidenceBinding": [
+      "evidence_sha256",
+      "candidate_sha256",
+      "gate_report_sha256",
+      "manifest_sha256",
+      "object_sha256",
+      "selection_sha256",
+      "binding_sha256"
+    ],
+    "SessionObservation": [
+      "frozen_versions_sha256",
+      "schema_policy_digest",
+      "observation_sha256"
+    ],
+    "SnapshotFingerprint": [
+      "sha256"
+    ],
+    "SnapshotIdentity": [
+      "input_fingerprint_sha256",
+      "frozen_version_vector_sha256",
+      "snapshot_sha256"
+    ],
+    "WholeSessionFailoverDrill": [
+      "selection_sha256",
+      "manifest_sha256",
+      "pointer_sha256",
+      "readback_sha256"
+    ]
+  },
+  "digest_dependency_policy": {
+    "node_key": ["root_object_type", "digest_field_path"],
+    "resolution": "source-root-validated-then-target-schema-qualified-path",
+    "target_node_key": "(target_schema_type, source_model_digest_field_path)",
+    "tuple_path_syntax": "events[].field",
+    "opaque_external_leaf": true,
+    "unordered_short_name_aliasing": false
+  },
   "sqlite_catalogs": {
-    "replication_sidecar": {"role": "replication", "user_version": 1, "allowed_tables": ["replication_sidecar_meta", "replication_intents", "replication_destination_cache", "replication_attempt_events", "replication_heads"], "system_tables": ["sqlite_sequence"], "tables": {"replication_sidecar_meta": {"columns": ["sidecar_id:INTEGER", "schema_version:INTEGER", "schema_identity:TEXT", "ddl_sha256:TEXT", "schema_digest:TEXT", "generation_number:INTEGER"], "primary_key": ["sidecar_id"], "order_by": ["sidecar_id"]}, "replication_intents": {"columns": ["intent_id:TEXT", "schema_version:INTEGER", "operation_day:TEXT", "direction:TEXT", "destination_id:TEXT", "checkpoint_id:TEXT", "row_count:INTEGER", "byte_count:INTEGER", "created_at:TEXT"], "primary_key": ["intent_id"], "order_by": ["intent_id"]}, "replication_destination_cache": {"columns": ["destination_id:TEXT", "descriptor_sha256:TEXT", "head_sha256:TEXT", "replication_generation:TEXT", "record_sha256:TEXT", "health_state:TEXT", "updated_at:TEXT"], "primary_key": ["destination_id"], "order_by": ["destination_id"]}, "replication_attempt_events": {"columns": ["event_id:TEXT", "intent_id:TEXT", "event_sequence:INTEGER", "to_state:TEXT", "event_sha256:TEXT", "occurred_at:TEXT"], "primary_key": ["event_id"], "order_by": ["intent_id", "event_sequence"]}, "replication_heads": {"columns": ["intent_id:TEXT", "current_state:TEXT", "state_version:INTEGER", "last_event_sequence:INTEGER", "updated_at:TEXT"], "primary_key": ["intent_id"], "order_by": ["intent_id"]}}, "catalog_digest_source": "existing-r2f4.3-replication-sidecar-ddl"},
-    "daily_shadow": {"role": "qualification", "user_version": 1, "allowed_tables": ["schema_migration", "daily_shadow_terms_evidence", "daily_shadow_contract", "daily_shadow_epoch", "daily_shadow_window", "daily_shadow_job", "daily_shadow_attempt_audit", "daily_shadow_evidence_ref", "daily_shadow_candidate_ref", "daily_shadow_session_report", "daily_shadow_terminal_attestation", "daily_shadow_circuit", "daily_shadow_circuit_event"], "system_tables": ["sqlite_sequence"], "tables": {"schema_migration": {"columns": ["migration_id:TEXT", "schema_version:INTEGER", "checksum:TEXT", "applied_at:TEXT"], "primary_key": ["migration_id"], "order_by": ["migration_id"]}, "daily_shadow_terms_evidence": {"columns": ["terms_evidence_sha256:TEXT", "terms_evidence_id:TEXT", "review_id:TEXT", "contract_version:TEXT", "installed_at:TEXT"], "primary_key": ["terms_evidence_sha256"], "order_by": ["terms_evidence_sha256"]}, "daily_shadow_contract": {"columns": ["descriptor_sha256:TEXT", "provider:TEXT", "profile:TEXT", "terms_evidence_sha256:TEXT"], "primary_key": ["descriptor_sha256"], "order_by": ["descriptor_sha256"]}, "daily_shadow_epoch": {"columns": ["epoch_id:TEXT", "epoch_ordinal:INTEGER", "epoch_state:TEXT", "calendar_generation:TEXT", "calendar_sha256:TEXT"], "primary_key": ["epoch_id"], "order_by": ["epoch_ordinal"]}, "daily_shadow_window": {"columns": ["provider:TEXT", "profile:TEXT", "epoch_id:TEXT", "window_state:TEXT", "consecutive_sessions:INTEGER"], "primary_key": ["provider", "profile"], "order_by": ["provider", "profile"]}, "daily_shadow_job": {"columns": ["job_id:TEXT", "epoch_id:TEXT", "session_id:TEXT", "trade_date:TEXT", "run_status:TEXT"], "primary_key": ["job_id"], "order_by": ["epoch_id", "trade_date", "job_id"]}, "daily_shadow_attempt_audit": {"columns": ["audit_id:TEXT", "job_id:TEXT", "session_id:TEXT", "ordinal:INTEGER", "audit_sha256:TEXT"], "primary_key": ["audit_id"], "order_by": ["job_id", "ordinal"]}, "daily_shadow_evidence_ref": {"columns": ["evidence_id:TEXT", "session_id:TEXT", "evidence_sha256:TEXT", "bundle_sha256:TEXT"], "primary_key": ["evidence_id"], "order_by": ["session_id", "evidence_id"]}, "daily_shadow_candidate_ref": {"columns": ["candidate_id:TEXT", "evidence_id:TEXT", "session_id:TEXT", "candidate_sha256:TEXT"], "primary_key": ["candidate_id"], "order_by": ["session_id", "candidate_id"]}, "daily_shadow_session_report": {"columns": ["session_report_id:TEXT", "session_id:TEXT", "trade_date:TEXT", "outcome:TEXT", "report_sha256:TEXT"], "primary_key": ["session_report_id"], "order_by": ["trade_date", "session_report_id"]}, "daily_shadow_terminal_attestation": {"columns": ["attestation_id:TEXT", "session_report_id:TEXT", "attestation_sha256:TEXT", "immutable_version:INTEGER"], "primary_key": ["attestation_id"], "order_by": ["attestation_id"]}, "daily_shadow_circuit": {"columns": ["circuit_id:TEXT", "state:TEXT"], "primary_key": ["circuit_id"], "order_by": ["circuit_id"]}, "daily_shadow_circuit_event": {"columns": ["event_id:TEXT", "circuit_id:TEXT", "event_sha256:TEXT", "occurred_at:TEXT"], "primary_key": ["event_id"], "order_by": ["circuit_id", "occurred_at", "event_id"]}}, "catalog_digest_source": "existing-r2f4-daily-shadow-ddl"},
-    "shadow_registry": {"role": "qualification", "user_version": 2, "allowed_tables": ["schema_migration", "terms_evidence", "provider_record", "qualification_window", "shadow_job", "shadow_evidence_ref", "shadow_candidate_ref", "session_report", "shadow_attempt_report", "shadow_evidence_attempt_ref", "shadow_terminal_attestation", "review_object", "qualification_session", "quarantine_snapshot"], "system_tables": ["sqlite_sequence"], "tables": {"schema_migration": {"columns": ["migration_id:TEXT", "schema_version:INTEGER", "applied_at:TEXT", "checksum:TEXT"], "primary_key": ["migration_id"], "order_by": ["migration_id"]}, "terms_evidence": {"columns": ["terms_evidence_id:TEXT", "provider_id:TEXT", "manifest_sha256:TEXT", "review_id:TEXT"], "primary_key": ["terms_evidence_id"], "order_by": ["terms_evidence_id"]}, "provider_record": {"columns": ["provider_id:TEXT", "admission_state:TEXT", "adapter_hash:TEXT", "endpoint_contract_hash:TEXT", "source_schema_hash:TEXT", "normalizer_hash:TEXT", "reconciliation_policy_hash:TEXT", "terms_evidence_hash:TEXT", "terms_review_id:TEXT", "state_version:INTEGER"], "primary_key": ["provider_id"], "order_by": ["provider_id"]}, "qualification_window": {"columns": ["provider_id:TEXT", "window_id:TEXT", "window_start:TEXT", "window_end:TEXT", "consecutive_sessions:INTEGER", "version_vector_sha256:TEXT", "calendar_generation:TEXT", "calendar_sha256:TEXT", "window_state:TEXT", "last_session_report_id:TEXT", "qualification_evidence_sha256:TEXT", "qualification_candidate_sha256:TEXT", "terminal_attestation_id:TEXT", "state_version:INTEGER"], "primary_key": ["provider_id", "window_id"], "order_by": ["provider_id", "window_id"]}, "shadow_job": {"columns": ["job_id:TEXT", "provider_id:TEXT", "window_id:TEXT", "trade_date:TEXT", "universe_id:TEXT", "canonical_manifest_generation:TEXT", "canonical_manifest_sha256:TEXT", "version_vector_sha256:TEXT", "run_status:TEXT", "state_version:INTEGER"], "primary_key": ["job_id"], "order_by": ["provider_id", "window_id", "trade_date", "job_id"]}, "shadow_evidence_ref": {"columns": ["evidence_id:TEXT", "job_id:TEXT", "provider_id:TEXT", "window_id:TEXT", "session_id:TEXT", "evidence_sha256:TEXT", "bundle_ref:TEXT", "bundle_sha256:TEXT"], "primary_key": ["evidence_id"], "order_by": ["provider_id", "window_id", "session_id", "evidence_id"]}, "shadow_candidate_ref": {"columns": ["candidate_id:TEXT", "evidence_id:TEXT", "job_id:TEXT", "provider_id:TEXT", "window_id:TEXT", "session_id:TEXT", "candidate_ref:TEXT", "candidate_sha256:TEXT"], "primary_key": ["candidate_id"], "order_by": ["provider_id", "window_id", "session_id", "candidate_id"]}, "session_report": {"columns": ["session_report_id:TEXT", "provider_id:TEXT", "job_id:TEXT", "window_id:TEXT", "session_id:TEXT", "trade_date:TEXT", "outcome:TEXT", "calendar_generation:TEXT", "calendar_sha256:TEXT", "universe_sha256:TEXT", "version_vector_sha256:TEXT", "report_ref:TEXT", "report_sha256:TEXT"], "primary_key": ["session_report_id"], "order_by": ["provider_id", "window_id", "trade_date", "session_report_id"]}, "shadow_attempt_report": {"columns": ["attempt_id:TEXT", "report_id:TEXT", "job_id:TEXT", "provider_id:TEXT", "window_id:TEXT", "session_id:TEXT", "version_vector_sha256:TEXT", "outcome:TEXT", "started_at:TEXT", "completed_at:TEXT", "coverage_expected:INTEGER", "coverage_observed:INTEGER", "report_sha256:TEXT"], "primary_key": ["attempt_id"], "order_by": ["provider_id", "window_id", "session_id", "attempt_id"]}, "shadow_evidence_attempt_ref": {"columns": ["evidence_id:TEXT", "provider_id:TEXT", "job_id:TEXT", "window_id:TEXT", "session_id:TEXT", "logical_request_ordinal:INTEGER", "attempt_id:TEXT"], "primary_key": ["evidence_id", "logical_request_ordinal"], "order_by": ["evidence_id", "logical_request_ordinal"]}, "shadow_terminal_attestation": {"columns": ["attestation_id:TEXT", "provider_id:TEXT", "job_id:TEXT", "window_id:TEXT", "session_id:TEXT", "evidence_id:TEXT", "candidate_id:TEXT", "session_report_id:TEXT", "report_digest_sha256:TEXT", "evidence_sha256:TEXT", "candidate_sha256:TEXT", "immutable_version:INTEGER"], "primary_key": ["attestation_id"], "order_by": ["provider_id", "window_id", "session_id", "attestation_id"]}, "review_object": {"columns": ["review_object_id:TEXT", "provider_id:TEXT", "terms_evidence_hash:TEXT", "adapter_hash:TEXT", "version_vector_sha256:TEXT", "reviewed_at:TEXT"], "primary_key": ["review_object_id"], "order_by": ["review_object_id"]}, "qualification_session": {"columns": ["provider_id:TEXT", "window_id:TEXT", "trade_date:TEXT", "session_report_id:TEXT", "terminal_attestation_id:TEXT", "calendar_generation:TEXT", "calendar_sha256:TEXT"], "primary_key": ["provider_id", "window_id", "trade_date"], "order_by": ["provider_id", "window_id", "trade_date"]}, "quarantine_snapshot": {"columns": ["provider_id:TEXT", "adapter_hash:TEXT", "terms_evidence_hash:TEXT", "version_vector_sha256:TEXT"], "primary_key": ["provider_id"], "order_by": ["provider_id"]}}, "catalog_digest_source": "existing-r2f4-shadow-registry-schema-version-2"},
-    "calendar_generation": {"role": "calendar", "user_version": 1, "allowed_tables": ["calendar_generation_meta", "calendar_generation_candidate", "calendar_official_object", "calendar_maintenance_attempt", "calendar_generation_promotion", "calendar_generation_head"], "system_tables": ["sqlite_sequence"], "tables": {"calendar_generation_meta": {"columns": ["singleton:INTEGER", "schema_version:INTEGER", "schema_sha256:TEXT", "bundled_sha256:TEXT"], "primary_key": ["singleton"], "order_by": ["singleton"]}, "calendar_generation_candidate": {"columns": ["staging_sequence:INTEGER", "source_sha256:TEXT", "payload_json:BLOB", "admission:TEXT"], "primary_key": ["staging_sequence"], "order_by": ["staging_sequence"]}, "calendar_official_object": {"columns": ["body_sha256:TEXT", "body_bytes:BLOB"], "primary_key": ["body_sha256"], "order_by": ["body_sha256"]}, "calendar_maintenance_attempt": {"columns": ["target_year:INTEGER", "slot_date:TEXT", "source_sha256:TEXT", "outcome:TEXT"], "primary_key": ["target_year", "slot_date"], "order_by": ["target_year", "slot_date"]}, "calendar_generation_promotion": {"columns": ["sequence:INTEGER", "generation_sha256:TEXT", "source_sha256:TEXT", "promoted_at:TEXT"], "primary_key": ["sequence"], "order_by": ["sequence"]}, "calendar_generation_head": {"columns": ["singleton:INTEGER", "sequence:INTEGER", "generation_sha256:TEXT"], "primary_key": ["singleton"], "order_by": ["singleton"]}}, "catalog_digest_source": "existing-r2f4-calendar-generation-ddl"},
-    "universe": {"role": "universe", "user_version": 1, "allowed_tables": ["universe_meta", "universe_source_state", "universe_contract", "universe_member", "universe_semantic_mapping", "universe_instrument_evidence", "universe_required_symbol_snapshot", "universe_publication_context", "contract_evidence", "contract_required_snapshot", "universe_attempt", "universe_attempt_result", "universe_head"], "system_tables": ["sqlite_sequence"], "tables": {"universe_meta": {"columns": ["meta_key:TEXT", "meta_value:TEXT"], "primary_key": ["meta_key"], "order_by": ["meta_key"]}, "universe_source_state": {"columns": ["source_state_id:TEXT", "source_state_sha256:TEXT", "trade_date:TEXT"], "primary_key": ["source_state_id"], "order_by": ["source_state_id"]}, "universe_contract": {"columns": ["contract_id:TEXT", "sequence:INTEGER", "trade_date:TEXT", "contract_sha256:TEXT"], "primary_key": ["contract_id"], "order_by": ["sequence", "contract_id"]}, "universe_member": {"columns": ["contract_id:TEXT", "symbol:TEXT", "security_id:TEXT", "member_sha256:TEXT"], "primary_key": ["contract_id", "symbol"], "order_by": ["contract_id", "symbol"]}, "universe_semantic_mapping": {"columns": ["mapping_id:TEXT", "mapping_version:TEXT", "mapping_sha256:TEXT"], "primary_key": ["mapping_id"], "order_by": ["mapping_id"]}, "universe_instrument_evidence": {"columns": ["evidence_id:TEXT", "evidence_sha256:TEXT", "symbol:TEXT", "mapping_id:TEXT"], "primary_key": ["evidence_id"], "order_by": ["evidence_id"]}, "universe_required_symbol_snapshot": {"columns": ["snapshot_id:TEXT", "snapshot_sha256:TEXT", "symbol_count:INTEGER"], "primary_key": ["snapshot_id"], "order_by": ["snapshot_id"]}, "universe_publication_context": {"columns": ["context_id:TEXT", "run_id:TEXT", "trade_date:TEXT", "context_sha256:TEXT"], "primary_key": ["context_id"], "order_by": ["trade_date", "context_id"]}, "contract_evidence": {"columns": ["contract_id:TEXT", "evidence_id:TEXT", "evidence_role:TEXT"], "primary_key": ["contract_id", "evidence_id", "evidence_role"], "order_by": ["contract_id", "evidence_id", "evidence_role"]}, "contract_required_snapshot": {"columns": ["contract_id:TEXT", "snapshot_id:TEXT", "snapshot_sha256:TEXT"], "primary_key": ["contract_id"], "order_by": ["contract_id"]}, "universe_attempt": {"columns": ["attempt_id:TEXT", "dedup_key:TEXT", "trade_date:TEXT", "planned_sha256:TEXT"], "primary_key": ["attempt_id"], "order_by": ["trade_date", "attempt_id"]}, "universe_attempt_result": {"columns": ["attempt_id:TEXT", "terminal_status:TEXT", "result_sha256:TEXT"], "primary_key": ["attempt_id"], "order_by": ["attempt_id"]}, "universe_head": {"columns": ["singleton_id:INTEGER", "sequence:INTEGER", "contract_id:TEXT", "head_sha256:TEXT"], "primary_key": ["singleton_id"], "order_by": ["singleton_id"]}}, "catalog_digest_source": "existing-r2f4-universe-ddl"}
+    "replication_sidecar": {
+      "role": "replication",
+      "user_version": 1,
+      "schema_version_source": "PRAGMA user_version=1; exact sqlite_master; backend/app/storage/replication:SIDECAR_DDL",
+      "allowed_tables": [
+        "replication_attempt_events",
+        "replication_destination_cache",
+        "replication_heads",
+        "replication_intents",
+        "replication_sidecar_meta"
+      ],
+      "system_tables": [],
+      "sqlite_master_allowlist": [
+        "index:replication_attempt_events_intent_idx",
+        "index:replication_destination_cache_health_idx",
+        "index:replication_heads_due_idx",
+        "index:replication_intents_checkpoint_idx",
+        "table:replication_attempt_events",
+        "table:replication_destination_cache",
+        "table:replication_heads",
+        "table:replication_intents",
+        "table:replication_sidecar_meta",
+        "trigger:replication_attempt_events_no_delete",
+        "trigger:replication_attempt_events_no_update",
+        "trigger:replication_heads_monotonic_cas",
+        "trigger:replication_heads_no_delete",
+        "trigger:replication_intents_no_delete",
+        "trigger:replication_intents_no_update",
+        "trigger:replication_sidecar_meta_no_delete",
+        "trigger:replication_sidecar_meta_no_update"
+      ],
+      "tables": {
+        "replication_attempt_events": {
+          "columns": [
+            "event_id:TEXT",
+            "intent_id:TEXT",
+            "event_sequence:INTEGER",
+            "prev_event_sha256:TEXT",
+            "event_type:TEXT",
+            "from_state:TEXT",
+            "to_state:TEXT",
+            "attempt:INTEGER",
+            "reason_code:TEXT",
+            "state_version:INTEGER",
+            "occurred_at:TEXT",
+            "destination_replication_generation:TEXT",
+            "destination_record_sha256:TEXT",
+            "destination_head_sha256:TEXT",
+            "event_sha256:TEXT"
+          ],
+          "primary_key": [
+            "event_id"
+          ],
+          "order_by": [
+            "intent_id",
+            "event_sequence"
+          ]
+        },
+        "replication_destination_cache": {
+          "columns": [
+            "destination_id:TEXT",
+            "descriptor_sha256:TEXT",
+            "head_sha256:TEXT",
+            "replication_generation:TEXT",
+            "record_sha256:TEXT",
+            "source_instance_id:TEXT",
+            "source_sequence:INTEGER",
+            "health_state:TEXT",
+            "health_observed_at:TEXT",
+            "cache_version:INTEGER",
+            "updated_at:TEXT"
+          ],
+          "primary_key": [
+            "destination_id"
+          ],
+          "order_by": [
+            "destination_id"
+          ]
+        },
+        "replication_heads": {
+          "columns": [
+            "intent_id:TEXT",
+            "current_state:TEXT",
+            "state_version:INTEGER",
+            "last_event_sequence:INTEGER",
+            "lease_owner:TEXT",
+            "lease_until:TEXT",
+            "next_attempt_at:TEXT",
+            "last_reason_code:TEXT",
+            "updated_at:TEXT"
+          ],
+          "primary_key": [
+            "intent_id"
+          ],
+          "order_by": [
+            "intent_id"
+          ]
+        },
+        "replication_intents": {
+          "columns": [
+            "intent_id:TEXT",
+            "schema_version:INTEGER",
+            "operation_day:TEXT",
+            "direction:TEXT",
+            "destination_id:TEXT",
+            "pointer_row_sha256:TEXT",
+            "pointer_generation:TEXT",
+            "source_run_id:TEXT",
+            "source_trade_date:TEXT",
+            "source_published_at:TEXT",
+            "pointer_db_device:INTEGER",
+            "pointer_db_inode:INTEGER",
+            "pointer_db_schema_digest:TEXT",
+            "manifest_canonical_sha256:TEXT",
+            "source_object_set_sha256:TEXT",
+            "publication_binding_sha256:TEXT",
+            "source_instance_id:TEXT",
+            "source_instance_sha256:TEXT",
+            "source_sequence:INTEGER",
+            "checkpoint_id:TEXT",
+            "source_manifest_bytes_sha256:TEXT",
+            "plan_sha256:TEXT",
+            "intent_sha256:TEXT",
+            "object_count:INTEGER",
+            "row_count:INTEGER",
+            "byte_count:INTEGER",
+            "created_at:TEXT"
+          ],
+          "primary_key": [
+            "intent_id"
+          ],
+          "order_by": [
+            "intent_id"
+          ]
+        },
+        "replication_sidecar_meta": {
+          "columns": [
+            "sidecar_id:INTEGER",
+            "schema_version:INTEGER",
+            "schema_identity:TEXT",
+            "ddl_sha256:TEXT",
+            "schema_digest:TEXT",
+            "source_instance_id:TEXT",
+            "source_instance_sha256:TEXT",
+            "created_at:TEXT",
+            "generation_number:INTEGER",
+            "previous_generation_sha256:TEXT",
+            "generation_payload_sha256:TEXT"
+          ],
+          "primary_key": [
+            "sidecar_id"
+          ],
+          "order_by": [
+            "sidecar_id"
+          ]
+        }
+      },
+      "catalog_digest_source": "backend/app/storage/replication:SIDECAR_DDL"
+    },
+    "daily_shadow": {
+      "role": "qualification",
+      "user_version": 0,
+      "schema_version_source": "PRAGMA user_version=0; exact sqlite_master; backend/app/market/daily_shadow_schema:DAILY_SHADOW_DDL+MIGRATION_ID",
+      "allowed_tables": [
+        "daily_shadow_attempt_audit",
+        "daily_shadow_candidate_ref",
+        "daily_shadow_circuit",
+        "daily_shadow_circuit_event",
+        "daily_shadow_contract",
+        "daily_shadow_epoch",
+        "daily_shadow_evidence_ref",
+        "daily_shadow_job",
+        "daily_shadow_session_report",
+        "daily_shadow_terminal_attestation",
+        "daily_shadow_terms_evidence",
+        "daily_shadow_window",
+        "schema_migration"
+      ],
+      "system_tables": [],
+      "sqlite_master_allowlist": [
+        "table:daily_shadow_attempt_audit",
+        "table:daily_shadow_candidate_ref",
+        "table:daily_shadow_circuit",
+        "table:daily_shadow_circuit_event",
+        "table:daily_shadow_contract",
+        "table:daily_shadow_epoch",
+        "table:daily_shadow_evidence_ref",
+        "table:daily_shadow_job",
+        "table:daily_shadow_session_report",
+        "table:daily_shadow_terminal_attestation",
+        "table:daily_shadow_terms_evidence",
+        "table:daily_shadow_window",
+        "table:schema_migration",
+        "trigger:daily_attempt_immutable_delete",
+        "trigger:daily_attempt_immutable_update",
+        "trigger:daily_attestation_immutable_delete",
+        "trigger:daily_attestation_immutable_update",
+        "trigger:daily_candidate_immutable_delete",
+        "trigger:daily_candidate_immutable_update",
+        "trigger:daily_circuit_event_immutable_delete",
+        "trigger:daily_circuit_event_immutable_update",
+        "trigger:daily_contract_immutable_delete",
+        "trigger:daily_contract_immutable_update",
+        "trigger:daily_evidence_immutable_delete",
+        "trigger:daily_evidence_immutable_update",
+        "trigger:daily_session_immutable_delete",
+        "trigger:daily_session_immutable_update",
+        "trigger:daily_terminal_graph_gate",
+        "trigger:daily_terms_immutable_delete",
+        "trigger:daily_terms_immutable_update",
+        "trigger:schema_migration_immutable_delete",
+        "trigger:schema_migration_immutable_update"
+      ],
+      "tables": {
+        "daily_shadow_attempt_audit": {
+          "columns": [
+            "audit_id:TEXT",
+            "epoch_id:TEXT",
+            "job_id:TEXT",
+            "session_id:TEXT",
+            "ordinal:INTEGER",
+            "request_id:TEXT",
+            "endpoint:TEXT",
+            "attempt:INTEGER",
+            "outcome:TEXT",
+            "elapsed_ms:INTEGER",
+            "response_bytes:INTEGER",
+            "expected_rows:INTEGER",
+            "observed_rows:INTEGER",
+            "failure_class:TEXT",
+            "audit_sha256:TEXT"
+          ],
+          "primary_key": [
+            "audit_id"
+          ],
+          "order_by": [
+            "job_id",
+            "ordinal"
+          ]
+        },
+        "daily_shadow_candidate_ref": {
+          "columns": [
+            "candidate_id:TEXT",
+            "evidence_id:TEXT",
+            "epoch_id:TEXT",
+            "job_id:TEXT",
+            "session_id:TEXT",
+            "candidate_sha256:TEXT",
+            "canonical_symbol_set_sha256:TEXT",
+            "bundle_ref:TEXT",
+            "bundle_sha256:TEXT",
+            "quality_report_sha256:TEXT",
+            "reconciliation_report_sha256:TEXT"
+          ],
+          "primary_key": [
+            "candidate_id"
+          ],
+          "order_by": [
+            "session_id",
+            "candidate_id"
+          ]
+        },
+        "daily_shadow_circuit": {
+          "columns": [
+            "endpoint:TEXT",
+            "state:TEXT",
+            "consecutive_failures:INTEGER",
+            "opened_at:TEXT",
+            "cooldown_until:TEXT",
+            "probe_lease_id:TEXT",
+            "probe_owner:TEXT",
+            "probe_expires_at:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "endpoint"
+          ],
+          "order_by": [
+            "endpoint"
+          ]
+        },
+        "daily_shadow_circuit_event": {
+          "columns": [
+            "event_id:TEXT",
+            "endpoint:TEXT",
+            "event_type:TEXT",
+            "observed_at:TEXT",
+            "state_before:TEXT",
+            "state_after:TEXT",
+            "failure_class:TEXT",
+            "event_sha256:TEXT"
+          ],
+          "primary_key": [
+            "event_id"
+          ],
+          "order_by": [
+            "endpoint",
+            "observed_at",
+            "event_id"
+          ]
+        },
+        "daily_shadow_contract": {
+          "columns": [
+            "descriptor_sha256:TEXT",
+            "provider:TEXT",
+            "profile:TEXT",
+            "descriptor_json:BLOB",
+            "terms_evidence_sha256:TEXT",
+            "installed_at:TEXT"
+          ],
+          "primary_key": [
+            "descriptor_sha256"
+          ],
+          "order_by": [
+            "descriptor_sha256"
+          ]
+        },
+        "daily_shadow_epoch": {
+          "columns": [
+            "epoch_id:TEXT",
+            "epoch_ordinal:INTEGER",
+            "prior_epoch_id:TEXT",
+            "epoch_state:TEXT",
+            "reset_reason:TEXT",
+            "calendar_generation:TEXT",
+            "calendar_sha256:TEXT",
+            "universe_policy_sha256:TEXT",
+            "version_vector_sha256:TEXT",
+            "terms_evidence_sha256:TEXT",
+            "expected_dates_json:BLOB",
+            "expected_dates_sha256:TEXT",
+            "created_at:TEXT"
+          ],
+          "primary_key": [
+            "epoch_id"
+          ],
+          "order_by": [
+            "epoch_ordinal"
+          ]
+        },
+        "daily_shadow_evidence_ref": {
+          "columns": [
+            "evidence_id:TEXT",
+            "epoch_id:TEXT",
+            "job_id:TEXT",
+            "session_id:TEXT",
+            "completion_sha256:TEXT",
+            "evidence_sha256:TEXT",
+            "bundle_ref:TEXT",
+            "bundle_sha256:TEXT"
+          ],
+          "primary_key": [
+            "evidence_id"
+          ],
+          "order_by": [
+            "session_id",
+            "evidence_id"
+          ]
+        },
+        "daily_shadow_job": {
+          "columns": [
+            "job_id:TEXT",
+            "epoch_id:TEXT",
+            "session_id:TEXT",
+            "trade_date:TEXT",
+            "request_plan_sha256:TEXT",
+            "canonical_snapshot_sha256:TEXT",
+            "canonical_symbol_set_sha256:TEXT",
+            "run_status:TEXT",
+            "lease_owner:TEXT",
+            "lease_expires_at:TEXT",
+            "terminal_attestation_id:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "job_id"
+          ],
+          "order_by": [
+            "epoch_id",
+            "trade_date",
+            "job_id"
+          ]
+        },
+        "daily_shadow_session_report": {
+          "columns": [
+            "session_report_id:TEXT",
+            "epoch_id:TEXT",
+            "job_id:TEXT",
+            "session_id:TEXT",
+            "trade_date:TEXT",
+            "outcome:TEXT",
+            "canonical_snapshot_sha256:TEXT",
+            "canonical_symbol_set_sha256:TEXT",
+            "request_plan_sha256:TEXT",
+            "completion_sha256:TEXT",
+            "evidence_id:TEXT",
+            "evidence_sha256:TEXT",
+            "candidate_id:TEXT",
+            "candidate_sha256:TEXT",
+            "reconciliation_report_sha256:TEXT",
+            "terminal_attestation_id:TEXT",
+            "failure_class:TEXT",
+            "report_json:BLOB",
+            "report_sha256:TEXT",
+            "created_at:TEXT"
+          ],
+          "primary_key": [
+            "session_report_id"
+          ],
+          "order_by": [
+            "trade_date",
+            "session_report_id"
+          ]
+        },
+        "daily_shadow_terminal_attestation": {
+          "columns": [
+            "attestation_id:TEXT",
+            "epoch_id:TEXT",
+            "job_id:TEXT",
+            "session_id:TEXT",
+            "session_report_id:TEXT",
+            "evidence_id:TEXT",
+            "candidate_id:TEXT",
+            "canonical_symbol_set_sha256:TEXT",
+            "request_plan_json:BLOB",
+            "request_plan_sha256:TEXT",
+            "completion_json:BLOB",
+            "completion_sha256:TEXT",
+            "attempt_closure_json:BLOB",
+            "attempt_closure_sha256:TEXT",
+            "report_graph_json:BLOB",
+            "report_graph_sha256:TEXT",
+            "attestation_sha256:TEXT",
+            "immutable_version:INTEGER"
+          ],
+          "primary_key": [
+            "attestation_id"
+          ],
+          "order_by": [
+            "attestation_id"
+          ]
+        },
+        "daily_shadow_terms_evidence": {
+          "columns": [
+            "terms_evidence_sha256:TEXT",
+            "terms_evidence_id:TEXT",
+            "review_id:TEXT",
+            "contract_version:TEXT",
+            "content_bytes_sha256:TEXT",
+            "canonical_json:BLOB",
+            "installed_at:TEXT"
+          ],
+          "primary_key": [
+            "terms_evidence_sha256"
+          ],
+          "order_by": [
+            "terms_evidence_sha256"
+          ]
+        },
+        "daily_shadow_window": {
+          "columns": [
+            "provider:TEXT",
+            "profile:TEXT",
+            "epoch_id:TEXT",
+            "window_state:TEXT",
+            "first_trade_date:TEXT",
+            "last_trade_date:TEXT",
+            "next_trade_date:TEXT",
+            "consecutive_sessions:INTEGER",
+            "required_sessions:INTEGER",
+            "last_session_report_id:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "provider",
+            "profile"
+          ],
+          "order_by": [
+            "provider",
+            "profile"
+          ]
+        },
+        "schema_migration": {
+          "columns": [
+            "migration_id:TEXT",
+            "schema_version:INTEGER",
+            "checksum:TEXT",
+            "applied_at:TEXT"
+          ],
+          "primary_key": [
+            "migration_id"
+          ],
+          "order_by": [
+            "migration_id"
+          ]
+        }
+      },
+      "catalog_digest_source": "backend/app/market/daily_shadow_schema:DAILY_SHADOW_DDL+MIGRATION_ID"
+    },
+    "shadow_registry": {
+      "role": "qualification",
+      "user_version": 0,
+      "schema_version_source": "PRAGMA user_version=0; exact sqlite_master; backend/app/market/shadow_registry_schema:REGISTRY_DDL+MIGRATION_SQL",
+      "allowed_tables": [
+        "provider_record",
+        "qualification_session",
+        "qualification_window",
+        "quarantine_snapshot",
+        "review_object",
+        "schema_migration",
+        "session_report",
+        "shadow_attempt_report",
+        "shadow_candidate_ref",
+        "shadow_evidence_attempt_ref",
+        "shadow_evidence_ref",
+        "shadow_job",
+        "shadow_terminal_attestation",
+        "terms_evidence"
+      ],
+      "system_tables": [],
+      "sqlite_master_allowlist": [
+        "table:provider_record",
+        "table:qualification_session",
+        "table:qualification_window",
+        "table:quarantine_snapshot",
+        "table:review_object",
+        "table:schema_migration",
+        "table:session_report",
+        "table:shadow_attempt_report",
+        "table:shadow_candidate_ref",
+        "table:shadow_evidence_attempt_ref",
+        "table:shadow_evidence_ref",
+        "table:shadow_job",
+        "table:shadow_terminal_attestation",
+        "table:terms_evidence",
+        "trigger:candidate_attach_requires_nonterminal_job",
+        "trigger:evidence_ready_requires_pending_normalization",
+        "trigger:session_report_hash_match",
+        "trigger:session_report_immutable_delete",
+        "trigger:session_report_immutable_update",
+        "trigger:shadow_attempt_report_immutable_delete",
+        "trigger:shadow_attempt_report_immutable_update",
+        "trigger:terminal_attestation_gate",
+        "trigger:terminal_attestation_immutable_delete",
+        "trigger:terminal_attestation_immutable_update"
+      ],
+      "tables": {
+        "provider_record": {
+          "columns": [
+            "provider_id:TEXT",
+            "admission_state:TEXT",
+            "adapter_hash:TEXT",
+            "endpoint_contract_hash:TEXT",
+            "source_schema_hash:TEXT",
+            "normalizer_hash:TEXT",
+            "reconciliation_policy_hash:TEXT",
+            "terms_evidence_hash:TEXT",
+            "terms_review_id:TEXT",
+            "credential_env_name:TEXT",
+            "intended_use:TEXT",
+            "retention_decision:TEXT",
+            "quota_contract:TEXT",
+            "required_fields_json:TEXT",
+            "unit_contract_json:TEXT",
+            "state_version:INTEGER",
+            "quarantine_reason:TEXT"
+          ],
+          "primary_key": [
+            "provider_id"
+          ],
+          "order_by": [
+            "provider_id"
+          ]
+        },
+        "qualification_session": {
+          "columns": [
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "trade_date:TEXT",
+            "session_report_id:TEXT",
+            "terminal_attestation_id:TEXT",
+            "calendar_generation:TEXT",
+            "calendar_sha256:TEXT"
+          ],
+          "primary_key": [
+            "provider_id",
+            "window_id",
+            "trade_date"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "trade_date"
+          ]
+        },
+        "qualification_window": {
+          "columns": [
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "window_start:TEXT",
+            "window_end:TEXT",
+            "consecutive_sessions:INTEGER",
+            "version_vector_sha256:TEXT",
+            "calendar_generation:TEXT",
+            "calendar_sha256:TEXT",
+            "window_state:TEXT",
+            "last_session_report_id:TEXT",
+            "qualification_evidence_sha256:TEXT",
+            "qualification_candidate_sha256:TEXT",
+            "terminal_attestation_id:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "provider_id",
+            "window_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id"
+          ]
+        },
+        "quarantine_snapshot": {
+          "columns": [
+            "provider_id:TEXT",
+            "adapter_hash:TEXT",
+            "terms_evidence_hash:TEXT",
+            "version_vector_sha256:TEXT"
+          ],
+          "primary_key": [
+            "provider_id"
+          ],
+          "order_by": [
+            "provider_id"
+          ]
+        },
+        "review_object": {
+          "columns": [
+            "review_object_id:TEXT",
+            "provider_id:TEXT",
+            "terms_evidence_hash:TEXT",
+            "adapter_hash:TEXT",
+            "version_vector_sha256:TEXT",
+            "reviewed_at:TEXT"
+          ],
+          "primary_key": [
+            "review_object_id"
+          ],
+          "order_by": [
+            "review_object_id"
+          ]
+        },
+        "schema_migration": {
+          "columns": [
+            "migration_id:TEXT",
+            "schema_version:INTEGER",
+            "applied_at:TEXT",
+            "checksum:TEXT"
+          ],
+          "primary_key": [
+            "migration_id"
+          ],
+          "order_by": [
+            "migration_id"
+          ]
+        },
+        "session_report": {
+          "columns": [
+            "session_report_id:TEXT",
+            "provider_id:TEXT",
+            "job_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "successful_attempt_id:TEXT",
+            "evidence_id:TEXT",
+            "candidate_id:TEXT",
+            "terminal_attestation_id:TEXT",
+            "report_version:INTEGER",
+            "trade_date:TEXT",
+            "outcome:TEXT",
+            "calendar_generation:TEXT",
+            "calendar_sha256:TEXT",
+            "universe_sha256:TEXT",
+            "version_vector_sha256:TEXT",
+            "evidence_sha256:TEXT",
+            "candidate_sha256:TEXT",
+            "report_ref:TEXT",
+            "report_sha256:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "session_report_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "trade_date",
+            "session_report_id"
+          ]
+        },
+        "shadow_attempt_report": {
+          "columns": [
+            "attempt_id:TEXT",
+            "report_id:TEXT",
+            "job_id:TEXT",
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "request_id:TEXT",
+            "endpoint:TEXT",
+            "endpoint_class:TEXT",
+            "logical_request_ordinal:INTEGER",
+            "attempt_number:INTEGER",
+            "version_vector_sha256:TEXT",
+            "outcome:TEXT",
+            "started_at:TEXT",
+            "completed_at:TEXT",
+            "coverage_expected:INTEGER",
+            "coverage_observed:INTEGER",
+            "request_count:INTEGER",
+            "retry_count:INTEGER",
+            "rate_limit_count:INTEGER",
+            "failure_class:TEXT",
+            "page_identities_json:TEXT",
+            "page_count:INTEGER",
+            "row_count:INTEGER",
+            "terminal_marker:INTEGER",
+            "durable_report_ref:TEXT",
+            "report_sha256:TEXT",
+            "evidence_refs_json:TEXT",
+            "evidence_id:TEXT",
+            "evidence_sha256:TEXT",
+            "candidate_sha256:TEXT",
+            "terminal_session_report_id:TEXT",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "attempt_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "session_id",
+            "attempt_id"
+          ]
+        },
+        "shadow_candidate_ref": {
+          "columns": [
+            "candidate_id:TEXT",
+            "evidence_id:TEXT",
+            "job_id:TEXT",
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "candidate_ref:TEXT",
+            "candidate_sha256:TEXT",
+            "quality_report_ref:TEXT",
+            "quality_report_sha256:TEXT"
+          ],
+          "primary_key": [
+            "candidate_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "session_id",
+            "candidate_id"
+          ]
+        },
+        "shadow_evidence_attempt_ref": {
+          "columns": [
+            "evidence_id:TEXT",
+            "provider_id:TEXT",
+            "job_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "logical_request_ordinal:INTEGER",
+            "attempt_id:TEXT",
+            "endpoint:TEXT",
+            "request_id:TEXT",
+            "page_refs_json:TEXT",
+            "page_count:INTEGER",
+            "row_count:INTEGER"
+          ],
+          "primary_key": [
+            "evidence_id",
+            "logical_request_ordinal"
+          ],
+          "order_by": [
+            "evidence_id",
+            "logical_request_ordinal"
+          ]
+        },
+        "shadow_evidence_ref": {
+          "columns": [
+            "evidence_id:TEXT",
+            "job_id:TEXT",
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "completion_sha256:TEXT",
+            "evidence_sha256:TEXT",
+            "bundle_ref:TEXT",
+            "bundle_sha256:TEXT",
+            "attached_session_report_id:TEXT"
+          ],
+          "primary_key": [
+            "evidence_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "session_id",
+            "evidence_id"
+          ]
+        },
+        "shadow_job": {
+          "columns": [
+            "job_id:TEXT",
+            "provider_id:TEXT",
+            "window_id:TEXT",
+            "trade_date:TEXT",
+            "universe_id:TEXT",
+            "canonical_manifest_generation:TEXT",
+            "canonical_manifest_sha256:TEXT",
+            "version_vector_sha256:TEXT",
+            "successful_evidence_sha256:TEXT",
+            "successful_candidate_sha256:TEXT",
+            "completion_sha256:TEXT",
+            "terminal_attestation_id:TEXT",
+            "run_status:TEXT",
+            "lease_owner:TEXT",
+            "lease_expires_at:TEXT",
+            "attempt_count:INTEGER",
+            "state_version:INTEGER"
+          ],
+          "primary_key": [
+            "job_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "trade_date",
+            "job_id"
+          ]
+        },
+        "shadow_terminal_attestation": {
+          "columns": [
+            "attestation_id:TEXT",
+            "provider_id:TEXT",
+            "job_id:TEXT",
+            "window_id:TEXT",
+            "session_id:TEXT",
+            "evidence_id:TEXT",
+            "candidate_id:TEXT",
+            "session_report_id:TEXT",
+            "session_report_version:INTEGER",
+            "request_plan_canonical_json:BLOB",
+            "completion_canonical_json:BLOB",
+            "attempt_ordinal_closure_canonical_json:BLOB",
+            "report_digest_canonical_json:BLOB",
+            "attempt_ordinal_closure_sha256:TEXT",
+            "request_plan_sha256:TEXT",
+            "completion_sha256:TEXT",
+            "report_digest_sha256:TEXT",
+            "evidence_sha256:TEXT",
+            "candidate_sha256:TEXT",
+            "terminal_outcome:TEXT",
+            "immutable_version:INTEGER"
+          ],
+          "primary_key": [
+            "attestation_id"
+          ],
+          "order_by": [
+            "provider_id",
+            "window_id",
+            "session_id",
+            "attestation_id"
+          ]
+        },
+        "terms_evidence": {
+          "columns": [
+            "terms_evidence_id:TEXT",
+            "provider_id:TEXT",
+            "official_url_allowlist_json:TEXT",
+            "content_object_relpath:TEXT",
+            "content_bytes_sha256:TEXT",
+            "contract_version:TEXT",
+            "as_of_date:TEXT",
+            "reviewer:TEXT",
+            "review_id:TEXT",
+            "approved_intended_use:TEXT",
+            "approved_retention:TEXT",
+            "approved_credential_mode:TEXT",
+            "approved_quota_decision:TEXT",
+            "manifest_sha256:TEXT"
+          ],
+          "primary_key": [
+            "terms_evidence_id"
+          ],
+          "order_by": [
+            "terms_evidence_id"
+          ]
+        }
+      },
+      "catalog_digest_source": "backend/app/market/shadow_registry_schema:REGISTRY_DDL+MIGRATION_SQL"
+    },
+    "calendar_generation": {
+      "role": "calendar",
+      "user_version": 0,
+      "schema_version_source": "PRAGMA user_version=0; exact sqlite_master; backend/app/market/calendar_generation:CALENDAR_GENERATION_DDL",
+      "allowed_tables": [
+        "calendar_generation_candidate",
+        "calendar_generation_head",
+        "calendar_generation_meta",
+        "calendar_generation_promotion",
+        "calendar_maintenance_attempt",
+        "calendar_official_object"
+      ],
+      "system_tables": [],
+      "sqlite_master_allowlist": [
+        "table:calendar_generation_candidate",
+        "table:calendar_generation_head",
+        "table:calendar_generation_meta",
+        "table:calendar_generation_promotion",
+        "table:calendar_maintenance_attempt",
+        "table:calendar_official_object",
+        "trigger:calendar_attempt_no_delete",
+        "trigger:calendar_attempt_terminal_only",
+        "trigger:calendar_candidate_no_delete",
+        "trigger:calendar_candidate_no_update",
+        "trigger:calendar_head_no_delete",
+        "trigger:calendar_meta_no_delete",
+        "trigger:calendar_meta_no_update",
+        "trigger:calendar_object_no_delete",
+        "trigger:calendar_object_no_update",
+        "trigger:calendar_promotion_no_delete",
+        "trigger:calendar_promotion_no_update"
+      ],
+      "tables": {
+        "calendar_generation_candidate": {
+          "columns": [
+            "staging_sequence:INTEGER",
+            "source_sha256:TEXT",
+            "payload_json:TEXT",
+            "staged_at:TEXT",
+            "admission:TEXT",
+            "reason:TEXT"
+          ],
+          "primary_key": [
+            "staging_sequence"
+          ],
+          "order_by": [
+            "staging_sequence"
+          ]
+        },
+        "calendar_generation_head": {
+          "columns": [
+            "singleton:INTEGER",
+            "sequence:INTEGER",
+            "generation_sha256:TEXT"
+          ],
+          "primary_key": [
+            "singleton"
+          ],
+          "order_by": [
+            "singleton"
+          ]
+        },
+        "calendar_generation_meta": {
+          "columns": [
+            "singleton:INTEGER",
+            "schema_version:INTEGER",
+            "schema_sha256:TEXT",
+            "bundled_sha256:TEXT"
+          ],
+          "primary_key": [
+            "singleton"
+          ],
+          "order_by": [
+            "singleton"
+          ]
+        },
+        "calendar_generation_promotion": {
+          "columns": [
+            "sequence:INTEGER",
+            "generation_sha256:TEXT",
+            "parent_sha256:TEXT",
+            "source_sha256:TEXT",
+            "attempt_target_year:INTEGER",
+            "attempt_slot_date:TEXT",
+            "payload_json:TEXT",
+            "promoted_at:TEXT"
+          ],
+          "primary_key": [
+            "sequence"
+          ],
+          "order_by": [
+            "sequence"
+          ]
+        },
+        "calendar_maintenance_attempt": {
+          "columns": [
+            "target_year:INTEGER",
+            "slot_date:TEXT",
+            "source_sha256:TEXT",
+            "expected_parent_sha256:TEXT",
+            "started_at:TEXT",
+            "finished_at:TEXT",
+            "outcome:TEXT",
+            "official_requests:INTEGER",
+            "machine_requests:INTEGER"
+          ],
+          "primary_key": [
+            "target_year",
+            "slot_date"
+          ],
+          "order_by": [
+            "target_year",
+            "slot_date"
+          ]
+        },
+        "calendar_official_object": {
+          "columns": [
+            "body_sha256:TEXT",
+            "body_bytes:BLOB"
+          ],
+          "primary_key": [
+            "body_sha256"
+          ],
+          "order_by": [
+            "body_sha256"
+          ]
+        }
+      },
+      "catalog_digest_source": "backend/app/market/calendar_generation:CALENDAR_GENERATION_DDL"
+    },
+    "universe": {
+      "role": "universe",
+      "user_version": 1,
+      "schema_version_source": "PRAGMA user_version=1; exact sqlite_master; backend/app/market/universe:UNIVERSE_DDL",
+      "allowed_tables": [
+        "contract_evidence",
+        "contract_required_snapshot",
+        "universe_attempt",
+        "universe_attempt_result",
+        "universe_contract",
+        "universe_head",
+        "universe_instrument_evidence",
+        "universe_member",
+        "universe_meta",
+        "universe_publication_context",
+        "universe_required_symbol_snapshot",
+        "universe_semantic_mapping",
+        "universe_source_state"
+      ],
+      "system_tables": [],
+      "sqlite_master_allowlist": [
+        "table:contract_evidence",
+        "table:contract_required_snapshot",
+        "table:universe_attempt",
+        "table:universe_attempt_result",
+        "table:universe_contract",
+        "table:universe_head",
+        "table:universe_instrument_evidence",
+        "table:universe_member",
+        "table:universe_meta",
+        "table:universe_publication_context",
+        "table:universe_required_symbol_snapshot",
+        "table:universe_semantic_mapping",
+        "table:universe_source_state",
+        "trigger:contract_evidence_no_delete",
+        "trigger:contract_evidence_no_update",
+        "trigger:contract_snapshot_no_delete",
+        "trigger:contract_snapshot_no_update",
+        "trigger:universe_attempt_no_delete",
+        "trigger:universe_attempt_no_update",
+        "trigger:universe_attempt_result_no_delete",
+        "trigger:universe_attempt_result_no_update",
+        "trigger:universe_contract_no_delete",
+        "trigger:universe_contract_no_update",
+        "trigger:universe_evidence_no_delete",
+        "trigger:universe_evidence_no_update",
+        "trigger:universe_head_no_delete",
+        "trigger:universe_head_update_guard",
+        "trigger:universe_mapping_no_delete",
+        "trigger:universe_mapping_no_update",
+        "trigger:universe_member_no_delete",
+        "trigger:universe_member_no_update",
+        "trigger:universe_meta_no_delete",
+        "trigger:universe_meta_no_update",
+        "trigger:universe_publication_context_no_delete",
+        "trigger:universe_publication_context_no_update",
+        "trigger:universe_snapshot_no_delete",
+        "trigger:universe_snapshot_no_update",
+        "trigger:universe_source_state_no_delete",
+        "trigger:universe_source_state_no_update"
+      ],
+      "tables": {
+        "contract_evidence": {
+          "columns": [
+            "contract_id:TEXT",
+            "evidence_id:TEXT",
+            "evidence_role:TEXT",
+            "security_id:TEXT",
+            "symbol:TEXT",
+            "exclusion_reason:TEXT"
+          ],
+          "primary_key": [
+            "contract_id",
+            "evidence_id",
+            "evidence_role"
+          ],
+          "order_by": [
+            "contract_id",
+            "evidence_id",
+            "evidence_role"
+          ]
+        },
+        "contract_required_snapshot": {
+          "columns": [
+            "contract_id:TEXT",
+            "snapshot_id:TEXT",
+            "snapshot_sha256:TEXT"
+          ],
+          "primary_key": [
+            "contract_id"
+          ],
+          "order_by": [
+            "contract_id"
+          ]
+        },
+        "universe_attempt": {
+          "columns": [
+            "attempt_id:TEXT",
+            "dedup_key:TEXT",
+            "hook_kind:TEXT",
+            "refresh_id:TEXT",
+            "canonical_run_id:TEXT",
+            "source_version_digest:TEXT",
+            "trade_date:TEXT",
+            "operation_day:TEXT",
+            "attempt_status:TEXT",
+            "request_budget:INTEGER",
+            "classification_max_attempts:INTEGER",
+            "created_at:TEXT",
+            "planned_sha256:TEXT"
+          ],
+          "primary_key": [
+            "attempt_id"
+          ],
+          "order_by": [
+            "trade_date",
+            "attempt_id"
+          ]
+        },
+        "universe_attempt_result": {
+          "columns": [
+            "attempt_id:TEXT",
+            "terminal_status:TEXT",
+            "classification_request_count:INTEGER",
+            "reason_code:TEXT",
+            "source_state_id:TEXT",
+            "finished_at:TEXT",
+            "result_sha256:TEXT"
+          ],
+          "primary_key": [
+            "attempt_id"
+          ],
+          "order_by": [
+            "attempt_id"
+          ]
+        },
+        "universe_contract": {
+          "columns": [
+            "contract_id:TEXT",
+            "sequence:INTEGER",
+            "parent_contract_id:TEXT",
+            "trade_date:TEXT",
+            "universe_id:TEXT",
+            "schema_version:INTEGER",
+            "scope:TEXT",
+            "calendar_generation_id:TEXT",
+            "calendar_sha256:TEXT",
+            "classification_generation_id:TEXT",
+            "classification_generation_sequence:INTEGER",
+            "classification_source:TEXT",
+            "classification_source_version:TEXT",
+            "classification_source_snapshot_date:TEXT",
+            "classification_observed_at:TEXT",
+            "classification_snapshot_sha256:TEXT",
+            "exact_pit_cutoff:TEXT",
+            "provider_id:TEXT",
+            "source_date_semantics:TEXT",
+            "source_state_id:TEXT",
+            "source_state_sha256:TEXT",
+            "source_version_digest:TEXT",
+            "required_symbol_snapshot_id:TEXT",
+            "required_symbol_snapshot_sha256:TEXT",
+            "instrument_evidence_ids_json:TEXT",
+            "counts_json:TEXT",
+            "layer_counts_json:TEXT",
+            "source_refs_json:TEXT",
+            "classification_evidence_ids_json:TEXT",
+            "classification_evidence_partition_sha256:TEXT",
+            "effective_main_board_ids_json:TEXT",
+            "effective_main_board_partition_sha256:TEXT",
+            "required_additions_ids_json:TEXT",
+            "required_additions_partition_sha256:TEXT",
+            "payload_json:TEXT",
+            "contract_sha256:TEXT",
+            "created_at:TEXT"
+          ],
+          "primary_key": [
+            "contract_id"
+          ],
+          "order_by": [
+            "sequence",
+            "contract_id"
+          ]
+        },
+        "universe_head": {
+          "columns": [
+            "singleton_id:INTEGER",
+            "sequence:INTEGER",
+            "contract_id:TEXT",
+            "contract_sha256:TEXT",
+            "head_sha256:TEXT",
+            "updated_at:TEXT"
+          ],
+          "primary_key": [
+            "singleton_id"
+          ],
+          "order_by": [
+            "singleton_id"
+          ]
+        },
+        "universe_instrument_evidence": {
+          "columns": [
+            "evidence_id:TEXT",
+            "evidence_sha256:TEXT",
+            "provider_id:TEXT",
+            "authority_status:TEXT",
+            "artifact_origin:TEXT",
+            "security_id:TEXT",
+            "symbol:TEXT",
+            "mapping_id:TEXT",
+            "mapping_version:TEXT",
+            "mapping_sha256:TEXT",
+            "source_snapshot_date:TEXT",
+            "evidence_trade_date:TEXT",
+            "exclusion_reason:TEXT",
+            "index_role:TEXT",
+            "source_date_semantics:TEXT",
+            "evidence_json:TEXT",
+            "adapter_version:TEXT",
+            "source_schema:TEXT",
+            "security_type:TEXT",
+            "exchange:TEXT",
+            "board:TEXT",
+            "list_date:TEXT",
+            "delist_date:TEXT",
+            "listing_status:TEXT",
+            "daily_trade_status:TEXT",
+            "suspension_state:TEXT",
+            "st_state:TEXT",
+            "expected_trading_state:TEXT",
+            "observed_at:TEXT",
+            "lineage_hash:TEXT"
+          ],
+          "primary_key": [
+            "evidence_id"
+          ],
+          "order_by": [
+            "evidence_id"
+          ]
+        },
+        "universe_member": {
+          "columns": [
+            "contract_id:TEXT",
+            "symbol:TEXT",
+            "security_id:TEXT",
+            "member_sha256:TEXT",
+            "member_json:TEXT"
+          ],
+          "primary_key": [
+            "contract_id",
+            "symbol"
+          ],
+          "order_by": [
+            "contract_id",
+            "symbol"
+          ]
+        },
+        "universe_meta": {
+          "columns": [
+            "meta_key:TEXT",
+            "meta_value:TEXT"
+          ],
+          "primary_key": [
+            "meta_key"
+          ],
+          "order_by": [
+            "meta_key"
+          ]
+        },
+        "universe_publication_context": {
+          "columns": [
+            "context_id:TEXT",
+            "run_id:TEXT",
+            "trade_date:TEXT",
+            "manifest_ref:TEXT",
+            "evidence_refs_json:TEXT",
+            "publication_lineage_json:TEXT",
+            "publication_lineage_sha256:TEXT",
+            "context_sha256:TEXT",
+            "status:TEXT",
+            "created_at:TEXT"
+          ],
+          "primary_key": [
+            "context_id"
+          ],
+          "order_by": [
+            "trade_date",
+            "context_id"
+          ]
+        },
+        "universe_required_symbol_snapshot": {
+          "columns": [
+            "snapshot_id:TEXT",
+            "snapshot_sha256:TEXT",
+            "snapshot_token_digest:TEXT",
+            "schema_version:INTEGER",
+            "symbol_count:INTEGER",
+            "snapshot_json:TEXT"
+          ],
+          "primary_key": [
+            "snapshot_id"
+          ],
+          "order_by": [
+            "snapshot_id"
+          ]
+        },
+        "universe_semantic_mapping": {
+          "columns": [
+            "mapping_id:TEXT",
+            "mapping_version:TEXT",
+            "provider_id:TEXT",
+            "source_schema:TEXT",
+            "payload_json:TEXT",
+            "mapping_sha256:TEXT",
+            "authority_status:TEXT"
+          ],
+          "primary_key": [
+            "mapping_id"
+          ],
+          "order_by": [
+            "mapping_id"
+          ]
+        },
+        "universe_source_state": {
+          "columns": [
+            "source_state_id:TEXT",
+            "source_state_sha256:TEXT",
+            "trade_date:TEXT",
+            "provider_id:TEXT",
+            "source_version_digest:TEXT",
+            "source_refs_json:TEXT",
+            "verified_at:TEXT"
+          ],
+          "primary_key": [
+            "source_state_id"
+          ],
+          "order_by": [
+            "source_state_id"
+          ]
+        }
+      },
+      "catalog_digest_source": "backend/app/market/universe:UNIVERSE_DDL"
+    }
   },
   "digest_contracts": [
-    {"field": "ImmutableObservationEnvelopeV1.payload_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ImmutableObservationEnvelopeV1", "included_field_paths": ["payload"], "excluded_fields": ["payload_sha256", "envelope_sha256"], "ordering": "sorted object keys; source arrays retain declared order", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/envelope-payload-v1\\0"},
-    {"field": "ImmutableObservationEnvelopeV1.envelope_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ImmutableObservationEnvelopeV1", "included_field_paths": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "canonicalization_version", "payload_sha256"], "excluded_fields": ["payload", "payload_sha256", "envelope_sha256"], "ordering": "sorted object keys", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/envelope-v1\\0"},
-    {"field": "PreCaptureFailurePayloadV1.semantic_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PreCaptureFailurePayloadV1", "included_field_paths": ["schema_version", "reason_code", "requested_start", "requested_end", "as_of_utc", "descriptor_states"], "excluded_fields": ["semantic_report_sha256"], "ordering": "descriptor_states source order; object keys sorted", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/pre-capture-v1\\0"},
-    {"field": "CalendarRawFacts.raw_facts_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CalendarRawFacts", "included_field_paths": ["source_sequence", "generation", "confirmed", "unknown_state", "conflict_state"], "excluded_fields": ["raw_facts_sha256"], "ordering": "source_sequence raw source order; object keys sorted", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/calendar-raw-v1\\0"},
-    {"field": "ReadBoundaryRawFacts.probe_schema_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadBoundaryRawFacts", "included_field_paths": ["requested_as_of", "max_visible_session", "future_rows_seen", "future_rows_count", "query_count", "write_count"], "excluded_fields": ["probe_schema_digest"], "ordering": "object keys sorted", "null_encoding": "null is JSON null for max_visible_session", "domain_separation_prefix": "r2f5/read-boundary-v1\\0"},
-    {"field": "SessionEvidenceBinding.evidence_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "EvidenceObject", "included_field_paths": ["evidence_id", "immutable_evidence_bytes"], "excluded_fields": ["evidence_sha256", "envelope_sha256"], "ordering": "immutable bytes; no filesystem order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/evidence-object-v1\\0"},
-    {"field": "SessionEvidenceBinding.candidate_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CandidateObject", "included_field_paths": ["candidate_id", "immutable_candidate_bytes"], "excluded_fields": ["candidate_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/candidate-object-v1\\0"},
-    {"field": "SessionEvidenceBinding.gate_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "GateReport", "included_field_paths": ["gate_report_id", "immutable_gate_report_bytes"], "excluded_fields": ["gate_report_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/gate-report-v1\\0"},
-    {"field": "SessionEvidenceBinding.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/manifest-v1\\0"},
-    {"field": "SessionEvidenceBinding.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ObjectEvidence", "included_field_paths": ["object_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/object-v1\\0"},
-    {"field": "SessionEvidenceBinding.selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["selection_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/selection-v1\\0"},
-    {"field": "SessionEvidenceBinding.binding_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionEvidenceBinding", "included_field_paths": ["evidence_id", "evidence_sha256", "candidate_id", "candidate_sha256", "gate_report_id", "gate_report_sha256", "manifest_id", "manifest_sha256", "object_id", "object_sha256", "selection_id", "selection_sha256"], "excluded_fields": ["binding_sha256"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/lineage-binding-v1\\0"},
-    {"field": "PointerReconciliation.pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-v1\\0"},
-    {"field": "PointerReconciliation.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-manifest-v1\\0"},
-    {"field": "PointerReconciliation.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ObjectEvidence", "included_field_paths": ["object_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-object-v1\\0"},
-    {"field": "PointerReconciliation.descriptor_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "InputDescriptor", "included_field_paths": ["descriptor_id", "descriptor_metadata"], "excluded_fields": ["descriptor_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/descriptor-v1\\0"},
-    {"field": "ReplicationObservation.source_commit_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["source_commit_id", "source_commit_bytes"], "excluded_fields": ["source_commit_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/source-commit-v1\\0"},
-    {"field": "ReplicationObservation.destination_record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["destination_record_id", "destination_record_bytes"], "excluded_fields": ["destination_record_sha256"], "ordering": "immutable bytes", "null_encoding": "null only when destination_generation is null", "domain_separation_prefix": "r2f5/destination-record-v1\\0"},
-    {"field": "ReplicationObservation.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "null only for LOCAL_CHAIN_ONLY", "domain_separation_prefix": "r2f5/destination-head-v1\\0"},
-    {"field": "ReplicationObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationObservation", "included_field_paths": ["immutable", "state", "checkpoint_id", "source_commit_sha256", "intent_id", "enqueue_state", "reason_code", "observed_at", "lag_seconds", "trust_scope", "destination_generation", "destination_record_sha256", "destination_head_sha256"], "excluded_fields": ["observation_sha256"], "ordering": "object keys sorted", "null_encoding": "null literal for optional IDs/hashes", "domain_separation_prefix": "r2f5/replication-observation-v1\\0"},
-    {"field": "RecoveryObservation.duplicate_proof_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RecoveryProof", "included_field_paths": ["event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count"], "excluded_fields": ["duplicate_proof_sha256", "raw_bytes"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-v1\\0"},
-    {"field": "RecoveryObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RecoveryObservation", "included_field_paths": ["immutable", "event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count", "duplicate_proof_sha256", "observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-observation-v1\\0"},
-    {"field": "ErrorHandlingObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ErrorHandlingObservation", "included_field_paths": ["immutable", "events[].event_id", "events[].forced_error_class", "events[].sanitized_reason", "events[].normalized_result", "events[].attempt_id", "events[].expected_class", "events[].observed_class", "events[].evidence_sha256", "events[].observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "six events fixed timeout/auth/rate/schema/coverage/storage order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/error-handling-v1\\0"},
-    {"field": "LocalNasIsolationObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "LocalNasIsolationObservation", "included_field_paths": ["immutable", "event_id", "local_publication_ready", "local_publication_id", "local_pointer_sha256", "outage_start", "outage_end", "backlog_before_ids", "backlog_after_ids", "backlog_before_count", "backlog_after_count", "lag_seconds", "lag_threshold_seconds", "retryable", "retry_state", "retry_transition", "nas_failure_did_not_block_local", "attempt_id", "observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "backlog IDs source order; object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/local-nas-v1\\0"},
-    {"field": "SessionObservation.frozen_versions_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FrozenReliabilityVersions", "included_field_paths": ["git_commit", "installed_release", "installed_release_sha256", "dataset_generation", "canonical_schema", "evidence_schema", "primary_provider_id", "secondary_provider_id", "qualification_window_id", "qualification_proof_status", "adapter_hash", "endpoint_contract_hash", "source_schema_hash", "normalizer_hash", "reconciliation_policy_version", "selection_policy_version", "config_digest", "auto_failover_enabled", "failover_kill_switch", "provider_priority", "continuity_start_date", "repair_policy_version", "calendar_generation", "calendar_sha256", "universe_generation", "universe_sha256", "replication_policy_version", "replication_evidence_version", "replication_trust_scope", "destination_generation", "destination_head_sha256", "remote_proof_artifact_ref", "restore_policy_version", "restore_evidence_version"], "excluded_fields": ["frozen_versions_sha256", "semantic_report_sha256"], "ordering": "sorted object keys; provider_priority declared order", "null_encoding": "typed absence JSON null", "domain_separation_prefix": "r2f5/frozen-vector-v1\\0"},
-    {"field": "SessionObservation.schema_policy_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionObservation", "included_field_paths": ["schema_policy_versions"], "excluded_fields": ["schema_policy_digest"], "ordering": "schema_policy_versions declared order; object keys sorted", "null_encoding": "absence forbidden for ready", "domain_separation_prefix": "r2f5/schema-policy-v1\\0"},
-    {"field": "SessionObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionObservation", "included_field_paths": ["session", "ordinal", "frozen_versions_sha256", "same_evening_published_at", "next_morning_published_at", "required_count", "loaded_count", "suspension_count", "not_listed_count", "delisted_count", "unknown_count", "canonical_provider_ids", "evidence", "pointer_reconciliation", "replication_observation", "calendar_raw_facts", "read_boundary_raw_facts", "schema_policy_versions", "schema_policy_digest", "cutoff_results", "coverage", "canonical_integrity", "source_purity", "provenance", "calendar", "universe", "replication", "read_boundary"], "excluded_fields": ["observation_sha256", "diagnostic_envelope", "semantic_report_sha256"], "ordering": "object keys sorted; arrays retain declared source/order", "null_encoding": "JSON null for declared optional timestamps only", "domain_separation_prefix": "r2f5/session-observation-v1\\0"},
-    {"field": "WholeSessionFailoverDrill.selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["selection_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-selection-v1\\0"},
-    {"field": "WholeSessionFailoverDrill.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-manifest-v1\\0"},
-    {"field": "WholeSessionFailoverDrill.pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-pointer-v1\\0"},
-    {"field": "WholeSessionFailoverDrill.readback_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FailoverReadback", "included_field_paths": ["readback_id", "immutable_readback_bytes"], "excluded_fields": ["readback_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-readback-v1\\0"},
-    {"field": "ReplaySampleEvidence.sample_object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplaySample", "included_field_paths": ["sample_object_id", "immutable_sample_bytes"], "excluded_fields": ["sample_object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/replay-sample-v1\\0"},
-    {"field": "ReplaySampleEvidence.candidate_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CandidateObject", "included_field_paths": ["candidate_id", "immutable_candidate_bytes"], "excluded_fields": ["candidate_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/replay-candidate-v1\\0"},
-    {"field": "RestoreDrillEvidence.sentinel_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreSentinel", "included_field_paths": ["sentinel_id", "immutable_sentinel_bytes"], "excluded_fields": ["sentinel_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-sentinel-v1\\0"},
-    {"field": "RestoreDrillEvidence.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-head-v1\\0"},
-    {"field": "RestoreDrillEvidence.record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreRecord", "included_field_paths": ["record_id", "immutable_record_bytes"], "excluded_fields": ["record_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-record-v1\\0"},
-    {"field": "RestoreDrillEvidence.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-manifest-v1\\0"},
-    {"field": "RestoreDrillEvidence.restore_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreReport", "included_field_paths": ["restore_report_id", "immutable_restore_report_bytes"], "excluded_fields": ["restore_report_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-report-v1\\0"},
-    {"field": "RestoreDrillEvidence.api_readback_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreApiReadback", "included_field_paths": ["readback_id", "immutable_readback_bytes"], "excluded_fields": ["api_readback_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-readback-v1\\0"},
-    {"field": "SnapshotFingerprint.sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FingerprintSubject", "included_field_paths": ["descriptor_role", "descriptor_id", "descriptor_state", "device", "inode", "size_bytes", "mtime_ns", "ctime_ns", "fingerprint_kind", "hash_scope", "captured_content_bytes"], "excluded_fields": ["sha256"], "ordering": "object keys sorted; path entries tree order", "null_encoding": "typed null for absent descriptor metadata", "domain_separation_prefix": "r2f5/fingerprint-v1\\0"},
-    {"field": "FrozenReliabilityVersions.config_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "AcceptanceConfig", "included_field_paths": ["dataset_root_descriptor", "evidence_root_descriptor", "control_store_descriptor", "clock_policy", "cutoff_policy", "limits", "replay_policy", "replication_policy", "restore_policy", "redaction_policy"], "excluded_fields": ["config_digest"], "ordering": "sorted object keys", "null_encoding": "absence forbidden for ready", "domain_separation_prefix": "r2f5/config-v1\\0"},
-    {"field": "RecoveryObservation.after_manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["after_manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-manifest-v1\\0"},
-    {"field": "RecoveryObservation.after_pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["after_pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-pointer-v1\\0"},
-    {"field": "RecoveryObservation.after_selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["after_selection_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-selection-v1\\0"},
-    {"field": "ErrorHandlingObservation.events.evidence_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ForcedErrorEvidence", "included_field_paths": ["event_id", "forced_error_class", "immutable_evidence_bytes"], "excluded_fields": ["evidence_sha256"], "ordering": "six fixed class order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/forced-error-evidence-v1\\0"},
-    {"field": "LocalNasIsolationObservation.local_pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "LocalPublicationPointer", "included_field_paths": ["local_publication_id", "immutable_pointer_bytes"], "excluded_fields": ["local_pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/local-pointer-v1\\0"},
-    {"field": "CompletedReplicationRestoreSnapshotV1.replication_observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationObservation", "included_field_paths": ["immutable", "state", "checkpoint_id", "source_commit_sha256", "destination_record_sha256", "destination_head_sha256", "observed_at"], "excluded_fields": ["replication_observation_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-replication-v1\\0"},
-    {"field": "CompletedReplicationRestoreSnapshotV1.restore_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreReport", "included_field_paths": ["restore_report_id", "immutable_restore_report_bytes"], "excluded_fields": ["restore_report_sha256"], "ordering": "immutable bytes", "null_encoding": "null only when no restore record", "domain_separation_prefix": "r2f5/completed-restore-v1\\0"},
-    {"field": "CompletedReplicationRestoreSnapshotV1.destination_record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["destination_generation", "immutable_destination_record_bytes"], "excluded_fields": ["destination_record_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-destination-record-v1\\0"},
-    {"field": "CompletedReplicationRestoreSnapshotV1.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "immutable_destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-destination-head-v1\\0"},
-    {"field": "ReadonlyEvidenceDescriptor.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadonlyEvidenceObject", "included_field_paths": ["descriptor_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/readonly-object-v1\\0"},
-    {"field": "ReadonlyEvidenceDescriptor.descriptor_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadonlyEvidenceDescriptor", "included_field_paths": ["descriptor_id", "source_generation", "completed", "immutable"], "excluded_fields": ["descriptor_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/readonly-descriptor-v1\\0"},
-    {"field": "SnapshotIdentity.input_fingerprint_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SnapshotIdentity", "included_field_paths": ["input_fingerprints"], "excluded_fields": ["input_fingerprint_sha256", "snapshot_sha256", "semantic_report_sha256"], "ordering": "descriptor_role then descriptor_id byte order", "null_encoding": "typed absence descriptor object, never omitted", "domain_separation_prefix": "r2f5/input-fingerprints-v1\\0"},
-    {"field": "SnapshotIdentity.frozen_version_vector_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SnapshotIdentity", "included_field_paths": ["frozen_versions"], "excluded_fields": ["frozen_version_vector_sha256", "semantic_report_sha256"], "ordering": "sorted object keys; provider_priority declared order", "null_encoding": "typed JSON null for unavailable proof", "domain_separation_prefix": "r2f5/frozen-version-vector-v1\\0"},
-    {"field": "SnapshotIdentity.snapshot_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SnapshotIdentity", "included_field_paths": ["requested_start", "requested_end", "as_of_utc", "as_of_timezone", "input_fingerprints", "frozen_versions", "input_fingerprint_sha256", "frozen_version_vector_sha256"], "excluded_fields": ["snapshot_sha256", "semantic_report_sha256", "diagnostic_envelope"], "ordering": "object keys sorted; input descriptors role/id order", "null_encoding": "typed absence descriptor retained", "domain_separation_prefix": "r2f5/snapshot-identity-v1\\0"},
-    {"field": "R2FAcceptanceReport.semantic_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "R2FAcceptanceReport", "included_field_paths": ["status", "window_start", "window_end", "selected_sessions", "frozen_versions", "continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary", "quality_issues", "snapshot_identity", "session_observations", "observation_refs", "window_evidence_bundle", "window_evidence_refs", "pre_capture_failure", "provider_requests", "writes", "restore_started", "production_window_started"], "excluded_fields": ["semantic_report_sha256", "pre_capture_failure.semantic_report_sha256", "diagnostic_envelope", "elapsed_ms", "read_operations", "replay_sample_count"], "ordering": "object keys sorted; sessions ordinal order; quality issues stable order", "null_encoding": "JSON null for declared unavailable fields", "domain_separation_prefix": "r2f5/semantic-report-v1\\0"},
-    {"field": "FrozenReliabilityVersions.installed_release_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "InstalledRelease", "included_field_paths": ["release_identity", "immutable_release_bytes"], "excluded_fields": ["installed_release_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/installed-release-v1\\0"},
-    {"field": "FrozenReliabilityVersions.calendar_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CalendarGeneration", "included_field_paths": ["calendar_generation", "immutable_calendar_bytes"], "excluded_fields": ["calendar_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/calendar-generation-v1\\0"},
-    {"field": "FrozenReliabilityVersions.universe_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "UniverseGeneration", "included_field_paths": ["universe_generation", "immutable_universe_bytes"], "excluded_fields": ["universe_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/universe-generation-v1\\0"},
-    {"field": "FrozenReliabilityVersions.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "typed null only for LOCAL_CHAIN_ONLY", "domain_separation_prefix": "r2f5/frozen-destination-head-v1\\0"},
-    {"field": "OfflineReplayContext.implementation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "OfflineImplementation", "included_field_paths": ["adapter_id", "adapter_version", "normalizer_id", "normalizer_version", "immutable_implementation_bytes"], "excluded_fields": ["implementation_sha256"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/offline-implementation-v1\\0"}
+    {
+      "field": "ImmutableObservationEnvelopeV1.payload_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ImmutableObservationEnvelopeV1",
+      "included_field_paths": [
+        "payload"
+      ],
+      "excluded_fields": [
+        "payload_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "sorted object keys; source arrays retain declared order",
+      "null_encoding": "JSON null; absent fields forbidden",
+      "domain_separation_prefix": "r2f5/envelope-payload-v1\\0"
+    },
+    {
+      "field": "ImmutableObservationEnvelopeV1.envelope_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ImmutableObservationEnvelopeV1",
+      "included_field_paths": [
+        "artifact_id",
+        "artifact_ref",
+        "schema_version",
+        "creator_kind",
+        "creator_version",
+        "created_at",
+        "canonicalization_version",
+        "payload_sha256"
+      ],
+      "excluded_fields": [
+        "payload",
+        "payload_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "sorted object keys",
+      "null_encoding": "JSON null; absent fields forbidden",
+      "domain_separation_prefix": "r2f5/envelope-v1\\0"
+    },
+    {
+      "field": "PreCaptureFailurePayloadV1.semantic_report_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "PreCaptureFailurePayloadV1",
+      "included_field_paths": [
+        "schema_version",
+        "reason_code",
+        "requested_start",
+        "requested_end",
+        "as_of_utc",
+        "descriptor_states"
+      ],
+      "excluded_fields": [
+        "semantic_report_sha256"
+      ],
+      "ordering": "descriptor_states source order; object keys sorted",
+      "null_encoding": "JSON null; absent fields forbidden",
+      "domain_separation_prefix": "r2f5/pre-capture-v1\\0"
+    },
+    {
+      "field": "CalendarRawFacts.raw_facts_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "CalendarRawFacts",
+      "included_field_paths": [
+        "source_sequence",
+        "generation",
+        "confirmed",
+        "unknown_state",
+        "conflict_state"
+      ],
+      "excluded_fields": [
+        "raw_facts_sha256"
+      ],
+      "ordering": "source_sequence raw source order; object keys sorted",
+      "null_encoding": "JSON null; absent fields forbidden",
+      "domain_separation_prefix": "r2f5/calendar-raw-v1\\0"
+    },
+    {
+      "field": "ReadBoundaryRawFacts.probe_schema_digest",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReadBoundaryRawFacts",
+      "included_field_paths": [
+        "requested_as_of",
+        "max_visible_session",
+        "future_rows_seen",
+        "future_rows_count",
+        "query_count",
+        "write_count"
+      ],
+      "excluded_fields": [
+        "probe_schema_digest"
+      ],
+      "ordering": "object keys sorted",
+      "null_encoding": "null is JSON null for max_visible_session",
+      "domain_separation_prefix": "r2f5/read-boundary-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.evidence_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "EvidenceObject",
+      "included_field_paths": [
+        "evidence_id",
+        "immutable_evidence_bytes"
+      ],
+      "excluded_fields": [
+        "evidence_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes; no filesystem order",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/evidence-object-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.candidate_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "CandidateObject",
+      "included_field_paths": [
+        "candidate_id",
+        "immutable_candidate_bytes"
+      ],
+      "excluded_fields": [
+        "candidate_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/candidate-object-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.gate_report_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "GateReport",
+      "included_field_paths": [
+        "gate_report_id",
+        "immutable_gate_report_bytes"
+      ],
+      "excluded_fields": [
+        "gate_report_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/gate-report-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.manifest_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "Manifest",
+      "included_field_paths": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "excluded_fields": [
+        "manifest_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/manifest-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.object_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ObjectEvidence",
+      "included_field_paths": [
+        "object_id",
+        "immutable_object_bytes"
+      ],
+      "excluded_fields": [
+        "object_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/object-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.selection_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionSelection",
+      "included_field_paths": [
+        "selection_id",
+        "immutable_selection_bytes"
+      ],
+      "excluded_fields": [
+        "selection_sha256",
+        "envelope_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/selection-v1\\0"
+    },
+    {
+      "field": "SessionEvidenceBinding.binding_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionEvidenceBinding",
+      "included_field_paths": [
+        "evidence_id",
+        "evidence_sha256",
+        "candidate_id",
+        "candidate_sha256",
+        "gate_report_id",
+        "gate_report_sha256",
+        "manifest_id",
+        "manifest_sha256",
+        "object_id",
+        "object_sha256",
+        "selection_id",
+        "selection_sha256"
+      ],
+      "excluded_fields": [
+        "binding_sha256"
+      ],
+      "ordering": "fixed field path order above",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/lineage-binding-v1\\0"
+    },
+    {
+      "field": "PointerReconciliation.pointer_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "PointerRecord",
+      "included_field_paths": [
+        "pointer_id",
+        "immutable_pointer_bytes"
+      ],
+      "excluded_fields": [
+        "pointer_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/pointer-v1\\0"
+    },
+    {
+      "field": "PointerReconciliation.manifest_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "Manifest",
+      "included_field_paths": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "excluded_fields": [
+        "manifest_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/pointer-manifest-v1\\0"
+    },
+    {
+      "field": "PointerReconciliation.object_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ObjectEvidence",
+      "included_field_paths": [
+        "object_id",
+        "immutable_object_bytes"
+      ],
+      "excluded_fields": [
+        "object_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/pointer-object-v1\\0"
+    },
+    {
+      "field": "PointerReconciliation.descriptor_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "InputDescriptor",
+      "included_field_paths": [
+        "descriptor_id",
+        "descriptor_metadata"
+      ],
+      "excluded_fields": [
+        "descriptor_sha256"
+      ],
+      "ordering": "object keys sorted",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/descriptor-v1\\0"
+    },
+    {
+      "field": "ReplicationObservation.source_commit_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplicationRecord",
+      "included_field_paths": [
+        "source_commit_id",
+        "source_commit_bytes"
+      ],
+      "excluded_fields": [
+        "source_commit_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/source-commit-v1\\0"
+    },
+    {
+      "field": "ReplicationObservation.destination_record_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplicationRecord",
+      "included_field_paths": [
+        "destination_record_id",
+        "destination_record_bytes"
+      ],
+      "excluded_fields": [
+        "destination_record_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "null only when destination_generation is null",
+      "domain_separation_prefix": "r2f5/destination-record-v1\\0"
+    },
+    {
+      "field": "ReplicationObservation.destination_head_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "DestinationHead",
+      "included_field_paths": [
+        "destination_generation",
+        "destination_head_bytes"
+      ],
+      "excluded_fields": [
+        "destination_head_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "null only for LOCAL_CHAIN_ONLY",
+      "domain_separation_prefix": "r2f5/destination-head-v1\\0"
+    },
+    {
+      "field": "ReplicationObservation.observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplicationObservation",
+      "included_field_paths": [
+        "immutable",
+        "state",
+        "checkpoint_id",
+        "source_commit_sha256",
+        "intent_id",
+        "enqueue_state",
+        "reason_code",
+        "observed_at",
+        "lag_seconds",
+        "trust_scope",
+        "destination_generation",
+        "destination_record_sha256",
+        "destination_head_sha256"
+      ],
+      "excluded_fields": [
+        "observation_sha256"
+      ],
+      "ordering": "object keys sorted",
+      "null_encoding": "null literal for optional IDs/hashes",
+      "domain_separation_prefix": "r2f5/replication-observation-v1\\0"
+    },
+    {
+      "field": "RecoveryObservation.duplicate_proof_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RecoveryProof",
+      "included_field_paths": [
+        "event_id",
+        "attempt_id",
+        "before_generation",
+        "after_generation",
+        "queue_identity",
+        "restart_boundary",
+        "exactly_once_publication_id",
+        "after_manifest_sha256",
+        "after_pointer_sha256",
+        "after_selection_sha256",
+        "publication_count"
+      ],
+      "excluded_fields": [
+        "duplicate_proof_sha256",
+        "raw_bytes"
+      ],
+      "ordering": "fixed field path order above",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/recovery-v1\\0"
+    },
+    {
+      "field": "RecoveryObservation.observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RecoveryObservation",
+      "included_field_paths": [
+        "immutable",
+        "event_id",
+        "attempt_id",
+        "before_generation",
+        "after_generation",
+        "queue_identity",
+        "restart_boundary",
+        "exactly_once_publication_id",
+        "after_manifest_sha256",
+        "after_pointer_sha256",
+        "after_selection_sha256",
+        "publication_count",
+        "duplicate_proof_sha256",
+        "observed_at"
+      ],
+      "excluded_fields": [
+        "observation_sha256"
+      ],
+      "ordering": "object keys sorted",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/recovery-observation-v1\\0"
+    },
+    {
+      "field": "ErrorHandlingObservation.observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ErrorHandlingObservation",
+      "included_field_paths": [
+        "immutable",
+        "events[].event_id",
+        "events[].forced_error_class",
+        "events[].sanitized_reason",
+        "events[].normalized_result",
+        "events[].attempt_id",
+        "events[].expected_class",
+        "events[].observed_class",
+        "events[].evidence_sha256",
+        "events[].observed_at"
+      ],
+      "excluded_fields": [
+        "observation_sha256"
+      ],
+      "ordering": "six events fixed timeout/auth/rate/schema/coverage/storage order",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/error-handling-v1\\0"
+    },
+    {
+      "field": "LocalNasIsolationObservation.observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "LocalNasIsolationObservation",
+      "included_field_paths": [
+        "immutable",
+        "event_id",
+        "local_publication_ready",
+        "local_publication_id",
+        "local_pointer_sha256",
+        "outage_start",
+        "outage_end",
+        "backlog_before_ids",
+        "backlog_after_ids",
+        "backlog_before_count",
+        "backlog_after_count",
+        "lag_seconds",
+        "lag_threshold_seconds",
+        "retryable",
+        "retry_state",
+        "retry_transition",
+        "nas_failure_did_not_block_local",
+        "attempt_id",
+        "observed_at"
+      ],
+      "excluded_fields": [
+        "observation_sha256"
+      ],
+      "ordering": "backlog IDs source order; object keys sorted",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/local-nas-v1\\0"
+    },
+    {
+      "field": "SessionObservation.frozen_versions_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "FrozenReliabilityVersions",
+      "included_field_paths": [
+        "git_commit",
+        "installed_release",
+        "installed_release_sha256",
+        "dataset_generation",
+        "canonical_schema",
+        "evidence_schema",
+        "primary_provider_id",
+        "secondary_provider_id",
+        "qualification_window_id",
+        "qualification_proof_status",
+        "adapter_hash",
+        "endpoint_contract_hash",
+        "source_schema_hash",
+        "normalizer_hash",
+        "reconciliation_policy_version",
+        "selection_policy_version",
+        "config_digest",
+        "auto_failover_enabled",
+        "failover_kill_switch",
+        "provider_priority",
+        "continuity_start_date",
+        "repair_policy_version",
+        "calendar_generation",
+        "calendar_sha256",
+        "universe_generation",
+        "universe_sha256",
+        "replication_policy_version",
+        "replication_evidence_version",
+        "replication_trust_scope",
+        "destination_generation",
+        "destination_head_sha256",
+        "remote_proof_artifact_ref",
+        "restore_policy_version",
+        "restore_evidence_version"
+      ],
+      "excluded_fields": [
+        "frozen_versions_sha256",
+        "semantic_report_sha256"
+      ],
+      "ordering": "sorted object keys; provider_priority declared order",
+      "null_encoding": "typed absence JSON null",
+      "domain_separation_prefix": "r2f5/frozen-vector-v1\\0"
+    },
+    {
+      "field": "SessionObservation.schema_policy_digest",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionObservation",
+      "included_field_paths": [
+        "schema_policy_versions"
+      ],
+      "excluded_fields": [
+        "schema_policy_digest"
+      ],
+      "ordering": "schema_policy_versions declared order; object keys sorted",
+      "null_encoding": "absence forbidden for ready",
+      "domain_separation_prefix": "r2f5/schema-policy-v1\\0"
+    },
+    {
+      "field": "SessionObservation.observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionObservation",
+      "included_field_paths": [
+        "session",
+        "ordinal",
+        "frozen_versions_sha256",
+        "same_evening_published_at",
+        "next_morning_published_at",
+        "required_count",
+        "loaded_count",
+        "suspension_count",
+        "not_listed_count",
+        "delisted_count",
+        "unknown_count",
+        "canonical_provider_ids",
+        "evidence",
+        "pointer_reconciliation",
+        "replication_observation",
+        "calendar_raw_facts",
+        "read_boundary_raw_facts",
+        "schema_policy_versions",
+        "schema_policy_digest",
+        "cutoff_results",
+        "coverage",
+        "canonical_integrity",
+        "source_purity",
+        "provenance",
+        "calendar",
+        "universe",
+        "replication",
+        "read_boundary"
+      ],
+      "excluded_fields": [
+        "observation_sha256",
+        "diagnostic_envelope",
+        "semantic_report_sha256"
+      ],
+      "ordering": "object keys sorted; arrays retain declared source/order",
+      "null_encoding": "JSON null for declared optional timestamps only",
+      "domain_separation_prefix": "r2f5/session-observation-v1\\0"
+    },
+    {
+      "field": "WholeSessionFailoverDrill.selection_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionSelection",
+      "included_field_paths": [
+        "selection_id",
+        "immutable_selection_bytes"
+      ],
+      "excluded_fields": [
+        "selection_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/failover-selection-v1\\0"
+    },
+    {
+      "field": "WholeSessionFailoverDrill.manifest_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "Manifest",
+      "included_field_paths": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "excluded_fields": [
+        "manifest_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/failover-manifest-v1\\0"
+    },
+    {
+      "field": "WholeSessionFailoverDrill.pointer_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "PointerRecord",
+      "included_field_paths": [
+        "pointer_id",
+        "immutable_pointer_bytes"
+      ],
+      "excluded_fields": [
+        "pointer_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/failover-pointer-v1\\0"
+    },
+    {
+      "field": "WholeSessionFailoverDrill.readback_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "FailoverReadback",
+      "included_field_paths": [
+        "readback_id",
+        "immutable_readback_bytes"
+      ],
+      "excluded_fields": [
+        "readback_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/failover-readback-v1\\0"
+    },
+    {
+      "field": "ReplaySampleEvidence.sample_object_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplaySample",
+      "included_field_paths": [
+        "sample_object_id",
+        "immutable_sample_bytes"
+      ],
+      "excluded_fields": [
+        "sample_object_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/replay-sample-v1\\0"
+    },
+    {
+      "field": "ReplaySampleEvidence.candidate_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "CandidateObject",
+      "included_field_paths": [
+        "candidate_id",
+        "immutable_candidate_bytes"
+      ],
+      "excluded_fields": [
+        "candidate_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/replay-candidate-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.sentinel_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RestoreSentinel",
+      "included_field_paths": [
+        "sentinel_id",
+        "immutable_sentinel_bytes"
+      ],
+      "excluded_fields": [
+        "sentinel_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-sentinel-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.destination_head_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "DestinationHead",
+      "included_field_paths": [
+        "destination_generation",
+        "destination_head_bytes"
+      ],
+      "excluded_fields": [
+        "destination_head_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-head-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.record_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RestoreRecord",
+      "included_field_paths": [
+        "record_id",
+        "immutable_record_bytes"
+      ],
+      "excluded_fields": [
+        "record_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-record-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.manifest_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "Manifest",
+      "included_field_paths": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "excluded_fields": [
+        "manifest_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-manifest-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.restore_report_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RestoreReport",
+      "included_field_paths": [
+        "restore_report_id",
+        "immutable_restore_report_bytes"
+      ],
+      "excluded_fields": [
+        "restore_report_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-report-v1\\0"
+    },
+    {
+      "field": "RestoreDrillEvidence.api_readback_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RestoreApiReadback",
+      "included_field_paths": [
+        "readback_id",
+        "immutable_readback_bytes"
+      ],
+      "excluded_fields": [
+        "api_readback_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/restore-readback-v1\\0"
+    },
+    {
+      "field": "SnapshotFingerprint.sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "FingerprintSubject",
+      "included_field_paths": [
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "ctime_ns",
+        "fingerprint_kind",
+        "hash_scope",
+        "captured_content_bytes"
+      ],
+      "excluded_fields": [
+        "sha256"
+      ],
+      "ordering": "object keys sorted; path entries tree order",
+      "null_encoding": "typed null for absent descriptor metadata",
+      "domain_separation_prefix": "r2f5/fingerprint-v1\\0"
+    },
+    {
+      "field": "FrozenReliabilityVersions.config_digest",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "AcceptanceConfig",
+      "included_field_paths": [
+        "dataset_root_descriptor",
+        "evidence_root_descriptor",
+        "control_store_descriptor",
+        "clock_policy",
+        "cutoff_policy",
+        "limits",
+        "replay_policy",
+        "replication_policy",
+        "restore_policy",
+        "redaction_policy"
+      ],
+      "excluded_fields": [
+        "config_digest"
+      ],
+      "ordering": "sorted object keys",
+      "null_encoding": "absence forbidden for ready",
+      "domain_separation_prefix": "r2f5/config-v1\\0"
+    },
+    {
+      "field": "RecoveryObservation.after_manifest_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "Manifest",
+      "included_field_paths": [
+        "manifest_id",
+        "immutable_manifest_bytes"
+      ],
+      "excluded_fields": [
+        "after_manifest_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/recovery-manifest-v1\\0"
+    },
+    {
+      "field": "RecoveryObservation.after_pointer_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "PointerRecord",
+      "included_field_paths": [
+        "pointer_id",
+        "immutable_pointer_bytes"
+      ],
+      "excluded_fields": [
+        "after_pointer_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/recovery-pointer-v1\\0"
+    },
+    {
+      "field": "RecoveryObservation.after_selection_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SessionSelection",
+      "included_field_paths": [
+        "selection_id",
+        "immutable_selection_bytes"
+      ],
+      "excluded_fields": [
+        "after_selection_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/recovery-selection-v1\\0"
+    },
+    {
+      "field": "ErrorHandlingObservation.events.evidence_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ForcedErrorEvidence",
+      "included_field_paths": [
+        "event_id",
+        "forced_error_class",
+        "immutable_evidence_bytes"
+      ],
+      "excluded_fields": [
+        "evidence_sha256"
+      ],
+      "ordering": "six fixed class order",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/forced-error-evidence-v1\\0"
+    },
+    {
+      "field": "LocalNasIsolationObservation.local_pointer_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "LocalPublicationPointer",
+      "included_field_paths": [
+        "local_publication_id",
+        "immutable_pointer_bytes"
+      ],
+      "excluded_fields": [
+        "local_pointer_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/local-pointer-v1\\0"
+    },
+    {
+      "field": "CompletedReplicationRestoreSnapshotV1.replication_observation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplicationObservation",
+      "included_field_paths": [
+        "immutable",
+        "state",
+        "checkpoint_id",
+        "source_commit_sha256",
+        "destination_record_sha256",
+        "destination_head_sha256",
+        "observed_at"
+      ],
+      "excluded_fields": [
+        "replication_observation_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/completed-replication-v1\\0"
+    },
+    {
+      "field": "CompletedReplicationRestoreSnapshotV1.restore_report_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "RestoreReport",
+      "included_field_paths": [
+        "restore_report_id",
+        "immutable_restore_report_bytes"
+      ],
+      "excluded_fields": [
+        "restore_report_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "null only when no restore record",
+      "domain_separation_prefix": "r2f5/completed-restore-v1\\0"
+    },
+    {
+      "field": "CompletedReplicationRestoreSnapshotV1.destination_record_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReplicationRecord",
+      "included_field_paths": [
+        "destination_generation",
+        "immutable_destination_record_bytes"
+      ],
+      "excluded_fields": [
+        "destination_record_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/completed-destination-record-v1\\0"
+    },
+    {
+      "field": "CompletedReplicationRestoreSnapshotV1.destination_head_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "DestinationHead",
+      "included_field_paths": [
+        "destination_generation",
+        "immutable_destination_head_bytes"
+      ],
+      "excluded_fields": [
+        "destination_head_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/completed-destination-head-v1\\0"
+    },
+    {
+      "field": "ReadonlyEvidenceDescriptor.object_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReadonlyEvidenceObject",
+      "included_field_paths": [
+        "descriptor_id",
+        "immutable_object_bytes"
+      ],
+      "excluded_fields": [
+        "object_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/readonly-object-v1\\0"
+    },
+    {
+      "field": "ReadonlyEvidenceDescriptor.descriptor_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "ReadonlyEvidenceDescriptor",
+      "included_field_paths": [
+        "descriptor_id",
+        "source_generation",
+        "completed",
+        "immutable"
+      ],
+      "excluded_fields": [
+        "descriptor_sha256"
+      ],
+      "ordering": "object keys sorted",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/readonly-descriptor-v1\\0"
+    },
+    {
+      "field": "SnapshotIdentity.input_fingerprint_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SnapshotIdentity",
+      "included_field_paths": [
+        "input_fingerprints"
+      ],
+      "excluded_fields": [
+        "input_fingerprint_sha256",
+        "snapshot_sha256",
+        "semantic_report_sha256"
+      ],
+      "ordering": "descriptor_role then descriptor_id byte order",
+      "null_encoding": "typed absence descriptor object, never omitted",
+      "domain_separation_prefix": "r2f5/input-fingerprints-v1\\0"
+    },
+    {
+      "field": "SnapshotIdentity.frozen_version_vector_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SnapshotIdentity",
+      "included_field_paths": [
+        "frozen_versions"
+      ],
+      "excluded_fields": [
+        "frozen_version_vector_sha256",
+        "semantic_report_sha256"
+      ],
+      "ordering": "sorted object keys; provider_priority declared order",
+      "null_encoding": "typed JSON null for unavailable proof",
+      "domain_separation_prefix": "r2f5/frozen-version-vector-v1\\0"
+    },
+    {
+      "field": "SnapshotIdentity.snapshot_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SnapshotIdentity",
+      "included_field_paths": [
+        "requested_start",
+        "requested_end",
+        "as_of_utc",
+        "as_of_timezone",
+        "input_fingerprints",
+        "frozen_versions",
+        "input_fingerprint_sha256",
+        "frozen_version_vector_sha256"
+      ],
+      "excluded_fields": [
+        "snapshot_sha256",
+        "semantic_report_sha256",
+        "diagnostic_envelope"
+      ],
+      "ordering": "object keys sorted; input descriptors role/id order",
+      "null_encoding": "typed absence descriptor retained",
+      "domain_separation_prefix": "r2f5/snapshot-identity-v1\\0"
+    },
+    {
+      "field": "R2FAcceptanceReport.semantic_report_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "R2FAcceptanceReport",
+      "included_field_paths": [
+        "status",
+        "window_start",
+        "window_end",
+        "selected_sessions",
+        "frozen_versions",
+        "continuity",
+        "next_morning_availability",
+        "same_evening_availability",
+        "coverage",
+        "canonical_integrity",
+        "source_purity",
+        "recovery",
+        "failover",
+        "provenance",
+        "replay",
+        "adjustment",
+        "calendar",
+        "universe",
+        "error_handling",
+        "local_nas_isolation",
+        "replication",
+        "restore",
+        "read_boundary",
+        "quality_issues",
+        "snapshot_identity",
+        "session_observations",
+        "observation_refs",
+        "window_evidence_bundle",
+        "window_evidence_refs",
+        "pre_capture_failure",
+        "provider_requests",
+        "writes",
+        "restore_started",
+        "production_window_started"
+      ],
+      "excluded_fields": [
+        "semantic_report_sha256",
+        "pre_capture_failure.semantic_report_sha256",
+        "diagnostic_envelope",
+        "elapsed_ms",
+        "read_operations",
+        "replay_sample_count"
+      ],
+      "ordering": "object keys sorted; sessions ordinal order; quality issues stable order",
+      "null_encoding": "JSON null for declared unavailable fields",
+      "domain_separation_prefix": "r2f5/semantic-report-v1\\0"
+    },
+    {
+      "field": "FrozenReliabilityVersions.installed_release_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "InstalledRelease",
+      "included_field_paths": [
+        "release_identity",
+        "immutable_release_bytes"
+      ],
+      "excluded_fields": [
+        "installed_release_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden for ready",
+      "domain_separation_prefix": "r2f5/installed-release-v1\\0"
+    },
+    {
+      "field": "FrozenReliabilityVersions.calendar_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "CalendarGeneration",
+      "included_field_paths": [
+        "calendar_generation",
+        "immutable_calendar_bytes"
+      ],
+      "excluded_fields": [
+        "calendar_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden for ready",
+      "domain_separation_prefix": "r2f5/calendar-generation-v1\\0"
+    },
+    {
+      "field": "FrozenReliabilityVersions.universe_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "UniverseGeneration",
+      "included_field_paths": [
+        "universe_generation",
+        "immutable_universe_bytes"
+      ],
+      "excluded_fields": [
+        "universe_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "absent forbidden for ready",
+      "domain_separation_prefix": "r2f5/universe-generation-v1\\0"
+    },
+    {
+      "field": "FrozenReliabilityVersions.destination_head_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "DestinationHead",
+      "included_field_paths": [
+        "destination_generation",
+        "destination_head_bytes"
+      ],
+      "excluded_fields": [
+        "destination_head_sha256"
+      ],
+      "ordering": "immutable bytes",
+      "null_encoding": "typed null only for LOCAL_CHAIN_ONLY",
+      "domain_separation_prefix": "r2f5/frozen-destination-head-v1\\0"
+    },
+    {
+      "field": "OfflineReplayContext.implementation_sha256",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "OfflineImplementation",
+      "included_field_paths": [
+        "adapter_id",
+        "adapter_version",
+        "normalizer_id",
+        "normalizer_version",
+        "immutable_implementation_bytes"
+      ],
+      "excluded_fields": [
+        "implementation_sha256"
+      ],
+      "ordering": "fixed field path order above",
+      "null_encoding": "absent forbidden",
+      "domain_separation_prefix": "r2f5/offline-implementation-v1\\0"
+    }
   ]
 }
 ```
 
-`R2F5_X7_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
-excluding Markdown fences) is `7861268d852ba79de023da0fbd3c30da0bb6fc1e8048653a6dc6b5f34e38035c`.
+`R2F5_X8_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
+excluding Markdown fences) is `f0b4ae16cc3457ac51062acb51456974fede4ebc3293e866d486a0fb6f312dac`.
 
 The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
 status matrix, reducer field references, envelope fields, creator allowlists, date/time formats,
@@ -1354,6 +4832,14 @@ field MUST be excluded from its included paths. This is structural drift detecti
 hash proof and human review of the reducers remain mandatory. `model_schema_ast` is the closed
 object/tuple schema, and `digest_fields_by_model` is its explicit digest-field index; both are
 machine-readable and are cross-checked against all 61 digest contracts.
+Digest dependency nodes are fully qualified tuples `(root_object_type, digest_field_path)` and are
+constructed in deterministic sorted order. The resolver first validates an included path against
+the named source root (including tuple-item paths such as `events[].evidence_sha256`), returns its
+source schema kind, and then resolves the complete qualified path (for example
+`ErrorHandlingObservation.events.evidence_sha256`) to the target node tuple. Identical short names
+in different roots never alias. A digest over an opaque external immutable byte object is an
+explicit external leaf with no dependency edge. Unknown roots, bad nesting, self edges and
+cycles are unavailable validator failures.
 
 ## Static compatibility inventory
 
@@ -1420,10 +4906,18 @@ while this consistent read transaction remains stable; `-wal`/`-shm` are not ind
 or hashed. If a directory tree also contains the database, the tree walker MUST exclude that database
 and its `-wal`/`-shm` siblings by descriptor-bound database ownership; the SQLite logical fingerprint
 owns them, preventing double hashing or conflicting digests. The actual `sqlite_master` name/type
-set MUST equal the catalog's `allowed_tables` plus its `system_tables`; every catalog table MUST
-match its declared columns/types, primary-key tuple, order tuple and `user_version`. Missing,
-extra, type, key, order or version drift is `unavailable`. The SQLite limit is 1,000,000 rows per
-database and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`.
+set MUST equal the catalog's `sqlite_master_allowlist`; every catalog table MUST match its declared
+columns/types, primary-key tuple, order tuple and `user_version`. Missing, extra, type, key, order
+or version drift is `unavailable`. The fixed current versions are `PRAGMA user_version=0` for
+`daily_shadow`, `shadow_registry` and `calendar_generation`, and `1` for `replication_sidecar` and
+`universe`; zero-valued stores also require existing schema-version/migration rows and DDL digest
+where present. Each catalog's `schema_version_source` identifies its pragma, exact
+`sqlite_master`/column source and migration/DDL identity source. These are observations only: the
+reader MUST NOT set a pragma, run a migration, insert migration rows, initialize a missing store
+or rewrite a schema identity. The daily circuit catalog uses the
+authoritative `endpoint` primary key and event `endpoint` foreign-key columns; `circuit_id` is not
+accepted. The SQLite limit is 1,000,000 rows per database and 512 MiB encoded logical bytes;
+exceeding either returns `INPUT_LIMIT_EXCEEDED`.
 
 ## R2-F5.0 metric contract and evidence sources
 

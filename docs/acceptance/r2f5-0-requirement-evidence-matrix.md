@@ -5,7 +5,7 @@ an implementation or acceptance result. Every row is unique, every acceptance cr
 its FR/NFR parent(s), and every anchor is `PLANNED`. No anchor below is claimed to exist, execute,
 pass, or establish Task 20 production soak.
 
-X7 revision base: `97283a5ce6d67d925d84a9d4b759a8ebe98b3af9`; predecessor planning base:
+X8 revision base: `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;

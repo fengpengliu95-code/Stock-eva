@@ -18,7 +18,7 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (must remain the starting identity)
 
-**X7 revision base:** `97283a5ce6d67d925d84a9d4b759a8ebe98b3af9` (clean X6)
+**X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
 **Worktree:** `/Users/finlay/.codex/worktrees/r2f5-0/Stock- evaluation`
 
@@ -127,21 +127,21 @@ Given the design and plan at the base commit, when the strict design validator a
 run, then all mandatory sections, RFC 2119 requirements, unique IDs, AC parent references and
 planned anchors are validated, with no implementation or production result claimed.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-2: RED boundary (FR-1, NFR-2)
 
 Given the base tree before implementation, when the prescribed R2-F5 focused RED command runs,
 then the absent acceptance service/API/CLI is demonstrated without provider/network/production I/O.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-3: GREEN report (FR-2, FR-3, FR-4, FR-5, FR-6, FR-7)
 
 Given synthetic read-only fixtures, when the implementation evaluates them, then the report matches
 the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
 ### AC-4: Full/static compatibility (FR-8, NFR-1, NFR-2)
 
@@ -149,9 +149,9 @@ Given the implemented slice, when focused, full, Ruff, compileall, diff and prot
 checks run, then no predecessor compatibility surface is mutated and all gates are recorded by the
 future acceptance owner. This plan records no result now.
 
-Planned test anchors are machine-readable in the requirement matrix and X7 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
-Traceability: the planned X7 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
+Traceability: the planned X8 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
 FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23,
 FR-24, FR-25, FR-26, FR-27 and FR-28.
 
@@ -209,16 +209,16 @@ default provider-capable adapter, credential lookup, login/query, network/socket
 mutation is permitted. A provider-request sentinel and network/socket fake are required test seams;
 the existing `EvidenceReader` default path is not a valid direct dependency for this contract.
 
-The spec crosswalk MUST parse the design's fenced `R2F5_X7_CONTRACTS_JSON` block as the
+The spec crosswalk MUST parse the design's fenced `R2F5_X8_CONTRACTS_JSON` block as the
 machine-readable source for reason partitions, status/reason matrix, reducer field references,
 envelope fields, cardinalities and the fixed roadmap tuple. It MUST compare those sets with the
 API/model tokens and matrix SLO rows, reject duplicate or unknown definitions and report the
 block's structural result only; canonical hash semantics and reducer correctness still require
 human review. No validator result is an implementation or production acceptance claim.
-The validator MUST also recompute and compare the declared X7 contract-block SHA-256 so prose,
+The validator MUST also recompute and compare the declared X8 contract-block SHA-256 so prose,
 machine fields and the frozen block cannot drift silently.
 
-X7 extends that machine block with one exact `digest_contracts` entry for every digest field,
+X8 extends that machine block with one exact `digest_contracts` entry for every digest field,
 strict date/time formats, all 18 observed/target `MetricValue` kinds and the per-payload creator
 allowlist. The validator MUST compare those contracts against the design interfaces, report metric
 field names/reducers, implementation-plan model rows and matrix SLO rows. It MUST reject an absent,
@@ -226,15 +226,19 @@ duplicate or self-including digest contract; it MUST treat R2-F4 reader projecti
 and reject `r2f5_reader`/`r2f4_writer` envelope creation. Synthetic `test_fixture` envelopes are
 test-only and MUST be rejected for production acceptance.
 
-The X7 validator MUST parse `model_schema_ast` rather than merely checking non-empty strings. Its
+The X8 validator MUST parse `model_schema_ast` rather than merely checking non-empty strings. Its
 generic resolver MUST walk object fields and `[]` tuple-item schemas for every included path, reject
 unknown roots, bad nesting and excluded/self fields, and build a digest dependency graph with cycle
-and self-edge detection. Negative mutation fixtures for a nonexistent path, wrong tuple nesting and
-a two-node cycle MUST remain RED. It MUST also check that each `sqlite_catalogs` entry has an exact
-allowed-table/system-table set, declared columns/types, primary-key/order tuple and user-version
-expectation, and that every production payload's envelope creator is the literal `task20_writer`;
-reader projections are never creators. These checks are structural crosswalk evidence only and do
-not prove runtime semantics.
+and self-edge detection using fully-qualified `(root_object_type, digest_field_path)` nodes in sorted
+order; opaque external hashes are explicit leaf nodes and never suffix aliases. Negative mutation
+fixtures for a nonexistent path, wrong tuple nesting, same-name fields in two models and a real
+contract cycle MUST remain RED. The validator MUST execute the five authoritative DDL constants in
+an in-memory SQLite database, compare each `sqlite_master` object, table column/type list, primary
+key, ordering tuple and `PRAGMA user_version` to `sqlite_catalogs`, and verify the schema-version
+source/migration identity text. Missing, corrupt or locked production databases remain read-only
+unavailable. It MUST also check that every production payload's envelope creator is the literal
+`task20_writer`; reader projections are never creators. These checks are structural crosswalk
+evidence only and do not prove runtime semantics.
 
 ## Data Models
 
@@ -266,11 +270,11 @@ No persistence migration or new writer-owned database is permitted.
 Every digest field is bound to exactly one design `digest_contracts` record naming canonicalization,
 root type, included paths, excluded self/digest/envelope fields, ordering, null encoding and a
 domain prefix. Directory fingerprints use the fixed `open`/`openat`/`fstat` full-tree algorithm;
-SQLite fingerprints use the fixed URI read-only transaction/logical-row algorithm. The X7 limits
+SQLite fingerprints use the fixed URI read-only transaction/logical-row algorithm. The X8 limits
 are 100,000 entries, 512 MiB input bytes, 1,000,000 SQLite rows, 32 input roots, 20 sessions and
 3 replay samples; each over-limit result is `INPUT_LIMIT_EXCEEDED`/`unavailable`.
 
-## Planned pytest anchor catalog (X7)
+## Planned pytest anchor catalog (X8)
 
 This catalog is normative planning metadata. Each requirement ID appears once and maps to exactly
 one stable future pytest node/case token; the crosswalk validator compares this table with the
@@ -373,13 +377,13 @@ matrix rather than treating non-empty prose as evidence. No catalog entry exists
 
 ## Planned implementation tasks
 
-## X7 normative requirement mirror
+## X8 normative requirement mirror
 
-The design is the full semantic authority. This mirror keeps every X7 ID explicit in the plan so
+The design is the full semantic authority. This mirror keeps every X8 ID explicit in the plan so
 the crosswalk validator can detect omissions or duplicate definitions; it is not implementation
 evidence.
 
-### X7 acceptance criteria
+### X8 acceptance criteria
 
 ### AC-5: Complete SLO metric inventory (FR-9, NFR-6)
 
@@ -458,7 +462,7 @@ Given only elapsed/counter changes, when report envelopes are compared, then sem
 
 Given invalid enum/hash/ID/negative/oversized values, when validation runs, then the report is rejected safely.
 
-### X7 edge cases
+### X8 edge cases
 
 - EC-9: Missing SLO field or threshold is unavailable and never inferred from another metric.
 - EC-10: BaoStock-only/unqualified secondary cannot pass failover.

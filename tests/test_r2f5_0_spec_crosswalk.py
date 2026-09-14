@@ -7,9 +7,11 @@ runtime. Planned anchors are not asserted to exist until the implementation phas
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
+import sqlite3
 from copy import deepcopy
 from pathlib import Path
 
@@ -149,16 +151,113 @@ def _reason_source(design: str) -> list[str]:
     return re.findall(r'"([A-Z][A-Z0-9_]+)"', match.group(1))
 
 
-def _x7_contract(design: str) -> dict[str, object]:
+def _x8_contract(design: str) -> dict[str, object]:
     match = re.search(
-        r"<!-- R2F5_X7_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
+        r"<!-- R2F5_X8_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
         design,
         flags=re.DOTALL,
     )
-    assert match, "X7 structured contract block missing"
+    assert match, "X8 structured contract block missing"
     value = json.loads(match.group(1))
     assert isinstance(value, dict)
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    declared = re.search(
+        r"R2F5_X8_CONTRACTS_JSON` canonical block digest .*? is `([0-9a-f]{64})`",
+        design,
+        flags=re.DOTALL,
+    )
+    assert declared, "X8 canonical block digest declaration missing"
+    assert declared.group(1) == hashlib.sha256(canonical).hexdigest()
     return value
+
+
+_AUTHORITATIVE_CATALOG_SPECS = {
+    "replication_sidecar": (
+        ROOT / "backend/app/storage/replication.py",
+        "SIDECAR_DDL",
+        None,
+        1,
+    ),
+    "daily_shadow": (
+        ROOT / "backend/app/market/daily_shadow_schema.py",
+        "DAILY_SHADOW_DDL",
+        None,
+        0,
+    ),
+    "shadow_registry": (
+        ROOT / "backend/app/market/shadow_registry_schema.py",
+        "REGISTRY_DDL",
+        "MIGRATION_0002_DDL",
+        0,
+    ),
+    "calendar_generation": (
+        ROOT / "backend/app/market/calendar_generation.py",
+        "CALENDAR_GENERATION_DDL",
+        None,
+        0,
+    ),
+    "universe": (
+        ROOT / "backend/app/market/universe.py",
+        "UNIVERSE_DDL",
+        None,
+        1,
+    ),
+}
+
+
+def _authoritative_string(source: Path, name: str) -> str:
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "strip"
+            and isinstance(value.func.value, ast.Constant)
+            and isinstance(value.func.value.value, str)
+        ):
+            return value.func.value.value.strip()
+    raise AssertionError(f"authoritative DDL constant missing: {source}:{name}")
+
+
+def _authoritative_catalog(role: str) -> dict[str, object]:
+    source, ddl_name, extra_name, expected_user_version = _AUTHORITATIVE_CATALOG_SPECS[role]
+    ddl = _authoritative_string(source, ddl_name)
+    if extra_name:
+        ddl += "\n" + _authoritative_string(source, extra_name)
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(ddl)
+        objects = connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        tables: dict[str, object] = {}
+        for (table_name,) in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ):
+            info = connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            tables[table_name] = {
+                "columns": [f"{row[1]}:{row[2] or ''}" for row in info],
+                "primary_key": [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]],
+            }
+        return {
+            "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
+            "objects": [f"{kind}:{name}" for kind, name in objects],
+            "tables": tables,
+            "expected_user_version": expected_user_version,
+        }
+    finally:
+        connection.close()
 
 
 def _model_digest_fields(design: str) -> set[str]:
@@ -180,31 +279,115 @@ def _model_digest_fields(design: str) -> set[str]:
     return fields
 
 
-def _schema_path_exists(ast: dict[str, object], root: str, path: str) -> bool:
-    """Resolve an AST path, including tuple item syntax such as ``events[].event_id``."""
+def _resolve_schema_path(
+    ast: dict[str, object], root: str, path: str
+) -> tuple[str, str, str] | None:
+    """Resolve a path to its root, full path and object/tuple-item schema kind.
+
+    The path is deliberately resolved from the named root and its nested tuple
+    schema; no digest-name suffix lookup is involved here.  Digest target
+    qualification is performed separately from the returned source path.
+    """
     node = ast.get(root)
     if not isinstance(node, dict):
-        return False
+        return None
     fields = set(node.get("object_fields", []))
     tuple_items = node.get("tuple_item_schemas", {})
     if not isinstance(tuple_items, dict):
-        return False
-    for index, segment in enumerate(path.split(".")):
+        return None
+    schema_kind = "object_field"
+    segments = path.split(".")
+    for index, segment in enumerate(segments):
         is_tuple = segment.endswith("[]")
         name = segment[:-2] if is_tuple else segment
         if name not in fields:
-            return False
+            return None
         if is_tuple:
             items = tuple_items.get(name)
             if not isinstance(items, list):
-                return False
+                return None
             fields = set(items)
+            schema_kind = "tuple_item"
         elif index < len(path.split(".")) - 1:
             nested = ast.get(name)
             if not isinstance(nested, dict):
-                return False
+                return None
             fields = set(nested.get("object_fields", []))
-    return True
+            schema_kind = "object_field"
+    return root, path, schema_kind
+
+
+def _schema_path_exists(ast: dict[str, object], root: str, path: str) -> bool:
+    return _resolve_schema_path(ast, root, path) is not None
+
+
+def _resolve_digest_target(
+    contract: dict[str, object], root: str, path: str
+) -> tuple[str, str, str, str | None, tuple[str, str] | None] | None:
+    """Resolve source schema path and its fully-qualified digest target.
+
+    The target lookup uses the complete source-model path, never a digest
+    suffix.  A path with no local contract is an explicitly opaque external
+    leaf and returns ``target_node=None``.
+    """
+    ast = contract["model_schema_ast"]
+    entries = contract["digest_contracts"]
+    resolved = _resolve_schema_path(ast, root, path)
+    if resolved is None:
+        return None
+    qualified_path = f"{root}.{path.replace('[]', '')}"
+    matches = sorted(
+        (entry for entry in entries if entry["field"] == qualified_path),
+        key=lambda entry: (entry["root_object_type"], entry["field"]),
+    )
+    if not matches:
+        return (*resolved, None, None)
+    target = matches[0]
+    target_node = (target["root_object_type"], target["field"])
+    return (*resolved, target["root_object_type"], target_node)
+
+
+def _digest_dependency_graph(
+    contract: dict[str, object],
+) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    ast = contract["model_schema_ast"]
+    entries = contract["digest_contracts"]
+    assert isinstance(ast, dict) and isinstance(entries, list)
+    nodes = {(entry["root_object_type"], entry["field"]): entry for entry in entries}
+    # ``field`` is already the source model's fully-qualified digest path
+    # (for example ``SessionObservation.observation_sha256``).  Keep the
+    # qualified path as the lookup key and retain the complete node tuple as
+    # the value.  Never unpack a node into a short model-name alias: two roots
+    # can legitimately expose the same digest suffix.
+    graph: dict[tuple[str, str], list[tuple[str, str]]] = {node: [] for node in nodes}
+    for node in sorted(nodes):
+        entry = nodes[node]
+        root = entry["root_object_type"]
+        for path in sorted(entry["included_field_paths"]):
+            resolved = _resolve_digest_target(contract, root, path)
+            assert resolved is not None, f"missing digest path {root}.{path}"
+            target = resolved[-1]
+            if target is not None:
+                if target == node:
+                    raise AssertionError(f"digest dependency self-edge at {node}")
+                graph[node].append(target)
+        graph[node].sort()
+    visiting: set[tuple[str, str]] = set()
+    visited: set[tuple[str, str]] = set()
+
+    def visit(node: tuple[str, str]) -> None:
+        assert node not in visiting, f"digest dependency cycle at {node}"
+        if node in visited:
+            return
+        visiting.add(node)
+        for dependency in graph[node]:
+            visit(dependency)
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in sorted(graph):
+        visit(node)
+    return graph
 
 
 def _validate_digest_contract_paths(contract: dict[str, object]) -> None:
@@ -221,32 +404,8 @@ def _validate_digest_contract_paths(contract: dict[str, object]) -> None:
         field_name = entry["field"].rsplit(".", 1)[-1]
         assert field_name in entry["excluded_fields"]
         assert all("?" not in item for item in entry["excluded_fields"])
-    graph: dict[str, set[str]] = {field: set() for field in fields}
-    suffixes = {field.rsplit(".", 1)[-1]: field for field in fields}
-    for entry in entries:
-        source = entry["field"]
-        for path in entry["included_field_paths"]:
-            target = suffixes.get(path.rsplit(".", 1)[-1].removesuffix("[]"))
-            if target == source:
-                raise AssertionError(f"digest dependency self-edge at {source}")
-            if target is not None:
-                graph[source].add(target)
-
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(node: str) -> None:
-        assert node not in visiting, f"digest dependency cycle at {node}"
-        if node in visited:
-            return
-        visiting.add(node)
-        for dependency in graph[node]:
-            visit(dependency)
-        visiting.remove(node)
-        visited.add(node)
-
-    for field in graph:
-        visit(field)
+    graph = _digest_dependency_graph(contract)
+    assert all(isinstance(node, tuple) and len(node) == 2 for node in graph)
 
 
 def _reason_tokens(text: str) -> set[str]:
@@ -308,7 +467,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         assert heading in text
     assert "SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
-    assert "97283a5ce6d67d925d84a9d4b759a8ebe98b3af9" in text
+    assert "a7d3be1c6b9f760c659470fffcf6299bcd8ddf73" in text
     assert "MUST" in text and "MUST NOT" in text
     assert "production_window_started=false" in text
     assert "Task 20" in text and "20 confirmed consecutive" in text
@@ -339,7 +498,7 @@ def test_r2f5_crosswalk_is_exact_and_anchored() -> None:
         for match in (
             re.match(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (test_r2f5_req_[a-z]+_\d{2}) \|$", line)
             for line in _section(
-                plan, "## Planned pytest anchor catalog (X7)", "## Planned implementation tasks"
+                plan, "## Planned pytest anchor catalog (X8)", "## Planned implementation tasks"
             ).splitlines()
         )
         if match
@@ -363,7 +522,7 @@ def test_r2f5_requirement_blocks_are_rfc2119_and_unique() -> None:
 
 def test_r2f5_no_anchor_or_result_is_claimed() -> None:
     matrix = MATRIX.read_text(encoding="utf-8")
-    assert "97283a5ce6d67d925d84a9d4b759a8ebe98b3af9" in matrix
+    assert "a7d3be1c6b9f760c659470fffcf6299bcd8ddf73" in matrix
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in matrix
     assert "No catalog entry exists or passes yet" in PLAN.read_text(encoding="utf-8")
     assert "Task 20" in matrix and "production soak" in matrix
@@ -556,7 +715,7 @@ def test_r2f5_matrix_has_one_explicit_row_per_roadmap_slo() -> None:
     assert all(row[2].strip() and ";" in row[2] for row in design_rows)
 
 
-def test_r2f5_x7_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
+def test_r2f5_x8_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
     matrix = MATRIX.read_text(encoding="utf-8")
@@ -569,12 +728,12 @@ def test_r2f5_x7_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> No
         if (design + plan)[match.end() : match.end() + 3] != ".py"
     }
     assert body_tokens <= allowed, sorted(body_tokens - allowed)
-    assert "## Planned pytest anchor catalog (X7)" in plan
+    assert "## Planned pytest anchor catalog (X8)" in plan
     assert "no hand-written dimension count" in design or "fixed expected tuple" in design
     assert "replication" in matrix and "child of local/NAS" in matrix
 
 
-def test_r2f5_x7_metric_union_and_window_evidence_are_closed() -> None:
+def test_r2f5_x8_metric_union_and_window_evidence_are_closed() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "type MetricResult =" in design
     assert 'status: "pass"' in design and "reason_code: null" in design
@@ -588,7 +747,7 @@ def test_r2f5_x7_metric_union_and_window_evidence_are_closed() -> None:
     assert "Overall status precedence" in design
 
 
-def test_r2f5_x7_model_source_mapping_and_read_only_restore_contract() -> None:
+def test_r2f5_x8_model_source_mapping_and_read_only_restore_contract() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "provider_record.provider_id" in design
     assert "qualification_window.window_id" in design
@@ -603,7 +762,7 @@ def test_r2f5_x7_model_source_mapping_and_read_only_restore_contract() -> None:
     assert "maximum" in design and "unavailable" in design
 
 
-def test_r2f5_x7_time_hash_and_cardinality_contracts_are_explicit() -> None:
+def test_r2f5_x8_time_hash_and_cardinality_contracts_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "YYYY-MM-DD" in design
     assert "RFC3339" in design or "UTC instant" in design
@@ -615,7 +774,7 @@ def test_r2f5_x7_time_hash_and_cardinality_contracts_are_explicit() -> None:
     assert "canonical JSON" in design and "hash preimage" in design
 
 
-def test_r2f5_x7_validator_checks_interface_tokens_and_collection_bounds() -> None:
+def test_r2f5_x8_validator_checks_interface_tokens_and_collection_bounds() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     fingerprint = _section(design, "interface SnapshotFingerprint {", "// All fields")
     for field in (
@@ -651,9 +810,9 @@ def test_r2f5_x7_validator_checks_interface_tokens_and_collection_bounds() -> No
     assert "window_evidence_refs" in design and "exactly one" in design
 
 
-def test_r2f5_x7_structured_contract_is_closed_and_crosswalked() -> None:
+def test_r2f5_x8_structured_contract_is_closed_and_crosswalked() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     canonical_contract = json.dumps(
         contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -702,9 +861,9 @@ def test_r2f5_x7_structured_contract_is_closed_and_crosswalked() -> None:
     }
 
 
-def test_r2f5_x7_digest_contracts_cover_models_without_self_inclusion() -> None:
+def test_r2f5_x8_digest_contracts_cover_models_without_self_inclusion() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     entries = contract["digest_contracts"]
     assert isinstance(entries, list) and entries
     fields = [entry["field"] for entry in entries]
@@ -757,9 +916,9 @@ def test_r2f5_x7_digest_contracts_cover_models_without_self_inclusion() -> None:
         assert entry["ordering"] and entry["null_encoding"]
 
 
-def test_r2f5_x7_digest_path_validator_rejects_bad_nesting_and_cycles() -> None:
+def test_r2f5_x8_digest_path_validator_rejects_bad_nesting_and_cycles() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     broken_path = deepcopy(contract)
     broken_path["digest_contracts"][0]["included_field_paths"] = ["payload.no_such_field"]
     with pytest.raises(AssertionError, match="missing digest path"):
@@ -792,8 +951,8 @@ def test_r2f5_x7_digest_path_validator_rejects_bad_nesting_and_cycles() -> None:
                 "domain_separation_prefix": "r2f5/a-v1\\0",
             },
             {
-                "field": "B.b",
-                "root_object_type": "B",
+                "field": "A.b",
+                "root_object_type": "A",
                 "included_field_paths": ["a"],
                 "excluded_fields": ["b"],
                 "canonicalization_version": "project-canonical-json-v1",
@@ -811,10 +970,65 @@ def test_r2f5_x7_digest_path_validator_rejects_bad_nesting_and_cycles() -> None:
     with pytest.raises(AssertionError, match="self-edge"):
         _validate_digest_contract_paths(self_edge)
 
+    qualified = deepcopy(cyclic)
+    qualified["model_schema_ast"] = {
+        "A": {
+            "object_fields": ["a", "observation_sha256", "manifest_sha256"],
+            "tuple_item_schemas": {},
+        },
+        "B": {
+            "object_fields": ["a", "observation_sha256", "manifest_sha256"],
+            "tuple_item_schemas": {},
+        },
+    }
+    qualified["digest_contracts"] = [
+        {
+            **qualified["digest_contracts"][0],
+            "field": "A.observation_sha256",
+            "included_field_paths": ["manifest_sha256"],
+            "excluded_fields": ["observation_sha256"],
+        },
+        {
+            **qualified["digest_contracts"][1],
+            "field": "B.observation_sha256",
+            "root_object_type": "B",
+            "included_field_paths": ["manifest_sha256"],
+            "excluded_fields": ["observation_sha256"],
+        },
+        {
+            **qualified["digest_contracts"][0],
+            "field": "A.manifest_sha256",
+            "included_field_paths": ["a"],
+            "excluded_fields": ["manifest_sha256"],
+        },
+        {
+            **qualified["digest_contracts"][1],
+            "field": "B.manifest_sha256",
+            "root_object_type": "B",
+            "included_field_paths": ["a"],
+            "excluded_fields": ["manifest_sha256"],
+        },
+    ]
+    graph = _digest_dependency_graph(qualified)
+    assert ("A", "A.observation_sha256") in graph
+    assert ("B", "B.observation_sha256") in graph
+    assert graph[("A", "A.observation_sha256")] == [("A", "A.manifest_sha256")]
+    assert graph[("B", "B.observation_sha256")] == [("B", "B.manifest_sha256")]
 
-def test_r2f5_x7_date_metric_creator_and_limits_contracts_match_models() -> None:
+    real_cycle = deepcopy(contract)
+    schema_digest = next(
+        item
+        for item in real_cycle["digest_contracts"]
+        if item["field"] == "SessionObservation.schema_policy_digest"
+    )
+    schema_digest["included_field_paths"] = ["observation_sha256"]
+    with pytest.raises(AssertionError, match="digest dependency cycle"):
+        _validate_digest_contract_paths(real_cycle)
+
+
+def test_r2f5_x8_date_metric_creator_and_limits_contracts_match_models() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     assert set(contract["date_time_formats"]) == {"session_date", "rfc3339_utc", "as_of"}
     assert "YYYY-MM-DD" in contract["date_time_formats"]["session_date"]
     assert "RFC3339" in contract["date_time_formats"]["rfc3339_utc"]
@@ -881,25 +1095,37 @@ def test_r2f5_x7_date_metric_creator_and_limits_contracts_match_models() -> None
         "calendar_generation": "calendar",
         "universe": "universe",
     }
-    expected_versions = {"shadow_registry": 2}
+    expected_versions = {"daily_shadow": 0, "shadow_registry": 0, "calendar_generation": 0}
     for role, catalog in catalogs.items():
         assert catalog["role"] == expected_roles[role]
         assert catalog["user_version"] == expected_versions.get(role, 1)
-        assert catalog["system_tables"] == ["sqlite_sequence"]
+        authoritative = _authoritative_catalog(role)
+        assert catalog["user_version"] == authoritative["expected_user_version"]
+        assert authoritative["user_version"] == catalog["user_version"]
+        assert catalog["sqlite_master_allowlist"] == authoritative["objects"]
+        assert catalog["system_tables"] == []
         tables = catalog["tables"]
-        assert catalog["allowed_tables"] == list(tables)
+        assert catalog["allowed_tables"] == sorted(authoritative["tables"])
+        assert set(tables) == set(authoritative["tables"])
         for table_name, schema in tables.items():
             assert table_name in catalog["allowed_tables"]
             assert schema["columns"] and all(":" in column for column in schema["columns"])
             assert schema["primary_key"] and schema["order_by"]
-        assert catalog["catalog_digest_source"].startswith("existing-r2f4")
+            assert schema["columns"] == authoritative["tables"][table_name]["columns"]
+            assert schema["primary_key"] == authoritative["tables"][table_name]["primary_key"]
+            declared_names = {column.split(":", 1)[0] for column in schema["columns"]}
+            assert all(column in declared_names for column in schema["order_by"])
+        assert catalog["schema_version_source"].startswith(
+            f"PRAGMA user_version={catalog['user_version']}"
+        )
+        assert catalog["catalog_digest_source"].startswith("backend/")
 
 
-def test_r2f5_x7_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
+def test_r2f5_x8_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
     matrix = MATRIX.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     metric_fields = set(contract["metric_fields"])
     report = _section(design, "interface R2FAcceptanceReport {", "interface SnapshotIdentity {")
     report_fields = set(re.findall(r"^\s+([a-z_]+): MetricResult;", report, re.MULTILINE))
@@ -921,9 +1147,9 @@ def test_r2f5_x7_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
     assert "r2f5_reader" in design and "MUST NOT appear as envelope creators" in design
 
 
-def test_r2f5_x7_model_ast_roots_and_tuple_items_are_explicit() -> None:
+def test_r2f5_x8_model_ast_roots_and_tuple_items_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x7_contract(design)
+    contract = _x8_contract(design)
     ast = contract["model_schema_ast"]
     assert ast and all(
         isinstance(node.get("object_fields"), list)
@@ -947,7 +1173,7 @@ def test_r2f5_x7_model_ast_roots_and_tuple_items_are_explicit() -> None:
     assert "duplicate_proof_sha256" in ast["RecoveryObservation"]["object_fields"]
 
 
-def test_r2f5_x7_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
+def test_r2f5_x8_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     envelope = _section(
         design,
@@ -1017,7 +1243,7 @@ def test_r2f5_x7_envelope_raw_facts_and_pre_capture_models_are_explicit() -> Non
     assert "Task19 only opens immutable refs" in design
 
 
-def test_r2f5_x7_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
+def test_r2f5_x8_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     metric_value = _section(design, "type MetricValue =", "type MetricResult =")
     assert all(
