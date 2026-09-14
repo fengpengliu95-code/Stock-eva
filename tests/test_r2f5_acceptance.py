@@ -16,6 +16,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import stat
@@ -28,7 +29,12 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+
+import backend.app.cli as cli_module
+from backend.app.config import Settings
+from backend.app.main import app
 
 ROOT = Path(__file__).parents[1]
 DESIGN = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
@@ -124,6 +130,7 @@ REASONS = {
     "LINEAGE_UNAVAILABLE",
     "REPLAY_UNAVAILABLE",
     "REPLAY_SEMANTIC_MISMATCH",
+    "REMOTE_PROOF_MISSING",
     "INPUT_LIMIT_EXCEEDED",
     "SNAPSHOT_CHANGED",
     "CONTROL_STATE_UNAVAILABLE",
@@ -223,6 +230,453 @@ def _session_dates(count: int = 20) -> list[str]:
             result.append(current.isoformat())
         current += timedelta(days=1)
     return result
+
+
+def _jcs(value: Any) -> bytes:
+    """Test writer JCS: compact sorted UTF-8 JSON, independent of production."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _task20_envelope(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    metadata = {
+        "artifact_id": artifact_id,
+        "artifact_ref": f"evidence/{artifact_id}",
+        "schema_version": "r2f5-observation-envelope-v1",
+        "creator_kind": "task20_writer",
+        "creator_version": "v1",
+        "created_at": "2026-09-14T06:00:00Z",
+        "canonicalization_version": "project-canonical-json-v1",
+        "payload_sha256": hashlib.sha256(_jcs(payload)).hexdigest(),
+    }
+    return {
+        **metadata,
+        "payload": payload,
+        "envelope_sha256": hashlib.sha256(b"r2f5/envelope-v1\0" + _jcs(metadata)).hexdigest(),
+    }
+
+
+@dataclass
+class GoldenTree:
+    request: dict[str, Any]
+    dataset: Path
+    evidence: Path
+    controls: list[Path]
+    sessions: list[str]
+    session_observations: list[dict[str, Any]]
+    window_envelope: dict[str, Any]
+    snapshot_identity: dict[str, Any]
+    frozen_versions: dict[str, Any]
+
+
+def _build_complete_golden_tree(tmp_path: Path) -> GoldenTree:
+    """Build the complete approved tree; no public input flags encode its state."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    dataset, evidence, control = (
+        tmp_path / name for name in ("golden-dataset", "golden-evidence", "golden-control")
+    )
+    for root in (dataset, evidence, control):
+        root.mkdir()
+    sessions = _session_dates()
+    frozen = {
+        "git_commit": "1" * 40,
+        "installed_release": "stock-eva-r2f5.0",
+        "dataset_generation": "g20",
+        "primary_provider_id": "baostock",
+        "secondary_provider_id": "tickflow",
+        "calendar_generation": "calendar-g20",
+        "universe_generation": "universe-g20",
+        "replication_policy_version": "r2f4-replication-v1",
+        "restore_policy_version": "r2f4-restore-v1",
+    }
+    manifest = {
+        "dataset": "stock-eva-market",
+        "generation": "g20",
+        "schema_version": 2,
+        "sessions": sessions,
+    }
+    (dataset / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (dataset / "calendar.json").write_text(
+        json.dumps(
+            {
+                "source_sequence": sessions,
+                "generation": "calendar-g20",
+                "confirmed": True,
+                "unknown_state": False,
+                "conflict_state": False,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_observations = []
+    for ordinal, session in enumerate(sessions, start=1):
+        digest = hashlib.sha256(_jcs({"session": session, "ordinal": ordinal})).hexdigest()
+
+        def metric(kind: str, value: Any, target: Any) -> dict[str, Any]:
+            return {
+                "status": "pass",
+                "observed": {"kind": kind, "value": value},
+                "target": {"kind": kind, "value": target},
+                "reason_code": None,
+                "acceptance_ref": "AC-15",
+                "planned_test_anchor": "test_r2f5_slo",
+            }
+
+        observation = {
+            "session": session,
+            "ordinal": ordinal,
+            "frozen_versions_sha256": digest,
+            "same_evening_published_at": f"{session}T13:15:00Z",
+            "next_morning_published_at": f"{session}T00:00:00Z",
+            "required_count": 1,
+            "loaded_count": 1,
+            "suspension_count": 0,
+            "not_listed_count": 0,
+            "delisted_count": 0,
+            "unknown_count": 0,
+            "canonical_provider_ids": ["baostock"],
+            "evidence": {"evidence_id": f"e-{ordinal:02d}", "evidence_sha256": digest},
+            "lineage": {
+                "lineage_id": f"lineage-{ordinal:02d}",
+                "source_id": f"source-{ordinal:02d}",
+                "candidate_id": f"candidate-{ordinal:02d}",
+                "gate_report_id": f"gate-{ordinal:02d}",
+                "lineage_sha256": digest,
+            },
+            "manifest": {
+                "manifest_id": f"manifest-{ordinal:02d}",
+                "manifest_sha256": digest,
+                "generation": "g20",
+                "schema_version": 2,
+            },
+            "pointer_reconciliation": {
+                "pointer_id": f"p-{ordinal:02d}",
+                "pointer_sha256": digest,
+                "manifest_sha256": digest,
+                "object_sha256": digest,
+                "pointer_manifest_object_match": True,
+                "descriptor_sha256": digest,
+            },
+            "replication_observation": {
+                "immutable": True,
+                "state": "completed",
+                "checkpoint_id": f"cp-{ordinal:02d}",
+                "source_commit_sha256": digest,
+                "intent_id": f"intent-{ordinal:02d}",
+                "enqueue_state": "enqueued",
+                "reason_code": None,
+                "observed_at": "2026-09-14T06:00:00Z",
+                "lag_seconds": 0,
+                "trust_scope": "REMOTE_VERIFIED",
+                "destination_generation": "g20",
+                "destination_record_sha256": digest,
+                "destination_head_sha256": digest,
+                "observation_sha256": digest,
+            },
+            "calendar_raw_facts": {
+                "source_sequence": sessions,
+                "generation": "calendar-g20",
+                "confirmed": True,
+                "unknown_state": False,
+                "conflict_state": False,
+                "raw_facts_sha256": digest,
+            },
+            "universe_facts": {
+                "required_count": 1,
+                "loaded_count": 1,
+                "unknown_count": 0,
+                "universe_generation": "universe-g20",
+                "universe_sha256": digest,
+            },
+            "read_boundary_raw_facts": {
+                "requested_as_of": "2026-09-14T06:00:00Z",
+                "max_visible_session": session,
+                "future_rows_seen": False,
+                "future_rows_count": 0,
+                "query_count": 1,
+                "write_count": 0,
+                "probe_schema_digest": digest,
+            },
+            "schema_policy_versions": ["r2f5-schema-v1"],
+            "schema_policy_digest": digest,
+            "cutoff_results": {
+                "same_evening": metric("ratio", 0.9, 0.9),
+                "next_morning": metric("ratio", 1, 1),
+            },
+            "coverage": metric("ratio", 1, 1),
+            "canonical_integrity": metric("bool", True, True),
+            "source_purity": metric("bool", True, True),
+            "provenance": metric("bool", True, True),
+            "calendar": metric("bool", True, True),
+            "universe": metric("bool", True, True),
+            "replication": metric("duration_seconds", 0, 300),
+            "read_boundary": metric("bool", True, True),
+            "observation_sha256": digest,
+        }
+        observation["evidence"] = {
+            "evidence_id": f"e-{ordinal:02d}",
+            "evidence_sha256": digest,
+            "candidate_id": f"candidate-{ordinal:02d}",
+            "candidate_sha256": digest,
+            "gate_report_id": f"gate-{ordinal:02d}",
+            "gate_report_sha256": digest,
+            "manifest_id": f"manifest-{ordinal:02d}",
+            "manifest_sha256": digest,
+            "object_id": f"object-{ordinal:02d}",
+            "object_sha256": digest,
+            "selection_id": f"selection-{ordinal:02d}",
+            "selection_sha256": digest,
+            "binding_sha256": digest,
+        }
+        observation["observation_sha256"] = hashlib.sha256(
+            _jcs({key: value for key, value in observation.items() if key != "observation_sha256"})
+        ).hexdigest()
+        session_observations.append(observation)
+        (dataset / "sessions").mkdir(exist_ok=True)
+        (dataset / "sessions" / f"{session}.json").write_text(
+            json.dumps(observation, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    child_payloads = {
+        "recovery_observation": {
+            "immutable": True,
+            "event_id": "recovery-001",
+            "attempt_id": "attempt-001",
+            "before_generation": "g19",
+            "after_generation": "g20",
+            "queue_identity": "queue-001",
+            "restart_boundary": "2026-09-14T05:00:00Z",
+            "exactly_once_publication_id": "publication-001",
+            "publication_count": 1,
+        },
+        "failover_observation": {
+            "source_schema": "task20-writer-owned",
+            "primary_unavailable": True,
+            "qualified_secondary_provider_id": "tickflow",
+            "qualification_proof_status": "available",
+            "session": sessions[0],
+            "selected_provider_id": "tickflow",
+            "mixed_source_rows": 0,
+        },
+        "replay_sample": {
+            "sample_object_sha256": "2" * 64,
+            "candidate_sha256": "3" * 64,
+            "semantic_equal": True,
+            "offline_context": {
+                "adapter_id": "baostock",
+                "adapter_version": "offline-v1",
+                "normalizer_id": "market",
+                "normalizer_version": "v1",
+                "implementation_sha256": "4" * 64,
+                "network_allowed": False,
+                "provider_requests": 0,
+            },
+        },
+        "adjustment_equivalence": {
+            "compared_sessions": sessions[:2],
+            "tolerance_policy_version": "r2f5-adjustment-v1",
+            "equivalence_passed": True,
+        },
+        "error_handling_observation": {
+            "immutable": True,
+            "events": [
+                {
+                    "event_id": f"error-{i}",
+                    "forced_error_class": klass,
+                    "sanitized_reason": "ERROR_HANDLING_FAILED",
+                    "normalized_result": "unavailable",
+                    "attempt_id": f"attempt-{i}",
+                    "expected_class": klass,
+                    "observed_class": klass,
+                    "evidence_sha256": "5" * 64,
+                    "observed_at": "2026-09-14T06:00:00Z",
+                }
+                for i, klass in enumerate(
+                    ("auth", "schema", "storage", "timeout", "decode", "unknown")
+                )
+            ],
+            "observation_sha256": "6" * 64,
+        },
+        "local_nas_isolation_observation": {
+            "immutable": True,
+            "event_id": "nas-001",
+            "local_publication_ready": True,
+            "local_publication_id": "local-001",
+            "local_pointer_sha256": "7" * 64,
+            "outage_start": "2026-09-14T05:00:00Z",
+            "outage_end": "2026-09-14T05:01:00Z",
+            "backlog_before_ids": [],
+            "backlog_after_ids": [],
+            "backlog_before_count": 0,
+            "backlog_after_count": 0,
+            "lag_seconds": 0,
+            "lag_threshold_seconds": 300,
+            "retryable": True,
+            "retry_state": "complete",
+            "retry_transition": "queued_to_complete",
+            "nas_failure_did_not_block_local": True,
+            "attempt_id": "nas-attempt-001",
+            "observed_at": "2026-09-14T06:00:00Z",
+            "observation_sha256": "8" * 64,
+        },
+        "restore_observation": {
+            "source_schema": "task20-writer-owned",
+            "sentinel_sha256": "9" * 64,
+            "destination_id": "restore-001",
+            "destination_generation": "g20",
+            "destination_head_sha256": "a" * 64,
+            "record_sha256": "b" * 64,
+            "manifest_sha256": "c" * 64,
+            "checkpoint_id": "cp-restore-001",
+            "restore_report_id": "restore-report-001",
+            "restore_report_sha256": "d" * 64,
+            "schema_version": "r2f5-restore-v1",
+            "row_count": 20,
+            "api_readback_sha256": "e" * 64,
+            "verification_state": "verified",
+        },
+    }
+    child_payloads["recovery_observation"].update(
+        {
+            "after_manifest_sha256": "f" * 64,
+            "after_pointer_sha256": "f" * 64,
+            "after_selection_sha256": "f" * 64,
+            "duplicate_proof_sha256": "f" * 64,
+            "observed_at": "2026-09-14T06:00:00Z",
+            "observation_sha256": "f" * 64,
+        }
+    )
+    child_payloads["failover_observation"].update(
+        {
+            "selection_sha256": "f" * 64,
+            "manifest_sha256": "f" * 64,
+            "pointer_sha256": "f" * 64,
+            "readback_sha256": "f" * 64,
+        }
+    )
+    for payload in child_payloads.values():
+        payload["observation_sha256"] = hashlib.sha256(
+            _jcs({key: value for key, value in payload.items() if key != "observation_sha256"})
+        ).hexdigest()
+    bundle_payload = {
+        key: _task20_envelope(value, key.replace("_observation", "") + "-001")
+        for key, value in child_payloads.items()
+    }
+    bundle_payload["observation_count"] = 1
+    window_envelope = _task20_envelope(bundle_payload, "window-001")
+    (evidence / "window.json").write_text(
+        json.dumps(window_envelope, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (evidence / "session_observations.json").write_text(
+        json.dumps(session_observations, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    controls = []
+    for role in (
+        "replication_sidecar",
+        "daily_shadow",
+        "shadow_registry",
+        "calendar_generation",
+        "universe",
+    ):
+        path = control / f"{role}.db"
+        _create_authoritative_catalog(path, role)
+        controls.append(path)
+    descriptors = [
+        {
+            "descriptor_role": "dataset",
+            "descriptor_id": "manifest",
+            "descriptor_state": "available",
+            "sha256": hashlib.sha256((dataset / "manifest.json").read_bytes()).hexdigest(),
+        },
+        {
+            "descriptor_role": "evidence",
+            "descriptor_id": "window-001",
+            "descriptor_state": "available",
+            "sha256": hashlib.sha256((evidence / "window.json").read_bytes()).hexdigest(),
+        },
+    ] + [
+        {
+            "descriptor_role": role,
+            "descriptor_id": path.name,
+            "descriptor_state": "available",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for role, path in zip(
+            (
+                "replication_sidecar",
+                "daily_shadow",
+                "shadow_registry",
+                "calendar_generation",
+                "universe",
+            ),
+            controls,
+            strict=True,
+        )
+    ]
+    snapshot = {
+        "requested_start": sessions[0],
+        "requested_end": sessions[-1],
+        "as_of_utc": "2026-09-14T06:00:00Z",
+        "as_of_timezone": "Asia/Shanghai",
+        "input_fingerprints": descriptors,
+        "frozen_versions": frozen,
+    }
+    snapshot["input_fingerprint_sha256"] = hashlib.sha256(_jcs(descriptors)).hexdigest()
+    snapshot["frozen_version_vector_sha256"] = hashlib.sha256(_jcs(frozen)).hexdigest()
+    snapshot["snapshot_sha256"] = hashlib.sha256(
+        _jcs({key: value for key, value in snapshot.items() if key != "snapshot_sha256"})
+    ).hexdigest()
+    (evidence / "frozen_versions.json").write_text(
+        json.dumps(frozen, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (evidence / "snapshot_identity.json").write_text(
+        json.dumps(snapshot, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return GoldenTree(
+        {
+            "start": sessions[0],
+            "end": sessions[-1],
+            "local_dataset_root": str(dataset),
+            "evidence_root": str(evidence),
+            "control_store_roots": [str(path) for path in controls],
+            "now": "2026-09-14T06:00:00Z",
+        },
+        dataset,
+        evidence,
+        controls,
+        sessions,
+        session_observations,
+        window_envelope,
+        snapshot,
+        frozen,
+    )
+
+
+def _clone_golden_tree(source: GoldenTree, destination: Path) -> GoldenTree:
+    dataset, evidence, control = (destination / name for name in ("dataset", "evidence", "control"))
+    shutil.copytree(source.dataset, dataset)
+    shutil.copytree(source.evidence, evidence)
+    shutil.copytree(source.controls[0].parent, control)
+    controls = [control / path.name for path in source.controls]
+    request = {
+        **source.request,
+        "local_dataset_root": str(dataset),
+        "evidence_root": str(evidence),
+        "control_store_roots": [str(path) for path in controls],
+    }
+    return GoldenTree(
+        request,
+        dataset,
+        evidence,
+        controls,
+        source.sessions,
+        source.session_observations,
+        source.window_envelope,
+        source.snapshot_identity,
+        source.frozen_versions,
+    )
 
 
 @pytest.fixture
@@ -616,34 +1070,49 @@ def _build_case_input(case: _CaseSpec, captured_window: dict[str, Any]) -> dict[
     payload = deepcopy(captured_window)
     dataset = Path(payload["local_dataset_root"])
     evidence = Path(payload["evidence_root"])
+    calendar_path = dataset / "calendar.json"
+    if calendar_path.exists():
+        calendar_document = json.loads(calendar_path.read_text(encoding="utf-8"))
+        raw_calendar = list(calendar_document.get("source_sequence", ()))
+    else:
+        # The minimal RED fixture intentionally omits this artifact; the local
+        # builder creates the authoritative input before applying its mutation.
+        raw_calendar = _session_dates()
+        calendar_path.write_text(
+            json.dumps({"source_sequence": raw_calendar}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def write_calendar(values: list[str], **updates: Any) -> None:
+        calendar_path.write_text(
+            json.dumps({"source_sequence": values, **updates}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def mutate_session(**updates: Any) -> None:
+        session_path = dataset / "sessions" / f"{raw_calendar[0]}.json"
+        session = (
+            json.loads(session_path.read_text(encoding="utf-8")) if session_path.exists() else {}
+        )
+        session.update(updates)
+        session_path.parent.mkdir(exist_ok=True)
+        session_path.write_text(json.dumps(session, sort_keys=True) + "\n", encoding="utf-8")
+
     if case.mutation in {"nineteen_sessions", "exact_twenty"}:
-        payload["raw_calendar"] = payload["raw_calendar"][:-1]
-        (dataset / "calendar.json").write_text(
-            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
-        )
+        raw_calendar = raw_calendar[:-1]
+        write_calendar(raw_calendar)
     elif case.mutation in {"duplicate_raw_calendar", "duplicate"}:
-        payload["raw_calendar"][5] = payload["raw_calendar"][4]
-        (dataset / "calendar.json").write_text(
-            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
-        )
+        raw_calendar[5] = raw_calendar[4]
+        write_calendar(raw_calendar)
     elif case.mutation in {"out_of_order_raw", "replacement_race"}:
-        payload["raw_calendar"][5], payload["raw_calendar"][6] = (
-            payload["raw_calendar"][6],
-            payload["raw_calendar"][5],
-        )
-        (dataset / "calendar.json").write_text(
-            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
-        )
+        raw_calendar[5], raw_calendar[6] = raw_calendar[6], raw_calendar[5]
+        write_calendar(raw_calendar)
     elif case.mutation == "missing_middle":
-        payload["raw_calendar"].pop(10)
-        (dataset / "calendar.json").write_text(
-            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
-        )
+        raw_calendar.pop(10)
+        write_calendar(raw_calendar)
     elif case.mutation == "future_session":
-        payload["raw_calendar"][-1] = "2099-01-01"
-        (dataset / "calendar.json").write_text(
-            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
-        )
+        raw_calendar[-1] = "2099-01-01"
+        write_calendar(raw_calendar)
     elif case.mutation == "missing_control" or case.mutation == "missing_locked_sqlite":
         missing = Path(payload["control_store_roots"][-1])
         if missing.exists():
@@ -653,42 +1122,70 @@ def _build_case_input(case: _CaseSpec, captured_window: dict[str, Any]) -> dict[
     elif case.mutation == "unsafe_path":
         payload["local_dataset_root"] = "relative-dataset"
     elif case.mutation == "coverage_failure" or case.mutation == "universe_mismatch":
-        payload["required_count"] = 100
-        payload["loaded_count"] = 99
-        payload["unknown_count"] = 1
+        mutate_session(required_count=100, loaded_count=99, unknown_count=1)
     elif case.mutation == "mixed_source":
-        payload["canonical_provider_ids"] = ["baostock", "tickflow"]
+        mutate_session(canonical_provider_ids=["baostock", "tickflow"])
     elif case.mutation == "version_drift":
-        payload["frozen_versions"]["calendar_generation"] = "calendar-drift"
+        frozen_path = evidence / "frozen_versions.json"
+        frozen = json.loads(frozen_path.read_text(encoding="utf-8")) if frozen_path.exists() else {}
+        frozen["calendar_generation"] = "calendar-drift"
+        frozen_path.write_text(json.dumps(frozen, sort_keys=True) + "\n", encoding="utf-8")
         manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
         manifest["generation"] = "calendar-drift"
         (dataset / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
         )
     elif case.mutation == "unknown_replay_identity":
-        payload["offline_replay"] = {
-            "adapter_id": "unknown",
-            "normalizer_id": "unknown",
-            "network_allowed": False,
-            "provider_requests": 0,
-        }
+        (evidence / "replay-identity.json").write_text(
+            json.dumps(
+                {"adapter_id": "unknown", "normalizer_id": "unknown", "network_allowed": False}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     elif case.mutation == "local_chain_only":
-        payload["replication_trust_scope"] = "LOCAL_CHAIN_ONLY"
+        mutate_session(replication_observation={"trust_scope": "LOCAL_CHAIN_ONLY"})
     elif case.mutation == "missing_restore_drill":
-        payload["restore_verification_state"] = None
+        (evidence / "restore_observation.json").unlink(missing_ok=True)
     elif case.mutation == "lineage_missing":
-        payload["lineage"] = None
+        (dataset / "sessions" / f"{raw_calendar[0]}.json").unlink(missing_ok=True)
     elif case.mutation == "calendar_conflict":
-        payload["calendar_conflict"] = True
+        write_calendar(raw_calendar, conflict_state=True)
     elif case.mutation == "toctou":
-        payload["toctou_probe"] = True
+        (evidence / "toctou-probe.json").write_text("before\n", encoding="utf-8")
     # Every remaining named drill has a material immutable evidence mutation;
     # the reader receives no fixture-control key for it.
-    (evidence / f"{case.mutation}.json").write_text(
-        json.dumps({"artifact_id": case.mutation, "creator_kind": "task20_writer"}) + "\n",
+    target_name = f"{case.requirement.lower()}.json"
+    (evidence / target_name).write_text(
+        json.dumps(
+            {
+                "artifact_id": case.requirement.lower(),
+                "creator_kind": "task20_writer",
+                "metric": case.metric,
+                "expected_status": case.status,
+                "expected_reason": case.reason,
+                "effect": case.effect,
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    return payload
+    # Bind the named mutation into the authoritative Task 20 window bundle so
+    # it is on the future reader's input graph, rather than being an orphan
+    # marker that only the test itself can see.
+    window_path = evidence / "window.json"
+    try:
+        window = json.loads(window_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        window = _task20_envelope({}, "window-001")
+    window_payload = dict(window.get("payload", {}))
+    window_payload[case.requirement.lower()] = json.loads(
+        (evidence / target_name).read_text(encoding="utf-8")
+    )
+    window = _task20_envelope(window_payload, str(window.get("artifact_id", "window-001")))
+    window_path.write_text(json.dumps(window, sort_keys=True) + "\n", encoding="utf-8")
+    return {key: payload[key] for key in INPUT_KEYS}
 
 
 def _anchor_builder(case: _CaseSpec):
@@ -696,6 +1193,13 @@ def _anchor_builder(case: _CaseSpec):
         return _build_case_input(case, captured)
 
     build.__name__ = f"build_{case.requirement.lower()}"
+    build.target_descriptor = "evidence_root"
+    build.mutated_path = f"{case.requirement.lower()}.json"
+    build.expected = {
+        "metric": case.metric,
+        "status": case.status,
+        "reason": case.reason,
+    }
     return build
 
 
@@ -768,17 +1272,19 @@ class _SloCase:
 
 
 def _slo_cases(metric: str, reason: str, kind: str, passed: Any, failed: Any, target: Any):
-    failed_status = "unavailable" if reason.endswith("_UNAVAILABLE") else "not_ready"
-    failed_kind = None if failed_status == "unavailable" else kind
-    failed_value = None if failed_status == "unavailable" else failed
-    failed_target = None if failed_status == "unavailable" else target
+    # A measured SLO breach is a discriminated MetricResult ``fail`` even when
+    # its reason name contains UNAVAILABLE.  Only absent/corrupt evidence uses
+    # the separate unavailable branch below.
+    failed_kind = kind
+    failed_value = failed
+    failed_target = target
     return (
         _SloCase(metric, "pass", "ready", "pass", None, kind, passed, kind, target),
         _SloCase(
             metric,
             "fail",
-            failed_status,
-            failed_status,
+            "not_ready",
+            "fail",
             reason,
             failed_kind,
             failed_value,
@@ -960,6 +1466,19 @@ def test_r2f5_metric_kinds_match_approved_structured_contract() -> None:
         assert METRIC_CONTRACTS[metric][2] == target
 
 
+def test_r2f5_metric_and_report_status_unions_are_discriminated() -> None:
+    """MetricResult and the enclosing report deliberately have different unions."""
+    metric_statuses = {case.metric_status for cases in SLO_CASES.values() for case in cases}
+    report_statuses = {case.report_status for cases in SLO_CASES.values() for case in cases}
+    assert metric_statuses == {"pass", "fail", "unavailable"}
+    assert report_statuses == {"ready", "not_ready", "unavailable"}
+    for cases in SLO_CASES.values():
+        passing, failing, missing = cases
+        assert (passing.metric_status, passing.report_status) == ("pass", "ready")
+        assert (failing.metric_status, failing.report_status) == ("fail", "not_ready")
+        assert (missing.metric_status, missing.report_status) == ("unavailable", "unavailable")
+
+
 def test_r2f5_strict_protocol_simulator_accepts_each_builder_and_material_mutation(
     captured_window,
 ) -> None:
@@ -980,6 +1499,170 @@ def test_r2f5_strict_protocol_simulator_accepts_each_builder_and_material_mutati
             for key in ("local_dataset_root", "evidence_root")
         ) + (_physical_fingerprint(Path(captured_window["control_store_roots"][0]).parent),)
         assert changed or after_fingerprint != before_fingerprint
+
+
+def test_r2f5_complete_golden_tree_has_ready_shape_and_all_evidence(tmp_path: Path) -> None:
+    golden = _build_complete_golden_tree(tmp_path)
+    assert set(golden.request) == INPUT_KEYS
+    assert len(golden.sessions) == 20
+    assert golden.sessions == sorted(golden.sessions)
+    assert len(golden.session_observations) == 20
+    assert all(
+        observation["ordinal"] == index
+        for index, observation in enumerate(golden.session_observations, 1)
+    )
+    assert all(
+        observation["canonical_integrity"]["status"] == "pass"
+        for observation in golden.session_observations
+    )
+    assert all(
+        observation["replication_observation"]["trust_scope"] == "REMOTE_VERIFIED"
+        for observation in golden.session_observations
+    )
+    assert all(
+        all(value is not None for value in observation[key].values())
+        for observation in golden.session_observations
+        for key in ("lineage", "manifest", "universe_facts")
+    )
+    assert golden.window_envelope["creator_kind"] == "task20_writer"
+    assert golden.window_envelope["payload"]["observation_count"] == 1
+    assert all(value is not None for value in golden.window_envelope["payload"].values())
+    assert golden.snapshot_identity["snapshot_sha256"]
+    assert golden.frozen_versions["replication_policy_version"]
+
+
+def test_r2f5_golden_tree_public_reader_must_return_ready_with_all_pass_metrics(
+    tmp_path: Path,
+) -> None:
+    golden = _build_complete_golden_tree(tmp_path)
+    before = (
+        _physical_fingerprint(golden.dataset),
+        _physical_fingerprint(golden.evidence),
+        _physical_fingerprint(golden.controls[0].parent),
+    )
+    report = _as_dict(_evaluate(golden.request))
+    assert report["status"] == "ready"
+    for metric, (kind, _passed, target) in METRIC_CONTRACTS.items():
+        assert report[metric]["status"] == "pass"
+        assert report[metric]["reason_code"] is None
+        assert report[metric]["observed"] == {"kind": kind, "value": _passed}
+        assert report[metric]["target"] == {"kind": kind, "value": target}
+    assert report["selected_sessions"] == golden.sessions
+    assert report["frozen_versions"] == golden.frozen_versions
+    assert (
+        report["snapshot_identity"]["snapshot_sha256"]
+        == golden.snapshot_identity["snapshot_sha256"]
+    )
+    assert len(report["session_observations"]) == 20
+    assert (
+        report["window_evidence_bundle"]["payload_sha256"]
+        == golden.window_envelope["payload_sha256"]
+    )
+    assert (
+        report["window_evidence_bundle"]["envelope_sha256"]
+        == golden.window_envelope["envelope_sha256"]
+    )
+    assert report["provider_requests"] == 0 and report["writes"] is False
+    assert (
+        _physical_fingerprint(golden.dataset),
+        _physical_fingerprint(golden.evidence),
+        _physical_fingerprint(golden.controls[0].parent),
+    ) == before
+
+
+def test_r2f5_golden_envelope_hash_excludes_payload_and_self_hash(tmp_path: Path) -> None:
+    golden = _build_complete_golden_tree(tmp_path)
+    envelope = golden.window_envelope
+    metadata = {
+        key: value for key, value in envelope.items() if key not in {"payload", "envelope_sha256"}
+    }
+    assert envelope["payload_sha256"] == hashlib.sha256(_jcs(envelope["payload"])).hexdigest()
+    assert (
+        envelope["envelope_sha256"]
+        == hashlib.sha256(b"r2f5/envelope-v1\0" + _jcs(metadata)).hexdigest()
+    )
+    vector = _task20_envelope({"a": 1, "b": "x"}, "vector-001")
+    assert vector["payload_sha256"] == (
+        "ecf9e98ec0641e23113ff3ce8bdc78d0ddd249886517fd4a7f68cc83d4e65667"
+    )
+    assert vector["envelope_sha256"] == (
+        "b32c1c8d0f4538c277817c76995914c4f911fe925382bd4912ee0b367b3f9a8c"
+    )
+
+
+def test_r2f5_golden_service_http_cli_semantic_parity(tmp_path: Path, monkeypatch, capsys) -> None:
+    golden = _build_complete_golden_tree(tmp_path)
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=golden.controls[0].parent,
+        local_market_dataset_root=golden.dataset,
+        provider_shadow_root=golden.evidence,
+    )
+    service_report = _as_dict(_evaluate(golden.request))
+    transport = httpx.ASGITransport(app=app)
+
+    async def http_report():
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get(
+                "/api/v1/market/reliability-acceptance",
+                params={"start": golden.request["start"], "end": golden.request["end"]},
+            )
+
+    import asyncio
+
+    response = asyncio.run(http_report())
+    assert response.status_code == 200
+    http_report_payload = response.json()
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-eva",
+            "r2f-acceptance",
+            "--start",
+            golden.request["start"],
+            "--end",
+            golden.request["end"],
+        ],
+    )
+    assert cli_module.main() == 0
+    cli_report = json.loads(capsys.readouterr().out)
+
+    def semantic(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {"semantic_report_sha256", "diagnostic_envelope"}
+        }
+
+    assert semantic(http_report_payload) == semantic(service_report)
+    assert semantic(cli_report) == semantic(service_report)
+
+
+def test_r2f5_builder_metadata_points_to_real_request_root_and_unique_target(
+    tmp_path: Path,
+) -> None:
+    golden = _build_complete_golden_tree(tmp_path / "source")
+    clone = _clone_golden_tree(golden, tmp_path / "clone")
+    targets = []
+    for case in CASE_SPECS.values():
+        builder = case.builder
+        assert callable(builder)
+        before = _physical_fingerprint(clone.evidence)
+        built = builder(clone.request)
+        assert builder.target_descriptor == "evidence_root"
+        assert builder.mutated_path == f"{case.requirement.lower()}.json"
+        target = Path(built[builder.target_descriptor]) / builder.mutated_path
+        assert target.exists()
+        after = _physical_fingerprint(clone.evidence)
+        assert after != before
+        artifact = json.loads(target.read_text(encoding="utf-8"))
+        assert artifact["metric"] == builder.expected["metric"] == case.metric
+        assert artifact["expected_status"] == builder.expected["status"] == case.status
+        assert artifact["expected_reason"] == builder.expected["reason"] == case.reason
+        targets.append(target.name)
+    assert len(set(targets)) == 92
 
 
 def _fake_reader_module(result: Any) -> types.ModuleType:
@@ -1330,7 +2013,8 @@ def test_r2f5_physical_fingerprint_is_unchanged_on_error(captured_window) -> Non
 
 
 @pytest.mark.parametrize(
-    "filesystem_shape", ("symlink", "intermediate_replacement", "special", "hardlink")
+    "filesystem_shape",
+    ("symlink", "intermediate_replacement", "special", "hardlink", "path_collision"),
 )
 def test_r2f5_tree_identity_rejects_unsafe_filesystem_shapes(
     captured_window, filesystem_shape
@@ -1346,12 +2030,19 @@ def test_r2f5_tree_identity_rejects_unsafe_filesystem_shapes(
         (dataset / "nested").symlink_to(dataset / "nested-replaced", target_is_directory=True)
     elif filesystem_shape == "special":
         os.mkfifo(dataset / "named-pipe")
-    else:
+    elif filesystem_shape == "hardlink":
         os.link(dataset / "manifest.json", dataset / "manifest-hardlink.json")
+    else:
+        (dataset / "manifest.json").rename(dataset / "manifest.original")
+        (dataset / "manifest.json").mkdir()
     case = deepcopy(captured_window)
     case["fixture_mutation"] = f"unsafe_{filesystem_shape}"
-    assert _physical_fingerprint(dataset)
-    _evaluate(case)
+    before = _physical_fingerprint(dataset)
+    report = _as_dict(_evaluate(case))
+    assert report["status"] == "unavailable"
+    assert report["read_boundary"]["status"] == "unavailable"
+    assert report["read_boundary"]["reason_code"] == "PATH_INVALID"
+    assert _physical_fingerprint(dataset) == before
 
 
 def test_r2f5_sqlite_corrupt_and_locked_inputs_remain_write_free(captured_window) -> None:
@@ -1448,6 +2139,44 @@ def test_r2f5_wal_writer_thread_is_external_and_reader_reports_snapshot_change(
     assert report["read_boundary"]["reason_code"] == "SNAPSHOT_CHANGED"
     assert report["provider_requests"] == 0 and report["writes"] is False
     assert _physical_fingerprint(database.parent) != before
+
+
+def test_r2f5_wal_commit_before_read_transaction_is_one_new_snapshot(
+    captured_window,
+) -> None:
+    """A completed WAL commit before capture is visible as one coherent snapshot."""
+    import threading
+
+    database = Path(captured_window["control_store_roots"][0])
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE wal_before (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO wal_before VALUES (1, 'old')")
+        connection.commit()
+    ready_to_commit = threading.Event()
+    committed = threading.Event()
+
+    def writer() -> None:
+        ready_to_commit.wait(timeout=1)
+        with sqlite3.connect(database, timeout=1) as connection:
+            connection.execute("UPDATE wal_before SET value='new' WHERE id=1")
+            connection.commit()
+        committed.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    ready_to_commit.set()
+    assert committed.wait(timeout=2)
+    before = _physical_fingerprint(database.parent)
+    report = _as_dict(_evaluate(captured_window))
+    thread.join(timeout=2)
+    assert report["status"] == "unavailable"
+    assert report["read_boundary"]["status"] == "pass"
+    assert report["read_boundary"]["reason_code"] is None
+    assert report["read_boundary"]["observed"] == {"kind": "bool", "value": True}
+    assert "SNAPSHOT_CHANGED" not in report["quality_issues"]
+    assert report["provider_requests"] == 0 and report["writes"] is False
+    assert _physical_fingerprint(database.parent) == before
 
 
 def test_r2f5_tree_size_limit_is_bounded_not_sampled(captured_window) -> None:
