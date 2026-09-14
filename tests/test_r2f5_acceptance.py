@@ -31,7 +31,16 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).parents[1]
+DESIGN = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
 MATRIX = ROOT / "docs/acceptance/r2f5-0-requirement-evidence-matrix.md"
+INPUT_KEYS = {
+    "start",
+    "end",
+    "local_dataset_root",
+    "evidence_root",
+    "control_store_roots",
+    "now",
+}
 REQUIREMENT_ANCHORS = tuple(
     re.findall(r"PLANNED::(test_r2f5_req_[a-z]+_\d{2})", MATRIX.read_text(encoding="utf-8"))
 )
@@ -63,6 +72,45 @@ EXPECTED_METRICS = (
     "restore",
     "read_boundary",
 )
+METRIC_CONTRACTS = {
+    "continuity": ("count", 0, 20),
+    "next_morning_availability": ("ratio", 1, 1),
+    "same_evening_availability": ("ratio", 0.9, 0.9),
+    "coverage": ("ratio", 1, 1),
+    "canonical_integrity": ("bool", True, True),
+    "source_purity": ("bool", True, True),
+    "recovery": ("bool", True, True),
+    "failover": ("bool", True, True),
+    "provenance": ("bool", True, True),
+    "replay": ("bool", True, True),
+    "adjustment": ("bool", True, True),
+    "calendar": ("bool", True, True),
+    "universe": ("bool", True, True),
+    "error_handling": ("bool", True, True),
+    "local_nas_isolation": ("bool", True, True),
+    "replication": ("duration_seconds", 0, 300),
+    "restore": ("bool", True, True),
+    "read_boundary": ("bool", True, True),
+}
+REPORT_CORE_FIELDS = {
+    "status",
+    "window_start",
+    "window_end",
+    "selected_sessions",
+    "frozen_versions",
+    "quality_issues",
+    "snapshot_identity",
+    "session_observations",
+    "observation_refs",
+    "window_evidence_bundle",
+    "window_evidence_refs",
+    "pre_capture_failure",
+    "semantic_report_sha256",
+    "provider_requests",
+    "writes",
+    "restore_started",
+    "production_window_started",
+}
 SLO_ANCHORS = tuple(f"test_r2f5_slo_{metric}" for metric in EXPECTED_METRICS)
 TARGET_MODULE = "backend.app.market.reliability_acceptance"
 REASONS = {
@@ -190,6 +238,38 @@ def captured_window(tmp_path: Path) -> dict[str, Any]:
         '{"dataset":"test-only","generation":"g20","schema_version":2}\n', encoding="utf-8"
     )
     (evidence / "README").write_text("synthetic immutable bytes only\n", encoding="utf-8")
+    window_payload = {
+        "recovery_observation": None,
+        "failover_observation": None,
+        "replay_sample": None,
+        "adjustment_equivalence": None,
+        "error_handling_observation": None,
+        "local_nas_isolation_observation": None,
+        "restore_observation": None,
+        "observation_count": 1,
+    }
+    canonical = (json.dumps(window_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    window_envelope = {
+        "artifact_id": "window-001",
+        "artifact_ref": "evidence/window-001",
+        "schema_version": "r2f5-observation-envelope-v1",
+        "creator_kind": "task20_writer",
+        "creator_version": "v1",
+        "created_at": "2026-09-14T06:00:00Z",
+        "payload": window_payload,
+        "canonicalization_version": "project-canonical-json-v1",
+        "payload_sha256": hashlib.sha256(b"r2f5/envelope-payload-v1\0" + canonical).hexdigest(),
+    }
+    envelope_canonical = (
+        json.dumps(window_envelope, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    window_envelope["envelope_sha256"] = hashlib.sha256(
+        b"r2f5/envelope-v1\0" + envelope_canonical
+    ).hexdigest()
+    (evidence / "window.json").write_text(
+        json.dumps(window_envelope, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     catalog_roles = (
         "replication_sidecar",
         "daily_shadow",
@@ -275,13 +355,17 @@ def _red_reader() -> Any:
 
 
 def _evaluate(payload: dict[str, Any]) -> Any:
+    # Scenario metadata stays test-local. Only the approved AcceptanceInput
+    # projection is ever handed to the future reader.
+    request = {key: payload[key] for key in INPUT_KEYS}
+    assert set(request) == INPUT_KEYS
     module = _red_reader()
     reader_type = getattr(module, "AcceptanceReader", None)
     assert reader_type is not None, "AcceptanceReader is the required read-only contract"
     reader = reader_type()
     evaluate = getattr(reader, "evaluate", None)
     assert callable(evaluate), "AcceptanceReader.evaluate must be callable"
-    return evaluate(payload)
+    return evaluate(request)
 
 
 def _as_dict(result: Any) -> dict[str, Any]:
@@ -299,7 +383,7 @@ class _CaseSpec:
     """One matrix anchor's expected report and mutation contract."""
 
     requirement: str
-    scenario: str
+    mutation: str
     status: str
     reason: str
     metric: str
@@ -309,6 +393,7 @@ class _CaseSpec:
     target_value: Any
     expected_exception: str | None
     effect: str
+    builder: Any = None
 
 
 _CASE_OVERRIDES: dict[str, tuple[str, str, str, str]] = {
@@ -491,23 +576,13 @@ _CASE_OVERRIDES.update(
 
 
 def _case_specs() -> dict[str, _CaseSpec]:
-    metric_values = {
-        "continuity": ("count", 1, 0),
-        "same_evening_availability": ("count", 17, 18),
-        "coverage": ("ratio", 0.99, 1),
-        "source_purity": ("count", 1, 20),
-        "provenance": ("count", 19, 20),
-        "replay": ("bool", False, True),
-        "replication": ("duration_seconds", 301, 300),
-        "restore": ("duration_seconds", 301, 300),
-        "read_boundary": ("bool", False, True),
-    }
+    failed_values = {"count": 1, "ratio": 0.85, "bool": False, "duration_seconds": 301}
     cases: dict[str, _CaseSpec] = {}
     for anchor in REQUIREMENT_ANCHORS:
         requirement = re.search(r"(?:^|_)(FR|NFR|AC|EC)_(\d+)$", anchor, flags=re.IGNORECASE)
         assert requirement is not None
         requirement_id = f"{requirement.group(1).upper()}-{int(requirement.group(2))}"
-        scenario, status, reason, metric = _CASE_OVERRIDES.get(
+        mutation_name, status, reason, metric = _CASE_OVERRIDES.get(
             requirement_id,
             (
                 f"contract_{requirement_id.lower()}",
@@ -517,15 +592,15 @@ def _case_specs() -> dict[str, _CaseSpec]:
             ),
         )
         unavailable = status == "unavailable" or reason.endswith("_UNAVAILABLE")
-        value_kind, observed_value, target_value = metric_values.get(metric, ("count", 1, 20))
+        value_kind, _passed_value, target_value = METRIC_CONTRACTS[metric]
         cases[anchor] = _CaseSpec(
             requirement=requirement_id,
-            scenario=scenario,
+            mutation=mutation_name,
             status=status,
             reason=reason,
             metric=metric,
             observed_kind=None if unavailable else value_kind,
-            observed_value=None if unavailable else observed_value,
+            observed_value=None if unavailable else failed_values[value_kind],
             target_kind=None if unavailable else value_kind,
             target_value=None if unavailable else target_value,
             expected_exception=None,
@@ -537,71 +612,112 @@ def _case_specs() -> dict[str, _CaseSpec]:
 CASE_SPECS = _case_specs()
 
 
-def _apply_scenario(case: _CaseSpec, captured_window: dict[str, Any]) -> dict[str, Any]:
+def _build_case_input(case: _CaseSpec, captured_window: dict[str, Any]) -> dict[str, Any]:
     payload = deepcopy(captured_window)
-    payload["scenario"] = case.scenario
-    expected_status = "unavailable" if case.reason.endswith("_UNAVAILABLE") else case.status
-    payload["expected"] = {
-        "status": expected_status,
-        "reason": case.reason,
-        "metric": case.metric,
-        "observed": {"kind": case.observed_kind, "value": case.observed_value},
-        "target": {"kind": case.target_kind, "value": case.target_value},
-        "effect": case.effect,
-    }
-    if case.scenario in {"nineteen_sessions", "exact_twenty"}:
+    dataset = Path(payload["local_dataset_root"])
+    evidence = Path(payload["evidence_root"])
+    if case.mutation in {"nineteen_sessions", "exact_twenty"}:
         payload["raw_calendar"] = payload["raw_calendar"][:-1]
-    elif case.scenario in {"duplicate_raw_calendar", "duplicate"}:
+        (dataset / "calendar.json").write_text(
+            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
+        )
+    elif case.mutation in {"duplicate_raw_calendar", "duplicate"}:
         payload["raw_calendar"][5] = payload["raw_calendar"][4]
-    elif case.scenario in {"out_of_order_raw", "replacement_race"}:
+        (dataset / "calendar.json").write_text(
+            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
+        )
+    elif case.mutation in {"out_of_order_raw", "replacement_race"}:
         payload["raw_calendar"][5], payload["raw_calendar"][6] = (
             payload["raw_calendar"][6],
             payload["raw_calendar"][5],
         )
-    elif case.scenario == "missing_middle":
+        (dataset / "calendar.json").write_text(
+            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
+        )
+    elif case.mutation == "missing_middle":
         payload["raw_calendar"].pop(10)
-    elif case.scenario == "future_session":
+        (dataset / "calendar.json").write_text(
+            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
+        )
+    elif case.mutation == "future_session":
         payload["raw_calendar"][-1] = "2099-01-01"
-    elif case.scenario == "missing_control" or case.scenario == "missing_locked_sqlite":
-        Path(payload["control_store_roots"][-1]).unlink()
-    elif case.scenario == "corrupt_sqlite":
+        (dataset / "calendar.json").write_text(
+            json.dumps({"source_sequence": payload["raw_calendar"]}) + "\n", encoding="utf-8"
+        )
+    elif case.mutation == "missing_control" or case.mutation == "missing_locked_sqlite":
+        missing = Path(payload["control_store_roots"][-1])
+        if missing.exists():
+            missing.unlink()
+    elif case.mutation == "corrupt_sqlite":
         Path(payload["control_store_roots"][0]).write_bytes(b"not sqlite")
-    elif case.scenario == "unsafe_path":
+    elif case.mutation == "unsafe_path":
         payload["local_dataset_root"] = "relative-dataset"
-    elif case.scenario == "coverage_failure" or case.scenario == "universe_mismatch":
+    elif case.mutation == "coverage_failure" or case.mutation == "universe_mismatch":
         payload["required_count"] = 100
         payload["loaded_count"] = 99
         payload["unknown_count"] = 1
-    elif case.scenario == "mixed_source":
+    elif case.mutation == "mixed_source":
         payload["canonical_provider_ids"] = ["baostock", "tickflow"]
-    elif case.scenario == "version_drift":
+    elif case.mutation == "version_drift":
         payload["frozen_versions"]["calendar_generation"] = "calendar-drift"
-    elif case.scenario == "unknown_replay_identity":
+        manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+        manifest["generation"] = "calendar-drift"
+        (dataset / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    elif case.mutation == "unknown_replay_identity":
         payload["offline_replay"] = {
             "adapter_id": "unknown",
             "normalizer_id": "unknown",
             "network_allowed": False,
             "provider_requests": 0,
         }
-    elif case.scenario == "local_chain_only":
+    elif case.mutation == "local_chain_only":
         payload["replication_trust_scope"] = "LOCAL_CHAIN_ONLY"
-    elif case.scenario == "missing_restore_drill":
+    elif case.mutation == "missing_restore_drill":
         payload["restore_verification_state"] = None
-    elif case.scenario == "lineage_missing":
+    elif case.mutation == "lineage_missing":
         payload["lineage"] = None
-    elif case.scenario == "calendar_conflict":
+    elif case.mutation == "calendar_conflict":
         payload["calendar_conflict"] = True
-    elif case.scenario == "toctou":
+    elif case.mutation == "toctou":
         payload["toctou_probe"] = True
+    # Every remaining named drill has a material immutable evidence mutation;
+    # the reader receives no fixture-control key for it.
+    (evidence / f"{case.mutation}.json").write_text(
+        json.dumps({"artifact_id": case.mutation, "creator_kind": "task20_writer"}) + "\n",
+        encoding="utf-8",
+    )
     return payload
+
+
+def _anchor_builder(case: _CaseSpec):
+    def build(captured: dict[str, Any]) -> dict[str, Any]:
+        return _build_case_input(case, captured)
+
+    build.__name__ = f"build_{case.requirement.lower()}"
+    return build
+
+
+for _case in CASE_SPECS.values():
+    # Each matrix anchor owns a named callable builder, even when two anchors
+    # share the same fixture mutation implementation.
+    object.__setattr__(_case, "builder", _anchor_builder(_case))
 
 
 def _assert_case_report(case: _CaseSpec, payload: dict[str, Any]) -> None:
     report = _as_dict(_evaluate(payload))
+    assert REPORT_CORE_FIELDS <= report.keys()
+    assert set(EXPECTED_METRICS) <= report.keys()
     expected_status = "unavailable" if case.reason.endswith("_UNAVAILABLE") else case.status
     assert report["status"] == expected_status
     metric = report[case.metric]
-    assert metric["status"] == expected_status
+    expected_metric_status = (
+        "unavailable"
+        if expected_status == "unavailable"
+        else ("pass" if expected_status == "ready" else "fail")
+    )
+    assert metric["status"] == expected_metric_status
     assert metric["reason_code"] == case.reason
     if expected_status == "unavailable":
         assert metric["observed"] is None and metric["target"] is None
@@ -619,13 +735,14 @@ def _make_requirement_test(anchor: str):
 
     def test(captured_window: dict[str, Any]) -> None:
         assert REQUIREMENT_SUMMARIES[anchor], f"matrix summary missing for {anchor}"
-        payload = _apply_scenario(case, captured_window)
-        expected_status = "unavailable" if case.reason.endswith("_UNAVAILABLE") else case.status
-        assert payload["expected"]["status"] == expected_status
-        assert payload["expected"]["reason"] == case.reason
-        assert payload["expected"]["metric"] == case.metric
-        assert payload["expected"]["effect"] == "no_filesystem_db_provider_or_pointer_write"
+        assert callable(case.builder)
+        payload = case.builder(captured_window)
+        roots = [Path(payload[key]) for key in ("local_dataset_root", "evidence_root")] + [
+            Path(path).parent for path in payload["control_store_roots"]
+        ]
+        before = tuple(_physical_fingerprint(root) for root in roots)
         _assert_case_report(case, payload)
+        assert tuple(_physical_fingerprint(root) for root in roots) == before
 
     test.__name__ = anchor
     test.__qualname__ = anchor
@@ -686,22 +803,22 @@ SLO_CASES = {
     metric: _slo_cases(metric, reason, kind, passed, failed, target)
     for metric, reason, kind, passed, failed, target in (
         ("continuity", "CONTINUITY_FAILED", "count", 0, 1, 0),
-        ("next_morning_availability", "AVAILABILITY_CUTOFF_FAILED", "count", 20, 19, 20),
-        ("same_evening_availability", "AVAILABILITY_CUTOFF_FAILED", "count", 18, 17, 18),
+        ("next_morning_availability", "AVAILABILITY_CUTOFF_FAILED", "ratio", 1, 0.95, 1),
+        ("same_evening_availability", "AVAILABILITY_CUTOFF_FAILED", "ratio", 0.9, 0.85, 0.9),
         ("coverage", "COVERAGE_FAILED", "ratio", 1, 0.99, 1),
-        ("canonical_integrity", "CANONICAL_INTEGRITY_FAILED", "count", 20, 19, 20),
-        ("source_purity", "SOURCE_PURITY_FAILED", "count", 20, 19, 20),
-        ("recovery", "RECOVERY_FAILED", "count", 1, 0, 1),
+        ("canonical_integrity", "CANONICAL_INTEGRITY_FAILED", "bool", True, False, True),
+        ("source_purity", "SOURCE_PURITY_FAILED", "bool", True, False, True),
+        ("recovery", "RECOVERY_FAILED", "bool", True, False, True),
         ("failover", "FAILOVER_UNAVAILABLE", "bool", True, False, True),
-        ("provenance", "LINEAGE_UNAVAILABLE", "count", 20, 19, 20),
+        ("provenance", "LINEAGE_UNAVAILABLE", "bool", True, False, True),
         ("replay", "REPLAY_SEMANTIC_MISMATCH", "bool", True, False, True),
         ("adjustment", "ADJUSTMENT_UNAVAILABLE", "bool", True, False, True),
-        ("calendar", "CALENDAR_CONFLICT", "count", 20, 19, 20),
-        ("universe", "UNIVERSE_COUNT_MISMATCH", "count", 20, 19, 20),
-        ("error_handling", "ERROR_HANDLING_FAILED", "count", 6, 5, 6),
+        ("calendar", "CALENDAR_CONFLICT", "bool", True, False, True),
+        ("universe", "UNIVERSE_COUNT_MISMATCH", "bool", True, False, True),
+        ("error_handling", "ERROR_HANDLING_FAILED", "bool", True, False, True),
         ("local_nas_isolation", "LOCAL_NAS_ISOLATION_FAILED", "bool", True, False, True),
         ("replication", "REPLICATION_LAG", "duration_seconds", 0, 301, 300),
-        ("restore", "RESTORE_UNAVAILABLE", "duration_seconds", 0, 301, 300),
+        ("restore", "RESTORE_UNAVAILABLE", "bool", True, False, True),
         ("read_boundary", "READ_BOUNDARY_FAILED", "bool", True, False, True),
     )
 }
@@ -709,15 +826,28 @@ SLO_CASES = {
 
 def _assert_slo_report(case: _SloCase, captured_window: dict[str, Any]) -> None:
     payload = deepcopy(captured_window)
-    payload["slo_metric"] = case.metric
-    payload["slo_mutation"] = case.mutation
-    payload["slo_inputs"] = {
-        "metric": case.metric,
-        "observed": {"kind": case.observed_kind, "value": case.observed_value},
-        "target": {"kind": case.target_kind, "value": case.target_value},
-    }
+    evidence = Path(payload["evidence_root"])
     if case.mutation == "unavailable":
-        Path(payload["control_store_roots"][-1]).unlink()
+        (evidence / "window.json").unlink()
+    else:
+        (evidence / f"{case.metric}-{case.mutation}.json").write_text(
+            json.dumps(
+                {
+                    "metric_value_kind": case.observed_kind,
+                    "observed_value": case.observed_value,
+                    "target_value": case.target_value,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    roots = (
+        Path(payload["local_dataset_root"]),
+        Path(payload["evidence_root"]),
+        Path(payload["control_store_roots"][0]).parent,
+    )
+    before = tuple(_physical_fingerprint(root) for root in roots)
     assert case.metric in EXPECTED_METRICS
     assert case.observed_kind is None or case.observed_kind in {
         "count",
@@ -727,6 +857,8 @@ def _assert_slo_report(case: _SloCase, captured_window: dict[str, Any]) -> None:
         "hash",
     }
     report = _as_dict(_evaluate(payload))
+    assert REPORT_CORE_FIELDS <= report.keys()
+    assert set(EXPECTED_METRICS) <= report.keys()
     assert report["status"] == case.report_status
     result = report[case.metric]
     assert result["status"] == case.metric_status
@@ -742,6 +874,7 @@ def _assert_slo_report(case: _SloCase, captured_window: dict[str, Any]) -> None:
     assert report["writes"] is False
     assert report["restore_started"] is False
     assert report["production_window_started"] is False
+    assert tuple(_physical_fingerprint(root) for root in roots) == before
 
 
 def _make_slo_test(metric: str):
@@ -765,6 +898,88 @@ def test_r2f5_acceptance_fixture_has_exact_anchor_inventory() -> None:
     assert len(set(REQUIREMENT_ANCHORS)) == 92
     assert len(SLO_ANCHORS) == 18
     assert set(SLO_ANCHORS) == {f"test_r2f5_slo_{metric}" for metric in EXPECTED_METRICS}
+    assert all(
+        callable(case.builder) and case.builder.__name__.startswith("build_")
+        for case in CASE_SPECS.values()
+    )
+
+
+def test_r2f5_input_projection_has_no_undeclared_control_fields() -> None:
+    assert INPUT_KEYS == {
+        "start",
+        "end",
+        "local_dataset_root",
+        "evidence_root",
+        "control_store_roots",
+        "now",
+    }
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "request['" + "scenario']" not in source
+    assert "request[" + '"scenario"]' not in source
+
+
+def test_r2f5_reader_receives_only_strict_acceptance_input(captured_window, monkeypatch) -> None:
+    seen = {}
+    module = types.ModuleType(TARGET_MODULE)
+
+    class Reader:
+        def evaluate(self, request):
+            seen.update(request)
+            return {}
+
+    module.AcceptanceReader = Reader
+    monkeypatch.setitem(sys.modules, TARGET_MODULE, module)
+    _evaluate(captured_window)
+    assert set(seen) == INPUT_KEYS
+
+
+def test_r2f5_metric_kinds_match_approved_structured_contract() -> None:
+    block = json.loads(
+        re.search(
+            r"<!-- R2F5_X8_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
+            DESIGN.read_text(encoding="utf-8"),
+            re.S,
+        ).group(1)
+    )
+    assert set(block["metric_fields"]) == set(METRIC_CONTRACTS)
+    for metric, (kind, _passed, target) in METRIC_CONTRACTS.items():
+        contract = block["metric_value_kinds"][metric]
+        expected_range = {
+            "continuity": "[0,20]",
+            "count": "[0,20]",
+            "ratio": "[0,1]",
+            "bool": "boolean",
+            "duration_seconds": "[0,2147483647]",
+        }[kind]
+        assert contract == {
+            "observed": kind,
+            "target": kind,
+            "unavailable_null": True,
+            "range": expected_range,
+        }
+        assert METRIC_CONTRACTS[metric][2] == target
+
+
+def test_r2f5_strict_protocol_simulator_accepts_each_builder_and_material_mutation(
+    captured_window,
+) -> None:
+    for anchor, case in CASE_SPECS.items():
+        assert callable(case.builder), anchor
+        before = {key: captured_window[key] for key in INPUT_KEYS}
+        before_fingerprint = tuple(
+            _physical_fingerprint(Path(captured_window[key]))
+            for key in ("local_dataset_root", "evidence_root")
+        ) + (_physical_fingerprint(Path(captured_window["control_store_roots"][0]).parent),)
+        payload = case.builder(captured_window)
+        request = {key: payload[key] for key in INPUT_KEYS}
+        assert set(request) == INPUT_KEYS
+        assert all(isinstance(request[key], (str, list)) for key in INPUT_KEYS)
+        changed = request != before
+        after_fingerprint = tuple(
+            _physical_fingerprint(Path(captured_window[key]))
+            for key in ("local_dataset_root", "evidence_root")
+        ) + (_physical_fingerprint(Path(captured_window["control_store_roots"][0]).parent),)
+        assert changed or after_fingerprint != before_fingerprint
 
 
 def _fake_reader_module(result: Any) -> types.ModuleType:
@@ -860,10 +1075,21 @@ def test_r2f5_session_negative_cases(captured_window, mutation, expected_reason)
         case["raw_calendar"][-1] = "2099-01-01"
     assert expected_reason in REASONS
     assert case["raw_calendar"] != captured_window["raw_calendar"]
+    (Path(case["local_dataset_root"]) / "calendar.json").write_text(
+        json.dumps({"source_sequence": case["raw_calendar"]}) + "\n", encoding="utf-8"
+    )
     report = _as_dict(_evaluate(case))
     assert report["status"] in {"not_ready", "unavailable"}
     metric = "calendar" if mutation == "future" else "continuity"
+    expected_status = "not_ready" if mutation == "nineteen" else "unavailable"
+    assert report["status"] == expected_status
+    assert report[metric]["status"] == ("fail" if expected_status == "not_ready" else "unavailable")
     assert report[metric]["reason_code"] == expected_reason
+    if expected_status == "unavailable":
+        assert report[metric]["observed"] is None and report[metric]["target"] is None
+    else:
+        assert report[metric]["observed"] == {"kind": "count", "value": 1}
+        assert report[metric]["target"] == {"kind": "count", "value": 20}
 
 
 @pytest.mark.parametrize(
@@ -881,9 +1107,22 @@ def test_r2f5_shanghai_cutoff_boundaries(
 ) -> None:
     case = deepcopy(captured_window)
     case["published_at"] = published_at
+    (Path(case["evidence_root"]) / "cutoff.json").write_text(
+        json.dumps({"published_at": published_at}) + "\n", encoding="utf-8"
+    )
     assert metric in EXPECTED_METRICS
     report = _as_dict(_evaluate(case))
-    assert report[metric]["status"] == ("pass" if should_pass else "fail")
+    expected_status = "pass" if should_pass else "fail"
+    assert report[metric]["status"] == expected_status
+    if should_pass:
+        assert report[metric]["reason_code"] is None
+        expected_value = 1 if metric == "next_morning_availability" else 0.9
+        assert report[metric]["observed"] == {"kind": "ratio", "value": expected_value}
+        assert report[metric]["target"] == {"kind": "ratio", "value": expected_value}
+    else:
+        assert report[metric]["reason_code"] == "AVAILABILITY_CUTOFF_FAILED"
+        assert report[metric]["observed"]["kind"] == "ratio"
+        assert report[metric]["observed"]["value"] < report[metric]["target"]["value"]
 
 
 def test_r2f5_missing_control_db_never_initializes(captured_window) -> None:
@@ -919,11 +1158,22 @@ def test_r2f5_complete_frozen_vector_is_bound_and_drift_is_not_ready(captured_wi
     drifted = deepcopy(captured_window)
     drifted["frozen_versions"]["calendar_generation"] = "calendar-drift"
     assert drifted["frozen_versions"] != versions
-    _evaluate(drifted)
+    manifest = Path(drifted["local_dataset_root"]) / "manifest.json"
+    manifest.write_text(
+        '{"dataset":"test-only","generation":"calendar-drift","schema_version":2}\n',
+        encoding="utf-8",
+    )
+    report = _as_dict(_evaluate(drifted))
+    assert report["status"] == "not_ready"
+    provenance = report["provenance"]
+    assert provenance["status"] == "fail"
+    assert provenance["reason_code"] == "VERSION_DRIFT"
+    assert provenance["observed"] == {"kind": "bool", "value": False}
+    assert provenance["target"] == {"kind": "bool", "value": True}
 
 
 @pytest.mark.parametrize(
-    ("scenario", "expected_reason"),
+    ("mutation", "expected_reason"),
     [
         ("baostock_only", "FAILOVER_UNAVAILABLE"),
         ("no_secondary_qualification", "FAILOVER_UNAVAILABLE"),
@@ -946,10 +1196,10 @@ def test_r2f5_complete_frozen_vector_is_bound_and_drift_is_not_ready(captured_wi
     ],
 )
 def test_r2f5_evidence_failure_is_bounded_and_readonly(
-    captured_window, scenario: str, expected_reason: str
+    captured_window, mutation: str, expected_reason: str
 ) -> None:
     case = deepcopy(captured_window)
-    case["scenario"] = scenario
+    case["fixture_mutation"] = mutation
     assert expected_reason in REASONS or expected_reason in {
         "FAILOVER_UNAVAILABLE",
         "REPLICATION_UNAVAILABLE",
@@ -959,9 +1209,48 @@ def test_r2f5_evidence_failure_is_bounded_and_readonly(
         "RECOVERY_FAILED",
         "ERROR_HANDLING_FAILED",
     }
-    roots = (Path(case["local_dataset_root"]), Path(case["evidence_root"]))
+    roots = (
+        Path(case["local_dataset_root"]),
+        Path(case["evidence_root"]),
+        Path(case["control_store_roots"][0]).parent,
+    )
+    (roots[1] / f"{mutation}.json").write_text(
+        json.dumps({"artifact_id": mutation, "creator_kind": "task20_writer"}) + "\n",
+        encoding="utf-8",
+    )
     before = tuple(_tree_digest(root) for root in roots)
-    _evaluate(case)
+    report = _as_dict(_evaluate(case))
+    metric_by_mutation = {
+        "baostock_only": "failover",
+        "no_secondary_qualification": "failover",
+        "missing_whole_session_drill": "failover",
+        "local_chain_only": "replication",
+        "missing_replication_threshold": "replication",
+        "missing_restore_drill": "restore",
+        "unknown_replay_identity": "replay",
+        "replay_semantic_mismatch": "replay",
+        "lineage_missing": "provenance",
+        "corrupt_envelope_hash": "provenance",
+        "nas_outage_not_retryable": "local_nas_isolation",
+        "recovery_duplicate_publication": "recovery",
+        "forced_error_missing_class": "error_handling",
+    }
+    metric = metric_by_mutation.get(mutation, "read_boundary")
+    unavailable = expected_reason.endswith("_UNAVAILABLE") or expected_reason in {
+        "CONTROL_STATE_UNAVAILABLE",
+        "PATH_INVALID",
+        "SNAPSHOT_CHANGED",
+        "PIT_VISIBILITY_INVALID",
+        "REMOTE_PROOF_MISSING",
+        "INPUT_LIMIT_EXCEEDED",
+    }
+    assert report["status"] == ("unavailable" if unavailable else "not_ready")
+    assert report[metric]["status"] == ("unavailable" if unavailable else "fail")
+    assert report[metric]["reason_code"] == expected_reason
+    if unavailable:
+        assert report[metric]["observed"] is None and report[metric]["target"] is None
+    else:
+        assert report[metric]["observed"] is not None
     assert tuple(_tree_digest(root) for root in roots) == before
 
 
@@ -970,6 +1259,12 @@ def test_r2f5_window_evidence_is_single_task20_envelope(captured_window) -> None
     assert envelope["creator_kind"] == "task20_writer"
     assert envelope["schema_version"] == "r2f5-observation-envelope-v1"
     assert envelope["creator_kind"] not in {"r2f5_reader", "r2f4_writer"}
+    actual = json.loads(
+        (Path(captured_window["evidence_root"]) / "window.json").read_text(encoding="utf-8")
+    )
+    assert actual["creator_kind"] == "task20_writer"
+    assert len(actual["payload_sha256"]) == 64
+    assert len(actual["envelope_sha256"]) == 64
     _evaluate(captured_window)
 
 
@@ -1029,7 +1324,7 @@ def test_r2f5_physical_fingerprint_is_unchanged_on_error(captured_window) -> Non
     evidence = Path(captured_window["evidence_root"])
     before = (_physical_fingerprint(dataset), _physical_fingerprint(evidence))
     case = deepcopy(captured_window)
-    case["scenario"] = "snapshot_content_changed"
+    case["fixture_mutation"] = "snapshot_content_changed"
     _evaluate(case)
     assert (_physical_fingerprint(dataset), _physical_fingerprint(evidence)) == before
 
@@ -1054,7 +1349,7 @@ def test_r2f5_tree_identity_rejects_unsafe_filesystem_shapes(
     else:
         os.link(dataset / "manifest.json", dataset / "manifest-hardlink.json")
     case = deepcopy(captured_window)
-    case["scenario"] = f"unsafe_{filesystem_shape}"
+    case["fixture_mutation"] = f"unsafe_{filesystem_shape}"
     assert _physical_fingerprint(dataset)
     _evaluate(case)
 
@@ -1064,7 +1359,7 @@ def test_r2f5_sqlite_corrupt_and_locked_inputs_remain_write_free(captured_window
     database.write_bytes(b"not sqlite")
     before_corrupt = _physical_fingerprint(database.parent)
     corrupt = deepcopy(captured_window)
-    corrupt["scenario"] = "corrupt_sqlite"
+    corrupt["fixture_mutation"] = "corrupt_sqlite"
     _evaluate(corrupt)
     assert database.read_bytes() == b"not sqlite"
     assert _physical_fingerprint(database.parent) == before_corrupt
@@ -1073,7 +1368,7 @@ def test_r2f5_sqlite_corrupt_and_locked_inputs_remain_write_free(captured_window
     connection = sqlite3.connect(database, timeout=0.01)
     connection.execute("BEGIN EXCLUSIVE")
     locked = deepcopy(captured_window)
-    locked["scenario"] = "locked_sqlite"
+    locked["fixture_mutation"] = "locked_sqlite"
     _evaluate(locked)
     connection.rollback()
     connection.close()
@@ -1094,7 +1389,7 @@ def test_r2f5_sqlite_catalog_drift_is_unavailable_without_migration(captured_win
             connection.execute("PRAGMA user_version=99")
     before = _physical_fingerprint(database.parent)
     case = deepcopy(captured_window)
-    case["scenario"] = f"catalog_{drift}_drift"
+    case["fixture_mutation"] = f"catalog_{drift}_drift"
     report = _as_dict(_evaluate(case))
     assert report["status"] == "unavailable"
     assert report["read_boundary"]["reason_code"] == "CONTROL_STATE_UNAVAILABLE"
@@ -1110,7 +1405,7 @@ def test_r2f5_wal_snapshot_is_readonly_and_rejects_concurrent_change(captured_wi
         connection.commit()
     before = _physical_fingerprint(database.parent)
     case = deepcopy(captured_window)
-    case["scenario"] = "wal_concurrent_snapshot"
+    case["fixture_mutation"] = "wal_concurrent_snapshot"
     report = _as_dict(_evaluate(case))
     assert report["status"] == "unavailable"
     assert report["read_boundary"]["reason_code"] in {
@@ -1120,12 +1415,47 @@ def test_r2f5_wal_snapshot_is_readonly_and_rejects_concurrent_change(captured_wi
     assert _physical_fingerprint(database.parent) == before
 
 
+def test_r2f5_wal_writer_thread_is_external_and_reader_reports_snapshot_change(
+    captured_window,
+) -> None:
+    import threading
+
+    database = Path(captured_window["control_store_roots"][0])
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE wal_thread (id INTEGER PRIMARY KEY, value TEXT)")
+    go = threading.Event()
+    finished = threading.Event()
+
+    def writer() -> None:
+        go.wait(timeout=1)
+        with sqlite3.connect(database, timeout=1) as connection:
+            connection.execute("INSERT INTO wal_thread VALUES (1, 'external')")
+            connection.commit()
+        finished.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    before = _physical_fingerprint(database.parent)
+    go.set()
+    try:
+        report = _as_dict(_evaluate(captured_window))
+    finally:
+        thread.join(timeout=2)
+    assert finished.is_set()
+    assert report["status"] == "unavailable"
+    assert report["read_boundary"]["status"] == "unavailable"
+    assert report["read_boundary"]["reason_code"] == "SNAPSHOT_CHANGED"
+    assert report["provider_requests"] == 0 and report["writes"] is False
+    assert _physical_fingerprint(database.parent) != before
+
+
 def test_r2f5_tree_size_limit_is_bounded_not_sampled(captured_window) -> None:
     oversized = Path(captured_window["local_dataset_root"]) / "oversized.bin"
     oversized.open("wb").truncate(536_870_913)
     before = _physical_fingerprint(oversized.parent)
     case = deepcopy(captured_window)
-    case["scenario"] = "size_limit"
+    case["fixture_mutation"] = "size_limit"
     report = _as_dict(_evaluate(case))
     assert report["status"] == "unavailable"
     assert report["read_boundary"]["reason_code"] == "INPUT_LIMIT_EXCEEDED"
@@ -1143,27 +1473,49 @@ def test_r2f5_digest_known_vector_and_self_exclusion_are_independent(captured_wi
     preimage = _independent_jcs(payload)
     assert preimage == b'{"a":"\xe6\xb1\x89\xe5\xad\x97","nullable":null,"z":1}\n'
     digest = hashlib.sha256(b"r2f5/test-v1\0" + preimage).hexdigest()
-    assert digest == hashlib.sha256(b"r2f5/test-v1\0" + preimage).hexdigest()
+    assert digest == "78bace6ee01a85ac5794470c6acfa60103a0f9f3cff40f6cadf6805667d6902b"
     case = deepcopy(captured_window)
-    case["scenario"] = "digest_known_vector"
+    case["fixture_mutation"] = "digest_known_vector"
     case["expected_payload_sha256"] = digest
     _evaluate(case)
 
 
+def test_r2f5_external_payload_envelope_and_semantic_vectors_are_literal() -> None:
+    payload = b'{"a":1,"b":"x"}\n'
+    envelope = (
+        b'{"artifact_id":"a","artifact_ref":"r",'
+        b'"canonicalization_version":"project-canonical-json-v1",'
+        b'"created_at":"2026-01-01T00:00:00Z","creator_kind":"task20_writer",'
+        b'"creator_version":"v1","payload_sha256":"00",'
+        b'"schema_version":"r2f5-observation-envelope-v1"}\n'
+    )
+    semantic = b'{"status":"unavailable"}\n'
+    assert hashlib.sha256(b"r2f5/envelope-payload-v1\0" + payload).hexdigest() == (
+        "030f98b799fb67a849527d2442a4a846ead97f2af036a4b60ebdccc3a0d17a3d"
+    )
+    assert hashlib.sha256(b"r2f5/envelope-v1\0" + envelope).hexdigest() == (
+        "eb5fcb4e1da1692d93d4ce2787828362f117a49f01d07ef2121d4fd65f5fad52"
+    )
+    assert hashlib.sha256(b"r2f5/semantic-report-v1\0" + semantic).hexdigest() == (
+        "a58f08564f68f6d5b2bd89e78c6ae1e5aea6c1053ad4d873544083e74a25f2ff"
+    )
+
+
 def test_r2f5_wrong_creator_schema_or_hash_is_unavailable(captured_window) -> None:
-    envelope = captured_window["window_evidence_bundle"]
+    path = Path(captured_window["evidence_root"]) / "window.json"
     for field, value in (
         ("creator_kind", "r2f5_reader"),
         ("schema_version", "r2f4-envelope-v1"),
         ("payload_sha256", "f" * 64),
     ):
+        envelope = json.loads(path.read_text(encoding="utf-8"))
         case = deepcopy(captured_window)
-        case["scenario"] = f"tamper_{field}"
-        case["window_evidence_bundle"][field] = value
-        assert case["window_evidence_bundle"] != envelope
+        case["fixture_mutation"] = f"tamper_{field}"
+        envelope[field] = value
+        path.write_text(json.dumps(envelope, sort_keys=True) + "\n", encoding="utf-8")
         report = _as_dict(_evaluate(case))
         assert report["status"] == "unavailable"
-        assert report["provenance"]["reason_code"] == "LINEAGE_INVALID"
+        assert report["canonical_integrity"]["reason_code"] == "CANONICAL_INTEGRITY_FAILED"
 
 
 def test_r2f5_provider_and_socket_sentinels_are_never_called(captured_window, monkeypatch) -> None:
@@ -1176,25 +1528,57 @@ def test_r2f5_provider_and_socket_sentinels_are_never_called(captured_window, mo
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     case = deepcopy(captured_window)
-    case["scenario"] = "offline_replay"
+    case["fixture_mutation"] = "offline_replay"
     _evaluate(case)
     assert calls["connect"] == 0
 
 
-def test_r2f5_toctou_hook_replacement_invalidates_whole_snapshot(captured_window) -> None:
+def test_r2f5_provider_adapter_ctor_login_query_and_default_reader_are_sentinels(
+    captured_window, monkeypatch
+) -> None:
+    module = _red_reader()
+    calls = {"count": 0}
+
+    class ForbiddenProvider:
+        def __init__(self, *_args, **_kwargs):
+            calls["count"] += 1
+            raise AssertionError("provider construction is forbidden")
+
+        def login(self, *_args, **_kwargs):
+            calls["count"] += 1
+            raise AssertionError("provider login is forbidden")
+
+        def query(self, *_args, **_kwargs):
+            calls["count"] += 1
+            raise AssertionError("provider query is forbidden")
+
+    for name in ("BaoStockProviderAdapter", "BaoStockProvider", "EvidenceReader"):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, ForbiddenProvider)
+    _evaluate(captured_window)
+    assert calls["count"] == 0
+
+
+def test_r2f5_toctou_hook_replacement_invalidates_whole_snapshot(
+    captured_window, monkeypatch
+) -> None:
+    module = _red_reader()
+    assert hasattr(module, "os")
     dataset = Path(captured_window["local_dataset_root"])
     replacement = dataset / "manifest.replacement"
     replacement.write_text("replacement\n", encoding="utf-8")
     called = {"value": False}
 
-    def replace_during_read() -> None:
-        called["value"] = True
-        os.replace(replacement, dataset / "manifest.json")
+    original_fstat = module.os.fstat
 
-    case = deepcopy(captured_window)
-    case["scenario"] = "toctou"
-    case["before_content_read"] = replace_during_read
-    report = _as_dict(_evaluate(case))
+    def fstat(fd):
+        if not called["value"]:
+            called["value"] = True
+            os.replace(replacement, dataset / "manifest.json")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(module.os, "fstat", fstat)
+    report = _as_dict(_evaluate(captured_window))
     assert called["value"] is True
     assert report["status"] == "unavailable"
     assert report["read_boundary"]["reason_code"] == "SNAPSHOT_CHANGED"
@@ -1214,12 +1598,36 @@ def test_r2f5_maximum_reference_fixture_is_bounded_and_write_free(captured_windo
     assert _physical_fingerprint(dataset) == before
 
 
+def test_r2f5_maximum_sqlite_fixture_uses_public_reader_and_p95(captured_window) -> None:
+    database = Path(captured_window["control_store_roots"][0])
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE perf_rows (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.executemany(
+            "INSERT INTO perf_rows VALUES (?, ?)",
+            ((index, str(index)) for index in range(100_000)),
+        )
+    before = _physical_fingerprint(database.parent)
+    samples = []
+    for _ in range(6):
+        started = time.perf_counter()
+        _evaluate(captured_window)
+        samples.append((time.perf_counter() - started) * 1000)
+    assert sorted(samples)[4] < 10_000
+    assert _physical_fingerprint(database.parent) == before
+
+
 def test_r2f5_pre_capture_failure_has_typed_payload_and_no_fabricated_observations(
     captured_window,
 ) -> None:
     Path(captured_window["control_store_roots"][-1]).unlink()
     case = deepcopy(captured_window)
-    case["scenario"] = "pre_capture_unavailable"
+    case["fixture_mutation"] = "pre_capture_unavailable"
+    roots = (
+        Path(case["local_dataset_root"]),
+        Path(case["evidence_root"]),
+        Path(case["control_store_roots"][0]).parent,
+    )
+    before = tuple(_physical_fingerprint(root) for root in roots)
     report = _as_dict(_evaluate(case))
     failure = report["pre_capture_failure"]
     assert report["status"] == "unavailable"
@@ -1228,3 +1636,5 @@ def test_r2f5_pre_capture_failure_has_typed_payload_and_no_fabricated_observatio
     assert report["snapshot_identity"] is None
     assert report["session_observations"] == []
     assert report["semantic_report_sha256"] == failure["semantic_report_sha256"]
+    assert report["provider_requests"] == 0 and report["writes"] is False
+    assert tuple(_physical_fingerprint(root) for root in roots) == before
