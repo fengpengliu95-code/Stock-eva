@@ -8,8 +8,8 @@ pass, or establish Task 20 production soak.
 X8 revision base: `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
-SQLite amendment X3 base: `ec8d244184b231979f8fc2af7dc1029eb95b623d` (clean committed base;
-X3 candidate not yet audited).
+SQLite amendment X4 base: `1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` (clean committed X3 base;
+X4 candidate not yet audited).
 
 Approval metadata: independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. L1 is the catalog-source validator's `startswith` checks, which MUST be

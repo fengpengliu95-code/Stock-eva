@@ -10,8 +10,8 @@
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**SQLite amendment X3 base:** `ec8d244184b231979f8fc2af7dc1029eb95b623d` (clean committed base;
-X3 candidate not yet audited)
+**SQLite amendment X4 base:** `1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` (clean committed X3 base;
+X4 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -5481,9 +5481,10 @@ where present. Each catalog's `schema_version_source` identifies its pragma, exa
 run a migration, initialize a missing store, rewrite schema identity or open an input DB through
 SQLite. The daily circuit catalog uses the authoritative `endpoint` primary key and event `endpoint`
 foreign-key columns; `circuit_id` is not accepted. The SQLite limit is 1,000,000 rows per database
-and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`. The semantic
-fingerprint is the exact ordered member fingerprints plus logical and catalog digests; raw temp
-paths and volatile elapsed/cleanup diagnostics are excluded.
+and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`. The SQLite
+snapshot digest preimage contains the exact ordered `[db,wal,shm]` member fingerprints, followed by
+`rollback_journal_absence`, `logical_digest` and `catalog_digest`; raw temp paths and volatile
+elapsed/cleanup diagnostics are excluded.
 
 ## R2-F5.0 metric contract and evidence sources
 

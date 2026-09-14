@@ -1551,6 +1551,26 @@ def test_r2f5_sqlite_zero_write_amendment_forbids_direct_input_open() -> None:
         assert "max_attempts=1" in text or "one attempt" in text
     assert "writer begun after" in design
     assert "## SQLite zero-write planned RED crosswalk (X3)" in matrix
+    normalized_design = " ".join(design.split())
+    assert (
+        "The SQLite snapshot digest preimage contains the exact ordered `[db,wal,shm]` member "
+        "fingerprints, followed by `rollback_journal_absence`, `logical_digest` and "
+        "`catalog_digest`; raw temp paths and volatile elapsed/cleanup diagnostics are excluded."
+        in normalized_design
+    )
+    task_two = _section(
+        plan,
+        "### Task 2 — Read-only snapshot and report domain",
+        "### Task 3 — Metrics, replay and status wiring",
+    )
+    normalized_task_two = " ".join(task_two.split())
+    assert (
+        "At `initial_probe`, `round_1_pre_copy`, `round_1_post_copy`, `round_2_pre_copy`, "
+        "`round_2_post_copy` and `final_path_reprobe`, use descriptor-relative "
+        "`lstat`/`fstatat(..., AT_SYMLINK_NOFOLLOW)` from that same retained parent dirfd to prove "
+        "`<db>-journal` remains absent and require parent mode/mtime/ctime to remain exact; any "
+        "journal presence or parent metadata drift MUST fail closed." in normalized_task_two
+    )
 
 
 def test_r2f5_sqlite_crosswalk_rejects_anchor_schema_and_digest_mutations() -> None:

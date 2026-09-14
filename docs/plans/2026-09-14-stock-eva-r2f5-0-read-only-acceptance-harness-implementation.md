@@ -20,8 +20,8 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**SQLite amendment X3 base:** `ec8d244184b231979f8fc2af7dc1029eb95b623d` (clean committed base;
-X3 candidate not yet audited)
+**SQLite amendment X4 base:** `1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` (clean committed X3 base;
+X4 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -609,6 +609,11 @@ a test failure, not a tolerated RED condition.
 Implement the minimum Pydantic models and pure evaluator from the design. Reuse strict readers;
 retain one parent dirfd and re-lstat/re-open/compare each source DB/WAL/SHM entry before/after each
 copy in both complete rounds; require exact fingerprint/copy equality and detect unlink/recreate.
+At `initial_probe`, `round_1_pre_copy`, `round_1_post_copy`, `round_2_pre_copy`,
+`round_2_post_copy` and `final_path_reprobe`, use descriptor-relative
+`lstat`/`fstatat(..., AT_SYMLINK_NOFOLLOW)` from that same retained parent dirfd to prove
+`<db>-journal` remains absent and require parent mode/mtime/ctime to remain exact; any journal
+presence or parent metadata drift MUST fail closed.
 Create both exact-name trios under approved system temp outside all inputs with root `0700`/current
 uid/no-follow and file `0600`/`O_EXCL`; fsync only temp descriptors. Open only the selected temp DB
 using ordinary `mode=rw`, set `query_only`, apply WAL and read integrity/catalog/logical rows;
