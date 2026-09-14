@@ -146,16 +146,35 @@ def _reason_source(design: str) -> list[str]:
     return re.findall(r'"([A-Z][A-Z0-9_]+)"', match.group(1))
 
 
-def _x5_contract(design: str) -> dict[str, object]:
+def _x6_contract(design: str) -> dict[str, object]:
     match = re.search(
-        r"<!-- R2F5_X5_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
+        r"<!-- R2F5_X6_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
         design,
         flags=re.DOTALL,
     )
-    assert match, "X5 structured contract block missing"
+    assert match, "X6 structured contract block missing"
     value = json.loads(match.group(1))
     assert isinstance(value, dict)
     return value
+
+
+def _model_digest_fields(design: str) -> set[str]:
+    """Read digest-typed fields from the TypeScript interfaces, including nested error events."""
+    block = _section(design, "type MetricValue =", "### Status and reason vocabulary")
+    fields: set[str] = set()
+    for match in re.finditer(
+        r"interface\s+(\w+(?:<T>)?)\s*\{(.*?)(?=\ninterface\s+|\ntype\s+|\Z)",
+        block,
+        flags=re.DOTALL,
+    ):
+        model, body = match.groups()
+        model = model.removesuffix("<T>")
+        for field in re.findall(r"\b((?:[A-Za-z][A-Za-z0-9_]*(?:sha256|digest))|sha256)\s*:", body):
+            qualified = f"{model}.{field}"
+            if model == "ErrorHandlingObservation" and field == "evidence_sha256":
+                qualified = "ErrorHandlingObservation.events.evidence_sha256"
+            fields.add(qualified)
+    return fields
 
 
 def _reason_tokens(text: str) -> set[str]:
@@ -217,7 +236,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         assert heading in text
     assert "SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
-    assert "affa7153ef088dbd6e7004eeed721588e24656cc" in text
+    assert "68125def42796e8fcf87810c9aa59e1d7eaf2bed" in text
     assert "MUST" in text and "MUST NOT" in text
     assert "production_window_started=false" in text
     assert "Task 20" in text and "20 confirmed consecutive" in text
@@ -248,7 +267,7 @@ def test_r2f5_crosswalk_is_exact_and_anchored() -> None:
         for match in (
             re.match(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (test_r2f5_req_[a-z]+_\d{2}) \|$", line)
             for line in _section(
-                plan, "## Planned pytest anchor catalog (X5)", "## Planned implementation tasks"
+                plan, "## Planned pytest anchor catalog (X6)", "## Planned implementation tasks"
             ).splitlines()
         )
         if match
@@ -272,7 +291,7 @@ def test_r2f5_requirement_blocks_are_rfc2119_and_unique() -> None:
 
 def test_r2f5_no_anchor_or_result_is_claimed() -> None:
     matrix = MATRIX.read_text(encoding="utf-8")
-    assert "affa7153ef088dbd6e7004eeed721588e24656cc" in matrix
+    assert "68125def42796e8fcf87810c9aa59e1d7eaf2bed" in matrix
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in matrix
     assert "No catalog entry exists or passes yet" in PLAN.read_text(encoding="utf-8")
     assert "Task 20" in matrix and "production soak" in matrix
@@ -465,7 +484,7 @@ def test_r2f5_matrix_has_one_explicit_row_per_roadmap_slo() -> None:
     assert all(row[2].strip() and ";" in row[2] for row in design_rows)
 
 
-def test_r2f5_x5_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
+def test_r2f5_x6_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
     matrix = MATRIX.read_text(encoding="utf-8")
@@ -478,12 +497,12 @@ def test_r2f5_x5_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> No
         if (design + plan)[match.end() : match.end() + 3] != ".py"
     }
     assert body_tokens <= allowed, sorted(body_tokens - allowed)
-    assert "## Planned pytest anchor catalog (X5)" in plan
+    assert "## Planned pytest anchor catalog (X6)" in plan
     assert "no hand-written dimension count" in design or "fixed expected tuple" in design
     assert "replication" in matrix and "child of local/NAS" in matrix
 
 
-def test_r2f5_x5_metric_union_and_window_evidence_are_closed() -> None:
+def test_r2f5_x6_metric_union_and_window_evidence_are_closed() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "type MetricResult =" in design
     assert 'status: "pass"' in design and "reason_code: null" in design
@@ -497,7 +516,7 @@ def test_r2f5_x5_metric_union_and_window_evidence_are_closed() -> None:
     assert "Overall status precedence" in design
 
 
-def test_r2f5_x5_model_source_mapping_and_read_only_restore_contract() -> None:
+def test_r2f5_x6_model_source_mapping_and_read_only_restore_contract() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "provider_record.provider_id" in design
     assert "qualification_window.window_id" in design
@@ -512,7 +531,7 @@ def test_r2f5_x5_model_source_mapping_and_read_only_restore_contract() -> None:
     assert "maximum" in design and "unavailable" in design
 
 
-def test_r2f5_x5_time_hash_and_cardinality_contracts_are_explicit() -> None:
+def test_r2f5_x6_time_hash_and_cardinality_contracts_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "YYYY-MM-DD" in design
     assert "RFC3339" in design or "UTC instant" in design
@@ -524,7 +543,7 @@ def test_r2f5_x5_time_hash_and_cardinality_contracts_are_explicit() -> None:
     assert "canonical JSON" in design and "hash preimage" in design
 
 
-def test_r2f5_x5_validator_checks_interface_tokens_and_collection_bounds() -> None:
+def test_r2f5_x6_validator_checks_interface_tokens_and_collection_bounds() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     fingerprint = _section(design, "interface SnapshotFingerprint {", "// All fields")
     for field in (
@@ -560,9 +579,9 @@ def test_r2f5_x5_validator_checks_interface_tokens_and_collection_bounds() -> No
     assert "window_evidence_refs" in design and "exactly one" in design
 
 
-def test_r2f5_x5_structured_contract_is_closed_and_crosswalked() -> None:
+def test_r2f5_x6_structured_contract_is_closed_and_crosswalked() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x5_contract(design)
+    contract = _x6_contract(design)
     canonical_contract = json.dumps(
         contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -611,7 +630,117 @@ def test_r2f5_x5_structured_contract_is_closed_and_crosswalked() -> None:
     }
 
 
-def test_r2f5_x5_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
+def test_r2f5_x6_digest_contracts_cover_models_without_self_inclusion() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    contract = _x6_contract(design)
+    entries = contract["digest_contracts"]
+    assert isinstance(entries, list) and entries
+    fields = [entry["field"] for entry in entries]
+    assert len(fields) == len(set(fields))
+    assert set(fields) == _model_digest_fields(design)
+    required_keys = {
+        "field",
+        "canonicalization_version",
+        "root_object_type",
+        "included_field_paths",
+        "excluded_fields",
+        "ordering",
+        "null_encoding",
+        "domain_separation_prefix",
+    }
+    for entry in entries:
+        assert set(entry) == required_keys
+        field_name = entry["field"].rsplit(".", 1)[-1]
+        assert field_name not in entry["included_field_paths"]
+        assert field_name in " ".join(entry["excluded_fields"])
+        assert not any(
+            token in entry["included_field_paths"]
+            for token in (
+                "complete_object",
+                "complete_frozen_version_vector",
+                "all_declared_session_fields",
+                "metric_results",
+                "validated_config_fields",
+            )
+        )
+        assert entry["canonicalization_version"] == "project-canonical-json-v1"
+        assert entry["domain_separation_prefix"].startswith("r2f5/")
+        assert entry["included_field_paths"]
+        assert entry["ordering"] and entry["null_encoding"]
+
+
+def test_r2f5_x6_date_metric_creator_and_limits_contracts_match_models() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    contract = _x6_contract(design)
+    assert set(contract["date_time_formats"]) == {"session_date", "rfc3339_utc", "as_of"}
+    assert "YYYY-MM-DD" in contract["date_time_formats"]["session_date"]
+    assert "RFC3339" in contract["date_time_formats"]["rfc3339_utc"]
+    assert "Asia/Shanghai" in contract["date_time_formats"]["as_of"]
+    metric_kinds = contract["metric_value_kinds"]
+    assert set(metric_kinds) == set(contract["metric_fields"])
+    for field, spec in metric_kinds.items():
+        assert spec["observed"] in {"count", "ratio", "duration_ms", "bool", "hash"}, field
+        assert spec["target"] == spec["observed"], field
+        assert spec["unavailable_null"] is True
+        assert spec["range"]
+    creators = contract["creator_allowlist"]
+    assert set(creators["production_envelope_payloads"]) == {
+        "WindowEvidenceBundlePayload",
+        "RecoveryObservation",
+        "WholeSessionFailoverDrill",
+        "ReplaySampleEvidence",
+        "AdjustmentEquivalenceEvidence",
+        "ErrorHandlingObservation",
+        "LocalNasIsolationObservation",
+        "RestoreDrillEvidence",
+    }
+    assert all(
+        value == ["task20_writer"] for value in creators["production_envelope_payloads"].values()
+    )
+    assert creators["reader_projections"] == {
+        "SecondaryQualificationProjection": [],
+        "CompletedReplicationRestoreSnapshotV1": [],
+    }
+    assert creators["synthetic_envelope_only"] == ["test_fixture"]
+    assert creators["reader_never_creates"] == ["r2f5_reader", "r2f4_writer"]
+    assert contract["limits"] == {
+        "max_entries": 100000,
+        "max_input_bytes": 536870912,
+        "max_db_rows": 1000000,
+        "max_input_roots": 32,
+        "max_sessions": 20,
+        "max_replay_samples": 3,
+        "max_elapsed_ms": 10000,
+    }
+
+
+def test_r2f5_x6_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    plan = PLAN.read_text(encoding="utf-8")
+    matrix = MATRIX.read_text(encoding="utf-8")
+    contract = _x6_contract(design)
+    metric_fields = set(contract["metric_fields"])
+    report = _section(design, "interface R2FAcceptanceReport {", "interface SnapshotIdentity {")
+    report_fields = set(re.findall(r"^\s+([a-z_]+): MetricResult;", report, re.MULTILINE))
+    assert report_fields == metric_fields
+    assert metric_fields <= set(_field for _field, *_rest in _slo_rows(design))
+    assert metric_fields <= set(_field for _field, *_rest in _matrix_slo_rows(matrix))
+    assert all(field in plan for field in metric_fields)
+    reducers = contract["metric_reducers"]
+    for field, paths in reducers.items():
+        assert paths and all(path.count(".") >= 1 for path in paths), field
+        assert all(
+            path.split(".", 1)[0] in {"session", "window", "frozen_versions"} for path in paths
+        ), field
+    creators = contract["creator_allowlist"]["production_envelope_payloads"]
+    for payload_type in creators:
+        assert (
+            payload_type == "WindowEvidenceBundlePayload" or f"interface {payload_type} " in design
+        )
+    assert "r2f5_reader" in design and "MUST NOT appear as envelope creators" in design
+
+
+def test_r2f5_x6_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     envelope = _section(
         design,
@@ -681,7 +810,7 @@ def test_r2f5_x5_envelope_raw_facts_and_pre_capture_models_are_explicit() -> Non
     assert "Task19 only opens immutable refs" in design
 
 
-def test_r2f5_x5_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
+def test_r2f5_x6_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     metric_value = _section(design, "type MetricValue =", "type MetricResult =")
     assert all(

@@ -18,7 +18,7 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (must remain the starting identity)
 
-**X5 revision base:** `affa7153ef088dbd6e7004eeed721588e24656cc` (clean X4)
+**X6 revision base:** `68125def42796e8fcf87810c9aa59e1d7eaf2bed` (clean X5)
 
 **Worktree:** `/Users/finlay/.codex/worktrees/r2f5-0/Stock- evaluation`
 
@@ -42,9 +42,8 @@ design first and stop implementation until the reviewed specification is amended
 - FR-1: The implementation MUST create only the acceptance reader/report domain and read-only CLI/
   API wiring described by the design; it MUST NOT add a writer or provider path.
 - FR-2: It MUST validate paths and capture/fingerprint one immutable snapshot before evaluation;
-  each input uses descriptor identity plus the deterministic full tree/full-file streaming
-  SHA-256 contract (sorted safe POSIX paths, entry type/mode/size and content), with a 512 MiB
-  maximum and no bounded sampling claim.
+  each directory uses the descriptor-bound deterministic tree algorithm and each SQLite database
+  uses the unique read-only logical-snapshot algorithm, with no bounded sampling claim.
 - FR-3: It MUST select exactly 20 confirmed consecutive sessions and preserve missing-middle,
   19-versus-20 and future/PIT distinctions.
 - FR-4: It MUST freeze and compare the complete version vector, apply inclusive Shanghai cutoffs,
@@ -52,7 +51,8 @@ design first and stop implementation until the reviewed specification is amended
 - FR-5: It MUST consume evidence/candidate/selection/replay/calendar/universe/replication/restore
   records without mutation and fail closed on missing, corrupt, locked or changed inputs.
 - FR-6: It MUST expose the exact report, API, CLI exits, mutation markers and redaction contract.
-- FR-7: It MUST stop at bounded object/row/sample/time limits and record measured counters.
+- FR-7: It MUST stop at explicit input-root, tree-entry, byte, SQLite-row, session and replay-
+  sample limits, return `INPUT_LIMIT_EXCEEDED` when exceeded, and record measured counters.
 - FR-8: It MUST leave protected predecessor readers, schemas, fixtures and public models compatible.
 - FR-9: It MUST expose separate MetricResult fields for every roadmap Section 10 dimension, including
   canonical integrity, recovery, failover, adjustment, error handling, local/NAS isolation,
@@ -88,7 +88,8 @@ design first and stop implementation until the reviewed specification is amended
 - FR-24: It MUST preserve raw calendar order/duplicates and bind SnapshotIdentity to all inputs.
 - FR-25: It MUST return exactly 20 ordered per-session observations or digest-bound references.
 - FR-26: It MUST exclude volatile diagnostics from semantic JSON and its digest.
-- FR-27: It MUST enforce closed enums, reasons, hashes, IDs, counters and quality issues.
+- FR-27: It MUST enforce closed enums, reason partitions, typed MetricValue/date-time kinds,
+  hashes, IDs, counters, digest contracts and quality issues.
 - FR-28: It MUST enforce exact reason precedence and fail closed on concurrent snapshot changes.
 
 ## Non-Functional Requirements
@@ -124,21 +125,21 @@ Given the design and plan at the base commit, when the strict design validator a
 run, then all mandatory sections, RFC 2119 requirements, unique IDs, AC parent references and
 planned anchors are validated, with no implementation or production result claimed.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-2: RED boundary (FR-1, NFR-2)
 
 Given the base tree before implementation, when the prescribed R2-F5 focused RED command runs,
 then the absent acceptance service/API/CLI is demonstrated without provider/network/production I/O.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-3: GREEN report (FR-2, FR-3, FR-4, FR-5, FR-6, FR-7)
 
 Given synthetic read-only fixtures, when the implementation evaluates them, then the report matches
 the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-4: Full/static compatibility (FR-8, NFR-1, NFR-2)
 
@@ -146,9 +147,9 @@ Given the implemented slice, when focused, full, Ruff, compileall, diff and prot
 checks run, then no predecessor compatibility surface is mutated and all gates are recorded by the
 future acceptance owner. This plan records no result now.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
-Traceability: the planned X5 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
+Traceability: the planned X6 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
 FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23,
 FR-24, FR-25, FR-26, FR-27 and FR-28.
 
@@ -186,6 +187,12 @@ volatile diagnostic envelope. Secondary qualification/admission, whole-session f
 completed replication/restore readers are strict read-only adapters over existing immutable
 records; they do not widen `ProviderId` or persisted schemas.
 
+The exact report metric field tuple is:
+`continuity`, `next_morning_availability`, `same_evening_availability`, `coverage`,
+`canonical_integrity`, `source_purity`, `recovery`, `failover`, `provenance`, `replay`,
+`adjustment`, `calendar`, `universe`, `error_handling`, `local_nas_isolation`, `replication`,
+`restore`, `read_boundary`.
+
 The implementation MUST add only read-only projection/descriptor readers where an existing status
 reader is insufficient: `read_status`/`read_window` cannot establish historical secondary
 qualification, admission or whole-session forced-failover proof. Qualification/admission and
@@ -200,14 +207,22 @@ default provider-capable adapter, credential lookup, login/query, network/socket
 mutation is permitted. A provider-request sentinel and network/socket fake are required test seams;
 the existing `EvidenceReader` default path is not a valid direct dependency for this contract.
 
-The spec crosswalk MUST parse the design's fenced `R2F5_X5_CONTRACTS_JSON` block as the
+The spec crosswalk MUST parse the design's fenced `R2F5_X6_CONTRACTS_JSON` block as the
 machine-readable source for reason partitions, status/reason matrix, reducer field references,
 envelope fields, cardinalities and the fixed roadmap tuple. It MUST compare those sets with the
 API/model tokens and matrix SLO rows, reject duplicate or unknown definitions and report the
 block's structural result only; canonical hash semantics and reducer correctness still require
 human review. No validator result is an implementation or production acceptance claim.
-The validator MUST also recompute and compare the declared X5 contract-block SHA-256 so prose,
+The validator MUST also recompute and compare the declared X6 contract-block SHA-256 so prose,
 machine fields and the frozen block cannot drift silently.
+
+X6 extends that machine block with one exact `digest_contracts` entry for every digest field,
+strict date/time formats, all 18 observed/target `MetricValue` kinds and the per-payload creator
+allowlist. The validator MUST compare those contracts against the design interfaces, report metric
+field names/reducers, implementation-plan model rows and matrix SLO rows. It MUST reject an absent,
+duplicate or self-including digest contract; it MUST treat R2-F4 reader projections as non-artifacts
+and reject `r2f5_reader`/`r2f4_writer` envelope creation. Synthetic `test_fixture` envelopes are
+test-only and MUST be rejected for production acceptance.
 
 ## Data Models
 
@@ -234,7 +249,14 @@ No persistence migration or new writer-owned database is permitted.
 | `ErrorHandlingObservation` | exactly six forced classes, expected/observed mapping, sanitized evidence hashes | each class exactly once; closed forced-error mapping only |
 | `LocalNasIsolationObservation` | outage interval, local publication/pointer, backlog IDs/counts, lag, retry transition | local publication remains ready despite NAS outage |
 
-## Planned pytest anchor catalog (X5)
+Every digest field is bound to exactly one design `digest_contracts` record naming canonicalization,
+root type, included paths, excluded self/digest/envelope fields, ordering, null encoding and a
+domain prefix. Directory fingerprints use the fixed `open`/`openat`/`fstat` full-tree algorithm;
+SQLite fingerprints use the fixed URI read-only transaction/logical-row algorithm. The X6 limits
+are 100,000 entries, 512 MiB input bytes, 1,000,000 SQLite rows, 32 input roots, 20 sessions and
+3 replay samples; each over-limit result is `INPUT_LIMIT_EXCEEDED`/`unavailable`.
+
+## Planned pytest anchor catalog (X6)
 
 This catalog is normative planning metadata. Each requirement ID appears once and maps to exactly
 one stable future pytest node/case token; the crosswalk validator compares this table with the
@@ -337,13 +359,13 @@ matrix rather than treating non-empty prose as evidence. No catalog entry exists
 
 ## Planned implementation tasks
 
-## X5 normative requirement mirror
+## X6 normative requirement mirror
 
-The design is the full semantic authority. This mirror keeps every X5 ID explicit in the plan so
+The design is the full semantic authority. This mirror keeps every X6 ID explicit in the plan so
 the crosswalk validator can detect omissions or duplicate definitions; it is not implementation
 evidence.
 
-### X5 acceptance criteria
+### X6 acceptance criteria
 
 ### AC-5: Complete SLO metric inventory (FR-9, NFR-6)
 
@@ -422,7 +444,7 @@ Given only elapsed/counter changes, when report envelopes are compared, then sem
 
 Given invalid enum/hash/ID/negative/oversized values, when validation runs, then the report is rejected safely.
 
-### X5 edge cases
+### X6 edge cases
 
 - EC-9: Missing SLO field or threshold is unavailable and never inferred from another metric.
 - EC-10: BaoStock-only/unqualified secondary cannot pass failover.

@@ -5,7 +5,7 @@ an implementation or acceptance result. Every row is unique, every acceptance cr
 its FR/NFR parent(s), and every anchor is `PLANNED`. No anchor below is claimed to exist, execute,
 pass, or establish Task 20 production soak.
 
-X5 revision base: `affa7153ef088dbd6e7004eeed721588e24656cc`; predecessor planning base:
+X6 revision base: `68125def42796e8fcf87810c9aa59e1d7eaf2bed`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;
@@ -15,8 +15,8 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | ID | Unique testable requirement summary | Parent FR/NFR refs | Planned test anchors | Stage/status |
 | --- | --- | --- | --- | --- |
 | FR-1 | Read existing allowlisted roots/control stores without create, initialize, migrate, repair, delete, provider, or canonical writer calls | — | `PLANNED::test_r2f5_req_fr_01` | SPEC CANDIDATE; PLANNED |
-| FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration; use descriptor-bound deterministic tree/full-file hashing | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
-| FR-3 | Fingerprint every input before and after with descriptor identity and deterministic full streaming SHA-256; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
+| FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration; use the fixed descriptor-bound tree and SQLite logical-snapshot algorithms | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
+| FR-3 | Fingerprint every input before and after with exact tree/logical-snapshot identity and digest contracts; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
 | FR-4 | Capture one strict immutable in-memory snapshot and never initialize a missing control DB | — | `PLANNED::test_r2f5_req_fr_04` | SPEC CANDIDATE; PLANNED |
 | FR-5 | Select exactly 20 distinct confirmed consecutive sessions visible to the Shanghai trusted clock | — | `PLANNED::test_r2f5_req_fr_05` | SPEC CANDIDATE; PLANNED |
 | FR-6 | Report missing-middle, unknown, duplicate, non-advancing and later-repaired availability explicitly | — | `PLANNED::test_r2f5_req_fr_06` | SPEC CANDIDATE; PLANNED |
@@ -35,7 +35,7 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | NFR-1 | Preserve predecessor readers, public models, tables, manifests, pointers, partitions and schemas | — | `PLANNED::test_r2f5_req_nfr_01` | SPEC CANDIDATE; PLANNED |
 | NFR-2 | Use read-only SQLite and descriptor-bound no-follow reads and close resources on all paths | — | `PLANNED::test_r2f5_req_nfr_02` | SPEC CANDIDATE; PLANNED |
 | NFR-3 | Keep failures deterministic, bounded, sanitized and zero-write | — | `PLANNED::test_r2f5_req_nfr_03` | SPEC CANDIDATE; PLANNED |
-| NFR-4 | Complete reference 20-session/100000-row evaluation within 10000 ms or bounded-fail | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
+| NFR-4 | Complete the maximum 20-session/100000-row fixture within 10000 ms including full fingerprints, or bounded-fail | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
 | NFR-5 | Give every FR/NFR/AC/EC a unique planned test anchor without claiming it passed | — | `PLANNED::test_r2f5_req_nfr_05` | SPEC CANDIDATE; PLANNED |
 | NFR-6 | Keep public errors to allowlisted reason/count/hash/time fields with no path/token/SQL/raw text | — | `PLANNED::test_r2f5_req_nfr_06` | SPEC CANDIDATE; PLANNED |
 | NFR-7 | Enforce bounded object bytes, row counts, 20 sessions and at most three replay samples | — | `PLANNED::test_r2f5_req_nfr_07` | SPEC CANDIDATE; PLANNED |
@@ -82,12 +82,12 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | FR-24 | Preserve raw calendar order/duplicates and bind SnapshotIdentity to range, Shanghai clock, fingerprints and versions | FR-3, FR-5 | `PLANNED::test_r2f5_req_fr_24` | SPEC CANDIDATE; PLANNED |
 | FR-25 | Return exactly 20 ordered per-session observations or digest-bound references; window drills live in one typed bundle | FR-9 | `PLANNED::test_r2f5_req_fr_25` | SPEC CANDIDATE; PLANNED |
 | FR-26 | Exclude elapsed/read/replay counters from semantic canonical JSON and digest | FR-16 | `PLANNED::test_r2f5_req_fr_26` | SPEC CANDIDATE; PLANNED |
-| FR-27 | Enforce closed enums/reason partitions, typed MetricValue, safe IDs/hashes, nonnegative bounds and readonly cardinalities | FR-14 | `PLANNED::test_r2f5_req_fr_27` | SPEC CANDIDATE; PLANNED |
+| FR-27 | Enforce closed enums/reason/date-time/MetricValue kinds, safe IDs/hashes, digest contracts, nonnegative bounds and readonly cardinalities | FR-14 | `PLANNED::test_r2f5_req_fr_27` | SPEC CANDIDATE; PLANNED |
 | FR-28 | Enforce exact reason precedence and invalidate the whole report on concurrent snapshot change | FR-3, FR-6 | `PLANNED::test_r2f5_req_fr_28` | SPEC CANDIDATE; PLANNED |
 | NFR-11 | Preserve roadmap continuity, availability, coverage and purity thresholds without invention or relaxation | FR-9 | `PLANNED::test_r2f5_req_nfr_11` | SPEC CANDIDATE; PLANNED |
 | NFR-12 | Require reviewed R2-F4 numeric lag/duration thresholds; missing values or LOCAL_CHAIN_ONLY cannot pass remote | FR-13 | `PLANNED::test_r2f5_req_nfr_12` | SPEC CANDIDATE; PLANNED |
 | NFR-13 | Fail closed on any snapshot descriptor/content/version change and never mix retries | FR-3, FR-4 | `PLANNED::test_r2f5_req_nfr_13` | SPEC CANDIDATE; PLANNED |
-| NFR-14 | Encode semantic report as canonical UTF-8 JSON with envelope payload/preimage rules and volatile diagnostics excluded | FR-16 | `PLANNED::test_r2f5_req_nfr_14` | SPEC CANDIDATE; PLANNED |
+| NFR-14 | Encode semantic report and every digest field with one exact canonical contract; exclude envelope/volatile diagnostics as declared | FR-16 | `PLANNED::test_r2f5_req_nfr_14` | SPEC CANDIDATE; PLANNED |
 | NFR-15 | Keep API/CLI additive and predecessor response/schema contracts unchanged | FR-15, FR-16 | `PLANNED::test_r2f5_req_nfr_15` | SPEC CANDIDATE; PLANNED |
 | AC-15 | All 17 roadmap Section 10 table dimensions plus replication child appear as independent MetricResult fields with reducer/threshold/reason/anchor | FR-9, FR-19, NFR-11 | `PLANNED::test_r2f5_req_ac_15` | SPEC CANDIDATE; PLANNED |
 | AC-16 | BaoStock-only/no secondary/no whole-session drill cannot pass failover; qualified proof requires whole-session purity | FR-20, FR-21 | `PLANNED::test_r2f5_req_ac_16` | SPEC CANDIDATE; PLANNED |

@@ -8,7 +8,7 @@
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
-**X5 revision base:** `affa7153ef088dbd6e7004eeed721588e24656cc` (clean X4)
+**X6 revision base:** `68125def42796e8fcf87810c9aa59e1d7eaf2bed` (clean X5)
 
 **Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
 
@@ -60,11 +60,12 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   it MUST be disjoint from configured control, staging, temporary, user, NAS and home roots.
   Symlink aliases, unresolved variables, mutable-root descendants and overlap MUST fail closed.
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
-  fingerprint every input root and database by descriptor identity, size, mtime/ctime and a full
-  streaming SHA-256 of its captured immutable bytes. Descriptor metadata detects replacement;
-  content hashing detects content drift. An input larger than the declared maximum MUST yield
-  `BOUNDS_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate the
-  report and preserve the prior state.
+  fingerprint every input root and database by the exact descriptor-bound tree/logical-snapshot
+  algorithms below. Directory entries use full streaming content SHA-256; SQLite uses its one
+  read-only transaction algorithm, never a live database/WAL file hash. Descriptor metadata detects
+  replacement; content hashing detects content drift. Any input over a declared limit MUST yield
+  `INPUT_LIMIT_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate
+  the report and preserve the prior state.
 - FR-4: The evaluator MUST capture one immutable in-memory snapshot from strict existing readers
   before metric calculation. A missing control database MUST remain missing; the evaluator MUST
   never create an empty replacement.
@@ -186,11 +187,12 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   and evidence sample count (at most 3), and MUST return `unavailable` rather than scan without a
   bound.
 - NFR-7: The harness MUST expose measured `elapsed_ms`, `read_operations` and `replay_sample_count`.
-  The reference synthetic gate MUST complete within 10,000 ms for 20 sessions and at most 100,000
-  rows. Each input descriptor MUST be at most 512 MiB for full streaming SHA-256; a larger file or
-  SQLite database is `BOUNDS_EXCEEDED`/unavailable, not a sampled claim. The benchmark MUST include
-  the full-file hash in its 10,000 ms budget; exceeding any bound is a harness failure, not a
-  production SLO pass.
+  The reference fixture MUST contain 20 sessions and 100,000 rows and complete within 10,000 ms;
+  this is a real maximum fixture, not a micro-sample. Limits MUST be explicit: at most 100,000
+  tree entries, 512 MiB total regular-file bytes per input, 1,000,000 SQLite rows per database,
+  32 input roots/descriptors, 20 sessions and 3 replay samples. Exceeding any limit returns
+  `INPUT_LIMIT_EXCEEDED`/`unavailable`; the benchmark includes full hashing and logical SQLite
+  snapshot work in its 10,000 ms budget, not a sampled claim.
 - NFR-8: A snapshot identity MUST bind the requested range, trusted Shanghai clock observation,
   input fingerprints and frozen version set. A report MUST be rejected if any bound field changes.
 - NFR-9: Tests MUST cover RED, GREEN, focused acceptance, full regression, static checks,
@@ -222,7 +224,7 @@ distinct consecutive sessions, then the report selects those dates in order and 
 Given 19, 21, duplicate, future or missing-middle sessions, when evaluation runs, then the report
 is `not_ready` or `unavailable` with an allowlisted reason and never silently pads the window.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-2: Shanghai cutoff arithmetic (FR-8, FR-9)
 
@@ -230,7 +232,7 @@ Given timezone-aware publication times, when a session is published at 21:15 and
 08:00 Asia/Shanghai, then both boundary observations count. When they occur at 21:16 or 08:01,
 then the corresponding metric fails and the report cannot be ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-3: Frozen version set and drift (FR-7, NFR-8)
 
@@ -238,7 +240,7 @@ Given 20 session observations with one frozen version vector, when any provider,
 policy, calendar, universe, replication, restore or schema identity changes, then the report is
 `not_ready` with `VERSION_DRIFT` and the exact source state remains untouched.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-4: Coverage and source purity (FR-9, FR-12)
 
@@ -246,7 +248,7 @@ Given legal-universe counts and canonical partition source identities, when ever
 coverage and zero mixed-source rows, then those metrics pass. When any unknown/count mismatch or
 mixed provider partition exists, then the report is not ready and names only the sanitized reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-5: Evidence lineage and replay (FR-10, FR-11)
 
@@ -255,7 +257,7 @@ the bounded offline sample replays semantically identically, then provenance and
 Given a missing hash, wrong binding, corrupt object or replay mismatch, then no publication state is
 changed and the relevant metric is unavailable/not ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-6: Replication and restore evidence (FR-13, FR-17)
 
@@ -264,7 +266,7 @@ proof satisfy the declared evidence contract, then the metrics pass. Given lag, 
 locked/corrupt sidecar or unverified generation, then the report is not ready/unavailable and does
 not start a drain or restore.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-7: Read-only snapshot and fingerprints (FR-1, FR-3, FR-4, NFR-3)
 
@@ -272,7 +274,7 @@ Given an existing private fixture, when CLI/API evaluation succeeds or fails, th
 fingerprint is byte/metadata identical before and after, no missing control DB is initialized, and
 the captured snapshot is closed after use.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-8: Path validation and redaction (FR-2, NFR-4, NFR-5)
 
@@ -280,7 +282,7 @@ Given relative, root, home, mutable-root, symlink, unresolved-variable or overla
 the CLI/API is invoked, then it rejects before enumeration with exit 2/HTTP 422 and no path is
 echoed. Given corrupt or permission-denied input, then the response contains only a closed reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-9: API/CLI parity (FR-15, FR-16, FR-17)
 
@@ -288,7 +290,7 @@ Given identical configured roots, dates, frozen clock and fixture, when CLI and 
 then their report status, selected sessions, metric results, reason order, `provider_requests` and
 `writes` agree; the API performs no provider or store initialization.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-10: Mandatory metric gate (FR-9, FR-14, NFR-2)
 
@@ -296,7 +298,7 @@ Given all mandatory metrics pass for exactly 20 sessions, when the report is bui
 `ready`. Given any mandatory metric fails, then status is `not_ready`; given a required source is
 unprovable, then status is `unavailable`. No optional observation can override this mapping.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-11: Bounded evaluation (NFR-6, NFR-7)
 
@@ -304,14 +306,14 @@ Given a 20-session fixture within the declared row/object/sample bounds, when ev
 it records elapsed/read/replay counts and completes within 10,000 ms on the reference gate. Given
 an over-bound object or row set, then it stops with unavailable rather than unboundedly reading.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-12: Protected compatibility (NFR-1, NFR-9)
 
 Given the R2-F2 golden fixture and R2-F4 readers, when the crosswalk/focused checks run, then their
 bytes and public response shapes remain compatible and no protected production module is widened.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-13: Production boundary (FR-18, NFR-10)
 
@@ -319,7 +321,7 @@ Given any offline ready report, when a reviewer inspects metadata, then it state
 `production_window_started=false`, Task 20 pending and R2-F5.0 NO-GO. No report can authorize a
 provider call, installation, LaunchAgent, NAS action or Release 2 re-entry.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-14: Deterministic and sanitized errors (FR-14, FR-17, NFR-2, NFR-4)
 
@@ -327,7 +329,7 @@ Given identical bytes and clock, when evaluation is repeated across success, mis
 locked fixtures, then JSON is deterministic, reason precedence is stable, diagnostics are bounded,
 and all results include zero provider requests/writes.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-15: Complete SLO metric inventory (FR-9, FR-19, NFR-11)
 
@@ -336,7 +338,7 @@ present as separate `MetricResult` fields with exact targets and anchors. Missin
 availability, canonical integrity, recovery, failover, adjustment, error handling, local/NAS,
 replication, restore or read-boundary evidence cannot be hidden behind another metric.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-16: Secondary qualification and failover (FR-20, FR-21)
 
@@ -345,7 +347,7 @@ when evaluation runs, then failover is `not_ready`/`unavailable` and top-level r
 Given a qualified admission and complete drill record, then failover passes only when selection,
 manifest, pointer and all rows agree with zero mixed-source rows.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-17: Remote trust and restore snapshot (FR-22, NFR-12)
 
@@ -354,7 +356,7 @@ verification, trust scope and reviewed numeric thresholds, when the strict snaps
 then it can pass. Given `LOCAL_CHAIN_ONLY`, missing threshold, locked sidecar or writer/reconcile
 only evidence, then the metric is unavailable/not ready and no destination operation starts.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-18: Offline replay identity (FR-11, FR-23)
 
@@ -362,7 +364,7 @@ Given immutable bytes and an exact frozen offline adapter/normalizer identity, w
 then it performs deterministic normalization and zero provider/network requests. Given unknown,
 mismatched or default login-capable identity, then replay is unavailable before adapter construction.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-19: Full version vector (FR-7, FR-24)
 
@@ -370,7 +372,7 @@ Given 20 observations, when the frozen vector is captured, then every required i
 and equal across all observations. Missing RELEASE, config, qualification/admission, primary/
 secondary, kill-switch/priority, policy or replication/restore evidence prevents ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-20: Raw sequence and snapshot identity (FR-3, FR-25, NFR-8, NFR-13)
 
@@ -379,7 +381,7 @@ rejects duplicates/out-of-order data before deriving sorted unique confirmed ses
 returns a digest-bound SnapshotIdentity and observation refs; any concurrent input change invalidates
 the whole report.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-21: Semantic determinism (FR-26, FR-27, NFR-14)
 
@@ -387,14 +389,14 @@ Given identical captured bytes, clock and arguments, when evaluation repeats, th
 per-session observations/refs and byte-identical semantic JSON/digest are returned. Changing only
 elapsed/counter diagnostics MUST NOT change the semantic digest.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-22: Closed bounded report types (FR-28, NFR-3)
 
 Given invalid enum, reason, hash, ID, negative counter, oversized quality issue or null ready
 version, when report validation runs, then it rejects the report with a sanitized unavailable result.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ### AC-23: Additive compatibility (NFR-1, NFR-15)
 
@@ -402,7 +404,7 @@ Given existing market, universe, evidence, calendar, replication and restore API
 the new acceptance endpoint/CLI is evaluated, then predecessor payloads/schemas remain unchanged;
 the new fields exist only in the acceptance report.
 
-Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X6 catalog only.
 
 ## Edge Cases
 
@@ -515,16 +517,16 @@ const ACCEPTANCE_REASON_CODES = [
   "CONTINUITY_FAILED", "AVAILABILITY_CUTOFF_FAILED", "COVERAGE_FAILED", "SOURCE_PURITY_FAILED",
   "RECOVERY_FAILED", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE",
   "ERROR_HANDLING_FAILED", "LOCAL_NAS_ISOLATION_FAILED", "REPLICATION_UNAVAILABLE",
-  "REPLICATION_LAG", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "BOUNDS_EXCEEDED",
+  "REPLICATION_LAG", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE",
   "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED",
   "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE",
   "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED",
-  "RETRY_WAIT", "DEAD_LETTER",
+  "RETRY_WAIT", "DEAD_LETTER", "INPUT_LIMIT_EXCEEDED",
 ] as const;
 type ValuesOf<T> = T extends readonly (infer Value)[] ? Value : never;
 type AcceptanceReasonCode = ValuesOf<typeof ACCEPTANCE_REASON_CODES>;
 
-type CreatorKind = "task20_writer" | "r2f4_writer" | "r2f5_reader" | "test_fixture";
+type CreatorKind = "task20_writer" | "test_fixture";
 
 interface ImmutableObservationEnvelopeV1<T> {
   artifact_id: string;
@@ -550,8 +552,10 @@ The envelope is the sole identity/hash wrapper for every window-level artifact. 
 and each non-null recovery, failover, replay, adjustment, error, NAS-isolation and restore record
 MUST be an `ImmutableObservationEnvelopeV1`; payloads MUST NOT repeat an ambiguous artifact hash
 or preimage field. `task20_writer` is the only production creator; `test_fixture` is synthetic-only
-and cannot establish production acceptance. Missing creator/version, unsupported schema or either
-hash mismatch is `unavailable`, never a reconstructed or current-state proof.
+and cannot establish production acceptance. Existing R2-F4 reader projections are not new envelope
+artifacts; `r2f5_reader` and `r2f4_writer` MUST NOT appear as envelope creators, and a reader MUST
+never create an envelope. Missing creator/version, unsupported schema or either hash mismatch is
+`unavailable`, never a reconstructed or current-state proof.
 
 Public validation is closed and immutable: identifiers use
 `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, SHA-256 values use `[0-9a-f]{64}`, bounded strings are at
@@ -560,6 +564,13 @@ numbers in `[0,1]`, and hash values are the typed 64-lowercase-hex `MetricValue`
 `MetricValue.kind` MUST match the metric's declared value type; arrays are readonly tuples with
 their stated exact/max cardinality and all JSON/API schemas MUST reject unknown fields. The API
 and CLI expose only these validated projections and sanitized reason codes.
+
+There are no open-ended date/time strings: session/range dates MUST match `YYYY-MM-DD` and pass
+actual calendar validation; timestamps MUST be RFC3339 with seconds (optional micros), timezone
+aware, and normalized to UTC `Z` in canonical bytes. `as_of_utc` is converted to the literal
+`Asia/Shanghai` zone for civil-date selection and the 21:15/08:00 cutoffs. The structured contract
+maps every one of the 18 metric results to an exact `MetricValue.kind`, observed/target nullability
+and range; an unavailable result has both values null, while pass/fail values are complete.
 
 interface SnapshotFingerprint {
   descriptor_role: "dataset" | "evidence" | "calendar" | "universe" | "replication" | "restore" | "control";
@@ -764,6 +775,7 @@ interface RecoveryObservation {
   publication_count: 1;
   duplicate_proof_sha256: string;
   observed_at: string;
+  observation_sha256: string;
 }
 
 interface ErrorHandlingObservation {
@@ -1069,6 +1081,11 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `WindowEvidenceBundle` | bundle cardinality | exactly one immutable bundle per evaluation | all window-level records are present or typed unavailable; no per-session duplication claim |
 | `PreCaptureFailurePayloadV1` | pre-capture failure | typed sanitized payload | canonical payload hash is the semantic report hash; no path or fabricated observation |
 
+Every `sha256`/`digest` field in these models is listed exactly once in the X6
+`digest_contracts` block. A contract names its canonicalization version, root object, exact
+included paths, excluded self/digest/envelope fields, ordering, null/absence encoding and
+domain-separation prefix; “complete object” is not an admissible implementation description.
+
 ```typescript
 interface CapturedSnapshot {
   snapshot_identity: SnapshotIdentity;
@@ -1109,19 +1126,19 @@ Reason precedence MUST be deterministic and exact, in this order: (1) `INVALID_A
 `FAILOVER_UNAVAILABLE`, `LINEAGE_UNAVAILABLE`, `REPLAY_UNAVAILABLE`,
 `REPLAY_SEMANTIC_MISMATCH`, `ADJUSTMENT_UNAVAILABLE`, `ERROR_HANDLING_FAILED`,
 `LOCAL_NAS_ISOLATION_FAILED`, `REPLICATION_UNAVAILABLE`, `REPLICATION_LAG`,
-`REMOTE_PROOF_MISSING`, `RESTORE_UNAVAILABLE`, `READ_BOUNDARY_FAILED`; (10) `BOUNDS_EXCEEDED`.
+`REMOTE_PROOF_MISSING`, `RESTORE_UNAVAILABLE`, `READ_BOUNDARY_FAILED`; (10) `INPUT_LIMIT_EXCEEDED`.
 The report retains all applicable metric failures in metric order even when top-level status is
 unavailable.
 
-<!-- R2F5_X5_CONTRACTS_JSON -->
+<!-- R2F5_X6_CONTRACTS_JSON -->
 ```json
 {
-  "contract_version": "r2f5-x5",
+  "contract_version": "r2f5-x6",
   "roadmap_dimensions": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "restore", "read_boundary"],
   "metric_fields": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary"],
   "reason_partitions": {
     "failure": ["CONTINUITY_FAILED", "AVAILABILITY_CUTOFF_FAILED", "COVERAGE_FAILED", "SOURCE_PURITY_FAILED", "CANONICAL_INTEGRITY_FAILED", "RECOVERY_FAILED", "ERROR_HANDLING_FAILED", "LOCAL_NAS_ISOLATION_FAILED", "REPLICATION_LAG", "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED", "CALENDAR_CONFLICT", "UNIVERSE_UNKNOWN_NONZERO", "UNIVERSE_COUNT_MISMATCH", "VERSION_DRIFT", "LINEAGE_INVALID"],
-    "unavailable": ["INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE", "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "LINEAGE_UNAVAILABLE", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE", "REPLICATION_UNAVAILABLE", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "BOUNDS_EXCEEDED", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED", "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE", "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED", "RETRY_WAIT", "DEAD_LETTER"]
+    "unavailable": ["INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE", "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "LINEAGE_UNAVAILABLE", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE", "REPLICATION_UNAVAILABLE", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED", "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE", "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED", "RETRY_WAIT", "DEAD_LETTER", "INPUT_LIMIT_EXCEEDED"]
   },
   "status_reason_matrix": {
     "pass": [null],
@@ -1149,17 +1166,114 @@ unavailable.
     "read_boundary": ["session.read_boundary_raw_facts"]
   },
   "cardinality": {"sessions": 20, "window_bundle": 1, "error_classes": 6, "input_roles_max": 32, "tree_entries_max": 100000, "input_bytes_max": 536870912},
-  "artifact_envelope_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"]
+  "artifact_envelope_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"],
+  "date_time_formats": {
+    "session_date": "YYYY-MM-DD / ^\\d{4}-\\d{2}-\\d{2}$ plus calendar-valid date",
+    "rfc3339_utc": "RFC3339 with seconds or micros, normalized to UTC Z",
+    "as_of": "UTC instant converted to Asia/Shanghai for civil-day cutoffs"
+  },
+  "metric_value_kinds": {
+    "continuity": {"observed": "count", "target": "count", "unavailable_null": true, "range": "[0,20]"},
+    "next_morning_availability": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
+    "same_evening_availability": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
+    "coverage": {"observed": "ratio", "target": "ratio", "unavailable_null": true, "range": "[0,1]"},
+    "canonical_integrity": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "source_purity": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "recovery": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "failover": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "provenance": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "replay": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "adjustment": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "calendar": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "universe": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "error_handling": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "local_nas_isolation": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "replication": {"observed": "duration_ms", "target": "duration_ms", "unavailable_null": true, "range": "[0,2147483647]"},
+    "restore": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"},
+    "read_boundary": {"observed": "bool", "target": "bool", "unavailable_null": true, "range": "boolean"}
+  },
+  "creator_allowlist": {
+    "production_envelope_payloads": {"WindowEvidenceBundlePayload": ["task20_writer"], "RecoveryObservation": ["task20_writer"], "WholeSessionFailoverDrill": ["task20_writer"], "ReplaySampleEvidence": ["task20_writer"], "AdjustmentEquivalenceEvidence": ["task20_writer"], "ErrorHandlingObservation": ["task20_writer"], "LocalNasIsolationObservation": ["task20_writer"], "RestoreDrillEvidence": ["task20_writer"]},
+    "reader_projections": {"SecondaryQualificationProjection": [], "CompletedReplicationRestoreSnapshotV1": []},
+    "synthetic_envelope_only": ["test_fixture"],
+    "reader_never_creates": ["r2f5_reader", "r2f4_writer"]
+  },
+  "limits": {"max_entries": 100000, "max_input_bytes": 536870912, "max_db_rows": 1000000, "max_input_roots": 32, "max_sessions": 20, "max_replay_samples": 3, "max_elapsed_ms": 10000},
+  "digest_contracts": [
+    {"field": "ImmutableObservationEnvelopeV1.payload_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "payload", "included_field_paths": ["payload"], "excluded_fields": ["payload_sha256", "envelope_sha256"], "ordering": "sorted object keys; source arrays retain declared order", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/envelope-payload-v1\\0"},
+    {"field": "ImmutableObservationEnvelopeV1.envelope_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ImmutableObservationEnvelopeV1", "included_field_paths": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "canonicalization_version", "payload_sha256"], "excluded_fields": ["payload", "payload_sha256?raw-preimage", "envelope_sha256"], "ordering": "sorted object keys", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/envelope-v1\\0"},
+    {"field": "PreCaptureFailurePayloadV1.semantic_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PreCaptureFailurePayloadV1", "included_field_paths": ["schema_version", "reason_code", "requested_start", "requested_end", "as_of_utc", "descriptor_states"], "excluded_fields": ["semantic_report_sha256"], "ordering": "descriptor_states source order; object keys sorted", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/pre-capture-v1\\0"},
+    {"field": "CalendarRawFacts.raw_facts_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CalendarRawFacts", "included_field_paths": ["source_sequence", "generation", "confirmed", "unknown_state", "conflict_state"], "excluded_fields": ["raw_facts_sha256"], "ordering": "source_sequence raw source order; object keys sorted", "null_encoding": "JSON null; absent fields forbidden", "domain_separation_prefix": "r2f5/calendar-raw-v1\\0"},
+    {"field": "ReadBoundaryRawFacts.probe_schema_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadBoundaryRawFacts", "included_field_paths": ["requested_as_of", "max_visible_session", "future_rows_seen", "future_rows_count", "query_count", "write_count"], "excluded_fields": ["probe_schema_digest"], "ordering": "object keys sorted", "null_encoding": "null is JSON null for max_visible_session", "domain_separation_prefix": "r2f5/read-boundary-v1\\0"},
+    {"field": "SessionEvidenceBinding.evidence_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "EvidenceObject", "included_field_paths": ["evidence_id", "immutable_evidence_bytes"], "excluded_fields": ["evidence_sha256", "envelope_sha256"], "ordering": "immutable bytes; no filesystem order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/evidence-object-v1\\0"},
+    {"field": "SessionEvidenceBinding.candidate_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CandidateObject", "included_field_paths": ["candidate_id", "immutable_candidate_bytes"], "excluded_fields": ["candidate_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/candidate-object-v1\\0"},
+    {"field": "SessionEvidenceBinding.gate_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "GateReport", "included_field_paths": ["gate_report_id", "immutable_gate_report_bytes"], "excluded_fields": ["gate_report_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/gate-report-v1\\0"},
+    {"field": "SessionEvidenceBinding.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/manifest-v1\\0"},
+    {"field": "SessionEvidenceBinding.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "EvidenceObject", "included_field_paths": ["object_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/object-v1\\0"},
+    {"field": "SessionEvidenceBinding.selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["selection_sha256", "envelope_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/selection-v1\\0"},
+    {"field": "SessionEvidenceBinding.binding_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionEvidenceBinding", "included_field_paths": ["evidence_id", "evidence_sha256", "candidate_id", "candidate_sha256", "gate_report_id", "gate_report_sha256", "manifest_id", "manifest_sha256", "object_id", "object_sha256", "selection_id", "selection_sha256"], "excluded_fields": ["binding_sha256"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/lineage-binding-v1\\0"},
+    {"field": "PointerReconciliation.pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-v1\\0"},
+    {"field": "PointerReconciliation.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-manifest-v1\\0"},
+    {"field": "PointerReconciliation.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "EvidenceObject", "included_field_paths": ["object_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/pointer-object-v1\\0"},
+    {"field": "PointerReconciliation.descriptor_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "InputDescriptor", "included_field_paths": ["descriptor_id", "descriptor_metadata"], "excluded_fields": ["descriptor_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/descriptor-v1\\0"},
+    {"field": "ReplicationObservation.source_commit_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["source_commit_id", "source_commit_bytes"], "excluded_fields": ["source_commit_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/source-commit-v1\\0"},
+    {"field": "ReplicationObservation.destination_record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["destination_record_id", "destination_record_bytes"], "excluded_fields": ["destination_record_sha256"], "ordering": "immutable bytes", "null_encoding": "null only when destination_generation is null", "domain_separation_prefix": "r2f5/destination-record-v1\\0"},
+    {"field": "ReplicationObservation.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "null only for LOCAL_CHAIN_ONLY", "domain_separation_prefix": "r2f5/destination-head-v1\\0"},
+    {"field": "ReplicationObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationObservation", "included_field_paths": ["immutable", "state", "checkpoint_id", "source_commit_sha256", "intent_id", "enqueue_state", "reason_code", "observed_at", "lag_seconds", "trust_scope", "destination_generation", "destination_record_sha256", "destination_head_sha256"], "excluded_fields": ["observation_sha256"], "ordering": "object keys sorted", "null_encoding": "null literal for optional IDs/hashes", "domain_separation_prefix": "r2f5/replication-observation-v1\\0"},
+    {"field": "RecoveryObservation.duplicate_proof_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RecoveryProof", "included_field_paths": ["event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count", "duplicate_evidence_bytes"], "excluded_fields": ["duplicate_proof_sha256"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-v1\\0"},
+    {"field": "RecoveryObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RecoveryObservation", "included_field_paths": ["immutable", "event_id", "attempt_id", "before_generation", "after_generation", "queue_identity", "restart_boundary", "exactly_once_publication_id", "after_manifest_sha256", "after_pointer_sha256", "after_selection_sha256", "publication_count", "duplicate_proof_sha256", "observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-observation-v1\\0"},
+    {"field": "ErrorHandlingObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ErrorHandlingObservation", "included_field_paths": ["immutable", "events", "event_id", "forced_error_class", "sanitized_reason", "normalized_result", "attempt_id", "expected_class", "observed_class", "evidence_sha256", "observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "six events fixed timeout/auth/rate/schema/coverage/storage order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/error-handling-v1\\0"},
+    {"field": "LocalNasIsolationObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "LocalNasIsolationObservation", "included_field_paths": ["immutable", "event_id", "local_publication_ready", "local_publication_id", "local_pointer_sha256", "outage_start", "outage_end", "backlog_before_ids", "backlog_after_ids", "backlog_before_count", "backlog_after_count", "lag_seconds", "lag_threshold_seconds", "retryable", "retry_state", "retry_transition", "nas_failure_did_not_block_local", "attempt_id", "observed_at"], "excluded_fields": ["observation_sha256"], "ordering": "backlog IDs source order; object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/local-nas-v1\\0"},
+    {"field": "SessionObservation.frozen_versions_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FrozenReliabilityVersions", "included_field_paths": ["git_commit", "installed_release", "installed_release_sha256", "dataset_generation", "canonical_schema", "evidence_schema", "primary_provider_id", "secondary_provider_id", "qualification_window_id", "qualification_proof_status", "adapter_hash", "endpoint_contract_hash", "source_schema_hash", "normalizer_hash", "reconciliation_policy_version", "selection_policy_version", "config_digest", "auto_failover_enabled", "failover_kill_switch", "provider_priority", "continuity_start_date", "repair_policy_version", "calendar_generation", "calendar_sha256", "universe_generation", "universe_sha256", "replication_policy_version", "replication_evidence_version", "replication_trust_scope", "destination_generation", "destination_head_sha256", "remote_proof_artifact_ref", "restore_policy_version", "restore_evidence_version"], "excluded_fields": ["frozen_versions_sha256", "semantic_report_sha256"], "ordering": "sorted object keys; provider_priority declared order", "null_encoding": "typed absence JSON null", "domain_separation_prefix": "r2f5/frozen-vector-v1\\0"},
+    {"field": "SessionObservation.schema_policy_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SchemaPolicyVector", "included_field_paths": ["schema_and_policy_versions"], "excluded_fields": ["schema_policy_digest"], "ordering": "sorted object keys", "null_encoding": "absence forbidden for ready", "domain_separation_prefix": "r2f5/schema-policy-v1\\0"},
+    {"field": "SessionObservation.observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionObservation", "included_field_paths": ["session", "ordinal", "frozen_versions_sha256", "same_evening_published_at", "next_morning_published_at", "required_count", "loaded_count", "suspension_count", "not_listed_count", "delisted_count", "unknown_count", "canonical_provider_ids", "evidence", "pointer_reconciliation", "replication_observation", "calendar_raw_facts", "read_boundary_raw_facts", "schema_policy_digest", "cutoff_results", "coverage", "canonical_integrity", "source_purity", "provenance", "calendar", "universe", "replication", "read_boundary"], "excluded_fields": ["observation_sha256", "diagnostic_envelope", "semantic_report_sha256"], "ordering": "object keys sorted; arrays retain declared source/order", "null_encoding": "JSON null for declared optional timestamps only", "domain_separation_prefix": "r2f5/session-observation-v1\\0"},
+    {"field": "WholeSessionFailoverDrill.selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["selection_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-selection-v1\\0"},
+    {"field": "WholeSessionFailoverDrill.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-manifest-v1\\0"},
+    {"field": "WholeSessionFailoverDrill.pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-pointer-v1\\0"},
+    {"field": "WholeSessionFailoverDrill.readback_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FailoverReadback", "included_field_paths": ["readback_id", "immutable_readback_bytes"], "excluded_fields": ["readback_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/failover-readback-v1\\0"},
+    {"field": "ReplaySampleEvidence.sample_object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplaySample", "included_field_paths": ["sample_object_id", "immutable_sample_bytes"], "excluded_fields": ["sample_object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/replay-sample-v1\\0"},
+    {"field": "ReplaySampleEvidence.candidate_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CandidateObject", "included_field_paths": ["candidate_id", "immutable_candidate_bytes"], "excluded_fields": ["candidate_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/replay-candidate-v1\\0"},
+    {"field": "RestoreDrillEvidence.sentinel_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreSentinel", "included_field_paths": ["sentinel_id", "immutable_sentinel_bytes"], "excluded_fields": ["sentinel_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-sentinel-v1\\0"},
+    {"field": "RestoreDrillEvidence.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-head-v1\\0"},
+    {"field": "RestoreDrillEvidence.record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreRecord", "included_field_paths": ["record_id", "immutable_record_bytes"], "excluded_fields": ["record_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-record-v1\\0"},
+    {"field": "RestoreDrillEvidence.manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-manifest-v1\\0"},
+    {"field": "RestoreDrillEvidence.restore_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreReport", "included_field_paths": ["restore_report_id", "immutable_restore_report_bytes"], "excluded_fields": ["restore_report_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-report-v1\\0"},
+    {"field": "RestoreDrillEvidence.api_readback_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreApiReadback", "included_field_paths": ["readback_id", "immutable_readback_bytes"], "excluded_fields": ["api_readback_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/restore-readback-v1\\0"},
+    {"field": "SnapshotFingerprint.sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FingerprintSubject", "included_field_paths": ["descriptor_role", "descriptor_id", "descriptor_state", "device", "inode", "size_bytes", "mtime_ns", "ctime_ns", "fingerprint_kind", "hash_scope", "captured_content_bytes"], "excluded_fields": ["sha256"], "ordering": "object keys sorted; path entries tree order", "null_encoding": "typed null for absent descriptor metadata", "domain_separation_prefix": "r2f5/fingerprint-v1\\0"},
+    {"field": "FrozenReliabilityVersions.config_digest", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "AcceptanceConfig", "included_field_paths": ["dataset_root_descriptor", "evidence_root_descriptor", "control_store_descriptor", "clock_policy", "cutoff_policy", "limits", "replay_policy", "replication_policy", "restore_policy", "redaction_policy"], "excluded_fields": ["config_digest"], "ordering": "sorted object keys", "null_encoding": "absence forbidden for ready", "domain_separation_prefix": "r2f5/config-v1\\0"},
+    {"field": "RecoveryObservation.after_manifest_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "Manifest", "included_field_paths": ["manifest_id", "immutable_manifest_bytes"], "excluded_fields": ["after_manifest_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-manifest-v1\\0"},
+    {"field": "RecoveryObservation.after_pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "PointerRecord", "included_field_paths": ["pointer_id", "immutable_pointer_bytes"], "excluded_fields": ["after_pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-pointer-v1\\0"},
+    {"field": "RecoveryObservation.after_selection_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SessionSelection", "included_field_paths": ["selection_id", "immutable_selection_bytes"], "excluded_fields": ["after_selection_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/recovery-selection-v1\\0"},
+    {"field": "ErrorHandlingObservation.events.evidence_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ForcedErrorEvidence", "included_field_paths": ["event_id", "forced_error_class", "immutable_evidence_bytes"], "excluded_fields": ["evidence_sha256"], "ordering": "six fixed class order", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/forced-error-evidence-v1\\0"},
+    {"field": "LocalNasIsolationObservation.local_pointer_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "LocalPublicationPointer", "included_field_paths": ["local_publication_id", "immutable_pointer_bytes"], "excluded_fields": ["local_pointer_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/local-pointer-v1\\0"},
+    {"field": "CompletedReplicationRestoreSnapshotV1.replication_observation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationObservation", "included_field_paths": ["checkpoint_id", "immutable_replication_observation_bytes"], "excluded_fields": ["replication_observation_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-replication-v1\\0"},
+    {"field": "CompletedReplicationRestoreSnapshotV1.restore_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "RestoreReport", "included_field_paths": ["restore_policy_version", "immutable_restore_report_bytes"], "excluded_fields": ["restore_report_sha256"], "ordering": "immutable bytes", "null_encoding": "null only when no restore record", "domain_separation_prefix": "r2f5/completed-restore-v1\\0"},
+    {"field": "CompletedReplicationRestoreSnapshotV1.destination_record_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReplicationRecord", "included_field_paths": ["destination_generation", "immutable_destination_record_bytes"], "excluded_fields": ["destination_record_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-destination-record-v1\\0"},
+    {"field": "CompletedReplicationRestoreSnapshotV1.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "immutable_destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/completed-destination-head-v1\\0"},
+    {"field": "ReadonlyEvidenceDescriptor.object_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadonlyEvidenceObject", "included_field_paths": ["descriptor_id", "immutable_object_bytes"], "excluded_fields": ["object_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/readonly-object-v1\\0"},
+    {"field": "ReadonlyEvidenceDescriptor.descriptor_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "ReadonlyEvidenceDescriptor", "included_field_paths": ["descriptor_id", "source_generation", "completed", "immutable"], "excluded_fields": ["descriptor_sha256"], "ordering": "object keys sorted", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/readonly-descriptor-v1\\0"},
+    {"field": "SnapshotIdentity.input_fingerprint_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SnapshotFingerprint[]", "included_field_paths": ["input_fingerprints"], "excluded_fields": ["input_fingerprint_sha256", "snapshot_sha256", "semantic_report_sha256"], "ordering": "descriptor_role then descriptor_id byte order", "null_encoding": "typed absence descriptor object, never omitted", "domain_separation_prefix": "r2f5/input-fingerprints-v1\\0"},
+    {"field": "SnapshotIdentity.frozen_version_vector_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "FrozenReliabilityVersions", "included_field_paths": ["frozen_versions"], "excluded_fields": ["frozen_version_vector_sha256", "semantic_report_sha256"], "ordering": "sorted object keys; provider_priority declared order", "null_encoding": "typed JSON null for unavailable proof", "domain_separation_prefix": "r2f5/frozen-version-vector-v1\\0"},
+    {"field": "SnapshotIdentity.snapshot_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "SnapshotIdentity", "included_field_paths": ["requested_start", "requested_end", "as_of_utc", "as_of_timezone", "input_fingerprints", "frozen_versions", "input_fingerprint_sha256", "frozen_version_vector_sha256"], "excluded_fields": ["snapshot_sha256", "semantic_report_sha256", "diagnostic_envelope"], "ordering": "object keys sorted; input descriptors role/id order", "null_encoding": "typed absence descriptor retained", "domain_separation_prefix": "r2f5/snapshot-identity-v1\\0"},
+    {"field": "R2FAcceptanceReport.semantic_report_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "R2FAcceptanceReport semantic payload", "included_field_paths": ["status", "window_start", "window_end", "selected_sessions", "frozen_versions", "continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary", "quality_issues", "snapshot_identity", "session_observations", "observation_refs", "window_evidence_bundle", "window_evidence_refs", "pre_capture_failure", "provider_requests", "writes", "restore_started", "production_window_started"], "excluded_fields": ["semantic_report_sha256", "pre_capture_failure.semantic_report_sha256", "diagnostic_envelope", "elapsed_ms", "read_operations", "replay_sample_count"], "ordering": "object keys sorted; sessions ordinal order; quality issues stable order", "null_encoding": "JSON null for declared unavailable fields", "domain_separation_prefix": "r2f5/semantic-report-v1\\0"},
+    {"field": "FrozenReliabilityVersions.installed_release_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "InstalledRelease", "included_field_paths": ["release_identity", "immutable_release_bytes"], "excluded_fields": ["installed_release_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/installed-release-v1\\0"},
+    {"field": "FrozenReliabilityVersions.calendar_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "CalendarGeneration", "included_field_paths": ["calendar_generation", "immutable_calendar_bytes"], "excluded_fields": ["calendar_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/calendar-generation-v1\\0"},
+    {"field": "FrozenReliabilityVersions.universe_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "UniverseGeneration", "included_field_paths": ["universe_generation", "immutable_universe_bytes"], "excluded_fields": ["universe_sha256"], "ordering": "immutable bytes", "null_encoding": "absent forbidden for ready", "domain_separation_prefix": "r2f5/universe-generation-v1\\0"},
+    {"field": "FrozenReliabilityVersions.destination_head_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "DestinationHead", "included_field_paths": ["destination_generation", "destination_head_bytes"], "excluded_fields": ["destination_head_sha256"], "ordering": "immutable bytes", "null_encoding": "typed null only for LOCAL_CHAIN_ONLY", "domain_separation_prefix": "r2f5/frozen-destination-head-v1\\0"},
+    {"field": "OfflineReplayContext.implementation_sha256", "canonicalization_version": "project-canonical-json-v1", "root_object_type": "OfflineImplementation", "included_field_paths": ["adapter_id", "adapter_version", "normalizer_id", "normalizer_version", "immutable_implementation_bytes"], "excluded_fields": ["implementation_sha256"], "ordering": "fixed field path order above", "null_encoding": "absent forbidden", "domain_separation_prefix": "r2f5/offline-implementation-v1\\0"}
+  ]
 }
 ```
 
-`R2F5_X5_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
-excluding Markdown fences) is `4f54e56793dde85081b2ba2392f446f3bb1e9ae81da3f22d93d85b7df08acbe0`.
+`R2F5_X6_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
+excluding Markdown fences) is `7438e50cbe55aceb4e1275ee876a2da95614897d458efb3a5bf3ce9a47adaee0`.
 
 The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
-status matrix, reducer field references, envelope fields and cardinalities against the TypeScript
-contracts and matrix. This is structural drift detection only; semantic hash proof and human review
-of the reducers remain mandatory.
+status matrix, reducer field references, envelope fields, creator allowlists, date/time formats,
+metric value kinds, limits and cardinalities against the TypeScript contracts, implementation plan
+and matrix. Every digest-typed model field MUST occur exactly once in `digest_contracts`; its own
+field MUST be excluded from its included paths. This is structural drift detection only; semantic
+hash proof and human review of the reducers remain mandatory.
 
 ## Static compatibility inventory
 
@@ -1173,13 +1287,53 @@ LaunchAgent, user-store read, canonical writer, NAS transport or new persistence
 
 ### Deterministic input tree fingerprint
 
-For a directory input, `content_sha256` MUST be a deterministic tree hash over the validated root
-descriptor followed by sorted POSIX-relative paths in UTF-8 byte order. Each entry contributes its
-relative path, type, mode, size and full streaming content SHA-256; symlinks, special files,
-hardlink ambiguity, path escape and unsafe names are rejected before enumeration. The maximum is
-100,000 entries and 512 MiB total bytes per input; exceeding either bound is unavailable. SQLite
-inputs use a read-only consistent snapshot/backup or full-file bytes under the same 512 MiB limit,
-never a bounded page sample. Before/after tree digests MUST match; the 10-second/100,000-row
+The implementation MUST open each directory root once with `open(root, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`
+for this deterministic tree hash
+and retain that descriptor as the root identity; it MUST enumerate only through descriptor-relative
+operations. It MUST `fstat` the root before and after enumeration. Every relative path MUST be
+POSIX-normalized (Unicode NFC, `/` separators, no empty, `.` or `..` components), encoded as UTF-8,
+and sorted by UTF-8 byte order. Normalization collisions, path escape, symlink, FIFO, socket, device,
+or other special entries are unavailable. A regular file with `st_nlink > 1` is hardlink ambiguity
+and is unavailable.
+
+The tree digest preimage MUST be a domain-separated prefix `r2f5/tree-v1\0` followed by a sequence
+of length-prefixed canonical records. Each record contains, in this order, the UTF-8 relative-path
+length and bytes, entry type, `st_dev`, `st_ino`, mode, size, `mtime_ns`, and a regular-file content
+streaming SHA-256 (or an explicit typed absence marker for directories). Each entry MUST be opened with
+`openat(root_fd, relative, O_NOFOLLOW|O_CLOEXEC)`; the reader MUST `fstat` before reading, stream
+the complete content, `fstat` after reading, and return `SNAPSHOT_CHANGED` if device/inode, size or
+mtime changes. Directory identity is checked before and after the entire walk. `mtime_ns` is included
+to detect metadata replacement/rollback even when content is unchanged; this detects concurrent
+replacement but does not claim protection from a malicious filesystem root.
+
+The maximum is 100,000 entries and 512 MiB total regular-file bytes per input; exceeding either
+bound returns `INPUT_LIMIT_EXCEEDED`/`unavailable`. Before/after tree digests MUST match. The
+10-second/100,000-row fixture benchmark includes this complete tree hash; production inputs over
+the limits cannot be ready. SQLite MUST NOT hash full-file bytes directly; its logical snapshot
+algorithm below owns the database, WAL and SHM state.
+
+### Unique SQLite logical snapshot fingerprint
+
+SQLite has one algorithm, not a choice of file or page hashing. The evaluator MUST open an existing
+database with a read-only URI `mode=ro&immutable=false`, set `PRAGMA query_only=ON`, issue `BEGIN`
+and retain that transaction until capture ends. It MUST read `sqlite_schema`, `PRAGMA page_count`,
+`PRAGMA user_version`, and every configured related table using deterministic `ORDER BY` clauses and
+typed length-prefixed encoding (including explicit null/type markers). The logical digest preimage
+is `r2f5/sqlite-logical-v1\0` plus schema, page-count, user-version and ordered row records. It
+MUST NOT hash the live database, `-wal` or `-shm` bytes directly. A busy/locked database is
+`unavailable`; a missing database is not opened or created. The transaction MUST remain open through
+the captured snapshot, then roll back/close without writes or journal creation.
+The Python implementation MUST use `sqlite3.connect(uri, uri=True)` with those URI flags and MUST
+not call `backup`, `VACUUM`, migration, initialization or any writer API; `query_only=ON` plus the
+read transaction is the zero-write guarantee.
+
+The evaluator MUST record descriptor identity before and after the transaction and reject changes
+to device/inode/size/mtime or logical version fields as `SNAPSHOT_CHANGED`. WAL changes are allowed
+while this consistent read transaction remains stable; `-wal`/`-shm` are not independently enumerated
+or hashed. If a directory tree also contains the database, the tree walker MUST exclude that database
+and its `-wal`/`-shm` siblings by descriptor-bound database ownership; the SQLite logical fingerprint
+owns them, preventing double hashing or conflicting digests. The SQLite limit is 1,000,000 rows per
+database and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`.
 
 ## R2-F5.0 metric contract and evidence sources
 
