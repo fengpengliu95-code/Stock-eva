@@ -17,11 +17,19 @@ import stat
 import struct
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 DESIGN = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
@@ -346,11 +354,12 @@ def _sqlite_logical_digest(path: Path | str, role: str | None = None) -> str:
     if key not in _CATALOGS:
         raise ValueError("unknown catalog")
     catalog = _CATALOGS[key]
-    uri = f"file:{path}?mode=ro&immutable=true"
+    uri = f"file:{path}?mode=ro&immutable=false"
     chunks = [b"r2f5/sqlite-logical-v1\0"]
     with sqlite3.connect(uri, uri=True, timeout=0) as connection:
         connection.execute("PRAGMA query_only=ON")
-        connection.execute("BEGIN")
+        connection.execute("PRAGMA busy_timeout=250")
+        connection.execute("BEGIN DEFERRED")
         chunks.append(
             b"P"
             + _sqlite_typed_bytes(connection.execute("PRAGMA page_count").fetchone()[0], "INTEGER")
@@ -397,8 +406,14 @@ def _stream_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("path invalid")
         while chunk := os.read(fd, 1024 * 1024):
             digest.update(chunk)
+        after = os.fstat(fd)
+        if _tree_identity(before) != _tree_identity(after):
+            raise ValueError("snapshot changed")
     finally:
         os.close(fd)
     return digest.hexdigest()
@@ -772,6 +787,14 @@ class ReadonlyEvidenceDescriptor(StrictModel):
     source_generation: str
 
 
+class SecondaryQualificationProjection(StrictModel):
+    provider_id: str
+    window_id: str
+    window_state: Literal["qualified"]
+    session_count: Literal[20]
+    logical_digest: str
+
+
 class FrozenR2F4PolicyThresholds(StrictModel):
     source: Literal["reviewed-r2f4-policy-evidence"]
     policy_version: str
@@ -802,7 +825,7 @@ class ImmutableObservationEnvelopeV1(StrictModel):
     creator_kind: Literal["task20_writer"]
     creator_version: str
     created_at: str
-    payload: Any
+    payload: dict[str, object]
     canonicalization_version: Literal["project-canonical-json-v1"]
     payload_sha256: str
     envelope_sha256: str
@@ -832,6 +855,24 @@ class WholeSessionFailoverDrill(StrictModel):
     mixed_source_rows: Literal[0]
 
 
+class RecoveryObservation(StrictModel):
+    immutable: Literal[True]
+    event_id: str
+    attempt_id: str
+    before_generation: str
+    after_generation: str
+    queue_identity: str
+    restart_boundary: str
+    exactly_once_publication_id: str
+    after_manifest_sha256: str
+    after_pointer_sha256: str
+    after_selection_sha256: str
+    publication_count: Literal[1]
+    duplicate_proof_sha256: str
+    observed_at: str
+    observation_sha256: str
+
+
 class ReplaySampleEvidence(StrictModel):
     sample_object_sha256: str
     candidate_sha256: str
@@ -845,10 +886,38 @@ class AdjustmentEquivalenceEvidence(StrictModel):
     equivalence_passed: Literal[True]
 
 
+class ErrorHandlingEvent(StrictModel):
+    event_id: str
+    forced_error_class: Literal["timeout", "auth", "rate", "schema", "coverage", "storage"]
+    sanitized_reason: str
+    normalized_result: Literal["not_ready", "unavailable"]
+    attempt_id: str
+    expected_class: Literal["timeout", "auth", "rate", "schema", "coverage", "storage"]
+    observed_class: Literal["timeout", "auth", "rate", "schema", "coverage", "storage"]
+    evidence_sha256: str
+    observed_at: str
+
+
 class ErrorHandlingObservation(StrictModel):
     immutable: Literal[True]
-    events: tuple[dict[str, Any], ...]
+    events: tuple[ErrorHandlingEvent, ...]
     observation_sha256: str
+
+    @model_validator(mode="after")
+    def validate_events(self) -> ErrorHandlingObservation:
+        expected = ("timeout", "auth", "rate", "schema", "coverage", "storage")
+        if (
+            len(self.events) != len(expected)
+            or tuple(event.forced_error_class for event in self.events) != expected
+        ):
+            raise ValueError("error event vector invalid")
+        if any(
+            event.expected_class != event.forced_error_class
+            or event.observed_class != event.forced_error_class
+            for event in self.events
+        ):
+            raise ValueError("error event class mismatch")
+        return self
 
 
 class LocalNasIsolationObservation(StrictModel):
@@ -954,6 +1023,7 @@ class PreCaptureFailurePayloadV1(StrictModel):
 
 
 class R2FAcceptanceReport(StrictModel):
+    _registry_projection: dict[str, Any] | None = PrivateAttr(default=None)
     status: Literal["ready", "not_ready", "unavailable"]
     window_start: str | None
     window_end: str | None
@@ -981,7 +1051,7 @@ class R2FAcceptanceReport(StrictModel):
     snapshot_identity: SnapshotIdentity | None
     session_observations: tuple[SessionObservation, ...]
     observation_refs: tuple[str, ...]
-    window_evidence_bundle: Any
+    window_evidence_bundle: ImmutableObservationEnvelopeV1 | None
     window_evidence_refs: tuple[str, ...]
     pre_capture_failure: PreCaptureFailurePayloadV1 | None
     semantic_report_sha256: str | None
@@ -1007,6 +1077,12 @@ class R2FAcceptanceReport(StrictModel):
             raise ValueError("pre-capture failure requires unavailable report")
         return self
 
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        output = super().model_dump(*args, **kwargs)
+        if self.status == "ready" and self._registry_projection is not None:
+            output["registry_projection"] = dict(self._registry_projection)
+        return output
+
 
 def _safe_json(path: Path) -> Any:
     info = os.lstat(path)
@@ -1026,6 +1102,42 @@ def _safe_json(path: Path) -> Any:
     finally:
         os.close(fd)
     return json.loads(raw.decode("utf-8"))
+
+
+def _read_anchored_file(root: Path, relative_path: str) -> bytes:
+    """Read one descriptor-relative file without following any path link."""
+    relative = PurePosixPath(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("unsafe descriptor path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    directory_fd = os.open(root, directory_flags)
+    try:
+        for component in relative.parts[:-1]:
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        file_fd = os.open(
+            relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd
+        )
+        try:
+            before = os.fstat(file_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("unsafe descriptor file")
+            chunks: list[bytes] = []
+            while chunk := os.read(file_fd, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(file_fd)
+            if _tree_identity(before) != _tree_identity(after):
+                raise ValueError("snapshot changed")
+            return b"".join(chunks)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
 
 
 class AcceptanceReader:
@@ -1188,6 +1300,20 @@ class AcceptanceReader:
                     continue
                 if left == right or left in right.parents or right in left.parents:
                     raise _AcceptanceError("PATH_INVALID")
+        controls = resolved[2:]
+        expected_controls = {
+            "replication.sqlite3",
+            "daily_bar_shadow.sqlite3",
+            "provider_registry.sqlite3",
+            "calendar_generations.sqlite3",
+            "market_universe.sqlite3",
+        }
+        if (
+            len(controls) != 5
+            or len(set(controls)) != 5
+            or {path.name for path in controls} != expected_controls
+        ):
+            raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
         return {"dataset": resolved[0], "evidence": resolved[1], "controls": tuple(resolved[2:])}
 
     def _capture_fingerprints(self, paths: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -1262,9 +1388,11 @@ class AcceptanceReader:
 
     def _validate_catalog(self, path: Path, key: str) -> None:
         catalog = _CATALOGS[key]
-        uri = f"file:{path}?mode=ro&immutable=true"
+        uri = f"file:{path}?mode=ro&immutable=false"
         with sqlite3.connect(uri, uri=True, timeout=0) as connection:
             connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=250")
+            connection.execute("BEGIN DEFERRED")
             if connection.execute("PRAGMA user_version").fetchone()[0] != catalog["user_version"]:
                 raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
             actual = {
@@ -1366,13 +1494,29 @@ class AcceptanceReader:
         frozen = FrozenReliabilityVersions.model_validate(
             _safe_json(paths["evidence"] / "frozen_versions.json")
         )
+        try:
+            self._validate_readonly_descriptor(paths["evidence"])
+        except (ValidationError, ValueError, OSError, json.JSONDecodeError):
+            return self._report_unavailable(
+                request, fingerprints, "LINEAGE_UNAVAILABLE", [], frozen
+            )
+        try:
+            registry_path = next(
+                path for path in paths["controls"] if path.name == "provider_registry.sqlite3"
+            )
+            registry = read_secondary_qualification_projection(registry_path)
+        except _AcceptanceError as error:
+            return self._report_unavailable(request, fingerprints, error.reason, [], frozen)
+        if (
+            registry.provider_id != frozen.secondary_provider_id
+            or registry.window_id != frozen.qualification_window_id
+        ):
+            return self._report_unavailable(
+                request, fingerprints, "CANONICAL_INTEGRITY_FAILED", [], frozen
+            )
         raw_sessions = list(calendar["source_sequence"])
         if not calendar.get("confirmed", False) or calendar.get("unknown_state", False):
             return self._report_unavailable(request, fingerprints, "CALENDAR_UNAVAILABLE", [], None)
-        if calendar.get("conflict_state", False):
-            return self._report_unavailable(
-                request, fingerprints, "CALENDAR_UNAVAILABLE", [], frozen
-            )
         if len(raw_sessions) != 20:
             return self._report_unavailable(
                 request, fingerprints, "SESSION_COUNT_NOT_20", [], frozen
@@ -1415,7 +1559,9 @@ class AcceptanceReader:
                 request, fingerprints, "LINEAGE_UNAVAILABLE", raw_sessions, frozen
             )
         try:
-            return self._build_report(request, paths, fingerprints, frozen, observations, calendar)
+            return self._build_report(
+                request, paths, fingerprints, frozen, observations, calendar, registry
+            )
         except _AcceptanceError as error:
             return self._report_unavailable(
                 request, fingerprints, error.reason, raw_sessions, frozen
@@ -1500,23 +1646,19 @@ class AcceptanceReader:
             if descriptor.get("contract_digest") != expected:
                 continue
             found = True
-            object_path = evidence / descriptor["object_path"]
             root_base = (
                 evidence
                 if descriptor.get("root_base") != "dataset"
                 else evidence.parent / "dataset"
             )
-            root_path = root_base / descriptor["root_path"]
-            if (
-                not object_path.is_file()
-                or not root_path.is_file()
-                or descriptor.get("immutable") is not True
-            ):
+            if descriptor.get("immutable") is not True:
                 raise ValueError("lineage unavailable")
-            raw = object_path.read_bytes()
+            raw = _read_anchored_file(evidence, descriptor["object_path"])
             if hashlib.sha256(raw).hexdigest() != descriptor.get("artifact_sha256"):
                 raise ValueError("lineage invalid")
-            root = _safe_json(root_path)
+            root = json.loads(
+                _read_anchored_file(root_base, descriptor["root_path"]).decode("utf-8")
+            )
             if descriptor.get("contract_digest") != _digest(source_field, root):
                 raise ValueError("lineage invalid")
         # A session-level mutation can legitimately produce a new digest before
@@ -1532,6 +1674,61 @@ class AcceptanceReader:
         }
         if not found and (not seen or (repeated and descriptor_count < 20)):
             raise ValueError("lineage unavailable")
+
+    def _validate_readonly_descriptor(self, evidence: Path) -> None:
+        """Read and verify the writer-owned descriptor and its immutable object."""
+        object_dir = evidence / "objects" / "ReadonlyEvidenceDescriptor.object_sha256"
+        descriptor_dir = evidence / "objects" / "ReadonlyEvidenceDescriptor.descriptor_sha256"
+        object_entries = [
+            entry for entry in os.listdir(object_dir) if entry.endswith(".descriptor.json")
+        ]
+        descriptor_entries = [
+            entry for entry in os.listdir(descriptor_dir) if entry.endswith(".descriptor.json")
+        ]
+        if len(object_entries) != 1 or len(descriptor_entries) != 1:
+            raise ValueError("readonly descriptor unavailable")
+        object_sidecar_path = (
+            f"objects/ReadonlyEvidenceDescriptor.object_sha256/{object_entries[0]}"
+        )
+        descriptor_sidecar_path = (
+            f"objects/ReadonlyEvidenceDescriptor.descriptor_sha256/{descriptor_entries[0]}"
+        )
+        object_sidecar = json.loads(
+            _read_anchored_file(evidence, object_sidecar_path).decode("utf-8")
+        )
+        descriptor_sidecar = json.loads(
+            _read_anchored_file(evidence, descriptor_sidecar_path).decode("utf-8")
+        )
+        for sidecar in (object_sidecar, descriptor_sidecar):
+            if sidecar.get("immutable") is not True:
+                raise ValueError("readonly descriptor unavailable")
+            object_path = sidecar.get("object_path")
+            if not isinstance(object_path, str):
+                raise ValueError("readonly descriptor unavailable")
+            raw = _read_anchored_file(evidence, object_path)
+            if hashlib.sha256(raw).hexdigest() != sidecar.get("artifact_sha256"):
+                raise ValueError("readonly descriptor invalid")
+        descriptor_raw = _read_anchored_file(evidence, descriptor_sidecar["object_path"])
+        descriptor = ReadonlyEvidenceDescriptor.model_validate(
+            json.loads(descriptor_raw.decode("utf-8"))
+        )
+        object_raw = _read_anchored_file(evidence, object_sidecar["object_path"])
+        object_root = json.loads(
+            _read_anchored_file(evidence, object_sidecar["root_path"]).decode("utf-8")
+        )
+        if (
+            descriptor.object_sha256
+            != _digest("ReadonlyEvidenceDescriptor.object_sha256", object_root)
+            or descriptor.descriptor_sha256
+            != _digest(
+                "ReadonlyEvidenceDescriptor.descriptor_sha256", descriptor.model_dump(mode="python")
+            )
+            or descriptor.object_sha256 != object_sidecar.get("contract_digest")
+            or descriptor.descriptor_sha256 != descriptor_sidecar.get("contract_digest")
+        ):
+            raise ValueError("readonly descriptor invalid")
+        if hashlib.sha256(object_raw).hexdigest() != object_sidecar.get("artifact_sha256"):
+            raise ValueError("readonly object invalid")
 
     def _report_unavailable(
         self,
@@ -1635,6 +1832,7 @@ class AcceptanceReader:
         frozen: FrozenReliabilityVersions,
         observations: list[dict[str, Any]],
         calendar: dict[str, Any],
+        registry: SecondaryQualificationProjection | None = None,
     ) -> R2FAcceptanceReport:
         sessions = [item["session"] for item in observations]
         identity = self._identity(request, fingerprints, frozen)
@@ -1710,6 +1908,20 @@ class AcceptanceReader:
         window = _safe_json(paths["evidence"] / "window.json")
         self._validate_envelope(window)
         payload = window["payload"]
+        WindowEvidenceBundlePayload.model_validate(payload)
+        child_models: dict[str, type[StrictModel]] = {
+            "recovery_observation": RecoveryObservation,
+            "failover_observation": WholeSessionFailoverDrill,
+            "replay_sample": ReplaySampleEvidence,
+            "adjustment_equivalence": AdjustmentEquivalenceEvidence,
+            "error_handling_observation": ErrorHandlingObservation,
+            "local_nas_isolation_observation": LocalNasIsolationObservation,
+            "restore_observation": RestoreDrillEvidence,
+        }
+        for child_name, child_model in child_models.items():
+            child_envelope = payload.get(child_name)
+            if child_envelope is not None:
+                child_model.model_validate(child_envelope["payload"])
         for name, child, reason, target in (
             ("recovery", "recovery_observation", "RECOVERY_FAILED", True),
             ("failover", "failover_observation", "FAILOVER_UNAVAILABLE", True),
@@ -1847,7 +2059,14 @@ class AcceptanceReader:
             versions_good,
             True,
         )
-        metrics["calendar"] = self._metric("calendar", "pass", None, True, True)
+        calendar_conflict = calendar.get("conflict_state", False)
+        metrics["calendar"] = self._metric(
+            "calendar",
+            "fail" if calendar_conflict else "pass",
+            "CALENDAR_CONFLICT" if calendar_conflict else None,
+            not calendar_conflict,
+            True,
+        )
         universe_good = all(
             item["unknown_count"] == 0
             and item["required_count"]
@@ -1861,7 +2080,7 @@ class AcceptanceReader:
         metrics["universe"] = self._metric(
             "universe",
             "pass" if universe_good else "fail",
-            None if universe_good else "UNIVERSE_UNKNOWN_NONZERO",
+            None if universe_good else "UNIVERSE_COUNT_MISMATCH",
             universe_good,
             True,
         )
@@ -1944,7 +2163,12 @@ class AcceptanceReader:
         report["semantic_report_sha256"] = _digest(
             "R2FAcceptanceReport.semantic_report_sha256", report
         )
-        return R2FAcceptanceReport.model_validate(report)
+        validated = R2FAcceptanceReport.model_validate(report)
+        if registry is not None and validated.status == "ready":
+            object.__setattr__(
+                validated, "_registry_projection", registry.model_dump(mode="python")
+            )
+        return validated
 
     def _validate_envelope(self, envelope: dict[str, Any]) -> None:
         ImmutableObservationEnvelopeV1.model_validate(envelope)
@@ -1971,6 +2195,141 @@ class AcceptanceReader:
             return False
 
 
+def read_secondary_qualification_projection(
+    path: Path | str,
+    *,
+    provider_id: str = "tickflow",
+    window_id: str = "qualification-window-20",
+) -> SecondaryQualificationProjection:
+    """Read the authority projection from the registry, never from a bundle."""
+    path = Path(path)
+    if _catalog_key(path) != "shadow_registry":
+        raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+    uri = f"file:{path}?mode=ro&immutable=false"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=0) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=250")
+            connection.execute("BEGIN DEFERRED")
+            catalog = _CATALOGS["shadow_registry"]
+            if connection.execute("PRAGMA user_version").fetchone()[0] != catalog["user_version"]:
+                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            actual_objects = {
+                f"{kind}:{name}"
+                for kind, name in connection.execute(
+                    "SELECT type,name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if actual_objects != set(catalog["sqlite_master_allowlist"]):
+                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            for table_name, table_spec in catalog["tables"].items():
+                columns = connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+                declared = [f"{row[1]}:{row[2] or ''}" for row in columns]
+                if declared != list(table_spec["columns"]):
+                    raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+                primary_key = [
+                    row[1] for row in sorted(columns, key=lambda item: item[5]) if row[5]
+                ]
+                if primary_key != list(table_spec["primary_key"]):
+                    raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            provider = connection.execute(
+                "SELECT provider_id, admission_state FROM provider_record WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+            window = connection.execute(
+                "SELECT provider_id, window_id, window_start, window_end, "
+                "consecutive_sessions, window_state, qualification_evidence_sha256, "
+                "qualification_candidate_sha256, terminal_attestation_id "
+                "FROM qualification_window WHERE provider_id=? AND window_id=?",
+                (provider_id, window_id),
+            ).fetchone()
+            if provider is None or provider[1] != "qualified" or window is None:
+                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            if window[6] is None or window[7] is None or window[8] is None:
+                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            sessions = connection.execute(
+                "SELECT trade_date, session_report_id, terminal_attestation_id "
+                "FROM qualification_session WHERE provider_id=? AND window_id=? "
+                "ORDER BY trade_date",
+                (provider_id, window_id),
+            ).fetchall()
+            if len(sessions) != 20:
+                raise _AcceptanceError("SESSION_COUNT_NOT_20")
+            dates = [row[0] for row in sessions]
+            if (
+                len(set(dates)) != 20
+                or dates != sorted(dates)
+                or dates[0] != window[2]
+                or dates[-1] != window[3]
+            ):
+                raise _AcceptanceError("SESSION_SEQUENCE_INVALID")
+            if window[4] != 20:
+                raise _AcceptanceError("SESSION_COUNT_NOT_20")
+            reports = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT session_report_id FROM session_report "
+                    "WHERE provider_id=? AND window_id=?",
+                    (provider_id, window_id),
+                )
+            }
+            attestations = {
+                row[0]: row
+                for row in connection.execute(
+                    "SELECT attestation_id, provider_id, window_id, session_id, "
+                    "session_report_id FROM shadow_terminal_attestation "
+                    "WHERE provider_id=? AND window_id=?",
+                    (provider_id, window_id),
+                )
+            }
+            if any(report_id not in reports for _, report_id, _ in sessions):
+                raise _AcceptanceError("CANONICAL_INTEGRITY_FAILED")
+            if any(
+                attestation_id not in attestations
+                or attestations[attestation_id][1:4] != (provider_id, window_id, trade_date)
+                or attestations[attestation_id][4] != report_id
+                for trade_date, report_id, attestation_id in sessions
+            ):
+                raise _AcceptanceError("CANONICAL_INTEGRITY_FAILED")
+            terminal_job = connection.execute(
+                "SELECT terminal_attestation_id FROM shadow_job "
+                "WHERE provider_id=? AND window_id=? AND trade_date=? "
+                "ORDER BY job_id DESC LIMIT 1",
+                (provider_id, window_id, window[3]),
+            ).fetchone()
+            if terminal_job is None or terminal_job[0] != window[8]:
+                raise _AcceptanceError("CANONICAL_INTEGRITY_FAILED")
+            digest = _sqlite_logical_digest(path, "shadow_registry")
+            connection.rollback()
+    except _AcceptanceError:
+        raise
+    except (OSError, sqlite3.Error):
+        raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE") from None
+    return SecondaryQualificationProjection(
+        provider_id=provider_id,
+        window_id=window_id,
+        window_state="qualified",
+        session_count=20,
+        logical_digest=digest,
+    )
+
+
+def read_readonly_evidence(
+    descriptor: ReadonlyEvidenceDescriptor | dict[str, Any],
+    immutable_bytes: bytes,
+) -> ReadonlyEvidenceDescriptor:
+    """Validate a Task20 descriptor against supplied immutable bytes."""
+    model = ReadonlyEvidenceDescriptor.model_validate(descriptor)
+    if hashlib.sha256(immutable_bytes).hexdigest() != model.object_sha256:
+        raise _AcceptanceError("LINEAGE_INVALID")
+    if (
+        _digest("ReadonlyEvidenceDescriptor.descriptor_sha256", model.model_dump(mode="python"))
+        != model.descriptor_sha256
+    ):
+        raise _AcceptanceError("LINEAGE_INVALID")
+    return model
+
+
 __all__ = [
     "AcceptanceInput",
     "AcceptanceReader",
@@ -1987,12 +2346,17 @@ __all__ = [
     "ImmutableObservationEnvelopeV1",
     "OfflineReplayContext",
     "WholeSessionFailoverDrill",
+    "RecoveryObservation",
     "ReplaySampleEvidence",
     "AdjustmentEquivalenceEvidence",
+    "ErrorHandlingEvent",
     "ErrorHandlingObservation",
     "LocalNasIsolationObservation",
     "RestoreDrillEvidence",
     "WindowEvidenceBundlePayload",
+    "SecondaryQualificationProjection",
+    "read_secondary_qualification_projection",
+    "read_readonly_evidence",
     "_canonical_json",
     "_digest",
     "_tree_content_digest",

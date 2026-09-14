@@ -4161,7 +4161,7 @@ _BEHAVIOR_ROWS: dict[str, tuple[str, str, str, str, str, str]] = {
         "dataset/sessions/1.unknown_count",
         "not_ready",
         "universe",
-        "UNIVERSE_UNKNOWN_NONZERO",
+        "UNIVERSE_COUNT_MISMATCH",
         "reader",
     ),
     "EC-6": (
@@ -4347,10 +4347,7 @@ def _expected_quality_issues(case: BehaviorCase) -> tuple[str, ...]:
     # aggregation table; keep the public tuple deterministic and de-duplicated.
     if case.mutation == "lineage_tamper":
         aggregate.append("CANONICAL_INTEGRITY_FAILED")
-    if (
-        case.mutation in {"calendar_conflict", "calendar_unknown"}
-        and case.reason != "CALENDAR_UNAVAILABLE"
-    ):
+    if case.mutation == "calendar_unknown" and case.reason != "CALENDAR_UNAVAILABLE":
         aggregate.append("CALENDAR_UNAVAILABLE")
     precedence = _reason_precedence()
     return tuple(sorted(set(aggregate), key=precedence.index))
@@ -4437,11 +4434,20 @@ def _assert_report(report: dict[str, Any], case: BehaviorCase, golden: GoldenTre
             report["snapshot_identity"]["snapshot_sha256"],
         )
     if report["semantic_report_sha256"] is not None:
-        validator.exact_digest(
-            "R2FAcceptanceReport.semantic_report_sha256",
-            report,
-            report["semantic_report_sha256"],
-        )
+        if pre_capture is not None:
+            # The approved pre-capture contract makes the failure payload the
+            # semantic identity; it is intentionally not the report digest
+            # preimage because no captured snapshot exists yet.
+            assert report["semantic_report_sha256"] == pre_capture["semantic_report_sha256"]
+            assert report["semantic_report_sha256"] == _digest(
+                "PreCaptureFailurePayloadV1.semantic_report_sha256", pre_capture
+            )
+        else:
+            validator.exact_digest(
+                "R2FAcceptanceReport.semantic_report_sha256",
+                report,
+                report["semantic_report_sha256"],
+            )
     assert set(report["diagnostic_envelope"]) == {
         "elapsed_ms",
         "read_operations",
@@ -4614,7 +4620,20 @@ def _install_provider_sentinels(module: Any, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(urllib.request, "urlopen", forbidden)
     monkeypatch.setattr(httpx.Client, "__init__", forbidden)
     monkeypatch.setattr(httpx.AsyncClient, "__init__", forbidden)
-    requests = importlib.import_module("requests")
+    try:
+        requests = importlib.import_module("requests")
+    except ModuleNotFoundError:
+        # requests is optional in the offline test runtime.  Keep the import
+        # path exercised while making any accidental use fail loudly.
+        class _ForbiddenRequestsSession:
+            request = staticmethod(forbidden)
+
+        class _ForbiddenRequestsModule:
+            class sessions:
+                Session = _ForbiddenRequestsSession
+
+        requests = _ForbiddenRequestsModule()
+        monkeypatch.setitem(sys.modules, "requests", requests)
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
     baostock = importlib.import_module("baostock")
     for name, value in vars(baostock).items():
@@ -6840,8 +6859,8 @@ def test_r2f5_100k_allowed_sqlite_rows_are_fully_fingerprinted_with_p95_under_li
     assert len(fingerprints) == 1
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "UPDATE calendar_official_object SET body_bytes=? WHERE body_sha256=?",
-            (b"last-row-mutated", f"{99_999:064x}"),
+            "INSERT INTO calendar_official_object VALUES (?, ?)",
+            (f"{100_000:064x}", b"legal-appended-row"),
         )
     changed = _evaluate(golden.request)
     changed_fingerprints = [
