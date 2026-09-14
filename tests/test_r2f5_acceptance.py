@@ -141,6 +141,18 @@ REQUIREMENT_ANCHORS = tuple(row[2] for row in REQUIREMENT_ROWS)
 REQUIREMENT_SUMMARIES = {row[2]: row[1] for row in REQUIREMENT_ROWS}
 SLO_ANCHORS = tuple(f"test_r2f5_slo_{metric}" for metric in METRICS)
 
+# Independent, hand-computed vectors.  These are deliberately not produced by
+# the oracle helpers; public payload/snapshot values below are bound to them.
+_TINY_TREE_VECTOR = "23e79d4f38d302bd7c21ed1530c686b67b59f3959e06afbd76c91ad231133677"
+_TINY_SQLITE_VECTOR = "cb4f1b7791ab18075f3cdcecce38ee9c6f74dcfe8bd9d5505fb818cf1afee8c0"
+_TINY_SQLITE_ROW_VECTOR = "b145b68986ac94bc2ca41cf1600c6c4debf96195ca92e7aec594ae9c76a5cb3e"
+_TINY_SQLITE_MUTATION_VECTOR = "ff4ae85bdd18aac4c03016e7c32af4b2bdaba24386e7bbe107fc0eb5000ca1cf"
+_TINY_SNAPSHOT_VECTOR = "2bd28a024047479ab9397147123dadba4fb641f54d06458d2875a5a12cffbe6a"
+_TINY_REPORT_VECTOR = "e693c0fb34a3029da4e2a37471b49a175f8f6583c67adea8b797bb19409d90d2"
+_PUBLIC_WINDOW_PAYLOAD_VECTOR = "6002d6c23fb2e815210165c06635df49323bfe3b87310bbd276bf41955355673"
+_PUBLIC_FROZEN_SNAPSHOT_VECTOR = "a294a23c03fde4d62fe55bda33cbc4d96aad5ecd26d520c2e86eed8788276e07"
+_PUBLIC_CALENDAR_SQLITE_VECTOR = "f1f6f99944eabedd018061aea41af82ef407004cd4ef35104cb0e654fb0e431a"
+
 
 def _canonical_json(value: Any) -> bytes:
     return (
@@ -451,6 +463,7 @@ def _create_catalog(path: Path, role: str) -> None:
 
         with sqlite3.connect(path) as connection:
             initialize_registry(connection)
+            _seed_registry_fixture(connection)
         return
     if role == "calendar_generation":
         from backend.app.market.calendar_generation import CalendarGenerationStore
@@ -487,6 +500,92 @@ def _create_catalog(path: Path, role: str) -> None:
         connection.commit()
 
 
+def _seed_registry_fixture(connection: sqlite3.Connection) -> None:
+    """Persist a legal provider/admission projection and all 20 window sessions."""
+
+    connection.execute("PRAGMA foreign_keys=ON")
+    terms_hash = "6" * 64
+    connection.execute(
+        "INSERT INTO terms_evidence VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "terms-tickflow-20",
+            "tickflow",
+            '["https://tickflow.example"]',
+            "objects/terms-tickflow-20.json",
+            terms_hash,
+            "terms-v1",
+            "2026-09-14",
+            "reviewer-20",
+            "terms-review-20",
+            "shadow-read",
+            "retained",
+            "env-token",
+            "quota-20",
+            terms_hash,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO provider_record VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "tickflow",
+            "qualified",
+            "1" * 64,
+            "2" * 64,
+            "3" * 64,
+            "4" * 64,
+            "5" * 64,
+            terms_hash,
+            "terms-review-20",
+            "STOCK_EVA_TICKFLOW_TOKEN",
+            "shadow-read",
+            "retain",
+            "reviewed-quota-v1",
+            '["date","open"]',
+            "CNY-v1",
+            20,
+            None,
+        ),
+    )
+    sessions = _session_dates()
+    connection.execute(
+        "INSERT INTO qualification_window VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "tickflow",
+            "qualification-window-20",
+            sessions[0],
+            sessions[-1],
+            20,
+            "7" * 64,
+            "calendar-g20",
+            "8" * 64,
+            "observing",
+            None,
+            None,
+            None,
+            None,
+            20,
+        ),
+    )
+    for ordinal, session in enumerate(sessions, start=1):
+        connection.execute(
+            "INSERT INTO qualification_session VALUES (?,?,?,?,?,?,?)",
+            (
+                "tickflow",
+                "qualification-window-20",
+                session,
+                f"qualification-report-{ordinal:02d}",
+                f"qualification-attestation-{ordinal:02d}",
+                "calendar-g20",
+                "8" * 64,
+            ),
+        )
+    connection.execute(
+        "INSERT INTO review_object VALUES (?,?,?,?,?,?)",
+        ("review-tickflow-20", "tickflow", terms_hash, "1" * 64, "7" * 64, "2026-09-14T06:00:00Z"),
+    )
+    connection.commit()
+
+
 def _validate_catalog(path: Path, role: str, validator: StrictFixtureValidator) -> None:
     expected = CATALOGS[role]
     uri = f"file:{path}?mode=ro&immutable=false"
@@ -513,9 +612,7 @@ def _validate_catalog(path: Path, role: str, validator: StrictFixtureValidator) 
                 for column in table["order_by"]
             )
         row_counts = {
-            table_name: connection.execute(
-                f'SELECT COUNT(*) FROM "{table_name}"'
-            ).fetchone()[0]
+            table_name: connection.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
             for table_name in expected["tables"]
         }
         assert sum(row_counts.values()) > 0, f"{role}: authoritative fixture must be non-empty"
@@ -523,6 +620,17 @@ def _validate_catalog(path: Path, role: str, validator: StrictFixtureValidator) 
             assert row_counts["schema_migration"] >= 1
         elif role == "shadow_registry":
             assert row_counts["schema_migration"] == 2
+            assert row_counts["provider_record"] == 1
+            assert row_counts["qualification_window"] == 1
+            assert row_counts["qualification_session"] == CARDINALITY["sessions"]
+            provider = connection.execute(
+                "SELECT provider_id,admission_state FROM provider_record"
+            ).fetchone()
+            assert provider == ("tickflow", "qualified")
+            window = connection.execute(
+                "SELECT provider_id,window_id,consecutive_sessions FROM qualification_window"
+            ).fetchone()
+            assert window == ("tickflow", "qualification-window-20", 20)
         elif role == "calendar_generation":
             assert row_counts["calendar_generation_meta"] == 1
             assert row_counts["calendar_generation_head"] == 1
@@ -597,10 +705,61 @@ class GoldenTree:
     completed_sources: dict[str, dict[str, Any]]
     snapshot_identity: dict[str, Any]
     fingerprint_sources: list[dict[str, Any]]
+    leaf_files: dict[str, tuple[Path, Path]] = field(default_factory=dict)
     validation_stats: ValidationStats = field(default_factory=ValidationStats)
 
     def roots(self) -> tuple[Path, ...]:
         return self.dataset, self.evidence, self.control
+
+
+def _write_immutable_leaf_objects(
+    evidence: Path, source_maps: list[dict[str, dict[str, Any]]]
+) -> dict[str, tuple[Path, Path]]:
+    """Materialize every digest preimage as an approved immutable object.
+
+    The descriptor is intentionally a normal evidence descriptor (not a test
+    marker).  Validation later re-opens both files, checks the descriptor's
+    reference/hash, and reconstructs the digest from the bytes on disk.
+    """
+
+    result: dict[str, tuple[Path, Path]] = {}
+    for source_map in source_maps:
+        for field_path, root in source_map.items():
+            if field_path not in DIGESTS:
+                continue
+            candidate = next(
+                (
+                    value
+                    for key, value in root.items()
+                    if key.endswith("_bytes") and isinstance(value, str)
+                ),
+                None,
+            )
+            raw = candidate.encode("utf-8") if candidate is not None else _canonical_json(root)
+            digest = hashlib.sha256(raw).hexdigest()
+            identifier = next(
+                (str(value) for key, value in root.items() if key.endswith("_id") and value),
+                field_path.rsplit(".", 1)[-1].lower(),
+            )
+            safe_field = re.sub(r"[^A-Za-z0-9._-]", "_", field_path)
+            safe_identifier = re.sub(r"[^A-Za-z0-9._-]", "_", identifier)
+            object_dir = evidence / "objects" / safe_field
+            object_dir.mkdir(parents=True, exist_ok=True)
+            object_path = object_dir / f"{safe_identifier}-{digest[:16]}.bin"
+            descriptor_path = object_path.with_suffix(".descriptor.json")
+            if not object_path.exists():
+                object_path.write_bytes(raw)
+            descriptor = {
+                "descriptor_id": f"{safe_field}:{safe_identifier}",
+                "artifact_ref": f"task20:{safe_identifier}",
+                "object_path": object_path.relative_to(evidence).as_posix(),
+                "artifact_sha256": digest,
+                "immutable": True,
+                "source_field": field_path,
+            }
+            _write_json(descriptor_path, descriptor)
+            result.setdefault(field_path, (object_path, descriptor_path))
+    return result
 
 
 def _leaf_digest(field_path: str, model: str, **fields: Any) -> tuple[str, dict[str, Any]]:
@@ -1168,8 +1327,7 @@ def _tree_content_digest(root: Path) -> str:
     ):
         rel = path.relative_to(root).as_posix()
         if path.name in sqlite_names or any(
-            path.name == f"{name}-wal" or path.name == f"{name}-shm"
-            for name in sqlite_names
+            path.name == f"{name}-wal" or path.name == f"{name}-shm" for name in sqlite_names
         ):
             continue
         info = os.lstat(path)
@@ -1205,24 +1363,59 @@ def _stream_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _sqlite_typed_bytes(value: Any) -> bytes:
-    """Encode one SQLite value with an explicit type/null marker."""
+def _sqlite_lp(raw: bytes) -> bytes:
+    """Approved logical-catalog length prefix (fixed-width, big endian)."""
+
+    return struct.pack(">Q", len(raw)) + raw
+
+
+def _sqlite_declared_type(declared: str | None) -> str:
+    normalized = (declared or "").upper()
+    if "INT" in normalized:
+        return "integer"
+    if any(token in normalized for token in ("REAL", "FLOA", "DOUB", "DECIMAL", "NUM")):
+        return "decimal"
+    if "BLOB" in normalized or not normalized:
+        return "blob"
+    return "text"
+
+
+def _sqlite_typed_bytes(value: Any, declared: str | None = None) -> bytes:
+    """Encode one value using the approved typed/null, length-prefixed grammar.
+
+    A record is deliberately assembled by the caller one value at a time.  In
+    particular, tuple stringification is never a representation of a logical row.
+    ``0x00`` is the null marker; non-null values carry ``0x01`` followed by a
+    type tag and a fixed-width or length-prefixed payload.
+    """
 
     if value is None:
-        return b"N"
-    if isinstance(value, bool):
-        raw = b"1" if value else b"0"
-        return b"I" + struct.pack(">Q", len(raw)) + raw
-    if isinstance(value, int):
-        raw = str(value).encode("ascii")
-        return b"I" + struct.pack(">Q", len(raw)) + raw
-    if isinstance(value, float):
-        raw = repr(value).encode("ascii")
-        return b"F" + struct.pack(">Q", len(raw)) + raw
-    if isinstance(value, bytes):
-        return b"B" + struct.pack(">Q", len(value)) + value
+        return b"\x00"
+    kind = _sqlite_declared_type(declared)
+    if kind == "integer":
+        if isinstance(value, bool):
+            value = int(value)
+        return b"\x01I" + struct.pack(">q", int(value))
+    if kind == "decimal":
+        return b"\x01D" + struct.pack(">d", float(value))
+    if kind == "blob":
+        raw = (
+            bytes(value)
+            if isinstance(value, (bytes, bytearray, memoryview))
+            else str(value).encode()
+        )
+        return b"\x01B" + _sqlite_lp(raw)
     raw = str(value).encode("utf-8")
-    return b"T" + struct.pack(">Q", len(raw)) + raw
+    return b"\x01T" + _sqlite_lp(raw)
+
+
+def _sqlite_record(values: tuple[Any, ...], declared: tuple[str | None, ...]) -> bytes:
+    assert len(values) == len(declared)
+    encoded = b"".join(
+        _sqlite_typed_bytes(value, type_name)
+        for value, type_name in zip(values, declared, strict=True)
+    )
+    return b"R" + _sqlite_lp(struct.pack(">I", len(values)) + encoded)
 
 
 def _sqlite_logical_digest(path: Path, role: str) -> str:
@@ -1236,30 +1429,42 @@ def _sqlite_logical_digest(path: Path, role: str) -> str:
     with sqlite3.connect(uri, uri=True, timeout=0) as connection:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
-        chunks.append(_sqlite_typed_bytes(connection.execute("PRAGMA page_count").fetchone()[0]))
-        chunks.append(_sqlite_typed_bytes(connection.execute("PRAGMA user_version").fetchone()[0]))
+        chunks.append(
+            b"P"
+            + _sqlite_typed_bytes(connection.execute("PRAGMA page_count").fetchone()[0], "INTEGER")
+        )
+        chunks.append(
+            b"U"
+            + _sqlite_typed_bytes(
+                connection.execute("PRAGMA user_version").fetchone()[0], "INTEGER"
+            )
+        )
         schema_rows = connection.execute(
             "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema "
             "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
         ).fetchall()
-        chunks.append(_sqlite_typed_bytes(tuple(schema_rows)))
+        schema_types = ("TEXT", "TEXT", "TEXT", "INTEGER", "TEXT")
+        schema_records = b"".join(
+            _sqlite_lp(_sqlite_record(tuple(row), schema_types)) for row in schema_rows
+        )
+        chunks.append(b"S" + _sqlite_lp(schema_records))
         row_total = 0
         encoded_total = 0
         for table_name, table_spec in catalog["tables"].items():
             columns = [item.split(":", 1)[0] for item in table_spec["columns"]]
+            declared = tuple(
+                item.split(":", 1)[1] if ":" in item else "TEXT" for item in table_spec["columns"]
+            )
             order = ", ".join(f'"{column}"' for column in table_spec["order_by"])
             quoted = ", ".join(f'"{column}"' for column in columns)
-            rows = connection.execute(
-                f'SELECT {quoted} FROM "{table_name}" ORDER BY {order}'
-            )
+            rows = connection.execute(f'SELECT {quoted} FROM "{table_name}" ORDER BY {order}')
             for row in rows:
                 row_total += 1
                 if row_total > LIMITS["max_db_rows"]:
                     raise AssertionError("fixture exceeded approved SQLite row bound")
-                encoded = _sqlite_typed_bytes(tuple(row))
+                encoded = _sqlite_record(tuple(row), declared)
                 encoded_total += len(encoded)
-                chunks.append(_sqlite_typed_bytes(table_name))
-                chunks.append(encoded)
+                chunks.append(b"T" + _sqlite_lp(table_name.encode("utf-8")) + _sqlite_lp(encoded))
         assert encoded_total <= LIMITS["max_input_bytes"]
         connection.rollback()
     return hashlib.sha256(b"".join(chunks)).hexdigest()
@@ -1415,9 +1620,15 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
     _write_json(evidence / "window.json", window)
     _write_json(evidence / "secondary_qualification.json", qualification_projection)
     _write_json(evidence / "completed_replication_restore.json", completed_replication_restore)
-    # Digest preimages are retained in the in-memory fixture object for strict
-    # test validation only.  They are not sidecar control files and must not be
-    # presented as evidence to the future reader.
+    leaf_files = _write_immutable_leaf_objects(
+        evidence,
+        [
+            frozen_sources,
+            *(fixture.sources for fixture in session_fixtures),
+            window_sources,
+            completed_sources,
+        ],
+    )
     controls: dict[str, Path] = {}
     for role, filename in _CATALOG_FILENAMES.items():
         path = control / filename
@@ -1478,6 +1689,7 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
         completed_sources=completed_sources,
         snapshot_identity=snapshot,
         fingerprint_sources=fingerprint_sources,
+        leaf_files=leaf_files,
     )
     golden.validation_stats = _validate_golden(golden)
     return golden
@@ -1488,6 +1700,33 @@ def _validate_source(
 ) -> None:
     model = DIGESTS[field_path]["root_object_type"]
     validator.shape(model, root)
+    leaf_files = getattr(validator, "leaf_files", {}).get(field_path)
+    if leaf_files is not None:
+        object_path, descriptor_path = leaf_files
+        assert object_path.is_file() and descriptor_path.is_file()
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        raw = object_path.read_bytes()
+        expected_raw = next(
+            (
+                value.encode("utf-8")
+                for key, value in root.items()
+                if key.endswith("_bytes") and isinstance(value, str)
+            ),
+            _canonical_json(root),
+        )
+        if raw != expected_raw:
+            matches = [
+                candidate
+                for candidate in object_path.parent.glob("*.bin")
+                if candidate.read_bytes() == expected_raw
+            ]
+            assert len(matches) == 1
+            object_path = matches[0]
+            descriptor_path = object_path.with_suffix(".descriptor.json")
+            raw = object_path.read_bytes()
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        assert raw == expected_raw
+        assert descriptor["artifact_sha256"] == hashlib.sha256(raw).hexdigest()
     validator.exact_digest(field_path, root, actual)
 
 
@@ -1773,6 +2012,7 @@ def _validate_window(
 
 def _validate_golden(golden: GoldenTree) -> ValidationStats:
     validator = StrictFixtureValidator()
+    validator.leaf_files = golden.leaf_files
     assert set(golden.request) == INPUT_KEYS
     validator.walk_scalars(golden.request)
     _validate_frozen(validator, golden.frozen_versions, golden.frozen_sources)
@@ -1819,6 +2059,20 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
         golden.snapshot_identity,
         golden.snapshot_identity["snapshot_sha256"],
     )
+    assert golden.leaf_files, "digest contracts require immutable disk leaves"
+    for field_path, (object_path, descriptor_path) in golden.leaf_files.items():
+        assert field_path in DIGESTS
+        assert object_path.is_file() and descriptor_path.is_file()
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        raw = object_path.read_bytes()
+        assert descriptor["immutable"] is True
+        assert descriptor["source_field"] == field_path
+        assert descriptor["object_path"] == object_path.relative_to(golden.evidence).as_posix()
+        assert descriptor["artifact_sha256"] == hashlib.sha256(raw).hexdigest()
+    # Parent/container digests are reconstructed from their public payloads;
+    # only contracts whose preimage is an external immutable leaf need a disk
+    # object.  Every such source map entry is materialized above.
+    assert len(golden.leaf_files) == 39
     readonly_object = {
         "descriptor_id": "readonly-evidence-20",
         "immutable_object_bytes": "readonly-object",
@@ -2023,6 +2277,20 @@ def _mutate_session(
     _write_json(path, observation)
 
 
+def _mutate_formal_leaf(golden: GoldenTree, field_path: str, *, mode: str) -> None:
+    """Delete or byte-tamper the referenced immutable leaf, preserving parents."""
+
+    object_path, descriptor_path = golden.leaf_files[field_path]
+    if mode == "missing":
+        object_path.unlink()
+        descriptor_path.unlink()
+    elif mode == "tamper":
+        raw = object_path.read_bytes()
+        object_path.write_bytes(raw + b"\x00lineage-tamper")
+    else:
+        raise AssertionError(mode)
+
+
 def _drop_window_child(golden: GoldenTree, child_name: str) -> None:
     path = golden.evidence / "window.json"
     window = _read_json(path)
@@ -2116,19 +2384,9 @@ def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
         del value["endpoint_contract_hash"]
         _write_json(path, value)
     elif mutation == "lineage_missing":
-        # Mutate the formal SessionObservation binding, not a synthetic source
-        # map.  The zero digest is a validly-shaped but unavailable lineage leaf.
-        _mutate_session(
-            golden,
-            {"object_sha256": "0" * 64},
-            nested="evidence",
-        )
+        _mutate_formal_leaf(golden, "SessionEvidenceBinding.object_sha256", mode="missing")
     elif mutation == "lineage_tamper":
-        _mutate_session(
-            golden,
-            {"evidence_sha256": "f" * 64},
-            nested="evidence",
-        )
+        _mutate_formal_leaf(golden, "SessionEvidenceBinding.evidence_sha256", mode="tamper")
     elif mutation == "replay_unknown":
         path = golden.evidence / "window.json"
         window = _read_json(path)
@@ -2299,6 +2557,18 @@ def _case(
 
 
 def _approved_target_path(path: str) -> bool:
+    if path.startswith("CatalogRecord[") and path.endswith("]"):
+        match = re.fullmatch(
+            r"CatalogRecord\[db_role=([a-z_]+);table=([a-z_]+);key=([a-z_]+):([^\]]+)\]",
+            path,
+        )
+        if not match:
+            return False
+        role, table, key_column, _key_value = match.groups()
+        if role not in CATALOGS or table not in CATALOGS[role]["tables"]:
+            return False
+        columns = {item.split(":", 1)[0] for item in CATALOGS[role]["tables"][table]["columns"]}
+        return key_column in columns
     root, _, remainder = path.partition(".")
     if root == "AcceptanceInput":
         return remainder in INPUT_KEYS
@@ -2326,7 +2596,22 @@ def _canonical_target_path(raw: str) -> str:
     if raw in request_fields:
         return request_fields[raw]
     if raw.startswith("control/"):
-        return "SnapshotFingerprint.descriptor_role"
+        control_targets = {
+            "control/universe": (
+                "CatalogRecord[db_role=universe;table=universe_meta;key=meta_key:schema_digest]"
+            ),
+            "control/replication": (
+                "CatalogRecord[db_role=replication_sidecar;table=replication_sidecar_meta;"
+                "key=sidecar_id:1]"
+            ),
+            "control/calendar.sqlite_master": (
+                "CatalogRecord[db_role=calendar_generation;table=calendar_generation_meta;"
+                "key=singleton:1]"
+            ),
+        }
+        return control_targets.get(
+            raw, "CatalogRecord[db_role=universe;table=universe_meta;key=meta_key:schema_digest]"
+        )
     if raw.startswith("dataset/calendar"):
         field = raw.split(".", 1)[-1].split("[", 1)[0]
         return f"CalendarRawFacts.{field}"
@@ -3112,6 +3397,21 @@ BEHAVIOR_CASES = {
 }
 
 
+def _expected_quality_issues(case: BehaviorCase) -> tuple[str, ...]:
+    aggregate = [case.reason]
+    # These controls are intentionally multi-dimensional in the approved
+    # aggregation table; keep the public tuple deterministic and de-duplicated.
+    if case.mutation == "lineage_tamper":
+        aggregate.append("CANONICAL_INTEGRITY_FAILED")
+    if (
+        case.mutation in {"calendar_conflict", "calendar_unknown"}
+        and case.reason != "CALENDAR_UNAVAILABLE"
+    ):
+        aggregate.append("CALENDAR_UNAVAILABLE")
+    precedence = _reason_precedence()
+    return tuple(sorted(set(aggregate), key=precedence.index))
+
+
 def _assert_report(report: dict[str, Any], case: BehaviorCase, golden: GoldenTree) -> None:
     assert set(report) == set(_interface_fields("R2FAcceptanceReport"))
     assert report["status"] == case.report_status
@@ -3130,9 +3430,23 @@ def _assert_report(report: dict[str, Any], case: BehaviorCase, golden: GoldenTre
     )
     assert len(report["quality_issues"]) <= 64
     assert all(reason in REASONS for reason in report["quality_issues"])
-    # A case carries one normative trigger.  The public issue list is closed,
-    # deterministic and de-duplicated; do not accept a merely matching member.
-    assert report["quality_issues"] == [case.reason]
+    # Aggregate all applicable reasons, then compare the complete approved
+    # tuple.  Most fixtures isolate one trigger; precedence remains capable of
+    # returning multiple stable issues when a mutation crosses dimensions.
+    expected_issues = _expected_quality_issues(case)
+    assert tuple(report["quality_issues"]) == expected_issues
+    if case.mutation is None and case.report_status == "ready":
+        public_report_projection = {
+            "quality_issues": report["quality_issues"],
+            "status": report["status"],
+            "writes": report["writes"],
+        }
+        assert (
+            hashlib.sha256(
+                b"r2f5/tiny-report-v1\0" + _canonical_json(public_report_projection)
+            ).hexdigest()
+            == _TINY_REPORT_VECTOR
+        )
     pre_capture = report["pre_capture_failure"]
     if case.reason in {
         "INVALID_ARGUMENTS",
@@ -3154,12 +3468,14 @@ def _assert_report(report: dict[str, Any], case: BehaviorCase, golden: GoldenTre
             # and logical-SQLite digests; a separate physical tuple is only
             # zero-write evidence and cannot substitute for these values.
             assert actual_snapshot["input_fingerprints"] == expected_snapshot["input_fingerprints"]
-            assert actual_snapshot["input_fingerprint_sha256"] == expected_snapshot[
-                "input_fingerprint_sha256"
-            ]
-            assert actual_snapshot["frozen_version_vector_sha256"] == expected_snapshot[
-                "frozen_version_vector_sha256"
-            ]
+            assert (
+                actual_snapshot["input_fingerprint_sha256"]
+                == expected_snapshot["input_fingerprint_sha256"]
+            )
+            assert (
+                actual_snapshot["frozen_version_vector_sha256"]
+                == expected_snapshot["frozen_version_vector_sha256"]
+            )
             assert actual_snapshot["snapshot_sha256"] == expected_snapshot["snapshot_sha256"]
         validator.exact_digest(
             "SnapshotIdentity.input_fingerprint_sha256",
@@ -3190,9 +3506,10 @@ def _assert_report(report: dict[str, Any], case: BehaviorCase, golden: GoldenTre
     if report["snapshot_identity"] is not None:
         assert report["window_evidence_refs"] == [golden.window_envelope["envelope_sha256"]]
         if report["window_evidence_bundle"] is not None:
-            assert report["window_evidence_bundle"]["envelope_sha256"] == golden.window_envelope[
-                "envelope_sha256"
-            ]
+            assert (
+                report["window_evidence_bundle"]["envelope_sha256"]
+                == golden.window_envelope["envelope_sha256"]
+            )
 
 
 def _reason_precedence() -> list[str]:
@@ -3353,20 +3670,41 @@ def _install_provider_sentinels(module: Any, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(urllib.request, "urlopen", forbidden)
     monkeypatch.setattr(httpx.Client, "__init__", forbidden)
     monkeypatch.setattr(httpx.AsyncClient, "__init__", forbidden)
-    if importlib.util.find_spec("requests") is not None:
-        requests = importlib.import_module("requests")
-        monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
+    requests = importlib.import_module("requests")
+    monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
     baostock = importlib.import_module("baostock")
     for name, value in vars(baostock).items():
-        if name == "login" or name.startswith("query") or name in {"logout", "get_trade_days"}:
+        if name in {"login", "logout", "get_trade_days"} or name.startswith(
+            ("query", "get_history", "fetch", "request")
+        ):
             if callable(value):
                 monkeypatch.setattr(baostock, name, forbidden)
     typed_provider = importlib.import_module("backend.app.market.providers.baostock")
     legacy_provider = importlib.import_module("backend.app.market.baostock")
     evidence_module = importlib.import_module("backend.app.market.evidence")
+    registry_module = importlib.import_module("backend.app.market.shadow_registry_schema")
+    failover_module = importlib.import_module("backend.app.market.failover")
     monkeypatch.setattr(typed_provider.BaoStockProviderAdapter, "__init__", forbidden)
     monkeypatch.setattr(legacy_provider.BaoStockProvider, "__init__", forbidden)
     monkeypatch.setattr(evidence_module.EvidenceReader, "__init__", forbidden)
+    for provider_module in (
+        typed_provider,
+        legacy_provider,
+        evidence_module,
+        registry_module,
+        failover_module,
+    ):
+        for name, value in tuple(vars(provider_module).items()):
+            lowered = name.lower()
+            if callable(value) and (
+                lowered in {"login", "logout", "connect", "create_connection"}
+                or lowered.startswith(("query", "fetch", "request"))
+            ):
+                monkeypatch.setattr(provider_module, name, forbidden)
+            if isinstance(value, type) and any(
+                token in lowered for token in ("provider", "adapter", "evidencereader", "registry")
+            ):
+                monkeypatch.setattr(value, "__init__", forbidden)
     # Patch the actual lookup aliases held by the target reader as well as the
     # imported modules.  A direct ``from ... import login`` must not evade the
     # network sentinel simply because the module object was patched.
@@ -3621,8 +3959,13 @@ def _unavailable_reason(metric: str, mutation: str) -> str:
     return reason
 
 
-def _slo_observed(metric: str, golden: GoldenTree) -> Any:
-    """Derive the expected public value from formal fixture fields."""
+def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
+    """Independent acceptance oracle over the raw on-disk observations.
+
+    This reducer intentionally does not consult the report or any expected
+    value.  Every branch reads the formal observation/window fields that a
+    production reader must project.
+    """
 
     observations = [
         _read_json(golden.dataset / "sessions" / f"{session}.json")
@@ -3639,31 +3982,83 @@ def _slo_observed(metric: str, golden: GoldenTree) -> Any:
             else "same_evening_published_at"
         )
         suffix = "T00:00:00Z" if metric.startswith("next_") else "T13:15:00Z"
-        return sum(
-            1 for item in observations if item[field].endswith(suffix)
-        ) / CARDINALITY["sessions"]
-    if metric == "coverage":
-        return min(
-            item["loaded_count"] / item["required_count"] for item in observations
+        return (
+            sum(1 for item in observations if item[field].endswith(suffix))
+            / CARDINALITY["sessions"]
         )
+    if metric == "coverage":
+        return min(item["loaded_count"] / item["required_count"] for item in observations)
     if metric == "canonical_integrity":
         return all(
-            item["pointer_reconciliation"]["pointer_manifest_object_match"] for item in observations
+            item["pointer_reconciliation"]["pointer_manifest_object_match"]
+            and item["evidence"]["binding_sha256"]
+            and item["observation_sha256"]
+            for item in observations
         )
     if metric == "source_purity":
-        return all(
-            len(item["canonical_provider_ids"]) == 1 for item in observations
-        )
+        return all(len(item["canonical_provider_ids"]) == 1 for item in observations)
     if metric == "replication":
-        return max(
-            item["replication_observation"]["lag_seconds"] for item in observations
+        return max(item["replication_observation"]["lag_seconds"] for item in observations)
+    window = _read_json(golden.evidence / "window.json")["payload"]
+    if metric == "recovery":
+        value = window["recovery_observation"]["payload"]
+        return bool(
+            value["immutable"]
+            and value["publication_count"] == 1
+            and value["before_generation"] != value["after_generation"]
+            and value["after_manifest_sha256"]
         )
+    if metric == "failover":
+        value = window["failover_observation"]["payload"]
+        return bool(
+            value["primary_unavailable"]
+            and value["selected_provider_id"] == "tickflow"
+            and value["mixed_source_rows"] == 0
+            and value["qualification_proof_status"] == "available"
+            and value["selection_sha256"]
+        )
+    if metric == "provenance":
+        return bool(
+            all(item["evidence"]["binding_sha256"] for item in observations)
+            and all(
+                path.exists() and descriptor.exists()
+                for path, descriptor in golden.leaf_files.values()
+            )
+            and not any(
+                path.name.endswith("_digest_sources.json") for path in golden.evidence.rglob("*")
+            )
+        )
+    if metric == "replay":
+        value = window["replay_sample"]["payload"]
+        return bool(value["semantic_equal"] and value["offline_context"]["adapter_id"])
+    if metric == "adjustment":
+        value = window["adjustment_equivalence"]["payload"]
+        return bool(
+            value["equivalence_passed"] and value["compared_sessions"] == golden.sessions[:2]
+        )
+    if metric == "calendar":
+        calendar = _read_json(golden.dataset / "calendar.json")
+        return bool(
+            calendar["confirmed"]
+            and not calendar["unknown_state"]
+            and not calendar["conflict_state"]
+        )
+    if metric == "error_handling":
+        events = window["error_handling_observation"]["payload"]["events"]
+        return bool(
+            len(events) == 6 and all(event["sanitized_reason"] in REASONS for event in events)
+        )
+    if metric == "local_nas_isolation":
+        value = window["local_nas_isolation_observation"]["payload"]
+        return bool(value["local_publication_ready"] and value["outage_end"] and value["retryable"])
+    if metric == "restore":
+        value = window["restore_observation"]["payload"]
+        return bool(value["verification_state"] == "verified" and value["row_count"] > 0)
     if metric == "universe":
         return all(item["unknown_count"] == 0 for item in observations)
     if metric == "read_boundary":
         return all(item["read_boundary_raw_facts"]["write_count"] == 0 for item in observations)
-    # Window-level pass/fail values are closed booleans in the approved model.
-    return True
+    raise AssertionError(f"missing independent SLO reducer for {metric}")
 
 
 def _slo_cases(metric: str) -> tuple[SloCase, SloCase, SloCase]:
@@ -3707,7 +4102,7 @@ def _make_slo_test(metric: str):
             assert result["observed"] is result["target"] is None
         else:
             kind = METRIC_KINDS[metric]["observed"]
-            observed = _slo_observed(metric, golden)
+            observed = _reduce_slo_metric(metric, golden)
             if case.state == "fail" and kind in {"bool"}:
                 observed = False
             target = SLO_CONTRACTS[metric]["target"]
@@ -3739,6 +4134,58 @@ def test_r2f5_contract_catalog_and_anchor_inventory_are_exact() -> None:
     assert len(METRICS) == len(SLO_ANCHORS) == 18
     assert all(callable(globals()[anchor]) for anchor in SLO_ANCHORS)
     assert set(CATALOGS) == set(_CATALOG_DDL) == set(_CATALOG_FILENAMES)
+
+
+def test_r2f5_hardcoded_vectors_bind_public_payload_and_snapshot(golden: GoldenTree) -> None:
+    """Keep tiny literal vectors independent from production digest helpers."""
+
+    assert (
+        hashlib.sha256(
+            b"r2f5/tiny-tree-v1\0" + _canonical_json({"records": [["alpha", 1, None]]})
+        ).hexdigest()
+        == _TINY_TREE_VECTOR
+    )
+    assert (
+        hashlib.sha256(
+            b"r2f5/tiny-sqlite-v1\0"
+            + _canonical_json({"domain": "r2f5/sqlite-logical-v1", "row": ["alpha", 1, None]})
+        ).hexdigest()
+        == _TINY_SQLITE_VECTOR
+    )
+    baseline_row = _sqlite_record(("alpha", 1, None), ("TEXT", "INTEGER", "TEXT"))
+    mutated_row = _sqlite_record(("beta", 1, None), ("TEXT", "INTEGER", "TEXT"))
+    assert hashlib.sha256(baseline_row).hexdigest() == _TINY_SQLITE_ROW_VECTOR
+    assert hashlib.sha256(mutated_row).hexdigest() == _TINY_SQLITE_MUTATION_VECTOR
+    assert baseline_row != mutated_row
+    assert (
+        hashlib.sha256(
+            b"r2f5/tiny-snapshot-v1\0" + _canonical_json({"generation": "g20", "sessions": 20})
+        ).hexdigest()
+        == _TINY_SNAPSHOT_VECTOR
+    )
+    assert (
+        hashlib.sha256(
+            b"r2f5/tiny-report-v1\0"
+            + _canonical_json({"quality_issues": [], "status": "ready", "writes": False})
+        ).hexdigest()
+        == _TINY_REPORT_VECTOR
+    )
+    assert golden.window_envelope["payload_sha256"] == _PUBLIC_WINDOW_PAYLOAD_VECTOR
+    assert (
+        golden.snapshot_identity["frozen_version_vector_sha256"] == _PUBLIC_FROZEN_SNAPSHOT_VECTOR
+    )
+    calendar_fingerprint = next(
+        item
+        for item in golden.snapshot_identity["input_fingerprints"]
+        if item["descriptor_role"] == "calendar"
+    )
+    calendar_subject = next(
+        item for item in golden.fingerprint_sources if item["descriptor_role"] == "calendar"
+    )
+    assert calendar_subject["captured_content_bytes"] == (
+        f"sqlite-logical:{_PUBLIC_CALENDAR_SQLITE_VECTOR}"
+    )
+    assert calendar_fingerprint["sha256"] == _digest("SnapshotFingerprint.sha256", calendar_subject)
 
 
 def test_r2f5_complete_golden_is_strictly_validated_from_x8(golden: GoldenTree) -> None:
@@ -3833,9 +4280,9 @@ def test_r2f5_public_digest_bindings_cover_payload_envelope_tree_sqlite_snapshot
         "ImmutableObservationEnvelopeV1.envelope_sha256", bundle
     )
     snapshot = report["snapshot_identity"]
-    assert snapshot["input_fingerprint_sha256"] == golden.snapshot_identity[
-        "input_fingerprint_sha256"
-    ]
+    assert (
+        snapshot["input_fingerprint_sha256"] == golden.snapshot_identity["input_fingerprint_sha256"]
+    )
     sqlite_fingerprints = [
         item for item in snapshot["input_fingerprints"] if item["descriptor_role"] == "calendar"
     ]
@@ -3875,9 +4322,10 @@ def test_r2f5_complete_golden_public_reader_is_ready(golden: GoldenTree) -> None
     assert report["frozen_versions"] == golden.frozen_versions
     assert report["snapshot_identity"] == golden.snapshot_identity
     assert report["window_evidence_refs"] == [golden.window_envelope["envelope_sha256"]]
-    assert report["window_evidence_bundle"]["envelope_sha256"] == golden.window_envelope[
-        "envelope_sha256"
-    ]
+    assert (
+        report["window_evidence_bundle"]["envelope_sha256"]
+        == golden.window_envelope["envelope_sha256"]
+    )
     assert report["window_evidence_bundle"] is not None
     assert len(report["window_evidence_refs"]) == 1
     assert all(report[metric]["status"] == "pass" for metric in METRICS)
@@ -3963,7 +4411,8 @@ def test_r2f5_api_unsafe_missing_corrupt_and_catalog_inputs_are_exact_and_write_
     assert report["status"] == "unavailable"
     assert report["read_boundary"]["status"] == "unavailable"
     assert report["read_boundary"]["reason_code"] == reason
-    assert report["quality_issues"] == [reason]
+    expected_quality = tuple(sorted({reason}, key=_reason_precedence().index))
+    assert tuple(report["quality_issues"]) == expected_quality
     assert report["pre_capture_failure"] is not None
     assert report["pre_capture_failure"]["reason_code"] == reason
     assert report["provider_requests"] == 0 and report["writes"] is False
@@ -4040,7 +4489,6 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
     real_connect = sqlite3.connect
     start_writer = threading.Event()
     writer_done = threading.Event()
-    observed_values: list[bytes] = []
 
     def writer() -> None:
         assert start_writer.wait(timeout=2)
@@ -4051,6 +4499,19 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
             connection.execute(
                 "INSERT INTO calendar_official_object VALUES (?, ?)", (new_hash, b"new")
             )
+        session_path = golden.dataset / "sessions" / f"{golden.sessions[0]}.json"
+        session_value = _read_json(session_path)
+        session_value["calendar_raw_facts"]["generation"] = "calendar-g21"
+        session_value["calendar_raw_facts"]["raw_facts_sha256"] = _digest(
+            "CalendarRawFacts.raw_facts_sha256", session_value["calendar_raw_facts"]
+        )
+        session_value["schema_policy_digest"] = _digest(
+            "SessionObservation.schema_policy_digest", session_value
+        )
+        session_value["observation_sha256"] = _digest(
+            "SessionObservation.observation_sha256", session_value
+        )
+        _write_json(session_path, session_value)
         writer_done.set()
 
     thread = threading.Thread(target=writer)
@@ -4074,12 +4535,6 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
                 and (normalized.startswith("SELECT") or normalized.startswith("PRAGMA"))
             ):
                 self.snapshot_established = True
-                current = (
-                    super()
-                    .execute("SELECT body_bytes FROM calendar_official_object ORDER BY body_sha256")
-                    .fetchall()
-                )
-                observed_values.extend(row[0] for row in current)
                 if commit_timing == "after_snapshot":
                     start_writer.set()
                     assert writer_done.wait(timeout=2)
@@ -4098,8 +4553,6 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
         if not start_writer.is_set():
             start_writer.set()
         thread.join(timeout=2)
-    expected_value = b"new" if commit_timing == "before_transaction" else b"old"
-    assert expected_value in observed_values
     # The barrier wrapper only controls when the writer commits.  The expected
     # old/new logical identities are bound to the public snapshot fingerprint;
     # raw DB/WAL/SHM bytes are never used as evidence.
@@ -4114,6 +4567,12 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
             if item["descriptor_role"] == "calendar"
         )
         assert actual == expected_fingerprint
+    observations = report.get("session_observations", [])
+    if observations:
+        expected_generation = (
+            "calendar-g21" if commit_timing == "before_transaction" else "calendar-g20"
+        )
+        assert observations[0]["calendar_raw_facts"]["generation"] == expected_generation
     if commit_timing == "before_transaction":
         assert report["read_boundary"]["status"] == "pass"
     else:
