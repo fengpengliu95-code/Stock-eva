@@ -126,6 +126,14 @@ METRICS = tuple(X8["metric_fields"])
 METRIC_KINDS = X8["metric_value_kinds"]
 REASON_PARTITIONS = X8["reason_partitions"]
 REASONS = frozenset(REASON_PARTITIONS["failure"] + REASON_PARTITIONS["unavailable"])
+ERROR_REASON_BY_CLASS = {
+    "timeout": "REPLICATION_UNAVAILABLE",
+    "auth": "FAILOVER_UNAVAILABLE",
+    "rate": "REPLICATION_LAG",
+    "schema": "CONTROL_STATE_UNAVAILABLE",
+    "coverage": "COVERAGE_FAILED",
+    "storage": "CONTROL_STATE_UNAVAILABLE",
+}
 CREATORS = X8["creator_allowlist"]
 LIMITS = X8["limits"]
 CATALOGS = X8["sqlite_catalogs"]
@@ -151,7 +159,7 @@ _TINY_SQLITE_ROW_VECTOR = "b145b68986ac94bc2ca41cf1600c6c4debf96195ca92e7aec594a
 _TINY_SQLITE_MUTATION_VECTOR = "ff4ae85bdd18aac4c03016e7c32af4b2bdaba24386e7bbe107fc0eb5000ca1cf"
 _TINY_SNAPSHOT_VECTOR = "2bd28a024047479ab9397147123dadba4fb641f54d06458d2875a5a12cffbe6a"
 _TINY_REPORT_VECTOR = "e693c0fb34a3029da4e2a37471b49a175f8f6583c67adea8b797bb19409d90d2"
-_PUBLIC_WINDOW_PAYLOAD_VECTOR = "6002d6c23fb2e815210165c06635df49323bfe3b87310bbd276bf41955355673"
+_PUBLIC_WINDOW_PAYLOAD_VECTOR = "c25b8109ff7052e36257878cd25bc3eb1ead91849b07c9b58f4eea13e09fef74"
 _PUBLIC_FROZEN_SNAPSHOT_VECTOR = "a294a23c03fde4d62fe55bda33cbc4d96aad5ecd26d520c2e86eed8788276e07"
 _PUBLIC_CALENDAR_SQLITE_VECTOR = "f1f6f99944eabedd018061aea41af82ef407004cd4ef35104cb0e654fb0e431a"
 _PUBLIC_SNAPSHOT_IDENTITY_VECTOR = (
@@ -1625,11 +1633,12 @@ def _build_window(sessions: list[str]) -> tuple[dict[str, Any], dict[str, dict[s
     )
 
     error_events = []
-    for forced_class in ("timeout", "auth", "rate", "schema", "coverage", "storage"):
+    error_classes = ("timeout", "auth", "rate", "schema", "coverage", "storage")
+    for forced_class in error_classes:
         event = {
             "event_id": f"error-{forced_class}",
             "forced_error_class": forced_class,
-            "sanitized_reason": "CONTROL_STATE_UNAVAILABLE",
+            "sanitized_reason": ERROR_REASON_BY_CLASS[forced_class],
             "normalized_result": "unavailable",
             "attempt_id": f"attempt-{forced_class}",
             "expected_class": forced_class,
@@ -2504,6 +2513,9 @@ def _validate_window(
     assert len(events) == CARDINALITY["error_classes"]
     expected_classes = ("timeout", "auth", "rate", "schema", "coverage", "storage")
     assert tuple(item["forced_error_class"] for item in events) == expected_classes
+    assert tuple(item["sanitized_reason"] for item in events) == tuple(
+        ERROR_REASON_BY_CLASS[item] for item in expected_classes
+    )
     tuple_fields = set(MODELS["ErrorHandlingObservation"]["tuple_item_schemas"]["events"])
     for event, forced_class in zip(events, expected_classes, strict=True):
         assert set(event) == tuple_fields
@@ -2968,6 +2980,27 @@ def _mutate_registry_projection(golden: GoldenTree, mutation: str) -> None:
         connection.commit()
 
 
+def _mutate_error_events(golden: GoldenTree, mutation: str) -> None:
+    path = golden.evidence / "window.json"
+    window = _read_json(path)
+    events = window["payload"]["error_handling_observation"]["payload"]["events"]
+    if mutation == "error_wrong_map":
+        events[0]["sanitized_reason"] = ERROR_REASON_BY_CLASS["auth"]
+    elif mutation == "error_duplicate":
+        events[1]["forced_error_class"] = events[0]["forced_error_class"]
+    elif mutation == "error_missing_class":
+        events.pop()
+    else:
+        raise AssertionError(mutation)
+    child = window["payload"]["error_handling_observation"]
+    child["payload"]["observation_sha256"] = _digest(
+        "ErrorHandlingObservation.observation_sha256", child["payload"]
+    )
+    _rehash_envelope(child)
+    _rehash_envelope(window)
+    _write_json(path, window)
+
+
 def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
     request = deepcopy(golden.request)
     if mutation == "missing_control":
@@ -2993,6 +3026,8 @@ def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
         _mutate_calendar(golden, mutation)
     elif mutation.startswith("registry_"):
         _mutate_registry_projection(golden, mutation)
+    elif mutation.startswith("error_") and mutation != "error_fail":
+        _mutate_error_events(golden, mutation)
     elif mutation == "cutoff_evening":
         for ordinal in (1, 2, 3):
             _mutate_session(
@@ -3083,16 +3118,7 @@ def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
             {"compared_sessions": ["2026-01-01", "2026-01-02"]},
         )
     elif mutation == "error_fail":
-        path = golden.evidence / "window.json"
-        window = _read_json(path)
-        child = window["payload"]["error_handling_observation"]
-        child["payload"]["events"][0]["sanitized_reason"] = "COVERAGE_FAILED"
-        child["payload"]["observation_sha256"] = _digest(
-            "ErrorHandlingObservation.observation_sha256", child["payload"]
-        )
-        _rehash_envelope(child)
-        _rehash_envelope(window)
-        _write_json(path, window)
+        _mutate_error_events(golden, "error_wrong_map")
     elif mutation == "error_missing":
         _drop_window_child(golden, "error_handling_observation")
     elif mutation == "nas_fail":
@@ -4787,8 +4813,15 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
         )
     if metric == "error_handling":
         events = window["error_handling_observation"]["payload"]["events"]
+        classes = tuple(event["forced_error_class"] for event in events)
         return bool(
-            len(events) == 6 and all(event["sanitized_reason"] in REASONS for event in events)
+            len(events) == len(ERROR_REASON_BY_CLASS)
+            and set(classes) == set(ERROR_REASON_BY_CLASS)
+            and len(classes) == len(set(classes))
+            and all(
+                event["sanitized_reason"] == ERROR_REASON_BY_CLASS[event["forced_error_class"]]
+                for event in events
+            )
         )
     if metric == "local_nas_isolation":
         value = window["local_nas_isolation_observation"]["payload"]
@@ -5022,6 +5055,9 @@ def test_r2f5_public_service_reads_authoritative_registry_projection(
     target_path = _canonical_target_path(target)
     assert _approved_target_path(target_path)
     request = _apply_mutation(golden, mutation)
+    mutated_registry_digest = _sqlite_logical_digest(
+        golden.controls["shadow_registry"], "shadow_registry"
+    )
     # Keep the independent envelope available and valid while changing only
     # the authoritative SQLite projection.
     StrictFixtureValidator().envelope(golden.window_envelope, "WindowEvidenceBundlePayload")
@@ -5034,6 +5070,7 @@ def test_r2f5_public_service_reads_authoritative_registry_projection(
     pre_capture = report.get("pre_capture_failure")
     assert pre_capture is not None
     assert pre_capture["descriptor_roles"] == ["shadow_registry"]
+    assert pre_capture["control_logical_digest"] == mutated_registry_digest
     assert pre_capture["reason_code"] == "CONTROL_STATE_UNAVAILABLE" or reason in (
         "SESSION_COUNT_NOT_20",
         "SESSION_SEQUENCE_INVALID",
@@ -5136,6 +5173,34 @@ def _contract_public_pointer(field_path: str) -> str:
     return "$.window_evidence_bundle.payload." + field_path.rsplit(".", 1)[-1]
 
 
+def _contract_root_from_golden(golden: GoldenTree, field_path: str) -> dict[str, Any]:
+    if field_path.startswith("Snapshot"):
+        return golden.snapshot_identity
+    if field_path.startswith("Frozen"):
+        return golden.frozen_versions
+    for source_map in (
+        golden.frozen_sources,
+        golden.window_sources,
+        golden.completed_sources,
+        *(fixture.sources for fixture in golden.session_fixtures),
+    ):
+        if field_path in source_map:
+            return source_map[field_path]
+    return {"contract_field": field_path, "contract_value": "baseline"}
+
+
+def _read_public_pointer(document: dict[str, Any], pointer: str) -> Any:
+    value: Any = document
+    for component in pointer.removeprefix("$").lstrip(".").split("."):
+        if not component:
+            continue
+        if component.endswith("[]"):
+            value = value[component[:-2]][0]
+        else:
+            value = value[component]
+    return value
+
+
 @pytest.mark.parametrize("field_path", tuple(DIGESTS))
 def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     golden: GoldenTree, field_path: str
@@ -5146,6 +5211,26 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     pointer = _contract_public_pointer(field_path)
     assert pointer.startswith("$.")
     leaf = golden.leaf_files.get(field_path)
+    root = _contract_root_from_golden(golden, field_path)
+    descriptor = _read_json(leaf[1]) if leaf is not None else None
+    object_bytes = leaf[0].read_bytes() if leaf is not None else _canonical_json(root)
+    expected = _digest(field_path, root) if field_path in DIGESTS else None
+    # The approved future seam consumes the actual model/root and its disk
+    # descriptor bytes; a callable-only/no-op implementation is insufficient.
+    module = _red_reader()
+    validator = getattr(module, "validate_canonical_digest", None)
+    baseline = validator(
+        root_object_type=DIGESTS[field_path]["root_object_type"],
+        field_path=field_path,
+        descriptor=descriptor,
+        object_bytes=object_bytes,
+        model=root,
+    )
+    assert baseline["valid"] is True
+    assert baseline["computed_digest"] == expected
+    assert baseline["reason_code"] is None
+    baseline_report = _evaluate(golden.request)
+    assert _read_public_pointer(baseline_report, pointer) == expected
     if leaf is not None:
         object_path, descriptor_path = leaf
         assert object_path.is_file() and descriptor_path.is_file()
@@ -5154,11 +5239,47 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
         assert _disk_digest_matches(golden, field_path, expected, descriptor_path)
         _mutate_formal_leaf(golden, field_path, mode="descriptor_tamper")
         assert not _disk_digest_matches(golden, field_path, expected, descriptor_path)
-    # The consumer seam is deliberately resolved from the future module only
-    # after the fixture/path proof above; missing target keeps this RED.
-    module = _red_reader()
-    validator = getattr(module, "validate_canonical_digest", None)
-    assert callable(validator), (field_path, pointer)
+        tampered = validator(
+            root_object_type=DIGESTS[field_path]["root_object_type"],
+            field_path=field_path,
+            descriptor=_read_json(descriptor_path),
+            object_bytes=object_path.read_bytes(),
+            model=root,
+        )
+        assert tampered["valid"] is False
+        assert tampered["reason_code"] in {
+            "LINEAGE_UNAVAILABLE",
+            "LINEAGE_INVALID",
+            "CANONICAL_INTEGRITY_FAILED",
+        }
+        tampered_report = _evaluate(golden.request)
+        assert tampered_report["status"] in {"unavailable", "not_ready"}
+        assert tampered["reason_code"] in tampered_report["quality_issues"]
+
+
+def test_r2f5_noop_validator_mutant_is_killed() -> None:
+    def noop_validator(**_kwargs: Any) -> dict[str, Any]:
+        return {"valid": True, "computed_digest": "0" * 64, "reason_code": None}
+
+    def assert_valid(result: dict[str, Any], expected: str) -> None:
+        assert result["valid"] is True
+        assert result["computed_digest"] == expected
+        assert result["reason_code"] is None
+
+    with pytest.raises(AssertionError):
+        assert_valid(
+            noop_validator(
+                root_object_type="x", field_path="x", descriptor=None, object_bytes=b"", model={}
+            ),
+            "f" * 64,
+        )
+
+
+def test_r2f5_fixed_public_pointer_mutant_is_killed() -> None:
+    report = {"snapshot_identity": {"snapshot_sha256": "expected"}}
+    assert _read_public_pointer(report, "$.snapshot_identity.snapshot_sha256") == "expected"
+    with pytest.raises(KeyError):
+        _read_public_pointer(report, "$.snapshot_identity.wrong_sha256")
 
 
 def test_r2f5_reducer_ast_never_reads_case_expectations_or_assigns_observed() -> None:
@@ -5176,6 +5297,37 @@ def test_r2f5_reducer_ast_never_reads_case_expectations_or_assigns_observed() ->
                 not isinstance(target, ast.Name) or target.id not in {"observed", "measured"}
                 for target in node.targets
             )
+
+
+@pytest.mark.parametrize("mutation", ("error_wrong_map", "error_duplicate", "error_missing_class"))
+def test_r2f5_error_reducer_rejects_wrong_mapping_duplicate_and_missing(
+    golden: GoldenTree, mutation: str
+) -> None:
+    assert _reduce_slo_metric("error_handling", golden) is True
+    _apply_mutation(golden, mutation)
+    assert _reduce_slo_metric("error_handling", golden) is False
+
+
+def test_r2f5_error_any_reason_mutant_is_killed(golden: GoldenTree) -> None:
+    _apply_mutation(golden, "error_wrong_map")
+    events = _read_json(golden.evidence / "window.json")["payload"]["error_handling_observation"][
+        "payload"
+    ]["events"]
+    any_reason_mutant = len(events) == 6 and all(
+        event["sanitized_reason"] in REASONS for event in events
+    )
+    assert any_reason_mutant is True
+    assert _reduce_slo_metric("error_handling", golden) is False
+
+
+@pytest.mark.parametrize("mutation", ("error_wrong_map", "error_duplicate", "error_missing_class"))
+def test_r2f5_error_public_metric_reports_exact_failure(golden: GoldenTree, mutation: str) -> None:
+    _apply_mutation(golden, mutation)
+    response = _api_get(golden)
+    assert response.status_code == 503
+    report = response.json()
+    assert report["error_handling"]["status"] == "fail"
+    assert report["error_handling"]["reason_code"] == "ERROR_HANDLING_FAILED"
 
 
 def test_r2f5_golden_artifacts_never_contain_test_control_fields(golden: GoldenTree) -> None:
@@ -5555,6 +5707,37 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
     expected_fingerprint = (
         new_fingerprint if commit_timing == "before_transaction" else old_fingerprint
     )
+    baseline_observation = _read_json(golden.dataset / "sessions" / f"{golden.sessions[0]}.json")
+    old_raw = deepcopy(baseline_observation["calendar_raw_facts"])
+    old_observation_sha = baseline_observation["observation_sha256"]
+    new_raw = deepcopy(old_raw)
+    new_raw["generation"] = "calendar-g21"
+    new_raw["raw_facts_sha256"] = _digest("CalendarRawFacts.raw_facts_sha256", new_raw)
+    new_observation = deepcopy(baseline_observation)
+    new_observation["calendar_raw_facts"] = new_raw
+    new_observation["observation_sha256"] = _digest(
+        "SessionObservation.observation_sha256", new_observation
+    )
+    old_tuple = (
+        old_fingerprint["captured_content_bytes"],
+        "calendar-g20",
+        old_raw["raw_facts_sha256"],
+        old_observation_sha,
+        {"kind": "bool", "value": True},
+        {"kind": "bool", "value": True},
+        "pass",
+        None,
+    )
+    new_tuple = (
+        new_fingerprint["captured_content_bytes"],
+        "calendar-g21",
+        new_raw["raw_facts_sha256"],
+        new_observation["observation_sha256"],
+        {"kind": "bool", "value": True},
+        {"kind": "bool", "value": True},
+        "pass",
+        None,
+    )
     if report["snapshot_identity"] is not None:
         actual = next(
             item
@@ -5575,6 +5758,21 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
         )
         assert first["observation_sha256"] == _digest(
             "SessionObservation.observation_sha256", first
+        )
+        calendar_db_digest = expected_fingerprint["captured_content_bytes"]
+        actual_tuple = (
+            calendar_db_digest,
+            calendar_raw["generation"],
+            calendar_raw["raw_facts_sha256"],
+            first["observation_sha256"],
+            report["calendar"]["observed"],
+            report["calendar"]["target"],
+            report["calendar"]["status"],
+            report["calendar"]["reason_code"],
+        )
+        assert actual_tuple in {old_tuple, new_tuple} or (
+            report["read_boundary"]["reason_code"] == "SNAPSHOT_CHANGED"
+            and actual_tuple[-2:] == ("unavailable", "SNAPSHOT_CHANGED")
         )
     assert report["provider_requests"] == 0
     assert report["writes"] is False
