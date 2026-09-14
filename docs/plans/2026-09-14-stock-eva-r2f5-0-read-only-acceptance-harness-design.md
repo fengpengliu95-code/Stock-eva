@@ -8,7 +8,7 @@
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
-**X4 revision base:** `4879bc7dddc87fd51613028a84ea834b67ac28d8` (clean X3)
+**X5 revision base:** `affa7153ef088dbd6e7004eeed721588e24656cc` (clean X4)
 
 **Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
 
@@ -222,7 +222,7 @@ distinct consecutive sessions, then the report selects those dates in order and 
 Given 19, 21, duplicate, future or missing-middle sessions, when evaluation runs, then the report
 is `not_ready` or `unavailable` with an allowlisted reason and never silently pads the window.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-2: Shanghai cutoff arithmetic (FR-8, FR-9)
 
@@ -230,7 +230,7 @@ Given timezone-aware publication times, when a session is published at 21:15 and
 08:00 Asia/Shanghai, then both boundary observations count. When they occur at 21:16 or 08:01,
 then the corresponding metric fails and the report cannot be ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-3: Frozen version set and drift (FR-7, NFR-8)
 
@@ -238,7 +238,7 @@ Given 20 session observations with one frozen version vector, when any provider,
 policy, calendar, universe, replication, restore or schema identity changes, then the report is
 `not_ready` with `VERSION_DRIFT` and the exact source state remains untouched.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-4: Coverage and source purity (FR-9, FR-12)
 
@@ -246,7 +246,7 @@ Given legal-universe counts and canonical partition source identities, when ever
 coverage and zero mixed-source rows, then those metrics pass. When any unknown/count mismatch or
 mixed provider partition exists, then the report is not ready and names only the sanitized reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-5: Evidence lineage and replay (FR-10, FR-11)
 
@@ -255,7 +255,7 @@ the bounded offline sample replays semantically identically, then provenance and
 Given a missing hash, wrong binding, corrupt object or replay mismatch, then no publication state is
 changed and the relevant metric is unavailable/not ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-6: Replication and restore evidence (FR-13, FR-17)
 
@@ -264,7 +264,7 @@ proof satisfy the declared evidence contract, then the metrics pass. Given lag, 
 locked/corrupt sidecar or unverified generation, then the report is not ready/unavailable and does
 not start a drain or restore.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-7: Read-only snapshot and fingerprints (FR-1, FR-3, FR-4, NFR-3)
 
@@ -272,7 +272,7 @@ Given an existing private fixture, when CLI/API evaluation succeeds or fails, th
 fingerprint is byte/metadata identical before and after, no missing control DB is initialized, and
 the captured snapshot is closed after use.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-8: Path validation and redaction (FR-2, NFR-4, NFR-5)
 
@@ -280,7 +280,7 @@ Given relative, root, home, mutable-root, symlink, unresolved-variable or overla
 the CLI/API is invoked, then it rejects before enumeration with exit 2/HTTP 422 and no path is
 echoed. Given corrupt or permission-denied input, then the response contains only a closed reason.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-9: API/CLI parity (FR-15, FR-16, FR-17)
 
@@ -288,7 +288,7 @@ Given identical configured roots, dates, frozen clock and fixture, when CLI and 
 then their report status, selected sessions, metric results, reason order, `provider_requests` and
 `writes` agree; the API performs no provider or store initialization.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-10: Mandatory metric gate (FR-9, FR-14, NFR-2)
 
@@ -296,7 +296,7 @@ Given all mandatory metrics pass for exactly 20 sessions, when the report is bui
 `ready`. Given any mandatory metric fails, then status is `not_ready`; given a required source is
 unprovable, then status is `unavailable`. No optional observation can override this mapping.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-11: Bounded evaluation (NFR-6, NFR-7)
 
@@ -304,14 +304,14 @@ Given a 20-session fixture within the declared row/object/sample bounds, when ev
 it records elapsed/read/replay counts and completes within 10,000 ms on the reference gate. Given
 an over-bound object or row set, then it stops with unavailable rather than unboundedly reading.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-12: Protected compatibility (NFR-1, NFR-9)
 
 Given the R2-F2 golden fixture and R2-F4 readers, when the crosswalk/focused checks run, then their
 bytes and public response shapes remain compatible and no protected production module is widened.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-13: Production boundary (FR-18, NFR-10)
 
@@ -319,7 +319,7 @@ Given any offline ready report, when a reviewer inspects metadata, then it state
 `production_window_started=false`, Task 20 pending and R2-F5.0 NO-GO. No report can authorize a
 provider call, installation, LaunchAgent, NAS action or Release 2 re-entry.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-14: Deterministic and sanitized errors (FR-14, FR-17, NFR-2, NFR-4)
 
@@ -327,7 +327,7 @@ Given identical bytes and clock, when evaluation is repeated across success, mis
 locked fixtures, then JSON is deterministic, reason precedence is stable, diagnostics are bounded,
 and all results include zero provider requests/writes.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-15: Complete SLO metric inventory (FR-9, FR-19, NFR-11)
 
@@ -336,7 +336,7 @@ present as separate `MetricResult` fields with exact targets and anchors. Missin
 availability, canonical integrity, recovery, failover, adjustment, error handling, local/NAS,
 replication, restore or read-boundary evidence cannot be hidden behind another metric.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-16: Secondary qualification and failover (FR-20, FR-21)
 
@@ -345,7 +345,7 @@ when evaluation runs, then failover is `not_ready`/`unavailable` and top-level r
 Given a qualified admission and complete drill record, then failover passes only when selection,
 manifest, pointer and all rows agree with zero mixed-source rows.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-17: Remote trust and restore snapshot (FR-22, NFR-12)
 
@@ -354,7 +354,7 @@ verification, trust scope and reviewed numeric thresholds, when the strict snaps
 then it can pass. Given `LOCAL_CHAIN_ONLY`, missing threshold, locked sidecar or writer/reconcile
 only evidence, then the metric is unavailable/not ready and no destination operation starts.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-18: Offline replay identity (FR-11, FR-23)
 
@@ -362,7 +362,7 @@ Given immutable bytes and an exact frozen offline adapter/normalizer identity, w
 then it performs deterministic normalization and zero provider/network requests. Given unknown,
 mismatched or default login-capable identity, then replay is unavailable before adapter construction.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-19: Full version vector (FR-7, FR-24)
 
@@ -370,7 +370,7 @@ Given 20 observations, when the frozen vector is captured, then every required i
 and equal across all observations. Missing RELEASE, config, qualification/admission, primary/
 secondary, kill-switch/priority, policy or replication/restore evidence prevents ready.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-20: Raw sequence and snapshot identity (FR-3, FR-25, NFR-8, NFR-13)
 
@@ -379,7 +379,7 @@ rejects duplicates/out-of-order data before deriving sorted unique confirmed ses
 returns a digest-bound SnapshotIdentity and observation refs; any concurrent input change invalidates
 the whole report.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-21: Semantic determinism (FR-26, FR-27, NFR-14)
 
@@ -387,14 +387,14 @@ Given identical captured bytes, clock and arguments, when evaluation repeats, th
 per-session observations/refs and byte-identical semantic JSON/digest are returned. Changing only
 elapsed/counter diagnostics MUST NOT change the semantic digest.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-22: Closed bounded report types (FR-28, NFR-3)
 
 Given invalid enum, reason, hash, ID, negative counter, oversized quality issue or null ready
 version, when report validation runs, then it rejects the report with a sanitized unavailable result.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ### AC-23: Additive compatibility (NFR-1, NFR-15)
 
@@ -402,7 +402,7 @@ Given existing market, universe, evidence, calendar, replication and restore API
 the new acceptance endpoint/CLI is evaluated, then predecessor payloads/schemas remain unchanged;
 the new fields exist only in the acceptance report.
 
-Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
+Planned test anchors are machine-readable in the requirement matrix and X5 catalog only.
 
 ## Edge Cases
 
@@ -474,10 +474,17 @@ interface ReliabilityAcceptanceQuery {
   end: string;   // YYYY-MM-DD, inclusive
 }
 
+type MetricValue =
+  | { kind: "count"; value: number }
+  | { kind: "ratio"; value: number }
+  | { kind: "duration_ms"; value: number }
+  | { kind: "bool"; value: boolean }
+  | { kind: "hash"; value: string };
+
 type MetricResult =
-  | { status: "pass"; observed: number | string | boolean; target: number | string | boolean;
+  | { status: "pass"; observed: MetricValue; target: MetricValue;
       reason_code: null; acceptance_ref: "AC-15"; planned_test_anchor: string }
-  | { status: "fail"; observed: number | string | boolean; target: number | string | boolean;
+  | { status: "fail"; observed: MetricValue; target: MetricValue;
       reason_code: FailureReasonCode; acceptance_ref: "AC-15"; planned_test_anchor: string }
   | { status: "unavailable"; observed: null; target: null;
       reason_code: UnavailableReasonCode; acceptance_ref: "AC-15"; planned_test_anchor: string };
@@ -488,7 +495,7 @@ type FailureReasonCode = Extract<AcceptanceReasonCode,
   "ERROR_HANDLING_FAILED" | "LOCAL_NAS_ISOLATION_FAILED" | "REPLICATION_LAG" |
   "REPLAY_SEMANTIC_MISMATCH" | "READ_BOUNDARY_FAILED" | "CALENDAR_CONFLICT" |
   "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "VERSION_DRIFT" |
-  "LINEAGE_UNAVAILABLE">;
+  "LINEAGE_INVALID">;
 type UnavailableReasonCode = Exclude<AcceptanceReasonCode, FailureReasonCode>;
 
 // The discriminant is normative: pass has no reason and complete values; fail has a closed
@@ -503,15 +510,56 @@ const ACCEPTANCE_REASON_CODES = [
   "INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE",
   "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "CALENDAR_CONFLICT",
   "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "VERSION_DRIFT", "LINEAGE_UNAVAILABLE",
+  "LINEAGE_INVALID",
   "CANONICAL_INTEGRITY_FAILED", "UNIVERSE_UNKNOWN_NONZERO", "UNIVERSE_COUNT_MISMATCH",
   "CONTINUITY_FAILED", "AVAILABILITY_CUTOFF_FAILED", "COVERAGE_FAILED", "SOURCE_PURITY_FAILED",
   "RECOVERY_FAILED", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE",
   "ERROR_HANDLING_FAILED", "LOCAL_NAS_ISOLATION_FAILED", "REPLICATION_UNAVAILABLE",
   "REPLICATION_LAG", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "BOUNDS_EXCEEDED",
-  "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED",
+  "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED",
+  "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE",
+  "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED",
+  "RETRY_WAIT", "DEAD_LETTER",
 ] as const;
 type ValuesOf<T> = T extends readonly (infer Value)[] ? Value : never;
 type AcceptanceReasonCode = ValuesOf<typeof ACCEPTANCE_REASON_CODES>;
+
+type CreatorKind = "task20_writer" | "r2f4_writer" | "r2f5_reader" | "test_fixture";
+
+interface ImmutableObservationEnvelopeV1<T> {
+  artifact_id: string;
+  artifact_ref: string;
+  schema_version: "r2f5-observation-envelope-v1";
+  creator_kind: CreatorKind;
+  creator_version: string;
+  created_at: string; // RFC3339 UTC, `Z`
+  payload: T;
+  canonicalization_version: "project-canonical-json-v1";
+  payload_sha256: string;
+  envelope_sha256: string;
+}
+
+// JCS-compatible project JSON is UTF-8, sorted keys, compact separators, ensure_ascii=false,
+// allow_nan=false, with one trailing newline. payload_sha256 hashes canonical(payload). The
+// envelope_sha256 preimage is the envelope fields except payload_sha256 and envelope_sha256,
+// with payload replaced by payload_sha256; artifact IDs, creator/version, timestamps and schema
+// remain in the preimage. Task20 writers create these bytes; Task19 only opens immutable refs,
+// recomputes both hashes and rejects missing creator/version, unknown schema or any mismatch.
+
+The envelope is the sole identity/hash wrapper for every window-level artifact. The outer bundle
+and each non-null recovery, failover, replay, adjustment, error, NAS-isolation and restore record
+MUST be an `ImmutableObservationEnvelopeV1`; payloads MUST NOT repeat an ambiguous artifact hash
+or preimage field. `task20_writer` is the only production creator; `test_fixture` is synthetic-only
+and cannot establish production acceptance. Missing creator/version, unsupported schema or either
+hash mismatch is `unavailable`, never a reconstructed or current-state proof.
+
+Public validation is closed and immutable: identifiers use
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, SHA-256 values use `[0-9a-f]{64}`, bounded strings are at
+most 128 UTF-8 bytes, counters/counts and durations are integers in `[0, 2^31-1]`, ratios are
+numbers in `[0,1]`, and hash values are the typed 64-lowercase-hex `MetricValue` variant.
+`MetricValue.kind` MUST match the metric's declared value type; arrays are readonly tuples with
+their stated exact/max cardinality and all JSON/API schemas MUST reject unknown fields. The API
+and CLI expose only these validated projections and sanitized reason codes.
 
 interface SnapshotFingerprint {
   descriptor_role: "dataset" | "evidence" | "calendar" | "universe" | "replication" | "restore" | "control";
@@ -549,7 +597,7 @@ interface FrozenReliabilityVersions {
   config_digest: string;
   auto_failover_enabled: boolean;
   failover_kill_switch: boolean;
-  provider_priority: string[]; // max 8
+  provider_priority: readonly string[]; // 1..8, safe IDs only
   continuity_start_date: string;
   repair_policy_version: string;
   calendar_generation: string;
@@ -574,7 +622,7 @@ interface R2FAcceptanceReport {
   status: "ready" | "not_ready" | "unavailable";
   window_start: string | null;
   window_end: string | null;
-  selected_sessions: string[];
+  selected_sessions: readonly string[]; // exactly 20 for a candidate window
   frozen_versions: FrozenReliabilityVersions | null;
   continuity: MetricResult;
   next_morning_availability: MetricResult;
@@ -594,13 +642,14 @@ interface R2FAcceptanceReport {
   replication: MetricResult;
   restore: MetricResult;
   read_boundary: MetricResult;
-  quality_issues: QualityIssueCode[];
+  quality_issues: readonly QualityIssueCode[]; // max 64
   snapshot_identity: SnapshotIdentity | null;
-  session_observations: SessionObservation[]; // exactly 20 for a candidate window
-  observation_refs: string[]; // exactly 20 for a candidate window
+  session_observations: readonly SessionObservation[]; // exactly 20 for a candidate window
+  observation_refs: readonly string[]; // exactly 20 for a candidate window
   window_evidence_bundle: WindowEvidenceBundle | null;
-  window_evidence_refs: string[]; // exactly 1 when a bundle is captured
-  semantic_report_sha256: string;
+  window_evidence_refs: readonly string[]; // exactly 1 when a bundle is captured
+  pre_capture_failure: PreCaptureFailurePayloadV1 | null;
+  semantic_report_sha256: string | null;
   diagnostic_envelope: DiagnosticEnvelope;
   provider_requests: 0;
   writes: false;
@@ -613,7 +662,7 @@ interface SnapshotIdentity {
   requested_end: string;
   as_of_utc: string;
   as_of_timezone: "Asia/Shanghai";
-  input_fingerprints: SnapshotFingerprint[]; // one per configured role, max 32
+  input_fingerprints: readonly SnapshotFingerprint[]; // one per configured role, max 32
   frozen_versions: FrozenReliabilityVersions;
   input_fingerprint_sha256: string;
   frozen_version_vector_sha256: string;
@@ -624,6 +673,36 @@ interface DiagnosticEnvelope {
   elapsed_ms: number | null;
   read_operations: number;
   replay_sample_count: number;
+}
+
+interface PreCaptureFailurePayloadV1 {
+  schema_version: "r2f5-pre-capture-failure-v1";
+  reason_code: UnavailableReasonCode;
+  requested_start: string;
+  requested_end: string;
+  as_of_utc: string;
+  descriptor_states: readonly ("dataset_absent" | "evidence_absent" | "calendar_absent" |
+    "universe_absent" | "replication_absent" | "restore_absent" | "control_absent" | "error")[];
+  semantic_report_sha256: string;
+}
+
+interface CalendarRawFacts {
+  source_sequence: readonly string[]; // max 64, source order and duplicates retained
+  generation: string;
+  confirmed: boolean;
+  unknown_state: boolean;
+  conflict_state: boolean;
+  raw_facts_sha256: string;
+}
+
+interface ReadBoundaryRawFacts {
+  requested_as_of: string;
+  max_visible_session: string | null;
+  future_rows_seen: boolean;
+  future_rows_count: number;
+  query_count: number;
+  write_count: number;
+  probe_schema_digest: string;
 }
 
 interface SessionEvidenceBinding {
@@ -657,10 +736,12 @@ interface ReplicationObservation {
   checkpoint_id: string;
   source_commit_sha256: string;
   intent_id: string | null;
-  enqueue_state: string;
-  reason_code: string;
+  enqueue_state: "pending" | "copying" | "verifying" | "retry_wait" | "replicated" | "dead_letter";
+  reason_code: "NONE" | "DISABLED" | "SOURCE_NOT_CONFIGURED" | "SOURCE_UNAVAILABLE" |
+    "LOCAL_POINTER_MISMATCH" | "REPLICATION_STATE_UNAVAILABLE" | "DESTINATION_UNAVAILABLE" |
+    "DESTINATION_TRUST_FAILED" | "COPY_FAILED" | "VERIFY_FAILED" | "RETRY_WAIT" | "DEAD_LETTER";
   observed_at: string;
-  lag_seconds: number | null;
+  lag_seconds: number | null; // bounded [0, 2^31-1]
   trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
   destination_generation: string | null;
   destination_record_sha256: string | null;
@@ -682,9 +763,6 @@ interface RecoveryObservation {
   after_selection_sha256: string;
   publication_count: 1;
   duplicate_proof_sha256: string;
-  artifact_ref: string;
-  artifact_sha256: string;
-  artifact_version: string;
   observed_at: string;
 }
 
@@ -699,28 +777,22 @@ interface ErrorHandlingObservation {
     expected_class: "timeout";
     observed_class: "timeout";
     evidence_sha256: string;
-    artifact_ref: string;
-    artifact_sha256: string;
-    artifact_version: string;
     observed_at: string;
   }, { event_id: string; forced_error_class: "auth"; sanitized_reason: AcceptanceReasonCode;
     normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "auth";
-    observed_class: "auth"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
-    artifact_version: string; observed_at: string }, { event_id: string; forced_error_class: "rate";
+    observed_class: "auth"; evidence_sha256: string; observed_at: string }, { event_id: string; forced_error_class: "rate";
     sanitized_reason: AcceptanceReasonCode; normalized_result: "not_ready" | "unavailable";
     attempt_id: string; expected_class: "rate"; observed_class: "rate"; evidence_sha256: string;
-    artifact_ref: string; artifact_sha256: string; artifact_version: string; observed_at: string },
+    observed_at: string },
   { event_id: string; forced_error_class: "schema"; sanitized_reason: AcceptanceReasonCode;
     normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "schema";
-    observed_class: "schema"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
-    artifact_version: string; observed_at: string }, { event_id: string; forced_error_class: "coverage";
+    observed_class: "schema"; evidence_sha256: string; observed_at: string }, { event_id: string; forced_error_class: "coverage";
     sanitized_reason: AcceptanceReasonCode; normalized_result: "not_ready" | "unavailable";
     attempt_id: string; expected_class: "coverage"; observed_class: "coverage"; evidence_sha256: string;
-    artifact_ref: string; artifact_sha256: string; artifact_version: string; observed_at: string },
+    observed_at: string },
   { event_id: string; forced_error_class: "storage"; sanitized_reason: AcceptanceReasonCode;
     normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "storage";
-    observed_class: "storage"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
-    artifact_version: string; observed_at: string }];
+    observed_class: "storage"; evidence_sha256: string; observed_at: string }];
   observation_sha256: string;
 }
 
@@ -732,16 +804,17 @@ interface LocalNasIsolationObservation {
   local_pointer_sha256: string;
   outage_start: string;
   outage_end: string;
-  backlog_before_ids: string[];
-  backlog_after_ids: string[];
+  backlog_before_ids: readonly string[]; // max 100000
+  backlog_after_ids: readonly string[]; // max 100000
   backlog_before_count: number;
   backlog_after_count: number;
+  lag_seconds: number;
+  lag_threshold_seconds: number;
+  retryable: boolean;
+  retry_state: "queued" | "retrying" | "completed" | "failed";
   retry_transition: "queued" | "retrying" | "completed" | "failed";
   nas_failure_did_not_block_local: true;
   attempt_id: string;
-  artifact_ref: string;
-  artifact_sha256: string;
-  artifact_version: string;
   observed_at: string;
   observation_sha256: string;
 }
@@ -749,6 +822,7 @@ interface LocalNasIsolationObservation {
 interface SessionObservation {
   session: string;
   ordinal: number;
+  frozen_versions_sha256: string;
   same_evening_published_at: string | null;
   next_morning_published_at: string | null;
   required_count: number;
@@ -757,10 +831,13 @@ interface SessionObservation {
   not_listed_count: number;
   delisted_count: number;
   unknown_count: number;
-  canonical_provider_ids: string[]; // max 8; exactly 1 for a pure partition
+  canonical_provider_ids: readonly string[]; // 1..8; exactly 1 for a pure partition
   evidence: SessionEvidenceBinding;
   pointer_reconciliation: PointerReconciliation;
   replication_observation: ReplicationObservation;
+  calendar_raw_facts: CalendarRawFacts;
+  read_boundary_raw_facts: ReadBoundaryRawFacts;
+  schema_policy_digest: string;
   cutoff_results: { same_evening: MetricResult; next_morning: MetricResult };
   coverage: MetricResult;
   canonical_integrity: MetricResult;
@@ -773,25 +850,20 @@ interface SessionObservation {
   observation_sha256: string;
 }
 
-interface WindowEvidenceBundle {
-  immutable: true;
-  bundle_ref: string;
-  bundle_sha256: string;
-  bundle_version: string;
-  recovery_observation: RecoveryObservation | null;
-  failover_observation: WholeSessionFailoverDrill | null;
-  replay_sample: ReplaySampleEvidence | null;
-  adjustment_equivalence: AdjustmentEquivalenceEvidence | null;
-  error_handling_observation: ErrorHandlingObservation | null;
-  local_nas_isolation_observation: LocalNasIsolationObservation | null;
-  restore_observation: RestoreDrillEvidence | null;
+type WindowEvidenceBundle = ImmutableObservationEnvelopeV1<WindowEvidenceBundlePayload>;
+
+interface WindowEvidenceBundlePayload {
+  recovery_observation: ImmutableObservationEnvelopeV1<RecoveryObservation> | null;
+  failover_observation: ImmutableObservationEnvelopeV1<WholeSessionFailoverDrill> | null;
+  replay_sample: ImmutableObservationEnvelopeV1<ReplaySampleEvidence> | null;
+  adjustment_equivalence: ImmutableObservationEnvelopeV1<AdjustmentEquivalenceEvidence> | null;
+  error_handling_observation: ImmutableObservationEnvelopeV1<ErrorHandlingObservation> | null;
+  local_nas_isolation_observation: ImmutableObservationEnvelopeV1<LocalNasIsolationObservation> | null;
+  restore_observation: ImmutableObservationEnvelopeV1<RestoreDrillEvidence> | null;
   observation_count: 1;
 }
 
 interface WholeSessionFailoverDrill {
-  artifact_ref: string;
-  artifact_sha256: string;
-  artifact_version: string;
   source_schema: "task20-writer-owned";
   primary_unavailable: true;
   qualified_secondary_provider_id: string;
@@ -806,24 +878,21 @@ interface WholeSessionFailoverDrill {
 }
 
 interface ReplaySampleEvidence {
-  artifact_ref: string; artifact_sha256: string; artifact_version: string;
   sample_object_sha256: string; candidate_sha256: string; semantic_equal: true;
   offline_context: OfflineReplayContext;
 }
 
 interface AdjustmentEquivalenceEvidence {
-  artifact_ref: string; artifact_sha256: string; artifact_version: string;
-  compared_sessions: string[]; tolerance_policy_version: string; equivalence_passed: true;
+  compared_sessions: readonly string[]; tolerance_policy_version: string; equivalence_passed: true;
 }
 
 interface RestoreDrillEvidence {
-  artifact_ref: string; artifact_sha256: string; artifact_version: string;
   source_schema: "task20-writer-owned";
   sentinel_sha256: string; destination_id: string; destination_generation: string;
   destination_head_sha256: string; record_sha256: string; manifest_sha256: string;
   checkpoint_id: string; restore_report_id: string; restore_report_sha256: string;
   schema_version: string; row_count: number; api_readback_sha256: string;
-  verification_state: "verified"; artifact_hash_preimage: string;
+  verification_state: "verified";
 }
 
 interface CompletedReplicationRestoreSnapshotV1 {
@@ -860,6 +929,15 @@ interface OfflineReplayContext {
 HTTP behavior MUST be: `200` for a valid report including `ready`/`not_ready`; `503` for
 `unavailable` required control/input state; `422` for invalid dates/configuration. Error bodies use
 the same bounded projection and never contain paths or raw exceptions.
+
+Before a snapshot can be captured, a required missing/corrupt/locked descriptor MUST produce a
+`PreCaptureFailurePayloadV1` with `semantic_report_sha256` equal to the canonical hash of that
+payload (excluding the hash field itself from its preimage). The report then has
+`semantic_report_sha256` equal to that payload hash, `snapshot_identity=null`, and no fabricated
+observations. This makes pre-capture failures deterministic and testable without nullable digest
+ambiguity.
+The canonical payload hash excludes only its hash field; requested range, Shanghai as-of and every
+typed descriptor state remain in the preimage.
 
 ### `r2f-acceptance` CLI
 
@@ -952,6 +1030,7 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 
 | Entity | Field | Type | Constraints |
 | --- | --- | --- | --- |
+| `ImmutableObservationEnvelopeV1<T>` | identity/hash/creator/payload | closed immutable generic envelope | exact 10 fields; project-canonical-json-v1; creator/version/timestamp and both SHA-256 values required |
 | `FrozenReliabilityVersions` | `git_commit` | safe hex string | exact reviewed commit; required |
 | `FrozenReliabilityVersions` | provider/adapter/policy fields | safe identifier | exact equality across all 20 sessions |
 | `FrozenReliabilityVersions` | calendar/universe/replication/restore fields | safe ID + SHA-256 + closed trust scope | current F4 `LOCAL_CHAIN_ONLY` is insufficient for remote claims; absent Task20 proof is unavailable |
@@ -969,6 +1048,7 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `SessionObservation` | pointer reconciliation | `PointerReconciliation` | pointer, manifest and object hashes must agree; descriptor hash is required |
 | `SessionObservation` | per-session fields | immutable typed observation records | date, cutoffs, counts, provider/source, lineage, pointer/manifest/object and read-boundary facts only |
 | `SessionObservation` | replication | `ReplicationObservation` | state, record/digest/time, lag and trust/destination proofs are explicit |
+| `SessionObservation` | frozen/calendar/read boundary | digest + `CalendarRawFacts` + `ReadBoundaryRawFacts` | digest equals report vector; raw facts, future-row counts and probe counts are reducer inputs |
 | `WindowEvidenceBundle` | window-level drills | immutable typed bundle | recovery, whole-session failover, replay sample, adjustment, six-class errors, NAS isolation and restore are one bundle, not per-session claims |
 | `R2FAcceptanceReport` | status | enum | `ready`, `not_ready`, `unavailable` |
 | `R2FAcceptanceReport` | selected sessions | tuple of date values | exact 20 only for a candidate window |
@@ -987,6 +1067,7 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `ErrorHandlingObservation` | forced-error mapping | closed class/reason/result plus event/attempt/record identity | each forced class maps to a sanitized result |
 | `LocalNasIsolationObservation` | outage/retry proof | interval, local publication, lag, transition and record identity | local publication and retry history are immutable; current status alone is insufficient |
 | `WindowEvidenceBundle` | bundle cardinality | exactly one immutable bundle per evaluation | all window-level records are present or typed unavailable; no per-session duplication claim |
+| `PreCaptureFailurePayloadV1` | pre-capture failure | typed sanitized payload | canonical payload hash is the semantic report hash; no path or fabricated observation |
 
 ```typescript
 interface CapturedSnapshot {
@@ -1032,6 +1113,54 @@ Reason precedence MUST be deterministic and exact, in this order: (1) `INVALID_A
 The report retains all applicable metric failures in metric order even when top-level status is
 unavailable.
 
+<!-- R2F5_X5_CONTRACTS_JSON -->
+```json
+{
+  "contract_version": "r2f5-x5",
+  "roadmap_dimensions": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "restore", "read_boundary"],
+  "metric_fields": ["continuity", "next_morning_availability", "same_evening_availability", "coverage", "canonical_integrity", "source_purity", "recovery", "failover", "provenance", "replay", "adjustment", "calendar", "universe", "error_handling", "local_nas_isolation", "replication", "restore", "read_boundary"],
+  "reason_partitions": {
+    "failure": ["CONTINUITY_FAILED", "AVAILABILITY_CUTOFF_FAILED", "COVERAGE_FAILED", "SOURCE_PURITY_FAILED", "CANONICAL_INTEGRITY_FAILED", "RECOVERY_FAILED", "ERROR_HANDLING_FAILED", "LOCAL_NAS_ISOLATION_FAILED", "REPLICATION_LAG", "REPLAY_SEMANTIC_MISMATCH", "READ_BOUNDARY_FAILED", "CALENDAR_CONFLICT", "UNIVERSE_UNKNOWN_NONZERO", "UNIVERSE_COUNT_MISMATCH", "VERSION_DRIFT", "LINEAGE_INVALID"],
+    "unavailable": ["INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE", "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "LINEAGE_UNAVAILABLE", "FAILOVER_UNAVAILABLE", "REPLAY_UNAVAILABLE", "ADJUSTMENT_UNAVAILABLE", "REPLICATION_UNAVAILABLE", "REMOTE_PROOF_MISSING", "RESTORE_UNAVAILABLE", "BOUNDS_EXCEEDED", "NONE", "DISABLED", "SOURCE_NOT_CONFIGURED", "SOURCE_UNAVAILABLE", "LOCAL_POINTER_MISMATCH", "REPLICATION_STATE_UNAVAILABLE", "DESTINATION_UNAVAILABLE", "DESTINATION_TRUST_FAILED", "COPY_FAILED", "VERIFY_FAILED", "RETRY_WAIT", "DEAD_LETTER"]
+  },
+  "status_reason_matrix": {
+    "pass": [null],
+    "fail": ["failure"],
+    "unavailable": ["unavailable"]
+  },
+  "metric_reducers": {
+    "continuity": ["session.session", "session.ordinal"],
+    "next_morning_availability": ["session.next_morning_published_at"],
+    "same_evening_availability": ["session.same_evening_published_at"],
+    "coverage": ["session.required_count", "session.loaded_count", "session.unknown_count"],
+    "canonical_integrity": ["session.pointer_reconciliation", "session.evidence.manifest_sha256", "session.evidence.object_sha256"],
+    "source_purity": ["session.canonical_provider_ids"],
+    "recovery": ["window.recovery_observation.payload"],
+    "failover": ["window.failover_observation.payload"],
+    "provenance": ["session.evidence"],
+    "replay": ["window.replay_sample.payload"],
+    "adjustment": ["window.adjustment_equivalence.payload"],
+    "calendar": ["session.calendar_raw_facts"],
+    "universe": ["session.required_count", "session.loaded_count", "session.suspension_count", "session.not_listed_count", "session.delisted_count", "session.unknown_count"],
+    "error_handling": ["window.error_handling_observation.payload"],
+    "local_nas_isolation": ["window.local_nas_isolation_observation.payload"],
+    "replication": ["session.replication_observation", "frozen_versions.replication_policy_version"],
+    "restore": ["window.restore_observation.payload"],
+    "read_boundary": ["session.read_boundary_raw_facts"]
+  },
+  "cardinality": {"sessions": 20, "window_bundle": 1, "error_classes": 6, "input_roles_max": 32, "tree_entries_max": 100000, "input_bytes_max": 536870912},
+  "artifact_envelope_fields": ["artifact_id", "artifact_ref", "schema_version", "creator_kind", "creator_version", "created_at", "payload", "canonicalization_version", "payload_sha256", "envelope_sha256"]
+}
+```
+
+`R2F5_X5_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
+excluding Markdown fences) is `4f54e56793dde85081b2ba2392f446f3bb1e9ae81da3f22d93d85b7df08acbe0`.
+
+The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
+status matrix, reducer field references, envelope fields and cardinalities against the TypeScript
+contracts and matrix. This is structural drift detection only; semantic hash proof and human review
+of the reducers remain mandatory.
+
 ## Static compatibility inventory
 
 The implementation MUST reuse and read, without widening authority, the existing strict
@@ -1041,6 +1170,16 @@ the injected offline replay resolver, `CandidateStore`/`SessionSelection`, `Univ
 `ReplicationStatusService`, completed `RestoreService` drill records, and the existing dataset
 manifest/pointer readers. It MUST preserve `read()` compatibility and MUST NOT add a provider,
 LaunchAgent, user-store read, canonical writer, NAS transport or new persistence schema.
+
+### Deterministic input tree fingerprint
+
+For a directory input, `content_sha256` MUST be a deterministic tree hash over the validated root
+descriptor followed by sorted POSIX-relative paths in UTF-8 byte order. Each entry contributes its
+relative path, type, mode, size and full streaming content SHA-256; symlinks, special files,
+hardlink ambiguity, path escape and unsafe names are rejected before enumeration. The maximum is
+100,000 entries and 512 MiB total bytes per input; exceeding either bound is unavailable. SQLite
+inputs use a read-only consistent snapshot/backup or full-file bytes under the same 512 MiB limit,
+never a bounded page sample. Before/after tree digests MUST match; the 10-second/100,000-row
 
 ## R2-F5.0 metric contract and evidence sources
 
@@ -1071,8 +1210,8 @@ roadmap dimension from prose.
 | `calendar` | warning/acquisition observable; unknown/conflict fails closed | session calendar statuses; all confirmed | `CALENDAR_UNAVAILABLE` | AC-15 | `test_r2f5_slo_calendar` |
 | `universe` | counts reconcile; unknown zero | session required/loaded/suspension/not-listed/delisted/unknown; all reconcile | `UNIVERSE_COUNT_MISMATCH` | AC-15 | `test_r2f5_slo_universe` |
 | `error_handling` | six forced classes map to sanitized categories | `window.error_handling_observation.events`; exact six classes once | `ERROR_HANDLING_FAILED` | AC-15 | `test_r2f5_slo_error_handling` |
-| `local_nas_isolation` | NAS outage leaves local ready and retryable backlog | `window.local_nas_isolation_observation`; local ready=true and outage proof | `LOCAL_NAS_ISOLATION_FAILED` | AC-15 | `test_r2f5_slo_local_nas_isolation` |
-| `replication` *(child of local/NAS)* | frozen lag policy and remote proof pass | session `replication_observation` + completed record; reducer max lag | `REPLICATION_LAG` | AC-15 | `test_r2f5_slo_replication` |
+| `local_nas_isolation` | NAS outage leaves local ready and retryable backlog | window envelope payload; reducer requires local-ready, outage publication, nonnegative lag/threshold, retryable=true, exact backlog IDs/counts and queued-to-retrying transition | `LOCAL_NAS_ISOLATION_FAILED` | AC-15 | `test_r2f5_slo_local_nas_isolation` |
+| `replication` *(child of local/NAS)* | frozen lag policy and remote proof pass | session `replication_observation` + completed record; reducer max nonnegative lag <= frozen threshold and remote proof | `REPLICATION_LAG` | AC-15 | `test_r2f5_slo_replication` |
 | `restore` | verified generation restore/readback satisfies frozen policy | `window.restore_observation`; one completed drill | `RESTORE_UNAVAILABLE` | AC-15 | `test_r2f5_slo_restore` |
 | `read_boundary` | GET calls make no filesystem mutation | session read-boundary results; all pass | `READ_BOUNDARY_FAILED` | AC-15 | `test_r2f5_slo_read_boundary` |
 
@@ -1174,6 +1313,12 @@ window object and its digest is bound in `window_evidence_refs`; window drills a
 each session. Missing/corrupt/locked artifacts are typed unavailable. If any descriptor, file
 bytes, database page, version, or bound clock changes before/during/after evaluation, the whole
 report is invalidated; the reader does not retry into a mixed snapshot.
+
+Each `SessionObservation.frozen_versions_sha256` MUST equal
+`SnapshotIdentity.frozen_version_vector_sha256`, computed over the complete frozen vector (not a
+subset). Calendar reducers consume `calendar_raw_facts` and read-boundary reducers consume
+`read_boundary_raw_facts`; a reducer MUST NOT use an already aggregated `MetricResult` as its input.
+The report is independently recomputable from raw session facts plus the one window bundle envelope.
 
 The semantic report payload consists only of SnapshotIdentity, frozen versions, selected sessions,
 per-session observations, the immutable window bundle/reference, metric results, quality issue codes
