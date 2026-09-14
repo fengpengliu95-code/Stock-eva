@@ -5055,21 +5055,34 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
             local = published.astimezone(shanghai)
             session_date = date.fromisoformat(item["session"])
             if metric.startswith("next_"):
-                return local.date() == session_date + timedelta(days=1) and (
-                    local.hour,
-                    local.minute,
-                    local.second,
-                    local.microsecond,
-                ) == (8, 0, 0, 0)
-            return local.date() == session_date and (
-                local.hour,
-                local.minute,
-                local.second,
-                local.microsecond,
-            ) == (21, 15, 0, 0)
+                cutoff_date = session_date + timedelta(days=1)
+                cutoff = datetime(
+                    cutoff_date.year,
+                    cutoff_date.month,
+                    cutoff_date.day,
+                    8,
+                    tzinfo=shanghai,
+                )
+                return local.date() == cutoff_date and local <= cutoff
+            cutoff = datetime(
+                session_date.year,
+                session_date.month,
+                session_date.day,
+                21,
+                15,
+                tzinfo=shanghai,
+            )
+            return local.date() == session_date and local <= cutoff
 
         return sum(1 for item in observations if at_boundary(item)) / CARDINALITY["sessions"]
     if metric == "coverage":
+        if all(
+            item["required_count"] > 0
+            and item["loaded_count"] == item["required_count"]
+            and item["unknown_count"] == 0
+            for item in observations
+        ):
+            return 1.0
         return min(
             item["loaded_count"] / item["required_count"]
             for item in observations
@@ -5077,12 +5090,14 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
         )
     if metric == "canonical_integrity":
         evidence_values = _disk_digest_values(golden, "SessionEvidenceBinding.evidence_sha256")
+        object_values = _disk_digest_values(golden, "SessionEvidenceBinding.object_sha256")
         pointer_values = _disk_digest_values(golden, "PointerReconciliation.pointer_sha256")
         return all(
             item["pointer_reconciliation"]["pointer_manifest_object_match"]
             and item["evidence"]["binding_sha256"]
             and item["observation_sha256"]
             and item["evidence"]["evidence_sha256"] in evidence_values
+            and item["evidence"]["object_sha256"] in object_values
             and item["pointer_reconciliation"]["pointer_sha256"] in pointer_values
             for item in observations
         )
@@ -5247,7 +5262,7 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
         value = window["restore_observation"]["payload"]
         return bool(
             value["verification_state"] == "verified"
-            and value["row_count"] > 0
+            and value["row_count"] == sum(item["loaded_count"] for item in observations)
             and value["schema_version"] == "restore-v1"
             and all(
                 _disk_digest_matches(golden, field, value[field.rsplit(".", 1)[-1]])
@@ -5283,6 +5298,29 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
             for item in observations
         )
     raise AssertionError(f"missing independent SLO reducer for {metric}")
+
+
+@pytest.mark.parametrize(
+    ("metric", "published_at", "expected"),
+    (
+        ("same_evening_availability", "2026-08-03T13:14:59Z", 1.0),
+        ("same_evening_availability", "2026-08-03T13:15:00Z", 1.0),
+        ("same_evening_availability", "2026-08-03T13:15:01Z", 19 / 20),
+        ("next_morning_availability", "2026-08-03T23:59:59Z", 1.0),
+        ("next_morning_availability", "2026-08-04T00:00:00Z", 1.0),
+        ("next_morning_availability", "2026-08-04T00:00:01Z", 19 / 20),
+    ),
+)
+def test_r2f5_availability_reducer_checks_timezone_cutoff_boundaries(
+    golden: GoldenTree, metric: str, published_at: str, expected: float
+) -> None:
+    field = (
+        "same_evening_published_at"
+        if metric == "same_evening_availability"
+        else "next_morning_published_at"
+    )
+    _mutate_session(golden, {field: published_at}, ordinal=1)
+    assert _reduce_slo_metric(metric, golden) == expected
 
 
 def _slo_cases(metric: str) -> tuple[SloCase, SloCase, SloCase]:
@@ -6028,20 +6066,46 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     assert set(tampered_report["quality_issues"]) & allowed
 
 
+def _assert_ordinal_rejection_basics(report: dict[str, Any], metric: str) -> None:
+    """Reject a generic 503 mutant that leaves the owning relation passing."""
+
+    assert report["status"] in {"unavailable", "not_ready"}
+    assert report["writes"] is False and report["provider_requests"] == 0
+    assert report[metric]["status"] != "pass"
+
+
 @pytest.mark.parametrize("ordinal", tuple(range(1, 21)))
 def test_r2f5_every_session_observation_ordinal_is_publicly_checked(
     golden: GoldenTree, ordinal: int
 ) -> None:
-    _mutate_session(golden, {"loaded_count": 4_999}, ordinal=ordinal, tamper_hash=True)
+    _mutate_session(golden, {"loaded_count": 4_999}, ordinal=ordinal)
     before = tuple(_physical_fingerprint(root) for root in golden.roots())
     response = _api_get(golden)
     if response.status_code == 404:
         return
-    assert response.status_code == 503
+    assert response.status_code in {200, 503}
     report = response.json()
-    assert report["status"] in {"unavailable", "not_ready"}
-    assert report["writes"] is False and report["provider_requests"] == 0
-    assert report["quality_issues"]
+    _assert_ordinal_rejection_basics(report, "coverage")
+    observations = report.get("session_observations") or []
+    refs = report.get("observation_refs") or []
+    if observations and refs:
+        assert len(observations) == len(refs) == 20
+        affected = observations[ordinal - 1]
+        assert affected["ordinal"] == ordinal
+        assert affected["session"] == golden.sessions[ordinal - 1]
+        assert refs[ordinal - 1] == affected["observation_sha256"]
+        assert affected["coverage"]["status"] == "fail"
+        assert affected["coverage"]["reason_code"] == SLO_CONTRACTS["coverage"]["failure_reason"]
+        for index, item in enumerate(observations):
+            if index == ordinal - 1:
+                continue
+            disk = _read_json(golden.dataset / "sessions" / f"{golden.sessions[index]}.json")
+            assert item["observation_sha256"] == disk["observation_sha256"]
+    else:
+        pre_capture = report.get("pre_capture_failure")
+        assert pre_capture is not None
+        assert "error" in pre_capture["descriptor_states"]
+        assert report["quality_issues"]
     assert tuple(_physical_fingerprint(root) for root in golden.roots()) == before
 
 
@@ -6054,11 +6118,33 @@ def test_r2f5_every_error_event_ordinal_is_publicly_checked(
     response = _api_get(golden)
     if response.status_code == 404:
         return
-    assert response.status_code == 503
+    assert response.status_code in {200, 503}
     report = response.json()
-    assert report["status"] in {"unavailable", "not_ready"}
-    assert report["writes"] is False and report["provider_requests"] == 0
-    assert report["quality_issues"]
+    _assert_ordinal_rejection_basics(report, "error_handling")
+    events = (
+        report.get("window_evidence_bundle", {})
+        .get("payload", {})
+        .get("error_handling_observation", {})
+        or {}
+    )
+    events = events.get("payload", {}).get("events", []) if events else []
+    if events:
+        assert len(events) == 6
+        assert (
+            events[event_index]["event_id"]
+            == f"error-{('timeout', 'auth', 'rate', 'schema', 'coverage', 'storage')[event_index]}"
+        )
+        assert events[event_index]["observed_class"] != events[event_index]["forced_error_class"]
+        assert report["error_handling"]["reason_code"] == "ERROR_HANDLING_FAILED"
+        for index, event in enumerate(events):
+            if index == event_index:
+                continue
+            assert (
+                event["event_id"]
+                == f"error-{('timeout', 'auth', 'rate', 'schema', 'coverage', 'storage')[index]}"
+            )
+    else:
+        assert report["quality_issues"]
     assert tuple(_physical_fingerprint(root) for root in golden.roots()) == before
 
 
@@ -6079,10 +6165,96 @@ def test_r2f5_every_snapshot_fingerprint_is_publicly_checked(
         return
     assert response.status_code == 503
     report = response.json()
-    assert report["status"] in {"unavailable", "not_ready"}
-    assert report["writes"] is False and report["provider_requests"] == 0
-    assert report["quality_issues"]
+    _assert_ordinal_rejection_basics(report, "canonical_integrity")
+    runtime_snapshot = report.get("snapshot_identity")
+    if runtime_snapshot is not None:
+        baseline = golden.snapshot_identity["input_fingerprints"]
+        actual = runtime_snapshot["input_fingerprints"]
+        assert len(actual) == len(baseline) == 7
+        role = baseline[fingerprint_index]["descriptor_role"]
+        assert actual[fingerprint_index]["descriptor_role"] == role
+        assert actual[fingerprint_index]["fingerprint_kind"] == "content_sha256"
+        assert actual[fingerprint_index]["sha256"] != baseline[fingerprint_index]["sha256"]
+        for index, item in enumerate(actual):
+            if index != fingerprint_index:
+                assert item["descriptor_role"] == baseline[index]["descriptor_role"]
+                assert item["sha256"] == baseline[index]["sha256"]
+    else:
+        pre_capture = report.get("pre_capture_failure")
+        assert pre_capture is not None
+        assert pre_capture["descriptor_states"]
+        assert report["quality_issues"]
     assert tuple(_physical_fingerprint(root) for root in golden.roots()) == before
+
+
+def test_r2f5_ordinal_generic_reject_mutant_is_killed() -> None:
+    generic = {
+        "status": "unavailable",
+        "writes": False,
+        "provider_requests": 0,
+        "coverage": {"status": "pass"},
+    }
+    with pytest.raises(AssertionError):
+        _assert_ordinal_rejection_basics(generic, "coverage")
+
+
+@pytest.mark.parametrize(
+    ("metric", "state"),
+    tuple((metric, state) for metric in METRICS for state in ("fail", "unavailable")),
+)
+def test_r2f5_three_state_slo_oracle_consumes_raw_mutations(
+    golden: GoldenTree, metric: str, state: str
+) -> None:
+    """Run every metric's independent reducer for both negative raw states."""
+
+    baseline = _reduce_slo_metric(metric, golden)
+    mutation = (
+        _SLO_FAILURE_MUTATIONS[metric] if state == "fail" else _SLO_UNAVAILABLE_MUTATIONS[metric]
+    )
+    _apply_mutation(golden, mutation)
+    try:
+        observed = _reduce_slo_metric(metric, golden)
+    except (AssertionError, FileNotFoundError, KeyError, sqlite3.DatabaseError, TypeError):
+        observed = None
+    if state == "fail":
+        if metric in {
+            "continuity",
+            "next_morning_availability",
+            "same_evening_availability",
+            "coverage",
+            "replication",
+        }:
+            assert observed != baseline
+        else:
+            assert observed is False or observed is None
+    else:
+        # Missing/corrupt evidence is an unavailable raw state even when a
+        # dimension (for example continuity) has no numeric delta to report.
+        assert (
+            observed is None
+            or observed != baseline
+            or mutation
+            in {
+                "calendar_unknown",
+                "session_missing",
+                "corrupt_control",
+            }
+        )
+        if mutation == "calendar_unknown":
+            assert _read_json(golden.dataset / "calendar.json")["unknown_state"] is True
+        elif mutation == "session_missing":
+            assert len(list((golden.dataset / "sessions").glob("*.json"))) < CARDINALITY["sessions"]
+        elif mutation in {"lineage_missing"}:
+            field_path = "SessionEvidenceBinding.object_sha256"
+            assert not golden.leaf_files[field_path][0].exists()
+        elif mutation.endswith("_missing"):
+            window = _read_json(golden.evidence / "window.json")["payload"]
+            assert any(value is None for value in window.values()) or not golden.leaf_files
+        elif mutation == "corrupt_control":
+            with pytest.raises(sqlite3.DatabaseError):
+                sqlite3.connect(golden.controls["replication_sidecar"]).execute(
+                    "SELECT 1"
+                ).fetchone()
 
 
 def test_r2f5_wrong_algorithm_mutant_is_killed() -> None:
