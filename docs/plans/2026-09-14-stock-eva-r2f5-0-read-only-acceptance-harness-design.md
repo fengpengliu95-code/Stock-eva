@@ -53,8 +53,9 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 
 - FR-1: The evaluator MUST read only an explicitly allowlisted local dataset root, evidence root,
   and existing control stores; it MUST NOT create, initialize, migrate, repair or delete any input.
-- FR-2: Every supplied root MUST be absolute, non-root, lexically normalized, descriptor-validated,
-  no-follow and disjoint from configured control, staging, temporary, user, NAS and home roots.
+- FR-2: Every supplied root MUST be absolute, non-root, lexically normalized, and pass `lstat`/
+  `open(..., O_NOFOLLOW)` descriptor-identity probes before directory enumeration or content reads;
+  it MUST be disjoint from configured control, staging, temporary, user, NAS and home roots.
   Symlink aliases, unresolved variables, mutable-root descendants and overlap MUST fail closed.
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
   fingerprint every input root and database by descriptor identity, size, mtime/ctime and SHA-256
@@ -107,6 +108,47 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - FR-18: The evaluator MUST record no Task 20 elapsed-session claim. A report MAY state that a
   supplied window is synthetically/evidentially complete, but MUST label installed production
   observation as pending unless separately authorized and evidenced.
+- FR-19: The report MUST expose one `MetricResult` for each of the 17 roadmap mandatory dimensions:
+  continuity, next-morning availability, same-evening availability, coverage, canonical integrity,
+  source purity, recovery, failover, provenance, replay, adjustment, calendar, universe, error
+  handling, local/NAS isolation, replication and restore. Each result MUST carry an observed value,
+  target, status and reason; a missing dimension MUST make the report unavailable.
+- FR-20: Secondary qualification/admission MUST be read through a strict immutable evidence reader
+  requiring provider, adapter, terms, version vector, qualification window, capability and
+  admission hashes. Missing or non-qualified secondary evidence MUST make failover `not_ready` or
+  `unavailable`; source purity alone MUST never substitute for qualification.
+- FR-21: Forced-failover acceptance MUST require a separate immutable whole-session drill record
+  proving primary-unavailable, qualified-secondary admission, one provider for every row, zero
+  mixed rows, selection/pointer/manifest agreement and readback. BaoStock-only or no drill proof
+  MUST fail closed.
+- FR-22: Replication/restore evidence MUST be read through strict completed-record snapshot readers
+  that require `trust_scope`, destination generation, destination-head proof and remote verification.
+  `LOCAL_CHAIN_ONLY` MUST never satisfy a remote/NAS or Task 20 acceptance target, and readers MUST
+  NOT call `create=True`, writer, reconcile, drain, mount or restore paths.
+- FR-23: Offline replay MAY run a frozen adapter/normalizer implementation on immutable bytes, but
+  MUST inject an explicit offline-only adapter/normalizer identity and MUST reject unknown or
+  mismatched identity. It MUST make zero network/provider requests and MUST NOT construct a default
+  login/query-capable adapter.
+- FR-24: `FrozenReliabilityVersions` MUST contain non-null ready-time identities for Git commit,
+  installed RELEASE, dataset generation, primary and secondary providers, qualification/admission,
+  adapter, endpoint/schema, selection/reconciliation policy, config digest, auto-failover setting,
+  kill switch, priority, continuity start/repair policy, calendar/universe generations, and
+  replication/restore policy/evidence versions, trust scope, destination generation/head proof and
+  remote verification. All 20 observations MUST equal this vector.
+- FR-25: Raw captured calendar observations MUST retain source order and duplicates for validation;
+  duplicate or out-of-order input MUST be unavailable. Only after validation MAY the evaluator
+  derive sorted unique confirmed sessions. `SnapshotIdentity` MUST bind requested range, Shanghai
+  clock instant/time-zone contract, all input fingerprints and the frozen version vector.
+- FR-26: The report MUST contain exactly 20 ordered per-session observations or immutable
+  observation references with digests when a candidate window is evaluated. Each observation MUST
+  independently cover cutoff results, coverage, pointer/manifest/hash, source, lineage,
+  replication and restore evidence.
+- FR-27: Volatile elapsed/counter diagnostics MUST live in a non-semantic envelope. The semantic
+  report payload and digest MUST exclude elapsed time, read duration and other volatile fields;
+  identical snapshot identity and bytes MUST yield byte-identical semantic JSON.
+- FR-28: All public enums, reason codes, identifiers, SHA-256 values, quality issues, counters and
+  cardinalities MUST use closed vocabularies, bounded nonnegative types and exact regex/length
+  validation. Ready reports MUST have exactly 20 observations and no null frozen-version field.
 
 ## Non-Functional Requirements
 
@@ -121,7 +163,7 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   NOT cross the API/CLI boundary.
 - NFR-5: Path validation MUST reject `/`, the home directory, configured mutable roots, relative
   paths, symlink aliases, environment-variable syntax, `..` escape and source/destination overlap
-  before filesystem enumeration.
+  using `lstat`/no-follow descriptor probes before filesystem enumeration or content reads.
 - NFR-6: Every read and replay MUST enforce bounded object bytes, row counts, session count (20)
   and evidence sample count (at most 3), and MUST return `unavailable` rather than scan without a
   bound.
@@ -136,6 +178,19 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - NFR-10: The implementation plan MUST preserve a separate production-mutation gate requiring
   explicit human authorization, installed-release readback, provider/terms approval and Task 20;
   no local code or synthetic fixture can satisfy that gate.
+- NFR-11: The SLO inventory MUST preserve the roadmap thresholds exactly: zero missing dates,
+  20/20 next-morning by 08:00, at least 18/20 same-evening by 21:15, 100% legal coverage and
+  zero mixed-source rows. No threshold may be invented or relaxed by the harness.
+- NFR-12: Replication lag, remote verification and restore duration MUST be passable only when a
+  reviewed R2-F4 policy/evidence record supplies numeric thresholds. Missing thresholds or a
+  `LOCAL_CHAIN_ONLY` trust scope MUST be `not_ready`/`unavailable`, never guessed.
+- NFR-13: Snapshot concurrency MUST be fail-closed: a root/database descriptor or content change
+  before, during or after any read invalidates the whole report; no retry may silently mix snapshots.
+- NFR-14: The semantic report MUST use canonical UTF-8 JSON with sorted keys, compact separators,
+  `ensure_ascii=false`, `allow_nan=false` and a domain-separated SHA-256; volatile diagnostics MUST
+  be outside that digest.
+- NFR-15: The acceptance API/CLI is additive only. Existing response models/routes and persisted
+  schemas remain unchanged; all new acceptance fields are namespaced to this report.
 
 ## Acceptance Criteria
 
@@ -266,11 +321,95 @@ and all results include zero provider requests/writes.
 Planned test anchors: `test_r2f5_report_digest_and_reason_order_are_deterministic`,
 `test_r2f5_missing_corrupt_locked_states_fail_closed`.
 
+### AC-15: Complete SLO metric inventory (FR-9, FR-19, NFR-11)
+
+Given a candidate window, when the report is serialized, then all 17 named roadmap dimensions are
+present as separate `MetricResult` fields with exact targets and anchors. Missing continuity,
+availability, canonical integrity, recovery, failover, adjustment, error handling, local/NAS,
+replication or restore evidence cannot be hidden behind another metric.
+
+Planned test anchors: `test_r2f5_report_has_every_roadmap_slo_metric`,
+`test_r2f5_each_slo_threshold_is_explicit`.
+
+### AC-16: Secondary qualification and failover (FR-20, FR-21)
+
+Given only BaoStock, no qualified secondary, or no immutable whole-session forced-failover drill,
+when evaluation runs, then failover is `not_ready`/`unavailable` and top-level ready is impossible.
+Given a qualified admission and complete drill record, then failover passes only when selection,
+manifest, pointer and all rows agree with zero mixed-source rows.
+
+Planned test anchors: `test_r2f5_baostock_only_cannot_pass_failover`,
+`test_r2f5_failover_requires_qualified_whole_session_drill`.
+
+### AC-17: Remote trust and restore snapshot (FR-22, NFR-12)
+
+Given a completed replication/restore record with destination generation, head proof, remote
+verification, trust scope and reviewed numeric thresholds, when the strict snapshot reader runs,
+then it can pass. Given `LOCAL_CHAIN_ONLY`, missing threshold, locked sidecar or writer/reconcile
+only evidence, then the metric is unavailable/not ready and no destination operation starts.
+
+Planned test anchors: `test_r2f5_local_chain_only_cannot_satisfy_remote_acceptance`,
+`test_r2f5_replication_restore_reader_is_strictly_read_only`.
+
+### AC-18: Offline replay identity (FR-11, FR-23)
+
+Given immutable bytes and an exact frozen offline adapter/normalizer identity, when replay runs,
+then it performs deterministic normalization and zero provider/network requests. Given unknown,
+mismatched or default login-capable identity, then replay is unavailable before adapter construction.
+
+Planned test anchors: `test_r2f5_replay_uses_injected_offline_identity`,
+`test_r2f5_replay_rejects_unknown_identity_without_provider`.
+
+### AC-19: Full version vector (FR-7, FR-24)
+
+Given 20 observations, when the frozen vector is captured, then every required identity is non-null
+and equal across all observations. Missing RELEASE, config, qualification/admission, primary/
+secondary, kill-switch/priority, policy or replication/restore evidence prevents ready.
+
+Planned test anchors: `test_r2f5_frozen_versions_are_complete_and_nonnull_when_ready`,
+`test_r2f5_version_vector_drift_is_unavailable`.
+
+### AC-20: Raw sequence and snapshot identity (FR-3, FR-25, NFR-8, NFR-13)
+
+Given raw calendar observations, when evaluation validates them, then it preserves source order and
+rejects duplicates/out-of-order data before deriving sorted unique confirmed sessions. The report
+returns a digest-bound SnapshotIdentity and observation refs; any concurrent input change invalidates
+the whole report.
+
+Planned test anchors: `test_r2f5_raw_calendar_order_and_duplicates_fail_closed`,
+`test_r2f5_snapshot_identity_binds_all_inputs_and_clock`.
+
+### AC-21: Semantic determinism (FR-26, FR-27, NFR-14)
+
+Given identical captured bytes, clock and arguments, when evaluation repeats, then exactly 20
+per-session observations/refs and byte-identical semantic JSON/digest are returned. Changing only
+elapsed/counter diagnostics MUST NOT change the semantic digest.
+
+Planned test anchors: `test_r2f5_semantic_digest_excludes_volatile_envelope`,
+`test_r2f5_per_session_observation_cardinality_and_order`.
+
+### AC-22: Closed bounded report types (FR-28, NFR-3)
+
+Given invalid enum, reason, hash, ID, negative counter, oversized quality issue or null ready
+version, when report validation runs, then it rejects the report with a sanitized unavailable result.
+
+Planned test anchors: `test_r2f5_report_types_are_closed_and_bounded`,
+`test_r2f5_ready_requires_nonnull_versions_and_exact_20_observations`.
+
+### AC-23: Additive compatibility (NFR-1, NFR-15)
+
+Given existing market, universe, evidence, calendar, replication and restore API responses, when
+the new acceptance endpoint/CLI is evaluated, then predecessor payloads/schemas remain unchanged;
+the new fields exist only in the acceptance report.
+
+Planned test anchors: `test_r2f5_acceptance_surface_is_additive`,
+`test_r2f5_predecessor_payloads_are_byte_compatible`.
+
 ## Edge Cases
 
 - EC-1: Exactly 19 confirmed sessions are available in the requested range; return `not_ready` with
   `SESSION_COUNT_NOT_20`, never infer a missing session.
-- EC-2: Exactly 20 dates contain a duplicate or a missing middle date; return `not_ready` with
+- EC-2: Exactly 20 raw dates contain a duplicate or are out of order; return `unavailable` with
   `SESSION_SEQUENCE_INVALID`, preserving the observed order and no deduplication.
 - EC-3: The requested end date is in the future or after the trusted Shanghai clock; return
   `unavailable`/`PIT_VISIBILITY_INVALID` before accepting session metrics.
@@ -304,6 +443,22 @@ Planned test anchors: `test_r2f5_report_digest_and_reason_order_are_deterministi
   return unavailable with measured counters.
 - EC-18: API/CLI receives malformed date, missing required argument or disallowed override; return
   HTTP 422/CLI 2 with no filesystem or provider access.
+- EC-19: Roadmap SLO field is absent from a report or has no explicit threshold; return unavailable,
+  never infer pass from another metric.
+- EC-20: Only BaoStock or an unqualified/unstaged secondary exists; failover remains not_ready/
+  unavailable and source purity cannot make it pass.
+- EC-21: Forced-failover record lacks whole-session selection/pointer/manifest/readback proof or has
+  mixed rows; failover returns unavailable and no pointer is changed.
+- EC-22: Replication/restore record is LOCAL_CHAIN_ONLY, lacks remote head proof/verification or
+  lacks a reviewed numeric lag/duration threshold; return not_ready/unavailable.
+- EC-23: Replay identity is unknown, mismatched, login-capable or provider-default; reject before
+  constructing it and perform zero network/provider calls.
+- EC-24: Frozen vector omits RELEASE, dataset, secondary/admission, config, kill-switch/priority,
+  policy, calendar/universe or replication/restore identity; ready validation rejects it.
+- EC-25: Raw calendar list is duplicated, out of order or changed while sorting; preserve raw bytes,
+  return unavailable and never evaluate a derived session list.
+- EC-26: Semantic digest input contains elapsed/counter volatility or omits SnapshotIdentity,
+  observation refs or one of 20 observations; reject the report as non-deterministic/incomplete.
 
 ## API Contracts
 
@@ -323,25 +478,66 @@ interface MetricResult {
   status: "pass" | "fail" | "unavailable";
   observed: number | string | boolean | null;
   target: number | string | boolean | null;
-  reason_code: string | null;
+  reason_code: AcceptanceReasonCode | null;
 }
+
+type AcceptanceReasonCode =
+  | "SESSION_COUNT_NOT_20" | "SESSION_SEQUENCE_INVALID" | "PIT_VISIBILITY_INVALID"
+  | "CALENDAR_UNAVAILABLE" | "CALENDAR_CONFLICT" | "UNIVERSE_UNKNOWN_NONZERO"
+  | "UNIVERSE_COUNT_MISMATCH" | "VERSION_DRIFT" | "AVAILABILITY_CUTOFF_FAILED"
+  | "COVERAGE_FAILED" | "CANONICAL_INTEGRITY_FAILED" | "SOURCE_PURITY_FAILED"
+  | "RECOVERY_FAILED" | "FAILOVER_UNAVAILABLE" | "LINEAGE_UNAVAILABLE"
+  | "REPLAY_UNAVAILABLE" | "ADJUSTMENT_UNAVAILABLE" | "ERROR_HANDLING_FAILED"
+  | "LOCAL_NAS_ISOLATION_FAILED" | "REPLICATION_UNAVAILABLE" | "REPLICATION_LAG"
+  | "RESTORE_UNAVAILABLE" | "PATH_INVALID" | "SNAPSHOT_CHANGED"
+  | "CONTROL_STATE_UNAVAILABLE" | "BOUNDS_EXCEEDED" | "INVALID_ARGUMENTS";
+
+interface SnapshotFingerprint {
+  descriptor_role: "dataset" | "evidence" | "calendar" | "universe" | "replication" | "restore";
+  device: number;
+  inode: number;
+  size_bytes: number;
+  mtime_ns: number;
+  ctime_ns: number;
+  sha256: string;
+}
+
+type QualityIssueCode = AcceptanceReasonCode | "REPLAY_SEMANTIC_MISMATCH" | "REMOTE_PROOF_MISSING";
 
 interface FrozenReliabilityVersions {
   git_commit: string;
-  installed_release: string | null;
+  installed_release: string;
+  installed_release_sha256: string;
+  dataset_generation: string;
   canonical_schema: string;
   evidence_schema: string;
-  provider_id: string;
+  primary_provider_id: string;
+  secondary_provider_id: string;
+  qualification_id: string;
+  admission_id: string;
   adapter_version: string;
   endpoint_contract_version: string;
+  schema_version: string;
   reconciliation_policy_version: string;
   selection_policy_version: string;
+  config_digest: string;
+  auto_failover_enabled: boolean;
+  failover_kill_switch: boolean;
+  provider_priority: string[];
+  continuity_start_date: string;
+  repair_policy_version: string;
   calendar_generation: string;
   calendar_sha256: string;
   universe_generation: string;
   universe_sha256: string;
-  replication_schema: string;
-  restore_drill_schema: string;
+  replication_policy_version: string;
+  replication_evidence_version: string;
+  replication_trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
+  destination_generation: string;
+  destination_head_sha256: string;
+  remote_verification_sha256: string;
+  restore_policy_version: string;
+  restore_evidence_version: string;
 }
 
 interface R2FAcceptanceReport {
@@ -355,20 +551,93 @@ interface R2FAcceptanceReport {
   same_evening_availability: MetricResult;
   coverage: MetricResult;
   source_purity: MetricResult;
+  canonical_integrity: MetricResult;
+  recovery: MetricResult;
+  failover: MetricResult;
   provenance: MetricResult;
   replay: MetricResult;
+  adjustment: MetricResult;
   calendar: MetricResult;
   universe: MetricResult;
+  error_handling: MetricResult;
+  local_nas_isolation: MetricResult;
   replication: MetricResult;
   restore: MetricResult;
-  quality_issues: string[];
+  quality_issues: QualityIssueCode[];
+  snapshot_identity: SnapshotIdentity | null;
+  session_observations: SessionObservation[];
+  observation_refs: string[];
+  semantic_report_sha256: string;
+  diagnostic_envelope: DiagnosticEnvelope;
   provider_requests: 0;
   writes: false;
   restore_started: false;
   production_window_started: false;
+}
+
+interface SnapshotIdentity {
+  requested_start: string;
+  requested_end: string;
+  as_of_utc: string;
+  as_of_timezone: "Asia/Shanghai";
+  input_fingerprints: SnapshotFingerprint[];
+  frozen_versions: FrozenReliabilityVersions;
+  input_fingerprint_sha256: string;
+  frozen_version_vector_sha256: string;
+  snapshot_sha256: string;
+}
+
+interface DiagnosticEnvelope {
   elapsed_ms: number | null;
   read_operations: number;
   replay_sample_count: number;
+}
+
+interface SessionObservation {
+  trade_date: string;
+  ordinal: number;
+  cutoff_results: { same_evening: MetricResult; next_morning: MetricResult };
+  coverage: MetricResult;
+  canonical_integrity: MetricResult;
+  recovery: MetricResult;
+  source_provider: string;
+  source_purity: MetricResult;
+  failover: MetricResult;
+  provenance: MetricResult;
+  replay: MetricResult;
+  adjustment: MetricResult;
+  calendar: MetricResult;
+  universe: MetricResult;
+  error_handling: MetricResult;
+  local_nas_isolation: MetricResult;
+  replication: MetricResult;
+  restore: MetricResult;
+  lineage_sha256: string;
+  replication_trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
+  observation_sha256: string;
+}
+
+interface CompletedReplicationRestoreSnapshotV1 {
+  trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
+  destination_generation: string;
+  destination_head_sha256: string;
+  remote_verification_sha256: string;
+  replication_policy_version: string;
+  restore_policy_version: string;
+  lag_threshold_seconds: number;
+  restore_duration_threshold_seconds: number;
+  replication_record_sha256: string;
+  restore_record_sha256: string;
+}
+
+interface OfflineReplayContext {
+  adapter_id: string;
+  adapter_version: string;
+  normalizer_id: string;
+  normalizer_version: string;
+  implementation_sha256: string;
+  network_allowed: false;
+  provider_requests: 0;
 }
 ```
 
@@ -415,9 +684,9 @@ database initialization/migration paths.
 | --- | --- | --- | --- |
 | `FrozenReliabilityVersions` | `git_commit` | safe hex string | exact reviewed commit; required |
 | `FrozenReliabilityVersions` | provider/adapter/policy fields | safe identifier | exact equality across all 20 sessions |
-| `FrozenReliabilityVersions` | calendar/universe/replication/restore fields | safe ID + SHA-256 | required where source is available; no fabricated nulls |
+| `FrozenReliabilityVersions` | calendar/universe/replication/restore fields | safe ID + SHA-256 + closed trust scope | destination generation/head and remote verification are required for remote claims; no fabricated nulls |
 | `MetricResult` | status | enum | `pass`, `fail`, `unavailable` only |
-| `MetricResult` | observed/target | bounded scalar | no arbitrary provider text |
+| `MetricResult` | observed/target | bounded nonnegative scalar/closed literal | no arbitrary provider text; exact threshold required |
 | `SnapshotFingerprint` | root/database identity | device/inode/size/timestamps/hash | descriptor-bound; changes invalidate report |
 | `CapturedSnapshot` | selected sessions | tuple of dates | exactly 20, sorted, unique and confirmed |
 | `CapturedSnapshot` | input fingerprints | tuple | one per every input root/control DB |
@@ -429,8 +698,24 @@ database initialization/migration paths.
 | `R2FAcceptanceReport` | status | enum | `ready`, `not_ready`, `unavailable` |
 | `R2FAcceptanceReport` | selected sessions | tuple[date] | exact 20 only for a candidate window |
 | `R2FAcceptanceReport` | metric fields | `MetricResult` | all mandatory rows always present |
-| `R2FAcceptanceReport` | quality issues | tuple of safe codes | stable order, bounded length, no raw text |
+| `R2FAcceptanceReport` | quality issues | tuple of `QualityIssueCode` | stable order, max 64, no raw text |
 | `R2FAcceptanceReport` | mutation markers | literals | provider requests `0`, writes `false`, restore/production flags `false` |
+| `R2FAcceptanceReport` | session observations/refs | tuple/list of 20 | ordered by validated Shanghai session; exactly 20 when candidate window is evaluated |
+| `R2FAcceptanceReport` | semantic identity | `SnapshotIdentity` + SHA-256 | required; excludes volatile diagnostic envelope |
+| `R2FAcceptanceReport` | diagnostics | `DiagnosticEnvelope` | nonnegative bounded counters; not included in semantic digest |
+| `SnapshotIdentity` | requested range/as-of/fingerprints | dates, UTC instant, tz literal, SHA-256 | all required and bound to one captured snapshot |
+| `SecondaryQualificationEvidenceV1` | qualification/admission identities | safe IDs/SHA-256 | exact 20 sessions; strict immutable evidence reader |
+| `WholeSessionFailoverDrillV1` | drill and selection proof | safe IDs/SHA-256/booleans/count | remote proof and zero mixed rows required for pass |
+| `CompletedReplicationRestoreSnapshotV1` | trust/destination/threshold fields | closed scope, IDs/SHA-256, nonnegative seconds | reviewed R2-F4 policy values required; LOCAL_CHAIN_ONLY cannot pass remote target |
+| `OfflineReplayContext` | adapter/normalizer identity | safe IDs/SHA-256 + literal false/zero | unknown or network-capable identity rejected |
+
+All identifiers MUST match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, all SHA-256 fields MUST match
+`[0-9a-f]{64}`, all counters/durations MUST be integers in `[0, 2^31-1]`, and all serialized
+collections MUST have explicit maximum lengths. `MetricResult.reason_code` and quality issues are
+closed enums; unknown values, extra fields, negative values and ready-time nulls are validation
+errors. A ready report MUST have `len(selected_sessions)=len(session_observations)=20` and
+`frozen_versions != null`; an unavailable report MAY have null identity only when path/control
+proof fails before a snapshot can be captured, and MUST state that reason.
 
 ### Status and reason vocabulary
 
@@ -438,14 +723,25 @@ The implementation MUST use the following public reason codes and MUST NOT expos
 exception text: `SESSION_COUNT_NOT_20`, `SESSION_SEQUENCE_INVALID`, `PIT_VISIBILITY_INVALID`,
 `CALENDAR_UNAVAILABLE`, `CALENDAR_CONFLICT`, `UNIVERSE_UNKNOWN_NONZERO`,
 `UNIVERSE_COUNT_MISMATCH`, `VERSION_DRIFT`, `AVAILABILITY_CUTOFF_FAILED`,
-`COVERAGE_FAILED`, `SOURCE_PURITY_FAILED`, `LINEAGE_UNAVAILABLE`, `REPLAY_UNAVAILABLE`,
+`COVERAGE_FAILED`, `CANONICAL_INTEGRITY_FAILED`, `SOURCE_PURITY_FAILED`,
+`RECOVERY_FAILED`, `FAILOVER_UNAVAILABLE`, `LINEAGE_UNAVAILABLE`, `REPLAY_UNAVAILABLE`,
+`ADJUSTMENT_UNAVAILABLE`, `ERROR_HANDLING_FAILED`, `LOCAL_NAS_ISOLATION_FAILED`,
 `REPLICATION_UNAVAILABLE`, `REPLICATION_LAG`, `RESTORE_UNAVAILABLE`, `PATH_INVALID`,
-`SNAPSHOT_CHANGED`, `CONTROL_STATE_UNAVAILABLE`, `BOUNDS_EXCEEDED`, `INVALID_ARGUMENTS`.
+`SNAPSHOT_CHANGED`, `CONTROL_STATE_UNAVAILABLE`, `SESSION_COUNT_NOT_20`,
+`SESSION_SEQUENCE_INVALID`, `BOUNDS_EXCEEDED`, `INVALID_ARGUMENTS`.
 
-Reason precedence MUST be deterministic: invalid arguments/path, snapshot/control unavailable,
-PIT/calendar, session sequence, version drift, lineage/integrity, calendar/universe, metrics,
-replication/restore, then bounded performance. The report retains all applicable metric failures
-in metric order even when the top-level status is unavailable.
+Reason precedence MUST be deterministic and exact, in this order: (1) `INVALID_ARGUMENTS`,
+`PATH_INVALID`; (2) `SNAPSHOT_CHANGED`, `CONTROL_STATE_UNAVAILABLE`; (3)
+`PIT_VISIBILITY_INVALID`; (4) `CALENDAR_UNAVAILABLE`, `CALENDAR_CONFLICT`; (5)
+`SESSION_SEQUENCE_INVALID`, `SESSION_COUNT_NOT_20`; (6) `VERSION_DRIFT`; (7)
+`LINEAGE_UNAVAILABLE`, `CANONICAL_INTEGRITY_FAILED`; (8) `UNIVERSE_UNKNOWN_NONZERO`,
+`UNIVERSE_COUNT_MISMATCH`; (9) per-session fields in this order: cutoff, `COVERAGE_FAILED`,
+`SOURCE_PURITY_FAILED`, `RECOVERY_FAILED`, `FAILOVER_UNAVAILABLE`, `LINEAGE_UNAVAILABLE`,
+`REPLAY_UNAVAILABLE`, `ADJUSTMENT_UNAVAILABLE`, `ERROR_HANDLING_FAILED`,
+  `LOCAL_NAS_ISOLATION_FAILED`, `REPLICATION_UNAVAILABLE`/`REPLICATION_LAG`,
+  `RESTORE_UNAVAILABLE`; (10) `BOUNDS_EXCEEDED`.
+The report retains all applicable metric failures in metric order even when top-level status is
+unavailable.
 
 ## Static compatibility inventory
 
@@ -455,6 +751,114 @@ The implementation MUST reuse and read, without widening authority, the existing
 `ReplicationStatusService`, completed `RestoreService` drill records, and the existing dataset
 manifest/pointer readers. It MUST preserve `read()` compatibility and MUST NOT add a provider,
 LaunchAgent, user-store read, canonical writer, NAS transport or new persistence schema.
+
+## R2-F5.0 metric contract and evidence sources
+
+The following table is normative. Every row is a separate `MetricResult` in the report and in every
+per-session observation where the dimension is session-scoped. The threshold is the roadmap target
+unless marked `R2-F4 policy`; a missing policy value is not a pass.
+
+| MetricResult field | Exact target/threshold | Required immutable evidence | Failure reason/test anchor |
+| --- | --- | --- | --- |
+| `continuity` | zero missing canonical dates in 20 selected sessions | raw calendar sequence + verified canonical session inventory | `CONTINUITY_FAILED` / `test_r2f5_continuity_metric` |
+| `next_morning_availability` | 20/20 by 08:00 Shanghai next civil day | immutable publication timestamps | `AVAILABILITY_CUTOFF_FAILED` / `test_r2f5_next_morning_metric` |
+| `same_evening_availability` | >=18/20 by 21:15 Shanghai session day | immutable publication timestamps | `AVAILABILITY_CUTOFF_FAILED` / `test_r2f5_same_evening_metric` |
+| `coverage` | 100% legal universe every session | exact universe snapshot + loaded count | `COVERAGE_FAILED` / `test_r2f5_coverage_metric` |
+| `canonical_integrity` | pointer, manifest, object hash and row/date identity reconcile each session | read-only dataset/pointer/manifest proof | `CANONICAL_INTEGRITY_FAILED` / `test_r2f5_canonical_pointer_manifest_hash_metric` |
+| `source_purity` | zero mixed-provider canonical partitions | per-partition provider identity | `SOURCE_PURITY_FAILED` / `test_r2f5_source_purity_metric` |
+| `recovery` | injected missing date queues across restart and publishes exactly once | immutable repair/recovery observation | `RECOVERY_FAILED` / `test_r2f5_recovery_metric` |
+| `failover` | forced primary failure publishes one qualified secondary whole session, zero mixed rows | secondary admission + immutable drill/readback | `FAILOVER_UNAVAILABLE` / `test_r2f5_failover_metric` |
+| `provenance` | every session traces raw evidence/provider/adapter/schema/time/hash/gate/selection | evidence/candidate/gate/selection lineage | `LINEAGE_UNAVAILABLE` / `test_r2f5_provenance_metric` |
+| `replay` | sampled raw evidence replays semantically identically offline | bounded immutable sample + offline identity | `REPLAY_UNAVAILABLE` / `test_r2f5_replay_metric` |
+| `adjustment` | declared cross-provider adjusted return tolerance passes; raw factor equality not required | reviewed R2-F4 reconciliation policy + factors | `ADJUSTMENT_UNAVAILABLE` / `test_r2f5_adjustment_metric` |
+| `calendar` | next-year warning/acquisition observable; unknown/conflict fails closed | promoted calendar generation/status evidence | `CALENDAR_UNAVAILABLE` / `test_r2f5_calendar_metric` |
+| `universe` | required/loaded/suspended/not-listed/delisted/unknown reconcile; unknown zero | exact-session universe snapshot | `UNIVERSE_COUNT_MISMATCH` / `test_r2f5_universe_metric` |
+| `error_handling` | timeout/auth/rate/schema/coverage/storage map to sanitized categories | immutable typed failure observations | `ERROR_HANDLING_FAILED` / `test_r2f5_error_handling_metric` |
+| `local_nas_isolation` | NAS outage leaves local ready and visible retryable backlog | local pointer + replication status/trust scope | `LOCAL_NAS_ISOLATION_FAILED` / `test_r2f5_local_nas_isolation_metric` |
+| `replication` | lag and destination verification satisfy frozen R2-F4 numeric policy | completed replication record with remote proof | `REPLICATION_LAG` / `test_r2f5_replication_metric` |
+| `restore` | verified generation restores/readbacks within frozen R2-F4 duration policy | completed immutable restore drill record | `RESTORE_UNAVAILABLE` / `test_r2f5_restore_metric` |
+
+`adjustment`, `replication` and `restore` have no guessed numeric tolerance in this slice. The
+reader MUST require a reviewed R2-F4 policy/evidence record carrying the exact value and version.
+R2-F4.3's current `LOCAL_CHAIN_ONLY` evidence is valid offline-chain evidence but cannot pass the
+remote/NAS acceptance dimension or establish Task 20 production readiness.
+
+## Secondary admission and failover evidence contract
+
+R2-F5.0 MUST add no `ProviderId`, canonical bar field, candidate schema or selection enum. It may
+define read-only domain models over retained records:
+
+```typescript
+interface SecondaryQualificationEvidenceV1 {
+  provider_id: string;
+  adapter_version: string;
+  endpoint_contract_version: string;
+  qualification_id: string;
+  qualification_sessions: number; // exactly 20
+  qualification_sha256: string;
+  terms_evidence_sha256: string;
+  admission_id: string;
+  admission_sha256: string;
+  status: "qualified" | "unqualified" | "unavailable";
+}
+
+interface WholeSessionFailoverDrillV1 {
+  drill_id: string;
+  trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
+  primary_unavailable: boolean;
+  secondary_qualified: boolean;
+  session: string;
+  selected_provider: string;
+  selected_candidate_sha256: string;
+  manifest_sha256: string;
+  pointer_sha256: string;
+  mixed_source_rows: number;
+  readback_verified: boolean;
+  drill_sha256: string;
+}
+```
+
+The strict reader MUST require immutable bytes, exact hashes, `qualification_sessions=20`,
+`secondary_qualified=true`, `REMOTE_VERIFIED` for a remote acceptance claim, and all pointer/
+manifest/selection identities to agree. Current absence, BaoStock-only, unqualified, or
+`LOCAL_CHAIN_ONLY` evidence MUST return `not_ready`/`unavailable` according to proof availability.
+
+## Replication and restore completed-record snapshot contract
+
+The acceptance reader consumes a `CompletedReplicationRestoreSnapshotV1` assembled from existing
+read-only status/record readers. It MUST contain `trust_scope`, `destination_generation`,
+`destination_head_sha256`, `remote_verification_sha256`, `replication_policy_version`,
+`restore_policy_version`, numeric `lag_threshold_seconds` and `restore_duration_threshold_seconds`
+from reviewed R2-F4 evidence, and immutable record hashes. It MUST reject a missing threshold,
+missing remote proof or `LOCAL_CHAIN_ONLY` when evaluating the remote target. It MUST use no
+`create=True`, writer, reconcile, drain, mount or restore execution path; an absent/locked/corrupt
+sidecar is unavailable, not an empty success.
+
+## Offline replay contract
+
+Replay takes `OfflineReplayContext { adapter_id, adapter_version, normalizer_id, normalizer_version,
+implementation_sha256, network_allowed: false, provider_requests: 0 }`. The implementation may
+invoke the frozen adapter/normalizer on immutable raw bytes for deterministic normalization, but
+MUST reject unknown/mismatched identity before construction. It MUST never call login/query,
+construct a default network-capable adapter, resolve credentials, open a provider socket or write
+replayed output. Deterministic normalization is allowed; provider/network side effects are not.
+
+## Snapshot identity, sequence and concurrency
+
+`SnapshotIdentity` is computed from requested start/end, an `as_of` UTC instant, the literal
+`Asia/Shanghai` cutoff contract, all input descriptor fingerprints, and the complete frozen version
+vector. Raw calendar observations retain source order and duplicate entries; the reader checks
+strict monotonic order before deriving sorted unique confirmed sessions. A duplicate/out-of-order
+raw sequence is `unavailable`, not a sortable warning. Every report returns the identity digest,
+the 20 ordered observation refs and each observation digest. If any descriptor, file bytes,
+database page, version, or bound clock changes before/during/after evaluation, the whole report is
+invalidated; the reader does not retry into a mixed snapshot.
+
+The semantic report payload consists only of SnapshotIdentity, frozen versions, selected sessions,
+per-session observations, metric results, quality issue codes and mutation markers. It is encoded
+as canonical UTF-8 JSON (sorted keys, compact separators, `ensure_ascii=false`, `allow_nan=false`)
+with a domain-separated SHA-256. `elapsed_ms`, read counts and replay counts are a separate
+diagnostic envelope and MUST NOT change the semantic payload bytes or digest.
 
 ## Production mutation gates
 

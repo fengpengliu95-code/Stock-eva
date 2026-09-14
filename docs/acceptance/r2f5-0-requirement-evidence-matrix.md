@@ -54,7 +54,7 @@ that AC parents are FR/NFR only, and that no result language is smuggled into th
 | AC-13 | Offline ready metadata still states production_window_started=false, Task20 pending and R2-F5.0 NO-GO | FR-18, NFR-10 | `PLANNED::test_r2f5_offline_ready_never_claims_task20_or_release2`, `PLANNED::test_r2f5_production_gates_are_false` | SPEC CANDIDATE; PLANNED |
 | AC-14 | Repeated identical captured bytes/clock give deterministic JSON, reason order and zero-write markers | FR-14, FR-17, NFR-3 | `PLANNED::test_r2f5_report_digest_and_reason_order_are_deterministic`, `PLANNED::test_r2f5_zero_provider_and_mutation_markers` | SPEC CANDIDATE; PLANNED |
 | EC-1 | 19 confirmed sessions returns SESSION_COUNT_NOT_20 without inference or padding | FR-5, FR-14 | `PLANNED::test_r2f5_rejects_19_21_duplicate_future_and_missing_middle` | SPEC CANDIDATE; PLANNED |
-| EC-2 | Duplicate/non-advancing or missing-middle dates return SESSION_SEQUENCE_INVALID | FR-5, FR-6 | `PLANNED::test_r2f5_rejects_19_21_duplicate_future_and_missing_middle` | SPEC CANDIDATE; PLANNED |
+| EC-2 | Duplicate/out-of-order raw dates return unavailable/SESSION_SEQUENCE_INVALID before sorted derivation | FR-5, FR-6 | `PLANNED::test_r2f5_rejects_19_21_duplicate_future_and_missing_middle` | SPEC CANDIDATE; PLANNED |
 | EC-3 | Future date rejects with PIT_VISIBILITY_INVALID after strict source proof | FR-5, FR-6 | `PLANNED::test_r2f5_future_date_is_not_visible` | SPEC CANDIDATE; PLANNED |
 | EC-4 | Unknown/conflicting calendar returns CALENDAR_UNAVAILABLE/CALENDAR_CONFLICT without guesses | FR-5, FR-12 | `PLANNED::test_r2f5_calendar_unknown_and_conflict_fail_closed` | SPEC CANDIDATE; PLANNED |
 | EC-5 | Universe unknown/count/index/generation mismatch prevents ready | FR-9, FR-12 | `PLANNED::test_r2f5_calendar_and_universe_gates_fail_closed` | SPEC CANDIDATE; PLANNED |
@@ -71,6 +71,63 @@ that AC parents are FR/NFR only, and that no result language is smuggled into th
 | EC-16 | Exception path/token/SQL/URL/provider text is reduced to allowlisted reason/detail | FR-14, NFR-6 | `PLANNED::test_r2f5_path_and_exception_redaction_is_stable` | SPEC CANDIDATE; PLANNED |
 | EC-17 | Object/row/sample/time bound stops safely and reports counters | FR-11, NFR-4, NFR-7 | `PLANNED::test_r2f5_bounded_replay_and_row_limits`, `PLANNED::test_r2f5_reference_fixture_reports_elapsed_within_bound` | SPEC CANDIDATE; PLANNED |
 | EC-18 | Malformed dates/missing args/disallowed overrides return 422/2 without filesystem/provider I/O | FR-15, FR-16, NFR-5 | `PLANNED::test_r2f5_cli_contract_and_exit_mapping`, `PLANNED::test_r2f5_api_invalid_arguments_are_zero_io` | SPEC CANDIDATE; PLANNED |
+| FR-19 | Expose separate MetricResult fields for all 17 roadmap SLO dimensions with observed value, target, status and reason | FR-9 | `PLANNED::test_r2f5_report_has_every_roadmap_slo_metric`, `PLANNED::test_r2f5_each_slo_threshold_is_explicit` | SPEC CANDIDATE; PLANNED |
+| FR-20 | Require immutable secondary qualification/admission hashes and failover proof; purity alone cannot pass | FR-10 | `PLANNED::test_r2f5_baostock_only_cannot_pass_failover`, `PLANNED::test_r2f5_failover_requires_qualified_whole_session_drill` | SPEC CANDIDATE; PLANNED |
+| FR-21 | Read replication/restore snapshots with trust scope, destination generation/head proof, remote verification and thresholds | FR-13 | `PLANNED::test_r2f5_replication_restore_reader_is_strictly_read_only` | SPEC CANDIDATE; PLANNED |
+| FR-22 | Replay only with injected frozen offline adapter/normalizer identity and zero provider/network construction | FR-11 | `PLANNED::test_r2f5_replay_uses_injected_offline_identity`, `PLANNED::test_r2f5_replay_rejects_unknown_identity_without_provider` | SPEC CANDIDATE; PLANNED |
+| FR-23 | Require complete non-null ready-time version vector and equality across all 20 observations | FR-7 | `PLANNED::test_r2f5_frozen_versions_are_complete_and_nonnull_when_ready` | SPEC CANDIDATE; PLANNED |
+| FR-24 | Preserve raw calendar order/duplicates and bind SnapshotIdentity to range, Shanghai clock, fingerprints and versions | FR-3, FR-5 | `PLANNED::test_r2f5_raw_calendar_order_and_duplicates_fail_closed`, `PLANNED::test_r2f5_snapshot_identity_binds_all_inputs_and_clock` | SPEC CANDIDATE; PLANNED |
+| FR-25 | Return exactly 20 ordered per-session observations or digest-bound references with independent evidence fields | FR-9 | `PLANNED::test_r2f5_per_session_observation_cardinality_and_order` | SPEC CANDIDATE; PLANNED |
+| FR-26 | Exclude elapsed/read/replay counters from semantic canonical JSON and digest | FR-16 | `PLANNED::test_r2f5_semantic_digest_excludes_volatile_envelope` | SPEC CANDIDATE; PLANNED |
+| FR-27 | Enforce closed enums/reasons, safe IDs/hashes, nonnegative bounds and bounded quality issues | FR-14 | `PLANNED::test_r2f5_report_types_are_closed_and_bounded` | SPEC CANDIDATE; PLANNED |
+| FR-28 | Enforce exact reason precedence and invalidate the whole report on concurrent snapshot change | FR-3, FR-6 | `PLANNED::test_r2f5_reason_precedence_is_exact`, `PLANNED::test_r2f5_snapshot_change_fails_closed` | SPEC CANDIDATE; PLANNED |
+| NFR-11 | Preserve roadmap continuity, availability, coverage and purity thresholds without invention or relaxation | FR-9 | `PLANNED::test_r2f5_each_slo_threshold_is_explicit` | SPEC CANDIDATE; PLANNED |
+| NFR-12 | Require reviewed R2-F4 numeric lag/duration thresholds; missing values or LOCAL_CHAIN_ONLY cannot pass remote | FR-13 | `PLANNED::test_r2f5_local_chain_only_cannot_satisfy_remote_acceptance` | SPEC CANDIDATE; PLANNED |
+| NFR-13 | Fail closed on any snapshot descriptor/content/version change and never mix retries | FR-3, FR-4 | `PLANNED::test_r2f5_snapshot_identity_rejects_changed_bound_fields` | SPEC CANDIDATE; PLANNED |
+| NFR-14 | Encode semantic report as canonical UTF-8 JSON with domain-separated SHA-256 and volatile envelope excluded | FR-16 | `PLANNED::test_r2f5_semantic_digest_excludes_volatile_envelope` | SPEC CANDIDATE; PLANNED |
+| NFR-15 | Keep API/CLI additive and predecessor response/schema contracts unchanged | FR-15, FR-16 | `PLANNED::test_r2f5_acceptance_surface_is_additive`, `PLANNED::test_r2f5_predecessor_payloads_are_byte_compatible` | SPEC CANDIDATE; PLANNED |
+| AC-15 | All 17 roadmap dimensions appear as independent MetricResult fields with explicit thresholds | FR-9, FR-19, NFR-11 | `PLANNED::test_r2f5_report_has_every_roadmap_slo_metric`, `PLANNED::test_r2f5_each_slo_threshold_is_explicit` | SPEC CANDIDATE; PLANNED |
+| AC-16 | BaoStock-only/no secondary/no whole-session drill cannot pass failover; qualified proof requires whole-session purity | FR-20, FR-21 | `PLANNED::test_r2f5_baostock_only_cannot_pass_failover`, `PLANNED::test_r2f5_failover_requires_qualified_whole_session_drill` | SPEC CANDIDATE; PLANNED |
+| AC-17 | LOCAL_CHAIN_ONLY/missing threshold or remote proof is unavailable/not_ready and starts no writer operation | FR-21, NFR-12, NFR-13 | `PLANNED::test_r2f5_local_chain_only_cannot_satisfy_remote_acceptance`, `PLANNED::test_r2f5_replication_restore_reader_is_strictly_read_only` | SPEC CANDIDATE; PLANNED |
+| AC-18 | Frozen offline replay identity permits deterministic normalization with zero provider/network; unknown identity rejects first | FR-22, NFR-13 | `PLANNED::test_r2f5_replay_uses_injected_offline_identity`, `PLANNED::test_r2f5_replay_rejects_unknown_identity_without_provider` | SPEC CANDIDATE; PLANNED |
+| AC-19 | Complete required frozen vector is non-null and equal across 20 observations | FR-23, NFR-14 | `PLANNED::test_r2f5_frozen_versions_are_complete_and_nonnull_when_ready`, `PLANNED::test_r2f5_version_vector_drift_is_unavailable` | SPEC CANDIDATE; PLANNED |
+| AC-20 | Raw duplicate/out-of-order calendar fails before sorting and SnapshotIdentity binds every input/clock/version | FR-24, FR-28, NFR-13 | `PLANNED::test_r2f5_raw_calendar_order_and_duplicates_fail_closed`, `PLANNED::test_r2f5_snapshot_identity_binds_all_inputs_and_clock` | SPEC CANDIDATE; PLANNED |
+| AC-21 | Candidate report contains exactly 20 ordered per-session observations/refs with independent metric evidence | FR-25, NFR-14 | `PLANNED::test_r2f5_per_session_observation_cardinality_and_order` | SPEC CANDIDATE; PLANNED |
+| AC-22 | Changing only elapsed/read/replay diagnostics leaves semantic JSON bytes and digest unchanged | FR-26, NFR-14 | `PLANNED::test_r2f5_semantic_digest_excludes_volatile_envelope` | SPEC CANDIDATE; PLANNED |
+| AC-23 | Invalid enum/reason/hash/ID/negative/oversized fields reject safely; additive predecessor contracts remain unchanged | FR-27, NFR-15 | `PLANNED::test_r2f5_report_types_are_closed_and_bounded`, `PLANNED::test_r2f5_acceptance_surface_is_additive` | SPEC CANDIDATE; PLANNED |
+| EC-19 | Missing SLO field or threshold returns unavailable and cannot infer pass from another dimension | FR-19, NFR-11 | `PLANNED::test_r2f5_missing_slo_metric_fails_closed` | SPEC CANDIDATE; PLANNED |
+| EC-20 | BaoStock-only/unqualified secondary returns failover not_ready/unavailable regardless of purity | FR-20 | `PLANNED::test_r2f5_baostock_only_cannot_pass_failover` | SPEC CANDIDATE; PLANNED |
+| EC-21 | Incomplete forced-failover proof cannot pass or mutate a pointer | FR-21 | `PLANNED::test_r2f5_failover_requires_qualified_whole_session_drill` | SPEC CANDIDATE; PLANNED |
+| EC-22 | LOCAL_CHAIN_ONLY or missing reviewed lag/duration policy cannot pass remote acceptance | FR-21, NFR-12 | `PLANNED::test_r2f5_local_chain_only_cannot_satisfy_remote_acceptance` | SPEC CANDIDATE; PLANNED |
+| EC-23 | Unknown/default network-capable replay identity is rejected before construction | FR-22 | `PLANNED::test_r2f5_replay_rejects_unknown_identity_without_provider` | SPEC CANDIDATE; PLANNED |
+| EC-24 | Missing RELEASE/dataset/admission/config/policy/calendar/universe/replication/restore identity rejects ready | FR-23, NFR-14 | `PLANNED::test_r2f5_frozen_versions_are_complete_and_nonnull_when_ready` | SPEC CANDIDATE; PLANNED |
+| EC-25 | Duplicate/out-of-order raw calendar remains unmodified and unavailable before sorted derivation | FR-24, FR-28 | `PLANNED::test_r2f5_raw_calendar_order_and_duplicates_fail_closed` | SPEC CANDIDATE; PLANNED |
+| EC-26 | Volatile diagnostics or absent identity/observation makes semantic report incomplete/non-deterministic | FR-25, FR-26, NFR-14 | `PLANNED::test_r2f5_semantic_digest_excludes_volatile_envelope`, `PLANNED::test_r2f5_per_session_observation_cardinality_and_order` | SPEC CANDIDATE; PLANNED |
+
+## Mandatory SLO crosswalk
+
+Each roadmap SLO has an independent report field, threshold source and planned anchor. These are
+not additional requirement IDs; FR-19/NFR-11 own the inventory contract.
+
+| Metric field | Exact target | Threshold source | Planned anchor |
+| --- | --- | --- | --- |
+| `continuity` | zero missing canonical dates in 20 sessions | roadmap Section 10 | `PLANNED::test_r2f5_continuity_metric` |
+| `next_morning_availability` | 20/20 by 08:00 Shanghai next day | roadmap Section 10 | `PLANNED::test_r2f5_next_morning_metric` |
+| `same_evening_availability` | at least 18/20 by 21:15 Shanghai | roadmap Section 10 | `PLANNED::test_r2f5_same_evening_metric` |
+| `coverage` | 100% legal universe each session | roadmap Section 10 | `PLANNED::test_r2f5_coverage_metric` |
+| `canonical_integrity` | pointer/manifest/object hashes reconcile every session | roadmap Section 10 | `PLANNED::test_r2f5_canonical_pointer_manifest_hash_metric` |
+| `source_purity` | zero mixed-provider canonical partitions | roadmap Section 10 | `PLANNED::test_r2f5_source_purity_metric` |
+| `recovery` | restart queue and exactly-once later publication | roadmap Section 10 | `PLANNED::test_r2f5_recovery_metric` |
+| `failover` | qualified secondary whole-session drill, zero mixed rows | roadmap Section 10 + R2-F4 evidence | `PLANNED::test_r2f5_failover_metric` |
+| `provenance` | complete raw/provider/version/hash/gate/selection lineage | roadmap Section 10 | `PLANNED::test_r2f5_provenance_metric` |
+| `replay` | bounded sample semantically identical offline | roadmap Section 10 | `PLANNED::test_r2f5_replay_metric` |
+| `adjustment` | declared adjusted-return tolerance | reviewed R2-F4 policy; missing is unavailable | `PLANNED::test_r2f5_adjustment_metric` |
+| `calendar` | warning/acquisition observable; unknown/conflict fail closed | roadmap Section 10 | `PLANNED::test_r2f5_calendar_metric` |
+| `universe` | required/loaded/suspension/listing counts reconcile; unknown zero | roadmap Section 10 | `PLANNED::test_r2f5_universe_metric` |
+| `error_handling` | timeout/auth/rate/schema/coverage/storage sanitized categories | roadmap Section 10 | `PLANNED::test_r2f5_error_handling_metric` |
+| `local_nas_isolation` | NAS outage leaves local ready and retryable backlog | roadmap Section 10 + R2-F4.3 | `PLANNED::test_r2f5_local_nas_isolation_metric` |
+| `replication` | lag/remote verification satisfy frozen R2-F4 numeric policy | reviewed R2-F4 policy; missing is unavailable | `PLANNED::test_r2f5_replication_metric` |
+| `restore` | restore/readback satisfies frozen R2-F4 duration policy | reviewed R2-F4 policy; missing is unavailable | `PLANNED::test_r2f5_restore_metric` |
 
 ## Crosswalk interpretation
 

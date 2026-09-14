@@ -49,6 +49,32 @@ design first and stop implementation until the reviewed specification is amended
 - FR-6: It MUST expose the exact report, API, CLI exits, mutation markers and redaction contract.
 - FR-7: It MUST stop at bounded object/row/sample/time limits and record measured counters.
 - FR-8: It MUST leave protected predecessor readers, schemas, fixtures and public models compatible.
+- FR-9: It MUST expose separate MetricResult fields for all 17 roadmap SLO dimensions, including
+  canonical integrity, recovery, failover, adjustment, error handling, local/NAS isolation,
+  replication and restore.
+- FR-10: It MUST require immutable secondary qualification/admission and whole-session failover
+  drill evidence; BaoStock-only or source-purity-only input cannot pass failover.
+- FR-11: It MUST read replication/restore completed records with trust scope, destination generation,
+  head proof, remote verification and frozen numeric thresholds; LOCAL_CHAIN_ONLY cannot pass remote.
+- FR-12: It MUST run replay only with injected frozen offline adapter/normalizer identity and zero
+  provider/network construction, login or query.
+- FR-13: It MUST require a complete non-null ready-time version vector and 20-session equality.
+- FR-14: It MUST preserve raw calendar order/duplicates, validate before sorted unique derivation,
+  and bind SnapshotIdentity to range, Shanghai clock, fingerprints and versions.
+- FR-15: It MUST return exactly 20 ordered per-session observations or immutable references/digests.
+- FR-16: It MUST exclude elapsed/counters from semantic report JSON/digest and use canonical JSON.
+- FR-17: It MUST enforce closed enums, reason codes, hashes, IDs, nonnegative bounds and quality issues.
+- FR-18: It MUST apply exact reason precedence and fail closed on concurrent snapshot change.
+- FR-19: It MUST expose separate MetricResult fields for all 17 roadmap SLO dimensions.
+- FR-20: It MUST require immutable secondary qualification/admission and whole-session failover proof.
+- FR-21: It MUST read replication/restore snapshots with trust scope, destination proof and frozen thresholds.
+- FR-22: It MUST run replay only with an injected frozen offline adapter/normalizer identity.
+- FR-23: It MUST require a complete non-null frozen version vector and 20-session equality.
+- FR-24: It MUST preserve raw calendar order/duplicates and bind SnapshotIdentity to all inputs.
+- FR-25: It MUST return exactly 20 ordered per-session observations or digest-bound references.
+- FR-26: It MUST exclude volatile diagnostics from semantic JSON and its digest.
+- FR-27: It MUST enforce closed enums, reasons, hashes, IDs, counters and quality issues.
+- FR-28: It MUST enforce exact reason precedence and fail closed on concurrent snapshot changes.
 
 ## Non-Functional Requirements
 
@@ -61,7 +87,16 @@ design first and stop implementation until the reviewed specification is amended
   or produce a bounded failure; this is not a production SLO.
 - NFR-5: Every requirement/criterion/edge case MUST have a planned unique test anchor in the
   matrix; planned anchors are not claimed as existing or passing until implementation.
-
+- NFR-6: All 17 SLO thresholds MUST be explicit and sourced from roadmap or reviewed R2-F4 evidence.
+- NFR-7: LOCAL_CHAIN_ONLY MUST be labeled offline-only and cannot satisfy remote/NAS/Task 20 acceptance.
+- NFR-8: Readers MUST NOT call create=True, writer, reconcile, drain, mount or restore paths.
+- NFR-9: Ready MUST require complete versions, exact 20 observations and valid SnapshotIdentity.
+- NFR-10: Public enums/IDs/hashes/reasons/counters MUST be extra-forbidden, bounded and deterministic.
+- NFR-11: All 17 SLO thresholds MUST be explicit and sourced from roadmap or reviewed R2-F4 evidence.
+- NFR-12: LOCAL_CHAIN_ONLY MUST be labeled offline-only and cannot satisfy remote/NAS/Task 20 acceptance.
+- NFR-13: Readers MUST NOT call create=True, writer, reconcile, drain, mount or restore paths.
+- NFR-14: Ready MUST require complete versions, exact 20 observations and valid SnapshotIdentity.
+- NFR-15: Public enums/IDs/hashes/reasons/counters MUST remain bounded and deterministic.
 ## Acceptance Criteria
 
 ### AC-1: Specification gate (FR-1, NFR-1, NFR-5)
@@ -94,10 +129,15 @@ future acceptance owner. This plan records no result now.
 
 Planned test anchors: `test_r2f5_protected_golden_objects_are_unchanged`.
 
+Traceability: the planned X2 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
+FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23,
+FR-24, FR-25, FR-26, FR-27 and FR-28.
+
 ## Edge Cases
 
 - EC-1: The implementation must preserve `unavailable` for missing/corrupt/locked control stores.
-- EC-2: It must reject 19, 21, duplicate and missing-middle sessions without padding.
+- EC-2: It must return unavailable for duplicate/out-of-order raw sessions and reject 19, 21 and
+  missing-middle sessions without padding.
 - EC-3: It must reject version drift and cutoff boundary failures deterministically.
 - EC-4: It must reject mixed-source, coverage, universe and lineage inconsistencies.
 - EC-5: It must reject unsafe/replaced/overlapping paths before enumeration.
@@ -119,6 +159,12 @@ interface R2FAcceptanceReader {
 }
 ```
 
+The report contract includes all 17 SLO `MetricResult` fields, `SnapshotIdentity`, a complete
+`FrozenReliabilityVersions`, exactly 20 ordered session observations/references and a separate
+volatile diagnostic envelope. Secondary qualification/admission, whole-session failover drill and
+completed replication/restore readers are strict read-only adapters over existing immutable
+records; they do not widen `ProviderId` or persisted schemas.
+
 ## Data Models
 
 The implementation MUST use the design's `MetricResult`, `FrozenReliabilityVersions`,
@@ -131,8 +177,117 @@ No persistence migration or new writer-owned database is permitted.
 | `FrozenReliabilityVersions` | provider/adapter/policy/schema/calendar/universe/replication/restore IDs | exact equality across selected sessions |
 | `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only |
 | `R2FAcceptanceReport` | status, metrics, markers, counters | no provider requests/writes; no production claim |
+| `SnapshotIdentity` | requested range, Shanghai as-of, fingerprints, version digest | all evaluation reads bind to one identity |
+| `SecondaryQualificationEvidenceV1` | qualification/admission IDs and hashes | missing/unqualified is not_ready/unavailable |
+| `CompletedReplicationRestoreSnapshotV1` | trust scope, destination generation/head/remote proofs, thresholds | LOCAL_CHAIN_ONLY cannot pass remote; no writer/reconcile paths |
+| `OfflineReplayContext` | frozen adapter/normalizer IDs and implementation hash | network false, provider requests zero |
 
 ## Planned implementation tasks
+
+## X2 normative requirement mirror
+
+The design is the full semantic authority. This mirror keeps every X2 ID explicit in the plan so
+the crosswalk validator can detect omissions or duplicate definitions; it is not implementation
+evidence.
+
+### X2 acceptance criteria
+
+### AC-5: Complete SLO metric inventory (FR-9, NFR-6)
+
+Given a report, when it is serialized, then all 17 SLO MetricResult fields and exact thresholds are present.
+
+### AC-6: Secondary qualification/failover (FR-10, NFR-7)
+
+Given BaoStock-only or absent drill evidence, when evaluated, then failover is not_ready/unavailable.
+
+### AC-7: Replication/restore trust (FR-11, NFR-6, NFR-7, NFR-8)
+
+Given LOCAL_CHAIN_ONLY or missing numeric policy, when evaluated, then remote metrics cannot pass and no writer path runs.
+
+### AC-8: Offline replay identity (FR-12, NFR-8)
+
+Given a frozen offline identity, when replay runs, then normalization is deterministic and provider requests are zero.
+
+### AC-9: Complete versions (FR-13, NFR-9)
+
+Given 20 observations, when versions are frozen, then all required identities are non-null and equal.
+
+### AC-10: Sequence and SnapshotIdentity (FR-14, FR-15, FR-18, NFR-9)
+
+Given raw calendar observations, when duplicate/order or fingerprint drift occurs, then evaluation is unavailable.
+
+### AC-11: Semantic determinism (FR-16, NFR-10)
+
+Given identical snapshot bytes, when diagnostics vary, then semantic JSON/digest remains byte-identical.
+
+### AC-12: Closed bounded types (FR-17, NFR-9)
+
+Given an invalid enum/hash/ID/negative bound, when validation runs, then the report is rejected safely.
+
+### AC-13: Additive compatibility (NFR-1, NFR-10)
+
+Given predecessor API/schema fixtures, when the acceptance surface is evaluated, then their bytes and contracts remain unchanged.
+
+### AC-14: Deterministic/sanitized errors (FR-6, FR-28, NFR-3, NFR-15)
+
+Given repeated identical snapshots or invalid input, when evaluation runs, then reason order and redacted output are stable.
+
+### AC-15: Complete SLO inventory (FR-9, NFR-11)
+
+Given a report, when serialized, then every one of the 17 roadmap SLO dimensions has a separate MetricResult and threshold.
+
+### AC-16: Secondary/failover gate (FR-10, FR-20, NFR-12)
+
+Given no qualified secondary or no whole-session drill, when evaluated, then failover cannot pass.
+
+### AC-17: Remote replication/restore proof (FR-11, FR-21, NFR-12, NFR-13)
+
+Given LOCAL_CHAIN_ONLY or missing frozen policy values, when evaluated, then remote metrics are unavailable/not_ready and no writer path runs.
+
+### AC-18: Offline replay proof (FR-12, FR-22, NFR-13)
+
+Given a frozen offline identity, when replay runs, then it performs zero provider/network calls; unknown identity is rejected first.
+
+### AC-19: Complete frozen versions (FR-13, FR-23, NFR-14)
+
+Given 20 observations, when versions are frozen, then every required identity is non-null and equal.
+
+### AC-20: Raw sequence and SnapshotIdentity (FR-14, FR-24, FR-28, NFR-13)
+
+Given raw calendar order or a concurrent fingerprint change, when evaluated, then duplicate/out-of-order or changed snapshots are unavailable.
+
+### AC-21: Per-session cardinality (FR-15, FR-25, NFR-14)
+
+Given a candidate window, when serialized, then exactly 20 ordered observations/refs independently cover the required fields.
+
+### AC-22: Semantic digest isolation (FR-16, FR-26, NFR-10)
+
+Given only elapsed/counter changes, when report envelopes are compared, then semantic JSON/digest is byte-identical.
+
+### AC-23: Closed/bounded types (FR-17, FR-27, NFR-15)
+
+Given invalid enum/hash/ID/negative/oversized values, when validation runs, then the report is rejected safely.
+
+### X2 edge cases
+
+- EC-9: Missing SLO field or threshold is unavailable and never inferred from another metric.
+- EC-10: BaoStock-only/unqualified secondary cannot pass failover.
+- EC-11: Incomplete forced-failover proof cannot pass or mutate a pointer.
+- EC-12: LOCAL_CHAIN_ONLY or missing lag/duration policy cannot pass remote acceptance.
+- EC-13: Unknown/default network-capable replay identity is rejected before construction.
+- EC-14: Missing any required frozen version rejects ready.
+- EC-15: Duplicate/out-of-order raw calendar is unavailable before sorting.
+- EC-16: Volatile diagnostics in semantic payload are rejected or excluded from digest.
+- EC-17: Any concurrent descriptor/content change invalidates the whole snapshot.
+- EC-18: Invalid enum/reason/hash/ID/quality issue/counter is bounded and sanitized.
+- EC-19: A missing SLO field or threshold is unavailable and never inferred.
+- EC-20: BaoStock-only/unqualified secondary cannot pass failover.
+- EC-21: Incomplete forced-failover proof cannot pass or mutate a pointer.
+- EC-22: LOCAL_CHAIN_ONLY or missing lag/duration policy cannot pass remote acceptance.
+- EC-23: Unknown/default network-capable replay identity is rejected before construction.
+- EC-24: Missing frozen RELEASE/dataset/admission/config/policy/calendar/universe/replication/restore identity rejects ready.
+- EC-25: Duplicate/out-of-order raw calendar is unavailable before sorting.
+- EC-26: Volatile diagnostics or missing identity/observation makes the semantic report incomplete.
 
 ### Task 0 — Review and validator (SPEC-FIRST; current task)
 
@@ -152,9 +307,13 @@ Files planned:
 - Modify `docs/runbooks/market-data-reliability.md` only if that runbook exists or is explicitly
   approved as a new documentation path.
 
-Write failing tests for exact 20/19/21/middle gap, cutoffs, frozen versions/drift, lineage,
-coverage/source purity, calendar/universe, replication/restore evidence, missing/corrupt/locked
-inputs, path/redaction, fingerprints, API/CLI parity and zero provider/write markers.
+Write failing tests for exact 20/19/21/middle gap, raw duplicate/order preservation, cutoffs, the
+complete frozen vector and drift, SnapshotIdentity/concurrency, lineage, coverage/source purity,
+canonical pointer/manifest/hash, recovery, secondary qualification/admission and whole-session
+failover, calendar/universe, error handling, local/NAS isolation, replication/restore evidence,
+missing/corrupt/locked inputs, path/redaction, fingerprints, API/CLI parity, semantic digest
+isolation, bounded types and zero provider/write markers. Path tests MUST permit only lstat/open
+no-follow descriptor probes before enumeration/content reads.
 
 Run RED, with no network or production roots:
 
@@ -171,7 +330,10 @@ a test failure, not a tolerated RED condition.
 
 Implement the minimum Pydantic models and pure evaluator from the design. Reuse strict readers;
 open existing SQLite stores read-only; capture descriptors and fingerprints; enforce every bound,
-hash and reason precedence. Do not add schema migration, persistence or writer seams.
+hash and reason precedence. Add strict immutable qualification/admission, failover-drill and
+replication/restore completed-record snapshot readers. Replay may invoke only an injected offline
+adapter/normalizer on immutable bytes; reject unknown identity before construction. Do not add
+schema migration, persistence, writer, reconcile, drain, mount or restore-execution seams.
 
 ### Task 3 — Metrics, replay and status wiring
 
