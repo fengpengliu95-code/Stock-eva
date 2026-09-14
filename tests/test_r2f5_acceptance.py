@@ -1204,6 +1204,7 @@ class GoldenTree:
     snapshot_identity: dict[str, Any]
     fingerprint_sources: list[dict[str, Any]]
     leaf_files: dict[str, tuple[Path, Path]] = field(default_factory=dict)
+    container_descriptors: dict[str, dict[str, Any]] = field(default_factory=dict)
     validation_stats: ValidationStats = field(default_factory=ValidationStats)
 
     def roots(self) -> tuple[Path, ...]:
@@ -2227,6 +2228,56 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
         fingerprint, subject = _fingerprint(public_role, path)
         input_fingerprints.append(fingerprint)
         fingerprint_sources.append(subject)
+    request = {
+        "start": sessions[0],
+        "end": sessions[-1],
+        "local_dataset_root": str(dataset),
+        "evidence_root": str(evidence),
+        "control_store_roots": [str(controls[role]) for role in CATALOGS],
+        "now": "2026-09-14T06:00:00Z",
+    }
+    # Construct the fixture object before snapshot identity so every
+    # input-materialized descriptor exists in the evidence tree that is
+    # fingerprinted.  No test is allowed to add descriptors after this point.
+    golden = GoldenTree(
+        request=request,
+        dataset=dataset,
+        evidence=evidence,
+        control=control,
+        controls=controls,
+        sessions=sessions,
+        frozen_versions=frozen,
+        frozen_sources=frozen_sources,
+        session_fixtures=session_fixtures,
+        window_envelope=window,
+        window_sources=window_sources,
+        qualification_projection=qualification_projection,
+        completed_replication_restore=completed_replication_restore,
+        completed_sources=completed_sources,
+        snapshot_identity={},
+        fingerprint_sources=fingerprint_sources,
+        leaf_files=leaf_files,
+    )
+    golden._allow_descriptor_materialization = True
+    for field_path, case in CONTRACT_CONSUMER_CASES.items():
+        if case.category == "input_materialized" and field_path not in leaf_files:
+            _materialized_contract_descriptor(golden, field_path)
+    golden._allow_descriptor_materialization = False
+
+    # Descriptor files are now part of the evidence tree; freeze fingerprints
+    # only after their creation and never rewrite the input roots later.
+    input_fingerprints = []
+    fingerprint_sources = []
+    for role, path in (("dataset", dataset), ("evidence", evidence)):
+        fingerprint, subject = _fingerprint(role, path)
+        input_fingerprints.append(fingerprint)
+        fingerprint_sources.append(subject)
+    for role, path in controls.items():
+        public_role = CATALOGS[role]["role"]
+        fingerprint, subject = _fingerprint(public_role, path)
+        input_fingerprints.append(fingerprint)
+        fingerprint_sources.append(subject)
+    golden.fingerprint_sources = fingerprint_sources
     snapshot = {
         "requested_start": sessions[0],
         "requested_end": sessions[-1],
@@ -2246,33 +2297,7 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
     )
     snapshot["snapshot_sha256"] = _digest("SnapshotIdentity.snapshot_sha256", snapshot)
     _write_json(evidence / "snapshot_identity.json", snapshot)
-    request = {
-        "start": sessions[0],
-        "end": sessions[-1],
-        "local_dataset_root": str(dataset),
-        "evidence_root": str(evidence),
-        "control_store_roots": [str(controls[role]) for role in CATALOGS],
-        "now": "2026-09-14T06:00:00Z",
-    }
-    golden = GoldenTree(
-        request=request,
-        dataset=dataset,
-        evidence=evidence,
-        control=control,
-        controls=controls,
-        sessions=sessions,
-        frozen_versions=frozen,
-        frozen_sources=frozen_sources,
-        session_fixtures=session_fixtures,
-        window_envelope=window,
-        window_sources=window_sources,
-        qualification_projection=qualification_projection,
-        completed_replication_restore=completed_replication_restore,
-        completed_sources=completed_sources,
-        snapshot_identity=snapshot,
-        fingerprint_sources=fingerprint_sources,
-        leaf_files=leaf_files,
-    )
+    golden.snapshot_identity = snapshot
     golden.validation_stats = _validate_golden(golden)
     return golden
 
@@ -2880,9 +2905,11 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
     the target contract digest stale.
     """
 
-    cached = getattr(golden, "_container_descriptors", {})
+    cached = golden.container_descriptors
     if field_path in cached:
         return cached[field_path]
+    if not getattr(golden, "_allow_descriptor_materialization", False):
+        raise AssertionError(f"input descriptor was not prebuilt: {field_path}")
     session_path = golden.dataset / "sessions" / f"{golden.sessions[0]}.json"
     if field_path.startswith("ImmutableObservationEnvelopeV1."):
         container, pointer = golden.evidence / "window.json", "$"
@@ -2995,6 +3022,7 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
         "schema_version": "r2f5-immutable-leaf-descriptor-v1",
         "canonicalization_version": "project-canonical-json-v1",
         "object_path": object_path.relative_to(golden.evidence).as_posix(),
+        "descriptor_path": descriptor_path.relative_to(golden.evidence).as_posix(),
         "root_path": container.relative_to(
             golden.dataset if container.is_relative_to(golden.dataset) else golden.evidence
         ).as_posix(),
@@ -3012,7 +3040,6 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
         "__evidence_root": golden.evidence,
         "__root_base": golden.dataset if descriptor["root_base"] == "dataset" else golden.evidence,
     }
-    golden._container_descriptors = cached
     return cached[field_path]
 
 
@@ -4676,7 +4703,7 @@ def _run_behavior_case(
     capsys: Any,
 ) -> None:
     request = _apply_mutation(golden, case.mutation)
-    before = tuple(_physical_fingerprint(root) for root in golden.roots())
+    before = tuple(_physical_fingerprint(root) for root in (golden.dataset, golden.evidence))
     if case.mode == "api":
         response = _api_get(golden, request)
         expected_http = (
@@ -4791,6 +4818,7 @@ class ContractConsumerCase:
     category: str
     root_object_type: str
     output_family: str
+    array_indices: tuple[int, ...] = ()
 
 
 _OUTPUT_DERIVED_ROOTS = frozenset(
@@ -4830,6 +4858,16 @@ def _contract_owner_metric(field_path: str) -> str:
     return "canonical_integrity"
 
 
+def _contract_array_indices(field_path: str) -> tuple[int, ...]:
+    if field_path.startswith("SessionObservation."):
+        return (0, 19)
+    if field_path == "ErrorHandlingObservation.events.evidence_sha256":
+        return (0, 5)
+    if field_path == "SnapshotFingerprint.sha256":
+        return (0, 6)
+    return ()
+
+
 CONTRACT_CONSUMER_CASES = {
     field_path: ContractConsumerCase(
         field_path=field_path,
@@ -4840,6 +4878,7 @@ CONTRACT_CONSUMER_CASES = {
         ),
         root_object_type=contract["root_object_type"],
         output_family=_contract_owner_metric(field_path),
+        array_indices=_contract_array_indices(field_path),
     )
     for field_path, contract in DIGESTS.items()
 }
@@ -4906,10 +4945,37 @@ SLO_CONTRACTS = _approved_slo_contracts()
 _CANONICAL_INTEGRITY_REASON = next(
     reason for reason in REASON_PARTITIONS["failure"] if "CANONICAL" in reason
 )
-CONTRACT_FIRST_BROKEN_REASON = {
-    field_path: _CANONICAL_INTEGRITY_REASON
+_DIGEST_REASON_BY_ROOT_METRIC = {
+    "CalendarRawFacts": "CALENDAR_UNAVAILABLE",
+    "ReadBoundaryRawFacts": "READ_BOUNDARY_FAILED",
+    "ErrorHandlingObservation": "ERROR_HANDLING_FAILED",
+    "RecoveryObservation": "RECOVERY_FAILED",
+    "LocalNasIsolationObservation": "LOCAL_NAS_ISOLATION_FAILED",
+    "WholeSessionFailoverDrill": "FAILOVER_UNAVAILABLE",
+    "ReplaySampleEvidence": "REPLAY_UNAVAILABLE",
+    "OfflineReplayContext": "REPLAY_UNAVAILABLE",
+    "RestoreDrillEvidence": "RESTORE_UNAVAILABLE",
+    "CompletedReplicationRestoreSnapshotV1": "REPLICATION_UNAVAILABLE",
+    "ReplicationObservation": "REPLICATION_UNAVAILABLE",
+    "FrozenReliabilityVersions": "VERSION_DRIFT",
+    "SnapshotFingerprint": "SNAPSHOT_CHANGED",
+}
+
+
+def _digest_failure_reason(field_path: str) -> str:
+    root = field_path.split(".", 1)[0]
+    if root in _DIGEST_REASON_BY_ROOT_METRIC:
+        return _DIGEST_REASON_BY_ROOT_METRIC[root]
+    return _CANONICAL_INTEGRITY_REASON
+
+
+CONTRACT_REASON_CROSSWALK = {
+    field_path: _digest_failure_reason(field_path)
     for field_path, case in CONTRACT_CONSUMER_CASES.items()
     if case.category == "input_materialized"
+}
+CONTRACT_FIRST_BROKEN_REASON = {
+    field_path: reason for field_path, reason in CONTRACT_REASON_CROSSWALK.items()
 }
 _SLO_FAILURE_MUTATIONS = {
     "continuity": "continuity_gap",
@@ -5256,6 +5322,25 @@ def test_r2f5_contract_consumer_classification_is_exactly_one_of_two() -> None:
     assert set(CATALOGS) == set(_CATALOG_DDL) == set(_CATALOG_FILENAMES)
 
 
+def test_r2f5_digest_reason_crosswalk_is_exact_and_approved() -> None:
+    assert set(CONTRACT_REASON_CROSSWALK) == {
+        field_path
+        for field_path, case in CONTRACT_CONSUMER_CASES.items()
+        if case.category == "input_materialized"
+    }
+    assert set(CONTRACT_REASON_CROSSWALK.values()) <= REASONS
+    assert len(set(CONTRACT_REASON_CROSSWALK.values())) >= 8
+    assert CONTRACT_REASON_CROSSWALK["CalendarRawFacts.raw_facts_sha256"] == (
+        "CALENDAR_UNAVAILABLE"
+    )
+    assert CONTRACT_REASON_CROSSWALK["ReadBoundaryRawFacts.probe_schema_digest"] == (
+        "READ_BOUNDARY_FAILED"
+    )
+    assert CONTRACT_REASON_CROSSWALK["ReplicationObservation.observation_sha256"] == (
+        "REPLICATION_UNAVAILABLE"
+    )
+
+
 def test_r2f5_input_contracts_have_disk_container_descriptor(golden: GoldenTree) -> None:
     input_cases = {
         field_path: case
@@ -5269,6 +5354,35 @@ def test_r2f5_input_contracts_have_disk_container_descriptor(golden: GoldenTree)
         assert descriptor["root_object_type"] == DIGESTS[field_path]["root_object_type"]
         assert descriptor["immutable"] is True
         assert descriptor["object_path"]
+
+
+def test_r2f5_descriptors_are_prebuilt_before_fingerprint_and_never_added_at_runtime(
+    golden: GoldenTree,
+) -> None:
+    assert len(golden.container_descriptors) == 17
+    before = tuple(_physical_fingerprint(root) for root in (golden.dataset, golden.evidence))
+    first = tuple(
+        _fingerprint(role, path)[0]
+        for role, path in (
+            [("dataset", golden.dataset), ("evidence", golden.evidence)]
+            + [(CATALOGS[role]["role"], path) for role, path in golden.controls.items()]
+        )
+    )
+    second = tuple(
+        _fingerprint(role, path)[0]
+        for role, path in (
+            [("dataset", golden.dataset), ("evidence", golden.evidence)]
+            + [(CATALOGS[role]["role"], path) for role, path in golden.controls.items()]
+        )
+    )
+    assert first == second
+    for field_path, descriptor in golden.container_descriptors.items():
+        assert descriptor["descriptor_path"]
+        assert (golden.evidence / descriptor["descriptor_path"]).is_file()
+        assert _materialized_contract_descriptor(golden, field_path) is descriptor
+    assert (
+        tuple(_physical_fingerprint(root) for root in (golden.dataset, golden.evidence)) == before
+    )
 
 
 def test_r2f5_hardcoded_vectors_bind_public_payload_and_snapshot(golden: GoldenTree) -> None:
@@ -5729,6 +5843,59 @@ def _output_derived_literal(field_path: str, golden: GoldenTree) -> tuple[Any, s
     return root, _digest(field_path, root)
 
 
+@pytest.mark.parametrize(
+    "field_path",
+    tuple(
+        field_path
+        for field_path, case in CONTRACT_CONSUMER_CASES.items()
+        if case.category == "output_derived"
+    ),
+)
+def test_r2f5_output_contracts_call_future_pure_seam_and_kill_wrong_domain(
+    golden: GoldenTree, field_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output roots must be validated by the future module, never test-only helpers."""
+
+    module = _red_reader()
+    if field_path.startswith("SnapshotIdentity."):
+        seam_name = "_compute_snapshot_identity_sha256"
+    elif field_path == "R2FAcceptanceReport.semantic_report_sha256":
+        seam_name = "_compute_semantic_report_sha256"
+    else:
+        seam_name = "_compute_pre_capture_failure_sha256"
+    seam = getattr(module, seam_name)
+    model, oracle_before = _output_derived_literal(field_path, golden)
+    pure_before = seam(model)
+    if field_path.startswith("SnapshotIdentity."):
+        assert pure_before == _digest("SnapshotIdentity.snapshot_sha256", model)
+    else:
+        assert pure_before == oracle_before
+
+    service_report = _evaluate(golden.request)
+    public_pointers = _resolve_contract_paths(service_report, field_path)
+    for public_pointer in public_pointers:
+        assert _read_public_pointer(service_report, public_pointer) == oracle_before
+
+    mutated = deepcopy(model)
+    candidate = next(
+        path
+        for path in DIGESTS[field_path]["included_field_paths"]
+        if path not in DIGESTS[field_path]["excluded_fields"]
+    )
+    mutated[candidate] = _mutated_value(mutated[candidate])
+    oracle_after = _digest(field_path, mutated)
+    assert oracle_after != oracle_before
+    pure_after = seam(mutated)
+    assert pure_after != pure_before
+
+    def wrong(_model: dict[str, Any]) -> str:
+        return "0" * 64
+
+    monkeypatch.setattr(module, seam_name, wrong)
+    with pytest.raises(AssertionError):
+        assert getattr(module, seam_name)(model) == pure_before
+
+
 def _read_public_pointer(document: dict[str, Any], pointer: str) -> Any:
     value: Any = document
     for component in pointer.removeprefix("$").lstrip(".").split("."):
@@ -5741,9 +5908,63 @@ def _read_public_pointer(document: dict[str, Any], pointer: str) -> Any:
     return value
 
 
+def _read_indexed_pointer(document: dict[str, Any], pointer: str, indices: tuple[int, ...]) -> Any:
+    value: Any = document
+    array_number = 0
+    for component in pointer.removeprefix("$").lstrip(".").split("."):
+        if not component:
+            continue
+        if component.endswith("[]"):
+            value = value[component[:-2]][indices[array_number]]
+            array_number += 1
+        else:
+            value = value[component]
+    return value
+
+
+def test_r2f5_contract_array_resolver_uses_declared_first_and_last_indices(
+    golden: GoldenTree,
+) -> None:
+    session_case = CONTRACT_CONSUMER_CASES["SessionObservation.observation_sha256"]
+    sessions = [fixture.observation for fixture in golden.session_fixtures]
+    assert session_case.array_indices == (0, 19)
+    session_document = {"sessions": sessions}
+    assert (
+        _read_indexed_pointer(session_document, "$.sessions[]", (0,))["session"]
+        == golden.sessions[0]
+    )
+    assert (
+        _read_indexed_pointer(session_document, "$.sessions[]", (19,))["session"]
+        == golden.sessions[-1]
+    )
+
+    error_case = CONTRACT_CONSUMER_CASES["ErrorHandlingObservation.events.evidence_sha256"]
+    window = _read_json(golden.evidence / "window.json")
+    events = window["payload"]["error_handling_observation"]["payload"]["events"]
+    assert error_case.array_indices == (0, 5)
+    assert (
+        _read_indexed_pointer({"events": events}, "$.events[]", (0,))["event_id"] == "error-timeout"
+    )
+    assert (
+        _read_indexed_pointer({"events": events}, "$.events[]", (5,))["event_id"] == "error-storage"
+    )
+
+    fingerprint_case = CONTRACT_CONSUMER_CASES["SnapshotFingerprint.sha256"]
+    fingerprints = golden.snapshot_identity["input_fingerprints"]
+    assert fingerprint_case.array_indices == (0, 6)
+    assert (
+        _read_indexed_pointer({"items": fingerprints}, "$.items[]", (0,))["descriptor_role"]
+        == "dataset"
+    )
+    assert (
+        _read_indexed_pointer({"items": fingerprints}, "$.items[]", (6,))["descriptor_role"]
+        == "universe"
+    )
+
+
 @pytest.mark.parametrize("field_path", tuple(DIGESTS))
 def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
-    golden: GoldenTree, field_path: str
+    golden: GoldenTree, field_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Each contract is exercised through a concrete disk/public binding."""
 
@@ -5769,13 +5990,28 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     else:
         root, expected = _output_derived_literal(field_path, golden)
         object_bytes = _canonical_json(root)
-    baseline_report = _evaluate(golden.request)
-    pointers = _resolve_contract_paths(baseline_report, field_path)
-    pointer = pointers[0] if pointers else None
     # The approved future seam consumes the actual model/root and its disk
     # descriptor bytes; a callable-only/no-op implementation is insufficient.
     module = _red_reader()
     validator = getattr(module, "validate_canonical_digest", None)
+    assert callable(validator)
+    validator_calls: list[tuple[str, str, str | None]] = []
+    original_validator = validator
+
+    def validator_spy(*args: Any, **kwargs: Any) -> Any:
+        root_type = kwargs.get("root_object_type", args[0] if args else "")
+        qualified = kwargs.get("field_path", args[1] if len(args) > 1 else "")
+        descriptor_arg = kwargs.get("descriptor")
+        descriptor_ref = (
+            descriptor_arg.get("object_path") if isinstance(descriptor_arg, dict) else None
+        )
+        validator_calls.append((root_type, qualified, descriptor_ref))
+        return original_validator(*args, **kwargs)
+
+    monkeypatch.setattr(module, "validate_canonical_digest", validator_spy)
+    baseline_report = _evaluate(golden.request)
+    pointers = _resolve_contract_paths(baseline_report, field_path)
+    pointer = pointers[0] if pointers else None
     baseline = validator(
         root_object_type=DIGESTS[field_path]["root_object_type"],
         field_path=field_path,
@@ -5786,6 +6022,8 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     assert baseline["valid"] is True
     assert baseline["computed_digest"] == expected
     assert baseline["reason_code"] is None
+    if case.category == "input_materialized":
+        assert any(call[1] == field_path for call in validator_calls)
     if pointer is not None:
         assert _read_public_pointer(baseline_report, pointer) == expected
     # Output-only contracts are consumed by their pure internal seam; their
