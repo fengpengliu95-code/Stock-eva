@@ -2192,12 +2192,22 @@ def test_r2f5_acceptance_api_is_additive_red_and_write_free(tmp_path: Path) -> N
     )
     assert response.status_code in {200, 503}, "R2-F5 acceptance API contract is not wired"
     assert str(tmp_path) not in response.text
-    if response.status_code == 200:
-        payload = response.json()
-        assert payload["provider_requests"] == 0
-        assert payload["writes"] is False
-        assert payload["restore_started"] is False
-        assert payload["production_window_started"] is False
+    payload = response.json()
+    assert payload["status"] in {"ready", "not_ready", "unavailable"}
+    assert {
+        "status",
+        "provider_requests",
+        "writes",
+        "restore_started",
+        "production_window_started",
+    } <= payload.keys()
+    assert all(token not in response.text for token in ("SELECT ", "sqlite", "baostock", "http://"))
+    assert payload["provider_requests"] == 0
+    assert payload["writes"] is False
+    assert payload["restore_started"] is False
+    assert payload["production_window_started"] is False
+    if response.status_code == 503:
+        assert payload["pre_capture_failure"]["reason_code"] == "CONTROL_STATE_UNAVAILABLE"
     assert _tree(tmp_path) == before
 
 
@@ -2225,9 +2235,55 @@ def test_r2f5_acceptance_cli_is_additive_red_and_has_no_execute(
     output = capsys.readouterr().out
     assert exit_code in {0, 1}, "r2f-acceptance CLI is not wired"
     payload = json.loads(output)
+    assert payload["status"] in {"ready", "not_ready", "unavailable"}
+    assert {
+        "status",
+        "provider_requests",
+        "writes",
+        "restore_started",
+        "production_window_started",
+    } <= payload.keys()
     assert payload["provider_requests"] == 0
     assert payload["writes"] is False
+    assert payload["restore_started"] is False
+    assert payload["production_window_started"] is False
     with pytest.raises(cli_module._CliArgumentError):
         cli_module.build_parser().parse_args(
             ["r2f-acceptance", "--start", "2026-08-03", "--end", "2026-08-28", "--execute"]
         )
+
+
+def test_r2f5_acceptance_api_invalid_date_is_422_without_io(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        local_market_dataset_root=tmp_path / "dataset",
+        provider_shadow_root=tmp_path / "shadow",
+    )
+    before = _tree(tmp_path)
+    response = _api_get(
+        "/api/v1/market/reliability-acceptance?start=not-a-date&end=2026-08-28",
+        settings,
+        raise_app_exceptions=False,
+    )
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["status"] == "unavailable"
+    assert payload["reason_code"] == "INVALID_ARGUMENTS"
+    assert str(tmp_path) not in response.text
+    assert _tree(tmp_path) == before
+
+
+def test_r2f5_acceptance_cli_invalid_date_has_exact_exit_two(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stock-eva", "r2f-acceptance", "--start", "not-a-date", "--end", "2026-08-28"],
+    )
+    assert cli_module.main() == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "error_code": "invalid_cli_arguments",
+        "status": "error",
+        "writes_data": False,
+    }
