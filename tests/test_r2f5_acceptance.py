@@ -1670,7 +1670,7 @@ def _build_window(sessions: list[str]) -> tuple[dict[str, Any], dict[str, dict[s
             "event_id": f"error-{forced_class}",
             "forced_error_class": forced_class,
             "sanitized_reason": "CONTROL_STATE_UNAVAILABLE",
-            "normalized_result": "unavailable",
+            "normalized_result": "not_ready" if forced_class == "timeout" else "unavailable",
             "attempt_id": f"attempt-{forced_class}",
             "expected_class": forced_class,
             "observed_class": forced_class,
@@ -2549,13 +2549,14 @@ def _validate_window(
     for event, forced_class in zip(events, expected_classes, strict=True):
         assert set(event) == tuple_fields
         assert event["expected_class"] == event["forced_error_class"] == event["observed_class"]
-        assert event["normalized_result"] == "unavailable"
+        assert event["normalized_result"] in {"not_ready", "unavailable"}
         _validate_source(
             validator,
             "ErrorHandlingObservation.events.evidence_sha256",
             sources[f"ErrorHandlingObservation.events.evidence_sha256:{forced_class}"],
             event["evidence_sha256"],
         )
+    assert {event["normalized_result"] for event in events} == {"not_ready", "unavailable"}
     validator.exact_digest(
         "ErrorHandlingObservation.observation_sha256", errors, errors["observation_sha256"]
     )
@@ -4621,6 +4622,66 @@ class SloCase:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class ContractConsumerCase:
+    field_path: str
+    category: str
+    root_object_type: str
+    output_family: str
+
+
+_OUTPUT_DERIVED_ROOTS = frozenset(
+    {"SnapshotIdentity", "R2FAcceptanceReport", "PreCaptureFailurePayloadV1"}
+)
+
+
+def _contract_owner_metric(field_path: str) -> str:
+    if field_path.startswith("CalendarRawFacts"):
+        return "calendar"
+    if field_path.startswith("ReadBoundaryRawFacts"):
+        return "read_boundary"
+    if field_path.startswith("ErrorHandlingObservation"):
+        return "error_handling"
+    if field_path.startswith("LocalNasIsolationObservation"):
+        return "local_nas_isolation"
+    if field_path.startswith("RecoveryObservation"):
+        return "recovery"
+    if field_path.startswith("WholeSessionFailoverDrill"):
+        return "failover"
+    if field_path.startswith("ReplaySampleEvidence") or field_path.startswith(
+        "OfflineReplayContext"
+    ):
+        return "replay"
+    if field_path.startswith("AdjustmentEquivalenceEvidence"):
+        return "adjustment"
+    if field_path.startswith("RestoreDrillEvidence"):
+        return "restore"
+    if field_path.startswith("CompletedReplicationRestoreSnapshotV1") or field_path.startswith(
+        "ReplicationObservation"
+    ):
+        return "replication"
+    if field_path.startswith(("SessionEvidenceBinding", "PointerReconciliation")):
+        return "canonical_integrity"
+    if field_path.startswith("FrozenReliabilityVersions"):
+        return "provenance"
+    return "canonical_integrity"
+
+
+CONTRACT_CONSUMER_CASES = {
+    field_path: ContractConsumerCase(
+        field_path=field_path,
+        category=(
+            "output_derived"
+            if contract["root_object_type"] in _OUTPUT_DERIVED_ROOTS
+            else "input_materialized"
+        ),
+        root_object_type=contract["root_object_type"],
+        output_family=_contract_owner_metric(field_path),
+    )
+    for field_path, contract in DIGESTS.items()
+}
+
+
 def _approved_slo_contracts() -> dict[str, dict[str, Any]]:
     """Parse target/reason/anchor from the approved normative SLO table.
 
@@ -4911,7 +4972,7 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
             and len(classes) == len(set(classes))
             and all(
                 event["expected_class"] == event["forced_error_class"] == event["observed_class"]
-                and event["normalized_result"] == "unavailable"
+                and event["normalized_result"] in {"not_ready", "unavailable"}
                 for event in events
             )
             and all(event["sanitized_reason"] in REASONS for event in events)
@@ -5001,6 +5062,19 @@ for _metric_name in METRICS:
 
 def test_r2f5_contract_catalog_and_anchor_inventory_are_exact() -> None:
     assert X8["contract_version"] == "r2f5-x8"
+
+
+def test_r2f5_contract_consumer_classification_is_exactly_one_of_two() -> None:
+    assert len(CONTRACT_CONSUMER_CASES) == 61
+    assert set(CONTRACT_CONSUMER_CASES) == set(DIGESTS)
+    assert {case.category for case in CONTRACT_CONSUMER_CASES.values()} == {
+        "input_materialized",
+        "output_derived",
+    }
+    assert all(
+        case.root_object_type == DIGESTS[field]["root_object_type"]
+        for field, case in CONTRACT_CONSUMER_CASES.items()
+    )
     assert len(DIGESTS) == 61
     assert len(REQUIREMENT_ANCHORS) == len(set(REQUIREMENT_ANCHORS)) == 92
     assert set(BEHAVIOR_CASES) == {row[0] for row in REQUIREMENT_ROWS}
@@ -5406,14 +5480,10 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
             model=root,
         )
         assert tampered["valid"] is False
-        assert tampered["reason_code"] in {
-            "LINEAGE_UNAVAILABLE",
-            "LINEAGE_INVALID",
-            "CANONICAL_INTEGRITY_FAILED",
-        }
+        assert tampered["reason_code"] == "CANONICAL_INTEGRITY_FAILED"
         tampered_report = _evaluate(golden.request)
         assert tampered_report["status"] in {"unavailable", "not_ready"}
-        assert tampered["reason_code"] in tampered_report["quality_issues"]
+        assert tampered_report["quality_issues"] == ["CANONICAL_INTEGRITY_FAILED"]
 
 
 def test_r2f5_noop_validator_mutant_is_killed() -> None:
