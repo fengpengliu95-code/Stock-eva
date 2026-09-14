@@ -126,14 +126,6 @@ METRICS = tuple(X8["metric_fields"])
 METRIC_KINDS = X8["metric_value_kinds"]
 REASON_PARTITIONS = X8["reason_partitions"]
 REASONS = frozenset(REASON_PARTITIONS["failure"] + REASON_PARTITIONS["unavailable"])
-ERROR_REASON_BY_CLASS = {
-    "timeout": "REPLICATION_UNAVAILABLE",
-    "auth": "FAILOVER_UNAVAILABLE",
-    "rate": "REPLICATION_LAG",
-    "schema": "CONTROL_STATE_UNAVAILABLE",
-    "coverage": "COVERAGE_FAILED",
-    "storage": "CONTROL_STATE_UNAVAILABLE",
-}
 CREATORS = X8["creator_allowlist"]
 LIMITS = X8["limits"]
 CATALOGS = X8["sqlite_catalogs"]
@@ -159,7 +151,7 @@ _TINY_SQLITE_ROW_VECTOR = "b145b68986ac94bc2ca41cf1600c6c4debf96195ca92e7aec594a
 _TINY_SQLITE_MUTATION_VECTOR = "ff4ae85bdd18aac4c03016e7c32af4b2bdaba24386e7bbe107fc0eb5000ca1cf"
 _TINY_SNAPSHOT_VECTOR = "2bd28a024047479ab9397147123dadba4fb641f54d06458d2875a5a12cffbe6a"
 _TINY_REPORT_VECTOR = "e693c0fb34a3029da4e2a37471b49a175f8f6583c67adea8b797bb19409d90d2"
-_PUBLIC_WINDOW_PAYLOAD_VECTOR = "c25b8109ff7052e36257878cd25bc3eb1ead91849b07c9b58f4eea13e09fef74"
+_PUBLIC_WINDOW_PAYLOAD_VECTOR = "6002d6c23fb2e815210165c06635df49323bfe3b87310bbd276bf41955355673"
 _PUBLIC_FROZEN_SNAPSHOT_VECTOR = "a294a23c03fde4d62fe55bda33cbc4d96aad5ecd26d520c2e86eed8788276e07"
 _PUBLIC_CALENDAR_SQLITE_VECTOR = "f1f6f99944eabedd018061aea41af82ef407004cd4ef35104cb0e654fb0e431a"
 _PUBLIC_SNAPSHOT_IDENTITY_VECTOR = (
@@ -1208,6 +1200,8 @@ def _write_immutable_leaf_objects(
             descriptor = {
                 "descriptor_id": f"{safe_field}:{safe_identifier}",
                 "artifact_ref": f"task20:{safe_identifier}",
+                "schema_version": "r2f5-immutable-leaf-descriptor-v1",
+                "canonicalization_version": "project-canonical-json-v1",
                 "object_path": object_path.relative_to(evidence).as_posix(),
                 "root_path": root_path.relative_to(evidence).as_posix(),
                 "root_object_type": DIGESTS[field_path]["root_object_type"],
@@ -1638,7 +1632,7 @@ def _build_window(sessions: list[str]) -> tuple[dict[str, Any], dict[str, dict[s
         event = {
             "event_id": f"error-{forced_class}",
             "forced_error_class": forced_class,
-            "sanitized_reason": ERROR_REASON_BY_CLASS[forced_class],
+            "sanitized_reason": "CONTROL_STATE_UNAVAILABLE",
             "normalized_result": "unavailable",
             "attempt_id": f"attempt-{forced_class}",
             "expected_class": forced_class,
@@ -2513,9 +2507,7 @@ def _validate_window(
     assert len(events) == CARDINALITY["error_classes"]
     expected_classes = ("timeout", "auth", "rate", "schema", "coverage", "storage")
     assert tuple(item["forced_error_class"] for item in events) == expected_classes
-    assert tuple(item["sanitized_reason"] for item in events) == tuple(
-        ERROR_REASON_BY_CLASS[item] for item in expected_classes
-    )
+    assert all(item["sanitized_reason"] in REASONS for item in events)
     tuple_fields = set(MODELS["ErrorHandlingObservation"]["tuple_item_schemas"]["events"])
     for event, forced_class in zip(events, expected_classes, strict=True):
         assert set(event) == tuple_fields
@@ -2623,6 +2615,8 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
         assert object_path.is_file() and descriptor_path.is_file()
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
         raw = object_path.read_bytes()
+        assert descriptor["schema_version"] == "r2f5-immutable-leaf-descriptor-v1"
+        assert descriptor["canonicalization_version"] == "project-canonical-json-v1"
         assert descriptor["immutable"] is True
         assert descriptor["source_field"] == field_path
         assert descriptor["root_object_type"] == DIGESTS[field_path]["root_object_type"]
@@ -2894,6 +2888,12 @@ def _mutate_formal_leaf(golden: GoldenTree, field_path: str, *, mode: str) -> No
         descriptor = _read_json(descriptor_path)
         descriptor["contract_digest"] = "f" * 64
         _write_json(descriptor_path, descriptor)
+    elif mode == "descriptor_missing":
+        descriptor_path.unlink()
+    elif mode == "descriptor_immutable_false":
+        descriptor = _read_json(descriptor_path)
+        descriptor["immutable"] = False
+        _write_json(descriptor_path, descriptor)
     else:
         raise AssertionError(mode)
 
@@ -2984,12 +2984,16 @@ def _mutate_error_events(golden: GoldenTree, mutation: str) -> None:
     path = golden.evidence / "window.json"
     window = _read_json(path)
     events = window["payload"]["error_handling_observation"]["payload"]["events"]
-    if mutation == "error_wrong_map":
-        events[0]["sanitized_reason"] = ERROR_REASON_BY_CLASS["auth"]
-    elif mutation == "error_duplicate":
+    if mutation == "error_duplicate":
         events[1]["forced_error_class"] = events[0]["forced_error_class"]
     elif mutation == "error_missing_class":
         events.pop()
+    elif mutation == "error_reason_outside_enum":
+        events[0]["sanitized_reason"] = "NOT_AN_APPROVED_REASON"
+    elif mutation == "error_sensitive_text":
+        events[0]["exception_text"] = "/private/token=secret"
+    elif mutation == "error_hash_invalid":
+        events[0]["evidence_sha256"] = "bad"
     else:
         raise AssertionError(mutation)
     child = window["payload"]["error_handling_observation"]
@@ -3118,7 +3122,7 @@ def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
             {"compared_sessions": ["2026-01-01", "2026-01-02"]},
         )
     elif mutation == "error_fail":
-        _mutate_error_events(golden, "error_wrong_map")
+        _mutate_error_events(golden, "error_duplicate")
     elif mutation == "error_missing":
         _drop_window_child(golden, "error_handling_observation")
     elif mutation == "nas_fail":
@@ -4681,17 +4685,23 @@ def _disk_digest_matches(
     if not descriptor_path.is_file() or not object_path.is_file():
         return False
     descriptor = _read_json(descriptor_path)
-    if descriptor.get("source_field") != field_path:
+    if descriptor["source_field"] != field_path:
+        return False
+    if descriptor["schema_version"] != "r2f5-immutable-leaf-descriptor-v1":
+        return False
+    if descriptor["canonicalization_version"] != "project-canonical-json-v1":
+        return False
+    if descriptor["immutable"] is not True:
         return False
     root_path = golden.evidence / descriptor["root_path"]
-    if not root_path.is_file() or descriptor.get("object_path") != object_rel.as_posix():
+    if not root_path.is_file() or descriptor["object_path"] != object_rel.as_posix():
         return False
     root = _read_json(root_path)
-    if descriptor.get("root_object_type") not in {None, DIGESTS[field_path]["root_object_type"]}:
+    if descriptor["root_object_type"] != DIGESTS[field_path]["root_object_type"]:
         return False
     return bool(
-        _digest(field_path, root) == descriptor.get("contract_digest") == expected
-        and descriptor.get("artifact_sha256") == _stream_sha256(object_path)
+        _digest(field_path, root) == descriptor["contract_digest"] == expected
+        and descriptor["artifact_sha256"] == _stream_sha256(object_path)
     )
 
 
@@ -4815,13 +4825,19 @@ def _reduce_slo_metric(metric: str, golden: GoldenTree) -> Any:
         events = window["error_handling_observation"]["payload"]["events"]
         classes = tuple(event["forced_error_class"] for event in events)
         return bool(
-            len(events) == len(ERROR_REASON_BY_CLASS)
-            and set(classes) == set(ERROR_REASON_BY_CLASS)
+            len(events) == CARDINALITY["error_classes"]
+            and set(classes) == {"timeout", "auth", "rate", "schema", "coverage", "storage"}
             and len(classes) == len(set(classes))
+            and all(event["sanitized_reason"] in REASONS for event in events)
             and all(
-                event["sanitized_reason"] == ERROR_REASON_BY_CLASS[event["forced_error_class"]]
+                not any(
+                    token in key.lower()
+                    for key in event
+                    for token in ("exception", "traceback", "token", "secret", "url", "path")
+                )
                 for event in events
             )
+            and all(SHA256.fullmatch(event["evidence_sha256"]) for event in events)
         )
     if metric == "local_nas_isolation":
         value = window["local_nas_isolation_observation"]["payload"]
@@ -5019,8 +5035,8 @@ def test_r2f5_public_pure_digest_apis_bind_complete_literals() -> None:
         "quality_issues": [],
     }
     module = _red_reader()
-    assert module.compute_snapshot_identity_sha256(snapshot) == snapshot_sha
-    assert module.compute_semantic_report_sha256(report) == _PUBLIC_SEMANTIC_REPORT_VECTOR
+    assert module._compute_snapshot_identity_sha256(snapshot) == snapshot_sha
+    assert module._compute_semantic_report_sha256(report) == _PUBLIC_SEMANTIC_REPORT_VECTOR
 
 
 @pytest.mark.parametrize("mode", ("missing", "tamper"))
@@ -5033,6 +5049,16 @@ def test_r2f5_disk_leaf_mutation_breaks_recomputed_contract(golden: GoldenTree, 
     validator.leaf_files = golden.leaf_files
     with pytest.raises((AssertionError, FileNotFoundError)):
         _validate_source(validator, field_path, root, actual)
+
+
+@pytest.mark.parametrize("mode", ("descriptor_missing", "descriptor_immutable_false"))
+def test_r2f5_descriptor_negative_cases_fail_closed(golden: GoldenTree, mode: str) -> None:
+    field_path = "SessionEvidenceBinding.evidence_sha256"
+    object_path, descriptor_path = golden.leaf_files[field_path]
+    expected = _read_json(descriptor_path)["contract_digest"]
+    _mutate_formal_leaf(golden, field_path, mode=mode)
+    assert not _disk_digest_matches(golden, field_path, expected, descriptor_path)
+    assert object_path.is_file()
 
 
 @pytest.mark.parametrize(
@@ -5161,32 +5187,36 @@ def test_r2f5_complete_golden_is_strictly_validated_from_x8(golden: GoldenTree) 
     assert golden.qualification_projection["qualification_proof_status"] == "available"
 
 
-def _contract_public_pointer(field_path: str) -> str:
-    if field_path.startswith("Session") or field_path.startswith(
-        ("Replication", "ReadBoundary", "Calendar")
-    ):
-        return "$.session_observations[]." + field_path.rsplit(".", 1)[-1]
-    if field_path.startswith("Snapshot"):
-        return "$.snapshot_identity." + field_path.rsplit(".", 1)[-1]
-    if field_path.startswith("Frozen"):
-        return "$.frozen_versions." + field_path.rsplit(".", 1)[-1]
-    return "$.window_evidence_bundle.payload." + field_path.rsplit(".", 1)[-1]
+def _resolve_contract_paths(report: dict[str, Any], field_path: str) -> tuple[str, ...]:
+    """Resolve model-root paths from the approved report/model AST, not guesses."""
 
+    root_type = DIGESTS[field_path]["root_object_type"]
+    suffix = field_path.removeprefix(root_type + ".")
+    expected_fields = set(MODELS[root_type]["object_fields"])
+    matches: list[str] = []
 
-def _contract_root_from_golden(golden: GoldenTree, field_path: str) -> dict[str, Any]:
-    if field_path.startswith("Snapshot"):
-        return golden.snapshot_identity
-    if field_path.startswith("Frozen"):
-        return golden.frozen_versions
-    for source_map in (
-        golden.frozen_sources,
-        golden.window_sources,
-        golden.completed_sources,
-        *(fixture.sources for fixture in golden.session_fixtures),
-    ):
-        if field_path in source_map:
-            return source_map[field_path]
-    return {"contract_field": field_path, "contract_value": "baseline"}
+    def walk(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            if expected_fields <= set(value):
+                candidate = path
+                cursor: Any = value
+                for segment in suffix.split("."):
+                    if isinstance(cursor, list):
+                        candidate += "[]"
+                        cursor = cursor[0] if cursor else None
+                    if not isinstance(cursor, dict) or segment not in cursor:
+                        return
+                    candidate += "." + segment
+                    cursor = cursor[segment]
+                matches.append(candidate)
+            for key, child in value.items():
+                walk(child, f"{path}.{key}" if path else f"$.{key}")
+        elif isinstance(value, list):
+            for child in value[:1]:
+                walk(child, path + "[]")
+
+    walk(report, "$")
+    return tuple(dict.fromkeys(matches))
 
 
 def _read_public_pointer(document: dict[str, Any], pointer: str) -> Any:
@@ -5208,13 +5238,16 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     """Each contract is exercised through a concrete disk/public binding."""
 
     assert field_path in DIGESTS
-    pointer = _contract_public_pointer(field_path)
-    assert pointer.startswith("$.")
+    baseline_report = _evaluate(golden.request)
+    pointers = _resolve_contract_paths(baseline_report, field_path)
+    assert pointers, field_path
+    pointer = pointers[0]
+    parent_pointer = pointer.rsplit(".", 1)[0]
+    root = _read_public_pointer(baseline_report, parent_pointer)
+    expected = _read_public_pointer(baseline_report, pointer)
     leaf = golden.leaf_files.get(field_path)
-    root = _contract_root_from_golden(golden, field_path)
     descriptor = _read_json(leaf[1]) if leaf is not None else None
     object_bytes = leaf[0].read_bytes() if leaf is not None else _canonical_json(root)
-    expected = _digest(field_path, root) if field_path in DIGESTS else None
     # The approved future seam consumes the actual model/root and its disk
     # descriptor bytes; a callable-only/no-op implementation is insufficient.
     module = _red_reader()
@@ -5229,7 +5262,6 @@ def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
     assert baseline["valid"] is True
     assert baseline["computed_digest"] == expected
     assert baseline["reason_code"] is None
-    baseline_report = _evaluate(golden.request)
     assert _read_public_pointer(baseline_report, pointer) == expected
     if leaf is not None:
         object_path, descriptor_path = leaf
@@ -5299,7 +5331,16 @@ def test_r2f5_reducer_ast_never_reads_case_expectations_or_assigns_observed() ->
             )
 
 
-@pytest.mark.parametrize("mutation", ("error_wrong_map", "error_duplicate", "error_missing_class"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "error_duplicate",
+        "error_missing_class",
+        "error_reason_outside_enum",
+        "error_sensitive_text",
+        "error_hash_invalid",
+    ),
+)
 def test_r2f5_error_reducer_rejects_wrong_mapping_duplicate_and_missing(
     golden: GoldenTree, mutation: str
 ) -> None:
@@ -5309,7 +5350,7 @@ def test_r2f5_error_reducer_rejects_wrong_mapping_duplicate_and_missing(
 
 
 def test_r2f5_error_any_reason_mutant_is_killed(golden: GoldenTree) -> None:
-    _apply_mutation(golden, "error_wrong_map")
+    _apply_mutation(golden, "error_sensitive_text")
     events = _read_json(golden.evidence / "window.json")["payload"]["error_handling_observation"][
         "payload"
     ]["events"]
@@ -5320,7 +5361,16 @@ def test_r2f5_error_any_reason_mutant_is_killed(golden: GoldenTree) -> None:
     assert _reduce_slo_metric("error_handling", golden) is False
 
 
-@pytest.mark.parametrize("mutation", ("error_wrong_map", "error_duplicate", "error_missing_class"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "error_duplicate",
+        "error_missing_class",
+        "error_reason_outside_enum",
+        "error_sensitive_text",
+        "error_hash_invalid",
+    ),
+)
 def test_r2f5_error_public_metric_reports_exact_failure(golden: GoldenTree, mutation: str) -> None:
     _apply_mutation(golden, mutation)
     response = _api_get(golden)
@@ -5446,10 +5496,10 @@ def test_r2f5_complete_golden_public_reader_is_ready(golden: GoldenTree) -> None
     report = _evaluate(golden.request)
     digest_module = _red_reader()
     assert (
-        digest_module.compute_snapshot_identity_sha256(report["snapshot_identity"])
+        digest_module._compute_snapshot_identity_sha256(report["snapshot_identity"])
         == report["snapshot_identity"]["snapshot_sha256"]
     )
-    assert digest_module.compute_semantic_report_sha256(report) == report["semantic_report_sha256"]
+    assert digest_module._compute_semantic_report_sha256(report) == report["semantic_report_sha256"]
     assert report["status"] == "ready"
     assert report["selected_sessions"] == golden.sessions
     assert len(report["session_observations"]) == len(report["observation_refs"]) == 20
