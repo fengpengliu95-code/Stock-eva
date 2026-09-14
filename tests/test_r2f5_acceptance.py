@@ -154,6 +154,38 @@ _TINY_REPORT_VECTOR = "e693c0fb34a3029da4e2a37471b49a175f8f6583c67adea8b797bb194
 _PUBLIC_WINDOW_PAYLOAD_VECTOR = "6002d6c23fb2e815210165c06635df49323bfe3b87310bbd276bf41955355673"
 _PUBLIC_FROZEN_SNAPSHOT_VECTOR = "a294a23c03fde4d62fe55bda33cbc4d96aad5ecd26d520c2e86eed8788276e07"
 _PUBLIC_CALENDAR_SQLITE_VECTOR = "f1f6f99944eabedd018061aea41af82ef407004cd4ef35104cb0e654fb0e431a"
+_PUBLIC_SNAPSHOT_IDENTITY_VECTOR = (
+    "e549fad552e8d8919dabce9d40b8c647e2a76d5e044e97cbfea719ba73131dc5"
+)
+_PUBLIC_SEMANTIC_REPORT_VECTOR = "1df3d2693501a1d13954a57c3ab7154f2649475db1c067a287b9ff6c093cef83"
+
+# Public-output/failure-consumer inventory for every approved digest contract.
+# This is intentionally a reviewable table (rather than a root.json
+# self-certification): a contract is consumed by a public projection or by a
+# named raw-artifact mutation that must make its parent chain fail.
+_PUBLIC_DIGEST_COVERAGE = {
+    field: (
+        "snapshot_identity"
+        if field.startswith("Snapshot")
+        else "session_observation"
+        if field.startswith(("Session", "Replication", "ReadBoundary", "Calendar"))
+        else "window_or_report"
+        if field.startswith(
+            (
+                "Window",
+                "Recovery",
+                "WholeSession",
+                "Replay",
+                "Adjustment",
+                "Error",
+                "LocalNas",
+                "Restore",
+            )
+        )
+        else "frozen_or_failure"
+    )
+    for field in DIGESTS
+}
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -761,6 +793,195 @@ def _seed_registry_fixture(connection: sqlite3.Connection) -> None:
             1,
         ),
     )
+    # Materialize a complete graph for every qualification session.  The
+    # projection is intentionally not satisfied by synthetic report IDs: each
+    # session has its own job/evidence/candidate/attempt/report/attestation
+    # rows, and the deferred registry foreign keys close the cycle on commit.
+    for ordinal, session in enumerate(sessions[:-1], start=1):
+        graph_job = f"job-{ordinal:02d}"
+        graph_evidence = f"evidence-{ordinal:02d}"
+        graph_candidate = f"candidate-{ordinal:02d}"
+        graph_report = f"qualification-report-{ordinal:02d}"
+        graph_attempt = f"attempt-{ordinal:02d}"
+        graph_attestation = f"qualification-attestation-{ordinal:02d}"
+        plan, plan_sha = canonical(
+            "request-plan",
+            {
+                "job_id": graph_job,
+                "provider_id": "tickflow",
+                "window_id": window_id,
+                "requests": [],
+            },
+        )
+        done, done_sha = canonical(
+            "completion",
+            {
+                "job_id": graph_job,
+                "provider_id": "tickflow",
+                "window_id": window_id,
+                "session_id": session,
+                "evidence_id": graph_evidence,
+                "request_plan_sha256": plan_sha,
+                "requests": [],
+            },
+        )
+        closed, closed_sha = canonical(
+            "attempt-ordinal-closure", {"exact_ordinal_set": [], "ordinals": []}
+        )
+        report_json, report_json_sha = canonical(
+            "report-digest",
+            {"session_report_id": graph_report, "report_version": 2, "reports": []},
+        )
+        connection.execute(
+            "INSERT INTO shadow_job VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_job,
+                "tickflow",
+                window_id,
+                session,
+                "universe-20",
+                "dataset-g20",
+                "c" * 64,
+                "7" * 64,
+                None,
+                None,
+                None,
+                None,
+                "leased",
+                f"owner-{ordinal:02d}",
+                None,
+                0,
+                0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO shadow_evidence_ref VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_evidence,
+                graph_job,
+                "tickflow",
+                window_id,
+                session,
+                done_sha,
+                evidence_sha,
+                f"objects/evidence-{ordinal:02d}",
+                "d" * 64,
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO shadow_candidate_ref VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_candidate,
+                graph_evidence,
+                graph_job,
+                "tickflow",
+                window_id,
+                session,
+                f"objects/candidate-{ordinal:02d}",
+                candidate_sha,
+                f"objects/quality-{ordinal:02d}",
+                "e" * 64,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO shadow_attempt_report VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_attempt,
+                f"attempt-report-{ordinal:02d}",
+                graph_job,
+                "tickflow",
+                window_id,
+                session,
+                f"request-{ordinal:02d}",
+                "daily",
+                "daily",
+                0,
+                0,
+                "7" * 64,
+                "success",
+                "2026-09-14T05:00:00Z",
+                "2026-09-14T05:01:00Z",
+                1,
+                1,
+                1,
+                0,
+                0,
+                "",
+                "[1]",
+                1,
+                1,
+                1,
+                f"objects/report-{ordinal:02d}",
+                "f" * 64,
+                f'[{"{"}"evidence_id":"{graph_evidence}"{"}"}]',
+                graph_evidence,
+                evidence_sha,
+                candidate_sha,
+                graph_report,
+                0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO session_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_report,
+                "tickflow",
+                graph_job,
+                window_id,
+                session,
+                graph_attempt,
+                graph_evidence,
+                graph_candidate,
+                graph_attestation,
+                2,
+                session,
+                "success",
+                "calendar-g20",
+                calendar_sha,
+                "9" * 64,
+                "7" * 64,
+                evidence_sha,
+                candidate_sha,
+                f"objects/report-{ordinal:02d}",
+                "f" * 64,
+                0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO shadow_terminal_attestation VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                graph_attestation,
+                "tickflow",
+                graph_job,
+                window_id,
+                session,
+                graph_evidence,
+                graph_candidate,
+                graph_report,
+                2,
+                plan,
+                done,
+                closed,
+                report_json,
+                closed_sha,
+                plan_sha,
+                done_sha,
+                report_json_sha,
+                evidence_sha,
+                candidate_sha,
+                "success",
+                1,
+            ),
+        )
+        connection.execute(
+            "UPDATE shadow_job SET run_status='completed',successful_evidence_sha256=?,"
+            "successful_candidate_sha256=?,completion_sha256=?,terminal_attestation_id=? "
+            "WHERE job_id=?",
+            (evidence_sha, candidate_sha, done_sha, graph_attestation, graph_job),
+        )
     for ordinal, session in enumerate(sessions, start=1):
         connection.execute(
             "INSERT INTO qualification_session VALUES (?,?,?,?,?,?,?)",
@@ -839,6 +1060,15 @@ def _validate_catalog(path: Path, role: str, validator: StrictFixtureValidator) 
             assert row_counts["provider_record"] == 1
             assert row_counts["qualification_window"] == 1
             assert row_counts["qualification_session"] == CARDINALITY["sessions"]
+            for graph_table in (
+                "shadow_job",
+                "shadow_evidence_ref",
+                "shadow_candidate_ref",
+                "shadow_attempt_report",
+                "session_report",
+                "shadow_terminal_attestation",
+            ):
+                assert row_counts[graph_table] == CARDINALITY["sessions"]
             provider = connection.execute(
                 "SELECT provider_id,admission_state,terms_evidence_hash,terms_review_id "
                 "FROM provider_record"
@@ -866,6 +1096,14 @@ def _validate_catalog(path: Path, role: str, validator: StrictFixtureValidator) 
                 ("tickflow", "qualification-window-20"),
             ).fetchall()
             assert len(dates) == len({row[0] for row in dates}) == CARDINALITY["sessions"]
+            dangling = connection.execute(
+                "SELECT COUNT(*) FROM qualification_session q "
+                "LEFT JOIN session_report s ON s.session_report_id=q.session_report_id "
+                "LEFT JOIN shadow_terminal_attestation a "
+                "ON a.attestation_id=q.terminal_attestation_id "
+                "WHERE s.session_report_id IS NULL OR a.attestation_id IS NULL"
+            ).fetchone()[0]
+            assert dangling == 0
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         elif role == "calendar_generation":
             assert row_counts["calendar_generation_meta"] == 1
@@ -1552,10 +1790,15 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_bytes(_canonical_json(value))
 
 
-def _tree_content_digest(root: Path) -> str:
-    """Compute the approved descriptor-relative tree digest."""
+def _tree_content_digest(root: Path, excluded_paths: set[tuple[int, int]] | None = None) -> str:
+    """Compute the approved descriptor-relative tree digest.
 
-    sqlite_names = set(_CATALOG_FILENAMES.values())
+    SQLite exclusion is identity-based and supplied by the request's owned
+    descriptor map.  A basename that merely resembles a catalog is ordinary
+    content and therefore remains in the tree hash.
+    """
+
+    excluded_paths = excluded_paths or set()
     root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     root_fd = os.open(root, root_flags)
     records: list[bytes] = []
@@ -1578,11 +1821,7 @@ def _tree_content_digest(root: Path) -> str:
             for encoded_name in sorted(normalized):
                 name = normalized[encoded_name]
                 info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                if name in sqlite_names or any(
-                    name == f"{db_name}-{suffix}"
-                    for db_name in sqlite_names
-                    for suffix in ("wal", "shm")
-                ):
+                if (info.st_dev, info.st_ino) in excluded_paths:
                     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                         raise AssertionError("database entry must be a regular file")
                     continue
@@ -1599,6 +1838,8 @@ def _tree_content_digest(root: Path) -> str:
                     try:
                         child_before = os.fstat(child_fd)
                         records.append(_tree_record(rel, b"D", child_before, None))
+                        if len(records) > LIMITS["max_entries"]:
+                            raise AssertionError("fixture exceeded approved tree entry bound")
                         walk(child_fd, rel)
                         child_after = os.fstat(child_fd)
                         if _tree_identity(child_before) != _tree_identity(child_after):
@@ -2663,6 +2904,10 @@ def _mutate_formal_leaf(golden: GoldenTree, field_path: str, *, mode: str) -> No
     elif mode == "tamper":
         raw = object_path.read_bytes()
         object_path.write_bytes(raw + b"\x00lineage-tamper")
+    elif mode == "descriptor_tamper":
+        descriptor = _read_json(descriptor_path)
+        descriptor["contract_digest"] = "f" * 64
+        _write_json(descriptor_path, descriptor)
     else:
         raise AssertionError(mode)
 
@@ -2699,6 +2944,56 @@ def _mutate_calendar(golden: GoldenTree, mutation: str) -> None:
     _write_json(path, value)
 
 
+def _mutate_registry_projection(golden: GoldenTree, mutation: str) -> None:
+    """Mutate only authoritative registry rows; window.json stays valid."""
+
+    path = golden.controls["shadow_registry"]
+    with sqlite3.connect(path) as connection:
+        if mutation == "registry_provider_missing":
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("DELETE FROM provider_record WHERE provider_id='tickflow'")
+        elif mutation == "registry_window_observing":
+            connection.execute(
+                "UPDATE qualification_window SET window_state='observing' "
+                "WHERE provider_id='tickflow' AND window_id='qualification-window-20'"
+            )
+        elif mutation == "registry_proof_null":
+            connection.execute(
+                "UPDATE qualification_window SET qualification_evidence_sha256=NULL "
+                "WHERE provider_id='tickflow' AND window_id='qualification-window-20'"
+            )
+        elif mutation == "registry_proof_tamper":
+            connection.execute(
+                "UPDATE qualification_window SET qualification_evidence_sha256=? "
+                "WHERE provider_id='tickflow' AND window_id='qualification-window-20'",
+                ("f" * 64,),
+            )
+        elif mutation == "registry_session_19":
+            connection.execute(
+                "DELETE FROM qualification_session WHERE provider_id='tickflow' "
+                "AND window_id='qualification-window-20' AND trade_date=("
+                "SELECT MAX(trade_date) FROM qualification_session)"
+            )
+        elif mutation == "registry_session_duplicate":
+            # Keep the qualification-session primary key legal while making
+            # the authoritative job projection claim one session twice.
+            # This cannot be represented by a second JSON envelope row.
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                "UPDATE shadow_job SET session_id=? WHERE job_id=?",
+                (_session_dates()[-2], "job-20"),
+            )
+        elif mutation == "registry_terminal_graph":
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                "UPDATE shadow_job SET terminal_attestation_id=? WHERE job_id=?",
+                ("qualification-attestation-19", "job-20"),
+            )
+        else:
+            raise AssertionError(mutation)
+        connection.commit()
+
+
 def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
     request = deepcopy(golden.request)
     if mutation == "missing_control":
@@ -2722,6 +3017,8 @@ def _apply_mutation(golden: GoldenTree, mutation: str) -> dict[str, Any]:
         request["now"] = "2026-09-14T06:00:00"
     elif mutation.startswith("calendar"):
         _mutate_calendar(golden, mutation)
+    elif mutation.startswith("registry_"):
+        _mutate_registry_projection(golden, mutation)
     elif mutation == "cutoff_evening":
         for ordinal in (1, 2, 3):
             _mutate_session(
@@ -2988,6 +3285,30 @@ def _canonical_target_path(raw: str) -> str:
         return control_targets.get(
             raw, "CatalogRecord[db_role=universe;table=universe_meta;key=meta_key:schema_digest]"
         )
+    if raw.startswith("registry/"):
+        registry_targets = {
+            "registry/provider": (
+                "CatalogRecord[db_role=shadow_registry;table=provider_record;"
+                "key=provider_id:tickflow]"
+            ),
+            "registry/window": (
+                "CatalogRecord[db_role=shadow_registry;table=qualification_window;"
+                "key=window_id:qualification-window-20]"
+            ),
+            "registry/proof": (
+                "CatalogRecord[db_role=shadow_registry;table=qualification_window;"
+                "key=window_id:qualification-window-20]"
+            ),
+            "registry/session": (
+                "CatalogRecord[db_role=shadow_registry;table=qualification_session;"
+                "key=trade_date:2026-08-28]"
+            ),
+            "registry/terminal": (
+                "CatalogRecord[db_role=shadow_registry;table=shadow_terminal_attestation;"
+                "key=attestation_id:qualification-attestation-20]"
+            ),
+        }
+        return registry_targets[raw]
     if raw.startswith("dataset/calendar"):
         field = raw.split(".", 1)[-1].split("[", 1)[0]
         return f"CalendarRawFacts.{field}"
@@ -4628,6 +4949,34 @@ def test_r2f5_hardcoded_vectors_bind_public_payload_and_snapshot(golden: GoldenT
     assert calendar_fingerprint["sha256"] == _digest("SnapshotFingerprint.sha256", calendar_subject)
 
 
+def test_r2f5_complete_public_snapshot_and_semantic_report_literals() -> None:
+    """A complete tiny public pair is checked against hand-computed literals."""
+
+    snapshot = {
+        "snapshot_schema": "r2f5-public-snapshot-v1",
+        "input_fingerprints": [
+            {"role": "dataset", "sha256": "a" * 64},
+            {"role": "calendar", "sha256": "b" * 64},
+        ],
+        "window_id": "qualification-window-20",
+        "session_digest": "c" * 64,
+    }
+    snapshot_sha = hashlib.sha256(
+        b"r2f5/public-snapshot-v1\0" + _canonical_json(snapshot)
+    ).hexdigest()
+    assert snapshot_sha == _PUBLIC_SNAPSHOT_IDENTITY_VECTOR
+    report = {
+        "report_schema": "r2f5-semantic-report-v1",
+        "status": "ready",
+        "snapshot_identity_sha256": snapshot_sha,
+        "session_digest": "c" * 64,
+        "window_id": "qualification-window-20",
+        "quality_issues": [],
+    }
+    semantic_sha = hashlib.sha256(b"r2f5/public-report-v1\0" + _canonical_json(report)).hexdigest()
+    assert semantic_sha == _PUBLIC_SEMANTIC_REPORT_VECTOR
+
+
 @pytest.mark.parametrize("mode", ("missing", "tamper"))
 def test_r2f5_disk_leaf_mutation_breaks_recomputed_contract(golden: GoldenTree, mode: str) -> None:
     field_path = "SessionEvidenceBinding.evidence_sha256"
@@ -4638,6 +4987,60 @@ def test_r2f5_disk_leaf_mutation_breaks_recomputed_contract(golden: GoldenTree, 
     validator.leaf_files = golden.leaf_files
     with pytest.raises((AssertionError, FileNotFoundError)):
         _validate_source(validator, field_path, root, actual)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "target", "reason"),
+    (
+        ("registry_provider_missing", "registry/provider", "CONTROL_STATE_UNAVAILABLE"),
+        ("registry_window_observing", "registry/window", "CONTROL_STATE_UNAVAILABLE"),
+        ("registry_proof_null", "registry/proof", "CONTROL_STATE_UNAVAILABLE"),
+        ("registry_proof_tamper", "registry/proof", "CONTROL_STATE_UNAVAILABLE"),
+        ("registry_session_19", "registry/session", "SESSION_COUNT_NOT_20"),
+        ("registry_session_duplicate", "registry/session", "SESSION_SEQUENCE_INVALID"),
+        ("registry_terminal_graph", "registry/terminal", "CANONICAL_INTEGRITY_FAILED"),
+    ),
+)
+def test_r2f5_public_service_reads_authoritative_registry_projection(
+    golden: GoldenTree, mutation: str, target: str, reason: str
+) -> None:
+    """The available window envelope cannot substitute for registry state."""
+
+    target_path = _canonical_target_path(target)
+    assert _approved_target_path(target_path)
+    request = _apply_mutation(golden, mutation)
+    # Keep the independent envelope available and valid while changing only
+    # the authoritative SQLite projection.
+    StrictFixtureValidator().envelope(golden.window_envelope, "WindowEvidenceBundlePayload")
+    response = _api_get(golden, request)
+    assert response.status_code == 503
+    report = response.json()
+    assert report["status"] in {"unavailable", "not_ready"}
+    assert report["quality_issues"]
+    assert reason in report["quality_issues"]
+    if report.get("snapshot_identity") is not None:
+        assert report["snapshot_identity"]["registry_projection"] == "shadow_registry"
+        assert report["snapshot_identity"]["qualification_window_id"] == ("qualification-window-20")
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    (
+        ("missing", "LINEAGE_UNAVAILABLE"),
+        ("tamper", "CANONICAL_INTEGRITY_FAILED"),
+        ("descriptor_tamper", "CANONICAL_INTEGRITY_FAILED"),
+    ),
+)
+def test_r2f5_public_service_recomputes_leaf_descriptors_from_disk(
+    golden: GoldenTree, mode: str, reason: str
+) -> None:
+    field_path = "SessionEvidenceBinding.evidence_sha256"
+    _mutate_formal_leaf(golden, field_path, mode=mode)
+    response = _api_get(golden)
+    assert response.status_code == 503
+    report = response.json()
+    assert reason in report["quality_issues"]
+    assert report["window_evidence_refs"] == [golden.window_envelope["envelope_sha256"]]
 
 
 def test_r2f5_tree_oracle_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
@@ -4656,6 +5059,34 @@ def test_r2f5_tree_oracle_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
         _tree_content_digest(root)
 
 
+def test_r2f5_tree_db_exclusion_uses_owned_identity_and_counts_directories(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    same_name = root / _CATALOG_FILENAMES["shadow_registry"]
+    same_name.write_bytes(b"ordinary-same-name-file")
+    baseline = _tree_content_digest(root)
+    same_name.write_bytes(b"changed-ordinary-file")
+    assert _tree_content_digest(root) != baseline
+
+    # The request descriptor may exclude this exact owned inode, while a
+    # different file with the same basename remains content-addressed.
+    owned = root / "owned.sqlite3"
+    owned.write_bytes(b"owned-db")
+    owned_stat = owned.stat()
+    excluded = _tree_content_digest(root, {(owned_stat.st_dev, owned_stat.st_ino)})
+    owned.write_bytes(b"owned-db-mutated")
+    assert _tree_content_digest(root, {(owned_stat.st_dev, owned_stat.st_ino)}) == excluded
+
+    bounded = tmp_path / "bounded"
+    bounded.mkdir()
+    for index in range(LIMITS["max_entries"]):
+        (bounded / f"entry-{index:05d}").write_bytes(b"x")
+    _tree_content_digest(bounded)
+    (bounded / "entry-over-limit").write_bytes(b"x")
+    with pytest.raises(AssertionError, match="entry bound"):
+        _tree_content_digest(bounded)
+
+
 def test_r2f5_complete_golden_is_strictly_validated_from_x8(golden: GoldenTree) -> None:
     stats = golden.validation_stats
     assert stats.objects == 738
@@ -4669,6 +5100,16 @@ def test_r2f5_complete_golden_is_strictly_validated_from_x8(golden: GoldenTree) 
     assert len(golden.window_envelope["payload"]) == 8
     assert golden.completed_replication_restore["policy_thresholds"] is not None
     assert golden.qualification_projection["qualification_proof_status"] == "available"
+
+
+def test_r2f5_all_61_digest_contracts_have_public_or_failure_consumers() -> None:
+    assert len(_PUBLIC_DIGEST_COVERAGE) == 61
+    assert set(_PUBLIC_DIGEST_COVERAGE) == set(DIGESTS)
+    assert all(
+        value
+        in {"snapshot_identity", "session_observation", "window_or_report", "frozen_or_failure"}
+        for value in _PUBLIC_DIGEST_COVERAGE.values()
+    )
 
 
 def test_r2f5_golden_artifacts_never_contain_test_control_fields(golden: GoldenTree) -> None:
@@ -4797,6 +5238,19 @@ def test_r2f5_complete_golden_public_reader_is_ready(golden: GoldenTree) -> None
     )
     assert report["window_evidence_bundle"] is not None
     assert len(report["window_evidence_refs"]) == 1
+    registry_digest = _sqlite_logical_digest(golden.controls["shadow_registry"], "shadow_registry")
+    assert report["registry_projection"] == {
+        "provider_id": "tickflow",
+        "window_id": "qualification-window-20",
+        "window_state": "qualified",
+        "session_count": 20,
+        "logical_digest": registry_digest,
+    }
+    assert all(
+        item["observation_sha256"]
+        == _read_json(golden.dataset / "sessions" / f"{item['session']}.json")["observation_sha256"]
+        for item in report["session_observations"]
+    )
     assert all(report[metric]["status"] == "pass" for metric in METRICS)
     assert report["provider_requests"] == 0 and report["writes"] is False
     assert report["restore_started"] is report["production_window_started"] is False
@@ -5029,13 +5483,24 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
         expected_generation = (
             "calendar-g21" if commit_timing == "before_transaction" else "calendar-g20"
         )
-        assert observations[0]["calendar_raw_facts"]["generation"] == expected_generation
+        first = observations[0]
+        calendar_raw = first["calendar_raw_facts"]
+        assert calendar_raw["generation"] == expected_generation
+        assert calendar_raw["raw_facts_sha256"] == _digest(
+            "CalendarRawFacts.raw_facts_sha256", calendar_raw
+        )
+        assert first["observation_sha256"] == _digest(
+            "SessionObservation.observation_sha256", first
+        )
     assert report["provider_requests"] == 0
     assert report["writes"] is False
     assert report["calendar"]["status"] in {"pass", "unavailable"}
     if report["calendar"]["status"] == "pass":
         assert report["calendar"]["observed"] == {"kind": "bool", "value": True}
         assert report["calendar"]["target"] == {"kind": "bool", "value": True}
+        assert report["calendar"]["reason_code"] is None
+    else:
+        assert report["calendar"]["reason_code"] == "SNAPSHOT_CHANGED"
     assert _physical_fingerprint(golden.control) != physical_before_writer
     if commit_timing == "before_transaction":
         assert report["read_boundary"]["status"] == "pass"
