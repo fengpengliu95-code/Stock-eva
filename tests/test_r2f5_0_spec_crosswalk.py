@@ -89,6 +89,15 @@ EXPECTED_SQLITE_RED_CASES = {
     "cleanup_success": "test_r2f5_sqlite_temp_cleanup_succeeds",
     "cleanup_failure": "test_r2f5_sqlite_temp_cleanup_failure_is_typed",
     "input_unchanged": "test_r2f5_sqlite_input_members_remain_unchanged",
+    "initial_rollback_journal_present": (
+        "test_r2f5_sqlite_initial_rollback_journal_present_is_invalid"
+    ),
+    "rollback_journal_appears_disappears": (
+        "test_r2f5_sqlite_rollback_journal_appears_then_disappears_is_changed"
+    ),
+    "stable_rollback_journal_absent_delete": (
+        "test_r2f5_sqlite_stable_absent_rollback_journal_delete_is_accepted"
+    ),
 }
 
 
@@ -172,7 +181,7 @@ def _interface_fields(text: str, name: str) -> list[str]:
 def _sqlite_matrix_rows() -> list[tuple[str, str, str, str, str]]:
     section = _section(
         MATRIX.read_text(encoding="utf-8"),
-        "## SQLite zero-write planned RED crosswalk (X2)",
+        "## SQLite zero-write planned RED crosswalk (X3)",
         "## Mandatory SLO crosswalk",
     )
     return [
@@ -185,7 +194,7 @@ def _sqlite_matrix_rows() -> list[tuple[str, str, str, str, str]]:
 def _sqlite_plan_catalog() -> dict[str, str]:
     section = _section(
         PLAN.read_text(encoding="utf-8"),
-        "## Planned SQLite zero-write RED anchor catalog (X2)",
+        "## Planned SQLite zero-write RED anchor catalog (X3)",
         "## Planned implementation tasks",
     )
     entries = [
@@ -480,7 +489,7 @@ def _validate_digest_contract_paths(contract: dict[str, object]) -> None:
 
 
 def _validate_sqlite_structured_contract(contract: dict[str, object]) -> None:
-    assert contract["contract_version"] == "r2f5-x8-sqlite-x2"
+    assert contract["contract_version"] == "r2f5-x8-sqlite-x3"
     ast = contract["model_schema_ast"]
     assert isinstance(ast, dict)
     present_fields = [
@@ -506,12 +515,39 @@ def _validate_sqlite_structured_contract(contract: dict[str, object]) -> None:
     ]
     assert ast["SQLitePresentMemberFingerprint"]["object_fields"] == present_fields
     assert ast["SQLiteAbsentMemberFingerprint"]["object_fields"] == absent_fields
+    rollback_fields = [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "parent_mode",
+        "parent_mtime_ns",
+        "parent_ctime_ns",
+        "safe_basename",
+        "absence_marker",
+        "directory_entry_change_marker",
+        "probe_checkpoints",
+        "proof_digest",
+    ]
+    rollback_checkpoints = [
+        "initial_probe",
+        "round_1_pre_copy",
+        "round_1_post_copy",
+        "round_2_pre_copy",
+        "round_2_post_copy",
+        "final_path_reprobe",
+    ]
+    assert ast["SQLiteRollbackJournalAbsenceProof"]["object_fields"] == rollback_fields
+    assert ast["SQLiteRollbackJournalAbsenceProof"]["tuple_item_schemas"] == {
+        "probe_checkpoints": rollback_checkpoints
+    }
     assert ast["SQLiteSnapshotFingerprint"]["object_fields"] == [
         "subject_kind",
         "descriptor_role",
         "descriptor_id",
         "descriptor_state",
         "sqlite_members",
+        "rollback_journal_absence",
         "logical_digest",
         "catalog_digest",
     ]
@@ -596,6 +632,38 @@ def _validate_sqlite_structured_contract(contract: dict[str, object]) -> None:
         "overlaps_either_round": "SNAPSHOT_CHANGED",
         "begins_after_stable_capture": "captured_old_snapshot_valid",
     }
+    assert capture["rollback_journal_sentinel"] == {
+        "basename": "<db_basename>-journal",
+        "proof_model": "SQLiteRollbackJournalAbsenceProof",
+        "probe_from": "same_retained_validated_parent_dirfd",
+        "probe_operations": [
+            "fstat_parent",
+            "lstat_at_no_follow",
+            "fstatat_at_symlink_nofollow",
+        ],
+        "parent_stat_fields": [
+            "parent_device",
+            "parent_inode",
+            "parent_mode",
+            "parent_mtime_ns",
+            "parent_ctime_ns",
+        ],
+        "checkpoints": rollback_checkpoints,
+        "required_state": "absent_at_all_capture_checkpoints",
+        "directory_entry_change_marker": "none_observed",
+        "between_checkpoint_detection": "parent_directory_mtime_ctime_must_remain_exact",
+        "initial_present": {
+            "reason": "SQLITE_SNAPSHOT_INVALID",
+            "status": "unavailable",
+            "control_reason": "CONTROL_STATE_UNAVAILABLE",
+            "classification": "control_unavailable",
+        },
+        "appears_or_disappears_after_initial": "SNAPSHOT_CHANGED",
+        "copy": False,
+        "open": False,
+        "parse": False,
+        "policy": "sentinel_must_be_evaluated_not_ignored",
+    }
     temp = capture["temp_storage"]
     assert temp == {
         "approved_root": "system_temp_outside_all_input_roots",
@@ -626,10 +694,15 @@ def _validate_sqlite_structured_contract(contract: dict[str, object]) -> None:
     assert contract["sqlite_planned_red_cases"] == EXPECTED_SQLITE_RED_CASES
 
     digest_entries = {entry["field"]: entry for entry in contract["digest_contracts"]}
-    assert len(digest_entries) == 64
+    assert len(digest_entries) == 65
     assert digest_entries["SQLitePresentMemberFingerprint.full_sha256"]["included_field_paths"] == [
         "captured_content_bytes"
     ]
+    rollback_digest = digest_entries["SQLiteRollbackJournalAbsenceProof.proof_digest"]
+    assert rollback_digest["included_field_paths"] == rollback_fields[:-1]
+    assert rollback_digest["domain_separation_prefix"] == (
+        "r2f5/sqlite-rollback-journal-absence-v1\\0"
+    )
     logical_digest = digest_entries["SQLiteSnapshotFingerprint.logical_digest"]
     assert logical_digest["domain_separation_prefix"] == "r2f5/sqlite-logical-v2\\0"
     assert logical_digest["included_field_paths"] == [
@@ -1433,6 +1506,7 @@ def test_r2f5_sqlite_zero_write_amendment_forbids_direct_input_open() -> None:
     for model in (
         "SQLitePresentMemberFingerprint",
         "SQLiteAbsentMemberFingerprint",
+        "SQLiteRollbackJournalAbsenceProof",
         "SQLiteSnapshotFingerprint",
         "SnapshotFingerprint",
     ):
@@ -1476,7 +1550,7 @@ def test_r2f5_sqlite_zero_write_amendment_forbids_direct_input_open() -> None:
         assert "cleanup" in text
         assert "max_attempts=1" in text or "one attempt" in text
     assert "writer begun after" in design
-    assert "## SQLite zero-write planned RED crosswalk (X2)" in matrix
+    assert "## SQLite zero-write planned RED crosswalk (X3)" in matrix
 
 
 def test_r2f5_sqlite_crosswalk_rejects_anchor_schema_and_digest_mutations() -> None:
@@ -1504,6 +1578,23 @@ def test_r2f5_sqlite_crosswalk_rejects_anchor_schema_and_digest_mutations() -> N
     catalog_digest["included_field_paths"].remove("primary_keys")
     with pytest.raises(AssertionError):
         _validate_sqlite_structured_contract(missing_catalog_preimage)
+
+    missing_journal_checkpoint = deepcopy(contract)
+    missing_journal_checkpoint["sqlite_capture"]["rollback_journal_sentinel"]["checkpoints"].remove(
+        "round_1_post_copy"
+    )
+    with pytest.raises(AssertionError):
+        _validate_sqlite_structured_contract(missing_journal_checkpoint)
+
+    incomplete_journal_preimage = deepcopy(contract)
+    journal_digest = next(
+        entry
+        for entry in incomplete_journal_preimage["digest_contracts"]
+        if entry["field"] == "SQLiteRollbackJournalAbsenceProof.proof_digest"
+    )
+    journal_digest["included_field_paths"].remove("parent_ctime_ns")
+    with pytest.raises(AssertionError):
+        _validate_sqlite_structured_contract(incomplete_journal_preimage)
 
 
 def test_r2f5_x8_model_ast_roots_and_tuple_items_are_explicit() -> None:

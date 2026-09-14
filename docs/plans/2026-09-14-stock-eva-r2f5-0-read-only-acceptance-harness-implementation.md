@@ -20,8 +20,8 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**SQLite amendment X2 base:** `394050d8728404b810c6cc3a8b4552edd02561c8` (clean committed base;
-X2 candidate not yet audited)
+**SQLite amendment X3 base:** `ec8d244184b231979f8fc2af7dc1029eb95b623d` (clean committed base;
+X3 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -55,7 +55,9 @@ design first and stop implementation until the reviewed specification is amended
   descriptor-copy/two-round/temp-trio algorithm: source `[db,wal,shm]` members are re-lstatted and
   re-opened no-follow from the same retained parent dirfd before/after every copy in both complete
   rounds, copied fully to secure private temporary storage, and fingerprint/byte-equality verified;
-  no input-DB SQLite open or bounded sampling claim is permitted.
+  the separate `<db>-journal` sentinel is proved absent at the initial, both rounds' pre/post-copy
+  and final path checkpoints while parent directory identity/mode/mtime/ctime remain exact. It is
+  never copied/opened/parsed/ignored; no input-DB SQLite open or bounded sampling claim is permitted.
 - FR-3: It MUST select exactly 20 confirmed consecutive sessions and preserve missing-middle,
   19-versus-20 and future/PIT distinctions.
 - FR-4: It MUST freeze and compare the complete version vector, apply inclusive Shanghai cutoffs,
@@ -122,7 +124,8 @@ design first and stop implementation until the reviewed specification is amended
   LaunchAgent or touch Application Support production state.
 - NFR-3: All failure paths MUST be sanitized, deterministic, bounded and zero-input-write;
   `SQLITE_SNAPSHOT_INVALID`, `TEMP_STORAGE_UNAVAILABLE` and `TEMP_CLEANUP_FAILED` are typed
-  unavailable reasons.
+  unavailable reasons. A rollback journal present initially is SQLite-invalid/control-unavailable;
+  any later appearance/disappearance or parent entry-time drift is `SNAPSHOT_CHANGED`.
 - NFR-4: The reference 20-session/100,000-row synthetic evaluation MUST complete within 10,000 ms
   or produce a bounded failure; this is not a production SLO.
 - NFR-5: Every requirement/criterion/edge case MUST have a planned unique test anchor in the
@@ -163,7 +166,8 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 Given synthetic read-only fixtures, when the implementation evaluates them, then the report matches
 the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers. SQLite
 fixtures additionally prove the exact `[db,wal,shm]` typed tuple, DELETE/WAL presence rules, two
-equal complete copies, temp-only `mode=rw`/`query_only` logical reads and descriptor-safe cleanup.
+equal complete copies, the separately digest-bound six-checkpoint rollback-journal absence proof,
+temp-only `mode=rw`/`query_only` logical reads and descriptor-safe cleanup.
 
 Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
@@ -190,8 +194,9 @@ FR-24, FR-25, FR-26, FR-27 and FR-28.
 - EC-6: It must reject over-bound replay/object/row/time inputs without unbounded retries.
 - EC-7: It must preserve all input-member fingerprints after success and error, detect
   unlink/recreate and writer overlap, accept only stable DELETE absence or a complete WAL trio,
-  preserve the captured old snapshot for a writer begun after the stable boundary, clean every
-  temp descriptor/path, and never initialize stores.
+  reject an initially present rollback journal and any journal create/remove during capture even
+  if the final trio is unchanged, preserve the captured old snapshot for a writer begun after the
+  stable boundary, clean every temp descriptor/path, and never initialize stores.
 - EC-8: It must keep Task 20, production, NAS, restore execution and Release 2 claims false.
 
 ## API Contracts
@@ -218,11 +223,14 @@ records; they do not widen `ProviderId` or persisted schemas.
 
 `InputSnapshotFingerprint` is a closed API union of tree/file `SnapshotFingerprint` and
 `SQLiteSnapshotFingerprint`. The SQLite variant has exactly `subject_kind`, descriptor role/id/state,
-the ordered typed `[db,wal,shm]` member tuple, `logical_digest` and `catalog_digest`; it has no
-single-file `sha256`. Present members include parent/basename plus entry/fd metadata and full hash;
-absent WAL/SHM members include only parent/basename and `absent_at_validated_parent`. The structured
-contract's union registry, tuple-position schema, digest preimages, capture policy and planned RED
-case map are normative and MUST match this API, the matrix and the planned catalog exactly.
+the ordered typed `[db,wal,shm]` member tuple, a separate `rollback_journal_absence` proof,
+`logical_digest` and `catalog_digest`; it has no single-file `sha256`. Present members include
+parent/basename plus entry/fd metadata and full hash; absent WAL/SHM members include only
+parent/basename and `absent_at_validated_parent`. The rollback proof includes retained parent
+identity/mode/mtime/ctime, the exact safe `<db>-journal` basename, typed absence/no-entry-change
+markers, six ordered checkpoints and `proof_digest`. The structured contract's union registry,
+tuple-position schema, digest preimages, capture policy and planned RED case map are normative and
+MUST match this API, the matrix and the planned catalog exactly.
 
 The exact report metric field tuple is:
 `continuity`, `next_morning_availability`, `same_evening_availability`, `coverage`,
@@ -261,7 +269,7 @@ duplicate or self-including digest contract; it MUST treat R2-F4 reader projecti
 and reject `r2f5_reader`/`r2f4_writer` envelope creation. Synthetic `test_fixture` envelopes are
 test-only and MUST be rejected for production acceptance.
 
-The X8/X2 validator MUST parse `model_schema_ast`, `model_unions`,
+The X8/X3 validator MUST parse `model_schema_ast`, `model_unions`,
 `sqlite_member_tuple_schema`, `sqlite_capture` and `sqlite_planned_red_cases` rather than merely
 checking non-empty strings. Its
 generic resolver MUST walk object fields and `[]` tuple-item schemas for every included path, reject
@@ -292,7 +300,8 @@ No persistence migration or new writer-owned database is permitted.
 | `PreCaptureFailurePayloadV1` | sanitized unavailable reason, range/as-of, typed descriptor states, semantic hash | canonical payload hash excludes only its hash field; no path or fabricated observations |
 | `FrozenReliabilityVersions` | provider/adapter/policy/schema/calendar/universe/replication/restore IDs | exact equality across selected sessions |
 | `SQLitePresentMemberFingerprint` / `SQLiteAbsentMemberFingerprint` | typed role/presence, retained parent identity and safe basename; present entry/fd metadata and full hash or absent marker | DB is present-only; absent is sidecar-only; no unknown/extra fields |
-| `SQLiteSnapshotFingerprint` | descriptor identity, exact ordered `[db,wal,shm]` tuple, logical digest, catalog digest | only DELETE `[present,absent,absent]` or WAL `[present,present,present]`; no single-file sha256 |
+| `SQLiteRollbackJournalAbsenceProof` | typed absent journal sentinel, retained parent identity/mode/mtime/ctime, safe basename, no-entry-change marker, six checkpoints and proof digest | journal is never a tuple member, copied, opened or parsed; any create/remove fails closed |
+| `SQLiteSnapshotFingerprint` | descriptor identity, exact ordered `[db,wal,shm]` tuple, rollback-journal absence proof, logical digest, catalog digest | only DELETE `[present,absent,absent]` or WAL `[present,present,present]`; no single-file sha256 |
 | `InputSnapshotFingerprint` | closed tree/file-or-SQLite union | public snapshot/API input fingerprint shape; no nullable hybrid model |
 | `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only; SQLite source members copied to private temp trio |
 | `R2FAcceptanceReport` | status, metrics, markers, counters | no provider requests/writes; no production claim |
@@ -311,7 +320,8 @@ Every digest field is bound to exactly one design `digest_contracts` record nami
 root type, included paths, excluded self/digest/envelope fields, ordering, null encoding and a
 domain prefix. Directory fingerprints use the fixed `open`/`openat`/`fstat` full-tree algorithm;
 SQLite fingerprints use the fixed descriptor-copy/two-round/temp-trio algorithm, with source
-DB/WAL/SHM presence, parent/entry/fd identity and full-byte checks before/after every copy. The X8 limits
+DB/WAL/SHM presence, parent/entry/fd identity and full-byte checks before/after every copy plus the
+separate rollback-journal absence sentinel at all six checkpoints. The X8 limits
 are 100,000 entries, 512 MiB input bytes, 1,000,000 SQLite rows, 32 input roots, 20 sessions and
 3 replay samples; each over-limit result is `INPUT_LIMIT_EXCEEDED`/`unavailable`.
 
@@ -416,7 +426,7 @@ matrix rather than treating non-empty prose as evidence. No catalog entry exists
 | EC-25 | test_r2f5_req_ec_25 |
 | EC-26 | test_r2f5_req_ec_26 |
 
-## Planned SQLite zero-write RED anchor catalog (X2)
+## Planned SQLite zero-write RED anchor catalog (X3)
 
 These are concrete future pytest cases, not passing evidence. The crosswalk validator parses the
 scenario key and exact node token, compares them one-to-one with the matrix and structured contract,
@@ -436,6 +446,9 @@ and validates the tuple/schema/digest contract each case targets.
 | cleanup_success | test_r2f5_sqlite_temp_cleanup_succeeds |
 | cleanup_failure | test_r2f5_sqlite_temp_cleanup_failure_is_typed |
 | input_unchanged | test_r2f5_sqlite_input_members_remain_unchanged |
+| initial_rollback_journal_present | test_r2f5_sqlite_initial_rollback_journal_present_is_invalid |
+| rollback_journal_appears_disappears | test_r2f5_sqlite_rollback_journal_appears_then_disappears_is_changed |
+| stable_rollback_journal_absent_delete | test_r2f5_sqlite_stable_absent_rollback_journal_delete_is_accepted |
 
 ## Planned implementation tasks
 
@@ -571,11 +584,14 @@ missing/corrupt/locked inputs, path/redaction, fingerprints, API/CLI parity, sem
 isolation, bounded types and zero provider/write markers. Path tests MUST permit only lstat/open
 no-follow descriptor probes before enumeration/content reads.
 
-The SQLite RED subset MUST use the exact X2 catalog nodes for stable DELETE-mode absence, complete
+The SQLite RED subset MUST use the exact X3 catalog nodes for stable DELETE-mode absence, complete
 WAL trio/application, WAL-without-SHM rejection, writer-before/new, writer-during/changed,
 writer-after/old-valid, pathname unlink/recreate detection, temp-outside-input placement,
 uid/mode/no-follow/O_EXCL enforcement, cleanup success, typed cleanup failure and byte/metadata-
-unchanged inputs. These nodes are planned and absent at this amendment stage.
+unchanged inputs. It MUST also exercise an initially present rollback journal, a journal created and
+removed during capture (including a final DB/WAL/SHM trio equal to the initial tuple), and stable
+journal absence for an accepted DELETE-mode capture. These nodes are planned and absent at this
+amendment stage.
 
 Run RED, with no network or production roots:
 

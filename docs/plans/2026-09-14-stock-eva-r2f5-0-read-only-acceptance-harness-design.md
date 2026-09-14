@@ -10,8 +10,8 @@
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**SQLite amendment X2 base:** `394050d8728404b810c6cc3a8b4552edd02561c8` (clean committed base;
-X2 candidate not yet audited)
+**SQLite amendment X3 base:** `ec8d244184b231979f8fc2af7dc1029eb95b623d` (clean committed base;
+X3 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -70,7 +70,8 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
   fingerprint every input root and database by the exact descriptor-bound tree/logical-snapshot
   algorithms below. Directory entries use full streaming content SHA-256; SQLite uses its one
-  descriptor-copy/two-round/temp-trio algorithm, never a live database/WAL file hash through SQLite.
+  descriptor-copy/two-round/temp-trio algorithm plus rollback-journal absence sentinel, never a
+  live database/WAL file hash through SQLite.
   Descriptor metadata detects
   replacement; content hashing detects content drift. Any input over a declared limit MUST yield
   `INPUT_LIMIT_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate
@@ -197,6 +198,10 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   re-run descriptor-relative `lstat`/`openat(O_RDONLY|O_NOFOLLOW|O_CLOEXEC)` for each exact
   DB/WAL/SHM basename, compare the current directory entry and newly opened fd with the old fd,
   parent identity, metadata and full hash, and copy exact bytes to a secure private temp trio.
+  At the initial probe, both pre/post-copy points in each round and the final path re-probe, it MUST
+  also prove `<db>-journal` absent using descriptor-relative `lstat`/`fstatat(...,
+  AT_SYMLINK_NOFOLLOW)` from that same parent dirfd and `fstat` the unchanged parent
+  device/inode/mode/mtime/ctime; it MUST NOT copy, open, parse or ignore the journal.
   It MUST close and descriptor-safely delete every fd, connection and temp entry on every success,
   failure and exception path.
 - NFR-4: Error payloads MUST be sanitized to an allowlisted reason code and bounded safe detail;
@@ -213,7 +218,8 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   this is a real maximum fixture, not a micro-sample. Limits MUST be explicit: at most 100,000
   tree entries, 512 MiB total regular-file bytes per input, 1,000,000 SQLite rows per database,
   32 input roots/descriptors, 20 sessions and 3 replay samples. The SQLite fixture includes full
-  DB/WAL/SHM copy and two complete source fingerprint/copy rounds,
+  DB/WAL/SHM copy, two complete source fingerprint/copy rounds and all six rollback-journal
+  absence checkpoints,
   temp-trio WAL application, integrity and catalog reads, cleanup and descriptor verification; one
   bounded attempt may return `SNAPSHOT_CHANGED`/`unavailable`, never silently retry. Exceeding any
   limit returns `INPUT_LIMIT_EXCEEDED`/`unavailable`; the benchmark is not a sampled claim.
@@ -234,7 +240,11 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - NFR-13: Snapshot concurrency MUST be fail-closed: a root/database/WAL/SHM directory entry,
   descriptor, presence or content change before or during either copy round invalidates the whole
   report with `SNAPSHOT_CHANGED`; unlink/recreate MUST be detected even when the old fd remains
-  readable. A writer completed before capture yields the new stable snapshot, and a writer begun
+  readable. A rollback journal present initially is `SQLITE_SNAPSHOT_INVALID`/`unavailable`; one
+  that appears at any later checkpoint, including one that disappears again before the final
+  checkpoint, is `SNAPSHOT_CHANGED`. Parent directory mtime/ctime drift also fails closed so a
+  journal created and removed wholly between probes cannot be accepted merely because the final
+  DB/WAL/SHM trio is identical. A writer completed before capture yields the new stable snapshot, and a writer begun
   only after both rounds and the stable-capture boundary leaves the captured old snapshot valid.
   `max_attempts=1`; no retry may silently mix snapshots. Locked/busy or unprovable stability is
   `unavailable`.
@@ -302,7 +312,8 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 Given an existing private fixture, when CLI/API evaluation succeeds or fails, then every input
 fingerprint is byte/metadata identical before and after; each SQLite input has two byte-identical
 complete member-fingerprint/copy rounds from the same retained parent dirfd; DELETE absence or the
-full WAL trio is represented by the exact typed tuple; the temp root and files meet the placement,
+full WAL trio is represented by the exact typed tuple; `<db>-journal` is proved absent at all six
+checkpoints and bound into the fingerprint/digest; the temp root and files meet the placement,
 owner, mode, no-follow and cleanup contract; no missing control DB is initialized; and the captured
 snapshot is closed after use. Cleanup failure is typed `TEMP_CLEANUP_FAILED`, never a leaked path.
 
@@ -466,6 +477,8 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
   return `RESTORE_UNAVAILABLE` and never create a temporary restore destination.
 - EC-13: Any input root/database is replaced, symlinked, permission-denied, unlinked/recreated or
   changes fingerprint during read; return `SNAPSHOT_CHANGED`/unavailable and close all descriptors.
+  A rollback journal that appears after the initial absence proof is also `SNAPSHOT_CHANGED`, even
+  if it disappears and the final DB/WAL/SHM tuple equals the initial tuple.
   A writer completed before capture yields the new stable DB/WAL/SHM set; a writer overlapping
   either round fails closed; a writer begun after the stable-capture boundary leaves the captured
   old snapshot valid.
@@ -475,7 +488,8 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 - EC-15: SQLite DB is absent, locked or busy; the member tuple is neither DELETE
   `[present,absent,absent]` nor WAL `[present,present,present]`; or either round is unstable; return
   `SQLITE_SNAPSHOT_INVALID`/unavailable without initialization, migration, retry loop or lock
-  takeover. Private temp-copy cleanup is required on every path; an invalid temp root/owner/mode is
+  takeover. An initially present `<db>-journal` has the same typed SQLite-invalid/control-
+  unavailable outcome and MUST NOT be copied, opened or parsed. Private temp-copy cleanup is required on every path; an invalid temp root/owner/mode is
   `TEMP_STORAGE_UNAVAILABLE` and an unprovable cleanup is `TEMP_CLEANUP_FAILED`.
 - EC-16: An exception contains a path, token, SQL, URL, provider response or raw text; expose only
   its allowlisted reason and bounded safe identifier.
@@ -653,6 +667,28 @@ type SQLiteDbMemberFingerprint = SQLitePresentMemberFingerprint & { role: "db" }
 type SQLiteWalMemberFingerprint = SQLiteMemberFingerprint & { role: "wal" };
 type SQLiteShmMemberFingerprint = SQLiteMemberFingerprint & { role: "shm" };
 
+interface SQLiteRollbackJournalAbsenceProof {
+  role: "rollback_journal";
+  presence: "absent";
+  parent_device: number;
+  parent_inode: number;
+  parent_mode: number;
+  parent_mtime_ns: number;
+  parent_ctime_ns: number;
+  safe_basename: string;
+  absence_marker: "absent_at_all_capture_checkpoints";
+  directory_entry_change_marker: "none_observed";
+  probe_checkpoints: readonly [
+    "initial_probe",
+    "round_1_pre_copy",
+    "round_1_post_copy",
+    "round_2_pre_copy",
+    "round_2_post_copy",
+    "final_path_reprobe"
+  ];
+  proof_digest: string;
+}
+
 interface SQLiteSnapshotFingerprint {
   subject_kind: "sqlite";
   descriptor_role: "calendar" | "universe" | "replication" | "control";
@@ -663,6 +699,7 @@ interface SQLiteSnapshotFingerprint {
     SQLiteWalMemberFingerprint,
     SQLiteShmMemberFingerprint
   ];
+  rollback_journal_absence: SQLiteRollbackJournalAbsenceProof;
   logical_digest: string;
   catalog_digest: string;
 }
@@ -693,8 +730,12 @@ sidecar binds only that same verified parent identity, its safe basename and the
 `[present, absent, absent]` for a stable DELETE-mode database and `[present, present, present]`
 for a stable WAL trio. WAL-without-SHM, SHM-without-WAL, absent DB or any other role/presence
 combination is `SQLITE_SNAPSHOT_INVALID`/`unavailable`. A sidecar appearing or disappearing
-between probes is `SNAPSHOT_CHANGED`. `SQLiteSnapshotFingerprint` is the exact three-member tuple
-plus `logical_digest` and `catalog_digest`; it has no ambiguous single-file `sha256`. The public
+between probes is `SNAPSHOT_CHANGED`. The separate `rollback_journal_absence` proof binds the same
+parent identity and mode/mtime/ctime, exact `<db>-journal` safe basename, typed absence and
+no-directory-entry-change markers, all six probe checkpoints and its digest. It is not a fourth
+member: `sqlite_members` remains exactly `[db,wal,shm]`.
+`SQLiteSnapshotFingerprint` is the exact three-member tuple plus rollback-journal absence,
+`logical_digest` and `catalog_digest`; it has no ambiguous single-file `sha256`. The public
 `InputSnapshotFingerprint` union is exactly tree/file `SnapshotFingerprint` or
 `SQLiteSnapshotFingerprint`.
 
@@ -1165,7 +1206,8 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `SnapshotFingerprint` | tree/file identity | closed subject/role + present/absent descriptor identity and full tree/file hash | no SQLite-only nullable fields; changes across required probes invalidate report |
 | `SQLitePresentMemberFingerprint` | present DB/WAL/SHM member | parent identity, safe basename, entry/fd metadata and full-byte SHA-256 | regular file only; entry/new fd/old fd identity and hash must agree |
 | `SQLiteAbsentMemberFingerprint` | absent WAL/SHM member | parent identity, safe basename, `absent_at_validated_parent` | sidecar only; absence must remain true at every required probe |
-| `SQLiteSnapshotFingerprint` | SQLite identity | exact ordered `[db,wal,shm]` member tuple plus logical/catalog digests | DB present; only DELETE or full-WAL presence vectors; no single-file SHA-256 |
+| `SQLiteRollbackJournalAbsenceProof` | rollback journal sentinel | parent identity/mode/mtime/ctime, exact safe basename, absence/no-entry-change markers, six-checkpoint tuple and proof digest | absence-only; parent directory entry metadata must stay exact; journal is never a member, copied, opened, parsed or ignored |
+| `SQLiteSnapshotFingerprint` | SQLite identity | exact ordered `[db,wal,shm]` member tuple, rollback-journal absence proof and logical/catalog digests | DB present; only DELETE or full-WAL presence vectors; no single-file SHA-256 |
 | `InputSnapshotFingerprint` | public snapshot fingerprint | closed tree/file-or-SQLite union | every configured input role uses exactly one non-hybrid variant |
 | `CapturedSnapshot` | selected sessions | tuple of dates | exactly 20, sorted, unique and confirmed |
 | `CapturedSnapshot` | input fingerprints | tuple | one per every input root/control DB |
@@ -1251,7 +1293,7 @@ unavailable.
 <!-- R2F5_X8_CONTRACTS_JSON -->
 ```json
 {
-  "contract_version": "r2f5-x8-sqlite-x2",
+  "contract_version": "r2f5-x8-sqlite-x3",
   "roadmap_dimensions": [
     "continuity",
     "next_morning_availability",
@@ -1851,6 +1893,32 @@ unavailable.
       ],
       "tuple_item_schemas": {}
     },
+    "SQLiteRollbackJournalAbsenceProof": {
+      "object_fields": [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "parent_mode",
+        "parent_mtime_ns",
+        "parent_ctime_ns",
+        "safe_basename",
+        "absence_marker",
+        "directory_entry_change_marker",
+        "probe_checkpoints",
+        "proof_digest"
+      ],
+      "tuple_item_schemas": {
+        "probe_checkpoints": [
+          "initial_probe",
+          "round_1_pre_copy",
+          "round_1_post_copy",
+          "round_2_pre_copy",
+          "round_2_post_copy",
+          "final_path_reprobe"
+        ]
+      }
+    },
     "SQLiteSnapshotFingerprint": {
       "object_fields": [
         "subject_kind",
@@ -1858,6 +1926,7 @@ unavailable.
         "descriptor_id",
         "descriptor_state",
         "sqlite_members",
+        "rollback_journal_absence",
         "logical_digest",
         "catalog_digest"
       ],
@@ -2504,6 +2573,9 @@ unavailable.
     "SQLitePresentMemberFingerprint": [
       "full_sha256"
     ],
+    "SQLiteRollbackJournalAbsenceProof": [
+      "proof_digest"
+    ],
     "SQLiteSnapshotFingerprint": [
       "logical_digest",
       "catalog_digest"
@@ -2570,6 +2642,41 @@ unavailable.
       "overlaps_either_round": "SNAPSHOT_CHANGED",
       "begins_after_stable_capture": "captured_old_snapshot_valid"
     },
+    "rollback_journal_sentinel": {
+      "basename": "<db_basename>-journal",
+      "proof_model": "SQLiteRollbackJournalAbsenceProof",
+      "probe_from": "same_retained_validated_parent_dirfd",
+      "probe_operations": ["fstat_parent", "lstat_at_no_follow", "fstatat_at_symlink_nofollow"],
+      "parent_stat_fields": [
+        "parent_device",
+        "parent_inode",
+        "parent_mode",
+        "parent_mtime_ns",
+        "parent_ctime_ns"
+      ],
+      "checkpoints": [
+        "initial_probe",
+        "round_1_pre_copy",
+        "round_1_post_copy",
+        "round_2_pre_copy",
+        "round_2_post_copy",
+        "final_path_reprobe"
+      ],
+      "required_state": "absent_at_all_capture_checkpoints",
+      "directory_entry_change_marker": "none_observed",
+      "between_checkpoint_detection": "parent_directory_mtime_ctime_must_remain_exact",
+      "initial_present": {
+        "reason": "SQLITE_SNAPSHOT_INVALID",
+        "status": "unavailable",
+        "control_reason": "CONTROL_STATE_UNAVAILABLE",
+        "classification": "control_unavailable"
+      },
+      "appears_or_disappears_after_initial": "SNAPSHOT_CHANGED",
+      "copy": false,
+      "open": false,
+      "parse": false,
+      "policy": "sentinel_must_be_evaluated_not_ignored"
+    },
     "temp_storage": {
       "approved_root": "system_temp_outside_all_input_roots",
       "root_mode": "0700",
@@ -2587,7 +2694,7 @@ unavailable.
       "fsync_scope": "temporary_descriptors_only"
     },
     "direct_input_sqlite_open": false,
-    "input_member_or_presence_change": "SNAPSHOT_CHANGED",
+    "input_member_presence_or_rollback_journal_change": "SNAPSHOT_CHANGED",
     "locked_or_unstable": "unavailable",
     "cleanup": {
       "protocol": "finally_descriptor_relative_no_follow_close_unlink_fsync_rmdir",
@@ -2595,7 +2702,7 @@ unavailable.
       "failure_reason": "TEMP_CLEANUP_FAILED",
       "public_path_leak": false
     },
-    "semantic_fingerprint": "ordered_members_plus_logical_digest_plus_catalog_digest"
+    "semantic_fingerprint": "ordered_members_plus_rollback_journal_absence_plus_logical_and_catalog_digests"
   },
   "sqlite_planned_red_cases": {
     "delete_mode_absence": "test_r2f5_sqlite_delete_mode_absent_sidecars",
@@ -2609,7 +2716,10 @@ unavailable.
     "temp_modes": "test_r2f5_sqlite_temp_owner_modes_and_no_follow",
     "cleanup_success": "test_r2f5_sqlite_temp_cleanup_succeeds",
     "cleanup_failure": "test_r2f5_sqlite_temp_cleanup_failure_is_typed",
-    "input_unchanged": "test_r2f5_sqlite_input_members_remain_unchanged"
+    "input_unchanged": "test_r2f5_sqlite_input_members_remain_unchanged",
+    "initial_rollback_journal_present": "test_r2f5_sqlite_initial_rollback_journal_present_is_invalid",
+    "rollback_journal_appears_disappears": "test_r2f5_sqlite_rollback_journal_appears_then_disappears_is_changed",
+    "stable_rollback_journal_absent_delete": "test_r2f5_sqlite_stable_absent_rollback_journal_delete_is_accepted"
   },
   "sqlite_catalogs": {
     "replication_sidecar": {
@@ -4746,6 +4856,30 @@ unavailable.
       "domain_separation_prefix": "none; standard SHA-256 of exact full member bytes"
     },
     {
+      "field": "SQLiteRollbackJournalAbsenceProof.proof_digest",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SQLiteRollbackJournalAbsenceProof",
+      "included_field_paths": [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "parent_mode",
+        "parent_mtime_ns",
+        "parent_ctime_ns",
+        "safe_basename",
+        "absence_marker",
+        "directory_entry_change_marker",
+        "probe_checkpoints"
+      ],
+      "excluded_fields": [
+        "proof_digest"
+      ],
+      "ordering": "object keys sorted; checkpoint tuple order retained",
+      "null_encoding": "absence forbidden; sentinel absence is a typed object",
+      "domain_separation_prefix": "r2f5/sqlite-rollback-journal-absence-v1\\0"
+    },
+    {
       "field": "SQLiteSnapshotFingerprint.logical_digest",
       "canonicalization_version": "sqlite-typed-length-prefixed-v2",
       "root_object_type": "SQLiteLogicalSnapshotPreimage",
@@ -4759,7 +4893,8 @@ unavailable.
       "excluded_fields": [
         "logical_digest",
         "catalog_digest",
-        "sqlite_members"
+        "sqlite_members",
+        "rollback_journal_absence"
       ],
       "ordering": "catalog table order, then declared ORDER BY tuple, then typed row fields",
       "null_encoding": "explicit SQLite null type marker and length zero",
@@ -4784,7 +4919,8 @@ unavailable.
       "excluded_fields": [
         "catalog_digest",
         "logical_digest",
-        "sqlite_members"
+        "sqlite_members",
+        "rollback_journal_absence"
       ],
       "ordering": "object keys sorted; catalog arrays use declared canonical order",
       "null_encoding": "absence forbidden",
@@ -5025,8 +5161,8 @@ unavailable.
         "snapshot_sha256",
         "semantic_report_sha256"
       ],
-      "ordering": "descriptor_role then descriptor_id byte order; SQLite member tuple is db,wal,shm",
-      "null_encoding": "typed tree/file absence or typed SQLite sidecar absence, never omitted",
+      "ordering": "descriptor_role then descriptor_id byte order; SQLite member tuple db,wal,shm then rollback-journal proof",
+      "null_encoding": "typed tree/file, SQLite sidecar and rollback-journal absence, never omitted",
       "domain_separation_prefix": "r2f5/input-fingerprints-v2\\0"
     },
     {
@@ -5063,8 +5199,8 @@ unavailable.
         "semantic_report_sha256",
         "diagnostic_envelope"
       ],
-      "ordering": "object keys sorted; input descriptors role/id order; SQLite members db,wal,shm",
-      "null_encoding": "typed tree/file or SQLite sidecar absence retained",
+      "ordering": "object keys sorted; input descriptors role/id order; SQLite members db,wal,shm then rollback-journal proof",
+      "null_encoding": "typed tree/file, SQLite sidecar and rollback-journal absence retained",
       "domain_separation_prefix": "r2f5/snapshot-identity-v2\\0"
     },
     {
@@ -5202,7 +5338,7 @@ unavailable.
 ```
 
 `R2F5_X8_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
-excluding Markdown fences) is `45f1dae4526de4cd411f63d5aa0bf5592fcc067e85b41514ad47a0ea0864cf55`.
+excluding Markdown fences) is `5eb31ad1ea9b88d6d2797842b64e3f2cfa7fef7dd0e682a552608c53d02ddcdd`.
 
 The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
 status matrix, reducer field references, envelope fields, creator allowlists, date/time formats,
@@ -5211,7 +5347,7 @@ and matrix. Every digest-typed model field MUST occur exactly once in `digest_co
 field MUST be excluded from its included paths. This is structural drift detection only; semantic
 hash proof and human review of the reducers remain mandatory. `model_schema_ast` is the closed
 object/tuple schema, and `digest_fields_by_model` is its explicit digest-field index; both are
-machine-readable and are cross-checked against all 64 digest contracts.
+machine-readable and are cross-checked against all 65 digest contracts.
 Digest dependency nodes are fully qualified tuples `(root_object_type, digest_field_path)` and are
 constructed in deterministic sorted order. The resolver first validates an included path against
 the named source root (including tuple-item paths such as `events[].evidence_sha256`), returns its
@@ -5263,7 +5399,9 @@ bound returns `INPUT_LIMIT_EXCEEDED`/`unavailable`. Before/after tree digests MU
 10-second/100,000-row fixture benchmark includes this complete tree hash; production inputs over
 the limits cannot be ready. The tree walker MUST NOT own or double-hash SQLite members; the SQLite
 algorithm below full-hashes and copies the DB/WAL/SHM members without opening an input through
-SQLite.
+SQLite. It also reserves `<db>-journal` as an absence-only rollback-journal sentinel: the tree
+walker MUST NOT treat it as an ordinary entry, and SQLite capture MUST evaluate it without copying,
+opening or parsing it.
 
 ### Unique SQLite logical snapshot fingerprint
 
@@ -5292,6 +5430,22 @@ any appearance/disappearance, entry/fd mismatch, metadata/hash drift or unequal 
 new stable snapshot; one overlapping either round is `SNAPSHOT_CHANGED`; one begun after both rounds
 and the declared stable-capture boundary leaves the captured old snapshot valid.
 
+`<db>-journal` is an independent fail-closed rollback-journal sentinel, not a fourth member of the
+tuple. At exactly `initial_probe`, `round_1_pre_copy`, `round_1_post_copy`,
+`round_2_pre_copy`, `round_2_post_copy` and `final_path_reprobe`, the evaluator MUST use the same
+retained parent dirfd to `fstat` the parent and perform both descriptor-relative `lstat` and
+`fstatat(..., AT_SYMLINK_NOFOLLOW)` for the exact safe journal basename. All six probes MUST prove
+`ENOENT`, and the parent device/inode/mode/mtime_ns/ctime_ns MUST remain exact. A journal present at
+`initial_probe` returns `SQLITE_SNAPSHOT_INVALID`/`unavailable` and classifies the control as
+unavailable. After initial absence, an observed journal, an observed present-then-absent transition,
+or parent directory mtime/ctime drift indicating a create/remove wholly between checkpoints returns
+`SNAPSHOT_CHANGED`, even if the final DB/WAL/SHM tuple and bytes equal the initial tuple. This
+deliberately fail-closed parent-directory test can reject an unrelated entry mutation. The journal
+MUST NOT be copied, opened, parsed or silently ignored. Its typed proof binds parent identity and
+mode/times, basename, absence/no-entry-change markers and ordered checkpoint tuple into
+`SQLiteRollbackJournalAbsenceProof.proof_digest`; that proof is a field of
+`SQLiteSnapshotFingerprint` and therefore enters the snapshot digest preimage.
+
 The secure temp root MUST be under an approved system temporary root and outside every input root
 and input-root alias. It MUST be created/opened no-follow, owned by the current uid and mode `0700`.
 Each round's files MUST preserve SQLite's exact trio naming, be created descriptor-relatively with
@@ -5308,8 +5462,9 @@ The logical digest preimage is `r2f5/sqlite-logical-v2\0` plus journal mode, sch
 user-version and ordered typed row records. The catalog digest preimage is
 `r2f5/sqlite-catalog-v1\0` plus the fixed
 role/version/master/table/column/PK/order/system/source contract. `SQLiteSnapshotFingerprint` is
-the ordered member tuple plus both digests; `SnapshotIdentity.input_fingerprint_sha256` binds the
-entire object. Temporary writes are not input writes and never enter public paths. A `finally`
+the ordered member tuple plus the rollback-journal absence proof and both logical/catalog digests;
+`SnapshotIdentity.input_fingerprint_sha256` binds the entire object. Temporary writes are not input
+writes and never enter public paths. A `finally`
 cleanup MUST close connections/fds, unlink entries relative to retained temp dirfds no-follow,
 fsync only temp descriptors where required, remove both round directories/root and prove absence.
 Success, failure and exception paths have the same cleanup postcondition. Cleanup failure returns
