@@ -1,13 +1,13 @@
 # Stock EVA R2-F5.0 Read-only Acceptance Harness Implementation Plan
 
-> **Planning state:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO. This plan is
+> **Planning state:** SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO. This plan is
 > not implementation evidence and does not start Task 20.
 
 **Author:** Codex R2-F delivery lead
 
 **Date:** 2026-09-14 (Asia/Shanghai)
 
-**Status:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
+**Status:** SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO
 
 **Reviewers:** Independent SPEC audit reviewed X8; implementation QUALITY review remains pending
 
@@ -19,6 +19,8 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (must remain the starting identity)
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
+
+**Amendment base:** `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -49,7 +51,9 @@ design first and stop implementation until the reviewed specification is amended
 - FR-2: It MUST validate paths and capture/fingerprint one immutable snapshot before evaluation;
   each directory uses root-fd, component-by-component `openat(O_DIRECTORY|O_NOFOLLOW)` and
   parent-fd leaf reads with before/after identity checks, while each SQLite database uses the
-  unique read-only logical-snapshot algorithm, with no bounded sampling claim.
+  descriptor-copy/temp-trio algorithm: source DB/WAL/SHM members are opened no-follow, copied
+  fully to private temporary storage, and fingerprint-verified before/after; no direct input-DB
+  SQLite open or bounded sampling claim is permitted.
 - FR-3: It MUST select exactly 20 confirmed consecutive sessions and preserve missing-middle,
   19-versus-20 and future/PIT distinctions.
 - FR-4: It MUST freeze and compare the complete version vector, apply inclusive Shanghai cutoffs,
@@ -58,7 +62,9 @@ design first and stop implementation until the reviewed specification is amended
   records without mutation and fail closed on missing, corrupt, locked or changed inputs.
 - FR-6: It MUST expose the exact report, API, CLI exits, mutation markers and redaction contract.
 - FR-7: It MUST stop at explicit input-root, tree-entry, byte, SQLite-row, session and replay-
-  sample limits, return `INPUT_LIMIT_EXCEEDED` when exceeded, and record measured counters.
+  sample limits, return `INPUT_LIMIT_EXCEEDED` when exceeded, and record measured counters. The
+  SQLite copy/stability protocol is bounded to one attempt and MUST clean its private temp dir on
+  every success, failure and exception path.
 - FR-8: It MUST leave protected predecessor readers, schemas, fixtures and public models compatible.
 - FR-9: It MUST expose separate MetricResult fields for every roadmap Section 10 dimension, including
   canonical integrity, recovery, failover, adjustment, error handling, local/NAS isolation,
@@ -259,7 +265,7 @@ No persistence migration or new writer-owned database is permitted.
 | `TestEnvelope<T>` | same ten-field shape with literal test schema and `creator_kind="test_fixture"` | test-only endpoint/type; production reader rejects it and readers never create either envelope |
 | `PreCaptureFailurePayloadV1` | sanitized unavailable reason, range/as-of, typed descriptor states, semantic hash | canonical payload hash excludes only its hash field; no path or fabricated observations |
 | `FrozenReliabilityVersions` | provider/adapter/policy/schema/calendar/universe/replication/restore IDs | exact equality across selected sessions |
-| `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only |
+| `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only; SQLite source members copied to private temp trio |
 | `R2FAcceptanceReport` | status, metrics, markers, counters | no provider requests/writes; no production claim |
 | `SnapshotIdentity` | requested range, Shanghai as-of, fingerprints, version digest | all evaluation reads bind to one identity |
 | `SecondaryQualificationProjection` | existing provider_record/qualification_window fields | missing/unqualified is not_ready/unavailable; no invented IDs/hashes |
@@ -275,7 +281,8 @@ No persistence migration or new writer-owned database is permitted.
 Every digest field is bound to exactly one design `digest_contracts` record naming canonicalization,
 root type, included paths, excluded self/digest/envelope fields, ordering, null encoding and a
 domain prefix. Directory fingerprints use the fixed `open`/`openat`/`fstat` full-tree algorithm;
-SQLite fingerprints use the fixed URI read-only transaction/logical-row algorithm. The X8 limits
+SQLite fingerprints use the fixed descriptor-copy/temp-trio algorithm, with source DB/WAL/SHM
+identity and full-byte checks before/after copy. The X8 limits
 are 100,000 entries, 512 MiB input bytes, 1,000,000 SQLite rows, 32 input roots, 20 sessions and
 3 replay samples; each over-limit result is `INPUT_LIMIT_EXCEEDED`/`unavailable`.
 
@@ -528,8 +535,9 @@ a test failure, not a tolerated RED condition.
 ### Task 2 — Read-only snapshot and report domain
 
 Implement the minimum Pydantic models and pure evaluator from the design. Reuse strict readers;
-open existing SQLite stores read-only; capture descriptors and fingerprints; enforce every bound,
-hash and reason precedence. Add strict immutable qualification/admission, failover-drill and
+capture source DB/WAL/SHM descriptors and full bytes into a private temporary trio before any
+SQLite logical read; enforce the two-fingerprint stability protocol, every bound, hash and reason
+precedence, and unconditional temporary cleanup. Add strict immutable qualification/admission, failover-drill and
 replication/restore completed-record snapshot readers. Replay may invoke only an injected offline
 adapter/normalizer on immutable bytes; reject unknown identity before construction. Do not add
 schema migration, persistence, writer, reconcile, drain, mount or restore-execution seams.
@@ -597,4 +605,4 @@ this SPEC APPROVED stage.
 
 Task 0's validator/crosswalk and the independent X8 SPEC review are complete; until implementation,
 focused/full/static verification, installed readback and the separate human gate, the state is
-`SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.
+`SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO`.

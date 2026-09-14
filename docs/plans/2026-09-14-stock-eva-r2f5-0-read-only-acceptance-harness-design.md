@@ -4,11 +4,13 @@
 
 **Date:** 2026-09-14 (Asia/Shanghai)
 
-**Status:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
+**Status:** SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
+
+**Amendment base:** `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -67,7 +69,7 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
   fingerprint every input root and database by the exact descriptor-bound tree/logical-snapshot
   algorithms below. Directory entries use full streaming content SHA-256; SQLite uses its one
-  read-only transaction algorithm, never a live database/WAL file hash. Descriptor metadata detects
+  descriptor-copy/temp-trio algorithm, never a live database/WAL file hash. Descriptor metadata detects
   replacement; content hashing detects content drift. Any input over a declared limit MUST yield
   `INPUT_LIMIT_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate
   the report and preserve the prior state.
@@ -185,8 +187,11 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   manifest, pointer, partition, selection, evidence or status schema may be rewritten or widened.
 - NFR-2: Report ordering, JSON serialization, reason precedence and metric arithmetic MUST be
   deterministic for identical captured bytes, clock and arguments.
-- NFR-3: The evaluator MUST use read-only SQLite connections and descriptor-bound no-follow reads;
-  it MUST close descriptors/connections on every success and failure path.
+- NFR-3: The evaluator MUST never open an input SQLite path directly. It MUST open each existing
+  DB/WAL/SHM member through a validated parent dirfd with no-follow read-only descriptors, acquire
+  a non-writing read-lock/consistent-capture proof, copy full bytes to a private temp trio, verify
+  source identities and full hashes before/after, and close/delete every descriptor, connection and
+  temp path on every success, failure and exception path.
 - NFR-4: Error payloads MUST be sanitized to an allowlisted reason code and bounded safe detail;
   raw provider responses, credentials, URLs, SQL, environment values and exception messages MUST
   NOT cross the API/CLI boundary.
@@ -200,9 +205,11 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   The reference fixture MUST contain 20 sessions and 100,000 rows and complete within 10,000 ms;
   this is a real maximum fixture, not a micro-sample. Limits MUST be explicit: at most 100,000
   tree entries, 512 MiB total regular-file bytes per input, 1,000,000 SQLite rows per database,
-  32 input roots/descriptors, 20 sessions and 3 replay samples. Exceeding any limit returns
-  `INPUT_LIMIT_EXCEEDED`/`unavailable`; the benchmark includes full hashing and logical SQLite
-  snapshot work in its 10,000 ms budget, not a sampled claim.
+  32 input roots/descriptors, 20 sessions and 3 replay samples. The SQLite fixture includes full
+  DB/WAL/SHM copy, two complete source fingerprint validations (or one lock-proven stable capture),
+  temp-trio WAL application, integrity and catalog reads, cleanup and descriptor verification; one
+  bounded attempt may return `SNAPSHOT_CHANGED`/`unavailable`, never silently retry. Exceeding any
+  limit returns `INPUT_LIMIT_EXCEEDED`/`unavailable`; the benchmark is not a sampled claim.
 - NFR-8: A snapshot identity MUST bind the requested range, trusted Shanghai clock observation,
   input fingerprints and frozen version set. A report MUST be rejected if any bound field changes.
 - NFR-9: Tests MUST cover RED, GREEN, focused acceptance, full regression, static checks,
@@ -217,8 +224,10 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - NFR-12: Replication lag, remote verification and restore duration MUST be passable only when a
   reviewed R2-F4 policy/evidence record supplies numeric thresholds. Missing thresholds or a
   `LOCAL_CHAIN_ONLY` trust scope MUST be `not_ready`/`unavailable`, never guessed.
-- NFR-13: Snapshot concurrency MUST be fail-closed: a root/database descriptor or content change
-  before, during or after any read invalidates the whole report; no retry may silently mix snapshots.
+- NFR-13: Snapshot concurrency MUST be fail-closed: a root/database/WAL/SHM descriptor or content
+  change before or during copy invalidates the whole report with `SNAPSHOT_CHANGED`; a writer after
+  the stable capture is allowed to leave the captured old snapshot valid. No retry may silently mix
+  snapshots. Locked/busy or unprovable read-lock stability is `unavailable`.
 - NFR-14: The semantic report MUST use canonical UTF-8 JSON with sorted keys, compact separators,
   `ensure_ascii=false`, `allow_nan=false` and a domain-separated SHA-256; volatile diagnostics MUST
   be outside that digest.
@@ -443,12 +452,15 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 - EC-12: Restore drill is absent, not terminal, hash-invalid, source-changing or destination-unsafe;
   return `RESTORE_UNAVAILABLE` and never create a temporary restore destination.
 - EC-13: Any input root/database is replaced, symlinked, permission-denied or changes fingerprint
-  during read; return unavailable and close all descriptors.
+  during read; return `SNAPSHOT_CHANGED`/unavailable and close all descriptors. A writer before
+  capture yields the new stable DB/WAL/SHM set; a writer during copy fails closed; a writer after
+  stable capture leaves the captured old snapshot valid.
 - EC-14: Path is relative, `/`, home, a configured mutable root, unresolved-variable syntax or an
   ancestor/descendant overlap; reject after only allowed `lstat`/`O_NOFOLLOW` descriptor probes and
   before directory enumeration/content reads; do not create it.
-- EC-15: SQLite is absent or locked; return unavailable without initialization, migration, retry
-  loop or lock takeover.
+- EC-15: SQLite is absent, locked, busy or has an unstable DB/WAL/SHM set; return unavailable
+  without initialization, migration, retry loop or lock takeover. Private temp-copy cleanup is
+  required on every error path.
 - EC-16: An exception contains a path, token, SQL, URL, provider response or raw text; expose only
   its allowlisted reason and bounded safe identifier.
 - EC-17: Object/row/sample bound is exceeded or evaluation exceeds 10,000 ms; stop at the bound and
@@ -2297,6 +2309,25 @@ unavailable.
     "tuple_path_syntax": "events[].field",
     "opaque_external_leaf": true,
     "unordered_short_name_aliasing": false
+  },
+  "sqlite_capture": {
+    "algorithm": "descriptor-copy-two-fingerprint-v1",
+    "input_members": ["db", "-wal", "-shm"],
+    "member_discovery": "validated_parent_dirfd_only",
+    "open_flags": ["O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC"],
+    "source_write_policy": "zero_write",
+    "stability_protocol": "read_lock_or_consistent_capture_protocol",
+    "copy_strategy": "full_bytes_to_private_mkdtemp_outside_input_roots",
+    "copy_verification": ["fstat_before", "full_sha256", "size", "mtime_ns", "inode", "fstat_after"],
+    "source_fingerprint_rounds": 2,
+    "max_attempts": 1,
+    "wal_policy": "temp_trio_wal_must_be_applied_before_logical_read",
+    "temp_sqlite_policy": "normal_or_wal_aware_temp_connection_only",
+    "direct_input_sqlite_open": false,
+    "input_wal_or_shm_change": "SNAPSHOT_CHANGED",
+    "locked_or_unstable": "unavailable",
+    "cleanup": "always_close_delete_temp_on_success_failure_exception",
+    "semantic_fingerprint": "logical_snapshot_digest_plus_source_member_descriptors"
   },
   "sqlite_catalogs": {
     "replication_sidecar": {
@@ -4827,7 +4858,7 @@ unavailable.
 ```
 
 `R2F5_X8_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
-excluding Markdown fences) is `f0b4ae16cc3457ac51062acb51456974fede4ebc3293e866d486a0fb6f312dac`.
+excluding Markdown fences) is `bba0d429ca52019dcc04c1bc94a28015713d4a03fd0b7b611e6182316474137d`.
 
 The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
 status matrix, reducer field references, envelope fields, creator allowlists, date/time formats,
@@ -4891,38 +4922,48 @@ algorithm below owns the database, WAL and SHM state.
 
 ### Unique SQLite logical snapshot fingerprint
 
-SQLite has one algorithm, not a choice of file or page hashing. The evaluator MUST open an existing
-database with a read-only URI `mode=ro&immutable=false`, set `PRAGMA query_only=ON`, issue `BEGIN`
-and retain that transaction until capture ends. It MUST read `sqlite_schema`, `PRAGMA page_count`,
-`PRAGMA user_version`, and every catalog-listed table using its fixed deterministic `ORDER BY`
-clause and
-typed length-prefixed encoding (including explicit null/type markers). The logical digest preimage
-is `r2f5/sqlite-logical-v1\0` plus schema, page-count, user-version and ordered row records. It
-MUST NOT hash the live database, `-wal` or `-shm` bytes directly. A busy/locked database is
-`unavailable`; a missing database is not opened or created. The transaction MUST remain open through
-the captured snapshot, then roll back/close without writes or journal creation.
-The Python implementation MUST use `sqlite3.connect(uri, uri=True)` with those URI flags and MUST
-not call `backup`, `VACUUM`, migration, initialization or any writer API; `query_only=ON` plus the
-read transaction is the zero-write guarantee.
+SQLite input files MUST never be opened directly by SQLite. macOS SQLite can update a `-shm`
+mtime while a non-immutable read-only connection reads a WAL, while an immutable connection can
+ignore the WAL and locks; neither behavior is an acceptable physical zero-write contract. For
+each database, and each existing `-wal`/`-shm` sibling, the evaluator MUST open the member from the
+validated parent directory fd with `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`, fstat its device/inode/mode/size/
+mtime, and reject symlinks, special files, path escape or a missing required sibling. The parent
+directory fd and every member descriptor are part of the captured identity.
 
-The evaluator MUST record descriptor identity before and after the transaction and reject changes
-to device/inode/size/mtime or logical version fields as `SNAPSHOT_CHANGED`. WAL changes are allowed
-while this consistent read transaction remains stable; `-wal`/`-shm` are not independently enumerated
-or hashed. If a directory tree also contains the database, the tree walker MUST exclude that database
-and its `-wal`/`-shm` siblings by descriptor-bound database ownership; the SQLite logical fingerprint
-owns them, preventing double hashing or conflicting digests. The actual `sqlite_master` name/type
-set MUST equal the catalog's `sqlite_master_allowlist`; every catalog table MUST match its declared
-columns/types, primary-key tuple, order tuple and `user_version`. Missing, extra, type, key, order
-or version drift is `unavailable`. The fixed current versions are `PRAGMA user_version=0` for
+Before copying, the evaluator MUST obtain the existing read-lock/consistent-capture protocol
+without writing the input. It MUST copy all three members' bytes to a private `mkdtemp` directory
+outside every input root, then fstat and full-stream SHA-256 verify each source before/after copy,
+including size, mtime and inode, and verify the parent directory identity before/after. The source
+DB/WAL/SHM set MUST be stable as a set: either the protocol's read lock proves stability or a second
+complete fingerprint-copy round MUST equal the first. `max_attempts=1`; lock/busy or any mismatch is
+`SNAPSHOT_CHANGED`/`unavailable`, with no retry wager. A writer before capture therefore yields the
+new stable set, a writer during copy yields `SNAPSHOT_CHANGED`, and a writer after the stable capture
+does not invalidate that captured old snapshot.
+
+On the temporary copy only, the evaluator MAY use a normal SQLite connection or WAL-aware temporary
+trio connection. If a WAL exists, it MUST be applied/read as part of that temporary trio (for example
+by a normal temp connection/backup operation that writes only the temp directory); `immutable=true`
+MUST NOT be used in a way that ignores the copied WAL. The evaluator MUST then read `sqlite_schema`,
+`PRAGMA page_count`, `PRAGMA user_version`, and every catalog-listed table with fixed deterministic
+`ORDER BY` and typed length-prefixed encoding. The logical digest preimage is
+`r2f5/sqlite-logical-v2\0` plus schema, page-count, user-version and ordered row records. Temporary
+writes are not input writes, are not persistent, never enter report paths and MUST be closed and
+deleted on success, error or exception. Missing, corrupt, locked or integrity-invalid copies are
+`unavailable`; cleanup failure is also unavailable and MUST not leak a path.
+
+The actual `sqlite_master` name/type set MUST equal `sqlite_master_allowlist`; every catalog table
+MUST match declared columns/types, primary-key/order tuple and `user_version`. Missing, extra, type,
+key, order or version drift is `unavailable`. The fixed versions are `PRAGMA user_version=0` for
 `daily_shadow`, `shadow_registry` and `calendar_generation`, and `1` for `replication_sidecar` and
 `universe`; zero-valued stores also require existing schema-version/migration rows and DDL digest
 where present. Each catalog's `schema_version_source` identifies its pragma, exact
-`sqlite_master`/column source and migration/DDL identity source. These are observations only: the
-reader MUST NOT set a pragma, run a migration, insert migration rows, initialize a missing store
-or rewrite a schema identity. The daily circuit catalog uses the
-authoritative `endpoint` primary key and event `endpoint` foreign-key columns; `circuit_id` is not
-accepted. The SQLite limit is 1,000,000 rows per database and 512 MiB encoded logical bytes;
-exceeding either returns `INPUT_LIMIT_EXCEEDED`.
+`sqlite_master`/column source and migration/DDL identity source. The reader MUST NOT set a pragma,
+run a migration, initialize a missing store, rewrite schema identity or open an input DB through
+SQLite. The daily circuit catalog uses the authoritative `endpoint` primary key and event `endpoint`
+foreign-key columns; `circuit_id` is not accepted. The SQLite limit is 1,000,000 rows per database
+and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`. The semantic
+fingerprint is the logical snapshot digest plus the verified source member descriptor identities;
+raw temp paths and volatile elapsed/cleanup diagnostics are excluded.
 
 ## R2-F5.0 metric contract and evidence sources
 
@@ -5104,4 +5145,4 @@ The independent SPEC review confirms every FR/NFR/AC/EC and the crosswalk valida
 separate implementation, focused/full/static verification, installed readback and human gate occur,
 the authoritative state remains:
 
-`SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.
+`SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO`.

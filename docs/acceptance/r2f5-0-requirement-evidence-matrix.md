@@ -1,4 +1,4 @@
-# R2-F5.0 requirement-evidence matrix (SPEC APPROVED)
+# R2-F5.0 requirement-evidence matrix (SPEC APPROVED - AMENDMENT CANDIDATE)
 
 This is the normative planning crosswalk for Task 19. It is intentionally an evidence plan, not
 an implementation or acceptance result. Every row is unique, every acceptance criterion names
@@ -8,11 +8,17 @@ pass, or establish Task 20 production soak.
 X8 revision base: `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
+Amendment base: `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited).
+
 Approval metadata: independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. L1 is the catalog-source validator's `startswith` checks, which MUST be
 tightened to exact comparisons during implementation. This metadata-only approval commit is not
 itself audited and does not claim RED, GREEN, implementation, Task 20 or production GO. Matrix
 rows remain `PLANNED` evidence metadata, not execution results.
+
+Amendment state: `SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO`.
+The SQLite zero-write amendment records observed macOS WAL/SHM behavior and is not yet approved;
+its validator and implementation changes remain pending review.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;
 the validator checks that IDs occur exactly once in this table, that design requirements exist,

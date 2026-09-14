@@ -465,7 +465,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         "## Out of Scope",
     ):
         assert heading in text
-    assert "SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
+    assert "SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
     assert "a7d3be1c6b9f760c659470fffcf6299bcd8ddf73" in text
     assert "MUST" in text and "MUST NOT" in text
@@ -526,7 +526,7 @@ def test_r2f5_no_anchor_or_result_is_claimed() -> None:
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in matrix
     assert "No catalog entry exists or passes yet" in PLAN.read_text(encoding="utf-8")
     assert "Task 20" in matrix and "production soak" in matrix
-    assert "IMPLEMENTATION NOT STARTED" in PLAN.read_text(encoding="utf-8")
+    assert "IMPLEMENTATION PAUSED" in PLAN.read_text(encoding="utf-8")
     assert "NO-GO" in PLAN.read_text(encoding="utf-8")
     assert "Do not create a service" in PLAN.read_text(encoding="utf-8")
 
@@ -1163,6 +1163,54 @@ def test_r2f5_x8_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
             payload_type == "WindowEvidenceBundlePayload" or f"interface {payload_type} " in design
         )
     assert "r2f5_reader" in design and "MUST NOT appear as envelope creators" in design
+
+
+def test_r2f5_sqlite_zero_write_amendment_forbids_direct_input_open() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    plan = PLAN.read_text(encoding="utf-8")
+    contract = _x8_contract(design)
+    capture = contract["sqlite_capture"]
+    assert capture == {
+        "algorithm": "descriptor-copy-two-fingerprint-v1",
+        "input_members": ["db", "-wal", "-shm"],
+        "member_discovery": "validated_parent_dirfd_only",
+        "open_flags": ["O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC"],
+        "source_write_policy": "zero_write",
+        "stability_protocol": "read_lock_or_consistent_capture_protocol",
+        "copy_strategy": "full_bytes_to_private_mkdtemp_outside_input_roots",
+        "copy_verification": [
+            "fstat_before",
+            "full_sha256",
+            "size",
+            "mtime_ns",
+            "inode",
+            "fstat_after",
+        ],
+        "source_fingerprint_rounds": 2,
+        "max_attempts": 1,
+        "wal_policy": "temp_trio_wal_must_be_applied_before_logical_read",
+        "temp_sqlite_policy": "normal_or_wal_aware_temp_connection_only",
+        "direct_input_sqlite_open": False,
+        "input_wal_or_shm_change": "SNAPSHOT_CHANGED",
+        "locked_or_unstable": "unavailable",
+        "cleanup": "always_close_delete_temp_on_success_failure_exception",
+        "semantic_fingerprint": "logical_snapshot_digest_plus_source_member_descriptors",
+    }
+    assert "mode=ro&immutable=false" not in design
+    assert "SQLite input files MUST never be opened directly by SQLite" in design
+    for phrase in ("fstat", "full-stream SHA-256", "writer during copy", "captured old snapshot"):
+        assert phrase in design
+    for text in (design, plan):
+        assert "private `mkdtemp`" in text or "private temporary" in text
+        assert "DB/WAL/SHM" in text
+        assert "WAL" in text and "temp-trio" in text
+        assert (
+            "close/delete" in text
+            or "closed and deleted" in text
+            or "unconditional temporary cleanup" in text
+        )
+        assert "max_attempts=1" in text or "one attempt" in text
+    assert "writer after" in design
 
 
 def test_r2f5_x8_model_ast_roots_and_tuple_items_are_explicit() -> None:
