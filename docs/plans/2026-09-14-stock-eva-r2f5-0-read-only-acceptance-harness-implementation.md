@@ -1,15 +1,15 @@
 # Stock EVA R2-F5.0 Read-only Acceptance Harness Implementation Plan
 
-> **Planning state:** SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO. This plan is
+> **Planning state:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO. This plan is
 > not implementation evidence and does not start Task 20.
 
 **Author:** Codex R2-F delivery lead
 
 **Date:** 2026-09-14 (Asia/Shanghai)
 
-**Status:** SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
+**Status:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
 
-**Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
+**Reviewers:** Independent SPEC audit reviewed X8; implementation QUALITY review remains pending
 
 **Goal:** Implement Task 19 as a bounded, read-only evaluator for a proposed exact 20-session
 R2-F5 window, consuming existing strict readers and immutable drill evidence only.
@@ -19,6 +19,11 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (must remain the starting identity)
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
+
+**Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
+SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
+checks MUST be tightened to exact comparisons during implementation. This metadata-only approval
+commit is not itself audited and does not claim RED, GREEN, implementation, Task 20 or production GO.
 
 **Worktree:** `/Users/finlay/.codex/worktrees/r2f5-0/Stock- evaluation`
 
@@ -586,9 +591,10 @@ The CLI MUST reject `--execute`; there is no execution mode in R2-F5.0.
 The authoritative requirement/evidence crosswalk is
 [r2f5-0-requirement-evidence-matrix.md](../acceptance/r2f5-0-requirement-evidence-matrix.md).
 Every anchor in that matrix is explicitly marked `PLANNED`, and no anchor is evidence of a pass at
-this SPEC CANDIDATE stage.
+this SPEC APPROVED stage.
 
 ## Required review decision
 
-Until Task 0's validator/crosswalk and a later independent SPEC review are complete, the state is
-`SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.
+Task 0's validator/crosswalk and the independent X8 SPEC review are complete; until implementation,
+focused/full/static verification, installed readback and the separate human gate, the state is
+`SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.

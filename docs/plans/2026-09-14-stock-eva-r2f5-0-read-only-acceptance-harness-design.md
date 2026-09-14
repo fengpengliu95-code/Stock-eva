@@ -4,13 +4,18 @@
 
 **Date:** 2026-09-14 (Asia/Shanghai)
 
-**Status:** SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
+**Status:** SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
+**Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
+SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
+checks MUST be tightened to exact comparisons during implementation. This metadata-only approval
+commit is not itself audited and does not claim RED, GREEN, implementation, Task 20 or production GO.
+
+**Reviewers:** Independent SPEC audit reviewed X8; implementation QUALITY review remains pending
 
 **Scope:** Task 19 only. A local, read-only acceptance evaluator for a proposed R2-F5 window.
 Task 20's installed 20-session production observation and Task 21's Release 2 re-entry remain
@@ -5095,8 +5100,8 @@ The following actions are explicitly forbidden in R2-F5.0 and require a later ap
 
 ## Required review decision
 
-This candidate is complete only when an independent SPEC review confirms every FR/NFR/AC/EC and
-the crosswalk validator passes. Until a separate implementation, focused/full/static verification,
-installed readback and human gate occur, the authoritative state remains:
+The independent SPEC review confirms every FR/NFR/AC/EC and the crosswalk validator passes. Until a
+separate implementation, focused/full/static verification, installed readback and human gate occur,
+the authoritative state remains:
 
-`SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.
+`SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO`.
