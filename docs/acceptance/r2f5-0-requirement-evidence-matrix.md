@@ -8,7 +8,8 @@ pass, or establish Task 20 production soak.
 X8 revision base: `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
-Amendment base: `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited).
+SQLite amendment X2 base: `394050d8728404b810c6cc3a8b4552edd02561c8` (clean committed base;
+X2 candidate not yet audited).
 
 Approval metadata: independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. L1 is the catalog-source validator's `startswith` checks, which MUST be
@@ -20,15 +21,18 @@ Amendment state: `SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / 
 The SQLite zero-write amendment records observed macOS WAL/SHM behavior and is not yet approved;
 its validator and implementation changes remain pending review.
 
-The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;
-the validator checks that IDs occur exactly once in this table, that design requirements exist,
-that AC parents are FR/NFR only, and that no result language is smuggled into this candidate.
-The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk. Every FR/NFR/AC/EC row has one globally unique planned anchor; the implementation plan catalog maps each anchor one-to-one to a future pytest node/case. The roadmap dimensions below are parsed from Section 10 at validation time; this matrix does not maintain a second hand-written count.
+The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk.
+Every FR/NFR/AC/EC row has one globally unique planned anchor; the implementation plan catalog maps
+each anchor one-to-one to a future pytest node/case. The SQLite X2 table maps each concrete RED
+scenario one-to-one to the plan and structured contract. The validator checks IDs, parents,
+anchors, model unions, exact member tuple schema, digest preimages and capture policy rather than
+accepting token presence. Roadmap dimensions below are parsed from Section 10 at validation time.
+
 | ID | Unique testable requirement summary | Parent FR/NFR refs | Planned test anchors | Stage/status |
 | --- | --- | --- | --- | --- |
 | FR-1 | Read existing allowlisted roots/control stores without create, initialize, migrate, repair, delete, provider, or canonical writer calls | — | `PLANNED::test_r2f5_req_fr_01` | SPEC CANDIDATE; PLANNED |
-| FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration; use root-fd component-safe tree traversal and the fixed SQLite logical-snapshot algorithm | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
-| FR-3 | Fingerprint every input before and after with exact tree/logical-snapshot identity, fixed SQLite catalogs and digest contracts; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
+| FR-2 | Reject unsafe paths; use root-fd tree traversal and the fixed same-parent-dirfd/two-round SQLite copy algorithm | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
+| FR-3 | Fingerprint every input exactly; SQLite binds ordered typed members plus logical/catalog digests and any in-capture change invalidates | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
 | FR-4 | Capture one strict immutable in-memory snapshot and never initialize a missing control DB | — | `PLANNED::test_r2f5_req_fr_04` | SPEC CANDIDATE; PLANNED |
 | FR-5 | Select exactly 20 distinct confirmed consecutive sessions visible to the Shanghai trusted clock | — | `PLANNED::test_r2f5_req_fr_05` | SPEC CANDIDATE; PLANNED |
 | FR-6 | Report missing-middle, unknown, duplicate, non-advancing and later-repaired availability explicitly | — | `PLANNED::test_r2f5_req_fr_06` | SPEC CANDIDATE; PLANNED |
@@ -45,12 +49,12 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | FR-17 | Every result includes zero-write markers and closed typed MetricValue/reason/hash/cardinality validation | — | `PLANNED::test_r2f5_req_fr_17` | SPEC CANDIDATE; PLANNED |
 | FR-18 | Never claim Task 20 elapsed production soak or R2-F5/Release 2 GO from an offline report; pre-capture failures use typed canonical payloads | — | `PLANNED::test_r2f5_req_fr_18` | SPEC CANDIDATE; PLANNED |
 | NFR-1 | Preserve predecessor readers, public models, tables, manifests, pointers, partitions and schemas | — | `PLANNED::test_r2f5_req_nfr_01` | SPEC CANDIDATE; PLANNED |
-| NFR-2 | Use read-only SQLite and descriptor-bound no-follow reads and close resources on all paths | — | `PLANNED::test_r2f5_req_nfr_02` | SPEC CANDIDATE; PLANNED |
-| NFR-3 | Keep failures deterministic, bounded, sanitized and zero-write | — | `PLANNED::test_r2f5_req_nfr_03` | SPEC CANDIDATE; PLANNED |
-| NFR-4 | Complete the maximum 20-session/100000-row fixture within 10000 ms including full tree/logical fingerprints, or bounded-fail at explicit limits | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
+| NFR-2 | Never open inputs through SQLite; use same-parent-dirfd no-follow member probes/copies and descriptor-safe cleanup | — | `PLANNED::test_r2f5_req_nfr_02` | SPEC CANDIDATE; PLANNED |
+| NFR-3 | Keep failures deterministic, bounded, sanitized and zero-input-write with typed SQLite/temp/cleanup outcomes | — | `PLANNED::test_r2f5_req_nfr_03` | SPEC CANDIDATE; PLANNED |
+| NFR-4 | Complete the maximum fixture including two full SQLite member fingerprint/copy rounds, or bounded-fail within 10000 ms | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
 | NFR-5 | Give every FR/NFR/AC/EC a unique planned test anchor without claiming it passed | — | `PLANNED::test_r2f5_req_nfr_05` | SPEC CANDIDATE; PLANNED |
 | NFR-6 | Keep public errors to allowlisted reason/count/hash/time fields with no path/token/SQL/raw text | — | `PLANNED::test_r2f5_req_nfr_06` | SPEC CANDIDATE; PLANNED |
-| NFR-7 | Enforce bounded object bytes, row counts, 20 sessions, at most three replay samples and fixed catalog versions | — | `PLANNED::test_r2f5_req_nfr_07` | SPEC CANDIDATE; PLANNED |
+| NFR-7 | Enforce bounds plus secure outside-input temp root 0700/current uid/no-follow, files 0600/O_EXCL, temp-only fsync and max_attempts=1 | — | `PLANNED::test_r2f5_req_nfr_07` | SPEC CANDIDATE; PLANNED |
 | NFR-8 | Bind snapshot identity to range, Shanghai clock, fingerprints and frozen versions | — | `PLANNED::test_r2f5_req_nfr_08` | SPEC CANDIDATE; PLANNED |
 | NFR-9 | Run RED, GREEN, focused/full/static and protected compatibility checks before implementation GO | — | `PLANNED::test_r2f5_req_nfr_09` | SPEC CANDIDATE; PLANNED |
 | NFR-10 | Require separate human/installed-release/terms/Task20 authority for production mutation and soak; production envelopes are Task20-owned | — | `PLANNED::test_r2f5_req_nfr_10` | SPEC CANDIDATE; PLANNED |
@@ -60,7 +64,7 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | AC-4 | 100% legal coverage and zero mixed-source rows pass; unknown/count mismatch or mixed source fails | FR-9, FR-12 | `PLANNED::test_r2f5_req_ac_04` | SPEC CANDIDATE; PLANNED |
 | AC-5 | Complete lineage plus bounded offline semantic replay passes; missing/corrupt binding remains unavailable | FR-10, FR-11 | `PLANNED::test_r2f5_req_ac_05` | SPEC CANDIDATE; PLANNED |
 | AC-6 | Replication lag/missing restore drill is visible and cannot initiate drain or restore | FR-13, FR-17 | `PLANNED::test_r2f5_req_ac_06` | SPEC CANDIDATE; PLANNED |
-| AC-7 | Success/error evaluation preserves every input fingerprint and missing DB remains absent | FR-1, FR-3, FR-4, NFR-2 | `PLANNED::test_r2f5_req_ac_07` | SPEC CANDIDATE; PLANNED |
+| AC-7 | Two complete SQLite copies/fingerprints are exact; typed DELETE/WAL tuple, secure temp, cleanup and unchanged input all hold | FR-1, FR-3, FR-4, NFR-2 | `PLANNED::test_r2f5_req_ac_07` | SPEC CANDIDATE; PLANNED |
 | AC-8 | Invalid paths/config and raw diagnostic inputs fail before enumeration with redacted 2/422 output | FR-2, NFR-6 | `PLANNED::test_r2f5_req_ac_08` | SPEC CANDIDATE; PLANNED |
 | AC-9 | API and CLI agree on report/markers/reason order and both perform zero initialization/provider calls | FR-15, FR-16, FR-17 | `PLANNED::test_r2f5_req_ac_09` | SPEC CANDIDATE; PLANNED |
 | AC-10 | All mandatory pass gives ready; any provable failure gives not_ready; unprovable input gives unavailable | FR-9, FR-14, NFR-3 | `PLANNED::test_r2f5_req_ac_10` | SPEC CANDIDATE; PLANNED |
@@ -80,9 +84,9 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | EC-10 | Missing/oversized/malformed/semantic-mismatch replay is bounded REPLAY_UNAVAILABLE | FR-11, NFR-7 | `PLANNED::test_r2f5_req_ec_10` | SPEC CANDIDATE; PLANNED |
 | EC-11 | Missing/corrupt/locked/ahead/lagged/orphan replication evidence is read-only unavailable/degraded | FR-13, NFR-3 | `PLANNED::test_r2f5_req_ec_11` | SPEC CANDIDATE; PLANNED |
 | EC-12 | Missing/nonterminal/hash-invalid/changing/unsafe restore drill is unavailable without destination creation | FR-13, NFR-3 | `PLANNED::test_r2f5_req_ec_12` | SPEC CANDIDATE; PLANNED |
-| EC-13 | Replaced/symlinked/permission-denied/changed input returns SNAPSHOT_CHANGED or unavailable | FR-2, FR-3, NFR-2 | `PLANNED::test_r2f5_req_ec_13` | SPEC CANDIDATE; PLANNED |
+| EC-13 | Replaced/symlinked/unlink-recreated/writer-overlapped input returns SNAPSHOT_CHANGED; writer-before/new and writer-after/old are stable | FR-2, FR-3, NFR-2 | `PLANNED::test_r2f5_req_ec_13` | SPEC CANDIDATE; PLANNED |
 | EC-14 | Relative/root/home/mutable/variable/overlap path rejects before stat/enumeration | FR-2, NFR-5 | `PLANNED::test_r2f5_req_ec_14` | SPEC CANDIDATE; PLANNED |
-| EC-15 | Absent/locked SQLite returns unavailable without initialize/migrate/retry takeover | FR-1, FR-4, NFR-2 | `PLANNED::test_r2f5_req_ec_15` | SPEC CANDIDATE; PLANNED |
+| EC-15 | Absent DB, illegal sidecar vector, invalid temp security or failed cleanup returns its typed unavailable reason without retry/write | FR-1, FR-4, NFR-2 | `PLANNED::test_r2f5_req_ec_15` | SPEC CANDIDATE; PLANNED |
 | EC-16 | Exception path/token/SQL/URL/provider text is reduced to allowlisted reason/detail | FR-14, NFR-6 | `PLANNED::test_r2f5_req_ec_16` | SPEC CANDIDATE; PLANNED |
 | EC-17 | Object/row/sample/time bound stops safely and reports counters | FR-11, NFR-4, NFR-7 | `PLANNED::test_r2f5_req_ec_17` | SPEC CANDIDATE; PLANNED |
 | EC-18 | Malformed dates/missing args/disallowed overrides return 422/2 without filesystem/provider I/O | FR-15, FR-16, NFR-5 | `PLANNED::test_r2f5_req_ec_18` | SPEC CANDIDATE; PLANNED |
@@ -98,7 +102,7 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | FR-28 | Enforce exact reason precedence and invalidate the whole report on concurrent snapshot change | FR-3, FR-6 | `PLANNED::test_r2f5_req_fr_28` | SPEC CANDIDATE; PLANNED |
 | NFR-11 | Preserve roadmap continuity, availability, coverage and purity thresholds without invention or relaxation | FR-9 | `PLANNED::test_r2f5_req_nfr_11` | SPEC CANDIDATE; PLANNED |
 | NFR-12 | Require reviewed R2-F4 numeric lag/duration thresholds; missing values or LOCAL_CHAIN_ONLY cannot pass remote | FR-13 | `PLANNED::test_r2f5_req_nfr_12` | SPEC CANDIDATE; PLANNED |
-| NFR-13 | Fail closed on any snapshot descriptor/content/version change and never mix retries | FR-3, FR-4 | `PLANNED::test_r2f5_req_nfr_13` | SPEC CANDIDATE; PLANNED |
+| NFR-13 | Fail closed on in-capture entry/presence/inode/hash drift, detect unlink/recreate, use two equal rounds and never retry/mix | FR-3, FR-4 | `PLANNED::test_r2f5_req_nfr_13` | SPEC CANDIDATE; PLANNED |
 | NFR-14 | Encode semantic report and every digest field with one exact canonical contract; exclude envelope/volatile diagnostics as declared | FR-16 | `PLANNED::test_r2f5_req_nfr_14` | SPEC CANDIDATE; PLANNED |
 | NFR-15 | Keep API/CLI additive and predecessor response/schema contracts unchanged | FR-15, FR-16 | `PLANNED::test_r2f5_req_nfr_15` | SPEC CANDIDATE; PLANNED |
 | AC-15 | All 17 roadmap Section 10 table dimensions plus replication child appear as independent MetricResult fields with reducer/threshold/reason/anchor | FR-9, FR-19, NFR-11 | `PLANNED::test_r2f5_req_ac_15` | SPEC CANDIDATE; PLANNED |
@@ -118,6 +122,26 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | EC-24 | Missing RELEASE/dataset/admission/config/policy/calendar/universe/replication/restore identity rejects ready | FR-23, NFR-14 | `PLANNED::test_r2f5_req_ec_24` | SPEC CANDIDATE; PLANNED |
 | EC-25 | Duplicate/out-of-order raw calendar remains unmodified and unavailable before sorted derivation | FR-24, FR-28 | `PLANNED::test_r2f5_req_ec_25` | SPEC CANDIDATE; PLANNED |
 | EC-26 | Volatile diagnostics or absent identity/observation makes semantic report incomplete/non-deterministic | FR-25, FR-26, NFR-14 | `PLANNED::test_r2f5_req_ec_26` | SPEC CANDIDATE; PLANNED |
+
+## SQLite zero-write planned RED crosswalk (X2)
+
+Each row is a concrete future test and is not execution evidence. `Contract evidence` names the
+machine structure the validator resolves and checks, not a prose token.
+
+| Scenario key | Exact planned behavior | Contract evidence | Planned anchor | Stage/status |
+| --- | --- | --- | --- | --- |
+| delete_mode_absence | DB present/WAL+SHM typed absent and temp journal_mode=delete is the sole DELETE vector | `sqlite_member_tuple_schema`; `sqlite_capture.presence_mode_rules[0]` | `PLANNED::test_r2f5_sqlite_delete_mode_absent_sidecars` | RED PLANNED |
+| wal_trio | DB/WAL/SHM all present, temp journal_mode=wal, exact trio naming and WAL application | `sqlite_capture.presence_mode_rules[1]`; `sqlite_capture.temp_storage` | `PLANNED::test_r2f5_sqlite_wal_trio_applied_from_temp` | RED PLANNED |
+| wal_without_shm_invalid | WAL present and SHM absent is typed SQLite-invalid/unavailable | `sqlite_capture.invalid_presence_reason` | `PLANNED::test_r2f5_sqlite_wal_without_shm_is_invalid` | RED PLANNED |
+| writer_before | Writer completed before first probe yields the new stable snapshot | `sqlite_capture.writer_timing.completed_before_capture` | `PLANNED::test_r2f5_sqlite_writer_before_yields_new_snapshot` | RED PLANNED |
+| writer_during | Writer overlapping either full round yields SNAPSHOT_CHANGED | `sqlite_capture.writer_timing.overlaps_either_round` | `PLANNED::test_r2f5_sqlite_writer_during_is_snapshot_changed` | RED PLANNED |
+| writer_after | Writer begun after stable boundary leaves captured old snapshot valid | `sqlite_capture.writer_timing.begins_after_stable_capture` | `PLANNED::test_r2f5_sqlite_writer_after_keeps_old_snapshot_valid` | RED PLANNED |
+| unlink_recreate | Current entry/new fd mismatch with old fd detects unlink/recreate | `sqlite_capture.unlink_recreate_detection`; `sqlite_capture.entry_probe_protocol` | `PLANNED::test_r2f5_sqlite_unlink_recreate_is_detected` | RED PLANNED |
+| temp_outside | Temp root is approved system temp outside every input root/alias | `sqlite_capture.temp_storage.approved_root` | `PLANNED::test_r2f5_sqlite_temp_is_outside_all_input_roots` | RED PLANNED |
+| temp_modes | Root 0700/current uid/no-follow; files 0600/O_EXCL/no-follow | `sqlite_capture.temp_storage.root_mode`; `sqlite_capture.temp_storage.root_uid`; `sqlite_capture.temp_storage.root_open_flags`; `sqlite_capture.temp_storage.file_mode`; `sqlite_capture.temp_storage.file_open_flags` | `PLANNED::test_r2f5_sqlite_temp_owner_modes_and_no_follow` | RED PLANNED |
+| cleanup_success | Finally cleanup proves all temp entries/root absent with temp-only fsync | `sqlite_capture.cleanup.success_requirement`; `sqlite_capture.temp_storage.fsync_scope` | `PLANNED::test_r2f5_sqlite_temp_cleanup_succeeds` | RED PLANNED |
+| cleanup_failure | Cleanup failure is TEMP_CLEANUP_FAILED and leaks no path | `sqlite_capture.cleanup.failure_reason`; `sqlite_capture.cleanup.public_path_leak` | `PLANNED::test_r2f5_sqlite_temp_cleanup_failure_is_typed` | RED PLANNED |
+| input_unchanged | Success and every failure leave DB/WAL/SHM bytes/metadata/presence unchanged | `sqlite_capture.source_write_policy`; `sqlite_capture.direct_input_sqlite_open`; `sqlite_capture.max_attempts` | `PLANNED::test_r2f5_sqlite_input_members_remain_unchanged` | RED PLANNED |
 
 ## Mandatory SLO crosswalk
 

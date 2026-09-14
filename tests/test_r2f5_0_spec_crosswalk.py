@@ -28,6 +28,11 @@ REQ_ROW = re.compile(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (.*?) \| (.*?) \| (.*?) \| 
 CATALOG_ROW = re.compile(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (test_r2f5_req_[a-z]+_\d{2}) \|$")
 ANCHOR = re.compile(r"^test_r2f5_req_(?:fr|nfr|ac|ec)_\d{2}$")
 SLO_ANCHOR = re.compile(r"^test_r2f5_slo_[a-z_]+$")
+SQLITE_ANCHOR = re.compile(r"^test_r2f5_sqlite_[a-z_]+$")
+SQLITE_SCENARIO_ROW = re.compile(
+    r"^\| ([a-z_]+) \| (.*?) \| (.*?) \| `PLANNED::(test_r2f5_sqlite_[a-z_]+)` \| "
+    r"(RED PLANNED) \|$"
+)
 RFC2119 = re.compile(r"\b(?:MUST(?: NOT)?|SHOULD(?: NOT)?|MAY)\b")
 REASON_SHAPES = (
     "_FAILED",
@@ -70,6 +75,21 @@ EXPECTED_ROADMAP_DIMENSIONS = (
     "restore",
     "read_boundary",
 )
+
+EXPECTED_SQLITE_RED_CASES = {
+    "delete_mode_absence": "test_r2f5_sqlite_delete_mode_absent_sidecars",
+    "wal_trio": "test_r2f5_sqlite_wal_trio_applied_from_temp",
+    "wal_without_shm_invalid": "test_r2f5_sqlite_wal_without_shm_is_invalid",
+    "writer_before": "test_r2f5_sqlite_writer_before_yields_new_snapshot",
+    "writer_during": "test_r2f5_sqlite_writer_during_is_snapshot_changed",
+    "writer_after": "test_r2f5_sqlite_writer_after_keeps_old_snapshot_valid",
+    "unlink_recreate": "test_r2f5_sqlite_unlink_recreate_is_detected",
+    "temp_outside": "test_r2f5_sqlite_temp_is_outside_all_input_roots",
+    "temp_modes": "test_r2f5_sqlite_temp_owner_modes_and_no_follow",
+    "cleanup_success": "test_r2f5_sqlite_temp_cleanup_succeeds",
+    "cleanup_failure": "test_r2f5_sqlite_temp_cleanup_failure_is_typed",
+    "input_unchanged": "test_r2f5_sqlite_input_members_remain_unchanged",
+}
 
 
 def _section(text: str, heading: str, next_heading: str) -> str:
@@ -141,6 +161,57 @@ def _requirement_blocks(text: str) -> list[tuple[str, str]]:
 
 def _planned_anchors(value: str) -> list[str]:
     return re.findall(r"PLANNED::(test_r2f5_[A-Za-z0-9_]+)", value)
+
+
+def _interface_fields(text: str, name: str) -> list[str]:
+    match = re.search(rf"interface {re.escape(name)} \{{(.*?)\n\}}", text, flags=re.DOTALL)
+    assert match, f"missing interface {name}"
+    return re.findall(r"^\s+([a-z0-9_]+):", match.group(1), flags=re.MULTILINE)
+
+
+def _sqlite_matrix_rows() -> list[tuple[str, str, str, str, str]]:
+    section = _section(
+        MATRIX.read_text(encoding="utf-8"),
+        "## SQLite zero-write planned RED crosswalk (X2)",
+        "## Mandatory SLO crosswalk",
+    )
+    return [
+        match.groups()
+        for match in (SQLITE_SCENARIO_ROW.match(line) for line in section.splitlines())
+        if match
+    ]
+
+
+def _sqlite_plan_catalog() -> dict[str, str]:
+    section = _section(
+        PLAN.read_text(encoding="utf-8"),
+        "## Planned SQLite zero-write RED anchor catalog (X2)",
+        "## Planned implementation tasks",
+    )
+    entries = [
+        match.groups()
+        for match in (
+            re.match(r"^\| ([a-z_]+) \| (test_r2f5_sqlite_[a-z_]+) \|$", line)
+            for line in section.splitlines()
+        )
+        if match
+    ]
+    assert len(entries) == len({key for key, _anchor in entries})
+    return dict(entries)
+
+
+def _resolve_contract_value(contract: dict[str, object], path: str) -> object:
+    value: object = contract
+    for raw_segment in path.split("."):
+        match = re.fullmatch(r"([a-z_]+)(?:\[(\d+)\])?", raw_segment)
+        assert match, f"invalid structured contract path {path}"
+        key, index = match.groups()
+        assert isinstance(value, dict) and key in value, f"missing structured contract path {path}"
+        value = value[key]
+        if index is not None:
+            assert isinstance(value, list), f"non-list structured contract path {path}"
+            value = value[int(index)]
+    return value
 
 
 def _reason_source(design: str) -> list[str]:
@@ -406,6 +477,184 @@ def _validate_digest_contract_paths(contract: dict[str, object]) -> None:
         assert all("?" not in item for item in entry["excluded_fields"])
     graph = _digest_dependency_graph(contract)
     assert all(isinstance(node, tuple) and len(node) == 2 for node in graph)
+
+
+def _validate_sqlite_structured_contract(contract: dict[str, object]) -> None:
+    assert contract["contract_version"] == "r2f5-x8-sqlite-x2"
+    ast = contract["model_schema_ast"]
+    assert isinstance(ast, dict)
+    present_fields = [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "safe_basename",
+        "device",
+        "inode",
+        "mode",
+        "size_bytes",
+        "mtime_ns",
+        "full_sha256",
+    ]
+    absent_fields = [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "safe_basename",
+        "absence_marker",
+    ]
+    assert ast["SQLitePresentMemberFingerprint"]["object_fields"] == present_fields
+    assert ast["SQLiteAbsentMemberFingerprint"]["object_fields"] == absent_fields
+    assert ast["SQLiteSnapshotFingerprint"]["object_fields"] == [
+        "subject_kind",
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "sqlite_members",
+        "logical_digest",
+        "catalog_digest",
+    ]
+    assert ast["SnapshotFingerprint"]["object_fields"] == [
+        "subject_kind",
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "ctime_ns",
+        "fingerprint_kind",
+        "hash_scope",
+        "sha256",
+    ]
+    assert contract["model_unions"] == {
+        "SQLiteMemberFingerprint": [
+            "SQLitePresentMemberFingerprint",
+            "SQLiteAbsentMemberFingerprint",
+        ],
+        "InputSnapshotFingerprint": [
+            "SnapshotFingerprint",
+            "SQLiteSnapshotFingerprint",
+        ],
+    }
+    assert contract["sqlite_member_tuple_schema"] == [
+        {
+            "position": 0,
+            "role": "db",
+            "allowed_presence": ["present"],
+            "schema_by_presence": {"present": "SQLitePresentMemberFingerprint"},
+        },
+        {
+            "position": 1,
+            "role": "wal",
+            "allowed_presence": ["present", "absent"],
+            "schema_by_presence": {
+                "present": "SQLitePresentMemberFingerprint",
+                "absent": "SQLiteAbsentMemberFingerprint",
+            },
+        },
+        {
+            "position": 2,
+            "role": "shm",
+            "allowed_presence": ["present", "absent"],
+            "schema_by_presence": {
+                "present": "SQLitePresentMemberFingerprint",
+                "absent": "SQLiteAbsentMemberFingerprint",
+            },
+        },
+    ]
+    capture = contract["sqlite_capture"]
+    assert isinstance(capture, dict)
+    assert capture["algorithm"] == "descriptor-copy-two-round-v2"
+    assert capture["input_members"] == ["db", "wal", "shm"]
+    assert capture["valid_presence_vectors"] == [
+        ["present", "absent", "absent"],
+        ["present", "present", "present"],
+    ]
+    assert capture["presence_mode_rules"] == [
+        {
+            "presence": ["present", "absent", "absent"],
+            "temp_journal_mode": "delete",
+        },
+        {
+            "presence": ["present", "present", "present"],
+            "temp_journal_mode": "wal",
+        },
+    ]
+    assert capture["present_member_fields"] == present_fields
+    assert capture["absent_member_fields"] == absent_fields
+    assert capture["absence_marker"] == "absent_at_validated_parent"
+    assert capture["member_discovery"] == "same_retained_validated_parent_dirfd_only"
+    assert capture["copy_rounds"] == 2 and capture["max_attempts"] == 1
+    assert capture["round_equality"] == "exact_member_fingerprints_presence_and_copied_bytes"
+    assert capture["direct_input_sqlite_open"] is False
+    assert capture["invalid_presence_reason"] == "SQLITE_SNAPSHOT_INVALID"
+    assert capture["writer_timing"] == {
+        "completed_before_capture": "new_stable_snapshot",
+        "overlaps_either_round": "SNAPSHOT_CHANGED",
+        "begins_after_stable_capture": "captured_old_snapshot_valid",
+    }
+    temp = capture["temp_storage"]
+    assert temp == {
+        "approved_root": "system_temp_outside_all_input_roots",
+        "root_mode": "0700",
+        "root_uid": "current_uid",
+        "root_open_flags": ["O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC"],
+        "file_mode": "0600",
+        "file_open_flags": ["O_CREAT", "O_EXCL", "O_WRONLY", "O_NOFOLLOW", "O_CLOEXEC"],
+        "trio_basenames": ["<db_basename>", "<db_basename>-wal", "<db_basename>-shm"],
+        "sqlite_uri": "file:<temp_db>?mode=rw",
+        "query_only": True,
+        "required_reads": [
+            "integrity_check",
+            "journal_mode",
+            "sqlite_schema",
+            "catalog",
+            "logical_rows",
+        ],
+        "checkpoint_policy": "optional_temp_only",
+        "fsync_scope": "temporary_descriptors_only",
+    }
+    assert capture["cleanup"] == {
+        "protocol": "finally_descriptor_relative_no_follow_close_unlink_fsync_rmdir",
+        "success_requirement": "all_temp_entries_absent_and_root_removed",
+        "failure_reason": "TEMP_CLEANUP_FAILED",
+        "public_path_leak": False,
+    }
+    assert contract["sqlite_planned_red_cases"] == EXPECTED_SQLITE_RED_CASES
+
+    digest_entries = {entry["field"]: entry for entry in contract["digest_contracts"]}
+    assert len(digest_entries) == 64
+    assert digest_entries["SQLitePresentMemberFingerprint.full_sha256"]["included_field_paths"] == [
+        "captured_content_bytes"
+    ]
+    logical_digest = digest_entries["SQLiteSnapshotFingerprint.logical_digest"]
+    assert logical_digest["domain_separation_prefix"] == "r2f5/sqlite-logical-v2\\0"
+    assert logical_digest["included_field_paths"] == [
+        "journal_mode",
+        "sqlite_schema",
+        "page_count",
+        "user_version",
+        "ordered_typed_rows",
+    ]
+    assert digest_entries["SQLiteSnapshotFingerprint.catalog_digest"]["included_field_paths"] == [
+        "catalog_role",
+        "catalog_version",
+        "sqlite_master_objects",
+        "tables",
+        "columns",
+        "primary_keys",
+        "order_by_tuples",
+        "system_table_allowlist",
+        "schema_version_source",
+        "catalog_digest_source",
+    ]
+    config = digest_entries["FrozenReliabilityVersions.config_digest"]
+    assert config["included_field_paths"][-2:] == ["sqlite_capture", "sqlite_catalogs"]
+    fingerprints = digest_entries["SnapshotIdentity.input_fingerprint_sha256"]
+    assert fingerprints["domain_separation_prefix"] == "r2f5/input-fingerprints-v2\\0"
 
 
 def _reason_tokens(text: str) -> set[str]:
@@ -721,7 +970,8 @@ def test_r2f5_x8_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> No
     matrix = MATRIX.read_text(encoding="utf-8")
     req_anchors = {_planned_anchors(row[3])[0] for row in _matrix_rows()}
     slo_anchors = {row[-1] for row in _matrix_slo_rows(matrix)}
-    allowed = req_anchors | slo_anchors
+    sqlite_anchors = set(_sqlite_plan_catalog().values())
+    allowed = req_anchors | slo_anchors | sqlite_anchors
     body_tokens = {
         match.group(0)
         for match in re.finditer(r"test_r2f5_[A-Za-z0-9_]+", design + plan)
@@ -778,6 +1028,7 @@ def test_r2f5_x8_validator_checks_interface_tokens_and_collection_bounds() -> No
     design = DESIGN.read_text(encoding="utf-8")
     fingerprint = _section(design, "interface SnapshotFingerprint {", "// All fields")
     for field in (
+        "subject_kind",
         "descriptor_role",
         "descriptor_id",
         "descriptor_state",
@@ -910,8 +1161,15 @@ def test_r2f5_x8_digest_contracts_cover_models_without_self_inclusion() -> None:
                 "validated_config_fields",
             )
         )
-        assert entry["canonicalization_version"] == "project-canonical-json-v1"
-        assert entry["domain_separation_prefix"].startswith("r2f5/")
+        if entry["field"] == "SQLitePresentMemberFingerprint.full_sha256":
+            assert entry["canonicalization_version"] == "raw-full-stream-bytes-v1"
+            assert entry["domain_separation_prefix"].startswith("none;")
+        elif entry["field"] == "SQLiteSnapshotFingerprint.logical_digest":
+            assert entry["canonicalization_version"] == "sqlite-typed-length-prefixed-v2"
+            assert entry["domain_separation_prefix"] == "r2f5/sqlite-logical-v2\\0"
+        else:
+            assert entry["canonicalization_version"] == "project-canonical-json-v1"
+            assert entry["domain_separation_prefix"].startswith("r2f5/")
         assert entry["included_field_paths"]
         assert entry["ordering"] and entry["null_encoding"]
 
@@ -1168,49 +1426,84 @@ def test_r2f5_x8_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
 def test_r2f5_sqlite_zero_write_amendment_forbids_direct_input_open() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
+    matrix = MATRIX.read_text(encoding="utf-8")
     contract = _x8_contract(design)
-    capture = contract["sqlite_capture"]
-    assert capture == {
-        "algorithm": "descriptor-copy-two-fingerprint-v1",
-        "input_members": ["db", "-wal", "-shm"],
-        "member_discovery": "validated_parent_dirfd_only",
-        "open_flags": ["O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC"],
-        "source_write_policy": "zero_write",
-        "stability_protocol": "read_lock_or_consistent_capture_protocol",
-        "copy_strategy": "full_bytes_to_private_mkdtemp_outside_input_roots",
-        "copy_verification": [
-            "fstat_before",
-            "full_sha256",
-            "size",
-            "mtime_ns",
-            "inode",
-            "fstat_after",
-        ],
-        "source_fingerprint_rounds": 2,
-        "max_attempts": 1,
-        "wal_policy": "temp_trio_wal_must_be_applied_before_logical_read",
-        "temp_sqlite_policy": "normal_or_wal_aware_temp_connection_only",
-        "direct_input_sqlite_open": False,
-        "input_wal_or_shm_change": "SNAPSHOT_CHANGED",
-        "locked_or_unstable": "unavailable",
-        "cleanup": "always_close_delete_temp_on_success_failure_exception",
-        "semantic_fingerprint": "logical_snapshot_digest_plus_source_member_descriptors",
-    }
+    _validate_sqlite_structured_contract(contract)
+    ast = contract["model_schema_ast"]
+    for model in (
+        "SQLitePresentMemberFingerprint",
+        "SQLiteAbsentMemberFingerprint",
+        "SQLiteSnapshotFingerprint",
+        "SnapshotFingerprint",
+    ):
+        assert _interface_fields(design, model) == ast[model]["object_fields"]
+    assert re.search(
+        r"type InputSnapshotFingerprint = SnapshotFingerprint \| SQLiteSnapshotFingerprint;",
+        design,
+    )
+    assert re.search(r'interface SQLiteAbsentMemberFingerprint \{\s+role: "wal" \| "shm";', design)
+
+    matrix_rows = _sqlite_matrix_rows()
+    assert len(matrix_rows) == len(EXPECTED_SQLITE_RED_CASES)
+    matrix_cases = {key: anchor for key, _summary, _evidence, anchor, _stage in matrix_rows}
+    assert matrix_cases == EXPECTED_SQLITE_RED_CASES == _sqlite_plan_catalog()
+    assert len(set(matrix_cases.values())) == len(matrix_cases)
+    for key, summary, evidence, anchor, stage in matrix_rows:
+        assert key in EXPECTED_SQLITE_RED_CASES
+        assert summary.strip() and stage == "RED PLANNED"
+        assert SQLITE_ANCHOR.fullmatch(anchor)
+        paths = re.findall(r"`([a-z_]+(?:\.[a-z_]+|\[\d+\])*)`", evidence)
+        assert paths, key
+        for path in paths:
+            _resolve_contract_value(contract, path)
+
     assert "mode=ro&immutable=false" not in design
-    assert "SQLite input files MUST never be opened directly by SQLite" in design
-    for phrase in ("fstat", "full-stream SHA-256", "writer during copy", "captured old snapshot"):
+    assert "SQLite input files MUST never be opened through SQLite" in design
+    for phrase in (
+        "same retained parent dirfd",
+        "full-stream",
+        "unlinked/recreated",
+        "captured old snapshot",
+        "file:<temp_db>?mode=rw",
+        "PRAGMA query_only=ON",
+        "TEMP_CLEANUP_FAILED",
+    ):
         assert phrase in design
     for text in (design, plan):
-        assert "private `mkdtemp`" in text or "private temporary" in text
+        assert "private temporary" in text or "system temp" in text
         assert "DB/WAL/SHM" in text
-        assert "WAL" in text and "temp-trio" in text
-        assert (
-            "close/delete" in text
-            or "closed and deleted" in text
-            or "unconditional temporary cleanup" in text
-        )
+        assert "WAL" in text and "temp" in text
+        assert "cleanup" in text
         assert "max_attempts=1" in text or "one attempt" in text
-    assert "writer after" in design
+    assert "writer begun after" in design
+    assert "## SQLite zero-write planned RED crosswalk (X2)" in matrix
+
+
+def test_r2f5_sqlite_crosswalk_rejects_anchor_schema_and_digest_mutations() -> None:
+    contract = _x8_contract(DESIGN.read_text(encoding="utf-8"))
+
+    missing_anchor = deepcopy(contract)
+    del missing_anchor["sqlite_planned_red_cases"]["cleanup_failure"]
+    with pytest.raises(AssertionError):
+        _validate_sqlite_structured_contract(missing_anchor)
+
+    invalid_db_schema = deepcopy(contract)
+    invalid_db_schema["sqlite_member_tuple_schema"][0]["allowed_presence"] = [
+        "present",
+        "absent",
+    ]
+    with pytest.raises(AssertionError):
+        _validate_sqlite_structured_contract(invalid_db_schema)
+
+    missing_catalog_preimage = deepcopy(contract)
+    catalog_digest = next(
+        entry
+        for entry in missing_catalog_preimage["digest_contracts"]
+        if entry["field"] == "SQLiteSnapshotFingerprint.catalog_digest"
+    )
+    catalog_digest["included_field_paths"].remove("primary_keys")
+    with pytest.raises(AssertionError):
+        _validate_sqlite_structured_contract(missing_catalog_preimage)
 
 
 def test_r2f5_x8_model_ast_roots_and_tuple_items_are_explicit() -> None:
@@ -1333,7 +1626,7 @@ def test_r2f5_x8_metric_values_tree_hash_and_window_envelopes_are_bound() -> Non
     assert "deterministic tree hash" in design
     assert "full streaming content SHA" in design
     assert "hardlink ambiguity" in design
-    assert "SQLite" in design and "full-file bytes" in design
+    assert "SQLite" in design and "full_sha256" in design
     bundle = _section(
         design, "interface WindowEvidenceBundlePayload {", "interface WholeSessionFailoverDrill {"
     )

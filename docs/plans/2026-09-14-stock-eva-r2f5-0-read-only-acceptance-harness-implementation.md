@@ -20,7 +20,8 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**Amendment base:** `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited)
+**SQLite amendment X2 base:** `394050d8728404b810c6cc3a8b4552edd02561c8` (clean committed base;
+X2 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -51,9 +52,10 @@ design first and stop implementation until the reviewed specification is amended
 - FR-2: It MUST validate paths and capture/fingerprint one immutable snapshot before evaluation;
   each directory uses root-fd, component-by-component `openat(O_DIRECTORY|O_NOFOLLOW)` and
   parent-fd leaf reads with before/after identity checks, while each SQLite database uses the
-  descriptor-copy/temp-trio algorithm: source DB/WAL/SHM members are opened no-follow, copied
-  fully to private temporary storage, and fingerprint-verified before/after; no direct input-DB
-  SQLite open or bounded sampling claim is permitted.
+  descriptor-copy/two-round/temp-trio algorithm: source `[db,wal,shm]` members are re-lstatted and
+  re-opened no-follow from the same retained parent dirfd before/after every copy in both complete
+  rounds, copied fully to secure private temporary storage, and fingerprint/byte-equality verified;
+  no input-DB SQLite open or bounded sampling claim is permitted.
 - FR-3: It MUST select exactly 20 confirmed consecutive sessions and preserve missing-middle,
   19-versus-20 and future/PIT distinctions.
 - FR-4: It MUST freeze and compare the complete version vector, apply inclusive Shanghai cutoffs,
@@ -61,10 +63,15 @@ design first and stop implementation until the reviewed specification is amended
 - FR-5: It MUST consume evidence/candidate/selection/replay/calendar/universe/replication/restore
   records without mutation and fail closed on missing, corrupt, locked or changed inputs.
 - FR-6: It MUST expose the exact report, API, CLI exits, mutation markers and redaction contract.
+  `writes=false` denotes zero input/configured-root/persistent/production mutation; mandatory
+  private temp-copy writes remain ephemeral and must be fully cleaned.
 - FR-7: It MUST stop at explicit input-root, tree-entry, byte, SQLite-row, session and replay-
   sample limits, return `INPUT_LIMIT_EXCEEDED` when exceeded, and record measured counters. The
-  SQLite copy/stability protocol is bounded to one attempt and MUST clean its private temp dir on
-  every success, failure and exception path.
+  SQLite copy/stability protocol is bounded to one attempt. Secure temp storage MUST be outside all
+  input roots under an approved system temp, owned by the current uid, mode `0700`, opened
+  no-follow; files MUST use `0600` plus `O_EXCL`; only temp descriptors may be fsynced. Descriptor-
+  safe cleanup and proof of absence are mandatory on success, failure and exception paths, and a
+  cleanup failure MUST be the typed `TEMP_CLEANUP_FAILED` outcome without a path leak.
 - FR-8: It MUST leave protected predecessor readers, schemas, fixtures and public models compatible.
 - FR-9: It MUST expose separate MetricResult fields for every roadmap Section 10 dimension, including
   canonical integrity, recovery, failover, adjustment, error handling, local/NAS isolation,
@@ -88,7 +95,9 @@ design first and stop implementation until the reviewed specification is amended
   hashes, safe IDs, nonnegative bounds, readonly collection cardinalities and quality issues.
 - FR-18: It MUST apply exact reason/status matrices and precedence, use typed
   `PreCaptureFailurePayloadV1` for pre-capture unavailability, and fail closed on concurrent
-  snapshot change.
+  snapshot change. A writer completed before capture yields the new stable snapshot, one
+  overlapping either mandatory round yields `SNAPSHOT_CHANGED`, and one begun after the stable
+  boundary leaves the captured old snapshot valid.
 - FR-19: It MUST expose 17 roadmap MetricResult fields plus replication as a Local/NAS child metric,
   each with an independent session/window reducer and explicit threshold.
 - FR-20: It MUST project only existing provider_record/qualification_window fields and require an
@@ -111,7 +120,9 @@ design first and stop implementation until the reviewed specification is amended
   runbook/spec evidence and crosswalk validator.
 - NFR-2: No implementation test MUST open a real provider, read credentials, access NAS, load a
   LaunchAgent or touch Application Support production state.
-- NFR-3: All failure paths MUST be sanitized, deterministic, bounded and zero-write.
+- NFR-3: All failure paths MUST be sanitized, deterministic, bounded and zero-input-write;
+  `SQLITE_SNAPSHOT_INVALID`, `TEMP_STORAGE_UNAVAILABLE` and `TEMP_CLEANUP_FAILED` are typed
+  unavailable reasons.
 - NFR-4: The reference 20-session/100,000-row synthetic evaluation MUST complete within 10,000 ms
   or produce a bounded failure; this is not a production SLO.
 - NFR-5: Every requirement/criterion/edge case MUST have a planned unique test anchor in the
@@ -150,7 +161,9 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 ### AC-3: GREEN report (FR-2, FR-3, FR-4, FR-5, FR-6, FR-7)
 
 Given synthetic read-only fixtures, when the implementation evaluates them, then the report matches
-the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers.
+the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers. SQLite
+fixtures additionally prove the exact `[db,wal,shm]` typed tuple, DELETE/WAL presence rules, two
+equal complete copies, temp-only `mode=rw`/`query_only` logical reads and descriptor-safe cleanup.
 
 Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
@@ -175,7 +188,10 @@ FR-24, FR-25, FR-26, FR-27 and FR-28.
 - EC-4: It must reject mixed-source, coverage, universe and lineage inconsistencies.
 - EC-5: It must reject unsafe/replaced/overlapping paths before enumeration.
 - EC-6: It must reject over-bound replay/object/row/time inputs without unbounded retries.
-- EC-7: It must preserve all fingerprints after success and error and never initialize stores.
+- EC-7: It must preserve all input-member fingerprints after success and error, detect
+  unlink/recreate and writer overlap, accept only stable DELETE absence or a complete WAL trio,
+  preserve the captured old snapshot for a writer begun after the stable boundary, clean every
+  temp descriptor/path, and never initialize stores.
 - EC-8: It must keep Task 20, production, NAS, restore execution and Release 2 claims false.
 
 ## API Contracts
@@ -199,6 +215,14 @@ observations/references and a separate
 volatile diagnostic envelope. Secondary qualification/admission, whole-session failover drill and
 completed replication/restore readers are strict read-only adapters over existing immutable
 records; they do not widen `ProviderId` or persisted schemas.
+
+`InputSnapshotFingerprint` is a closed API union of tree/file `SnapshotFingerprint` and
+`SQLiteSnapshotFingerprint`. The SQLite variant has exactly `subject_kind`, descriptor role/id/state,
+the ordered typed `[db,wal,shm]` member tuple, `logical_digest` and `catalog_digest`; it has no
+single-file `sha256`. Present members include parent/basename plus entry/fd metadata and full hash;
+absent WAL/SHM members include only parent/basename and `absent_at_validated_parent`. The structured
+contract's union registry, tuple-position schema, digest preimages, capture policy and planned RED
+case map are normative and MUST match this API, the matrix and the planned catalog exactly.
 
 The exact report metric field tuple is:
 `continuity`, `next_morning_availability`, `same_evening_availability`, `coverage`,
@@ -237,7 +261,9 @@ duplicate or self-including digest contract; it MUST treat R2-F4 reader projecti
 and reject `r2f5_reader`/`r2f4_writer` envelope creation. Synthetic `test_fixture` envelopes are
 test-only and MUST be rejected for production acceptance.
 
-The X8 validator MUST parse `model_schema_ast` rather than merely checking non-empty strings. Its
+The X8/X2 validator MUST parse `model_schema_ast`, `model_unions`,
+`sqlite_member_tuple_schema`, `sqlite_capture` and `sqlite_planned_red_cases` rather than merely
+checking non-empty strings. Its
 generic resolver MUST walk object fields and `[]` tuple-item schemas for every included path, reject
 unknown roots, bad nesting and excluded/self fields, and build a digest dependency graph with cycle
 and self-edge detection using fully-qualified `(root_object_type, digest_field_path)` nodes in sorted
@@ -265,6 +291,9 @@ No persistence migration or new writer-owned database is permitted.
 | `TestEnvelope<T>` | same ten-field shape with literal test schema and `creator_kind="test_fixture"` | test-only endpoint/type; production reader rejects it and readers never create either envelope |
 | `PreCaptureFailurePayloadV1` | sanitized unavailable reason, range/as-of, typed descriptor states, semantic hash | canonical payload hash excludes only its hash field; no path or fabricated observations |
 | `FrozenReliabilityVersions` | provider/adapter/policy/schema/calendar/universe/replication/restore IDs | exact equality across selected sessions |
+| `SQLitePresentMemberFingerprint` / `SQLiteAbsentMemberFingerprint` | typed role/presence, retained parent identity and safe basename; present entry/fd metadata and full hash or absent marker | DB is present-only; absent is sidecar-only; no unknown/extra fields |
+| `SQLiteSnapshotFingerprint` | descriptor identity, exact ordered `[db,wal,shm]` tuple, logical digest, catalog digest | only DELETE `[present,absent,absent]` or WAL `[present,present,present]`; no single-file sha256 |
+| `InputSnapshotFingerprint` | closed tree/file-or-SQLite union | public snapshot/API input fingerprint shape; no nullable hybrid model |
 | `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only; SQLite source members copied to private temp trio |
 | `R2FAcceptanceReport` | status, metrics, markers, counters | no provider requests/writes; no production claim |
 | `SnapshotIdentity` | requested range, Shanghai as-of, fingerprints, version digest | all evaluation reads bind to one identity |
@@ -281,8 +310,8 @@ No persistence migration or new writer-owned database is permitted.
 Every digest field is bound to exactly one design `digest_contracts` record naming canonicalization,
 root type, included paths, excluded self/digest/envelope fields, ordering, null encoding and a
 domain prefix. Directory fingerprints use the fixed `open`/`openat`/`fstat` full-tree algorithm;
-SQLite fingerprints use the fixed descriptor-copy/temp-trio algorithm, with source DB/WAL/SHM
-identity and full-byte checks before/after copy. The X8 limits
+SQLite fingerprints use the fixed descriptor-copy/two-round/temp-trio algorithm, with source
+DB/WAL/SHM presence, parent/entry/fd identity and full-byte checks before/after every copy. The X8 limits
 are 100,000 entries, 512 MiB input bytes, 1,000,000 SQLite rows, 32 input roots, 20 sessions and
 3 replay samples; each over-limit result is `INPUT_LIMIT_EXCEEDED`/`unavailable`.
 
@@ -386,6 +415,27 @@ matrix rather than treating non-empty prose as evidence. No catalog entry exists
 | EC-24 | test_r2f5_req_ec_24 |
 | EC-25 | test_r2f5_req_ec_25 |
 | EC-26 | test_r2f5_req_ec_26 |
+
+## Planned SQLite zero-write RED anchor catalog (X2)
+
+These are concrete future pytest cases, not passing evidence. The crosswalk validator parses the
+scenario key and exact node token, compares them one-to-one with the matrix and structured contract,
+and validates the tuple/schema/digest contract each case targets.
+
+| Scenario key | Planned pytest node/case token |
+| --- | --- |
+| delete_mode_absence | test_r2f5_sqlite_delete_mode_absent_sidecars |
+| wal_trio | test_r2f5_sqlite_wal_trio_applied_from_temp |
+| wal_without_shm_invalid | test_r2f5_sqlite_wal_without_shm_is_invalid |
+| writer_before | test_r2f5_sqlite_writer_before_yields_new_snapshot |
+| writer_during | test_r2f5_sqlite_writer_during_is_snapshot_changed |
+| writer_after | test_r2f5_sqlite_writer_after_keeps_old_snapshot_valid |
+| unlink_recreate | test_r2f5_sqlite_unlink_recreate_is_detected |
+| temp_outside | test_r2f5_sqlite_temp_is_outside_all_input_roots |
+| temp_modes | test_r2f5_sqlite_temp_owner_modes_and_no_follow |
+| cleanup_success | test_r2f5_sqlite_temp_cleanup_succeeds |
+| cleanup_failure | test_r2f5_sqlite_temp_cleanup_failure_is_typed |
+| input_unchanged | test_r2f5_sqlite_input_members_remain_unchanged |
 
 ## Planned implementation tasks
 
@@ -521,6 +571,12 @@ missing/corrupt/locked inputs, path/redaction, fingerprints, API/CLI parity, sem
 isolation, bounded types and zero provider/write markers. Path tests MUST permit only lstat/open
 no-follow descriptor probes before enumeration/content reads.
 
+The SQLite RED subset MUST use the exact X2 catalog nodes for stable DELETE-mode absence, complete
+WAL trio/application, WAL-without-SHM rejection, writer-before/new, writer-during/changed,
+writer-after/old-valid, pathname unlink/recreate detection, temp-outside-input placement,
+uid/mode/no-follow/O_EXCL enforcement, cleanup success, typed cleanup failure and byte/metadata-
+unchanged inputs. These nodes are planned and absent at this amendment stage.
+
 Run RED, with no network or production roots:
 
 ```bash
@@ -535,9 +591,13 @@ a test failure, not a tolerated RED condition.
 ### Task 2 — Read-only snapshot and report domain
 
 Implement the minimum Pydantic models and pure evaluator from the design. Reuse strict readers;
-capture source DB/WAL/SHM descriptors and full bytes into a private temporary trio before any
-SQLite logical read; enforce the two-fingerprint stability protocol, every bound, hash and reason
-precedence, and unconditional temporary cleanup. Add strict immutable qualification/admission, failover-drill and
+retain one parent dirfd and re-lstat/re-open/compare each source DB/WAL/SHM entry before/after each
+copy in both complete rounds; require exact fingerprint/copy equality and detect unlink/recreate.
+Create both exact-name trios under approved system temp outside all inputs with root `0700`/current
+uid/no-follow and file `0600`/`O_EXCL`; fsync only temp descriptors. Open only the selected temp DB
+using ordinary `mode=rw`, set `query_only`, apply WAL and read integrity/catalog/logical rows;
+checkpoint only the temp trio if used. Enforce every bound, hash and reason precedence and a
+`finally` descriptor-safe cleanup whose failure is typed. Add strict immutable qualification/admission, failover-drill and
 replication/restore completed-record snapshot readers. Replay may invoke only an injected offline
 adapter/normalizer on immutable bytes; reject unknown identity before construction. Do not add
 schema migration, persistence, writer, reconcile, drain, mount or restore-execution seams.

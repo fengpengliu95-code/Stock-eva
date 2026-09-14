@@ -10,7 +10,8 @@
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**Amendment base:** `da76ee7623261498b95f36ab8212eaf8d4b48d27` (clean current HEAD; amendment not yet audited)
+**SQLite amendment X2 base:** `394050d8728404b810c6cc3a8b4552edd02561c8` (clean committed base;
+X2 candidate not yet audited)
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
 SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
@@ -69,7 +70,8 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
   fingerprint every input root and database by the exact descriptor-bound tree/logical-snapshot
   algorithms below. Directory entries use full streaming content SHA-256; SQLite uses its one
-  descriptor-copy/temp-trio algorithm, never a live database/WAL file hash. Descriptor metadata detects
+  descriptor-copy/two-round/temp-trio algorithm, never a live database/WAL file hash through SQLite.
+  Descriptor metadata detects
   replacement; content hashing detects content drift. Any input over a declared limit MUST yield
   `INPUT_LIMIT_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate
   the report and preserve the prior state.
@@ -117,7 +119,10 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   same report model, cutoff clock, reason vocabulary and zero-write guarantee as the CLI. Existing
   API response models MUST NOT change.
 - FR-17: The evaluator MUST report `provider_requests=0`, `writes=false`, `restore_started=false`
-  and `production_window_started=false` in every result, including errors.
+  and `production_window_started=false` in every result, including errors. Here `writes=false`
+  means zero input/configured-root/persistent/production writes; the mandatory private ephemeral
+  temp-copy operations are not a persistence mutation and MUST still satisfy the temp-only and
+  cleanup contract.
 - FR-18: The evaluator MUST record no Task 20 elapsed-session claim. A report MAY state that a
   supplied window is synthetically/evidentially complete, but MUST label installed production
   observation as pending unless separately authorized and evidenced.
@@ -187,11 +192,13 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   manifest, pointer, partition, selection, evidence or status schema may be rewritten or widened.
 - NFR-2: Report ordering, JSON serialization, reason precedence and metric arithmetic MUST be
   deterministic for identical captured bytes, clock and arguments.
-- NFR-3: The evaluator MUST never open an input SQLite path directly. It MUST open each existing
-  DB/WAL/SHM member through a validated parent dirfd with no-follow read-only descriptors, acquire
-  a non-writing read-lock/consistent-capture proof, copy full bytes to a private temp trio, verify
-  source identities and full hashes before/after, and close/delete every descriptor, connection and
-  temp path on every success, failure and exception path.
+- NFR-3: The evaluator MUST never open an input SQLite path through SQLite. It MUST retain one
+  validated parent dirfd for the attempt; in both complete rounds and before/after each copy it MUST
+  re-run descriptor-relative `lstat`/`openat(O_RDONLY|O_NOFOLLOW|O_CLOEXEC)` for each exact
+  DB/WAL/SHM basename, compare the current directory entry and newly opened fd with the old fd,
+  parent identity, metadata and full hash, and copy exact bytes to a secure private temp trio.
+  It MUST close and descriptor-safely delete every fd, connection and temp entry on every success,
+  failure and exception path.
 - NFR-4: Error payloads MUST be sanitized to an allowlisted reason code and bounded safe detail;
   raw provider responses, credentials, URLs, SQL, environment values and exception messages MUST
   NOT cross the API/CLI boundary.
@@ -206,7 +213,7 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   this is a real maximum fixture, not a micro-sample. Limits MUST be explicit: at most 100,000
   tree entries, 512 MiB total regular-file bytes per input, 1,000,000 SQLite rows per database,
   32 input roots/descriptors, 20 sessions and 3 replay samples. The SQLite fixture includes full
-  DB/WAL/SHM copy, two complete source fingerprint validations (or one lock-proven stable capture),
+  DB/WAL/SHM copy and two complete source fingerprint/copy rounds,
   temp-trio WAL application, integrity and catalog reads, cleanup and descriptor verification; one
   bounded attempt may return `SNAPSHOT_CHANGED`/`unavailable`, never silently retry. Exceeding any
   limit returns `INPUT_LIMIT_EXCEEDED`/`unavailable`; the benchmark is not a sampled claim.
@@ -224,10 +231,13 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - NFR-12: Replication lag, remote verification and restore duration MUST be passable only when a
   reviewed R2-F4 policy/evidence record supplies numeric thresholds. Missing thresholds or a
   `LOCAL_CHAIN_ONLY` trust scope MUST be `not_ready`/`unavailable`, never guessed.
-- NFR-13: Snapshot concurrency MUST be fail-closed: a root/database/WAL/SHM descriptor or content
-  change before or during copy invalidates the whole report with `SNAPSHOT_CHANGED`; a writer after
-  the stable capture is allowed to leave the captured old snapshot valid. No retry may silently mix
-  snapshots. Locked/busy or unprovable read-lock stability is `unavailable`.
+- NFR-13: Snapshot concurrency MUST be fail-closed: a root/database/WAL/SHM directory entry,
+  descriptor, presence or content change before or during either copy round invalidates the whole
+  report with `SNAPSHOT_CHANGED`; unlink/recreate MUST be detected even when the old fd remains
+  readable. A writer completed before capture yields the new stable snapshot, and a writer begun
+  only after both rounds and the stable-capture boundary leaves the captured old snapshot valid.
+  `max_attempts=1`; no retry may silently mix snapshots. Locked/busy or unprovable stability is
+  `unavailable`.
 - NFR-14: The semantic report MUST use canonical UTF-8 JSON with sorted keys, compact separators,
   `ensure_ascii=false`, `allow_nan=false` and a domain-separated SHA-256; volatile diagnostics MUST
   be outside that digest.
@@ -290,8 +300,11 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
 ### AC-7: Read-only snapshot and fingerprints (FR-1, FR-3, FR-4, NFR-3)
 
 Given an existing private fixture, when CLI/API evaluation succeeds or fails, then every input
-fingerprint is byte/metadata identical before and after, no missing control DB is initialized, and
-the captured snapshot is closed after use.
+fingerprint is byte/metadata identical before and after; each SQLite input has two byte-identical
+complete member-fingerprint/copy rounds from the same retained parent dirfd; DELETE absence or the
+full WAL trio is represented by the exact typed tuple; the temp root and files meet the placement,
+owner, mode, no-follow and cleanup contract; no missing control DB is initialized; and the captured
+snapshot is closed after use. Cleanup failure is typed `TEMP_CLEANUP_FAILED`, never a leaked path.
 
 Planned test anchors are machine-readable in the requirement matrix and X8 catalog only.
 
@@ -451,16 +464,19 @@ Planned test anchors are machine-readable in the requirement matrix and X8 catal
   unavailable/degraded evidence and never import, drain or quarantine from the reader.
 - EC-12: Restore drill is absent, not terminal, hash-invalid, source-changing or destination-unsafe;
   return `RESTORE_UNAVAILABLE` and never create a temporary restore destination.
-- EC-13: Any input root/database is replaced, symlinked, permission-denied or changes fingerprint
-  during read; return `SNAPSHOT_CHANGED`/unavailable and close all descriptors. A writer before
-  capture yields the new stable DB/WAL/SHM set; a writer during copy fails closed; a writer after
-  stable capture leaves the captured old snapshot valid.
+- EC-13: Any input root/database is replaced, symlinked, permission-denied, unlinked/recreated or
+  changes fingerprint during read; return `SNAPSHOT_CHANGED`/unavailable and close all descriptors.
+  A writer completed before capture yields the new stable DB/WAL/SHM set; a writer overlapping
+  either round fails closed; a writer begun after the stable-capture boundary leaves the captured
+  old snapshot valid.
 - EC-14: Path is relative, `/`, home, a configured mutable root, unresolved-variable syntax or an
   ancestor/descendant overlap; reject after only allowed `lstat`/`O_NOFOLLOW` descriptor probes and
   before directory enumeration/content reads; do not create it.
-- EC-15: SQLite is absent, locked, busy or has an unstable DB/WAL/SHM set; return unavailable
-  without initialization, migration, retry loop or lock takeover. Private temp-copy cleanup is
-  required on every error path.
+- EC-15: SQLite DB is absent, locked or busy; the member tuple is neither DELETE
+  `[present,absent,absent]` nor WAL `[present,present,present]`; or either round is unstable; return
+  `SQLITE_SNAPSHOT_INVALID`/unavailable without initialization, migration, retry loop or lock
+  takeover. Private temp-copy cleanup is required on every path; an invalid temp root/owner/mode is
+  `TEMP_STORAGE_UNAVAILABLE` and an unprovable cleanup is `TEMP_CLEANUP_FAILED`.
 - EC-16: An exception contains a path, token, SQL, URL, provider response or raw text; expose only
   its allowlisted reason and bounded safe identifier.
 - EC-17: Object/row/sample bound is exceeded or evaluation exceeds 10,000 ms; stop at the bound and
@@ -532,6 +548,7 @@ type UnavailableReasonCode = Exclude<AcceptanceReasonCode, FailureReasonCode>;
 // use one of these values; the crosswalk validator parses this literal and rejects duplicates.
 const ACCEPTANCE_REASON_CODES = [
   "INVALID_ARGUMENTS", "PATH_INVALID", "SNAPSHOT_CHANGED", "CONTROL_STATE_UNAVAILABLE",
+  "SQLITE_SNAPSHOT_INVALID", "TEMP_STORAGE_UNAVAILABLE", "TEMP_CLEANUP_FAILED",
   "PIT_VISIBILITY_INVALID", "CALENDAR_UNAVAILABLE", "CALENDAR_CONFLICT",
   "SESSION_SEQUENCE_INVALID", "SESSION_COUNT_NOT_20", "VERSION_DRIFT", "LINEAGE_UNAVAILABLE",
   "LINEAGE_INVALID",
@@ -603,7 +620,55 @@ Replication is the sole duration metric and uses `duration_seconds` end-to-end: 
 `lag_seconds` and target frozen threshold are bounded nonnegative canonical JSON numbers (no NaN,
 Infinity or exponent spelling), never milliseconds.
 
+type SQLiteMemberRole = "db" | "wal" | "shm";
+
+interface SQLitePresentMemberFingerprint {
+  role: SQLiteMemberRole;
+  presence: "present";
+  parent_device: number;
+  parent_inode: number;
+  safe_basename: string;
+  device: number;
+  inode: number;
+  mode: number;
+  size_bytes: number;
+  mtime_ns: number;
+  full_sha256: string;
+}
+
+interface SQLiteAbsentMemberFingerprint {
+  role: "wal" | "shm";
+  presence: "absent";
+  parent_device: number;
+  parent_inode: number;
+  safe_basename: string;
+  absence_marker: "absent_at_validated_parent";
+}
+
+type SQLiteMemberFingerprint =
+  | SQLitePresentMemberFingerprint
+  | SQLiteAbsentMemberFingerprint;
+
+type SQLiteDbMemberFingerprint = SQLitePresentMemberFingerprint & { role: "db" };
+type SQLiteWalMemberFingerprint = SQLiteMemberFingerprint & { role: "wal" };
+type SQLiteShmMemberFingerprint = SQLiteMemberFingerprint & { role: "shm" };
+
+interface SQLiteSnapshotFingerprint {
+  subject_kind: "sqlite";
+  descriptor_role: "calendar" | "universe" | "replication" | "control";
+  descriptor_id: string;
+  descriptor_state: "present";
+  sqlite_members: readonly [
+    SQLiteDbMemberFingerprint,
+    SQLiteWalMemberFingerprint,
+    SQLiteShmMemberFingerprint
+  ];
+  logical_digest: string;
+  catalog_digest: string;
+}
+
 interface SnapshotFingerprint {
+  subject_kind: "tree" | "file";
   descriptor_role: "dataset" | "evidence" | "calendar" | "universe" | "replication" | "restore" | "control";
   descriptor_id: string;
   descriptor_state: "present" | "absent";
@@ -616,6 +681,22 @@ interface SnapshotFingerprint {
   hash_scope: "full_streaming_bytes" | "none";
   sha256: string | null;
 }
+
+type InputSnapshotFingerprint = SnapshotFingerprint | SQLiteSnapshotFingerprint;
+
+`SQLiteMemberFingerprint` is a closed discriminated model. Its member tuple is exactly
+`[db, wal, shm]` in that order, with `db` statically and dynamically restricted to
+`presence="present"`. Every present member binds the retained parent `device`/`inode`, safe
+basename, entry/fd `device`/`inode`, mode, size, mtime and full-stream `full_sha256`; an absent
+sidecar binds only that same verified parent identity, its safe basename and the literal
+`absence_marker="absent_at_validated_parent"`. The only valid presence vectors are
+`[present, absent, absent]` for a stable DELETE-mode database and `[present, present, present]`
+for a stable WAL trio. WAL-without-SHM, SHM-without-WAL, absent DB or any other role/presence
+combination is `SQLITE_SNAPSHOT_INVALID`/`unavailable`. A sidecar appearing or disappearing
+between probes is `SNAPSHOT_CHANGED`. `SQLiteSnapshotFingerprint` is the exact three-member tuple
+plus `logical_digest` and `catalog_digest`; it has no ambiguous single-file `sha256`. The public
+`InputSnapshotFingerprint` union is exactly tree/file `SnapshotFingerprint` or
+`SQLiteSnapshotFingerprint`.
 
 type QualityIssueCode = AcceptanceReasonCode;
 
@@ -704,7 +785,7 @@ interface SnapshotIdentity {
   requested_end: string;
   as_of_utc: string;
   as_of_timezone: "Asia/Shanghai";
-  input_fingerprints: readonly SnapshotFingerprint[]; // one per configured role, max 32
+  input_fingerprints: readonly InputSnapshotFingerprint[]; // one per configured role, max 32
   frozen_versions: FrozenReliabilityVersions;
   input_fingerprint_sha256: string;
   frozen_version_vector_sha256: string;
@@ -1081,7 +1162,11 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `MetricResult` | status | enum | `pass`, `fail`, `unavailable` only |
 | `MetricResult` | observed/target | bounded nonnegative scalar/closed literal | no arbitrary provider text; exact threshold required |
 | `MetricResult` | reason/traceability | `AcceptanceReasonCode`, `AC-15`, planned anchor | reason is closed; every mandatory row carries its AC reference and unique planned pytest anchor |
-| `SnapshotFingerprint` | root/database identity | closed role + present/absent descriptor identity; nullable identity fields only for typed absence | every configured input role is represented, including missing descriptors; changes invalidate report |
+| `SnapshotFingerprint` | tree/file identity | closed subject/role + present/absent descriptor identity and full tree/file hash | no SQLite-only nullable fields; changes across required probes invalidate report |
+| `SQLitePresentMemberFingerprint` | present DB/WAL/SHM member | parent identity, safe basename, entry/fd metadata and full-byte SHA-256 | regular file only; entry/new fd/old fd identity and hash must agree |
+| `SQLiteAbsentMemberFingerprint` | absent WAL/SHM member | parent identity, safe basename, `absent_at_validated_parent` | sidecar only; absence must remain true at every required probe |
+| `SQLiteSnapshotFingerprint` | SQLite identity | exact ordered `[db,wal,shm]` member tuple plus logical/catalog digests | DB present; only DELETE or full-WAL presence vectors; no single-file SHA-256 |
+| `InputSnapshotFingerprint` | public snapshot fingerprint | closed tree/file-or-SQLite union | every configured input role uses exactly one non-hybrid variant |
 | `CapturedSnapshot` | selected sessions | tuple of dates | exactly 20, sorted, unique and confirmed |
 | `CapturedSnapshot` | input fingerprints | tuple | one per every input root/control DB |
 | `CapturedSnapshot` | versions | `FrozenReliabilityVersions` | one frozen vector for operation |
@@ -1123,7 +1208,7 @@ interface CapturedSnapshot {
   snapshot_identity: SnapshotIdentity;
   raw_calendar_observations: string[]; // source order retained; max 64
   confirmed_sessions: string[]; // exactly 20, sorted unique, confirmed, inclusive
-  input_descriptors: SnapshotFingerprint[]; // every configured role, including typed absence
+  input_descriptors: InputSnapshotFingerprint[]; // every configured role, including typed absence
   frozen_versions: FrozenReliabilityVersions;
   session_observations: SessionObservation[]; // exactly 20, ordinal 1..20
   window_evidence_bundle: WindowEvidenceBundle | null; // exactly one ref when present
@@ -1149,7 +1234,8 @@ quality issue and sanitized default has one closed code. Unknown values and dupl
 validator errors; arbitrary exception text MUST NOT cross the API/CLI boundary.
 
 Reason precedence MUST be deterministic and exact, in this order: (1) `INVALID_ARGUMENTS`,
-`PATH_INVALID`; (2) `SNAPSHOT_CHANGED`, `CONTROL_STATE_UNAVAILABLE`; (3)
+`PATH_INVALID`; (2) `SNAPSHOT_CHANGED`, `SQLITE_SNAPSHOT_INVALID`,
+`TEMP_STORAGE_UNAVAILABLE`, `TEMP_CLEANUP_FAILED`, `CONTROL_STATE_UNAVAILABLE`; (3)
 `PIT_VISIBILITY_INVALID`; (4) `CALENDAR_UNAVAILABLE`, `CALENDAR_CONFLICT`; (5)
 `SESSION_SEQUENCE_INVALID`, `SESSION_COUNT_NOT_20`; (6) `VERSION_DRIFT`; (7)
 `LINEAGE_UNAVAILABLE`, `CANONICAL_INTEGRITY_FAILED`; (8) `UNIVERSE_UNKNOWN_NONZERO`,
@@ -1165,7 +1251,7 @@ unavailable.
 <!-- R2F5_X8_CONTRACTS_JSON -->
 ```json
 {
-  "contract_version": "r2f5-x8",
+  "contract_version": "r2f5-x8-sqlite-x2",
   "roadmap_dimensions": [
     "continuity",
     "next_morning_availability",
@@ -1229,6 +1315,9 @@ unavailable.
       "PATH_INVALID",
       "SNAPSHOT_CHANGED",
       "CONTROL_STATE_UNAVAILABLE",
+      "SQLITE_SNAPSHOT_INVALID",
+      "TEMP_STORAGE_UNAVAILABLE",
+      "TEMP_CLEANUP_FAILED",
       "PIT_VISIBILITY_INVALID",
       "CALENDAR_UNAVAILABLE",
       "SESSION_SEQUENCE_INVALID",
@@ -1735,6 +1824,60 @@ unavailable.
       ],
       "tuple_item_schemas": {}
     },
+    "SQLitePresentMemberFingerprint": {
+      "object_fields": [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "safe_basename",
+        "device",
+        "inode",
+        "mode",
+        "size_bytes",
+        "mtime_ns",
+        "full_sha256"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SQLiteAbsentMemberFingerprint": {
+      "object_fields": [
+        "role",
+        "presence",
+        "parent_device",
+        "parent_inode",
+        "safe_basename",
+        "absence_marker"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SQLiteSnapshotFingerprint": {
+      "object_fields": [
+        "subject_kind",
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "sqlite_members",
+        "logical_digest",
+        "catalog_digest"
+      ],
+      "tuple_item_schemas": {
+        "sqlite_members": [
+          "role",
+          "presence",
+          "parent_device",
+          "parent_inode",
+          "safe_basename",
+          "absence_marker",
+          "device",
+          "inode",
+          "mode",
+          "size_bytes",
+          "mtime_ns",
+          "full_sha256"
+        ]
+      }
+    },
     "SnapshotIdentity": {
       "object_fields": [
         "requested_start",
@@ -1791,6 +1934,7 @@ unavailable.
     },
     "SnapshotFingerprint": {
       "object_fields": [
+        "subject_kind",
         "descriptor_role",
         "descriptor_id",
         "descriptor_state",
@@ -2030,6 +2174,7 @@ unavailable.
     },
     "FingerprintSubject": {
       "object_fields": [
+        "subject_kind",
         "descriptor_role",
         "descriptor_id",
         "descriptor_state",
@@ -2044,6 +2189,37 @@ unavailable.
       ],
       "tuple_item_schemas": {}
     },
+    "SQLiteMemberBytes": {
+      "object_fields": [
+        "captured_content_bytes"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SQLiteLogicalSnapshotPreimage": {
+      "object_fields": [
+        "journal_mode",
+        "sqlite_schema",
+        "page_count",
+        "user_version",
+        "ordered_typed_rows"
+      ],
+      "tuple_item_schemas": {}
+    },
+    "SQLiteCatalogPreimage": {
+      "object_fields": [
+        "catalog_role",
+        "catalog_version",
+        "sqlite_master_objects",
+        "tables",
+        "columns",
+        "primary_keys",
+        "order_by_tuples",
+        "system_table_allowlist",
+        "schema_version_source",
+        "catalog_digest_source"
+      ],
+      "tuple_item_schemas": {}
+    },
     "AcceptanceConfig": {
       "object_fields": [
         "dataset_root_descriptor",
@@ -2055,7 +2231,9 @@ unavailable.
         "replay_policy",
         "replication_policy",
         "restore_policy",
-        "redaction_policy"
+        "redaction_policy",
+        "sqlite_capture",
+        "sqlite_catalogs"
       ],
       "tuple_item_schemas": {}
     },
@@ -2188,13 +2366,49 @@ unavailable.
       ],
       "tuple_item_schemas": {}
     },
-    "SnapshotFingerprint[]": {
+    "InputSnapshotFingerprint[]": {
       "object_fields": [
         "input_fingerprints"
       ],
       "tuple_item_schemas": {}
     }
   },
+  "model_unions": {
+    "SQLiteMemberFingerprint": [
+      "SQLitePresentMemberFingerprint",
+      "SQLiteAbsentMemberFingerprint"
+    ],
+    "InputSnapshotFingerprint": [
+      "SnapshotFingerprint",
+      "SQLiteSnapshotFingerprint"
+    ]
+  },
+  "sqlite_member_tuple_schema": [
+    {
+      "position": 0,
+      "role": "db",
+      "allowed_presence": ["present"],
+      "schema_by_presence": {"present": "SQLitePresentMemberFingerprint"}
+    },
+    {
+      "position": 1,
+      "role": "wal",
+      "allowed_presence": ["present", "absent"],
+      "schema_by_presence": {
+        "present": "SQLitePresentMemberFingerprint",
+        "absent": "SQLiteAbsentMemberFingerprint"
+      }
+    },
+    {
+      "position": 2,
+      "role": "shm",
+      "allowed_presence": ["present", "absent"],
+      "schema_by_presence": {
+        "present": "SQLitePresentMemberFingerprint",
+        "absent": "SQLiteAbsentMemberFingerprint"
+      }
+    }
+  ],
   "digest_fields_by_model": {
     "CalendarRawFacts": [
       "raw_facts_sha256"
@@ -2287,6 +2501,13 @@ unavailable.
       "schema_policy_digest",
       "observation_sha256"
     ],
+    "SQLitePresentMemberFingerprint": [
+      "full_sha256"
+    ],
+    "SQLiteSnapshotFingerprint": [
+      "logical_digest",
+      "catalog_digest"
+    ],
     "SnapshotFingerprint": [
       "sha256"
     ],
@@ -2311,23 +2532,84 @@ unavailable.
     "unordered_short_name_aliasing": false
   },
   "sqlite_capture": {
-    "algorithm": "descriptor-copy-two-fingerprint-v1",
-    "input_members": ["db", "-wal", "-shm"],
-    "member_discovery": "validated_parent_dirfd_only",
+    "algorithm": "descriptor-copy-two-round-v2",
+    "input_members": ["db", "wal", "shm"],
+    "source_basenames": ["<db_basename>", "<db_basename>-wal", "<db_basename>-shm"],
+    "valid_presence_vectors": [
+      ["present", "absent", "absent"],
+      ["present", "present", "present"]
+    ],
+    "presence_mode_rules": [
+      {"presence": ["present", "absent", "absent"], "temp_journal_mode": "delete"},
+      {"presence": ["present", "present", "present"], "temp_journal_mode": "wal"}
+    ],
+    "invalid_presence_reason": "SQLITE_SNAPSHOT_INVALID",
+    "present_member_fields": [
+      "role", "presence", "parent_device", "parent_inode", "safe_basename", "device",
+      "inode", "mode", "size_bytes", "mtime_ns", "full_sha256"
+    ],
+    "absent_member_fields": [
+      "role", "presence", "parent_device", "parent_inode", "safe_basename", "absence_marker"
+    ],
+    "absence_marker": "absent_at_validated_parent",
+    "member_discovery": "same_retained_validated_parent_dirfd_only",
     "open_flags": ["O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC"],
     "source_write_policy": "zero_write",
-    "stability_protocol": "read_lock_or_consistent_capture_protocol",
-    "copy_strategy": "full_bytes_to_private_mkdtemp_outside_input_roots",
-    "copy_verification": ["fstat_before", "full_sha256", "size", "mtime_ns", "inode", "fstat_after"],
-    "source_fingerprint_rounds": 2,
+    "entry_probe_protocol": [
+      "fstat_parent", "lstat_at_no_follow", "openat_no_follow", "fstat_new_fd",
+      "compare_entry_to_new_fd", "compare_entry_and_new_fd_to_old_fd", "full_sha256",
+      "reopen_and_reprobe_after_copy"
+    ],
+    "copy_strategy": "two_complete_full_byte_copies_to_secure_temp_rounds",
+    "copy_rounds": 2,
+    "round_equality": "exact_member_fingerprints_presence_and_copied_bytes",
     "max_attempts": 1,
-    "wal_policy": "temp_trio_wal_must_be_applied_before_logical_read",
-    "temp_sqlite_policy": "normal_or_wal_aware_temp_connection_only",
+    "unlink_recreate_detection": "current_entry_and_new_fd_must_match_old_fd_identity_and_hash",
+    "writer_timing": {
+      "completed_before_capture": "new_stable_snapshot",
+      "overlaps_either_round": "SNAPSHOT_CHANGED",
+      "begins_after_stable_capture": "captured_old_snapshot_valid"
+    },
+    "temp_storage": {
+      "approved_root": "system_temp_outside_all_input_roots",
+      "root_mode": "0700",
+      "root_uid": "current_uid",
+      "root_open_flags": ["O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC"],
+      "file_mode": "0600",
+      "file_open_flags": ["O_CREAT", "O_EXCL", "O_WRONLY", "O_NOFOLLOW", "O_CLOEXEC"],
+      "trio_basenames": ["<db_basename>", "<db_basename>-wal", "<db_basename>-shm"],
+      "sqlite_uri": "file:<temp_db>?mode=rw",
+      "query_only": true,
+      "required_reads": [
+        "integrity_check", "journal_mode", "sqlite_schema", "catalog", "logical_rows"
+      ],
+      "checkpoint_policy": "optional_temp_only",
+      "fsync_scope": "temporary_descriptors_only"
+    },
     "direct_input_sqlite_open": false,
-    "input_wal_or_shm_change": "SNAPSHOT_CHANGED",
+    "input_member_or_presence_change": "SNAPSHOT_CHANGED",
     "locked_or_unstable": "unavailable",
-    "cleanup": "always_close_delete_temp_on_success_failure_exception",
-    "semantic_fingerprint": "logical_snapshot_digest_plus_source_member_descriptors"
+    "cleanup": {
+      "protocol": "finally_descriptor_relative_no_follow_close_unlink_fsync_rmdir",
+      "success_requirement": "all_temp_entries_absent_and_root_removed",
+      "failure_reason": "TEMP_CLEANUP_FAILED",
+      "public_path_leak": false
+    },
+    "semantic_fingerprint": "ordered_members_plus_logical_digest_plus_catalog_digest"
+  },
+  "sqlite_planned_red_cases": {
+    "delete_mode_absence": "test_r2f5_sqlite_delete_mode_absent_sidecars",
+    "wal_trio": "test_r2f5_sqlite_wal_trio_applied_from_temp",
+    "wal_without_shm_invalid": "test_r2f5_sqlite_wal_without_shm_is_invalid",
+    "writer_before": "test_r2f5_sqlite_writer_before_yields_new_snapshot",
+    "writer_during": "test_r2f5_sqlite_writer_during_is_snapshot_changed",
+    "writer_after": "test_r2f5_sqlite_writer_after_keeps_old_snapshot_valid",
+    "unlink_recreate": "test_r2f5_sqlite_unlink_recreate_is_detected",
+    "temp_outside": "test_r2f5_sqlite_temp_is_outside_all_input_roots",
+    "temp_modes": "test_r2f5_sqlite_temp_owner_modes_and_no_follow",
+    "cleanup_success": "test_r2f5_sqlite_temp_cleanup_succeeds",
+    "cleanup_failure": "test_r2f5_sqlite_temp_cleanup_failure_is_typed",
+    "input_unchanged": "test_r2f5_sqlite_input_members_remain_unchanged"
   },
   "sqlite_catalogs": {
     "replication_sidecar": {
@@ -4450,10 +4732,70 @@ unavailable.
       "domain_separation_prefix": "r2f5/restore-readback-v1\\0"
     },
     {
+      "field": "SQLitePresentMemberFingerprint.full_sha256",
+      "canonicalization_version": "raw-full-stream-bytes-v1",
+      "root_object_type": "SQLiteMemberBytes",
+      "included_field_paths": [
+        "captured_content_bytes"
+      ],
+      "excluded_fields": [
+        "full_sha256"
+      ],
+      "ordering": "byte offset ascending through EOF; no sampling",
+      "null_encoding": "absent forbidden for a present member",
+      "domain_separation_prefix": "none; standard SHA-256 of exact full member bytes"
+    },
+    {
+      "field": "SQLiteSnapshotFingerprint.logical_digest",
+      "canonicalization_version": "sqlite-typed-length-prefixed-v2",
+      "root_object_type": "SQLiteLogicalSnapshotPreimage",
+      "included_field_paths": [
+        "journal_mode",
+        "sqlite_schema",
+        "page_count",
+        "user_version",
+        "ordered_typed_rows"
+      ],
+      "excluded_fields": [
+        "logical_digest",
+        "catalog_digest",
+        "sqlite_members"
+      ],
+      "ordering": "catalog table order, then declared ORDER BY tuple, then typed row fields",
+      "null_encoding": "explicit SQLite null type marker and length zero",
+      "domain_separation_prefix": "r2f5/sqlite-logical-v2\\0"
+    },
+    {
+      "field": "SQLiteSnapshotFingerprint.catalog_digest",
+      "canonicalization_version": "project-canonical-json-v1",
+      "root_object_type": "SQLiteCatalogPreimage",
+      "included_field_paths": [
+        "catalog_role",
+        "catalog_version",
+        "sqlite_master_objects",
+        "tables",
+        "columns",
+        "primary_keys",
+        "order_by_tuples",
+        "system_table_allowlist",
+        "schema_version_source",
+        "catalog_digest_source"
+      ],
+      "excluded_fields": [
+        "catalog_digest",
+        "logical_digest",
+        "sqlite_members"
+      ],
+      "ordering": "object keys sorted; catalog arrays use declared canonical order",
+      "null_encoding": "absence forbidden",
+      "domain_separation_prefix": "r2f5/sqlite-catalog-v1\\0"
+    },
+    {
       "field": "SnapshotFingerprint.sha256",
       "canonicalization_version": "project-canonical-json-v1",
       "root_object_type": "FingerprintSubject",
       "included_field_paths": [
+        "subject_kind",
         "descriptor_role",
         "descriptor_id",
         "descriptor_state",
@@ -4471,7 +4813,7 @@ unavailable.
       ],
       "ordering": "object keys sorted; path entries tree order",
       "null_encoding": "typed null for absent descriptor metadata",
-      "domain_separation_prefix": "r2f5/fingerprint-v1\\0"
+      "domain_separation_prefix": "r2f5/tree-file-fingerprint-v2\\0"
     },
     {
       "field": "FrozenReliabilityVersions.config_digest",
@@ -4487,14 +4829,16 @@ unavailable.
         "replay_policy",
         "replication_policy",
         "restore_policy",
-        "redaction_policy"
+        "redaction_policy",
+        "sqlite_capture",
+        "sqlite_catalogs"
       ],
       "excluded_fields": [
         "config_digest"
       ],
       "ordering": "sorted object keys",
       "null_encoding": "absence forbidden for ready",
-      "domain_separation_prefix": "r2f5/config-v1\\0"
+      "domain_separation_prefix": "r2f5/config-v2\\0"
     },
     {
       "field": "RecoveryObservation.after_manifest_sha256",
@@ -4681,9 +5025,9 @@ unavailable.
         "snapshot_sha256",
         "semantic_report_sha256"
       ],
-      "ordering": "descriptor_role then descriptor_id byte order",
-      "null_encoding": "typed absence descriptor object, never omitted",
-      "domain_separation_prefix": "r2f5/input-fingerprints-v1\\0"
+      "ordering": "descriptor_role then descriptor_id byte order; SQLite member tuple is db,wal,shm",
+      "null_encoding": "typed tree/file absence or typed SQLite sidecar absence, never omitted",
+      "domain_separation_prefix": "r2f5/input-fingerprints-v2\\0"
     },
     {
       "field": "SnapshotIdentity.frozen_version_vector_sha256",
@@ -4719,9 +5063,9 @@ unavailable.
         "semantic_report_sha256",
         "diagnostic_envelope"
       ],
-      "ordering": "object keys sorted; input descriptors role/id order",
-      "null_encoding": "typed absence descriptor retained",
-      "domain_separation_prefix": "r2f5/snapshot-identity-v1\\0"
+      "ordering": "object keys sorted; input descriptors role/id order; SQLite members db,wal,shm",
+      "null_encoding": "typed tree/file or SQLite sidecar absence retained",
+      "domain_separation_prefix": "r2f5/snapshot-identity-v2\\0"
     },
     {
       "field": "R2FAcceptanceReport.semantic_report_sha256",
@@ -4858,7 +5202,7 @@ unavailable.
 ```
 
 `R2F5_X8_CONTRACTS_JSON` canonical block digest (sorted-key compact UTF-8 JSON, SHA-256,
-excluding Markdown fences) is `bba0d429ca52019dcc04c1bc94a28015713d4a03fd0b7b611e6182316474137d`.
+excluding Markdown fences) is `45f1dae4526de4cd411f63d5aa0bf5592fcc067e85b41514ad47a0ea0864cf55`.
 
 The validator parses this block and cross-checks its roadmap tuple, metric set, reason partitions,
 status matrix, reducer field references, envelope fields, creator allowlists, date/time formats,
@@ -4867,7 +5211,7 @@ and matrix. Every digest-typed model field MUST occur exactly once in `digest_co
 field MUST be excluded from its included paths. This is structural drift detection only; semantic
 hash proof and human review of the reducers remain mandatory. `model_schema_ast` is the closed
 object/tuple schema, and `digest_fields_by_model` is its explicit digest-field index; both are
-machine-readable and are cross-checked against all 61 digest contracts.
+machine-readable and are cross-checked against all 64 digest contracts.
 Digest dependency nodes are fully qualified tuples `(root_object_type, digest_field_path)` and are
 constructed in deterministic sorted order. The resolver first validates an included path against
 the named source root (including tuple-item paths such as `events[].evidence_sha256`), returns its
@@ -4917,39 +5261,60 @@ path and mtime are in those records. Python/macOS MUST use `dir_fd`/`openat` API
 The maximum is 100,000 entries and 512 MiB total regular-file bytes per input; exceeding either
 bound returns `INPUT_LIMIT_EXCEEDED`/`unavailable`. Before/after tree digests MUST match. The
 10-second/100,000-row fixture benchmark includes this complete tree hash; production inputs over
-the limits cannot be ready. SQLite MUST NOT hash full-file bytes directly; its logical snapshot
-algorithm below owns the database, WAL and SHM state.
+the limits cannot be ready. The tree walker MUST NOT own or double-hash SQLite members; the SQLite
+algorithm below full-hashes and copies the DB/WAL/SHM members without opening an input through
+SQLite.
 
 ### Unique SQLite logical snapshot fingerprint
 
-SQLite input files MUST never be opened directly by SQLite. macOS SQLite can update a `-shm`
-mtime while a non-immutable read-only connection reads a WAL, while an immutable connection can
-ignore the WAL and locks; neither behavior is an acceptable physical zero-write contract. For
-each database, and each existing `-wal`/`-shm` sibling, the evaluator MUST open the member from the
-validated parent directory fd with `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`, fstat its device/inode/mode/size/
-mtime, and reject symlinks, special files, path escape or a missing required sibling. The parent
-directory fd and every member descriptor are part of the captured identity.
+SQLite input files MUST never be opened through SQLite. macOS SQLite may update a live `-shm` while
+reading WAL state, and `immutable=true` may ignore the WAL; neither is an acceptable zero-input-write
+capture. The sole attempt retains one validated parent directory fd from start through the stable
+boundary. The exact source basenames are `[db_basename, db_basename + "-wal", db_basename +
+"-shm"]`; no path re-resolution is allowed. At the start and end of each of two mandatory complete
+rounds, and immediately before and after copying each member, the evaluator MUST use that same
+parent dirfd to `lstat`/`openat` the basename no-follow, `fstat` the newly opened fd and parent, and
+compare the directory entry and new fd to the old fd's device/inode, mode, size, mtime and full
+stream SHA-256. A pathname unlinked/recreated while the old fd is readable therefore fails closed.
+For an absent sidecar both descriptor-relative probes MUST prove `ENOENT` against the unchanged
+parent and bind the parent identity, safe basename and `absent_at_validated_parent` marker.
 
-Before copying, the evaluator MUST obtain the existing read-lock/consistent-capture protocol
-without writing the input. It MUST copy all three members' bytes to a private `mkdtemp` directory
-outside every input root, then fstat and full-stream SHA-256 verify each source before/after copy,
-including size, mtime and inode, and verify the parent directory identity before/after. The source
-DB/WAL/SHM set MUST be stable as a set: either the protocol's read lock proves stability or a second
-complete fingerprint-copy round MUST equal the first. `max_attempts=1`; lock/busy or any mismatch is
-`SNAPSHOT_CHANGED`/`unavailable`, with no retry wager. A writer before capture therefore yields the
-new stable set, a writer during copy yields `SNAPSHOT_CHANGED`, and a writer after the stable capture
-does not invalidate that captured old snapshot.
+The ordered tuple is exactly `[db,wal,shm]`. DB is always present. The only legal presence vectors
+are `[present,absent,absent]`, which the copied temp DB MUST also report as
+`PRAGMA journal_mode=delete`, and `[present,present,present]`, which MUST report
+`PRAGMA journal_mode=wal`; WAL-without-SHM, SHM-without-WAL, a vector/mode mismatch and all other
+combinations are
+`SQLITE_SNAPSHOT_INVALID`/`unavailable`. Each round MUST create a complete temp copy and full member
+fingerprint; round two MUST equal round one in tuple roles, presence, parent/member metadata, hashes
+and copied bytes. Neither a lock nor a stable old fd may replace this second round. `max_attempts=1`:
+any appearance/disappearance, entry/fd mismatch, metadata/hash drift or unequal copy is
+`SNAPSHOT_CHANGED`/`unavailable`, with no retry. A writer completed before the first probe yields the
+new stable snapshot; one overlapping either round is `SNAPSHOT_CHANGED`; one begun after both rounds
+and the declared stable-capture boundary leaves the captured old snapshot valid.
 
-On the temporary copy only, the evaluator MAY use a normal SQLite connection or WAL-aware temporary
-trio connection. If a WAL exists, it MUST be applied/read as part of that temporary trio (for example
-by a normal temp connection/backup operation that writes only the temp directory); `immutable=true`
-MUST NOT be used in a way that ignores the copied WAL. The evaluator MUST then read `sqlite_schema`,
-`PRAGMA page_count`, `PRAGMA user_version`, and every catalog-listed table with fixed deterministic
-`ORDER BY` and typed length-prefixed encoding. The logical digest preimage is
-`r2f5/sqlite-logical-v2\0` plus schema, page-count, user-version and ordered row records. Temporary
-writes are not input writes, are not persistent, never enter report paths and MUST be closed and
-deleted on success, error or exception. Missing, corrupt, locked or integrity-invalid copies are
-`unavailable`; cleanup failure is also unavailable and MUST not leak a path.
+The secure temp root MUST be under an approved system temporary root and outside every input root
+and input-root alias. It MUST be created/opened no-follow, owned by the current uid and mode `0700`.
+Each round's files MUST preserve SQLite's exact trio naming, be created descriptor-relatively with
+`O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC` and mode `0600`, and receive exact full bytes. Only
+temp file/directory descriptors MAY be `fsync`ed; no input descriptor may be `fsync`ed. On the
+selected equal temp trio, the evaluator MUST open an ordinary connection only as
+`file:<temp_db>?mode=rw`, immediately set `PRAGMA query_only=ON`, and read/apply the copied WAL.
+It MUST run integrity validation, read `PRAGMA journal_mode`, `sqlite_schema`, `PRAGMA page_count`,
+`PRAGMA user_version`, the fixed catalog and each catalog-listed table with deterministic `ORDER BY` and typed
+length-prefixed encoding. A checkpoint is optional and, if used, MUST target only the temp trio;
+`immutable=true`, `mode=ro` and any SQLite connection to an input basename are forbidden.
+
+The logical digest preimage is `r2f5/sqlite-logical-v2\0` plus journal mode, schema, page-count,
+user-version and ordered typed row records. The catalog digest preimage is
+`r2f5/sqlite-catalog-v1\0` plus the fixed
+role/version/master/table/column/PK/order/system/source contract. `SQLiteSnapshotFingerprint` is
+the ordered member tuple plus both digests; `SnapshotIdentity.input_fingerprint_sha256` binds the
+entire object. Temporary writes are not input writes and never enter public paths. A `finally`
+cleanup MUST close connections/fds, unlink entries relative to retained temp dirfds no-follow,
+fsync only temp descriptors where required, remove both round directories/root and prove absence.
+Success, failure and exception paths have the same cleanup postcondition. Cleanup failure returns
+`TEMP_CLEANUP_FAILED`; invalid placement/uid/mode/no-follow state returns
+`TEMP_STORAGE_UNAVAILABLE`; neither may expose a path or raw exception.
 
 The actual `sqlite_master` name/type set MUST equal `sqlite_master_allowlist`; every catalog table
 MUST match declared columns/types, primary-key/order tuple and `user_version`. Missing, extra, type,
@@ -4962,8 +5327,8 @@ run a migration, initialize a missing store, rewrite schema identity or open an 
 SQLite. The daily circuit catalog uses the authoritative `endpoint` primary key and event `endpoint`
 foreign-key columns; `circuit_id` is not accepted. The SQLite limit is 1,000,000 rows per database
 and 512 MiB encoded logical bytes; exceeding either returns `INPUT_LIMIT_EXCEEDED`. The semantic
-fingerprint is the logical snapshot digest plus the verified source member descriptor identities;
-raw temp paths and volatile elapsed/cleanup diagnostics are excluded.
+fingerprint is the exact ordered member fingerprints plus logical and catalog digests; raw temp
+paths and volatile elapsed/cleanup diagnostics are excluded.
 
 ## R2-F5.0 metric contract and evidence sources
 
@@ -5094,9 +5459,12 @@ canonical JSON of the complete per-session observation, including all MetricResu
 hashes. `observation_refs[i]` MUST equal the digest of the observation with `ordinal=i+1`, and both
 collections MUST have cardinality 20 for a candidate window. A bundle is exactly one immutable
 window object and its digest is bound in `window_evidence_refs`; window drills are not copied into
-each session. Missing/corrupt/locked artifacts are typed unavailable. If any descriptor, file
-bytes, database page, version, or bound clock changes before/during/after evaluation, the whole
-report is invalidated; the reader does not retry into a mixed snapshot.
+each session. Missing/corrupt/locked artifacts are typed unavailable. Any tree input change across
+its required before/after probes, or SQLite member/presence/entry change before or during either
+mandatory copy round, invalidates the whole report. A SQLite writer completed before capture
+defines the new snapshot; a writer overlapping capture fails; a writer begun after the
+stable-capture boundary does not retroactively invalidate the captured old temp snapshot. The
+reader never retries into a mixed snapshot.
 
 Each `SessionObservation.frozen_versions_sha256` MUST equal
 `SnapshotIdentity.frozen_version_vector_sha256`, computed over the complete frozen vector (not a
