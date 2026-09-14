@@ -5,7 +5,7 @@ an implementation or acceptance result. Every row is unique, every acceptance cr
 its FR/NFR parent(s), and every anchor is `PLANNED`. No anchor below is claimed to exist, execute,
 pass, or establish Task 20 production soak.
 
-X6 revision base: `68125def42796e8fcf87810c9aa59e1d7eaf2bed`; predecessor planning base:
+X7 revision base: `97283a5ce6d67d925d84a9d4b759a8ebe98b3af9`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;
@@ -15,8 +15,8 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | ID | Unique testable requirement summary | Parent FR/NFR refs | Planned test anchors | Stage/status |
 | --- | --- | --- | --- | --- |
 | FR-1 | Read existing allowlisted roots/control stores without create, initialize, migrate, repair, delete, provider, or canonical writer calls | — | `PLANNED::test_r2f5_req_fr_01` | SPEC CANDIDATE; PLANNED |
-| FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration; use the fixed descriptor-bound tree and SQLite logical-snapshot algorithms | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
-| FR-3 | Fingerprint every input before and after with exact tree/logical-snapshot identity and digest contracts; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
+| FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration; use root-fd component-safe tree traversal and the fixed SQLite logical-snapshot algorithm | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
+| FR-3 | Fingerprint every input before and after with exact tree/logical-snapshot identity, fixed SQLite catalogs and digest contracts; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
 | FR-4 | Capture one strict immutable in-memory snapshot and never initialize a missing control DB | — | `PLANNED::test_r2f5_req_fr_04` | SPEC CANDIDATE; PLANNED |
 | FR-5 | Select exactly 20 distinct confirmed consecutive sessions visible to the Shanghai trusted clock | — | `PLANNED::test_r2f5_req_fr_05` | SPEC CANDIDATE; PLANNED |
 | FR-6 | Report missing-middle, unknown, duplicate, non-advancing and later-repaired availability explicitly | — | `PLANNED::test_r2f5_req_fr_06` | SPEC CANDIDATE; PLANNED |
@@ -35,10 +35,10 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | NFR-1 | Preserve predecessor readers, public models, tables, manifests, pointers, partitions and schemas | — | `PLANNED::test_r2f5_req_nfr_01` | SPEC CANDIDATE; PLANNED |
 | NFR-2 | Use read-only SQLite and descriptor-bound no-follow reads and close resources on all paths | — | `PLANNED::test_r2f5_req_nfr_02` | SPEC CANDIDATE; PLANNED |
 | NFR-3 | Keep failures deterministic, bounded, sanitized and zero-write | — | `PLANNED::test_r2f5_req_nfr_03` | SPEC CANDIDATE; PLANNED |
-| NFR-4 | Complete the maximum 20-session/100000-row fixture within 10000 ms including full fingerprints, or bounded-fail | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
+| NFR-4 | Complete the maximum 20-session/100000-row fixture within 10000 ms including full tree/logical fingerprints, or bounded-fail at explicit limits | — | `PLANNED::test_r2f5_req_nfr_04` | SPEC CANDIDATE; PLANNED |
 | NFR-5 | Give every FR/NFR/AC/EC a unique planned test anchor without claiming it passed | — | `PLANNED::test_r2f5_req_nfr_05` | SPEC CANDIDATE; PLANNED |
 | NFR-6 | Keep public errors to allowlisted reason/count/hash/time fields with no path/token/SQL/raw text | — | `PLANNED::test_r2f5_req_nfr_06` | SPEC CANDIDATE; PLANNED |
-| NFR-7 | Enforce bounded object bytes, row counts, 20 sessions and at most three replay samples | — | `PLANNED::test_r2f5_req_nfr_07` | SPEC CANDIDATE; PLANNED |
+| NFR-7 | Enforce bounded object bytes, row counts, 20 sessions, at most three replay samples and fixed catalog versions | — | `PLANNED::test_r2f5_req_nfr_07` | SPEC CANDIDATE; PLANNED |
 | NFR-8 | Bind snapshot identity to range, Shanghai clock, fingerprints and frozen versions | — | `PLANNED::test_r2f5_req_nfr_08` | SPEC CANDIDATE; PLANNED |
 | NFR-9 | Run RED, GREEN, focused/full/static and protected compatibility checks before implementation GO | — | `PLANNED::test_r2f5_req_nfr_09` | SPEC CANDIDATE; PLANNED |
 | NFR-10 | Require separate human/installed-release/terms/Task20 authority for production mutation and soak; production envelopes are Task20-owned | — | `PLANNED::test_r2f5_req_nfr_10` | SPEC CANDIDATE; PLANNED |

@@ -10,7 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).parents[1]
 DESIGN = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
@@ -146,13 +149,13 @@ def _reason_source(design: str) -> list[str]:
     return re.findall(r'"([A-Z][A-Z0-9_]+)"', match.group(1))
 
 
-def _x6_contract(design: str) -> dict[str, object]:
+def _x7_contract(design: str) -> dict[str, object]:
     match = re.search(
-        r"<!-- R2F5_X6_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
+        r"<!-- R2F5_X7_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
         design,
         flags=re.DOTALL,
     )
-    assert match, "X6 structured contract block missing"
+    assert match, "X7 structured contract block missing"
     value = json.loads(match.group(1))
     assert isinstance(value, dict)
     return value
@@ -175,6 +178,75 @@ def _model_digest_fields(design: str) -> set[str]:
                 qualified = "ErrorHandlingObservation.events.evidence_sha256"
             fields.add(qualified)
     return fields
+
+
+def _schema_path_exists(ast: dict[str, object], root: str, path: str) -> bool:
+    """Resolve an AST path, including tuple item syntax such as ``events[].event_id``."""
+    node = ast.get(root)
+    if not isinstance(node, dict):
+        return False
+    fields = set(node.get("object_fields", []))
+    tuple_items = node.get("tuple_item_schemas", {})
+    if not isinstance(tuple_items, dict):
+        return False
+    for index, segment in enumerate(path.split(".")):
+        is_tuple = segment.endswith("[]")
+        name = segment[:-2] if is_tuple else segment
+        if name not in fields:
+            return False
+        if is_tuple:
+            items = tuple_items.get(name)
+            if not isinstance(items, list):
+                return False
+            fields = set(items)
+        elif index < len(path.split(".")) - 1:
+            nested = ast.get(name)
+            if not isinstance(nested, dict):
+                return False
+            fields = set(nested.get("object_fields", []))
+    return True
+
+
+def _validate_digest_contract_paths(contract: dict[str, object]) -> None:
+    ast = contract["model_schema_ast"]
+    entries = contract["digest_contracts"]
+    assert isinstance(ast, dict) and isinstance(entries, list)
+    fields = {entry["field"] for entry in entries}
+    assert len(fields) == len(entries)
+    for entry in entries:
+        root = entry["root_object_type"]
+        assert root in ast, root
+        for path in entry["included_field_paths"]:
+            assert _schema_path_exists(ast, root, path), f"missing digest path {root}.{path}"
+        field_name = entry["field"].rsplit(".", 1)[-1]
+        assert field_name in entry["excluded_fields"]
+        assert all("?" not in item for item in entry["excluded_fields"])
+    graph: dict[str, set[str]] = {field: set() for field in fields}
+    suffixes = {field.rsplit(".", 1)[-1]: field for field in fields}
+    for entry in entries:
+        source = entry["field"]
+        for path in entry["included_field_paths"]:
+            target = suffixes.get(path.rsplit(".", 1)[-1].removesuffix("[]"))
+            if target == source:
+                raise AssertionError(f"digest dependency self-edge at {source}")
+            if target is not None:
+                graph[source].add(target)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        assert node not in visiting, f"digest dependency cycle at {node}"
+        if node in visited:
+            return
+        visiting.add(node)
+        for dependency in graph[node]:
+            visit(dependency)
+        visiting.remove(node)
+        visited.add(node)
+
+    for field in graph:
+        visit(field)
 
 
 def _reason_tokens(text: str) -> set[str]:
@@ -236,7 +308,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         assert heading in text
     assert "SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
-    assert "68125def42796e8fcf87810c9aa59e1d7eaf2bed" in text
+    assert "97283a5ce6d67d925d84a9d4b759a8ebe98b3af9" in text
     assert "MUST" in text and "MUST NOT" in text
     assert "production_window_started=false" in text
     assert "Task 20" in text and "20 confirmed consecutive" in text
@@ -267,7 +339,7 @@ def test_r2f5_crosswalk_is_exact_and_anchored() -> None:
         for match in (
             re.match(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (test_r2f5_req_[a-z]+_\d{2}) \|$", line)
             for line in _section(
-                plan, "## Planned pytest anchor catalog (X6)", "## Planned implementation tasks"
+                plan, "## Planned pytest anchor catalog (X7)", "## Planned implementation tasks"
             ).splitlines()
         )
         if match
@@ -291,7 +363,7 @@ def test_r2f5_requirement_blocks_are_rfc2119_and_unique() -> None:
 
 def test_r2f5_no_anchor_or_result_is_claimed() -> None:
     matrix = MATRIX.read_text(encoding="utf-8")
-    assert "68125def42796e8fcf87810c9aa59e1d7eaf2bed" in matrix
+    assert "97283a5ce6d67d925d84a9d4b759a8ebe98b3af9" in matrix
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in matrix
     assert "No catalog entry exists or passes yet" in PLAN.read_text(encoding="utf-8")
     assert "Task 20" in matrix and "production soak" in matrix
@@ -484,7 +556,7 @@ def test_r2f5_matrix_has_one_explicit_row_per_roadmap_slo() -> None:
     assert all(row[2].strip() and ";" in row[2] for row in design_rows)
 
 
-def test_r2f5_x6_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
+def test_r2f5_x7_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
     matrix = MATRIX.read_text(encoding="utf-8")
@@ -497,12 +569,12 @@ def test_r2f5_x6_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> No
         if (design + plan)[match.end() : match.end() + 3] != ".py"
     }
     assert body_tokens <= allowed, sorted(body_tokens - allowed)
-    assert "## Planned pytest anchor catalog (X6)" in plan
+    assert "## Planned pytest anchor catalog (X7)" in plan
     assert "no hand-written dimension count" in design or "fixed expected tuple" in design
     assert "replication" in matrix and "child of local/NAS" in matrix
 
 
-def test_r2f5_x6_metric_union_and_window_evidence_are_closed() -> None:
+def test_r2f5_x7_metric_union_and_window_evidence_are_closed() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "type MetricResult =" in design
     assert 'status: "pass"' in design and "reason_code: null" in design
@@ -516,7 +588,7 @@ def test_r2f5_x6_metric_union_and_window_evidence_are_closed() -> None:
     assert "Overall status precedence" in design
 
 
-def test_r2f5_x6_model_source_mapping_and_read_only_restore_contract() -> None:
+def test_r2f5_x7_model_source_mapping_and_read_only_restore_contract() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "provider_record.provider_id" in design
     assert "qualification_window.window_id" in design
@@ -531,7 +603,7 @@ def test_r2f5_x6_model_source_mapping_and_read_only_restore_contract() -> None:
     assert "maximum" in design and "unavailable" in design
 
 
-def test_r2f5_x6_time_hash_and_cardinality_contracts_are_explicit() -> None:
+def test_r2f5_x7_time_hash_and_cardinality_contracts_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     assert "YYYY-MM-DD" in design
     assert "RFC3339" in design or "UTC instant" in design
@@ -543,7 +615,7 @@ def test_r2f5_x6_time_hash_and_cardinality_contracts_are_explicit() -> None:
     assert "canonical JSON" in design and "hash preimage" in design
 
 
-def test_r2f5_x6_validator_checks_interface_tokens_and_collection_bounds() -> None:
+def test_r2f5_x7_validator_checks_interface_tokens_and_collection_bounds() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     fingerprint = _section(design, "interface SnapshotFingerprint {", "// All fields")
     for field in (
@@ -579,9 +651,9 @@ def test_r2f5_x6_validator_checks_interface_tokens_and_collection_bounds() -> No
     assert "window_evidence_refs" in design and "exactly one" in design
 
 
-def test_r2f5_x6_structured_contract_is_closed_and_crosswalked() -> None:
+def test_r2f5_x7_structured_contract_is_closed_and_crosswalked() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x6_contract(design)
+    contract = _x7_contract(design)
     canonical_contract = json.dumps(
         contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -630,14 +702,30 @@ def test_r2f5_x6_structured_contract_is_closed_and_crosswalked() -> None:
     }
 
 
-def test_r2f5_x6_digest_contracts_cover_models_without_self_inclusion() -> None:
+def test_r2f5_x7_digest_contracts_cover_models_without_self_inclusion() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x6_contract(design)
+    contract = _x7_contract(design)
     entries = contract["digest_contracts"]
     assert isinstance(entries, list) and entries
     fields = [entry["field"] for entry in entries]
     assert len(fields) == len(set(fields))
     assert set(fields) == _model_digest_fields(design)
+    digest_fields = contract["digest_fields_by_model"]
+    expected_digest_fields: dict[str, list[str]] = {}
+    for field in fields:
+        model, name = field.rsplit(".", 1)
+        expected_digest_fields.setdefault(model, []).append(name)
+    assert digest_fields == expected_digest_fields
+    ast = contract["model_schema_ast"]
+    for model, names in digest_fields.items():
+        if model.endswith(".events"):
+            parent, tuple_name = model.rsplit(".", 1)
+            assert tuple_name in ast[parent]["tuple_item_schemas"]
+            assert set(names) <= set(ast[parent]["tuple_item_schemas"][tuple_name])
+        else:
+            assert model in ast
+            assert names and len(names) == len(set(names))
+    _validate_digest_contract_paths(contract)
     required_keys = {
         "field",
         "canonicalization_version",
@@ -669,9 +757,64 @@ def test_r2f5_x6_digest_contracts_cover_models_without_self_inclusion() -> None:
         assert entry["ordering"] and entry["null_encoding"]
 
 
-def test_r2f5_x6_date_metric_creator_and_limits_contracts_match_models() -> None:
+def test_r2f5_x7_digest_path_validator_rejects_bad_nesting_and_cycles() -> None:
     design = DESIGN.read_text(encoding="utf-8")
-    contract = _x6_contract(design)
+    contract = _x7_contract(design)
+    broken_path = deepcopy(contract)
+    broken_path["digest_contracts"][0]["included_field_paths"] = ["payload.no_such_field"]
+    with pytest.raises(AssertionError, match="missing digest path"):
+        _validate_digest_contract_paths(broken_path)
+
+    broken_tuple = deepcopy(contract)
+    error_entry = next(
+        item
+        for item in broken_tuple["digest_contracts"]
+        if item["field"] == "ErrorHandlingObservation.observation_sha256"
+    )
+    error_entry["included_field_paths"] = ["events.event_id"]
+    with pytest.raises(AssertionError, match="missing digest path"):
+        _validate_digest_contract_paths(broken_tuple)
+
+    cyclic = {
+        "model_schema_ast": {
+            "A": {"object_fields": ["a", "b"], "tuple_item_schemas": {}},
+            "B": {"object_fields": ["a", "b"], "tuple_item_schemas": {}},
+        },
+        "digest_contracts": [
+            {
+                "field": "A.a",
+                "root_object_type": "A",
+                "included_field_paths": ["b"],
+                "excluded_fields": ["a"],
+                "canonicalization_version": "project-canonical-json-v1",
+                "ordering": "sorted",
+                "null_encoding": "JSON null",
+                "domain_separation_prefix": "r2f5/a-v1\\0",
+            },
+            {
+                "field": "B.b",
+                "root_object_type": "B",
+                "included_field_paths": ["a"],
+                "excluded_fields": ["b"],
+                "canonicalization_version": "project-canonical-json-v1",
+                "ordering": "sorted",
+                "null_encoding": "JSON null",
+                "domain_separation_prefix": "r2f5/b-v1\\0",
+            },
+        ],
+    }
+    with pytest.raises(AssertionError, match="digest dependency cycle"):
+        _validate_digest_contract_paths(cyclic)
+
+    self_edge = deepcopy(cyclic)
+    self_edge["digest_contracts"][0]["included_field_paths"] = ["a"]
+    with pytest.raises(AssertionError, match="self-edge"):
+        _validate_digest_contract_paths(self_edge)
+
+
+def test_r2f5_x7_date_metric_creator_and_limits_contracts_match_models() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    contract = _x7_contract(design)
     assert set(contract["date_time_formats"]) == {"session_date", "rfc3339_utc", "as_of"}
     assert "YYYY-MM-DD" in contract["date_time_formats"]["session_date"]
     assert "RFC3339" in contract["date_time_formats"]["rfc3339_utc"]
@@ -679,11 +822,17 @@ def test_r2f5_x6_date_metric_creator_and_limits_contracts_match_models() -> None
     metric_kinds = contract["metric_value_kinds"]
     assert set(metric_kinds) == set(contract["metric_fields"])
     for field, spec in metric_kinds.items():
-        assert spec["observed"] in {"count", "ratio", "duration_ms", "bool", "hash"}, field
+        assert spec["observed"] in {"count", "ratio", "duration_seconds", "bool", "hash"}, field
         assert spec["target"] == spec["observed"], field
         assert spec["unavailable_null"] is True
         assert spec["range"]
     creators = contract["creator_allowlist"]
+    assert creators["production_creator_kind"] == "task20_writer"
+    assert creators["test_envelope"] == {
+        "schema_version": "r2f5-test-envelope-v1",
+        "creator_kind": "test_fixture",
+        "production_reader_accepts": False,
+    }
     assert set(creators["production_envelope_payloads"]) == {
         "WindowEvidenceBundlePayload",
         "RecoveryObservation",
@@ -703,6 +852,10 @@ def test_r2f5_x6_date_metric_creator_and_limits_contracts_match_models() -> None
     }
     assert creators["synthetic_envelope_only"] == ["test_fixture"]
     assert creators["reader_never_creates"] == ["r2f5_reader", "r2f4_writer"]
+    assert 'type ProductionCreatorKind = "task20_writer";' in design
+    test_envelope = _section(design, "type TestEnvelope<T> =", "// JCS-compatible project JSON")
+    assert 'creator_kind: "test_fixture";' in test_envelope
+    assert "MUST be rejected by a" in design and "production reader" in design
     assert contract["limits"] == {
         "max_entries": 100000,
         "max_input_bytes": 536870912,
@@ -713,12 +866,40 @@ def test_r2f5_x6_date_metric_creator_and_limits_contracts_match_models() -> None
         "max_elapsed_ms": 10000,
     }
 
+    catalogs = contract["sqlite_catalogs"]
+    assert set(catalogs) == {
+        "replication_sidecar",
+        "daily_shadow",
+        "shadow_registry",
+        "calendar_generation",
+        "universe",
+    }
+    expected_roles = {
+        "replication_sidecar": "replication",
+        "daily_shadow": "qualification",
+        "shadow_registry": "qualification",
+        "calendar_generation": "calendar",
+        "universe": "universe",
+    }
+    expected_versions = {"shadow_registry": 2}
+    for role, catalog in catalogs.items():
+        assert catalog["role"] == expected_roles[role]
+        assert catalog["user_version"] == expected_versions.get(role, 1)
+        assert catalog["system_tables"] == ["sqlite_sequence"]
+        tables = catalog["tables"]
+        assert catalog["allowed_tables"] == list(tables)
+        for table_name, schema in tables.items():
+            assert table_name in catalog["allowed_tables"]
+            assert schema["columns"] and all(":" in column for column in schema["columns"])
+            assert schema["primary_key"] and schema["order_by"]
+        assert catalog["catalog_digest_source"].startswith("existing-r2f4")
 
-def test_r2f5_x6_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
+
+def test_r2f5_x7_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
     matrix = MATRIX.read_text(encoding="utf-8")
-    contract = _x6_contract(design)
+    contract = _x7_contract(design)
     metric_fields = set(contract["metric_fields"])
     report = _section(design, "interface R2FAcceptanceReport {", "interface SnapshotIdentity {")
     report_fields = set(re.findall(r"^\s+([a-z_]+): MetricResult;", report, re.MULTILINE))
@@ -740,12 +921,38 @@ def test_r2f5_x6_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
     assert "r2f5_reader" in design and "MUST NOT appear as envelope creators" in design
 
 
-def test_r2f5_x6_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
+def test_r2f5_x7_model_ast_roots_and_tuple_items_are_explicit() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    contract = _x7_contract(design)
+    ast = contract["model_schema_ast"]
+    assert ast and all(
+        isinstance(node.get("object_fields"), list)
+        and isinstance(node.get("tuple_item_schemas"), dict)
+        for node in ast.values()
+    )
+    for root in {entry["root_object_type"] for entry in contract["digest_contracts"]}:
+        assert root in ast
+    assert ast["ErrorHandlingObservation"]["tuple_item_schemas"]["events"] == [
+        "event_id",
+        "forced_error_class",
+        "sanitized_reason",
+        "normalized_result",
+        "attempt_id",
+        "expected_class",
+        "observed_class",
+        "evidence_sha256",
+        "observed_at",
+    ]
+    assert "schema_policy_versions" in ast["SessionObservation"]["object_fields"]
+    assert "duplicate_proof_sha256" in ast["RecoveryObservation"]["object_fields"]
+
+
+def test_r2f5_x7_envelope_raw_facts_and_pre_capture_models_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     envelope = _section(
         design,
         "interface ImmutableObservationEnvelopeV1<T> {",
-        "interface SnapshotFingerprint {",
+        "type TestEnvelope<T> =",
     )
     assert re.findall(r"^\s+([a-z0-9_]+):", envelope, re.MULTILINE) == [
         "artifact_id",
@@ -810,12 +1017,12 @@ def test_r2f5_x6_envelope_raw_facts_and_pre_capture_models_are_explicit() -> Non
     assert "Task19 only opens immutable refs" in design
 
 
-def test_r2f5_x6_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
+def test_r2f5_x7_metric_values_tree_hash_and_window_envelopes_are_bound() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     metric_value = _section(design, "type MetricValue =", "type MetricResult =")
     assert all(
         f'kind: "{kind}"' in metric_value
-        for kind in ("count", "ratio", "duration_ms", "bool", "hash")
+        for kind in ("count", "ratio", "duration_seconds", "bool", "hash")
     )
     local_nas = _section(
         design, "interface LocalNasIsolationObservation {", "interface SessionObservation {"
