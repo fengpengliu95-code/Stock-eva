@@ -2173,3 +2173,61 @@ def test_read_only_dataset_store_rejects_writer_lifecycle_before_any_mutation(
     assert _tree(dataset_root) == before
     assert not control.exists()
     assert not staging.exists()
+
+
+def test_r2f5_acceptance_api_is_additive_red_and_write_free(tmp_path: Path) -> None:
+    """The new status route must exist without initializing configured roots."""
+
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        local_market_dataset_root=tmp_path / "dataset",
+        provider_shadow_root=tmp_path / "shadow",
+    )
+    before = _tree(tmp_path)
+    response = _api_get(
+        "/api/v1/market/reliability-acceptance?start=2026-08-03&end=2026-08-28",
+        settings,
+        raise_app_exceptions=False,
+    )
+    assert response.status_code in {200, 503}, "R2-F5 acceptance API contract is not wired"
+    assert str(tmp_path) not in response.text
+    if response.status_code == 200:
+        payload = response.json()
+        assert payload["provider_requests"] == 0
+        assert payload["writes"] is False
+        assert payload["restore_started"] is False
+        assert payload["production_window_started"] is False
+    assert _tree(tmp_path) == before
+
+
+def test_r2f5_acceptance_cli_is_additive_red_and_has_no_execute(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    """The CLI contract has no execute switch and emits one JSON report."""
+
+    settings = Settings(
+        _env_file=None,
+        local_control_dir=tmp_path / "control",
+        local_market_dataset_root=tmp_path / "dataset",
+        provider_shadow_root=tmp_path / "shadow",
+    )
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stock-eva", "r2f-acceptance", "--start", "2026-08-03", "--end", "2026-08-28"],
+    )
+    try:
+        exit_code = cli_module.main()
+    except SystemExit as error:
+        pytest.fail(f"RED: r2f-acceptance CLI is not wired (argparse exit {error.code})")
+    output = capsys.readouterr().out
+    assert exit_code in {0, 1}, "r2f-acceptance CLI is not wired"
+    payload = json.loads(output)
+    assert payload["provider_requests"] == 0
+    assert payload["writes"] is False
+    with pytest.raises(cli_module._CliArgumentError):
+        cli_module.build_parser().parse_args(
+            ["r2f-acceptance", "--start", "2026-08-03", "--end", "2026-08-28", "--execute"]
+        )

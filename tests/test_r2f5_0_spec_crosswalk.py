@@ -465,7 +465,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         "## Out of Scope",
     ):
         assert heading in text
-    assert "SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
+    assert "SPEC APPROVED / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
     assert "a7d3be1c6b9f760c659470fffcf6299bcd8ddf73" in text
     assert "MUST" in text and "MUST NOT" in text
@@ -1115,10 +1115,28 @@ def test_r2f5_x8_date_metric_creator_and_limits_contracts_match_models() -> None
             assert schema["primary_key"] == authoritative["tables"][table_name]["primary_key"]
             declared_names = {column.split(":", 1)[0] for column in schema["columns"]}
             assert all(column in declared_names for column in schema["order_by"])
-        assert catalog["schema_version_source"].startswith(
-            f"PRAGMA user_version={catalog['user_version']}"
+        # L1: source identity is part of the frozen catalog contract.  Prefix
+        # checks accepted a different module, DDL constant, or migration suffix
+        # while still appearing valid; compare the complete declared identity.
+        catalog_sources = {
+            "replication_sidecar": "backend/app/storage/replication:SIDECAR_DDL",
+            "daily_shadow": (
+                "backend/app/market/daily_shadow_schema:DAILY_SHADOW_DDL+MIGRATION_ID"
+            ),
+            "shadow_registry": (
+                "backend/app/market/shadow_registry_schema:REGISTRY_DDL+MIGRATION_SQL"
+            ),
+            "calendar_generation": (
+                "backend/app/market/calendar_generation:CALENDAR_GENERATION_DDL"
+            ),
+            "universe": "backend/app/market/universe:UNIVERSE_DDL",
+        }
+        source_identity = catalog_sources[role]
+        assert catalog["schema_version_source"] == (
+            f"PRAGMA user_version={catalog['user_version']}; exact sqlite_master; "
+            + source_identity
         )
-        assert catalog["catalog_digest_source"].startswith("backend/")
+        assert catalog["catalog_digest_source"] == source_identity
 
 
 def test_r2f5_x8_crosswalk_reads_plan_matrix_and_report_interfaces() -> None:
