@@ -159,34 +159,6 @@ _PUBLIC_SNAPSHOT_IDENTITY_VECTOR = (
 )
 _PUBLIC_SEMANTIC_REPORT_VECTOR = "1df3d2693501a1d13954a57c3ab7154f2649475db1c067a287b9ff6c093cef83"
 
-# Public-output/failure-consumer inventory for every approved digest contract.
-# This is intentionally a reviewable table (rather than a root.json
-# self-certification): a contract is consumed by a public projection or by a
-# named raw-artifact mutation that must make its parent chain fail.
-_PUBLIC_DIGEST_COVERAGE = {
-    field: (
-        "snapshot_identity"
-        if field.startswith("Snapshot")
-        else "session_observation"
-        if field.startswith(("Session", "Replication", "ReadBoundary", "Calendar"))
-        else "window_or_report"
-        if field.startswith(
-            (
-                "Window",
-                "Recovery",
-                "WholeSession",
-                "Replay",
-                "Adjustment",
-                "Error",
-                "LocalNas",
-                "Restore",
-            )
-        )
-        else "frozen_or_failure"
-    )
-    for field in DIGESTS
-}
-
 
 def _canonical_json(value: Any) -> bytes:
     return (
@@ -1230,6 +1202,7 @@ def _write_immutable_leaf_objects(
                 "artifact_ref": f"task20:{safe_identifier}",
                 "object_path": object_path.relative_to(evidence).as_posix(),
                 "root_path": root_path.relative_to(evidence).as_posix(),
+                "root_object_type": DIGESTS[field_path]["root_object_type"],
                 "contract_digest": _digest(field_path, root),
                 "artifact_sha256": digest,
                 "immutable": True,
@@ -2640,6 +2613,7 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
         raw = object_path.read_bytes()
         assert descriptor["immutable"] is True
         assert descriptor["source_field"] == field_path
+        assert descriptor["root_object_type"] == DIGESTS[field_path]["root_object_type"]
         assert descriptor["object_path"] == object_path.relative_to(golden.evidence).as_posix()
         root_path = golden.evidence / descriptor["root_path"]
         disk_root = json.loads(root_path.read_text(encoding="utf-8"))
@@ -4656,26 +4630,43 @@ def _unavailable_reason(metric: str, mutation: str) -> str:
     return reason
 
 
-def _disk_digest_matches(golden: GoldenTree, field_path: str, expected: str) -> bool:
-    """Resolve a formal contract root from its disk descriptor, never memory."""
+def _disk_digest_matches(
+    golden: GoldenTree,
+    field_path: str,
+    expected: str,
+    descriptor_path: Path | None = None,
+) -> bool:
+    """Resolve one specified formal descriptor from disk, never siblings."""
 
     leaf = golden.leaf_files.get(field_path)
     if leaf is None:
         return False
-    object_path, descriptor_path = leaf
-    for descriptor_candidate in descriptor_path.parent.glob("*.descriptor.json"):
-        descriptor = _read_json(descriptor_candidate)
-        root_path = golden.evidence / descriptor["root_path"]
-        if not root_path.is_file():
-            continue
-        root = _read_json(root_path)
-        if _digest(field_path, root) != expected:
-            continue
-        object_candidate = golden.evidence / descriptor["object_path"]
-        if not object_candidate.is_file():
-            continue
-        return descriptor["artifact_sha256"] == _stream_sha256(object_candidate)
-    return False
+    object_path, default_descriptor = leaf
+    descriptor_path = descriptor_path or default_descriptor
+    try:
+        descriptor_rel = descriptor_path.relative_to(golden.evidence)
+        object_rel = object_path.relative_to(golden.evidence)
+    except ValueError:
+        return False
+    if descriptor_rel.is_absolute() or object_rel.is_absolute():
+        return False
+    if descriptor_path != default_descriptor:
+        return False
+    if not descriptor_path.is_file() or not object_path.is_file():
+        return False
+    descriptor = _read_json(descriptor_path)
+    if descriptor.get("source_field") != field_path:
+        return False
+    root_path = golden.evidence / descriptor["root_path"]
+    if not root_path.is_file() or descriptor.get("object_path") != object_rel.as_posix():
+        return False
+    root = _read_json(root_path)
+    if descriptor.get("root_object_type") not in {None, DIGESTS[field_path]["root_object_type"]}:
+        return False
+    return bool(
+        _digest(field_path, root) == descriptor.get("contract_digest") == expected
+        and descriptor.get("artifact_sha256") == _stream_sha256(object_path)
+    )
 
 
 def _window_digest_ok(child: dict[str, Any], field_path: str) -> bool:
@@ -4846,7 +4837,7 @@ def _make_slo_test(metric: str):
         result = report[metric]
         assert result["status"] == case.metric_status
         assert result["reason_code"] == case.reason
-        if case.state == "pass":
+        if case.mutation is None:
             assert report["snapshot_identity"] == golden.snapshot_identity
             assert report["window_evidence_refs"] == [golden.window_envelope["envelope_sha256"]]
         if case.metric_status == "unavailable":
@@ -4854,8 +4845,6 @@ def _make_slo_test(metric: str):
         else:
             kind = METRIC_KINDS[metric]["observed"]
             measured_value = _reduce_slo_metric(metric, golden)
-            if case.state == "fail" and kind in {"bool"}:
-                measured_value = False
             target = SLO_CONTRACTS[metric]["target"]
             if metric == "replication":
                 target = _read_json(golden.evidence / "completed_replication_restore.json")[
@@ -4977,6 +4966,30 @@ def test_r2f5_complete_public_snapshot_and_semantic_report_literals() -> None:
     assert semantic_sha == _PUBLIC_SEMANTIC_REPORT_VECTOR
 
 
+def test_r2f5_public_pure_digest_apis_bind_complete_literals() -> None:
+    snapshot = {
+        "snapshot_schema": "r2f5-public-snapshot-v1",
+        "input_fingerprints": [
+            {"role": "dataset", "sha256": "a" * 64},
+            {"role": "calendar", "sha256": "b" * 64},
+        ],
+        "window_id": "qualification-window-20",
+        "session_digest": "c" * 64,
+    }
+    snapshot_sha = _PUBLIC_SNAPSHOT_IDENTITY_VECTOR
+    report = {
+        "report_schema": "r2f5-semantic-report-v1",
+        "status": "ready",
+        "snapshot_identity_sha256": snapshot_sha,
+        "session_digest": "c" * 64,
+        "window_id": "qualification-window-20",
+        "quality_issues": [],
+    }
+    module = _red_reader()
+    assert module.compute_snapshot_identity_sha256(snapshot) == snapshot_sha
+    assert module.compute_semantic_report_sha256(report) == _PUBLIC_SEMANTIC_REPORT_VECTOR
+
+
 @pytest.mark.parametrize("mode", ("missing", "tamper"))
 def test_r2f5_disk_leaf_mutation_breaks_recomputed_contract(golden: GoldenTree, mode: str) -> None:
     field_path = "SessionEvidenceBinding.evidence_sha256"
@@ -5018,6 +5031,15 @@ def test_r2f5_public_service_reads_authoritative_registry_projection(
     assert report["status"] in {"unavailable", "not_ready"}
     assert report["quality_issues"]
     assert reason in report["quality_issues"]
+    pre_capture = report.get("pre_capture_failure")
+    assert pre_capture is not None
+    assert pre_capture["descriptor_roles"] == ["shadow_registry"]
+    assert pre_capture["reason_code"] == "CONTROL_STATE_UNAVAILABLE" or reason in (
+        "SESSION_COUNT_NOT_20",
+        "SESSION_SEQUENCE_INVALID",
+        "CANONICAL_INTEGRITY_FAILED",
+    )
+    assert pre_capture["control_logical_digest"] != pre_capture.get("window_envelope_digest")
     if report.get("snapshot_identity") is not None:
         assert report["snapshot_identity"]["registry_projection"] == "shadow_registry"
         assert report["snapshot_identity"]["qualification_window_id"] == ("qualification-window-20")
@@ -5102,14 +5124,58 @@ def test_r2f5_complete_golden_is_strictly_validated_from_x8(golden: GoldenTree) 
     assert golden.qualification_projection["qualification_proof_status"] == "available"
 
 
-def test_r2f5_all_61_digest_contracts_have_public_or_failure_consumers() -> None:
-    assert len(_PUBLIC_DIGEST_COVERAGE) == 61
-    assert set(_PUBLIC_DIGEST_COVERAGE) == set(DIGESTS)
-    assert all(
-        value
-        in {"snapshot_identity", "session_observation", "window_or_report", "frozen_or_failure"}
-        for value in _PUBLIC_DIGEST_COVERAGE.values()
+def _contract_public_pointer(field_path: str) -> str:
+    if field_path.startswith("Session") or field_path.startswith(
+        ("Replication", "ReadBoundary", "Calendar")
+    ):
+        return "$.session_observations[]." + field_path.rsplit(".", 1)[-1]
+    if field_path.startswith("Snapshot"):
+        return "$.snapshot_identity." + field_path.rsplit(".", 1)[-1]
+    if field_path.startswith("Frozen"):
+        return "$.frozen_versions." + field_path.rsplit(".", 1)[-1]
+    return "$.window_evidence_bundle.payload." + field_path.rsplit(".", 1)[-1]
+
+
+@pytest.mark.parametrize("field_path", tuple(DIGESTS))
+def test_r2f5_each_qualified_digest_contract_has_real_public_consumer(
+    golden: GoldenTree, field_path: str
+) -> None:
+    """Each contract is exercised through a concrete disk/public binding."""
+
+    assert field_path in DIGESTS
+    pointer = _contract_public_pointer(field_path)
+    assert pointer.startswith("$.")
+    leaf = golden.leaf_files.get(field_path)
+    if leaf is not None:
+        object_path, descriptor_path = leaf
+        assert object_path.is_file() and descriptor_path.is_file()
+        descriptor = _read_json(descriptor_path)
+        expected = descriptor["contract_digest"]
+        assert _disk_digest_matches(golden, field_path, expected, descriptor_path)
+        _mutate_formal_leaf(golden, field_path, mode="descriptor_tamper")
+        assert not _disk_digest_matches(golden, field_path, expected, descriptor_path)
+    # The consumer seam is deliberately resolved from the future module only
+    # after the fixture/path proof above; missing target keeps this RED.
+    module = _red_reader()
+    validator = getattr(module, "validate_canonical_digest", None)
+    assert callable(validator), (field_path, pointer)
+
+
+def test_r2f5_reducer_ast_never_reads_case_expectations_or_assigns_observed() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    reducer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_reduce_slo_metric"
     )
+    names = {node.id for node in ast.walk(reducer) if isinstance(node, ast.Name)}
+    assert not names.intersection({"case", "expected", "state", "reason"})
+    for node in ast.walk(reducer):
+        if isinstance(node, ast.Assign):
+            assert all(
+                not isinstance(target, ast.Name) or target.id not in {"observed", "measured"}
+                for target in node.targets
+            )
 
 
 def test_r2f5_golden_artifacts_never_contain_test_control_fields(golden: GoldenTree) -> None:
@@ -5226,6 +5292,12 @@ def test_r2f5_public_digest_validator_matches_external_literals() -> None:
 def test_r2f5_complete_golden_public_reader_is_ready(golden: GoldenTree) -> None:
     before = tuple(_physical_fingerprint(root) for root in golden.roots())
     report = _evaluate(golden.request)
+    digest_module = _red_reader()
+    assert (
+        digest_module.compute_snapshot_identity_sha256(report["snapshot_identity"])
+        == report["snapshot_identity"]["snapshot_sha256"]
+    )
+    assert digest_module.compute_semantic_report_sha256(report) == report["semantic_report_sha256"]
     assert report["status"] == "ready"
     assert report["selected_sessions"] == golden.sessions
     assert len(report["session_observations"]) == len(report["observation_refs"]) == 20
@@ -5408,6 +5480,16 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("INSERT INTO calendar_official_object VALUES (?, ?)", (old_hash, b"old"))
+
+    def rowset_digest() -> str:
+        with sqlite3.connect(f"file:{database}?mode=ro&immutable=false", uri=True) as connection:
+            rows = connection.execute(
+                "SELECT body_sha256,body FROM calendar_official_object ORDER BY body_sha256"
+            ).fetchall()
+        encoded = b"".join(_sqlite_record(tuple(row), ("TEXT", "BLOB")) for row in rows)
+        return hashlib.sha256(b"r2f5/calendar-rowset-v1\0" + encoded).hexdigest()
+
+    old_rowset_digest = rowset_digest()
     old_fingerprint = _fingerprint("calendar", database)[0]
     real_connect = sqlite3.connect
     start_writer = threading.Event()
@@ -5468,6 +5550,8 @@ def test_r2f5_wal_barrier_reads_one_logical_snapshot(
     # old/new logical identities are bound to the public snapshot fingerprint;
     # raw DB/WAL/SHM bytes are never used as evidence.
     new_fingerprint = _fingerprint("calendar", database)[0]
+    new_rowset_digest = rowset_digest()
+    assert old_rowset_digest != new_rowset_digest
     expected_fingerprint = (
         new_fingerprint if commit_timing == "before_transaction" else old_fingerprint
     )
