@@ -18,7 +18,7 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (must remain the starting identity)
 
-**X3 revision base:** `d4ca71e7000d5dc8c93ab139409b8b6c682e4ff7` (clean X2)
+**X4 revision base:** `4879bc7dddc87fd51613028a84ea834b67ac28d8` (clean X3)
 
 **Worktree:** `/Users/finlay/.codex/worktrees/r2f5-0/Stock- evaluation`
 
@@ -41,7 +41,8 @@ design first and stop implementation until the reviewed specification is amended
 
 - FR-1: The implementation MUST create only the acceptance reader/report domain and read-only CLI/
   API wiring described by the design; it MUST NOT add a writer or provider path.
-- FR-2: It MUST validate paths and capture/fingerprint one immutable snapshot before evaluation.
+- FR-2: It MUST validate paths and capture/fingerprint one immutable snapshot before evaluation;
+  each input uses descriptor identity plus full streaming SHA-256 and a 512 MiB maximum.
 - FR-3: It MUST select exactly 20 confirmed consecutive sessions and preserve missing-middle,
   19-versus-20 and future/PIT distinctions.
 - FR-4: It MUST freeze and compare the complete version vector, apply inclusive Shanghai cutoffs,
@@ -57,19 +58,25 @@ design first and stop implementation until the reviewed specification is amended
 - FR-10: It MUST require immutable secondary qualification/admission and whole-session failover
   drill evidence; BaoStock-only or source-purity-only input cannot pass failover.
 - FR-11: It MUST read replication/restore completed records with trust scope, destination generation,
-  head proof, remote verification and frozen numeric thresholds; LOCAL_CHAIN_ONLY cannot pass remote.
+  head proof and frozen policy thresholds; LOCAL_CHAIN_ONLY cannot pass remote. Unsupported remote
+  verification fields are absent unless supplied by a Task20 writer-owned drill envelope.
 - FR-12: It MUST run replay only with injected frozen offline adapter/normalizer identity and zero
   provider/network construction, login or query.
 - FR-13: It MUST require a complete non-null ready-time version vector and 20-session equality.
 - FR-14: It MUST preserve raw calendar order/duplicates, validate before sorted unique derivation,
   and bind SnapshotIdentity to range, Shanghai clock, fingerprints and versions.
-- FR-15: It MUST return exactly 20 ordered per-session observations or immutable references/digests.
+- FR-15: It MUST return exactly 20 ordered per-session observations or immutable references/digests;
+  recovery, failover, replay, adjustment, error, NAS-isolation and restore records belong to one
+  window evidence bundle, not to every session observation.
 - FR-16: It MUST exclude elapsed/counters from semantic report JSON/digest and use canonical JSON.
 - FR-17: It MUST enforce closed enums, reason codes, hashes, IDs, nonnegative bounds and quality issues.
 - FR-18: It MUST apply exact reason precedence and fail closed on concurrent snapshot change.
-- FR-19: It MUST expose separate MetricResult fields for all roadmap SLO dimensions.
-- FR-20: It MUST require immutable secondary qualification/admission and whole-session failover proof.
-- FR-21: It MUST read replication/restore snapshots with trust scope, destination proof and frozen thresholds.
+- FR-19: It MUST expose 17 roadmap MetricResult fields plus replication as a Local/NAS child metric,
+  each with an independent session/window reducer and explicit threshold.
+- FR-20: It MUST project only existing provider_record/qualification_window fields and require an
+  immutable whole-session failover envelope; missing proof is unavailable and purity cannot substitute.
+- FR-21: It MUST read replication/restore snapshots with existing checkpoint/record/head/archive/audit
+  fields and frozen thresholds; Task20 owns remote/schema/readback drill evidence.
 - FR-22: It MUST run replay only with an injected frozen offline adapter/normalizer identity.
 - FR-23: It MUST require a complete non-null frozen version vector and 20-session equality.
 - FR-24: It MUST preserve raw calendar order/duplicates and bind SnapshotIdentity to all inputs.
@@ -94,7 +101,7 @@ design first and stop implementation until the reviewed specification is amended
 - NFR-8: Readers MUST NOT call create=True, writer, reconcile, drain, mount or restore paths.
 - NFR-9: Ready MUST require complete versions, exact 20 observations and valid SnapshotIdentity.
 - NFR-10: Public enums/IDs/hashes/reasons/counters MUST be extra-forbidden, bounded and deterministic.
-- NFR-11: Every roadmap Section 10 threshold MUST be explicit and sourced from the roadmap or reviewed R2-F4 evidence.
+- NFR-11: Every roadmap Section 10 threshold MUST be explicit and sourced from the roadmap or reviewed R2-F4 evidence; the fixed source tuple has 17 rows and replication is a child metric.
 - NFR-12: LOCAL_CHAIN_ONLY MUST be labeled offline-only and cannot satisfy remote/NAS/Task 20 acceptance.
 - NFR-13: Readers MUST NOT call create=True, writer, reconcile, drain, mount or restore paths.
 - NFR-14: Ready MUST require complete versions, exact 20 observations and valid SnapshotIdentity.
@@ -108,21 +115,21 @@ Given the design and plan at the base commit, when the strict design validator a
 run, then all mandatory sections, RFC 2119 requirements, unique IDs, AC parent references and
 planned anchors are validated, with no implementation or production result claimed.
 
-Planned test anchors: `test_r2f5_spec_has_mandatory_sections`, `test_r2f5_crosswalk_is_exact`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-2: RED boundary (FR-1, NFR-2)
 
 Given the base tree before implementation, when the prescribed R2-F5 focused RED command runs,
 then the absent acceptance service/API/CLI is demonstrated without provider/network/production I/O.
 
-Planned test anchors: `test_r2f5_red_service_absent`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-3: GREEN report (FR-2, FR-3, FR-4, FR-5, FR-6, FR-7)
 
 Given synthetic read-only fixtures, when the implementation evaluates them, then the report matches
 the design model, status vocabulary, 20-session rule, cutoffs, metrics, lineage and markers.
 
-Planned test anchors: `test_r2f5_acceptance_report_green_contract`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-4: Full/static compatibility (FR-8, NFR-1, NFR-2)
 
@@ -130,9 +137,9 @@ Given the implemented slice, when focused, full, Ruff, compileall, diff and prot
 checks run, then no predecessor compatibility surface is mutated and all gates are recorded by the
 future acceptance owner. This plan records no result now.
 
-Planned test anchors: `test_r2f5_protected_golden_objects_are_unchanged`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
-Traceability: the planned X3 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
+Traceability: the planned X4 acceptance criteria AC-5 through AC-23 below cover FR-9, FR-10,
 FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23,
 FR-24, FR-25, FR-26, FR-27 and FR-28.
 
@@ -162,8 +169,8 @@ interface R2FAcceptanceReader {
 }
 ```
 
-The report contract includes every roadmap Section 10 `MetricResult` field, including the explicit
-replication sub-dimension named by the roadmap Local/NAS target and `read_boundary`,
+The report contract includes every roadmap Section 10 `MetricResult` field, plus replication as a
+Local/NAS child metric and `read_boundary`,
 `SnapshotIdentity`, a complete `FrozenReliabilityVersions`, exactly 20 ordered session
 observations/references and a separate
 volatile diagnostic envelope. Secondary qualification/admission, whole-session failover drill and
@@ -197,15 +204,16 @@ No persistence migration or new writer-owned database is permitted.
 | `CapturedSnapshot` | selected sessions, fingerprints, versions | exactly 20 confirmed dates; in-memory/read-only |
 | `R2FAcceptanceReport` | status, metrics, markers, counters | no provider requests/writes; no production claim |
 | `SnapshotIdentity` | requested range, Shanghai as-of, fingerprints, version digest | all evaluation reads bind to one identity |
-| `SecondaryQualificationEvidenceV1` | qualification/admission IDs and hashes | missing/unqualified is not_ready/unavailable |
-| `CompletedReplicationRestoreSnapshotV1` | trust scope, destination generation/head/remote proofs, thresholds | LOCAL_CHAIN_ONLY cannot pass remote; no writer/reconcile paths |
+| `SecondaryQualificationProjection` | existing provider_record/qualification_window fields | missing/unqualified is not_ready/unavailable; no invented IDs/hashes |
+| `CompletedReplicationRestoreSnapshotV1` | existing checkpoint/record/head/archive and restore audit fields plus `FrozenR2F4PolicyThresholds` | LOCAL_CHAIN_ONLY or absent reviewed thresholds cannot pass remote; no writer/reconcile paths |
 | `OfflineReplayContext` | frozen adapter/normalizer IDs and implementation hash | network false, provider requests zero; registry resolver rejects unknown/default identities |
-| `SessionObservation` | session/cutoffs/counts/source set/evidence hashes/pointer reconciliation/replication/recovery/error/NAS records | exactly ordered 20 observations; each record is immutable and independently re-checkable |
+| `SessionObservation` | session/cutoffs/counts/source set/evidence hashes/pointer reconciliation/replication/read-boundary facts | exactly ordered 20 observations; no window-drill claim |
+| `WindowEvidenceBundle` | recovery/failover/replay/adjustment/error/NAS/restore records | exactly one immutable window bundle; current state alone is insufficient |
 | `RecoveryObservation` | event/attempt/generation/queue/restart/exactly-once publication IDs and hashes | current queue status alone is insufficient |
-| `ErrorHandlingObservation` | forced class, sanitized reason/result, event/attempt/record/version/time | closed forced-error mapping only |
-| `LocalNasIsolationObservation` | outage interval, local publication, lag, retry transition, event/attempt/record/version/time | current status alone is insufficient |
+| `ErrorHandlingObservation` | exactly six forced classes, expected/observed mapping, sanitized evidence hashes | each class exactly once; closed forced-error mapping only |
+| `LocalNasIsolationObservation` | outage interval, local publication/pointer, backlog IDs/counts, lag, retry transition | local publication remains ready despite NAS outage |
 
-## Planned pytest anchor catalog (X3)
+## Planned pytest anchor catalog (X4)
 
 This catalog is normative planning metadata. Each requirement ID appears once and maps to exactly
 one stable future pytest node/case token; the crosswalk validator compares this table with the
@@ -308,13 +316,13 @@ matrix rather than treating non-empty prose as evidence. No catalog entry exists
 
 ## Planned implementation tasks
 
-## X3 normative requirement mirror
+## X4 normative requirement mirror
 
-The design is the full semantic authority. This mirror keeps every X3 ID explicit in the plan so
+The design is the full semantic authority. This mirror keeps every X4 ID explicit in the plan so
 the crosswalk validator can detect omissions or duplicate definitions; it is not implementation
 evidence.
 
-### X3 acceptance criteria
+### X4 acceptance criteria
 
 ### AC-5: Complete SLO metric inventory (FR-9, NFR-6)
 
@@ -393,7 +401,7 @@ Given only elapsed/counter changes, when report envelopes are compared, then sem
 
 Given invalid enum/hash/ID/negative/oversized values, when validation runs, then the report is rejected safely.
 
-### X3 edge cases
+### X4 edge cases
 
 - EC-9: Missing SLO field or threshold is unavailable and never inferred from another metric.
 - EC-10: BaoStock-only/unqualified secondary cannot pass failover.

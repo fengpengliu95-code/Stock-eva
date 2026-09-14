@@ -44,6 +44,26 @@ EXTRA_REASON_CODES = {
     "REMOTE_PROOF_MISSING",
 }
 
+EXPECTED_ROADMAP_DIMENSIONS = (
+    "continuity",
+    "next_morning_availability",
+    "same_evening_availability",
+    "coverage",
+    "canonical_integrity",
+    "source_purity",
+    "recovery",
+    "failover",
+    "provenance",
+    "replay",
+    "adjustment",
+    "calendar",
+    "universe",
+    "error_handling",
+    "local_nas_isolation",
+    "restore",
+    "read_boundary",
+)
+
 
 def _section(text: str, heading: str, next_heading: str) -> str:
     start = text.index(heading) + len(heading)
@@ -71,11 +91,7 @@ def _roadmap_dimensions() -> list[str]:
         )
         if token:
             dimensions.append(token)
-        # Section 10 names replication lag in the Local/NAS row. Promote that explicit
-        # mandatory sub-dimension without maintaining a separate hand-written count/list.
-        if "replication" in match.group(2).lower() and "replication" not in dimensions:
-            dimensions.append("replication")
-    assert dimensions and len(dimensions) == len(set(dimensions))
+    assert tuple(dimensions) == EXPECTED_ROADMAP_DIMENSIONS
     return dimensions
 
 
@@ -145,9 +161,13 @@ def _slo_rows(text: str) -> list[tuple[str, str, str, str, str]]:
         "## R2-F5.0 metric contract and evidence sources",
         "## Secondary admission and failover evidence contract",
     )
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str]] = []
     for line in section.splitlines():
-        match = re.match(r"^\| `([a-z_]+)` \| (.*?) \| (.*?) \| (.*?) \| (.*?) \|$", line)
+        match = re.match(
+            r"^\| `([a-z_]+)`(?: \*\(child of local/NAS\)\*)? \| (.*?) \| (.*?) \| "
+            r"(.*?) \| (.*?) \| (.*?) \|$",
+            line,
+        )
         if match:
             rows.append(match.groups())
     return rows
@@ -158,7 +178,8 @@ def _matrix_slo_rows(text: str) -> list[tuple[str, str, str, str, str, str]]:
     rows: list[tuple[str, str, str, str, str, str]] = []
     for line in section.splitlines():
         match = re.match(
-            r"^\| `([a-z_]+)` \| (.*?) \| (.*?) \| `([A-Z0-9_]+)` \| (AC-\d+) \| "
+            r"^\| `([a-z_]+)`(?: \*\(child of local/NAS\)\*)? \| (.*?) \| (.*?) \| "
+            r"`([A-Z0-9_]+)` \| (AC-\d+) \| "
             r"`PLANNED::(test_r2f5_slo_[a-z_]+)` \|$",
             line,
         )
@@ -182,7 +203,7 @@ def test_r2f5_spec_has_mandatory_sections_and_boundary() -> None:
         assert heading in text
     assert "SPEC CANDIDATE / IMPLEMENTATION NOT STARTED / R2-F5.0 NO-GO" in text
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in text
-    assert "d4ca71e7000d5dc8c93ab139409b8b6c682e4ff7" in text
+    assert "4879bc7dddc87fd51613028a84ea834b67ac28d8" in text
     assert "MUST" in text and "MUST NOT" in text
     assert "production_window_started=false" in text
     assert "Task 20" in text and "20 confirmed consecutive" in text
@@ -213,7 +234,7 @@ def test_r2f5_crosswalk_is_exact_and_anchored() -> None:
         for match in (
             re.match(r"^\| ((?:FR|NFR|AC|EC)-\d+) \| (test_r2f5_req_[a-z]+_\d{2}) \|$", line)
             for line in _section(
-                plan, "## Planned pytest anchor catalog (X3)", "## Planned implementation tasks"
+                plan, "## Planned pytest anchor catalog (X4)", "## Planned implementation tasks"
             ).splitlines()
         )
         if match
@@ -237,7 +258,7 @@ def test_r2f5_requirement_blocks_are_rfc2119_and_unique() -> None:
 
 def test_r2f5_no_anchor_or_result_is_claimed() -> None:
     matrix = MATRIX.read_text(encoding="utf-8")
-    assert "d4ca71e7000d5dc8c93ab139409b8b6c682e4ff7" in matrix
+    assert "4879bc7dddc87fd51613028a84ea834b67ac28d8" in matrix
     assert "5393f499dbc8b84398658816f7a555dd3e547d47" in matrix
     assert "No catalog entry exists or passes yet" in PLAN.read_text(encoding="utf-8")
     assert "Task 20" in matrix and "production soak" in matrix
@@ -258,17 +279,22 @@ def test_r2f5_plan_preserves_required_commands_and_no_execute() -> None:
 def test_r2f5_slo_inventory_and_planned_anchor_contract_are_explicit() -> None:
     design = DESIGN.read_text(encoding="utf-8")
     dimensions = _roadmap_dimensions()
-    assert set(row[0] for row in _slo_rows(DESIGN.read_text(encoding="utf-8"))) == set(dimensions)
-    assert set(row[0] for row in _matrix_slo_rows(MATRIX.read_text(encoding="utf-8"))) == set(
-        dimensions
-    )
+    assert set(row[0] for row in _slo_rows(DESIGN.read_text(encoding="utf-8"))) == {
+        *dimensions,
+        "replication",
+    }
+    assert set(row[0] for row in _matrix_slo_rows(MATRIX.read_text(encoding="utf-8"))) == {
+        *dimensions,
+        "replication",
+    }
     assert "LOCAL_CHAIN_ONLY" in design
     assert "REMOTE_VERIFIED" in design
     assert "create=True" in design
     assert "network_allowed: false" in design
-    metric = _section(design, "interface MetricResult {", "const ACCEPTANCE_REASON_CODES = [")
-    assert 'acceptance_ref: "AC-15";' in metric
-    assert "planned_test_anchor: string;" in metric
+    metric = _section(design, "type MetricResult =", "// This is the only reason-code source")
+    assert 'status: "pass"' in metric and 'status: "fail"' in metric
+    assert 'status: "unavailable"' in metric
+    assert "reason_code: null" in metric and "FailureReasonCode" in metric
 
 
 def test_r2f5_reason_source_is_closed_unique_and_used() -> None:
@@ -295,7 +321,7 @@ def test_r2f5_report_and_session_observation_models_are_bound() -> None:
     observation = _section(
         design,
         "interface SessionObservation {",
-        "interface CompletedReplicationRestoreSnapshotV1 {",
+        "interface WindowEvidenceBundle {",
     )
     for field in (
         "session",
@@ -307,9 +333,6 @@ def test_r2f5_report_and_session_observation_models_are_bound() -> None:
         "evidence",
         "pointer_reconciliation",
         "replication_observation",
-        "recovery_observation",
-        "error_handling_observation",
-        "local_nas_isolation_observation",
         "observation_sha256",
     ):
         assert re.search(rf"^\s+{re.escape(field)}:", observation, re.MULTILINE), field
@@ -322,6 +345,13 @@ def test_r2f5_report_and_session_observation_models_are_bound() -> None:
         "LocalNasIsolationObservation",
     ):
         assert f"interface {nested} " in design
+    assert "interface WindowEvidenceBundle " in design
+    assert "window_evidence_bundle" in report
+    assert not re.search(
+        r"^\s+(recovery_observation|error_handling_observation|local_nas_isolation_observation):",
+        observation,
+        re.MULTILINE,
+    )
     versions = _section(
         design, "interface FrozenReliabilityVersions {", "interface R2FAcceptanceReport {"
     )
@@ -332,11 +362,12 @@ def test_r2f5_report_and_session_observation_models_are_bound() -> None:
         "dataset_generation",
         "primary_provider_id",
         "secondary_provider_id",
-        "qualification_id",
-        "admission_id",
-        "adapter_version",
-        "endpoint_contract_version",
-        "schema_version",
+        "qualification_window_id",
+        "qualification_proof_status",
+        "adapter_hash",
+        "endpoint_contract_hash",
+        "source_schema_hash",
+        "normalizer_hash",
         "reconciliation_policy_version",
         "selection_policy_version",
         "config_digest",
@@ -352,7 +383,7 @@ def test_r2f5_report_and_session_observation_models_are_bound() -> None:
         "replication_trust_scope",
         "destination_generation",
         "destination_head_sha256",
-        "remote_verification_sha256",
+        "remote_proof_artifact_ref",
         "restore_policy_version",
         "restore_evidence_version",
     ):
@@ -400,11 +431,110 @@ def test_r2f5_snapshot_roles_replay_and_readers_are_explicit() -> None:
 def test_r2f5_matrix_has_one_explicit_row_per_roadmap_slo() -> None:
     dimensions = _roadmap_dimensions()
     rows = _matrix_slo_rows(MATRIX.read_text(encoding="utf-8"))
-    assert {row[0] for row in rows} == set(dimensions)
-    assert len(rows) == len(dimensions)
+    assert {row[0] for row in rows} == {*dimensions, "replication"}
+    assert len(rows) == len(dimensions) + 1
     reasons = set(_reason_source(DESIGN.read_text(encoding="utf-8")))
     assert all(
         target.strip() and source.strip() and reason in reasons and acceptance == "AC-15"
         for _field, target, source, reason, acceptance, _anchor in rows
     )
     assert all(SLO_ANCHOR.fullmatch(anchor) for *_rest, anchor in rows)
+    design_rows = _slo_rows(DESIGN.read_text(encoding="utf-8"))
+    assert {row[0] for row in design_rows} == {row[0] for row in rows}
+    assert len({row[-1] for row in rows}) == 18
+    assert all(row[2].strip() and ";" in row[2] for row in design_rows)
+
+
+def test_r2f5_x4_roadmap_source_and_anchor_catalog_have_no_legacy_tokens() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    plan = PLAN.read_text(encoding="utf-8")
+    matrix = MATRIX.read_text(encoding="utf-8")
+    req_anchors = {_planned_anchors(row[3])[0] for row in _matrix_rows()}
+    slo_anchors = {row[-1] for row in _matrix_slo_rows(matrix)}
+    allowed = req_anchors | slo_anchors
+    body_tokens = {
+        match.group(0)
+        for match in re.finditer(r"test_r2f5_[A-Za-z0-9_]+", design + plan)
+        if (design + plan)[match.end() : match.end() + 3] != ".py"
+    }
+    assert body_tokens <= allowed, sorted(body_tokens - allowed)
+    assert "## Planned pytest anchor catalog (X4)" in plan
+    assert "no hand-written dimension count" in design or "fixed expected tuple" in design
+    assert "replication" in matrix and "child of local/NAS" in matrix
+
+
+def test_r2f5_x4_metric_union_and_window_evidence_are_closed() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    assert "type MetricResult =" in design
+    assert 'status: "pass"' in design and "reason_code: null" in design
+    assert 'status: "fail"' in design and "FailureReasonCode" in design
+    assert 'status: "unavailable"' in design and "UnavailableReasonCode" in design
+    assert "interface WindowEvidenceBundle" in design
+    assert "observation_count: 1" in design
+    assert "ErrorHandlingObservation.events` is an exact six-element tuple" in design
+    assert "nas_failure_did_not_block_local=true" in design
+    assert "publication_count=1" in design
+    assert "Overall status precedence" in design
+
+
+def test_r2f5_x4_model_source_mapping_and_read_only_restore_contract() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    assert "provider_record.provider_id" in design
+    assert "qualification_window.window_id" in design
+    for forbidden in ("capability_sha256", "qualification_session_digest", "admission_sha256"):
+        assert forbidden not in design
+    assert "VerifiedArchiveSnapshot" in design
+    assert "RestoreReport" in design and "RestoreAuditEvent" in design
+    assert "FrozenR2F4PolicyThresholds" in design
+    assert "reviewed-r2f4-policy-evidence" in design
+    assert "MUST NOT hash current" in design
+    assert "streaming SHA-256" in design
+    assert "maximum" in design and "unavailable" in design
+
+
+def test_r2f5_x4_time_hash_and_cardinality_contracts_are_explicit() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    assert "YYYY-MM-DD" in design
+    assert "RFC3339" in design or "UTC instant" in design
+    assert "Asia/Shanghai" in design
+    assert "[0-9a-f]{64}" in design
+    assert "exactly 20" in design
+    assert "exactly six" in design
+    assert "max 64" in design and "max 32" in design
+    assert "canonical JSON" in design and "hash preimage" in design
+
+
+def test_r2f5_x4_validator_checks_interface_tokens_and_collection_bounds() -> None:
+    design = DESIGN.read_text(encoding="utf-8")
+    fingerprint = _section(design, "interface SnapshotFingerprint {", "// All fields")
+    for field in (
+        "descriptor_role",
+        "descriptor_id",
+        "descriptor_state",
+        "fingerprint_kind",
+        "hash_scope",
+        "sha256",
+    ):
+        assert re.search(rf"^\s+{field}:", fingerprint, re.MULTILINE), field
+    captured = _section(design, "interface CapturedSnapshot {", "All identifiers")
+    for field in (
+        "snapshot_identity",
+        "raw_calendar_observations",
+        "confirmed_sessions",
+        "input_descriptors",
+        "frozen_versions",
+        "session_observations",
+        "window_evidence_bundle",
+        "captured_at_utc",
+    ):
+        assert re.search(rf"^\s+{field}:", captured, re.MULTILINE), field
+    error = _section(
+        design, "interface ErrorHandlingObservation {", "interface LocalNasIsolationObservation {"
+    )
+    assert all(
+        f'forced_error_class: "{name}"' in error
+        for name in ("timeout", "auth", "rate", "schema", "coverage", "storage")
+    )
+    assert "exactly six records" in design and "unique" in design
+    assert "len(selected_sessions)=len(session_observations)=20" in design
+    assert "window_evidence_refs" in design and "exactly one" in design

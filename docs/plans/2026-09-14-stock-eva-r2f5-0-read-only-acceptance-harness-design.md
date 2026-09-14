@@ -8,7 +8,7 @@
 
 **Base commit:** `5393f499dbc8b84398658816f7a555dd3e547d47` (clean worktree)
 
-**X3 revision base:** `d4ca71e7000d5dc8c93ab139409b8b6c682e4ff7` (clean X2)
+**X4 revision base:** `4879bc7dddc87fd51613028a84ea834b67ac28d8` (clean X3)
 
 **Reviewers:** Independent SPEC reviewer and independent QUALITY reviewer (not yet assigned)
 
@@ -60,8 +60,11 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   it MUST be disjoint from configured control, staging, temporary, user, NAS and home roots.
   Symlink aliases, unresolved variables, mutable-root descendants and overlap MUST fail closed.
 - FR-3: Before reading and after producing either a success or error report, the evaluator MUST
-  fingerprint every input root and database by descriptor identity, size, mtime/ctime and SHA-256
-  of bounded metadata/content; any change MUST invalidate the report and preserve the prior state.
+  fingerprint every input root and database by descriptor identity, size, mtime/ctime and a full
+  streaming SHA-256 of its captured immutable bytes. Descriptor metadata detects replacement;
+  content hashing detects content drift. An input larger than the declared maximum MUST yield
+  `BOUNDS_EXCEEDED`/`unavailable`, never a bounded sample claim; any change MUST invalidate the
+  report and preserve the prior state.
 - FR-4: The evaluator MUST capture one immutable in-memory snapshot from strict existing readers
   before metric calculation. A missing control database MUST remain missing; the evaluator MUST
   never create an empty replacement.
@@ -110,42 +113,54 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
 - FR-18: The evaluator MUST record no Task 20 elapsed-session claim. A report MAY state that a
   supplied window is synthetically/evidentially complete, but MUST label installed production
   observation as pending unless separately authorized and evidenced.
-- FR-19: The report MUST expose one `MetricResult` for each roadmap Section 10 mandatory dimension:
-  continuity, next-morning availability, same-evening availability, coverage, canonical integrity,
-  source purity, recovery, failover, provenance, replay, adjustment, calendar, universe, error
-  handling, local/NAS isolation, replication, restore and read boundary. Each result MUST carry an
-  observed value, target, status, reason, AC reference and unique planned test anchor; a missing
-  dimension MUST make the report unavailable.
-- FR-20: Secondary qualification/admission MUST be read through a strict immutable evidence reader
-  requiring provider, adapter, terms, version vector, qualification window, capability and
-  admission hashes. Missing or non-qualified secondary evidence MUST make failover `not_ready` or
-  `unavailable`; source purity alone MUST never substitute for qualification.
+- FR-19: The report MUST expose one `MetricResult` for each of the 17 roadmap Section 10 table
+  dimensions, plus one independently testable `replication` child metric sourced by the
+  Local/NAS isolation row (18 results total). Replication MUST NOT be represented as an 18th
+  roadmap row. Each result MUST carry an observed value, target, status, reason, AC reference and
+  unique planned test anchor; a missing dimension MUST make the report unavailable.
+- FR-20: Secondary qualification/admission MUST be read through a strict immutable projection of
+  the existing `provider_record` and `qualification_window` fields (`provider_id`,
+  `admission_state`, `adapter_hash`, `endpoint_contract_hash`, `source_schema_hash`,
+  `normalizer_hash`, `reconciliation_policy_hash`, terms evidence/review, `window_id`,
+  `consecutive_sessions`, `version_vector_sha256`, calendar generation/hash, window state,
+  qualification evidence/candidate hashes and terminal attestation). Task19 MUST NOT invent any
+  admission, capability or qualification digest. If these fields do not prove failover admission,
+  `qualification_proof_status=unavailable` and failover
+  MUST be `unavailable`/`not_ready`; source purity alone MUST never substitute.
 - FR-21: Forced-failover acceptance MUST require a separate immutable whole-session drill record
   proving primary-unavailable, qualified-secondary admission, one provider for every row, zero
   mixed rows, selection/pointer/manifest agreement and readback. BaoStock-only or no drill proof
   MUST fail closed.
 - FR-22: Replication/restore evidence MUST be read through strict completed-record snapshot readers
-  that require `trust_scope`, destination generation, destination-head proof and remote verification.
-  `LOCAL_CHAIN_ONLY` MUST never satisfy a remote/NAS or Task 20 acceptance target, and readers MUST
-  NOT call `create=True`, writer, reconcile, drain, mount or restore paths.
+  that reuse only the existing replication record/checkpoint/head fields and the existing
+  `VerifiedArchiveSnapshot`, `RestoreReport` and terminal audit fields. `LOCAL_CHAIN_ONLY` MUST
+  never satisfy a remote/NAS or Task 20 acceptance target. Remote verification, restore schema,
+  row-count and API readback are available only from a Task20 writer-owned immutable drill
+  envelope, if present; Task19 readers MUST NOT call `create=True`, writer, reconcile, drain,
+  mount or restore paths.
 - FR-23: Offline replay MAY run a frozen adapter/normalizer implementation on immutable bytes, but
   MUST inject an explicit offline-only adapter/normalizer identity and MUST reject unknown or
   mismatched identity. It MUST make zero network/provider requests and MUST NOT construct a default
   login/query-capable adapter.
 - FR-24: `FrozenReliabilityVersions` MUST contain non-null ready-time identities for Git commit,
-  installed RELEASE, dataset generation, primary and secondary providers, qualification/admission,
-  adapter, endpoint/schema, selection/reconciliation policy, config digest, auto-failover setting,
-  kill switch, priority, continuity start/repair policy, calendar/universe generations, and
-  replication/restore policy/evidence versions, trust scope, destination generation/head proof and
-  remote verification. All 20 observations MUST equal this vector.
+  installed RELEASE, dataset generation, primary/secondary provider IDs, the existing registry
+  qualification window identity, adapter/endpoint/schema hashes, selection/reconciliation policy,
+  config digest, auto-failover setting, kill switch, priority, continuity start/repair policy,
+  calendar/universe generations, and replication/restore policy/evidence versions. Unsupported
+  qualification/admission or remote-proof identities MUST be represented by typed absence and
+  make the relevant metric unavailable; they MUST NOT be guessed. All 20 observations MUST equal
+  this vector.
 - FR-25: Raw captured calendar observations MUST retain source order and duplicates for validation;
   duplicate or out-of-order input MUST be unavailable. Only after validation MAY the evaluator
   derive sorted unique confirmed sessions. `SnapshotIdentity` MUST bind requested range, Shanghai
   clock instant/time-zone contract, all input fingerprints and the frozen version vector.
 - FR-26: The report MUST contain exactly 20 ordered per-session observations or immutable
-  observation references with digests when a candidate window is evaluated. Each observation MUST
-  independently cover cutoff results, coverage, pointer/manifest/hash, source, lineage,
-  replication and restore evidence.
+  observation references with digests when a candidate window is evaluated. Session observations
+  MUST contain only per-session recomputable date, availability, coverage, canonical integrity,
+  source purity, provenance, calendar, universe, replication and read-boundary facts. Window-level
+  recovery, forced failover, replay sample, adjustment equivalence, forced-error matrix, NAS
+  outage isolation and restore drill MUST be carried by a typed `WindowEvidenceBundle`; the report
+  MUST NOT imply that those drills occurred once per session.
 - FR-27: Volatile elapsed/counter diagnostics MUST live in a non-semantic envelope. The semantic
   report payload and digest MUST exclude elapsed time, read duration and other volatile fields;
   identical snapshot identity and bytes MUST yield byte-identical semantic JSON.
@@ -172,7 +187,10 @@ claim that synthetic fixtures or an offline report are installed-runtime or prod
   bound.
 - NFR-7: The harness MUST expose measured `elapsed_ms`, `read_operations` and `replay_sample_count`.
   The reference synthetic gate MUST complete within 10,000 ms for 20 sessions and at most 100,000
-  rows; exceeding the bound is a harness failure, not a production SLO pass.
+  rows. Each input descriptor MUST be at most 512 MiB for full streaming SHA-256; a larger file or
+  SQLite database is `BOUNDS_EXCEEDED`/unavailable, not a sampled claim. The benchmark MUST include
+  the full-file hash in its 10,000 ms budget; exceeding any bound is a harness failure, not a
+  production SLO pass.
 - NFR-8: A snapshot identity MUST bind the requested range, trusted Shanghai clock observation,
   input fingerprints and frozen version set. A report MUST be rejected if any bound field changes.
 - NFR-9: Tests MUST cover RED, GREEN, focused acceptance, full regression, static checks,
@@ -204,8 +222,7 @@ distinct consecutive sessions, then the report selects those dates in order and 
 Given 19, 21, duplicate, future or missing-middle sessions, when evaluation runs, then the report
 is `not_ready` or `unavailable` with an allowlisted reason and never silently pads the window.
 
-Planned test anchors: `test_r2f5_exactly_20_confirmed_sessions_only`,
-`test_r2f5_rejects_19_21_duplicate_future_and_missing_middle`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-2: Shanghai cutoff arithmetic (FR-8, FR-9)
 
@@ -213,8 +230,7 @@ Given timezone-aware publication times, when a session is published at 21:15 and
 08:00 Asia/Shanghai, then both boundary observations count. When they occur at 21:16 or 08:01,
 then the corresponding metric fails and the report cannot be ready.
 
-Planned test anchors: `test_r2f5_cutoffs_are_inclusive_in_shanghai`,
-`test_r2f5_late_evening_and_next_morning_fail`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-3: Frozen version set and drift (FR-7, NFR-8)
 
@@ -222,8 +238,7 @@ Given 20 session observations with one frozen version vector, when any provider,
 policy, calendar, universe, replication, restore or schema identity changes, then the report is
 `not_ready` with `VERSION_DRIFT` and the exact source state remains untouched.
 
-Planned test anchors: `test_r2f5_version_vector_is_frozen_across_window`,
-`test_r2f5_version_drift_is_not_coerced_to_ready`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-4: Coverage and source purity (FR-9, FR-12)
 
@@ -231,8 +246,7 @@ Given legal-universe counts and canonical partition source identities, when ever
 coverage and zero mixed-source rows, then those metrics pass. When any unknown/count mismatch or
 mixed provider partition exists, then the report is not ready and names only the sanitized reason.
 
-Planned test anchors: `test_r2f5_coverage_requires_exact_legal_universe`,
-`test_r2f5_mixed_source_partition_fails_closed`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-5: Evidence lineage and replay (FR-10, FR-11)
 
@@ -241,8 +255,7 @@ the bounded offline sample replays semantically identically, then provenance and
 Given a missing hash, wrong binding, corrupt object or replay mismatch, then no publication state is
 changed and the relevant metric is unavailable/not ready.
 
-Planned test anchors: `test_r2f5_lineage_requires_evidence_candidate_gate_selection`,
-`test_r2f5_replay_is_bounded_and_offline`, `test_r2f5_corrupt_lineage_fails_closed`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-6: Replication and restore evidence (FR-13, FR-17)
 
@@ -251,8 +264,7 @@ proof satisfy the declared evidence contract, then the metrics pass. Given lag, 
 locked/corrupt sidecar or unverified generation, then the report is not ready/unavailable and does
 not start a drain or restore.
 
-Planned test anchors: `test_r2f5_replication_lag_is_visible`,
-`test_r2f5_restore_requires_completed_immutable_drill`, `test_r2f5_acceptance_never_drains_or_restores`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-7: Read-only snapshot and fingerprints (FR-1, FR-3, FR-4, NFR-3)
 
@@ -260,8 +272,7 @@ Given an existing private fixture, when CLI/API evaluation succeeds or fails, th
 fingerprint is byte/metadata identical before and after, no missing control DB is initialized, and
 the captured snapshot is closed after use.
 
-Planned test anchors: `test_r2f5_success_preserves_all_input_fingerprints`,
-`test_r2f5_error_preserves_all_input_fingerprints`, `test_r2f5_missing_control_db_is_not_initialized`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-8: Path validation and redaction (FR-2, NFR-4, NFR-5)
 
@@ -269,8 +280,7 @@ Given relative, root, home, mutable-root, symlink, unresolved-variable or overla
 the CLI/API is invoked, then it rejects before enumeration with exit 2/HTTP 422 and no path is
 echoed. Given corrupt or permission-denied input, then the response contains only a closed reason.
 
-Planned test anchors: `test_r2f5_path_validation_rejects_mutable_aliases`,
-`test_r2f5_path_and_exception_redaction_is_stable`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-9: API/CLI parity (FR-15, FR-16, FR-17)
 
@@ -278,8 +288,7 @@ Given identical configured roots, dates, frozen clock and fixture, when CLI and 
 then their report status, selected sessions, metric results, reason order, `provider_requests` and
 `writes` agree; the API performs no provider or store initialization.
 
-Planned test anchors: `test_r2f5_cli_and_api_have_identical_report_contract`,
-`test_r2f5_api_is_read_only_and_sanitized`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-10: Mandatory metric gate (FR-9, FR-14, NFR-2)
 
@@ -287,8 +296,7 @@ Given all mandatory metrics pass for exactly 20 sessions, when the report is bui
 `ready`. Given any mandatory metric fails, then status is `not_ready`; given a required source is
 unprovable, then status is `unavailable`. No optional observation can override this mapping.
 
-Planned test anchors: `test_r2f5_ready_requires_every_mandatory_metric`,
-`test_r2f5_not_ready_and_unavailable_are_distinct`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-11: Bounded evaluation (NFR-6, NFR-7)
 
@@ -296,16 +304,14 @@ Given a 20-session fixture within the declared row/object/sample bounds, when ev
 it records elapsed/read/replay counts and completes within 10,000 ms on the reference gate. Given
 an over-bound object or row set, then it stops with unavailable rather than unboundedly reading.
 
-Planned test anchors: `test_r2f5_bounded_replay_and_row_limits`,
-`test_r2f5_reference_fixture_reports_elapsed_within_bound`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-12: Protected compatibility (NFR-1, NFR-9)
 
 Given the R2-F2 golden fixture and R2-F4 readers, when the crosswalk/focused checks run, then their
 bytes and public response shapes remain compatible and no protected production module is widened.
 
-Planned test anchors: `test_r2f5_protected_golden_objects_are_unchanged`,
-`test_r2f5_existing_readers_remain_compatible`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-13: Production boundary (FR-18, NFR-10)
 
@@ -313,7 +319,7 @@ Given any offline ready report, when a reviewer inspects metadata, then it state
 `production_window_started=false`, Task 20 pending and R2-F5.0 NO-GO. No report can authorize a
 provider call, installation, LaunchAgent, NAS action or Release 2 re-entry.
 
-Planned test anchors: `test_r2f5_offline_ready_never_claims_task20_or_release2`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-14: Deterministic and sanitized errors (FR-14, FR-17, NFR-2, NFR-4)
 
@@ -321,8 +327,7 @@ Given identical bytes and clock, when evaluation is repeated across success, mis
 locked fixtures, then JSON is deterministic, reason precedence is stable, diagnostics are bounded,
 and all results include zero provider requests/writes.
 
-Planned test anchors: `test_r2f5_report_digest_and_reason_order_are_deterministic`,
-`test_r2f5_missing_corrupt_locked_states_fail_closed`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-15: Complete SLO metric inventory (FR-9, FR-19, NFR-11)
 
@@ -331,8 +336,7 @@ present as separate `MetricResult` fields with exact targets and anchors. Missin
 availability, canonical integrity, recovery, failover, adjustment, error handling, local/NAS,
 replication, restore or read-boundary evidence cannot be hidden behind another metric.
 
-Planned test anchors: `test_r2f5_report_has_every_roadmap_slo_metric`,
-`test_r2f5_each_slo_threshold_is_explicit`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-16: Secondary qualification and failover (FR-20, FR-21)
 
@@ -341,8 +345,7 @@ when evaluation runs, then failover is `not_ready`/`unavailable` and top-level r
 Given a qualified admission and complete drill record, then failover passes only when selection,
 manifest, pointer and all rows agree with zero mixed-source rows.
 
-Planned test anchors: `test_r2f5_baostock_only_cannot_pass_failover`,
-`test_r2f5_failover_requires_qualified_whole_session_drill`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-17: Remote trust and restore snapshot (FR-22, NFR-12)
 
@@ -351,8 +354,7 @@ verification, trust scope and reviewed numeric thresholds, when the strict snaps
 then it can pass. Given `LOCAL_CHAIN_ONLY`, missing threshold, locked sidecar or writer/reconcile
 only evidence, then the metric is unavailable/not ready and no destination operation starts.
 
-Planned test anchors: `test_r2f5_local_chain_only_cannot_satisfy_remote_acceptance`,
-`test_r2f5_replication_restore_reader_is_strictly_read_only`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-18: Offline replay identity (FR-11, FR-23)
 
@@ -360,8 +362,7 @@ Given immutable bytes and an exact frozen offline adapter/normalizer identity, w
 then it performs deterministic normalization and zero provider/network requests. Given unknown,
 mismatched or default login-capable identity, then replay is unavailable before adapter construction.
 
-Planned test anchors: `test_r2f5_replay_uses_injected_offline_identity`,
-`test_r2f5_replay_rejects_unknown_identity_without_provider`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-19: Full version vector (FR-7, FR-24)
 
@@ -369,8 +370,7 @@ Given 20 observations, when the frozen vector is captured, then every required i
 and equal across all observations. Missing RELEASE, config, qualification/admission, primary/
 secondary, kill-switch/priority, policy or replication/restore evidence prevents ready.
 
-Planned test anchors: `test_r2f5_frozen_versions_are_complete_and_nonnull_when_ready`,
-`test_r2f5_version_vector_drift_is_unavailable`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-20: Raw sequence and snapshot identity (FR-3, FR-25, NFR-8, NFR-13)
 
@@ -379,8 +379,7 @@ rejects duplicates/out-of-order data before deriving sorted unique confirmed ses
 returns a digest-bound SnapshotIdentity and observation refs; any concurrent input change invalidates
 the whole report.
 
-Planned test anchors: `test_r2f5_raw_calendar_order_and_duplicates_fail_closed`,
-`test_r2f5_snapshot_identity_binds_all_inputs_and_clock`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-21: Semantic determinism (FR-26, FR-27, NFR-14)
 
@@ -388,16 +387,14 @@ Given identical captured bytes, clock and arguments, when evaluation repeats, th
 per-session observations/refs and byte-identical semantic JSON/digest are returned. Changing only
 elapsed/counter diagnostics MUST NOT change the semantic digest.
 
-Planned test anchors: `test_r2f5_semantic_digest_excludes_volatile_envelope`,
-`test_r2f5_per_session_observation_cardinality_and_order`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-22: Closed bounded report types (FR-28, NFR-3)
 
 Given invalid enum, reason, hash, ID, negative counter, oversized quality issue or null ready
 version, when report validation runs, then it rejects the report with a sanitized unavailable result.
 
-Planned test anchors: `test_r2f5_report_types_are_closed_and_bounded`,
-`test_r2f5_ready_requires_nonnull_versions_and_exact_20_observations`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ### AC-23: Additive compatibility (NFR-1, NFR-15)
 
@@ -405,8 +402,7 @@ Given existing market, universe, evidence, calendar, replication and restore API
 the new acceptance endpoint/CLI is evaluated, then predecessor payloads/schemas remain unchanged;
 the new fields exist only in the acceptance report.
 
-Planned test anchors: `test_r2f5_acceptance_surface_is_additive`,
-`test_r2f5_predecessor_payloads_are_byte_compatible`.
+Planned test anchors are machine-readable in the requirement matrix and X4 catalog only.
 
 ## Edge Cases
 
@@ -478,14 +474,28 @@ interface ReliabilityAcceptanceQuery {
   end: string;   // YYYY-MM-DD, inclusive
 }
 
-interface MetricResult {
-  status: "pass" | "fail" | "unavailable";
-  observed: number | string | boolean | null;
-  target: number | string | boolean | null;
-  reason_code: AcceptanceReasonCode | null;
-  acceptance_ref: "AC-15";
-  planned_test_anchor: string;
-}
+type MetricResult =
+  | { status: "pass"; observed: number | string | boolean; target: number | string | boolean;
+      reason_code: null; acceptance_ref: "AC-15"; planned_test_anchor: string }
+  | { status: "fail"; observed: number | string | boolean; target: number | string | boolean;
+      reason_code: FailureReasonCode; acceptance_ref: "AC-15"; planned_test_anchor: string }
+  | { status: "unavailable"; observed: null; target: null;
+      reason_code: UnavailableReasonCode; acceptance_ref: "AC-15"; planned_test_anchor: string };
+
+type FailureReasonCode = Extract<AcceptanceReasonCode,
+  "CONTINUITY_FAILED" | "AVAILABILITY_CUTOFF_FAILED" | "COVERAGE_FAILED" |
+  "SOURCE_PURITY_FAILED" | "CANONICAL_INTEGRITY_FAILED" | "RECOVERY_FAILED" |
+  "ERROR_HANDLING_FAILED" | "LOCAL_NAS_ISOLATION_FAILED" | "REPLICATION_LAG" |
+  "REPLAY_SEMANTIC_MISMATCH" | "READ_BOUNDARY_FAILED" | "CALENDAR_CONFLICT" |
+  "UNIVERSE_UNKNOWN_NONZERO" | "UNIVERSE_COUNT_MISMATCH" | "VERSION_DRIFT" |
+  "LINEAGE_UNAVAILABLE">;
+type UnavailableReasonCode = Exclude<AcceptanceReasonCode, FailureReasonCode>;
+
+// The discriminant is normative: pass has no reason and complete values; fail has a closed
+// failure reason and complete values; unavailable has a closed unavailable reason and null values.
+// Overall status precedence is invalid arguments/path (HTTP 422/CLI 2), then unavailable if any required
+// proof is unavailable, then not_ready if any required metric fails, and ready only when every
+// required metric passes with an exact 20-session snapshot.
 
 // This is the only reason-code source of truth. Every table, default and public field below MUST
 // use one of these values; the crosswalk validator parses this literal and rejects duplicates.
@@ -512,6 +522,8 @@ interface SnapshotFingerprint {
   size_bytes: number | null;
   mtime_ns: number | null;
   ctime_ns: number | null;
+  fingerprint_kind: "descriptor_metadata" | "content_sha256";
+  hash_scope: "full_streaming_bytes" | "none";
   sha256: string | null;
 }
 
@@ -526,11 +538,12 @@ interface FrozenReliabilityVersions {
   evidence_schema: string;
   primary_provider_id: string;
   secondary_provider_id: string;
-  qualification_id: string;
-  admission_id: string;
-  adapter_version: string;
-  endpoint_contract_version: string;
-  schema_version: string;
+  qualification_window_id: string;
+  qualification_proof_status: "available" | "unavailable";
+  adapter_hash: string;
+  endpoint_contract_hash: string;
+  source_schema_hash: string;
+  normalizer_hash: string;
   reconciliation_policy_version: string;
   selection_policy_version: string;
   config_digest: string;
@@ -548,10 +561,14 @@ interface FrozenReliabilityVersions {
   replication_trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
   destination_generation: string;
   destination_head_sha256: string;
-  remote_verification_sha256: string;
+  remote_proof_artifact_ref: string | null;
   restore_policy_version: string;
   restore_evidence_version: string;
 }
+
+// All fields are required and non-null for status=ready; nullable proof fields are legal only for
+// not_ready/unavailable and are then accompanied by their typed reason. Provider IDs use the
+// existing closed registry IDs; no new ProviderId is introduced.
 
 interface R2FAcceptanceReport {
   status: "ready" | "not_ready" | "unavailable";
@@ -581,6 +598,8 @@ interface R2FAcceptanceReport {
   snapshot_identity: SnapshotIdentity | null;
   session_observations: SessionObservation[]; // exactly 20 for a candidate window
   observation_refs: string[]; // exactly 20 for a candidate window
+  window_evidence_bundle: WindowEvidenceBundle | null;
+  window_evidence_refs: string[]; // exactly 1 when a bundle is captured
   semantic_report_sha256: string;
   diagnostic_envelope: DiagnosticEnvelope;
   provider_requests: 0;
@@ -634,17 +653,19 @@ interface PointerReconciliation {
 
 interface ReplicationObservation {
   immutable: true;
-  state: "completed" | "pending" | "failed" | "unavailable";
-  record_id: string;
-  record_sha256: string;
-  digest_sha256: string;
+  state: "disabled" | "ready" | "degraded" | "unavailable";
+  checkpoint_id: string;
+  source_commit_sha256: string;
+  intent_id: string | null;
+  enqueue_state: string;
+  reason_code: string;
   observed_at: string;
   lag_seconds: number | null;
   trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
   destination_generation: string | null;
+  destination_record_sha256: string | null;
   destination_head_sha256: string | null;
-  remote_verification_sha256: string | null;
-  record_version: string;
+  observation_sha256: string;
 }
 
 interface RecoveryObservation {
@@ -656,41 +677,73 @@ interface RecoveryObservation {
   queue_identity: string;
   restart_boundary: string;
   exactly_once_publication_id: string;
-  record_sha256: string;
-  descriptor_sha256: string;
-  record_version: string;
+  after_manifest_sha256: string;
+  after_pointer_sha256: string;
+  after_selection_sha256: string;
+  publication_count: 1;
+  duplicate_proof_sha256: string;
+  artifact_ref: string;
+  artifact_sha256: string;
+  artifact_version: string;
   observed_at: string;
 }
 
 interface ErrorHandlingObservation {
   immutable: true;
-  events: Array<{ // max 6 forced error classes
+  events: [{
     event_id: string;
-    forced_error_class: "timeout" | "auth" | "rate" | "schema" | "coverage" | "storage";
+    forced_error_class: "timeout";
     sanitized_reason: AcceptanceReasonCode;
     normalized_result: "not_ready" | "unavailable";
     attempt_id: string;
-    record_sha256: string;
-    descriptor_sha256: string;
-    record_version: string;
+    expected_class: "timeout";
+    observed_class: "timeout";
+    evidence_sha256: string;
+    artifact_ref: string;
+    artifact_sha256: string;
+    artifact_version: string;
     observed_at: string;
-  }>;
+  }, { event_id: string; forced_error_class: "auth"; sanitized_reason: AcceptanceReasonCode;
+    normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "auth";
+    observed_class: "auth"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
+    artifact_version: string; observed_at: string }, { event_id: string; forced_error_class: "rate";
+    sanitized_reason: AcceptanceReasonCode; normalized_result: "not_ready" | "unavailable";
+    attempt_id: string; expected_class: "rate"; observed_class: "rate"; evidence_sha256: string;
+    artifact_ref: string; artifact_sha256: string; artifact_version: string; observed_at: string },
+  { event_id: string; forced_error_class: "schema"; sanitized_reason: AcceptanceReasonCode;
+    normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "schema";
+    observed_class: "schema"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
+    artifact_version: string; observed_at: string }, { event_id: string; forced_error_class: "coverage";
+    sanitized_reason: AcceptanceReasonCode; normalized_result: "not_ready" | "unavailable";
+    attempt_id: string; expected_class: "coverage"; observed_class: "coverage"; evidence_sha256: string;
+    artifact_ref: string; artifact_sha256: string; artifact_version: string; observed_at: string },
+  { event_id: string; forced_error_class: "storage"; sanitized_reason: AcceptanceReasonCode;
+    normalized_result: "not_ready" | "unavailable"; attempt_id: string; expected_class: "storage";
+    observed_class: "storage"; evidence_sha256: string; artifact_ref: string; artifact_sha256: string;
+    artifact_version: string; observed_at: string }];
   observation_sha256: string;
 }
 
 interface LocalNasIsolationObservation {
   immutable: true;
   event_id: string;
+  local_publication_ready: true;
+  local_publication_id: string;
+  local_pointer_sha256: string;
   outage_start: string;
   outage_end: string;
-  local_publication_id: string;
-  replication_lag_seconds: number;
+  backlog_before_ids: string[];
+  backlog_after_ids: string[];
+  backlog_before_count: number;
+  backlog_after_count: number;
   retry_transition: "queued" | "retrying" | "completed" | "failed";
+  nas_failure_did_not_block_local: true;
   attempt_id: string;
-  record_sha256: string;
-  descriptor_sha256: string;
-  record_version: string;
+  artifact_ref: string;
+  artifact_sha256: string;
+  artifact_version: string;
   observed_at: string;
+  observation_sha256: string;
 }
 
 interface SessionObservation {
@@ -708,39 +761,89 @@ interface SessionObservation {
   evidence: SessionEvidenceBinding;
   pointer_reconciliation: PointerReconciliation;
   replication_observation: ReplicationObservation;
-  recovery_observation: RecoveryObservation;
-  error_handling_observation: ErrorHandlingObservation;
-  local_nas_isolation_observation: LocalNasIsolationObservation;
   cutoff_results: { same_evening: MetricResult; next_morning: MetricResult };
   coverage: MetricResult;
   canonical_integrity: MetricResult;
   source_purity: MetricResult;
-  recovery: MetricResult;
-  failover: MetricResult;
   provenance: MetricResult;
-  replay: MetricResult;
-  adjustment: MetricResult;
   calendar: MetricResult;
   universe: MetricResult;
-  error_handling: MetricResult;
-  local_nas_isolation: MetricResult;
   replication: MetricResult;
-  restore: MetricResult;
   read_boundary: MetricResult;
   observation_sha256: string;
+}
+
+interface WindowEvidenceBundle {
+  immutable: true;
+  bundle_ref: string;
+  bundle_sha256: string;
+  bundle_version: string;
+  recovery_observation: RecoveryObservation | null;
+  failover_observation: WholeSessionFailoverDrill | null;
+  replay_sample: ReplaySampleEvidence | null;
+  adjustment_equivalence: AdjustmentEquivalenceEvidence | null;
+  error_handling_observation: ErrorHandlingObservation | null;
+  local_nas_isolation_observation: LocalNasIsolationObservation | null;
+  restore_observation: RestoreDrillEvidence | null;
+  observation_count: 1;
+}
+
+interface WholeSessionFailoverDrill {
+  artifact_ref: string;
+  artifact_sha256: string;
+  artifact_version: string;
+  source_schema: "task20-writer-owned";
+  primary_unavailable: true;
+  qualified_secondary_provider_id: string;
+  qualification_proof_status: "available" | "unavailable";
+  session: string;
+  selected_provider_id: string;
+  selection_sha256: string;
+  manifest_sha256: string;
+  pointer_sha256: string;
+  readback_sha256: string;
+  mixed_source_rows: 0;
+}
+
+interface ReplaySampleEvidence {
+  artifact_ref: string; artifact_sha256: string; artifact_version: string;
+  sample_object_sha256: string; candidate_sha256: string; semantic_equal: true;
+  offline_context: OfflineReplayContext;
+}
+
+interface AdjustmentEquivalenceEvidence {
+  artifact_ref: string; artifact_sha256: string; artifact_version: string;
+  compared_sessions: string[]; tolerance_policy_version: string; equivalence_passed: true;
+}
+
+interface RestoreDrillEvidence {
+  artifact_ref: string; artifact_sha256: string; artifact_version: string;
+  source_schema: "task20-writer-owned";
+  sentinel_sha256: string; destination_id: string; destination_generation: string;
+  destination_head_sha256: string; record_sha256: string; manifest_sha256: string;
+  checkpoint_id: string; restore_report_id: string; restore_report_sha256: string;
+  schema_version: string; row_count: number; api_readback_sha256: string;
+  verification_state: "verified"; artifact_hash_preimage: string;
 }
 
 interface CompletedReplicationRestoreSnapshotV1 {
   trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
   destination_generation: string;
   destination_head_sha256: string;
-  remote_verification_sha256: string;
+  destination_record_sha256: string;
+  checkpoint_id: string;
   replication_policy_version: string;
   restore_policy_version: string;
-  lag_threshold_seconds: number;
-  restore_duration_threshold_seconds: number;
-  replication_record_sha256: string;
-  restore_record_sha256: string;
+  replication_observation_sha256: string;
+  restore_report_sha256: string | null;
+  policy_thresholds: FrozenR2F4PolicyThresholds | null;
+}
+
+interface FrozenR2F4PolicyThresholds {
+  source: "reviewed-r2f4-policy-evidence";
+  policy_version: string;
+  replication_lag_seconds: number;
+  restore_duration_seconds: number;
 }
 
 interface OfflineReplayContext {
@@ -794,7 +897,7 @@ database initialization/migration paths.
 
 ```typescript
 interface SecondaryQualificationReader {
-  read_immutable_projection(descriptor: ReadonlyEvidenceDescriptor): SecondaryQualificationEvidenceV1;
+  read_immutable_projection(descriptor: ReadonlyEvidenceDescriptor): SecondaryQualificationProjection;
 }
 
 interface CompletedReplicationRestoreReader {
@@ -821,6 +924,16 @@ interface OfflineReplayResolver {
 }
 ```
 
+`ErrorHandlingObservation.events` is an exact six-element tuple (exactly six records) in this order and with unique
+`event_id`s: `timeout`, `auth`, `rate`, `schema`, `coverage`, `storage`. Each element records the
+forced class, expected/observed class, sanitized normalized result, attempt ID and evidence hash;
+any duplicate, omission, extra class or mismatch is unavailable. `RecoveryObservation` is one
+window-level historical record: it binds before gap/queue restart generation to after manifest,
+pointer and selection hashes, `publication_count=1` and a duplicate-proof hash. It cannot be
+replaced by current queue status. `LocalNasIsolationObservation` is likewise one window record and
+must bind local-ready/pointer identity, outage interval, backlog IDs/counts and retry transition;
+`nas_failure_did_not_block_local=true` is required for a pass.
+
 `read_status` and `read_window` are insufficient for qualification/admission or whole-session
 failover acceptance because they expose current capability state, not an immutable 20-session
 qualification/admission/drill projection. The planned readers above MUST assemble their projections
@@ -841,7 +954,7 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | --- | --- | --- | --- |
 | `FrozenReliabilityVersions` | `git_commit` | safe hex string | exact reviewed commit; required |
 | `FrozenReliabilityVersions` | provider/adapter/policy fields | safe identifier | exact equality across all 20 sessions |
-| `FrozenReliabilityVersions` | calendar/universe/replication/restore fields | safe ID + SHA-256 + closed trust scope | destination generation/head and remote verification are required for remote claims; no fabricated nulls |
+| `FrozenReliabilityVersions` | calendar/universe/replication/restore fields | safe ID + SHA-256 + closed trust scope | current F4 `LOCAL_CHAIN_ONLY` is insufficient for remote claims; absent Task20 proof is unavailable |
 | `MetricResult` | status | enum | `pass`, `fail`, `unavailable` only |
 | `MetricResult` | observed/target | bounded nonnegative scalar/closed literal | no arbitrary provider text; exact threshold required |
 | `MetricResult` | reason/traceability | `AcceptanceReasonCode`, `AC-15`, planned anchor | reason is closed; every mandatory row carries its AC reference and unique planned pytest anchor |
@@ -854,8 +967,9 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `SessionObservation` | source set | bounded `string[]` | canonical provider/source set cardinality is one for purity pass |
 | `SessionObservation` | evidence binding | `SessionEvidenceBinding` | evidence/candidate/gate/manifest/object/selection IDs and hashes bind transitively |
 | `SessionObservation` | pointer reconciliation | `PointerReconciliation` | pointer, manifest and object hashes must agree; descriptor hash is required |
-| `SessionObservation` | recovery/error/NAS records | immutable typed observation records | event/attempt/generation/restart/publication identities and record hashes are required |
+| `SessionObservation` | per-session fields | immutable typed observation records | date, cutoffs, counts, provider/source, lineage, pointer/manifest/object and read-boundary facts only |
 | `SessionObservation` | replication | `ReplicationObservation` | state, record/digest/time, lag and trust/destination proofs are explicit |
+| `WindowEvidenceBundle` | window-level drills | immutable typed bundle | recovery, whole-session failover, replay sample, adjustment, six-class errors, NAS isolation and restore are one bundle, not per-session claims |
 | `R2FAcceptanceReport` | status | enum | `ready`, `not_ready`, `unavailable` |
 | `R2FAcceptanceReport` | selected sessions | tuple of date values | exact 20 only for a candidate window |
 | `R2FAcceptanceReport` | metric fields | `MetricResult` | all mandatory rows always present |
@@ -865,14 +979,27 @@ resolve a provider-capable implementation; implementation MUST inject this offli
 | `R2FAcceptanceReport` | semantic identity | `SnapshotIdentity` + SHA-256 | required; excludes volatile diagnostic envelope |
 | `R2FAcceptanceReport` | diagnostics | `DiagnosticEnvelope` | nonnegative bounded counters; not included in semantic digest |
 | `SnapshotIdentity` | requested range/as-of/fingerprints | dates, UTC instant, tz literal, SHA-256 | all required and bound to one captured snapshot |
-| `SecondaryQualificationEvidenceV1` | qualification/admission identities | safe IDs/SHA-256 | exact 20 sessions; strict immutable evidence reader |
-| `WholeSessionFailoverDrillV1` | drill and selection proof | safe IDs/SHA-256/booleans/count | remote proof and zero mixed rows required for pass |
-| `CompletedReplicationRestoreSnapshotV1` | trust/destination/threshold fields | closed scope, IDs/SHA-256, nonnegative seconds | reviewed R2-F4 policy values required; LOCAL_CHAIN_ONLY cannot pass remote target |
+| `SecondaryQualificationProjection` | existing registry projection | exact `provider_record`/`qualification_window` fields | no invented admission/capability/qualification hashes; proof absence is unavailable |
+| `WholeSessionFailoverDrill` | Task20 writer-owned artifact | IDs/SHA-256/booleans/count | current F4 has no whole-session proof; missing artifact is unavailable |
+| `CompletedReplicationRestoreSnapshotV1` | existing replication/archive projection | checkpoint/record/head + `VerifiedArchiveSnapshot` fields and reviewed policy thresholds | no unsupported remote hash; Task20 drill envelope owns remote/readback fields |
 | `OfflineReplayContext` | adapter/normalizer identity | safe IDs/SHA-256 + literal false/zero | unknown or network-capable identity rejected |
 | `RecoveryObservation` | restart/publication proof | immutable IDs, generations, timestamp and SHA-256 | current queue state alone cannot satisfy historical recovery |
 | `ErrorHandlingObservation` | forced-error mapping | closed class/reason/result plus event/attempt/record identity | each forced class maps to a sanitized result |
 | `LocalNasIsolationObservation` | outage/retry proof | interval, local publication, lag, transition and record identity | local publication and retry history are immutable; current status alone is insufficient |
-| `SecondaryQualificationEvidenceV1` | qualification/admission proof | provider/adapter/endpoint, exact 20-session window, capability/terms/admission IDs and hashes | assembled by strict read-only projection reader; absence is negative evidence |
+| `WindowEvidenceBundle` | bundle cardinality | exactly one immutable bundle per evaluation | all window-level records are present or typed unavailable; no per-session duplication claim |
+
+```typescript
+interface CapturedSnapshot {
+  snapshot_identity: SnapshotIdentity;
+  raw_calendar_observations: string[]; // source order retained; max 64
+  confirmed_sessions: string[]; // exactly 20, sorted unique, confirmed, inclusive
+  input_descriptors: SnapshotFingerprint[]; // every configured role, including typed absence
+  frozen_versions: FrozenReliabilityVersions;
+  session_observations: SessionObservation[]; // exactly 20, ordinal 1..20
+  window_evidence_bundle: WindowEvidenceBundle | null; // exactly one ref when present
+  captured_at_utc: string;
+}
+```
 
 All identifiers MUST match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, all SHA-256 fields MUST match
 `[0-9a-f]{64}`, all counters/durations MUST be integers in `[0, 2^31-1]`, and all serialized
@@ -917,35 +1044,37 @@ LaunchAgent, user-store read, canonical writer, NAS transport or new persistence
 
 ## R2-F5.0 metric contract and evidence sources
 
-The following table is normative. Every row is a separate `MetricResult` in the report and in every
-per-session observation where the dimension is session-scoped. The threshold is the roadmap target
-unless marked `R2-F4 policy`; a missing policy value is not a pass.
+The following table is normative. Every row is a separate `MetricResult` in the report. The first
+17 rows are the roadmap Section 10 table dimensions, parsed and compared verbatim by the validator;
+`replication` is an independently testable child of `local_nas_isolation`, not a roadmap row. The
+`session fields + reducer` column is the complete independent recomputation recipe from the 20
+session observations and, where stated, the one window bundle. A missing policy value is not a pass.
 
 The roadmap Section 10 source row `Local/NAS isolation` explicitly mandates observable replication
-lag. This design preserves that source row and promotes its explicit replication sub-dimension to
-an independent `replication` `MetricResult`; the crosswalk validator derives this additional token
-from the source target text and maintains no hand-written dimension count.
+lag. This design preserves that source row and defines `replication` as a child metric. The
+validator compares a fixed expected tuple to the actual roadmap table and never derives a new
+roadmap dimension from prose.
 
-| MetricResult field | Exact target/threshold | Required immutable evidence | Acceptance ref | Failure reason/test anchor |
-| --- | --- | --- | --- | --- |
-| `continuity` | zero missing canonical dates in 20 selected sessions | raw calendar sequence + verified canonical session inventory | AC-15 | `CONTINUITY_FAILED` / `test_r2f5_continuity_metric` |
-| `next_morning_availability` | 20/20 by 08:00 Shanghai next civil day | immutable publication timestamps | AC-15 | `AVAILABILITY_CUTOFF_FAILED` / `test_r2f5_next_morning_metric` |
-| `same_evening_availability` | >=18/20 by 21:15 Shanghai session day | immutable publication timestamps | AC-15 | `AVAILABILITY_CUTOFF_FAILED` / `test_r2f5_same_evening_metric` |
-| `coverage` | 100% legal universe every session | exact universe snapshot + loaded count | AC-15 | `COVERAGE_FAILED` / `test_r2f5_coverage_metric` |
-| `canonical_integrity` | pointer, manifest, object hash and row/date identity reconcile each session | read-only dataset/pointer/manifest proof | AC-15 | `CANONICAL_INTEGRITY_FAILED` / `test_r2f5_canonical_pointer_manifest_hash_metric` |
-| `source_purity` | zero mixed-provider canonical partitions | per-partition provider identity | AC-15 | `SOURCE_PURITY_FAILED` / `test_r2f5_source_purity_metric` |
-| `recovery` | injected missing date queues across restart and publishes exactly once | immutable repair/recovery observation | AC-15 | `RECOVERY_FAILED` / `test_r2f5_recovery_metric` |
-| `failover` | forced primary failure publishes one qualified secondary whole session, zero mixed rows | secondary admission + immutable drill/readback | AC-15 | `FAILOVER_UNAVAILABLE` / `test_r2f5_failover_metric` |
-| `provenance` | every session traces raw evidence/provider/adapter/schema/time/hash/gate/selection | evidence/candidate/gate/selection lineage | AC-15 | `LINEAGE_UNAVAILABLE` / `test_r2f5_provenance_metric` |
-| `replay` | sampled raw evidence replays semantically identically offline | bounded immutable sample + offline identity | AC-15 | `REPLAY_UNAVAILABLE` / `test_r2f5_replay_metric` |
-| `adjustment` | declared cross-provider adjusted return tolerance passes; raw factor equality not required | reviewed R2-F4 reconciliation policy + factors | AC-15 | `ADJUSTMENT_UNAVAILABLE` / `test_r2f5_adjustment_metric` |
-| `calendar` | next-year warning/acquisition observable; unknown/conflict fails closed | promoted calendar generation/status evidence | AC-15 | `CALENDAR_UNAVAILABLE` / `test_r2f5_calendar_metric` |
-| `universe` | required/loaded/suspended/not-listed/delisted/unknown reconcile; unknown zero | exact-session universe snapshot | AC-15 | `UNIVERSE_COUNT_MISMATCH` / `test_r2f5_universe_metric` |
-| `error_handling` | timeout/auth/rate/schema/coverage/storage map to sanitized categories | immutable typed failure observations | AC-15 | `ERROR_HANDLING_FAILED` / `test_r2f5_error_handling_metric` |
-| `local_nas_isolation` | NAS outage leaves local ready and visible retryable backlog | local pointer + replication status/trust scope | AC-15 | `LOCAL_NAS_ISOLATION_FAILED` / `test_r2f5_local_nas_isolation_metric` |
-| `replication` | lag and destination verification satisfy frozen R2-F4 numeric policy | completed replication record with remote proof | AC-15 | `REPLICATION_LAG` / `test_r2f5_replication_metric` |
-| `restore` | verified generation restores/readbacks within frozen R2-F4 duration policy | completed immutable restore drill record | AC-15 | `RESTORE_UNAVAILABLE` / `test_r2f5_restore_metric` |
-| `read_boundary` | representative GET calls make no data/control/user-store filesystem mutation | read-only API/CLI audit record | AC-15 | `READ_BOUNDARY_FAILED` / `test_r2f5_read_boundary_metric` |
+| MetricResult field | Exact target/threshold | Session fields + reducer / window evidence | Failure reason | Acceptance ref | Planned anchor |
+| --- | --- | --- | --- | --- | --- |
+| `continuity` | zero missing canonical dates in 20 | `session`; count missing after sorted unique validation | `CONTINUITY_FAILED` | AC-15 | `test_r2f5_slo_continuity` |
+| `next_morning_availability` | 20/20 by 08:00 Shanghai next civil day | `next_morning_published_at`; count <= cutoff | `AVAILABILITY_CUTOFF_FAILED` | AC-15 | `test_r2f5_slo_next_morning_availability` |
+| `same_evening_availability` | >=18/20 by 21:15 Shanghai session day | `same_evening_published_at`; count <= cutoff | `AVAILABILITY_CUTOFF_FAILED` | AC-15 | `test_r2f5_slo_same_evening_availability` |
+| `coverage` | 100% legal universe every session | `required_count`, `loaded_count`, status; all loaded/required=1 | `COVERAGE_FAILED` | AC-15 | `test_r2f5_slo_coverage` |
+| `canonical_integrity` | pointer, manifest, object hash and row/date identity reconcile each session | `pointer_reconciliation`; all match=true | `CANONICAL_INTEGRITY_FAILED` | AC-15 | `test_r2f5_slo_canonical_integrity` |
+| `source_purity` | zero mixed-provider canonical partitions | `canonical_provider_ids`; max cardinality=1 | `SOURCE_PURITY_FAILED` | AC-15 | `test_r2f5_slo_source_purity` |
+| `recovery` | queued across restart and publishes exactly once | `window.recovery_observation`; one publication_count=1 | `RECOVERY_FAILED` | AC-15 | `test_r2f5_slo_recovery` |
+| `failover` | qualified secondary whole-session publication, zero mixed rows | `window.failover_observation`; immutable drill pass | `FAILOVER_UNAVAILABLE` | AC-15 | `test_r2f5_slo_failover` |
+| `provenance` | every session traces raw/provider/adapter/schema/time/hash/gate/selection | `evidence`; all seven bindings verify | `LINEAGE_UNAVAILABLE` | AC-15 | `test_r2f5_slo_provenance` |
+| `replay` | sampled raw evidence replays semantically identically offline | `window.replay_sample`; semantic_equal=true | `REPLAY_UNAVAILABLE` | AC-15 | `test_r2f5_slo_replay` |
+| `adjustment` | declared cross-provider return tolerance passes | `window.adjustment_equivalence`; policy and equivalence pass | `ADJUSTMENT_UNAVAILABLE` | AC-15 | `test_r2f5_slo_adjustment` |
+| `calendar` | warning/acquisition observable; unknown/conflict fails closed | session calendar statuses; all confirmed | `CALENDAR_UNAVAILABLE` | AC-15 | `test_r2f5_slo_calendar` |
+| `universe` | counts reconcile; unknown zero | session required/loaded/suspension/not-listed/delisted/unknown; all reconcile | `UNIVERSE_COUNT_MISMATCH` | AC-15 | `test_r2f5_slo_universe` |
+| `error_handling` | six forced classes map to sanitized categories | `window.error_handling_observation.events`; exact six classes once | `ERROR_HANDLING_FAILED` | AC-15 | `test_r2f5_slo_error_handling` |
+| `local_nas_isolation` | NAS outage leaves local ready and retryable backlog | `window.local_nas_isolation_observation`; local ready=true and outage proof | `LOCAL_NAS_ISOLATION_FAILED` | AC-15 | `test_r2f5_slo_local_nas_isolation` |
+| `replication` *(child of local/NAS)* | frozen lag policy and remote proof pass | session `replication_observation` + completed record; reducer max lag | `REPLICATION_LAG` | AC-15 | `test_r2f5_slo_replication` |
+| `restore` | verified generation restore/readback satisfies frozen policy | `window.restore_observation`; one completed drill | `RESTORE_UNAVAILABLE` | AC-15 | `test_r2f5_slo_restore` |
+| `read_boundary` | GET calls make no filesystem mutation | session read-boundary results; all pass | `READ_BOUNDARY_FAILED` | AC-15 | `test_r2f5_slo_read_boundary` |
 
 `adjustment`, `replication` and `restore` have no guessed numeric tolerance in this slice. The
 reader MUST require a reviewed R2-F4 policy/evidence record carrying the exact value and version.
@@ -958,61 +1087,65 @@ R2-F5.0 MUST add no `ProviderId`, canonical bar field, candidate schema or selec
 define read-only domain models over retained records:
 
 ```typescript
-interface SecondaryQualificationEvidenceV1 {
-  provider_id: string;
-  adapter_version: string;
-  endpoint_contract_version: string;
-  qualification_id: string;
-  qualification_sessions: string[]; // exactly 20 ordered confirmed sessions
-  qualification_sha256: string;
-  qualification_session_digest: string;
-  capability_sha256: string;
-  terms_evidence_sha256: string;
-  admission_id: string;
-  admission_sha256: string;
-  version_vector_sha256: string;
-  descriptor_sha256: string;
-  status: "qualified" | "unqualified" | "unavailable";
-}
-
-interface WholeSessionFailoverDrillV1 {
-  drill_id: string;
-  trust_scope: "LOCAL_CHAIN_ONLY" | "REMOTE_VERIFIED";
-  primary_unavailable: boolean;
-  secondary_qualified: boolean;
-  session: string;
-  selected_provider: string;
-  selection_id: string;
-  selected_candidate_sha256: string;
-  manifest_id: string;
-  manifest_sha256: string;
-  pointer_id: string;
-  pointer_sha256: string;
-  readback_id: string;
-  readback_sha256: string;
-  mixed_source_rows: number;
-  readback_verified: boolean;
-  descriptor_sha256: string;
-  drill_sha256: string;
+interface SecondaryQualificationProjection {
+  provider_id: "tickflow" | "tushare";
+  admission_state: "discovered" | "canary" | "shadow" | "qualified" | "quarantined";
+  adapter_hash: string; endpoint_contract_hash: string; source_schema_hash: string;
+  normalizer_hash: string; reconciliation_policy_hash: string;
+  terms_evidence_hash: string | null; terms_review_id: string | null;
+  window_id: string; window_start: string | null; window_end: string | null;
+  consecutive_sessions: number; version_vector_sha256: string;
+  calendar_generation: string; calendar_sha256: string;
+  window_state: "observing" | "qualified" | "reset";
+  last_session_report_id: string | null;
+  qualification_evidence_sha256: string | null;
+  qualification_candidate_sha256: string | null;
+  terminal_attestation_id: string | null;
+  qualification_proof_status: "available" | "unavailable";
 }
 ```
 
-The strict reader MUST require immutable bytes, exact hashes, `qualification_sessions` with exactly
-20 ordered dates, a matching `qualification_session_digest`,
-`secondary_qualified=true`, `REMOTE_VERIFIED` for a remote acceptance claim, and all pointer/
-manifest/selection identities to agree. Current absence, BaoStock-only, unqualified, or
-`LOCAL_CHAIN_ONLY` evidence MUST return `not_ready`/`unavailable` according to proof availability.
+Every field above is a direct projection of `provider_record` or `qualification_window` in the
+existing shadow registry; no new admission/capability/qualification digest is accepted. The strict
+reader MUST require immutable canonical bytes and exact descriptor binding. Existing
+`read_status`/`read_window` cannot prove whole-session failover. A missing secondary or any
+non-qualified state sets `qualification_proof_status=unavailable` and failover is unavailable.
+
+If Task20 adds a writer-owned `WholeSessionFailoverDrill` envelope, its creator, schema version,
+canonical JSON hash preimage, immutable object reference, selected provider/selection, pointer,
+manifest, readback and mixed-row count MUST be documented by Task20. Task19 only reads that
+artifact; it MUST NOT synthesize a digest from current rows. BaoStock-only, no qualified secondary,
+and no whole-session forced-failover proof are expected negative evidence.
+
+### Existing-field to artifact-source mapping
+
+| Projection | Directly reusable R2-F4 fields/readers | Task20-only fields (not present today) | Task19 disposition when absent |
+| --- | --- | --- | --- |
+| `SecondaryQualificationProjection` | `provider_record.provider_id`, `admission_state`, adapter/endpoint/source-schema/normalizer/reconciliation hashes, terms evidence/review; `qualification_window.window_id`, dates, `consecutive_sessions`, version/calendar hashes, window state, last report, qualification evidence/candidate hashes, terminal attestation | none; a whole-session failover envelope may add its own artifact ref/hash, but not to this projection | `qualification_proof_status=unavailable` |
+| replication completed record | `ReplicationObservation` source commit/checkpoint/intent/enqueue state/reason/effects/time; `ReplicationRecord` destination generation/record/head; `VerifiedDestinationCommitProof`; `VerifiedArchiveSnapshot` sentinel/head/record/manifest/checkpoint | remote verification attestation and remote trust scope beyond `LOCAL_CHAIN_ONLY` | replication unavailable/not ready for remote target |
+| restore completed record | `RestoreReport` report/source generation/record/manifest/object/binding/checkpoint/counts/state/start-event hash/timestamps/effects; `RestoreAuditEvent`/terminal event actual fields | immutable drill envelope for schema, row-count and representative API readback, plus its creator/version/hash preimage | restore unavailable |
+
+Task20-owned artifact fields are a schema boundary, not an assertion that Task20 exists or that its
+soak has started. Task19 MUST accept only an immutable descriptor-native record whose artifact hash
+is verified against the declared canonical preimage and creator/version; it MUST NOT hash current
+status rows to manufacture a historical proof.
 
 ## Replication and restore completed-record snapshot contract
 
 The acceptance reader consumes a `CompletedReplicationRestoreSnapshotV1` assembled from existing
-read-only status/record readers. It MUST contain `trust_scope`, `destination_generation`,
-`destination_head_sha256`, `remote_verification_sha256`, `replication_policy_version`,
-`restore_policy_version`, numeric `lag_threshold_seconds` and `restore_duration_threshold_seconds`
-from reviewed R2-F4 evidence, and immutable record hashes. It MUST reject a missing threshold,
-missing remote proof or `LOCAL_CHAIN_ONLY` when evaluating the remote target. It MUST use no
-`create=True`, writer, reconcile, drain, mount or restore execution path; an absent/locked/corrupt
-sidecar is unavailable, not an empty success.
+read-only replication readers and `VerifiedArchiveSnapshot` (`sentinel`, `sentinel_bytes`, `head`,
+`record`, `manifest_bytes`, `checkpoint`). It may also read actual `RestoreReport`,
+`RestoreAuditEvent` and terminal-event fields: report ID/hash, source generation/record/checkpoint,
+manifest/object/binding identities, object/row/byte counts, verification state, start-event hash,
+timestamps and effects. It MUST NOT claim an unsupported remote-verification hash field because no
+such F4 field exists. Current `LOCAL_CHAIN_ONLY` is offline-chain evidence only.
+
+Remote verification, restore schema/row-count/API readback and numeric lag/duration thresholds are
+available only from explicit Task20 writer-owned immutable drill envelopes. Their schema version,
+creator, canonical hash preimage and artifact hash MUST be supplied; Task19 only reads completed
+records. Thresholds absent from frozen R2-F4 policy/evidence are unavailable, not guessed. The
+reader MUST use no `create=True`, writer, reconcile, drain, mount or restore execution path; an
+absent/locked/corrupt sidecar is unavailable, not an empty success.
 
 ## Offline replay contract
 
@@ -1026,21 +1159,25 @@ replayed output. Deterministic normalization is allowed; provider/network side e
 ## Snapshot identity, sequence and concurrency
 
 `SnapshotIdentity` is computed from requested start/end, an `as_of` UTC instant, the literal
-`Asia/Shanghai` cutoff contract, all input descriptor fingerprints, and the complete frozen version
-vector. Raw calendar observations retain source order and duplicate entries; the reader checks
-strict monotonic order before deriving sorted unique confirmed sessions. A duplicate/out-of-order
-raw sequence is `unavailable`, not a sortable warning. Every report returns the identity digest,
-the 20 ordered observation refs and each observation digest. `SessionEvidenceBinding.binding_sha256`
+`Asia/Shanghai` cutoff contract, all input descriptor fingerprints (including typed absence for a
+missing root/control DB), and the complete frozen version vector. Raw calendar observations retain
+source order and duplicate entries; the reader checks strict order before deriving sorted unique
+confirmed sessions. A duplicate/out-of-order raw sequence is `unavailable`, not a sortable warning.
+Every report returns the identity digest, the 20 ordered observation refs and each observation
+digest, plus one window-bundle ref when a bundle exists. `SessionEvidenceBinding.binding_sha256`
 MUST hash the canonical JSON of its seven ID/hash pairs; `PointerReconciliation` MUST prove the
 pointer, manifest and object hash equality; `SessionObservation.observation_sha256` MUST hash the
-canonical JSON of the complete nested observation, including all MetricResult fields and record
+canonical JSON of the complete per-session observation, including all MetricResult fields and record
 hashes. `observation_refs[i]` MUST equal the digest of the observation with `ordinal=i+1`, and both
-collections MUST have cardinality 20 for a candidate window. If any descriptor, file bytes,
-database page, version, or bound clock changes before/during/after evaluation, the whole report is
-invalidated; the reader does not retry into a mixed snapshot.
+collections MUST have cardinality 20 for a candidate window. A bundle is exactly one immutable
+window object and its digest is bound in `window_evidence_refs`; window drills are not copied into
+each session. Missing/corrupt/locked artifacts are typed unavailable. If any descriptor, file
+bytes, database page, version, or bound clock changes before/during/after evaluation, the whole
+report is invalidated; the reader does not retry into a mixed snapshot.
 
 The semantic report payload consists only of SnapshotIdentity, frozen versions, selected sessions,
-per-session observations, metric results, quality issue codes and mutation markers. It is encoded
+per-session observations, the immutable window bundle/reference, metric results, quality issue codes
+and mutation markers. It is encoded
 as canonical UTF-8 JSON (sorted keys, compact separators, `ensure_ascii=false`, `allow_nan=false`)
 with a domain-separated SHA-256. `elapsed_ms`, read counts and replay counts are a separate
 diagnostic envelope and MUST NOT change the semantic payload bytes or digest.

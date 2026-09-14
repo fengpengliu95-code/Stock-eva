@@ -5,7 +5,7 @@ an implementation or acceptance result. Every row is unique, every acceptance cr
 its FR/NFR parent(s), and every anchor is `PLANNED`. No anchor below is claimed to exist, execute,
 pass, or establish Task 20 production soak.
 
-X3 revision base: `d4ca71e7000d5dc8c93ab139409b8b6c682e4ff7`; predecessor planning base:
+X4 revision base: `4879bc7dddc87fd51613028a84ea834b67ac28d8`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk;
@@ -16,7 +16,7 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | --- | --- | --- | --- | --- |
 | FR-1 | Read existing allowlisted roots/control stores without create, initialize, migrate, repair, delete, provider, or canonical writer calls | — | `PLANNED::test_r2f5_req_fr_01` | SPEC CANDIDATE; PLANNED |
 | FR-2 | Reject relative/root/home/mutable-root/symlink/overlap/unresolved paths before enumeration | — | `PLANNED::test_r2f5_req_fr_02` | SPEC CANDIDATE; PLANNED |
-| FR-3 | Fingerprint every input before and after; any descriptor/size/time/hash change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
+| FR-3 | Fingerprint every input before and after with descriptor identity and full streaming SHA-256; any change invalidates the report | — | `PLANNED::test_r2f5_req_fr_03` | SPEC CANDIDATE; PLANNED |
 | FR-4 | Capture one strict immutable in-memory snapshot and never initialize a missing control DB | — | `PLANNED::test_r2f5_req_fr_04` | SPEC CANDIDATE; PLANNED |
 | FR-5 | Select exactly 20 distinct confirmed consecutive sessions visible to the Shanghai trusted clock | — | `PLANNED::test_r2f5_req_fr_05` | SPEC CANDIDATE; PLANNED |
 | FR-6 | Report missing-middle, unknown, duplicate, non-advancing and later-repaired availability explicitly | — | `PLANNED::test_r2f5_req_fr_06` | SPEC CANDIDATE; PLANNED |
@@ -74,13 +74,13 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | EC-16 | Exception path/token/SQL/URL/provider text is reduced to allowlisted reason/detail | FR-14, NFR-6 | `PLANNED::test_r2f5_req_ec_16` | SPEC CANDIDATE; PLANNED |
 | EC-17 | Object/row/sample/time bound stops safely and reports counters | FR-11, NFR-4, NFR-7 | `PLANNED::test_r2f5_req_ec_17` | SPEC CANDIDATE; PLANNED |
 | EC-18 | Malformed dates/missing args/disallowed overrides return 422/2 without filesystem/provider I/O | FR-15, FR-16, NFR-5 | `PLANNED::test_r2f5_req_ec_18` | SPEC CANDIDATE; PLANNED |
-| FR-19 | Expose separate MetricResult fields for all roadmap SLO dimensions with observed value, target, status and reason | FR-9 | `PLANNED::test_r2f5_req_fr_19` | SPEC CANDIDATE; PLANNED |
-| FR-20 | Require immutable secondary qualification/admission hashes and failover proof; purity alone cannot pass | FR-10 | `PLANNED::test_r2f5_req_fr_20` | SPEC CANDIDATE; PLANNED |
-| FR-21 | Read replication/restore snapshots with trust scope, destination generation/head proof, remote verification and thresholds | FR-13 | `PLANNED::test_r2f5_req_fr_21` | SPEC CANDIDATE; PLANNED |
+| FR-19 | Expose 17 roadmap MetricResult fields plus replication as a Local/NAS child metric; each has an independent reducer and threshold | FR-9 | `PLANNED::test_r2f5_req_fr_19` | SPEC CANDIDATE; PLANNED |
+| FR-20 | Project only existing provider_record/qualification_window fields; missing proof makes failover unavailable and purity cannot substitute | FR-10 | `PLANNED::test_r2f5_req_fr_20` | SPEC CANDIDATE; PLANNED |
+| FR-21 | Read replication/restore snapshots with existing checkpoint/record/head/archive/audit fields; Task20 owns remote/readback envelope | FR-13 | `PLANNED::test_r2f5_req_fr_21` | SPEC CANDIDATE; PLANNED |
 | FR-22 | Replay only with injected frozen offline adapter/normalizer identity and zero provider/network construction | FR-11 | `PLANNED::test_r2f5_req_fr_22` | SPEC CANDIDATE; PLANNED |
 | FR-23 | Require complete non-null ready-time version vector and equality across all 20 observations | FR-7 | `PLANNED::test_r2f5_req_fr_23` | SPEC CANDIDATE; PLANNED |
 | FR-24 | Preserve raw calendar order/duplicates and bind SnapshotIdentity to range, Shanghai clock, fingerprints and versions | FR-3, FR-5 | `PLANNED::test_r2f5_req_fr_24` | SPEC CANDIDATE; PLANNED |
-| FR-25 | Return exactly 20 ordered per-session observations or digest-bound references with independent evidence fields | FR-9 | `PLANNED::test_r2f5_req_fr_25` | SPEC CANDIDATE; PLANNED |
+| FR-25 | Return exactly 20 ordered per-session observations or digest-bound references; window drills live in one typed bundle | FR-9 | `PLANNED::test_r2f5_req_fr_25` | SPEC CANDIDATE; PLANNED |
 | FR-26 | Exclude elapsed/read/replay counters from semantic canonical JSON and digest | FR-16 | `PLANNED::test_r2f5_req_fr_26` | SPEC CANDIDATE; PLANNED |
 | FR-27 | Enforce closed enums/reasons, safe IDs/hashes, nonnegative bounds and bounded quality issues | FR-14 | `PLANNED::test_r2f5_req_fr_27` | SPEC CANDIDATE; PLANNED |
 | FR-28 | Enforce exact reason precedence and invalidate the whole report on concurrent snapshot change | FR-3, FR-6 | `PLANNED::test_r2f5_req_fr_28` | SPEC CANDIDATE; PLANNED |
@@ -89,7 +89,7 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 | NFR-13 | Fail closed on any snapshot descriptor/content/version change and never mix retries | FR-3, FR-4 | `PLANNED::test_r2f5_req_nfr_13` | SPEC CANDIDATE; PLANNED |
 | NFR-14 | Encode semantic report as canonical UTF-8 JSON with domain-separated SHA-256 and volatile envelope excluded | FR-16 | `PLANNED::test_r2f5_req_nfr_14` | SPEC CANDIDATE; PLANNED |
 | NFR-15 | Keep API/CLI additive and predecessor response/schema contracts unchanged | FR-15, FR-16 | `PLANNED::test_r2f5_req_nfr_15` | SPEC CANDIDATE; PLANNED |
-| AC-15 | Every roadmap Section 10 dimension appears as an independent MetricResult field with explicit threshold/reason/anchor, including read boundary | FR-9, FR-19, NFR-11 | `PLANNED::test_r2f5_req_ac_15` | SPEC CANDIDATE; PLANNED |
+| AC-15 | All 17 roadmap Section 10 table dimensions plus replication child appear as independent MetricResult fields with reducer/threshold/reason/anchor | FR-9, FR-19, NFR-11 | `PLANNED::test_r2f5_req_ac_15` | SPEC CANDIDATE; PLANNED |
 | AC-16 | BaoStock-only/no secondary/no whole-session drill cannot pass failover; qualified proof requires whole-session purity | FR-20, FR-21 | `PLANNED::test_r2f5_req_ac_16` | SPEC CANDIDATE; PLANNED |
 | AC-17 | LOCAL_CHAIN_ONLY/missing threshold or remote proof is unavailable/not_ready and starts no writer operation | FR-21, NFR-12, NFR-13 | `PLANNED::test_r2f5_req_ac_17` | SPEC CANDIDATE; PLANNED |
 | AC-18 | Frozen offline replay identity permits deterministic normalization with zero provider/network; unknown identity rejects first | FR-22, NFR-13 | `PLANNED::test_r2f5_req_ac_18` | SPEC CANDIDATE; PLANNED |
@@ -109,10 +109,9 @@ The design is the requirement text authority. The matrix is the sole ID/parent/a
 
 ## Mandatory SLO crosswalk
 
-Each roadmap SLO has an independent report field, threshold source and planned anchor. The
-roadmap Local/NAS target explicitly contains replication lag; `replication` is therefore retained
-as an independently testable sub-dimension in addition to `local_nas_isolation`. These are not
-additional requirement IDs; FR-19/NFR-11 own the inventory contract.
+Each roadmap SLO table row has an independent report field, threshold source and planned anchor.
+The roadmap has 17 rows. `replication` is an independently testable child of the Local/NAS row,
+not an 18th roadmap dimension; FR-19/NFR-11 own that child inventory.
 
 | Metric field | Exact target | Threshold source | Failure reason | Acceptance ref | Planned anchor |
 | --- | --- | --- | --- | --- | --- |
@@ -131,7 +130,7 @@ additional requirement IDs; FR-19/NFR-11 own the inventory contract.
 | `universe` | required/loaded/suspension/listing counts reconcile; unknown zero | roadmap Section 10 | `UNIVERSE_COUNT_MISMATCH` | AC-15 | `PLANNED::test_r2f5_slo_universe` |
 | `error_handling` | timeout/auth/rate/schema/coverage/storage sanitized categories | roadmap Section 10 | `ERROR_HANDLING_FAILED` | AC-15 | `PLANNED::test_r2f5_slo_error_handling` |
 | `local_nas_isolation` | NAS outage leaves local ready and retryable backlog | roadmap Section 10 + R2-F4.3 | `LOCAL_NAS_ISOLATION_FAILED` | AC-15 | `PLANNED::test_r2f5_slo_local_nas_isolation` |
-| `replication` | lag/remote verification satisfy frozen R2-F4 numeric policy | reviewed R2-F4 policy; missing is unavailable | `REPLICATION_LAG` | AC-15 | `PLANNED::test_r2f5_slo_replication` |
+| `replication` *(child of local/NAS)* | lag/remote proof satisfy frozen R2-F4 numeric policy | reviewed R2-F4 policy; missing is unavailable | `REPLICATION_LAG` | AC-15 | `PLANNED::test_r2f5_slo_replication` |
 | `restore` | restore/readback satisfies frozen R2-F4 duration policy | reviewed R2-F4 policy; missing is unavailable | `RESTORE_UNAVAILABLE` | AC-15 | `PLANNED::test_r2f5_slo_restore` |
 | `read_boundary` | representative GET calls make no filesystem mutation | roadmap Section 10 | `READ_BOUNDARY_FAILED` | AC-15 | `PLANNED::test_r2f5_slo_read_boundary` |
 
