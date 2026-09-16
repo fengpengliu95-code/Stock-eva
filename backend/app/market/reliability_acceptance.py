@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import struct
@@ -27,7 +26,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
@@ -176,6 +174,10 @@ def _projection(root: dict[str, Any], paths: list[str]) -> Any:
 
 def _digest(field_path: str, root: dict[str, Any]) -> str:
     contract = _DIGESTS[field_path]
+    if field_path == "ReadonlyEvidenceDescriptor.object_sha256":
+        raw = root["immutable_object_bytes"]
+        raw = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
+        return _readonly_object_digest(raw)
     # The approved fixture vectors define projections solely by included field
     # paths.  ``excluded_fields`` documents ownership/self-reference but is not
     # part of the executable projection grammar.
@@ -183,6 +185,11 @@ def _digest(field_path: str, root: dict[str, Any]) -> str:
         _domain_prefix(field_path)
         + _canonical_json(_projection(root, contract["included_field_paths"]))
     ).hexdigest()
+
+
+def _readonly_object_digest(immutable_bytes: bytes) -> str:
+    """Hash the exact immutable object bytes under their dedicated domain."""
+    return hashlib.sha256(b"r2f5/readonly-object-v1\0" + immutable_bytes).hexdigest()
 
 
 def _lp(raw: bytes) -> bytes:
@@ -362,11 +369,20 @@ def _stat_parent(fd: int) -> os.stat_result:
 
 def _cleanup_temp_root(root: Path) -> None:
     try:
-        shutil.rmtree(root)
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for _directory, directories, files, directory_fd in os.fwalk(
+                root, topdown=False, follow_symlinks=False
+            ):
+                for name in files:
+                    os.unlink(name, dir_fd=directory_fd)
+                for name in directories:
+                    os.rmdir(name, dir_fd=directory_fd)
+        finally:
+            os.close(root_fd)
+        os.rmdir(root)
     except OSError as error:
         raise ValueError("temporary cleanup failed") from error
-    if root.exists():
-        raise ValueError("temporary cleanup failed")
 
 
 def _probe_sqlite_member(
@@ -520,6 +536,17 @@ def _capture_sqlite_members(path: Path, role: str) -> tuple[dict[str, Any], Path
             raise ValueError("sqlite rollback journal changed")
         if rounds[0] != rounds[1] or round_bytes[0] != round_bytes[1]:
             raise ValueError("sqlite snapshot changed")
+        final_members: list[dict[str, Any]] = []
+        final_bytes: dict[str, bytes] = {}
+        for member_role, member_name in member_names:
+            member, content = _probe_sqlite_member(
+                parent_fd, final_parent, member_name, member_role
+            )
+            final_members.append(member)
+            if content is not None:
+                final_bytes[member_role] = content
+        if tuple(final_members) != rounds[1] or final_bytes != round_bytes[1]:
+            raise ValueError("sqlite snapshot changed")
         if _tree_identity(parent) != _tree_identity(final_parent):
             raise ValueError("snapshot changed")
         journal = {
@@ -542,31 +569,40 @@ def _capture_sqlite_members(path: Path, role: str) -> tuple[dict[str, Any], Path
         if (
             temp_root.stat().st_uid != os.getuid()
             or stat.S_IMODE(temp_root.stat().st_mode) != 0o700
-            or temp_root.resolve().is_relative_to(path.parent.resolve())
+            or _path_contains(path.parent, temp_root)
         ):
             raise ValueError("temporary storage unavailable")
-        temp_dir = temp_root / "round"
-        temp_dir.mkdir(mode=0o700)
-        for member_role, _member_name in member_names:
-            content = round_bytes[0].get(member_role)
-            if content is None:
-                continue
-            target = temp_dir / (basename if member_role == "db" else f"{basename}-{member_role}")
-            fd = os.open(
-                target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
-            )
-            try:
-                view = memoryview(content)
-                while view:
-                    view = view[os.write(fd, view) :]
-                if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
-                    raise ValueError("temporary storage unavailable")
-            finally:
-                os.close(fd)
+        temp_dirs: list[Path] = []
+        for round_index, contents in enumerate(round_bytes, start=1):
+            temp_dir = temp_root / f"round_{round_index}"
+            temp_dir.mkdir(mode=0o700)
+            temp_dirs.append(temp_dir)
+            for member_role, _member_name in member_names:
+                content = contents.get(member_role)
+                if content is None:
+                    continue
+                target = temp_dir / (
+                    basename if member_role == "db" else f"{basename}-{member_role}"
+                )
+                fd = os.open(
+                    target,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                )
+                try:
+                    view = memoryview(content)
+                    while view:
+                        view = view[os.write(fd, view) :]
+                    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                        raise ValueError("temporary storage unavailable")
+                finally:
+                    os.close(fd)
+        temp_dir = temp_dirs[-1]
         temp_uri = f"file:{temp_dir / basename}?mode=rw"
         with sqlite3.connect(temp_uri, uri=True, timeout=0) as connection:
             connection.execute("PRAGMA query_only=ON")
-            connection.execute("PRAGMA integrity_check")
+            if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise ValueError("sqlite snapshot invalid")
             mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
             expected_mode = "wal" if vector == ["present", "present", "present"] else "delete"
             if mode != expected_mode:
@@ -582,6 +618,7 @@ def _capture_sqlite_members(path: Path, role: str) -> tuple[dict[str, Any], Path
             "catalog_digest": "",
             "_temp_root": temp_root,
             "_temp_dir": temp_dir,
+            "_temp_round_dirs": tuple(temp_dirs),
         }
         return snapshot, temp_dir / basename
     except Exception:
@@ -623,6 +660,8 @@ def _sqlite_logical_digest_from_temp(temp_db: Path, catalog: dict[str, Any]) -> 
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=250")
         connection.execute("BEGIN DEFERRED")
+        if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise ValueError("sqlite snapshot invalid")
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         if journal_mode not in ("delete", "wal"):
             raise ValueError("sqlite snapshot invalid")
@@ -704,6 +743,7 @@ def _sqlite_snapshot_fingerprint(path: Path, role: str) -> dict[str, Any]:
         captured["catalog_digest"] = _sqlite_catalog_digest(_CATALOGS[key])
         captured.pop("_temp_root", None)
         captured.pop("_temp_dir", None)
+        captured.pop("_temp_round_dirs", None)
         return captured
     finally:
         _cleanup_temp_root(captured.get("_temp_root", temp_db.parent.parent))
@@ -742,7 +782,7 @@ def _fingerprint(role: str, path: Path | str) -> tuple[dict[str, Any], dict[str,
         # retained only for the internal snapshot-identity compatibility path.
         return fingerprint, fingerprint
     elif stat.S_ISDIR(info.st_mode):
-        captured = _tree_content_digest(path, excluded_names={"snapshot_identity.json"})
+        captured = _tree_content_digest(path)
         kind, scope = "content_sha256", "full_streaming_bytes"
     elif stat.S_ISREG(info.st_mode):
         captured = _stream_sha256(path)
@@ -1265,13 +1305,71 @@ class ReadonlyEvidenceDescriptor(StrictModel):
     completed: Literal[True]
     source_generation: str
 
+    @field_validator("descriptor_id", "source_generation")
+    @classmethod
+    def safe_identifier(cls, value: str) -> str:
+        if not SAFE_ID.fullmatch(value):
+            raise ValueError("invalid identifier")
+        return value
+
+    @field_validator("object_sha256", "descriptor_sha256")
+    @classmethod
+    def valid_hash(cls, value: str) -> str:
+        if not SHA256.fullmatch(value):
+            raise ValueError("invalid hash")
+        return value
+
 
 class SecondaryQualificationProjection(StrictModel):
-    provider_id: str
+    provider_id: Literal["tickflow", "tushare"]
+    admission_state: Literal["discovered", "canary", "shadow", "qualified", "quarantined"]
+    adapter_hash: str
+    endpoint_contract_hash: str
+    source_schema_hash: str
+    normalizer_hash: str
+    reconciliation_policy_hash: str
+    terms_evidence_hash: str | None
+    terms_review_id: str | None
     window_id: str
-    window_state: Literal["qualified"]
-    session_count: Literal[20]
-    logical_digest: str
+    window_start: str | None
+    window_end: str | None
+    consecutive_sessions: int = Field(ge=0, le=MAX_INT)
+    version_vector_sha256: str
+    calendar_generation: str
+    calendar_sha256: str
+    window_state: Literal["observing", "qualified", "reset"]
+    last_session_report_id: str | None
+    qualification_evidence_sha256: str | None
+    qualification_candidate_sha256: str | None
+    terminal_attestation_id: str | None
+    qualification_proof_status: Literal["available", "unavailable"]
+
+    @field_validator(
+        "adapter_hash",
+        "endpoint_contract_hash",
+        "source_schema_hash",
+        "normalizer_hash",
+        "reconciliation_policy_hash",
+        "terms_evidence_hash",
+        "version_vector_sha256",
+        "calendar_sha256",
+        "qualification_evidence_sha256",
+        "qualification_candidate_sha256",
+    )
+    @classmethod
+    def valid_hash(cls, value: str | None) -> str | None:
+        if value is not None and not SHA256.fullmatch(value):
+            raise ValueError("invalid qualification hash")
+        return value
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def valid_window_date(cls, value: str | None) -> str | None:
+        if value is not None:
+            if not DATE_RE.fullmatch(value):
+                raise ValueError("invalid qualification date")
+            date.fromisoformat(value)
+        return value
 
 
 class FrozenR2F4PolicyThresholds(StrictModel):
@@ -1308,6 +1406,20 @@ class ImmutableObservationEnvelopeV1(StrictModel):
     canonicalization_version: Literal["project-canonical-json-v1"]
     payload_sha256: str
     envelope_sha256: str
+
+    @field_validator("artifact_id", "artifact_ref", "creator_version")
+    @classmethod
+    def safe_identifier(cls, value: str) -> str:
+        if not SAFE_ID.fullmatch(value):
+            raise ValueError("invalid envelope identifier")
+        return value
+
+    @field_validator("payload_sha256", "envelope_sha256")
+    @classmethod
+    def valid_hash(cls, value: str) -> str:
+        if not SHA256.fullmatch(value):
+            raise ValueError("invalid envelope hash")
+        return value
 
 
 class OfflineReplayContext(StrictModel):
@@ -1502,7 +1614,6 @@ class PreCaptureFailurePayloadV1(StrictModel):
 
 
 class R2FAcceptanceReport(StrictModel):
-    _registry_projection: dict[str, Any] | None = PrivateAttr(default=None)
     status: Literal["ready", "not_ready", "unavailable"]
     window_start: str | None
     window_end: str | None
@@ -1528,6 +1639,7 @@ class R2FAcceptanceReport(StrictModel):
     read_boundary: MetricResult
     quality_issues: tuple[str, ...]
     snapshot_identity: SnapshotIdentity | None
+    registry_projection: SecondaryQualificationProjection | None
     session_observations: tuple[SessionObservation, ...]
     observation_refs: tuple[str, ...]
     window_evidence_bundle: ImmutableObservationEnvelopeV1 | None
@@ -1558,8 +1670,10 @@ class R2FAcceptanceReport(StrictModel):
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         output = super().model_dump(*args, **kwargs)
-        if self.status == "ready" and self._registry_projection is not None:
-            output["registry_projection"] = dict(self._registry_projection)
+        # Keep the optional authority projection absent from unavailable
+        # compatibility payloads while retaining it as a typed model field.
+        if output.get("registry_projection") is None:
+            output.pop("registry_projection", None)
         return output
 
 
@@ -1581,6 +1695,40 @@ def _safe_json(path: Path) -> Any:
     finally:
         os.close(fd)
     return json.loads(raw.decode("utf-8"))
+
+
+def _safe_absolute_root(raw: str, *, require_directory: bool = True) -> Path:
+    """Validate every absolute path component without resolving links."""
+    path = Path(raw)
+    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+        raise _AcceptanceError("PATH_INVALID")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode):
+            # macOS exposes /tmp and /var as fixed system aliases.  Anchor
+            # those two aliases to their known absolute targets; all other
+            # symlinked ancestors remain invalid.
+            alias = {"/tmp": "/private/tmp", "/var": "/private/var"}.get(current.as_posix())
+            if alias is None or os.readlink(current) not in {"private/tmp", "private/var"}:
+                raise _AcceptanceError("PATH_INVALID")
+            current = Path(alias)
+            continue
+        if component != path.name and not stat.S_ISDIR(info.st_mode):
+            raise _AcceptanceError("PATH_INVALID")
+    if require_directory and not stat.S_ISDIR(os.lstat(current).st_mode):
+        raise _AcceptanceError("PATH_INVALID")
+    return current
+
+
+def _path_contains(parent: Path, candidate: Path) -> bool:
+    """Compare already trusted absolute paths without resolving links."""
+    try:
+        candidate.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _read_anchored_file(root: Path, relative_path: str) -> bytes:
@@ -1617,6 +1765,14 @@ def _read_anchored_file(root: Path, relative_path: str) -> bytes:
             os.close(file_fd)
     finally:
         os.close(directory_fd)
+
+
+def _safe_directory_entries(path: Path, suffix: str) -> list[str]:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        return sorted(name for name in os.listdir(fd) if name.endswith(suffix))
+    finally:
+        os.close(fd)
 
 
 class AcceptanceReader:
@@ -1756,29 +1912,9 @@ class AcceptanceReader:
             Path(request.evidence_root),
             *(Path(item) for item in request.control_store_roots),
         ]
-        home = Path.home().resolve()
         resolved: list[Path] = []
         for index, path in enumerate(roots):
-            if (
-                not path.is_absolute()
-                or path == Path("/")
-                or "$" in str(path)
-                or ".." in path.parts
-            ):
-                raise _AcceptanceError("PATH_INVALID")
-            if path == home or home in path.parents:
-                # Synthetic tests live under /private/tmp; the explicit roots are
-                # allowed even though they are descendants of the user home only
-                # when the path actually exists outside it.
-                if not path.exists() or path.is_relative_to(home):
-                    raise _AcceptanceError("PATH_INVALID")
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                raise _AcceptanceError("PATH_INVALID")
-            actual = path.resolve(strict=True)
-            resolved.append(actual)
-            if index >= 2 and actual.is_dir():
-                raise _AcceptanceError("PATH_INVALID")
+            resolved.append(_safe_absolute_root(path.as_posix(), require_directory=index < 2))
         for left_index, left in enumerate(resolved[:2]):
             for right_index, right in enumerate(resolved[:2]):
                 if left_index == right_index:
@@ -1806,36 +1942,6 @@ class AcceptanceReader:
             _fingerprint("dataset", paths["dataset"])[0],
             _fingerprint("evidence", paths["evidence"])[0],
         ]
-        # ``snapshot_identity.json`` is a reader output materialised by the
-        # fixture, not an acceptance input.  Its creation necessarily changes
-        # the parent directory's POSIX metadata; retain the original
-        # descriptor metadata while still hashing the complete tree excluding
-        # that output file.
-        identity_path = paths["evidence"] / "snapshot_identity.json"
-        if identity_path.is_file():
-            try:
-                stored = _safe_json(identity_path)
-                expected = next(
-                    item
-                    for item in stored["input_fingerprints"]
-                    if item["descriptor_role"] == "evidence"
-                )
-                values[1] = {
-                    **values[1],
-                    **{
-                        key: expected[key]
-                        for key in (
-                            "device",
-                            "inode",
-                            "size_bytes",
-                            "mtime_ns",
-                            "ctime_ns",
-                            "sha256",
-                        )
-                    },
-                }
-            except (KeyError, StopIteration, TypeError, ValueError, OSError, json.JSONDecodeError):
-                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE") from None
         for path in paths["controls"]:
             key = _catalog_key(path)
             if key is None:
@@ -1858,12 +1964,18 @@ class AcceptanceReader:
     ) -> R2FAcceptanceReport:
         if reason not in _UNAVAILABLE_REASONS:
             reason = "CONTROL_STATE_UNAVAILABLE"
+        safe_start = request.start if DATE_RE.fullmatch(request.start) else "1970-01-01"
+        safe_end = request.end if DATE_RE.fullmatch(request.end) else "1970-01-01"
+        try:
+            safe_now = _validate_timestamp(request.now)
+        except (TypeError, ValueError):
+            safe_now = "1970-01-01T00:00:00Z"
         payload = {
             "schema_version": "r2f5-pre-capture-failure-v1",
             "reason_code": reason,
-            "requested_start": request.start,
-            "requested_end": request.end,
-            "as_of_utc": request.now,
+            "requested_start": safe_start,
+            "requested_end": safe_end,
+            "as_of_utc": safe_now,
             "descriptor_states": states,
             "semantic_report_sha256": "0" * 64,
         }
@@ -1880,6 +1992,7 @@ class AcceptanceReader:
             **metrics,
             "quality_issues": [reason],
             "snapshot_identity": None,
+            "registry_projection": None,
             "session_observations": [],
             "observation_refs": [],
             "window_evidence_bundle": None,
@@ -1929,9 +2042,29 @@ class AcceptanceReader:
         fingerprints: tuple[dict[str, Any], ...],
     ) -> R2FAcceptanceReport:
         calendar = _safe_json(paths["dataset"] / "calendar.json")
-        frozen = FrozenReliabilityVersions.model_validate(
-            _safe_json(paths["evidence"] / "frozen_versions.json")
-        )
+        try:
+            frozen = FrozenReliabilityVersions.model_validate(
+                _safe_json(paths["evidence"] / "frozen_versions.json")
+            )
+        except (ValidationError, ValueError, OSError, json.JSONDecodeError):
+            return self._pre_capture(request, "CONTROL_STATE_UNAVAILABLE", ["error"])
+        try:
+            for field_name in (
+                "installed_release_sha256",
+                "config_digest",
+                "calendar_sha256",
+                "universe_sha256",
+                "destination_head_sha256",
+            ):
+                value = getattr(frozen, field_name)
+                if value is not None:
+                    self._validate_leaf(
+                        paths["evidence"], value, f"FrozenReliabilityVersions.{field_name}"
+                    )
+        except (ValidationError, ValueError, OSError, json.JSONDecodeError):
+            return self._report_unavailable(
+                request, fingerprints, "LINEAGE_UNAVAILABLE", [], frozen
+            )
         try:
             self._validate_readonly_descriptor(paths["evidence"])
         except (ValidationError, ValueError, OSError, json.JSONDecodeError):
@@ -1952,6 +2085,16 @@ class AcceptanceReader:
             return self._report_unavailable(
                 request, fingerprints, "CANONICAL_INTEGRITY_FAILED", [], frozen
             )
+        frozen_bindings = {
+            "adapter_hash": frozen.adapter_hash,
+            "endpoint_contract_hash": frozen.endpoint_contract_hash,
+            "source_schema_hash": frozen.source_schema_hash,
+            "normalizer_hash": frozen.normalizer_hash,
+            "calendar_generation": frozen.calendar_generation,
+            "calendar_sha256": frozen.calendar_sha256,
+        }
+        if any(getattr(registry, field) != expected for field, expected in frozen_bindings.items()):
+            return self._report_unavailable(request, fingerprints, "VERSION_DRIFT", [], frozen)
         raw_sessions = list(calendar["source_sequence"])
         if not calendar.get("confirmed", False) or calendar.get("unknown_state", False):
             return self._report_unavailable(request, fingerprints, "CALENDAR_UNAVAILABLE", [], None)
@@ -1983,6 +2126,20 @@ class AcceptanceReader:
                 if model.ordinal != ordinal or model.session != session:
                     raise ValueError("session sequence")
                 self._validate_observation_hashes(item, paths["evidence"], frozen)
+                for field_name, field_path in (
+                    ("source_commit_sha256", "ReplicationObservation.source_commit_sha256"),
+                    (
+                        "destination_record_sha256",
+                        "ReplicationObservation.destination_record_sha256",
+                    ),
+                    (
+                        "destination_head_sha256",
+                        "ReplicationObservation.destination_head_sha256",
+                    ),
+                ):
+                    self._validate_leaf(
+                        paths["evidence"], item["replication_observation"][field_name], field_path
+                    )
                 observations.append(item)
         except _AcceptanceError as error:
             return self._report_unavailable(
@@ -1990,7 +2147,7 @@ class AcceptanceReader:
             )
         except FileNotFoundError:
             return self._report_unavailable(
-                request, fingerprints, "CONTROL_STATE_UNAVAILABLE", raw_sessions, frozen
+                request, fingerprints, "LINEAGE_UNAVAILABLE", raw_sessions, frozen
             )
         except (ValidationError, ValueError, OSError, json.JSONDecodeError):
             return self._report_unavailable(
@@ -2097,6 +2254,14 @@ class AcceptanceReader:
             root = json.loads(
                 _read_anchored_file(root_base, descriptor["root_path"]).decode("utf-8")
             )
+            pointer = descriptor.get("root_pointer", "$")
+            for segment in pointer.removeprefix("$").strip(".").split("."):
+                if not segment:
+                    continue
+                if segment.endswith("[]"):
+                    root = root[segment[:-2]][0]
+                else:
+                    root = root[segment]
             if descriptor.get("contract_digest") != _digest(source_field, root):
                 raise ValueError("lineage invalid")
         # A session-level mutation can legitimately produce a new digest before
@@ -2117,12 +2282,8 @@ class AcceptanceReader:
         """Read and verify the writer-owned descriptor and its immutable object."""
         object_dir = evidence / "objects" / "ReadonlyEvidenceDescriptor.object_sha256"
         descriptor_dir = evidence / "objects" / "ReadonlyEvidenceDescriptor.descriptor_sha256"
-        object_entries = [
-            entry for entry in os.listdir(object_dir) if entry.endswith(".descriptor.json")
-        ]
-        descriptor_entries = [
-            entry for entry in os.listdir(descriptor_dir) if entry.endswith(".descriptor.json")
-        ]
+        object_entries = _safe_directory_entries(object_dir, ".descriptor.json")
+        descriptor_entries = _safe_directory_entries(descriptor_dir, ".descriptor.json")
         if len(object_entries) != 1 or len(descriptor_entries) != 1:
             raise ValueError("readonly descriptor unavailable")
         object_sidecar_path = (
@@ -2154,9 +2315,16 @@ class AcceptanceReader:
         object_root = json.loads(
             _read_anchored_file(evidence, object_sidecar["root_path"]).decode("utf-8")
         )
+        expected_object_bytes = object_root.get("immutable_object_bytes")
+        if (
+            set(object_root) != {"descriptor_id", "immutable_object_bytes"}
+            or object_root.get("descriptor_id") != descriptor.descriptor_id
+            or not isinstance(expected_object_bytes, str)
+        ):
+            raise ValueError("readonly object invalid")
         if (
             descriptor.object_sha256
-            != _digest("ReadonlyEvidenceDescriptor.object_sha256", object_root)
+            != _readonly_object_digest(expected_object_bytes.encode("utf-8"))
             or descriptor.descriptor_sha256
             != _digest(
                 "ReadonlyEvidenceDescriptor.descriptor_sha256", descriptor.model_dump(mode="python")
@@ -2165,6 +2333,8 @@ class AcceptanceReader:
             or descriptor.descriptor_sha256 != descriptor_sidecar.get("contract_digest")
         ):
             raise ValueError("readonly descriptor invalid")
+        if object_raw != expected_object_bytes.encode("utf-8"):
+            raise ValueError("readonly object invalid")
         if hashlib.sha256(object_raw).hexdigest() != object_sidecar.get("artifact_sha256"):
             raise ValueError("readonly object invalid")
 
@@ -2199,6 +2369,7 @@ class AcceptanceReader:
             try:
                 candidate = _safe_json(Path(request.evidence_root) / "window.json")
                 if isinstance(candidate, dict) and isinstance(candidate.get("payload"), dict):
+                    self._validate_envelope(candidate)
                     window_bundle = candidate
                     if isinstance(candidate.get("envelope_sha256"), str):
                         window_refs = [candidate["envelope_sha256"]]
@@ -2213,6 +2384,7 @@ class AcceptanceReader:
             **metrics,
             "quality_issues": [reason],
             "snapshot_identity": identity,
+            "registry_projection": None,
             "session_observations": [],
             "observation_refs": [],
             "window_evidence_bundle": window_bundle,
@@ -2359,7 +2531,85 @@ class AcceptanceReader:
         for child_name, child_model in child_models.items():
             child_envelope = payload.get(child_name)
             if child_envelope is not None:
-                child_model.model_validate(child_envelope["payload"])
+                # A malformed child is a typed unavailable metric.  Do not
+                # let one strict child validation error erase the rest of the
+                # captured window or leak as a generic invalid-arguments
+                # response.
+                try:
+                    child_model.model_validate(child_envelope["payload"])
+                except (ValidationError, ValueError, TypeError, KeyError):
+                    continue
+        child_digest_fields = {
+            "recovery_observation": tuple(
+                (name, f"RecoveryObservation.{name}")
+                for name in (
+                    "after_manifest_sha256",
+                    "after_pointer_sha256",
+                    "after_selection_sha256",
+                    "duplicate_proof_sha256",
+                )
+            ),
+            "failover_observation": tuple(
+                (name, f"WholeSessionFailoverDrill.{name}")
+                for name in (
+                    "selection_sha256",
+                    "manifest_sha256",
+                    "pointer_sha256",
+                    "readback_sha256",
+                )
+            ),
+            "replay_sample": (
+                ("sample_object_sha256", "ReplaySampleEvidence.sample_object_sha256"),
+                ("candidate_sha256", "ReplaySampleEvidence.candidate_sha256"),
+                (
+                    "implementation_sha256",
+                    "OfflineReplayContext.implementation_sha256",
+                ),
+            ),
+            "restore_observation": tuple(
+                (name, f"RestoreDrillEvidence.{name}")
+                for name in (
+                    "sentinel_sha256",
+                    "destination_head_sha256",
+                    "record_sha256",
+                    "manifest_sha256",
+                    "restore_report_sha256",
+                    "api_readback_sha256",
+                )
+            ),
+            "local_nas_isolation_observation": (
+                ("local_pointer_sha256", "LocalNasIsolationObservation.local_pointer_sha256"),
+            ),
+        }
+        for child_name, fields in child_digest_fields.items():
+            child = payload.get(child_name)
+            if child is None or not isinstance(child, dict):
+                continue
+            child_payload = child.get("payload", {})
+            for field_name, field_path in fields:
+                value = child_payload.get(field_name)
+                if value is None and field_name == "implementation_sha256":
+                    value = child_payload.get("offline_context", {}).get(field_name)
+                if not isinstance(value, str):
+                    raise ValueError("child evidence digest unavailable")
+                self._validate_leaf(paths["evidence"], value, field_path)
+        error_child = payload.get("error_handling_observation")
+        if isinstance(error_child, dict):
+            error_payload = error_child.get("payload", {})
+            if isinstance(error_payload, dict):
+                if isinstance(error_payload.get("observation_sha256"), str):
+                    self._validate_leaf(
+                        paths["evidence"],
+                        error_payload["observation_sha256"],
+                        "ErrorHandlingObservation.observation_sha256",
+                    )
+                for event in error_payload.get("events", ()):
+                    if isinstance(event, dict) and isinstance(event.get("evidence_sha256"), str):
+                        self._validate_leaf(
+                            paths["evidence"],
+                            event["evidence_sha256"],
+                            "ErrorHandlingObservation.events.evidence_sha256",
+                        )
         for name, child, reason, target in (
             ("recovery", "recovery_observation", "RECOVERY_FAILED", True),
             ("failover", "failover_observation", "FAILOVER_UNAVAILABLE", True),
@@ -2424,13 +2674,13 @@ class AcceptanceReader:
                     ("pass", None)
                     if good
                     else (
-                        ("unavailable", reason)
+                        ("fail", "REPLAY_SEMANTIC_MISMATCH")
                         if not value.get("semantic_equal", True)
                         else ("unavailable", reason)
                     )
                 )
                 if value.get("semantic_equal") is False:
-                    metric_reason = "REPLAY_UNAVAILABLE"
+                    metric_reason = "REPLAY_SEMANTIC_MISMATCH"
             elif name == "adjustment":
                 good = (
                     good
@@ -2548,12 +2798,25 @@ class AcceptanceReader:
         lag = max(
             (item["replication_observation"].get("lag_seconds") or 0) for item in observations
         )
+        remote_verified = (
+            all(
+                item["replication_observation"].get("trust_scope") == "REMOTE_VERIFIED"
+                for item in observations
+            )
+            and frozen.replication_trust_scope == "REMOTE_VERIFIED"
+        )
         metrics["replication"] = self._metric(
             "replication",
-            "unavailable" if threshold is None else ("pass" if lag <= threshold else "fail"),
+            "unavailable"
+            if threshold is None or not remote_verified
+            else ("pass" if lag <= threshold else "fail"),
             "REPLICATION_UNAVAILABLE"
             if threshold is None
-            else (None if lag <= threshold else "REPLICATION_LAG"),
+            else (
+                "REMOTE_PROOF_MISSING"
+                if not remote_verified
+                else (None if lag <= threshold else "REPLICATION_LAG")
+            ),
             lag,
             threshold or 0,
         )
@@ -2582,6 +2845,11 @@ class AcceptanceReader:
             **metrics,
             "quality_issues": issues,
             "snapshot_identity": identity,
+            "registry_projection": (
+                registry.model_dump(mode="python")
+                if registry is not None and status == "ready"
+                else None
+            ),
             "session_observations": observations,
             "observation_refs": [item["observation_sha256"] for item in observations],
             "window_evidence_bundle": window,
@@ -2601,12 +2869,7 @@ class AcceptanceReader:
         report["semantic_report_sha256"] = _digest(
             "R2FAcceptanceReport.semantic_report_sha256", report
         )
-        validated = R2FAcceptanceReport.model_validate(report)
-        if registry is not None and validated.status == "ready":
-            object.__setattr__(
-                validated, "_registry_projection", registry.model_dump(mode="python")
-            )
-        return validated
+        return R2FAcceptanceReport.model_validate(report)
 
     def _validate_envelope(self, envelope: dict[str, Any]) -> None:
         ImmutableObservationEnvelopeV1.model_validate(envelope)
@@ -2675,19 +2938,31 @@ def read_secondary_qualification_projection(
                 if primary_key != list(table_spec["primary_key"]):
                     raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
             provider = connection.execute(
-                "SELECT provider_id, admission_state FROM provider_record WHERE provider_id=?",
+                "SELECT provider_id, admission_state, adapter_hash, endpoint_contract_hash, "
+                "source_schema_hash, normalizer_hash, reconciliation_policy_hash, "
+                "terms_evidence_hash, terms_review_id FROM provider_record WHERE provider_id=?",
                 (provider_id,),
             ).fetchone()
             window = connection.execute(
                 "SELECT provider_id, window_id, window_start, window_end, "
-                "consecutive_sessions, window_state, qualification_evidence_sha256, "
-                "qualification_candidate_sha256, terminal_attestation_id "
+                "consecutive_sessions, window_state, version_vector_sha256, "
+                "calendar_generation, calendar_sha256, last_session_report_id, "
+                "qualification_evidence_sha256, qualification_candidate_sha256, "
+                "terminal_attestation_id "
                 "FROM qualification_window WHERE provider_id=? AND window_id=?",
                 (provider_id, window_id),
             ).fetchone()
-            if provider is None or provider[1] != "qualified" or window is None:
+            if provider is None or window is None:
                 raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-            if window[6] is None or window[7] is None or window[8] is None:
+            if provider[1] != "qualified" or window[5] != "qualified":
+                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+            if (
+                provider[7] is None
+                or provider[8] is None
+                or window[10] is None
+                or window[11] is None
+                or window[12] is None
+            ):
                 raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
             sessions = connection.execute(
                 "SELECT trade_date, session_report_id, terminal_attestation_id "
@@ -2739,9 +3014,8 @@ def read_secondary_qualification_projection(
                 "ORDER BY job_id DESC LIMIT 1",
                 (provider_id, window_id, window[3]),
             ).fetchone()
-            if terminal_job is None or terminal_job[0] != window[8]:
+            if terminal_job is None or terminal_job[0] != window[12]:
                 raise _AcceptanceError("CANONICAL_INTEGRITY_FAILED")
-            digest = _sqlite_logical_digest_from_temp(temp_db, _CATALOGS["shadow_registry"])
             connection.rollback()
     except _AcceptanceError:
         raise
@@ -2750,13 +3024,31 @@ def read_secondary_qualification_projection(
     finally:
         if captured is not None:
             _cleanup_temp_root(captured["_temp_root"])
-    return SecondaryQualificationProjection(
-        provider_id=provider_id,
-        window_id=window_id,
-        window_state="qualified",
-        session_count=20,
-        logical_digest=digest,
+    projection = SecondaryQualificationProjection(
+        provider_id=provider[0],
+        admission_state=provider[1],
+        adapter_hash=provider[2],
+        endpoint_contract_hash=provider[3],
+        source_schema_hash=provider[4],
+        normalizer_hash=provider[5],
+        reconciliation_policy_hash=provider[6],
+        terms_evidence_hash=provider[7],
+        terms_review_id=provider[8],
+        window_id=window[1],
+        window_start=window[2],
+        window_end=window[3],
+        consecutive_sessions=window[4],
+        version_vector_sha256=window[6],
+        calendar_generation=window[7],
+        calendar_sha256=window[8],
+        window_state=window[5],
+        last_session_report_id=window[9],
+        qualification_evidence_sha256=window[10],
+        qualification_candidate_sha256=window[11],
+        terminal_attestation_id=window[12],
+        qualification_proof_status="available",
     )
+    return projection
 
 
 def read_readonly_evidence(
@@ -2765,7 +3057,7 @@ def read_readonly_evidence(
 ) -> ReadonlyEvidenceDescriptor:
     """Validate a Task20 descriptor against supplied immutable bytes."""
     model = ReadonlyEvidenceDescriptor.model_validate(descriptor)
-    if hashlib.sha256(immutable_bytes).hexdigest() != model.object_sha256:
+    if _readonly_object_digest(immutable_bytes) != model.object_sha256:
         raise _AcceptanceError("LINEAGE_INVALID")
     if (
         _digest("ReadonlyEvidenceDescriptor.descriptor_sha256", model.model_dump(mode="python"))
