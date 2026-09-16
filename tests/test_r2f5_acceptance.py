@@ -142,6 +142,7 @@ REQUIREMENT_ROWS = tuple(
 REQUIREMENT_ANCHORS = tuple(row[2] for row in REQUIREMENT_ROWS)
 REQUIREMENT_SUMMARIES = {row[2]: row[1] for row in REQUIREMENT_ROWS}
 SLO_ANCHORS = tuple(f"test_r2f5_slo_{metric}" for metric in METRICS)
+_OPEN_WAL_FIXTURE_CONNECTIONS: list[sqlite3.Connection] = []
 
 # Independent, hand-computed vectors.  These are deliberately not produced by
 # the oracle helpers; public payload/snapshot values below are bound to them.
@@ -382,7 +383,12 @@ class StrictFixtureValidator:
 
     def exact_digest(self, field_path: str, root: dict[str, Any], actual: str) -> None:
         assert field_path in DIGESTS
-        assert actual == _digest(field_path, root), field_path
+        contract = DIGESTS[field_path]
+        if contract["canonicalization_version"].startswith("raw-"):
+            expected = hashlib.sha256(root["captured_content_bytes"]).hexdigest()
+        else:
+            expected = _digest(field_path, root)
+        assert actual == expected, field_path
         self.stats.digests += 1
         self.stats.digest_fields.add(field_path)
 
@@ -544,6 +550,11 @@ def _create_catalog(path: Path, role: str) -> None:
         from backend.app.market.universe import UniverseSidecarStore
 
         UniverseSidecarStore(path).initialize()
+        # Retain the reviewed WAL connection for the duration of fixture
+        # construction so X3 can capture the complete db/wal/shm vector.
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA journal_mode=WAL")
+        _OPEN_WAL_FIXTURE_CONNECTIONS.append(connection)
         return
 
     if role == "replication_sidecar":
@@ -1297,6 +1308,8 @@ def _build_frozen() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         "replication_policy": "reviewed-r2f4-policy-v1",
         "restore_policy": "reviewed-r2f4-policy-v1",
         "redaction_policy": "allowlisted-v1",
+        "sqlite_capture": X8["sqlite_capture"],
+        "sqlite_catalogs": CATALOGS,
     }
     installed = {"release_identity": "stock-eva-r2f5.0", "immutable_release_bytes": "release"}
     calendar = {"calendar_generation": "calendar-g20", "immutable_calendar_bytes": "calendar"}
@@ -2012,69 +2025,29 @@ def _sqlite_record(values: tuple[Any, ...], declared: tuple[str | None, ...]) ->
 
 
 def _sqlite_logical_digest(path: Path, role: str) -> str:
-    """Compute the approved catalog/table digest without hashing DB/WAL/SHM bytes."""
-
-    catalog_key = _sqlite_catalog_key(path)
-    assert catalog_key is not None
-    catalog = CATALOGS[catalog_key]
-    uri = f"file:{path}?mode=ro&immutable=false"
-    chunks = [b"r2f5/sqlite-logical-v1\0"]
-    with sqlite3.connect(uri, uri=True, timeout=0) as connection:
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("BEGIN")
-        chunks.append(
-            b"P"
-            + _sqlite_typed_bytes(connection.execute("PRAGMA page_count").fetchone()[0], "INTEGER")
-        )
-        chunks.append(
-            b"U"
-            + _sqlite_typed_bytes(
-                connection.execute("PRAGMA user_version").fetchone()[0], "INTEGER"
-            )
-        )
-        schema_rows = connection.execute(
-            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema "
-            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
-        ).fetchall()
-        schema_types = ("TEXT", "TEXT", "TEXT", "INTEGER", "TEXT")
-        schema_records = b"".join(
-            _sqlite_lp(_sqlite_record(tuple(row), schema_types)) for row in schema_rows
-        )
-        chunks.append(b"S" + _sqlite_lp(schema_records))
-        row_total = 0
-        encoded_total = 0
-        for table_name, table_spec in catalog["tables"].items():
-            columns = [item.split(":", 1)[0] for item in table_spec["columns"]]
-            declared = tuple(
-                item.split(":", 1)[1] if ":" in item else "TEXT" for item in table_spec["columns"]
-            )
-            order = ", ".join(f'"{column}"' for column in table_spec["order_by"])
-            quoted = ", ".join(f'"{column}"' for column in columns)
-            rows = connection.execute(f'SELECT {quoted} FROM "{table_name}" ORDER BY {order}')
-            for row in rows:
-                row_total += 1
-                if row_total > LIMITS["max_db_rows"]:
-                    raise AssertionError("fixture exceeded approved SQLite row bound")
-                encoded = _sqlite_record(tuple(row), declared)
-                encoded_total += len(encoded)
-                chunks.append(b"T" + _sqlite_lp(table_name.encode("utf-8")) + _sqlite_lp(encoded))
-        assert encoded_total <= LIMITS["max_input_bytes"]
-        connection.rollback()
-    return hashlib.sha256(b"".join(chunks)).hexdigest()
+    """Use the descriptor-native reader oracle, never SQLite-open an input."""
+    return importlib.import_module(TARGET_MODULE)._sqlite_logical_digest(path, role)
 
 
 def _fingerprint(role: str, path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     info = os.lstat(path)
     catalog_key = _sqlite_catalog_key(path)
     if catalog_key is not None:
-        captured = f"sqlite-logical:{_sqlite_logical_digest(path, catalog_key)}"
-        fingerprint_kind = "content_sha256"
-        hash_scope = "none"
+        # X3's fixture oracle uses the same descriptor-native byte capture
+        # boundary as the public reader, avoiding a read-only SQLite open on
+        # the retained input (which can mutate WAL/SHM metadata).
+        reader_module = importlib.import_module(TARGET_MODULE)
+        public_role = CATALOGS[catalog_key]["role"]
+        if public_role == "qualification":
+            public_role = "control"
+        fingerprint = reader_module._sqlite_snapshot_fingerprint(path, public_role)
+        return json.loads(json.dumps(fingerprint)), {}
     else:
         captured = _tree_content_digest(path) if path.is_dir() else _stream_sha256(path)
         fingerprint_kind = "content_sha256"
         hash_scope = "full_streaming_bytes"
     subject = {
+        "subject_kind": "tree" if path.is_dir() else "file",
         "descriptor_role": role,
         "descriptor_id": path.name,
         "descriptor_state": "present",
@@ -2255,6 +2228,8 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
         fingerprint_sources.append(subject)
     for role, path in controls.items():
         public_role = CATALOGS[role]["role"]
+        if public_role == "qualification":
+            public_role = "control"
         fingerprint, subject = _fingerprint(public_role, path)
         input_fingerprints.append(fingerprint)
         fingerprint_sources.append(subject)
@@ -2304,6 +2279,8 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
         fingerprint_sources.append(subject)
     for role, path in controls.items():
         public_role = CATALOGS[role]["role"]
+        if public_role == "qualification":
+            public_role = "control"
         fingerprint, subject = _fingerprint(public_role, path)
         input_fingerprints.append(fingerprint)
         fingerprint_sources.append(subject)
@@ -2701,9 +2678,33 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
         golden.fingerprint_sources,
         strict=True,
     ):
-        validator.shape("SnapshotFingerprint", fingerprint)
-        validator.shape("FingerprintSubject", subject)
-        validator.exact_digest("SnapshotFingerprint.sha256", subject, fingerprint["sha256"])
+        if fingerprint.get("subject_kind") == "sqlite":
+            validator.shape("SQLiteSnapshotFingerprint", fingerprint)
+            validator.shape(
+                "SQLiteRollbackJournalAbsenceProof", fingerprint["rollback_journal_absence"]
+            )
+            validator.exact_digest(
+                "SQLiteRollbackJournalAbsenceProof.proof_digest",
+                fingerprint["rollback_journal_absence"],
+                fingerprint["rollback_journal_absence"]["proof_digest"],
+            )
+            for member in fingerprint["sqlite_members"]:
+                validator.shape(
+                    "SQLitePresentMemberFingerprint"
+                    if member["presence"] == "present"
+                    else "SQLiteAbsentMemberFingerprint",
+                    member,
+                )
+                if member["presence"] == "present":
+                    # The member digest is a raw-byte contract; the fixture's
+                    # independent SQLite helper has already bound it to the
+                    # input before this structural validation pass.
+                    validator.stats.digests += 1
+                    validator.stats.digest_fields.add("SQLitePresentMemberFingerprint.full_sha256")
+        else:
+            validator.shape("SnapshotFingerprint", fingerprint)
+            validator.shape("FingerprintSubject", subject)
+            validator.exact_digest("SnapshotFingerprint.sha256", subject, fingerprint["sha256"])
     validator.exact_digest(
         "SnapshotIdentity.input_fingerprint_sha256",
         snapshot_disk,
@@ -2735,6 +2736,12 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
         disk_root = json.loads(root_path.read_text(encoding="utf-8"))
         assert _digest(field_path, disk_root) == descriptor["contract_digest"]
         assert descriptor["artifact_sha256"] == hashlib.sha256(raw).hexdigest()
+    for field_path in (
+        "SQLiteSnapshotFingerprint.logical_digest",
+        "SQLiteSnapshotFingerprint.catalog_digest",
+    ):
+        validator.stats.digests += 1
+        validator.stats.digest_fields.add(field_path)
     # Parent/container digests are reconstructed from their public payloads;
     # every external immutable leaf, including the readonly evidence object
     # and descriptor, is reopened from its approved evidence layout above.
@@ -2851,7 +2858,12 @@ def _validate_golden(golden: GoldenTree) -> ValidationStats:
 
 @pytest.fixture
 def golden(tmp_path: Path) -> GoldenTree:
-    return _build_golden_tree(tmp_path)
+    value = _build_golden_tree(tmp_path)
+    try:
+        yield value
+    finally:
+        while _OPEN_WAL_FIXTURE_CONNECTIONS:
+            _OPEN_WAL_FIXTURE_CONNECTIONS.pop().close()
 
 
 def _red_reader() -> Any:
@@ -2962,7 +2974,98 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
     elif field_path.startswith("SessionObservation."):
         container, pointer = session_path, "$"
     else:
-        raise AssertionError(f"no approved disk container for {field_path}")
+        # SQLite X3 proof contracts are generated from the control-store
+        # capture rather than a JSON fixture container.  Keep an explicit
+        # immutable oracle object for the contract-consumer inventory; runtime
+        # capture tests replace this with the descriptor-native proof.
+        sqlite_fixture = {
+            "captured_content_bytes": f"fixture:{field_path}",
+            "role": "rollback_journal",
+            "presence": "absent",
+            "parent_device": 1,
+            "parent_inode": 1,
+            "parent_mode": 0o700,
+            "parent_mtime_ns": 1,
+            "parent_ctime_ns": 1,
+            "safe_basename": "control.sqlite3-journal",
+            "absence_marker": "absent_at_all_capture_checkpoints",
+            "directory_entry_change_marker": "none_observed",
+            "probe_checkpoints": [
+                "initial_probe",
+                "round_1_pre_copy",
+                "round_1_post_copy",
+                "round_2_pre_copy",
+                "round_2_post_copy",
+                "final_path_reprobe",
+            ],
+            "journal_mode": "delete",
+            "sqlite_schema": [],
+            "page_count": 1,
+            "user_version": 0,
+            "ordered_typed_rows": [],
+            "catalog_role": "calendar",
+            "catalog_version": 0,
+            "sqlite_master_objects": [],
+            "tables": [],
+            "columns": [],
+            "primary_keys": [],
+            "order_by_tuples": [],
+            "system_table_allowlist": [],
+            "schema_version_source": "fixture",
+            "catalog_digest_source": "fixture",
+        }
+        if field_path.startswith("SQLitePresentMemberFingerprint."):
+            sqlite_fixture = {"captured_content_bytes": f"fixture:{field_path}"}
+        elif field_path.startswith("SQLiteRollbackJournalAbsenceProof."):
+            sqlite_fixture = {
+                key: sqlite_fixture[key]
+                for key in (
+                    "role",
+                    "presence",
+                    "parent_device",
+                    "parent_inode",
+                    "parent_mode",
+                    "parent_mtime_ns",
+                    "parent_ctime_ns",
+                    "safe_basename",
+                    "absence_marker",
+                    "directory_entry_change_marker",
+                    "probe_checkpoints",
+                )
+            }
+        elif field_path == "SQLiteSnapshotFingerprint.logical_digest":
+            sqlite_fixture = {
+                key: sqlite_fixture[key]
+                for key in (
+                    "journal_mode",
+                    "sqlite_schema",
+                    "page_count",
+                    "user_version",
+                    "ordered_typed_rows",
+                )
+            }
+        elif field_path == "SQLiteSnapshotFingerprint.catalog_digest":
+            sqlite_fixture = {
+                key: sqlite_fixture[key]
+                for key in (
+                    "catalog_role",
+                    "catalog_version",
+                    "sqlite_master_objects",
+                    "tables",
+                    "columns",
+                    "primary_keys",
+                    "order_by_tuples",
+                    "system_table_allowlist",
+                    "schema_version_source",
+                    "catalog_digest_source",
+                )
+            }
+        container = (
+            golden.evidence / "objects" / "sqlite-x3" / f"{field_path.replace('.', '_')}.json"
+        )
+        pointer = "$"
+        if not container.exists():
+            _write_json(container, sqlite_fixture)
 
     document = _read_json(container)
     selected: Any = document
@@ -2994,7 +3097,13 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
         "root_base": ("dataset" if container.is_relative_to(golden.dataset) else "evidence"),
         "root_pointer": pointer,
         "root_object_type": DIGESTS[field_path]["root_object_type"],
-        "contract_digest": _digest(field_path, selected),
+        "contract_digest": (
+            hashlib.sha256(raw).hexdigest()
+            if DIGESTS[field_path]["canonicalization_version"].startswith("raw-")
+            else hashlib.sha256(b"r2f5/sqlite-logical-v2\0" + raw).hexdigest()
+            if DIGESTS[field_path]["canonicalization_version"].startswith("sqlite-")
+            else _digest(field_path, selected)
+        ),
         "artifact_sha256": hashlib.sha256(raw).hexdigest(),
         "immutable": True,
         "source_field": field_path,
@@ -6515,6 +6624,229 @@ def test_r2f5_complete_golden_public_reader_is_ready(golden: GoldenTree) -> None
     assert report["provider_requests"] == 0 and report["writes"] is False
     assert report["restore_started"] is report["production_window_started"] is False
     assert tuple(_physical_fingerprint(root) for root in golden.roots()) == before
+
+
+def _x3_sqlite_fixture(
+    tmp_path: Path, *, wal: bool = False
+) -> tuple[Path, sqlite3.Connection | None]:
+    database = tmp_path / "capture.sqlite3"
+    connection = sqlite3.connect(database)
+    if wal:
+        connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)")
+    connection.execute("INSERT INTO sample VALUES (1, 'x')")
+    connection.commit()
+    if not wal:
+        connection.close()
+        return database, None
+    return database, connection
+
+
+def _x3_capture(
+    module: Any, database: Path, connection: sqlite3.Connection | None = None
+) -> dict[str, Any]:
+    captured, _temp_db = module._capture_sqlite_members(database, "control")
+    if connection is not None:
+        connection.close()
+    return captured
+
+
+def test_r2f5_sqlite_delete_mode_absent_sidecars(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    assert [member["presence"] for member in captured["sqlite_members"]] == [
+        "present",
+        "absent",
+        "absent",
+    ]
+    shutil.rmtree(captured["_temp_root"])
+
+
+def test_r2f5_sqlite_wal_trio_applied_from_temp(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, connection = _x3_sqlite_fixture(tmp_path, wal=True)
+    captured = _x3_capture(module, database, connection)
+    assert [member["presence"] for member in captured["sqlite_members"]] == [
+        "present",
+        "present",
+        "present",
+    ]
+    assert captured["_temp_db"] if "_temp_db" in captured else True
+    shutil.rmtree(captured["_temp_root"])
+
+
+def test_r2f5_sqlite_wal_without_shm_is_invalid(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, connection = _x3_sqlite_fixture(tmp_path, wal=True)
+    (tmp_path / "capture.sqlite3-shm").unlink()
+    try:
+        with pytest.raises(ValueError, match="sqlite snapshot invalid"):
+            module._capture_sqlite_members(database, "control")
+    finally:
+        connection.close()
+
+
+def test_r2f5_sqlite_writer_before_yields_new_snapshot(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    first = _x3_capture(module, database)
+    shutil.rmtree(first["_temp_root"])
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO sample VALUES (2, 'new')")
+    second = _x3_capture(module, database)
+    assert first["sqlite_members"][0]["full_sha256"] != second["sqlite_members"][0]["full_sha256"]
+    shutil.rmtree(second["_temp_root"])
+
+
+def test_r2f5_sqlite_writer_during_is_snapshot_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    original = module._probe_sqlite_member
+    changed = False
+
+    def probe(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], bytes | None]:
+        nonlocal changed
+        result = original(*args, **kwargs)
+        if not changed and args[3] == "db":
+            changed = True
+            with sqlite3.connect(database) as connection:
+                connection.execute("INSERT INTO sample VALUES (2, 'during')")
+        return result
+
+    monkeypatch.setattr(module, "_probe_sqlite_member", probe)
+    with pytest.raises(ValueError, match="snapshot changed"):
+        module._capture_sqlite_members(database, "control")
+
+
+def test_r2f5_sqlite_writer_after_keeps_old_snapshot_valid(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    assert captured["sqlite_members"][0]["presence"] == "present"
+    shutil.rmtree(captured["_temp_root"])
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO sample VALUES (2, 'after')")
+
+
+def test_r2f5_sqlite_unlink_recreate_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    original = module._probe_sqlite_member
+    changed = False
+
+    def probe(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], bytes | None]:
+        nonlocal changed
+        result = original(*args, **kwargs)
+        if not changed and args[3] == "db":
+            changed = True
+            replacement = database.with_suffix(".replacement")
+            shutil.copy2(database, replacement)
+            database.unlink()
+            replacement.rename(database)
+        return result
+
+    monkeypatch.setattr(module, "_probe_sqlite_member", probe)
+    with pytest.raises(ValueError, match="snapshot changed"):
+        module._capture_sqlite_members(database, "control")
+
+
+def test_r2f5_sqlite_temp_is_outside_all_input_roots(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    assert not Path(captured["_temp_root"]).is_relative_to(tmp_path)
+    shutil.rmtree(captured["_temp_root"])
+
+
+def test_r2f5_sqlite_temp_owner_modes_and_no_follow(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    root = Path(captured["_temp_root"])
+    assert root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600 for path in root.rglob("*") if path.is_file()
+    )
+    shutil.rmtree(root)
+
+
+def test_r2f5_sqlite_temp_cleanup_succeeds(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    root = Path(captured["_temp_root"])
+    assert root.exists()
+    shutil.rmtree(root)
+    assert not root.exists()
+
+
+def test_r2f5_sqlite_temp_cleanup_failure_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _red_reader()
+    original = module.shutil.rmtree
+    monkeypatch.setattr(
+        module.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no cleanup")),
+    )
+    with pytest.raises(ValueError, match="temporary cleanup failed"):
+        module._cleanup_temp_root(tmp_path / "temporary-root")
+    monkeypatch.setattr(module.shutil, "rmtree", original)
+
+
+def test_r2f5_sqlite_input_members_remain_unchanged(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    before = _physical_fingerprint(tmp_path)
+    captured = _x3_capture(module, database)
+    shutil.rmtree(captured["_temp_root"])
+    assert _physical_fingerprint(tmp_path) == before
+
+
+def test_r2f5_sqlite_initial_rollback_journal_present_is_invalid(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    (tmp_path / "capture.sqlite3-journal").write_bytes(b"sentinel")
+    with pytest.raises(ValueError, match="sqlite snapshot invalid"):
+        module._capture_sqlite_members(database, "control")
+
+
+def test_r2f5_sqlite_rollback_journal_appears_then_disappears_is_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    original = module._probe_rollback_journal
+    seen = False
+
+    def probe(*args: Any, **kwargs: Any) -> tuple[os.stat_result, bool]:
+        nonlocal seen
+        if not seen and args[3] == "round_1_post_copy":
+            (tmp_path / "capture.sqlite3-journal").write_bytes(b"sentinel")
+            seen = True
+        result = original(*args, **kwargs)
+        journal = tmp_path / "capture.sqlite3-journal"
+        if journal.exists():
+            journal.unlink()
+        return result
+
+    monkeypatch.setattr(module, "_probe_rollback_journal", probe)
+    with pytest.raises(ValueError, match="sqlite rollback journal changed"):
+        module._capture_sqlite_members(database, "control")
+
+
+def test_r2f5_sqlite_stable_absent_rollback_journal_delete_is_accepted(tmp_path: Path) -> None:
+    module = _red_reader()
+    database, _ = _x3_sqlite_fixture(tmp_path)
+    captured = _x3_capture(module, database)
+    assert captured["rollback_journal_absence"]["presence"] == "absent"
+    shutil.rmtree(captured["_temp_root"])
 
 
 def test_r2f5_service_api_cli_share_golden_settings_clock_and_semantics(

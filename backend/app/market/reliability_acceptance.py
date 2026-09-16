@@ -12,9 +12,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import struct
+import tempfile
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -95,6 +97,9 @@ _REASON_ORDER = (
     "INVALID_ARGUMENTS",
     "PATH_INVALID",
     "SNAPSHOT_CHANGED",
+    "SQLITE_SNAPSHOT_INVALID",
+    "TEMP_STORAGE_UNAVAILABLE",
+    "TEMP_CLEANUP_FAILED",
     "CONTROL_STATE_UNAVAILABLE",
     "PIT_VISIBILITY_INVALID",
     "CALENDAR_UNAVAILABLE",
@@ -293,7 +298,7 @@ def _tree_content_digest(
 
         walk(root_fd, "")
         if _tree_identity(before_root) != _tree_identity(os.fstat(root_fd)):
-            raise ValueError("snapshot changed")
+            raise ValueError("snapshot changed") from None
     finally:
         os.close(root_fd)
     return hashlib.sha256(b"r2f5/tree-v1\0" + b"".join(_lp(item) for item in records)).hexdigest()
@@ -348,18 +353,280 @@ def _catalog_key(path: Path) -> str | None:
     return names.get(path.name)
 
 
-def _sqlite_logical_digest(path: Path | str, role: str | None = None) -> str:
-    path = Path(path)
-    key = role or _catalog_key(path)
-    if key not in _CATALOGS:
-        raise ValueError("unknown catalog")
-    catalog = _CATALOGS[key]
-    uri = f"file:{path}?mode=ro&immutable=false"
-    chunks = [b"r2f5/sqlite-logical-v1\0"]
+def _stat_parent(fd: int) -> os.stat_result:
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("unsafe sqlite parent")
+    return info
+
+
+def _cleanup_temp_root(root: Path) -> None:
+    try:
+        shutil.rmtree(root)
+    except OSError as error:
+        raise ValueError("temporary cleanup failed") from error
+    if root.exists():
+        raise ValueError("temporary cleanup failed")
+
+
+def _probe_sqlite_member(
+    parent_fd: int,
+    parent: os.stat_result,
+    basename: str,
+    role: Literal["db", "wal", "shm"],
+) -> tuple[dict[str, Any], bytes | None]:
+    try:
+        entry = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if role == "db":
+            raise ValueError("sqlite db absent") from None
+        return (
+            {
+                "role": role,
+                "presence": "absent",
+                "parent_device": parent.st_dev,
+                "parent_inode": parent.st_ino,
+                "safe_basename": basename,
+                "absence_marker": "absent_at_validated_parent",
+            },
+            None,
+        )
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise ValueError("unsafe sqlite member")
+    file_fd = os.open(basename, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        before = os.fstat(file_fd)
+        if _tree_identity(entry) != _tree_identity(before) or before.st_nlink != 1:
+            raise ValueError("sqlite member changed")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        while chunk := os.read(file_fd, 1024 * 1024):
+            chunks.append(chunk)
+            digest.update(chunk)
+            if sum(map(len, chunks)) > MAX_BYTES:
+                raise ValueError("input limit")
+        after = os.fstat(file_fd)
+        if _tree_identity(before) != _tree_identity(after):
+            raise ValueError("sqlite member changed")
+        return (
+            {
+                "role": role,
+                "presence": "present",
+                "parent_device": parent.st_dev,
+                "parent_inode": parent.st_ino,
+                "safe_basename": basename,
+                "device": after.st_dev,
+                "inode": after.st_ino,
+                "mode": stat.S_IMODE(after.st_mode),
+                "size_bytes": after.st_size,
+                "mtime_ns": after.st_mtime_ns,
+                "full_sha256": digest.hexdigest(),
+            },
+            b"".join(chunks),
+        )
+    finally:
+        os.close(file_fd)
+
+
+def _probe_rollback_journal(
+    parent_fd: int, parent: os.stat_result, basename: str, checkpoint: str
+) -> tuple[os.stat_result, bool]:
+    journal = f"{basename}-journal"
+    try:
+        os.stat(journal, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        current_parent = _stat_parent(parent_fd)
+        if (
+            current_parent.st_dev,
+            current_parent.st_ino,
+            stat.S_IMODE(current_parent.st_mode),
+            current_parent.st_mtime_ns,
+            current_parent.st_ctime_ns,
+        ) != (
+            parent.st_dev,
+            parent.st_ino,
+            stat.S_IMODE(parent.st_mode),
+            parent.st_mtime_ns,
+            parent.st_ctime_ns,
+        ):
+            raise ValueError("snapshot changed") from None
+        return current_parent, False
+    raise ValueError(
+        "sqlite snapshot invalid"
+        if checkpoint == "initial_probe"
+        else "sqlite rollback journal changed"
+    )
+
+
+def _capture_sqlite_members(path: Path, role: str) -> tuple[dict[str, Any], Path]:
+    """Capture SQLite bytes via one retained parent fd, never input sqlite APIs."""
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    temp_root: Path | None = None
+    try:
+        parent = _stat_parent(parent_fd)
+        basename = path.name
+        checkpoints = (
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        )
+        journal_presence: list[bool] = []
+        rounds: list[tuple[dict[str, Any], ...]] = []
+        round_bytes: list[dict[str, bytes]] = []
+        member_names = (("db", basename), ("wal", f"{basename}-wal"), ("shm", f"{basename}-shm"))
+        # The first journal probe is deliberately independent of the first
+        # member round.  It proves the sentinel was absent before any bytes
+        # were copied and supplies the first element of the six-checkpoint
+        # proof tuple.
+        initial_parent, initial_present = _probe_rollback_journal(
+            parent_fd, parent, basename, checkpoints[0]
+        )
+        journal_presence.append(initial_present)
+        if _tree_identity(parent) != _tree_identity(initial_parent):
+            raise ValueError("snapshot changed")
+        for round_index in range(2):
+            checkpoint = checkpoints[1 + round_index * 2]
+            current_parent, present = _probe_rollback_journal(
+                parent_fd, parent, basename, checkpoint
+            )
+            journal_presence.append(present)
+            members: list[dict[str, Any]] = []
+            contents: dict[str, bytes] = {}
+            for member_role, member_name in member_names:
+                member, content = _probe_sqlite_member(
+                    parent_fd, current_parent, member_name, member_role
+                )
+                members.append(member)
+                if content is not None:
+                    contents[member_role] = content
+            vector = [member["presence"] for member in members]
+            if vector not in (["present", "absent", "absent"], ["present", "present", "present"]):
+                raise ValueError("sqlite snapshot invalid")
+            rounds.append(tuple(members))
+            round_bytes.append(contents)
+            checkpoint = checkpoints[2 + round_index * 2]
+            post_parent, post_present = _probe_rollback_journal(
+                parent_fd, parent, basename, checkpoint
+            )
+            journal_presence.append(post_present)
+        final_parent, final_present = _probe_rollback_journal(
+            parent_fd, parent, basename, checkpoints[-1]
+        )
+        journal_presence.append(final_present)
+        if any(journal_presence):
+            raise ValueError("sqlite rollback journal changed")
+        if rounds[0] != rounds[1] or round_bytes[0] != round_bytes[1]:
+            raise ValueError("sqlite snapshot changed")
+        if _tree_identity(parent) != _tree_identity(final_parent):
+            raise ValueError("snapshot changed")
+        journal = {
+            "role": "rollback_journal",
+            "presence": "absent",
+            "parent_device": parent.st_dev,
+            "parent_inode": parent.st_ino,
+            "parent_mode": stat.S_IMODE(parent.st_mode),
+            "parent_mtime_ns": parent.st_mtime_ns,
+            "parent_ctime_ns": parent.st_ctime_ns,
+            "safe_basename": f"{basename}-journal",
+            "absence_marker": "absent_at_all_capture_checkpoints",
+            "directory_entry_change_marker": "none_observed",
+            "probe_checkpoints": checkpoints,
+            "proof_digest": "0" * 64,
+        }
+        journal["proof_digest"] = _digest("SQLiteRollbackJournalAbsenceProof.proof_digest", journal)
+        vector = [member["presence"] for member in rounds[0]]
+        temp_root = Path(tempfile.mkdtemp(prefix="r2f5-sqlite-"))
+        if (
+            temp_root.stat().st_uid != os.getuid()
+            or stat.S_IMODE(temp_root.stat().st_mode) != 0o700
+            or temp_root.resolve().is_relative_to(path.parent.resolve())
+        ):
+            raise ValueError("temporary storage unavailable")
+        temp_dir = temp_root / "round"
+        temp_dir.mkdir(mode=0o700)
+        for member_role, _member_name in member_names:
+            content = round_bytes[0].get(member_role)
+            if content is None:
+                continue
+            target = temp_dir / (basename if member_role == "db" else f"{basename}-{member_role}")
+            fd = os.open(
+                target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+            )
+            try:
+                view = memoryview(content)
+                while view:
+                    view = view[os.write(fd, view) :]
+                if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                    raise ValueError("temporary storage unavailable")
+            finally:
+                os.close(fd)
+        temp_uri = f"file:{temp_dir / basename}?mode=rw"
+        with sqlite3.connect(temp_uri, uri=True, timeout=0) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA integrity_check")
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            expected_mode = "wal" if vector == ["present", "present", "present"] else "delete"
+            if mode != expected_mode:
+                raise ValueError("sqlite snapshot invalid")
+        snapshot = {
+            "subject_kind": "sqlite",
+            "descriptor_role": role,
+            "descriptor_id": basename,
+            "descriptor_state": "present",
+            "sqlite_members": rounds[0],
+            "rollback_journal_absence": journal,
+            "logical_digest": "",
+            "catalog_digest": "",
+            "_temp_root": temp_root,
+            "_temp_dir": temp_dir,
+        }
+        return snapshot, temp_dir / basename
+    except Exception:
+        if temp_root is not None:
+            try:
+                _cleanup_temp_root(temp_root)
+            except ValueError:
+                pass
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _sqlite_catalog_preimage(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Return the descriptor-bound, immutable catalog contract preimage."""
+    return {
+        "catalog_role": catalog["role"],
+        "catalog_version": catalog["user_version"],
+        "sqlite_master_objects": catalog["sqlite_master_allowlist"],
+        "tables": list(catalog["allowed_tables"]),
+        "columns": {name: spec["columns"] for name, spec in catalog["tables"].items()},
+        "primary_keys": {name: spec["primary_key"] for name, spec in catalog["tables"].items()},
+        "order_by_tuples": {name: spec["order_by"] for name, spec in catalog["tables"].items()},
+        "system_table_allowlist": catalog["system_tables"],
+        "schema_version_source": catalog["schema_version_source"],
+        "catalog_digest_source": catalog["catalog_digest_source"],
+    }
+
+
+def _sqlite_catalog_digest(catalog: dict[str, Any]) -> str:
+    preimage = _sqlite_catalog_preimage(catalog)
+    return hashlib.sha256(b"r2f5/sqlite-catalog-v1\0" + _canonical_json(preimage)).hexdigest()
+
+
+def _sqlite_logical_digest_from_temp(temp_db: Path, catalog: dict[str, Any]) -> str:
+    uri = f"file:{temp_db}?mode=rw"
+    chunks = [b"r2f5/sqlite-logical-v2\0"]
     with sqlite3.connect(uri, uri=True, timeout=0) as connection:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=250")
         connection.execute("BEGIN DEFERRED")
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        if journal_mode not in ("delete", "wal"):
+            raise ValueError("sqlite snapshot invalid")
+        chunks.append(b"J" + _sqlite_typed_bytes(journal_mode, "TEXT"))
         chunks.append(
             b"P"
             + _sqlite_typed_bytes(connection.execute("PRAGMA page_count").fetchone()[0], "INTEGER")
@@ -373,6 +640,19 @@ def _sqlite_logical_digest(path: Path | str, role: str | None = None) -> str:
         schema_rows = connection.execute(
             "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
         ).fetchall()
+        if {f"{row[0]}:{row[1]}" for row in schema_rows} != set(catalog["sqlite_master_allowlist"]):
+            raise ValueError("catalog schema drift")
+        for table_name, table_spec in catalog["tables"].items():
+            columns = connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            if [f"{row[1]}:{row[2] or ''}" for row in columns] != list(table_spec["columns"]):
+                raise ValueError("catalog columns drift")
+            if [row[1] for row in sorted(columns, key=lambda item: item[5]) if row[5]] != list(
+                table_spec["primary_key"]
+            ):
+                raise ValueError("catalog primary key drift")
+            names = {row[1] for row in columns}
+            if not set(table_spec["order_by"]).issubset(names):
+                raise ValueError("catalog order drift")
         schema_types = ("TEXT", "TEXT", "TEXT", "INTEGER", "TEXT")
         chunks.append(
             b"S"
@@ -402,6 +682,33 @@ def _sqlite_logical_digest(path: Path | str, role: str | None = None) -> str:
     return hashlib.sha256(b"".join(chunks)).hexdigest()
 
 
+def _sqlite_logical_digest(path: Path | str, role: str | None = None) -> str:
+    path = Path(path)
+    key = role or _catalog_key(path)
+    if key not in _CATALOGS:
+        raise ValueError("unknown catalog")
+    captured, temp_db = _capture_sqlite_members(path, _CATALOGS[key]["role"])
+    try:
+        return _sqlite_logical_digest_from_temp(temp_db, _CATALOGS[key])
+    finally:
+        _cleanup_temp_root(captured["_temp_root"])
+
+
+def _sqlite_snapshot_fingerprint(path: Path, role: str) -> dict[str, Any]:
+    key = _catalog_key(path)
+    if key is None:
+        raise ValueError("unknown catalog")
+    captured, temp_db = _capture_sqlite_members(path, role)
+    try:
+        captured["logical_digest"] = _sqlite_logical_digest_from_temp(temp_db, _CATALOGS[key])
+        captured["catalog_digest"] = _sqlite_catalog_digest(_CATALOGS[key])
+        captured.pop("_temp_root", None)
+        captured.pop("_temp_dir", None)
+        return captured
+    finally:
+        _cleanup_temp_root(captured.get("_temp_root", temp_db.parent.parent))
+
+
 def _stream_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -426,8 +733,14 @@ def _fingerprint(role: str, path: Path | str) -> tuple[dict[str, Any], dict[str,
         raise ValueError("path invalid")
     key = _catalog_key(path)
     if key:
-        captured = f"sqlite-logical:{_sqlite_logical_digest(path, key)}"
-        kind, scope = "content_sha256", "none"
+        public_role = _CATALOGS[key]["role"]
+        if public_role == "qualification":
+            public_role = "control"
+        fingerprint = _sqlite_snapshot_fingerprint(path, public_role)
+        # The SQLite proof is already the public fingerprint and intentionally
+        # has no ambiguous single-file SHA-256 subject.  The second value is
+        # retained only for the internal snapshot-identity compatibility path.
+        return fingerprint, fingerprint
     elif stat.S_ISDIR(info.st_mode):
         captured = _tree_content_digest(path, excluded_names={"snapshot_identity.json"})
         kind, scope = "content_sha256", "full_streaming_bytes"
@@ -437,6 +750,7 @@ def _fingerprint(role: str, path: Path | str) -> tuple[dict[str, Any], dict[str,
     else:
         raise ValueError("path invalid")
     subject = {
+        "subject_kind": "tree" if stat.S_ISDIR(info.st_mode) else "file",
         "descriptor_role": role,
         "descriptor_id": path.name,
         "descriptor_state": "present",
@@ -452,6 +766,7 @@ def _fingerprint(role: str, path: Path | str) -> tuple[dict[str, Any], dict[str,
     fingerprint = {
         key: subject[key]
         for key in (
+            "subject_kind",
             "descriptor_role",
             "descriptor_id",
             "descriptor_state",
@@ -465,7 +780,6 @@ def _fingerprint(role: str, path: Path | str) -> tuple[dict[str, Any], dict[str,
         )
     }
     fingerprint["sha256"] = _digest("SnapshotFingerprint.sha256", subject)
-    fingerprint["captured_content_bytes"] = captured
     return fingerprint, subject
 
 
@@ -624,6 +938,7 @@ class MetricResult(StrictModel):
 
 
 class SnapshotFingerprint(StrictModel):
+    subject_kind: Literal["tree", "file"]
     descriptor_role: Literal[
         "dataset",
         "evidence",
@@ -644,6 +959,170 @@ class SnapshotFingerprint(StrictModel):
     fingerprint_kind: Literal["descriptor_metadata", "content_sha256"]
     hash_scope: Literal["full_streaming_bytes", "none"]
     sha256: str | None
+
+
+class SQLitePresentMemberFingerprint(StrictModel):
+    role: Literal["db", "wal", "shm"]
+    presence: Literal["present"]
+    parent_device: int = Field(ge=0, le=MAX_INT)
+    parent_inode: int = Field(ge=0, le=MAX_INT)
+    safe_basename: str
+    device: int = Field(ge=0, le=MAX_INT)
+    inode: int = Field(ge=0, le=MAX_INT)
+    mode: int = Field(ge=0, le=MAX_INT)
+    size_bytes: int = Field(ge=0, le=MAX_INT)
+    mtime_ns: int = Field(ge=0)
+    full_sha256: str
+
+    @field_validator("safe_basename")
+    @classmethod
+    def safe_name(cls, value: str) -> str:
+        if value in {"", ".", ".."} or "/" in value or "\\" in value:
+            raise ValueError("unsafe basename")
+        return value
+
+    @field_validator("full_sha256")
+    @classmethod
+    def valid_hash(cls, value: str) -> str:
+        if not SHA256.fullmatch(value):
+            raise ValueError("invalid hash")
+        return value
+
+
+class SQLiteAbsentMemberFingerprint(StrictModel):
+    role: Literal["wal", "shm"]
+    presence: Literal["absent"]
+    parent_device: int = Field(ge=0, le=MAX_INT)
+    parent_inode: int = Field(ge=0, le=MAX_INT)
+    safe_basename: str
+    absence_marker: Literal["absent_at_validated_parent"]
+
+    @field_validator("safe_basename")
+    @classmethod
+    def safe_name(cls, value: str) -> str:
+        if value in {"", ".", ".."} or "/" in value or "\\" in value:
+            raise ValueError("unsafe basename")
+        return value
+
+
+SQLiteMemberFingerprint = Annotated[
+    SQLitePresentMemberFingerprint | SQLiteAbsentMemberFingerprint,
+    Field(discriminator="presence"),
+]
+
+
+class SQLiteRollbackJournalAbsenceProof(StrictModel):
+    role: Literal["rollback_journal"]
+    presence: Literal["absent"]
+    parent_device: int = Field(ge=0, le=MAX_INT)
+    parent_inode: int = Field(ge=0, le=MAX_INT)
+    parent_mode: int = Field(ge=0, le=MAX_INT)
+    parent_mtime_ns: int = Field(ge=0)
+    parent_ctime_ns: int = Field(ge=0)
+    safe_basename: str
+    absence_marker: Literal["absent_at_all_capture_checkpoints"]
+    directory_entry_change_marker: Literal["none_observed"]
+    probe_checkpoints: tuple[
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+        Literal[
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        ],
+    ]
+    proof_digest: str
+
+    @field_validator("safe_basename")
+    @classmethod
+    def safe_name(cls, value: str) -> str:
+        if value in {"", ".", ".."} or "/" in value or "\\" in value:
+            raise ValueError("unsafe basename")
+        return value
+
+    @model_validator(mode="after")
+    def validate_checkpoint_vector(self) -> SQLiteRollbackJournalAbsenceProof:
+        expected = (
+            "initial_probe",
+            "round_1_pre_copy",
+            "round_1_post_copy",
+            "round_2_pre_copy",
+            "round_2_post_copy",
+            "final_path_reprobe",
+        )
+        if self.probe_checkpoints != expected:
+            raise ValueError("rollback checkpoint vector invalid")
+        if not SHA256.fullmatch(self.proof_digest):
+            raise ValueError("invalid hash")
+        return self
+
+
+class SQLiteSnapshotFingerprint(StrictModel):
+    subject_kind: Literal["sqlite"]
+    descriptor_role: Literal["calendar", "universe", "replication", "control"]
+    descriptor_id: str
+    descriptor_state: Literal["present"]
+    sqlite_members: tuple[SQLiteMemberFingerprint, SQLiteMemberFingerprint, SQLiteMemberFingerprint]
+    rollback_journal_absence: SQLiteRollbackJournalAbsenceProof
+    logical_digest: str
+    catalog_digest: str
+
+    @model_validator(mode="after")
+    def validate_members(self) -> SQLiteSnapshotFingerprint:
+        if tuple(member.role for member in self.sqlite_members) != ("db", "wal", "shm"):
+            raise ValueError("sqlite member order invalid")
+        if self.sqlite_members[0].presence != "present":
+            raise ValueError("sqlite db must be present")
+        if not SHA256.fullmatch(self.logical_digest) or not SHA256.fullmatch(self.catalog_digest):
+            raise ValueError("invalid hash")
+        return self
+
+
+InputSnapshotFingerprint = Annotated[
+    SnapshotFingerprint | SQLiteSnapshotFingerprint,
+    Field(discriminator="subject_kind"),
+]
 
 
 class FrozenReliabilityVersions(StrictModel):
@@ -982,7 +1461,7 @@ class SnapshotIdentity(StrictModel):
     requested_end: str
     as_of_utc: str
     as_of_timezone: Literal["Asia/Shanghai"]
-    input_fingerprints: tuple[SnapshotFingerprint, ...]
+    input_fingerprints: tuple[InputSnapshotFingerprint, ...]
     frozen_versions: FrozenReliabilityVersions
     input_fingerprint_sha256: str
     frozen_version_vector_sha256: str
@@ -993,7 +1472,7 @@ class CapturedSnapshot(StrictModel):
     snapshot_identity: SnapshotIdentity
     raw_calendar_observations: tuple[str, ...]
     confirmed_sessions: tuple[str, ...]
-    input_descriptors: tuple[SnapshotFingerprint, ...]
+    input_descriptors: tuple[InputSnapshotFingerprint, ...]
     frozen_versions: FrozenReliabilityVersions
     session_observations: tuple[SessionObservation, ...]
     window_evidence_bundle: ImmutableObservationEnvelopeV1 | None
@@ -1257,8 +1736,14 @@ class AcceptanceReader:
             reason = (
                 "INPUT_LIMIT_EXCEEDED"
                 if "input limit" in text
+                else "SQLITE_SNAPSHOT_INVALID"
+                if "sqlite snapshot invalid" in text
+                else "TEMP_STORAGE_UNAVAILABLE"
+                if "temporary storage unavailable" in text
+                else "TEMP_CLEANUP_FAILED"
+                if "temporary cleanup failed" in text
                 else "SNAPSHOT_CHANGED"
-                if "snapshot changed" in text
+                if "snapshot changed" in text or "sqlite rollback journal changed" in text
                 else "CONTROL_STATE_UNAVAILABLE"
             )
             return self._pre_capture(request, reason, ["error"])
@@ -1317,30 +1802,9 @@ class AcceptanceReader:
         return {"dataset": resolved[0], "evidence": resolved[1], "controls": tuple(resolved[2:])}
 
     def _capture_fingerprints(self, paths: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-        public_keys = {
-            "descriptor_role",
-            "descriptor_id",
-            "descriptor_state",
-            "device",
-            "inode",
-            "size_bytes",
-            "mtime_ns",
-            "ctime_ns",
-            "fingerprint_kind",
-            "hash_scope",
-            "sha256",
-        }
         values = [
-            {
-                key: value
-                for key, value in _fingerprint("dataset", paths["dataset"])[0].items()
-                if key in public_keys
-            },
-            {
-                key: value
-                for key, value in _fingerprint("evidence", paths["evidence"])[0].items()
-                if key in public_keys
-            },
+            _fingerprint("dataset", paths["dataset"])[0],
+            _fingerprint("evidence", paths["evidence"])[0],
         ]
         # ``snapshot_identity.json`` is a reader output materialised by the
         # fixture, not an acceptance input.  Its creation necessarily changes
@@ -1376,44 +1840,18 @@ class AcceptanceReader:
             key = _catalog_key(path)
             if key is None:
                 raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-            values.append(
-                {
-                    key: value
-                    for key, value in _fingerprint(_CATALOGS[key]["role"], path)[0].items()
-                    if key in public_keys
-                }
-            )
+            public_role = _CATALOGS[key]["role"]
+            if public_role == "qualification":
+                public_role = "control"
+            values.append(_fingerprint(public_role, path)[0])
             self._validate_catalog(path, key)
         return tuple(values)
 
     def _validate_catalog(self, path: Path, key: str) -> None:
-        catalog = _CATALOGS[key]
-        uri = f"file:{path}?mode=ro&immutable=false"
-        with sqlite3.connect(uri, uri=True, timeout=0) as connection:
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("PRAGMA busy_timeout=250")
-            connection.execute("BEGIN DEFERRED")
-            if connection.execute("PRAGMA user_version").fetchone()[0] != catalog["user_version"]:
-                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-            actual = {
-                f"{kind}:{name}"
-                for kind, name in connection.execute(
-                    "SELECT type,name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if actual != set(catalog["sqlite_master_allowlist"]):
-                raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-            for table, spec in catalog["tables"].items():
-                columns = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
-                expected_names = [item.split(":", 1)[0] for item in spec["columns"]]
-                if [row[1] for row in columns] != expected_names:
-                    raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-                if [row[5] for row in columns if row[5]] != list(
-                    range(1, len(spec["primary_key"]) + 1)
-                ):
-                    raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-                if [row[1] for row in columns if row[5]] != list(spec["primary_key"]):
-                    raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
+        try:
+            _sqlite_logical_digest(path, key)
+        except (OSError, sqlite3.Error, ValueError):
+            raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE") from None
 
     def _pre_capture(
         self, request: AcceptanceInput, reason: str, states: list[str]
@@ -2205,8 +2643,12 @@ def read_secondary_qualification_projection(
     path = Path(path)
     if _catalog_key(path) != "shadow_registry":
         raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE")
-    uri = f"file:{path}?mode=ro&immutable=false"
+    captured: dict[str, Any] | None = None
     try:
+        captured, temp_db = _capture_sqlite_members(path, "control")
+        # Only the securely copied temporary database is opened by SQLite.
+        # The retained input parent fd is used solely for byte capture.
+        uri = f"file:{temp_db}?mode=rw"
         with sqlite3.connect(uri, uri=True, timeout=0) as connection:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA busy_timeout=250")
@@ -2299,12 +2741,15 @@ def read_secondary_qualification_projection(
             ).fetchone()
             if terminal_job is None or terminal_job[0] != window[8]:
                 raise _AcceptanceError("CANONICAL_INTEGRITY_FAILED")
-            digest = _sqlite_logical_digest(path, "shadow_registry")
+            digest = _sqlite_logical_digest_from_temp(temp_db, _CATALOGS["shadow_registry"])
             connection.rollback()
     except _AcceptanceError:
         raise
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error, ValueError):
         raise _AcceptanceError("CONTROL_STATE_UNAVAILABLE") from None
+    finally:
+        if captured is not None:
+            _cleanup_temp_root(captured["_temp_root"])
     return SecondaryQualificationProjection(
         provider_id=provider_id,
         window_id=window_id,
@@ -2337,6 +2782,11 @@ __all__ = [
     "MetricValue",
     "MetricResult",
     "SnapshotFingerprint",
+    "SQLitePresentMemberFingerprint",
+    "SQLiteAbsentMemberFingerprint",
+    "SQLiteRollbackJournalAbsenceProof",
+    "SQLiteSnapshotFingerprint",
+    "InputSnapshotFingerprint",
     "FrozenReliabilityVersions",
     "SnapshotIdentity",
     "PreCaptureFailurePayloadV1",
