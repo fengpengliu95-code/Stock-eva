@@ -1,4 +1,4 @@
-# R2-F5.0 requirement-evidence matrix (SPEC APPROVED - AMENDMENT CANDIDATE)
+# R2-F5.0 requirement-evidence matrix (SPEC APPROVED - SQLITE ZERO-WRITE AMENDMENT)
 
 This is the normative planning crosswalk for Task 19. It is intentionally an evidence plan, not
 an implementation or acceptance result. Every row is unique, every acceptance criterion names
@@ -8,18 +8,25 @@ pass, or establish Task 20 production soak.
 X8 revision base: `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73`; predecessor planning base:
 `5393f499dbc8b84398658816f7a555dd3e547d47`.
 
-SQLite amendment X4 base: `1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` (clean committed X3 base;
-X4 candidate not yet audited).
+SQLite amendment approval target: clean X4 `bb4676f6fc331888c0b65220bbacc84c222a03b6`.
+
+Structured SQLite contract: `r2f5-x8-sqlite-x3`; canonical digest
+`5eb31ad1ea9b88d6d2797842b64e3f2cfa7fef7dd0e682a552608c53d02ddcdd`.
 
 Approval metadata: independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
-SPEC GO, H0, M0, L1. L1 is the catalog-source validator's `startswith` checks, which MUST be
-tightened to exact comparisons during implementation. This metadata-only approval commit is not
-itself audited and does not claim RED, GREEN, implementation, Task 20 or production GO. Matrix
-rows remain `PLANNED` evidence metadata, not execution results.
+SPEC GO, H0, M0, L1. Independent SQLite audit reviewed clean X3
+`1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` as H0/M1; its sole M1 was omission of the final
+semantic summary and Task 2 six-checkpoint implementation wording. The parent quality manager
+reviewed the exact X3-to-X4 diff and local validator results for clean X4
+`bb4676f6fc331888c0b65220bbacc84c222a03b6` and confirmed that M1 closed. A final independent X4
+retry was unavailable because usage was unavailable; X4 is not independently audited. This
+metadata-only approval does not claim implementation completion, Task 20, production acceptance or
+R2-F5.0 GO. The X8 L1 requiring exact catalog-source comparisons remains an implementation
+obligation. Matrix rows remain `PLANNED` evidence metadata, not execution results.
 
-Amendment state: `SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO`.
-The SQLite zero-write amendment records observed macOS WAL/SHM behavior and is not yet approved;
-its validator and implementation changes remain pending review.
+Amendment state: `SPEC APPROVED - SQLITE ZERO-WRITE AMENDMENT / IMPLEMENTATION RESUMED / R2-F5.0 NO-GO`.
+The SQLite zero-write amendment is approved for implementation through the parent quality-manager
+closeout above; implementation evidence and all Task 20/production gates remain pending.
 
 The design is the requirement text authority. The matrix is the sole ID/parent/anchor crosswalk.
 Every FR/NFR/AC/EC row has one globally unique planned anchor; the implementation plan catalog maps

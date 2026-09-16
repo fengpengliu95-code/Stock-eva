@@ -1,15 +1,16 @@
 # Stock EVA R2-F5.0 Read-only Acceptance Harness Implementation Plan
 
-> **Planning state:** SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO. This plan is
+> **Planning state:** SPEC APPROVED - SQLITE ZERO-WRITE AMENDMENT / IMPLEMENTATION RESUMED / R2-F5.0 NO-GO. This plan is
 > not implementation evidence and does not start Task 20.
 
 **Author:** Codex R2-F delivery lead
 
 **Date:** 2026-09-14 (Asia/Shanghai)
 
-**Status:** SPEC APPROVED - AMENDMENT CANDIDATE / IMPLEMENTATION PAUSED / R2-F5.0 NO-GO
+**Status:** SPEC APPROVED - SQLITE ZERO-WRITE AMENDMENT / IMPLEMENTATION RESUMED / R2-F5.0 NO-GO
 
-**Reviewers:** Independent SPEC audit reviewed X8; implementation QUALITY review remains pending
+**Reviewers:** Independent SPEC audit reviewed X8 and X3; parent quality manager closed the X3 M1
+against X4; implementation QUALITY review remains pending
 
 **Goal:** Implement Task 19 as a bounded, read-only evaluator for a proposed exact 20-session
 R2-F5 window, consuming existing strict readers and immutable drill evidence only.
@@ -20,13 +21,21 @@ R2-F5 window, consuming existing strict readers and immutable drill evidence onl
 
 **X8 revision base:** `a7d3be1c6b9f760c659470fffcf6299bcd8ddf73` (clean X7)
 
-**SQLite amendment X4 base:** `1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` (clean committed X3 base;
-X4 candidate not yet audited)
+**SQLite amendment approval target:** clean X4 `bb4676f6fc331888c0b65220bbacc84c222a03b6`
+
+**Structured SQLite contract:** `r2f5-x8-sqlite-x3`; canonical digest
+`5eb31ad1ea9b88d6d2797842b64e3f2cfa7fef7dd0e682a552608c53d02ddcdd`
 
 **Approval metadata:** Independent audit reviewed clean X8 `964fcda98a90d4d79a0957ca8156618b87789877`;
-SPEC GO, H0, M0, L1. The remaining L1 is that the catalog-source validator's `startswith`
-checks MUST be tightened to exact comparisons during implementation. This metadata-only approval
-commit is not itself audited and does not claim RED, GREEN, implementation, Task 20 or production GO.
+SPEC GO, H0, M0, L1. Independent SQLite audit reviewed clean X3
+`1ec1d35bc00b5a64b9c0daf9fc8ac4927a884ba6` as H0/M1; its sole M1 was omission of the final
+semantic summary and Task 2 six-checkpoint implementation wording. The parent quality manager
+reviewed the exact X3-to-X4 diff and local validator results for clean X4
+`bb4676f6fc331888c0b65220bbacc84c222a03b6` and confirmed that M1 closed. A final independent X4
+retry was unavailable because usage was unavailable; X4 MUST NOT be described as independently
+audited. This metadata-only approval resumes implementation against the amendment and does not
+claim implementation completion, Task 20, production acceptance or R2-F5.0 GO. The X8 L1 requiring
+exact catalog-source comparisons remains an implementation obligation.
 
 **Worktree:** `/Users/finlay/.codex/worktrees/r2f5-0/Stock- evaluation`
 
