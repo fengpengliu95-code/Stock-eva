@@ -269,6 +269,10 @@ def _frame(body: bytes, *, message_type: str = "34") -> bytes:
     return header + body + PROTOCOL_MARKER
 
 
+def _sdk_noncompressed_response(response: bytes, body: bytes) -> str:
+    return response[:21].decode("ascii") + body.decode("utf-8") + "\n"
+
+
 def _frame_with_marker_in_declared_length(body: bytes, *, message_type: str = "34") -> bytes:
     import baostock.data.messageheader as messageheader
 
@@ -392,13 +396,16 @@ def _assert_sanitized_terminal(
 
 
 def test_checked_send_uses_sendall_and_emits_socket_counters() -> None:
-    response = _frame(b"0\1ok")
+    body = b"0\1ok"
+    response = _frame(body)
     connection = FramedSocket([response[:7], response[7:]])
 
     result, error, observations = _invoke_checked_send(connection)
 
     assert error is None
-    assert result == response.decode()
+    assert result == _sdk_noncompressed_response(response, body)
+    assert PROTOCOL_MARKER.decode().strip() not in result
+    assert result[21:-1].split("\1") == ["0", "ok"]
     assert connection.sendall_calls == 1
     assert connection.sent == b"request-token-secret\n"
     assert len(observations) == 1
@@ -449,13 +456,14 @@ def test_checked_send_rejects_unrecognized_declared_length_difference() -> None:
 
 
 def test_checked_send_accepts_exact_valid_crc_trailer() -> None:
-    response = _frame_with_crc_trailer(b"0\1ok")
+    body = b"0\1ok"
+    response = _frame_with_crc_trailer(body)
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 
     assert error is None
     assert result is not None
-    assert result[21:] == "0\1ok" + PROTOCOL_MARKER.decode()
+    assert result == _sdk_noncompressed_response(response, body)
     assert observations[0].provider_code == "0"
     assert observations[0].response_bytes == len(response)
 
@@ -479,25 +487,27 @@ def test_checked_send_rejects_corrupt_crc_trailer() -> None:
 
 
 def test_checked_send_accepts_compatible_server_patch_version() -> None:
-    response = _frame(b"0\1ok")
+    body = b"0\1ok"
+    response = _frame(body)
     response = b"00.9.31" + response[7:]
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 
     assert error is None
-    assert result == response.decode()
+    assert result == _sdk_noncompressed_response(response, body)
     assert observations[0].provider_code == "0"
     assert observations[0].outcome == TransportOutcome.SUCCESS
 
 
 def test_checked_send_accepts_compatible_server_minor_version() -> None:
-    response = _frame(b"0\1ok")
+    body = b"0\1ok"
+    response = _frame(body)
     response = b"00.8.80" + response[7:]
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 
     assert error is None
-    assert result == response.decode()
+    assert result == _sdk_noncompressed_response(response, body)
     assert observations[0].provider_code == "0"
     assert observations[0].outcome == TransportOutcome.SUCCESS
 
@@ -522,14 +532,13 @@ def test_checked_send_rejects_incompatible_server_protocol_family() -> None:
 
 
 def test_checked_send_classifies_provider_status_without_persisting_message() -> None:
-    response = _frame(
-        b"10001005\1private-token https://provider.invalid/private synthetic raw exception"
-    )
+    body = b"10001005\1private-token https://provider.invalid/private synthetic raw exception"
+    response = _frame(body)
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 
     assert error is None
-    assert result == response.decode()
+    assert result == _sdk_noncompressed_response(response, body)
     assert len(observations) == 1
     observation = observations[0]
     assert observation.protocol_stage == ProtocolStage.PROVIDER_STATUS
@@ -573,12 +582,13 @@ def test_checked_send_rejects_missing_or_unsafe_provider_code(response: bytes) -
 
 
 def test_checked_send_retains_safe_unknown_provider_code_without_message_guessing() -> None:
-    response = _frame(b"vendor-new-code\1private-token https://provider.invalid/private rate limit")
+    body = b"vendor-new-code\1private-token https://provider.invalid/private rate limit"
+    response = _frame(body)
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 
     assert error is None
-    assert result == response.decode()
+    assert result == _sdk_noncompressed_response(response, body)
     assert len(observations) == 1
     observation = observations[0]
     assert observation.protocol_stage == ProtocolStage.PROVIDER_STATUS

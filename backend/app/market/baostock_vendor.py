@@ -456,11 +456,7 @@ def checked_send_msg(message: str) -> str:
         provider_code = _provider_code(body)
     else:
         try:
-            result = (
-                bytes(received[:body_start]).decode("ascii")
-                + raw_body.decode("utf-8")
-                + PROTOCOL_MARKER.decode("ascii")
-            )
+            result = bytes(received[:body_start]).decode("ascii") + raw_body.decode("utf-8") + "\n"
         except UnicodeDecodeError:
             _raise_transport_error(
                 "BaoStock transport response encoding is invalid",
