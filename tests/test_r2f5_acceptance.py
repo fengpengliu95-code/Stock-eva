@@ -2406,6 +2406,7 @@ def _build_golden_tree(tmp_path: Path) -> GoldenTree:
     for field_path, case in CONTRACT_CONSUMER_CASES.items():
         if case.category == "input_materialized" and field_path not in leaf_files:
             _materialized_contract_descriptor(golden, field_path)
+    _materialize_error_event_descriptors(golden)
     golden._allow_descriptor_materialization = False
 
     # Descriptor files are now part of the evidence tree; freeze fingerprints
@@ -3253,6 +3254,38 @@ def _materialized_contract_descriptor(golden: GoldenTree, field_path: str) -> di
         "__root_base": golden.dataset if descriptor["root_base"] == "dataset" else golden.evidence,
     }
     return cached[field_path]
+
+
+def _materialize_error_event_descriptors(golden: GoldenTree) -> None:
+    """Materialize one immutable descriptor for every forced-error event."""
+
+    field_path = "ErrorHandlingObservation.events.evidence_sha256"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", field_path)
+    for forced_class in ("auth", "rate", "schema", "coverage", "storage"):
+        source = golden.window_sources[f"{field_path}:{forced_class}"]
+        container = golden.evidence / "objects" / safe / f"{forced_class}-source.json"
+        _write_json(container, source)
+        raw = _canonical_json(source)
+        object_path = golden.evidence / "objects" / safe / f"{forced_class}.bin"
+        descriptor_path = golden.evidence / "objects" / safe / f"{forced_class}.descriptor.json"
+        object_path.write_bytes(raw)
+        descriptor = {
+            "descriptor_id": f"canonical:{safe}:{forced_class}",
+            "artifact_ref": f"canonical:{safe}:{forced_class}",
+            "schema_version": "r2f5-immutable-leaf-descriptor-v1",
+            "canonicalization_version": "project-canonical-json-v1",
+            "object_path": object_path.relative_to(golden.evidence).as_posix(),
+            "descriptor_path": descriptor_path.relative_to(golden.evidence).as_posix(),
+            "root_path": container.relative_to(golden.evidence).as_posix(),
+            "root_base": "evidence",
+            "root_pointer": "$",
+            "root_object_type": DIGESTS[field_path]["root_object_type"],
+            "contract_digest": _digest(field_path, source),
+            "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+            "immutable": True,
+            "source_field": field_path,
+        }
+        _write_json(descriptor_path, descriptor)
 
 
 def _rehash_envelope(envelope: dict[str, Any]) -> None:
@@ -6688,10 +6721,83 @@ def test_r2f5_error_public_metric_reports_exact_failure(golden: GoldenTree, muta
     response = _api_get(golden)
     if response.status_code == 404:
         return
+    if mutation == "error_hash_invalid":
+        assert response.status_code == 503
+        report = response.json()
+        assert report["status"] == "unavailable"
+        assert "LINEAGE_UNAVAILABLE" in report["quality_issues"]
+        return
     assert response.status_code == 200
     report = response.json()
     assert report["error_handling"]["status"] == "fail"
     assert report["error_handling"]["reason_code"] == "ERROR_HANDLING_FAILED"
+
+
+def test_r2f5_error_event_digest_must_bind_immutable_evidence(golden: GoldenTree) -> None:
+    """A legal-looking event digest cannot bypass its immutable evidence binding."""
+
+    path = golden.evidence / "window.json"
+    window = _read_json(path)
+    events = window["payload"]["error_handling_observation"]["payload"]["events"]
+    original = events[0]["evidence_sha256"]
+    events[0]["evidence_sha256"] = "a" * 64
+    assert events[0]["evidence_sha256"] != original
+    child = window["payload"]["error_handling_observation"]
+    child["payload"]["observation_sha256"] = _digest(
+        "ErrorHandlingObservation.observation_sha256", child["payload"]
+    )
+    _rehash_envelope(child)
+    _rehash_envelope(window)
+    _write_json(path, window)
+
+    response = _api_get(golden)
+    assert response.status_code == 503
+    report = response.json()
+    assert report["status"] == "unavailable"
+    assert "LINEAGE_UNAVAILABLE" in report["quality_issues"]
+    assert report["error_handling"]["status"] == "unavailable"
+    assert report["writes"] is False and report["provider_requests"] == 0
+
+
+@pytest.mark.parametrize("mutation", ("object", "descriptor", "root"))
+def test_r2f5_error_event_descriptor_tamper_fails_closed(golden: GoldenTree, mutation: str) -> None:
+    safe = "ErrorHandlingObservation.events.evidence_sha256"
+    descriptor_path = golden.evidence / "objects" / safe / "auth.descriptor.json"
+    descriptor = _read_json(descriptor_path)
+    if mutation == "object":
+        (golden.evidence / descriptor["object_path"]).write_bytes(b"tampered")
+    elif mutation == "descriptor":
+        descriptor["object_path"] = (
+            "objects/ErrorHandlingObservation.events.evidence_sha256/missing.bin"
+        )
+        _write_json(descriptor_path, descriptor)
+    else:
+        root_path = golden.evidence / descriptor["root_path"]
+        root = _read_json(root_path)
+        root["immutable_evidence_bytes"] = "tampered"
+        _write_json(root_path, root)
+
+    response = _api_get(golden)
+    assert response.status_code == 503
+    report = response.json()
+    assert report["status"] == "unavailable"
+    assert set(report["quality_issues"]) & {"LINEAGE_INVALID", "LINEAGE_UNAVAILABLE"}
+    assert report["writes"] is False and report["provider_requests"] == 0
+
+
+@pytest.mark.parametrize("calendar_value", ([], {"confirmed": True, "unknown_state": False}))
+def test_r2f5_malformed_calendar_is_sanitized_unavailable(
+    golden: GoldenTree, calendar_value: Any
+) -> None:
+    _write_json(golden.dataset / "calendar.json", calendar_value)
+
+    response = _api_get(golden)
+    assert response.status_code == 503
+    report = response.json()
+    assert report["status"] == "unavailable"
+    assert report["quality_issues"] == ["CONTROL_STATE_UNAVAILABLE"]
+    assert report["pre_capture_failure"] is not None
+    assert report["provider_requests"] == 0 and report["writes"] is False
 
 
 def test_r2f5_golden_artifacts_never_contain_test_control_fields(golden: GoldenTree) -> None:

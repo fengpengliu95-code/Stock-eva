@@ -42,6 +42,7 @@ MAX_ENTRIES = 100_000
 MAX_BYTES = 512 * 1024 * 1024
 MAX_ROWS = 1_000_000
 MAX_ROOTS = 32
+_ERROR_EVENT_CLASSES = ("timeout", "auth", "rate", "schema", "coverage", "storage")
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -1496,7 +1497,7 @@ class ErrorHandlingObservation(StrictModel):
 
     @model_validator(mode="after")
     def validate_events(self) -> ErrorHandlingObservation:
-        expected = ("timeout", "auth", "rate", "schema", "coverage", "storage")
+        expected = _ERROR_EVENT_CLASSES
         if (
             len(self.events) != len(expected)
             or tuple(event.forced_error_class for event in self.events) != expected
@@ -2043,7 +2044,16 @@ class AcceptanceReader:
         paths: dict[str, Any],
         fingerprints: tuple[dict[str, Any], ...],
     ) -> R2FAcceptanceReport:
-        calendar = _safe_json(paths["dataset"] / "calendar.json")
+        try:
+            calendar = _safe_json(paths["dataset"] / "calendar.json")
+            if not isinstance(calendar, dict) or not isinstance(
+                calendar.get("source_sequence"), list
+            ):
+                raise ValueError("calendar source sequence unavailable")
+            if any(not isinstance(session, str) for session in calendar["source_sequence"]):
+                raise ValueError("calendar source sequence invalid")
+        except (ValidationError, ValueError, OSError, json.JSONDecodeError):
+            return self._pre_capture(request, "CONTROL_STATE_UNAVAILABLE", ["error"])
         try:
             frozen = FrozenReliabilityVersions.model_validate(
                 _safe_json(paths["evidence"] / "frozen_versions.json")
@@ -2277,11 +2287,13 @@ class AcceptanceReader:
             "ReadBoundaryRawFacts",
         }
         if not found:
-            # The fixture and the production contract use one descriptor for
-            # an array-valued source field; its root binds the source shape,
-            # while each tuple member is checked by the owning observation.
-            if source_field == "ErrorHandlingObservation.events.evidence_sha256" and seen:
-                return
+            # Every fixed error-class event owns one descriptor/object/root
+            # binding.  A missing or mismatched member is not a valid array
+            # contract and must fail closed.
+            if source_field == "ErrorHandlingObservation.events.evidence_sha256":
+                if descriptor_count != len(_ERROR_EVENT_CLASSES):
+                    raise ValueError("error event evidence lineage unavailable")
+                raise ValueError("error event evidence digest mismatch")
             if not seen or (repeated and descriptor_count < 20):
                 raise ValueError("lineage unavailable")
 
