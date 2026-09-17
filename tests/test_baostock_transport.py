@@ -269,6 +269,15 @@ def _frame(body: bytes, *, message_type: str = "34") -> bytes:
     return header + body + PROTOCOL_MARKER
 
 
+def _frame_with_marker_in_declared_length(body: bytes, *, message_type: str = "34") -> bytes:
+    import baostock.data.messageheader as messageheader
+
+    header = messageheader.to_message_header(
+        message_type, len(body) + len(PROTOCOL_MARKER)
+    ).encode()
+    return header + body + PROTOCOL_MARKER
+
+
 class FramedSocket:
     def __init__(
         self,
@@ -392,6 +401,43 @@ def test_checked_send_uses_sendall_and_emits_socket_counters() -> None:
     assert observation.recv_calls == 2
     assert observation.response_bytes == len(response)
     assert observation.end_marker_seen is True
+
+
+@pytest.mark.parametrize("message_type", ["34", "96"])
+def test_checked_send_accepts_exact_marker_inclusive_length_convention(
+    message_type: str,
+) -> None:
+    body = b"0\1ok" if message_type == "34" else zlib.compress(b"0\1ok\n")
+    response = _frame_with_marker_in_declared_length(body, message_type=message_type)
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result is not None
+    assert observations[0].provider_code == "0"
+    assert observations[0].response_bytes == len(response)
+
+
+def test_checked_send_rejects_unrecognized_declared_length_difference() -> None:
+    body = b"0\1ok"
+    import baostock.data.messageheader as messageheader
+
+    header = messageheader.to_message_header("34", len(body) + 1).encode()
+    response = header + body + PROTOCOL_MARKER
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+        protocol_stage=ProtocolStage.FRAME,
+        recv_calls=1,
+        response_bytes=len(response),
+        end_marker_seen=True,
+    )
 
 
 def test_checked_send_accepts_compatible_server_patch_version() -> None:

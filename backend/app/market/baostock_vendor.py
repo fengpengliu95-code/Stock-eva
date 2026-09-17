@@ -400,22 +400,25 @@ def checked_send_msg(message: str) -> str:
                     end_marker_seen=end_marker_seen,
                 )
 
-        expected_length = constants.MESSAGE_HEADER_LENGTH + body_length + len(PROTOCOL_MARKER)
-        if len(received) < expected_length:
-            if end_marker_seen:
+        if not end_marker_seen:
+            if len(received) > constants.MESSAGE_HEADER_LENGTH + body_length + len(PROTOCOL_MARKER):
                 _raise_transport_error(
-                    "BaoStock transport response frame length is invalid",
+                    "BaoStock transport response marker is invalid",
                     started_at=started_at,
                     normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
                     protocol_stage=ProtocolStage.FRAME,
                     recv_calls=recv_calls,
                     response_bytes=len(received),
-                    end_marker_seen=True,
+                    end_marker_seen=False,
                 )
             continue
-        if len(received) != expected_length or not end_marker_seen:
+        wire_body_length = len(received) - constants.MESSAGE_HEADER_LENGTH - len(PROTOCOL_MARKER)
+        if body_length not in {
+            wire_body_length,
+            wire_body_length + len(PROTOCOL_MARKER),
+        }:
             _raise_transport_error(
-                "BaoStock transport response marker is invalid",
+                "BaoStock transport response frame length is invalid",
                 started_at=started_at,
                 normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
                 protocol_stage=ProtocolStage.FRAME,
@@ -426,7 +429,7 @@ def checked_send_msg(message: str) -> str:
         break
 
     body_start = constants.MESSAGE_HEADER_LENGTH
-    raw_body = bytes(received[body_start : body_start + body_length])
+    raw_body = bytes(received[body_start : -len(PROTOCOL_MARKER)])
     if message_type in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
         try:
             body = _decompress_body(raw_body)
