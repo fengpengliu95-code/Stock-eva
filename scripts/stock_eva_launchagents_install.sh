@@ -3,9 +3,10 @@ set -euo pipefail
 
 MODE=check
 PROJECT_ROOT=""
+REUSE_LOCAL_DATASET=0
 
 usage() {
-  echo "Usage: $0 [--check|--install] [--project-root ABSOLUTE_PATH]"
+  echo "Usage: $0 [--check|--install] [--reuse-local-dataset] [--project-root ABSOLUTE_PATH]"
 }
 
 while (($#)); do
@@ -15,6 +16,9 @@ while (($#)); do
       ;;
     --install)
       MODE=install
+      ;;
+    --reuse-local-dataset)
+      REUSE_LOCAL_DATASET=1
       ;;
     --project-root)
       shift
@@ -27,6 +31,11 @@ while (($#)); do
   esac
   shift
 done
+
+if [[ "$REUSE_LOCAL_DATASET" == "1" && "$MODE" != "install" ]]; then
+  echo "error: --reuse-local-dataset is supported only with --install" >&2
+  exit 2
+fi
 
 SYSTEM_NAME="${STOCK_EVA_UNAME:-$(uname -s)}"
 LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
@@ -488,11 +497,23 @@ if [[ "$SCHEMA_MIGRATION_STATUS" -ne 0 ]]; then
   rollback "$SCHEMA_MIGRATION_STATUS"
 fi
 
-"$RELEASE_ROOT/.venv/bin/python" \
-  -m backend.app.storage.mirror \
-  --source /Volumes/Stock/stock-eva-market \
-  --destination "$DATA_ROOT/market-dataset" \
-  --execute
+if [[ "$REUSE_LOCAL_DATASET" == "1" ]]; then
+  # This is a strict, read-only proof of the existing local immutable copy.
+  # It intentionally does not pass a NAS source and cannot create a symlink
+  # or copy any object.  A failed proof trips the existing ERR rollback before
+  # the runtime/current pointer is changed.
+  "$RELEASE_ROOT/.venv/bin/python" \
+    -m backend.app.storage.mirror \
+    --destination "$DATA_ROOT/market-dataset" \
+    --verify-only
+  echo "dataset: verified local reuse; copied_bytes=0"
+else
+  "$RELEASE_ROOT/.venv/bin/python" \
+    -m backend.app.storage.mirror \
+    --source /Volumes/Stock/stock-eva-market \
+    --destination "$DATA_ROOT/market-dataset" \
+    --execute
+fi
 
 if [[ -L "$RUNTIME_CURRENT" ]]; then
   PREVIOUS_CURRENT_TARGET="$(/usr/bin/readlink "$RUNTIME_CURRENT")"

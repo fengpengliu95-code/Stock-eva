@@ -162,13 +162,75 @@ class MarketDatasetMirror:
         )
 
 
+def verify_local_dataset(root: Path) -> MirrorResult:
+    """Verify an existing local dataset without mutating any dataset files.
+
+    This is intentionally separate from :meth:`MarketDatasetMirror.sync`: a
+    NAS-free runtime handoff must be able to prove that the already-installed
+    local copy is complete, while never treating a symlink or a partial copy as
+    a valid dataset and never attempting a repair/copy.
+    """
+
+    root = Path(root)
+    if not root.is_absolute():
+        raise DatasetError("local dataset root must be absolute")
+    try:
+        if root.is_symlink() or not root.is_dir():
+            raise DatasetError("local dataset root is not a directory")
+    except OSError as exc:
+        raise DatasetError("local dataset root is unavailable") from exc
+
+    manifest = MarketDatasetMirror._validate(root)
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise DatasetError("local dataset is empty")
+    return MirrorResult(
+        status="verified_local_reuse",
+        generation=str(manifest["generation"]),
+        file_count=len(files),
+        row_count=sum(int(item["row_count"]) for item in files),
+        copied_bytes=0,
+        source=str(root),
+        destination=str(root),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify and copy a market dataset locally")
-    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--source", type=Path)
     parser.add_argument("--destination", required=True, type=Path)
-    parser.add_argument("--execute", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--execute", action="store_true")
+    modes.add_argument("--verify-only", "--verify-local", dest="verify_only", action="store_true")
     args = parser.parse_args()
+    if args.execute and args.source is None:
+        parser.error("--execute requires --source")
+    if args.verify_only and args.source is not None:
+        parser.error("--verify-only does not accept --source")
+    if not args.verify_only and args.source is None:
+        parser.error("--source is required unless --verify-only is selected")
     if not args.execute:
+        if args.verify_only:
+            try:
+                result = verify_local_dataset(args.destination)
+            except (DatasetError, OSError):
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "reason_code": "local_dataset_verification_failed",
+                            "writes_destination": False,
+                            "copied_bytes": 0,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+            payload = asdict(result)
+            payload["writes_destination"] = False
+            payload["verified_read_only"] = True
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
         print(
             json.dumps(
                 {

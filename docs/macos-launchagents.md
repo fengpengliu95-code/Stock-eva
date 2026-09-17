@@ -96,6 +96,20 @@ LaunchAgent 不会主动挂载 SMB，也不包含网络凭据。
 "/Users/finlay/Documents/Stock- evaluation/scripts/stock_eva_launchagents_install.sh" --install
 ```
 
+如果 NAS 当前未挂载，但本机 `data/market-dataset` 已经是完整的不可变镜像，
+可显式请求只读复用模式：
+
+```bash
+"/Users/finlay/Documents/Stock- evaluation/scripts/stock_eva_launchagents_install.sh" \
+  --install --reuse-local-dataset
+```
+
+该模式由新 release runtime 重新核验哨兵、manifest 及每个 Parquet 的 SHA-256、schema
+和行数，成功时输出 `verified local reuse; copied_bytes=0`。它不访问或伪装 NAS，
+也不改写本机 manifest、Parquet 或 pointer；任一缺失、损坏、空目录或路径错误都会在
+`runtime/current` 切换前触发既有 rollback。`--reuse-local-dataset` 不能与 `--check`
+一起使用。
+
 它只写入：
 
 - `~/Library/LaunchAgents/com.finlay.stock-eva.*.plist`

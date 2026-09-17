@@ -20,7 +20,7 @@ from backend.app.market.normalize import normalize_baostock_rows
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
 from backend.app.storage.dataset import DatasetError, NasMarketStore, _ManifestLock, _sha256
-from backend.app.storage.mirror import MarketDatasetMirror
+from backend.app.storage.mirror import MarketDatasetMirror, verify_local_dataset
 from backend.app.storage.models import StorageReadiness
 
 
@@ -739,6 +739,42 @@ def test_verified_local_mirror_is_idempotent_and_manifest_readable(tmp_path: Pat
     summary = MarketSummaryService(mirrored).latest(expected_session=date(2026, 7, 23))
     assert summary.status == "ready"
     assert summary.as_of == date(2026, 7, 23)
+
+
+def test_verify_local_dataset_is_read_only_and_reports_zero_copy_bytes(tmp_path: Path) -> None:
+    source = _root(tmp_path)
+    source_store = NasMarketStore(
+        MarketStore(tmp_path / "source-control.duckdb"),
+        source,
+        tmp_path / "source-staging",
+    )
+    source_store.save_refresh(
+        _bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"}
+    )
+    destination = tmp_path / "local-mirror"
+    MarketDatasetMirror(source, destination).sync()
+    before = _dataset_fingerprint(destination)
+
+    result = verify_local_dataset(destination)
+
+    assert result.status == "verified_local_reuse"
+    assert result.copied_bytes == 0
+    assert result.destination == str(destination)
+    assert _dataset_fingerprint(destination) == before
+
+
+def test_verify_local_dataset_rejects_empty_root_and_symlink(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(DatasetError):
+        verify_local_dataset(empty)
+
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(DatasetError):
+        verify_local_dataset(link)
 
 
 def test_older_archive_never_replaces_a_newer_local_dataset(tmp_path: Path) -> None:

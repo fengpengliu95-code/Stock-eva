@@ -391,6 +391,15 @@ def test_management_scripts_require_explicit_mutation_flags() -> None:
     assert '[[ "$attempt" -le 15 ]]' in status
 
 
+def test_local_dataset_reuse_is_an_explicit_install_only_mode() -> None:
+    installer = (SCRIPTS / "stock_eva_launchagents_install.sh").read_text()
+
+    assert "--reuse-local-dataset" in installer
+    assert "--verify-only" in installer
+    assert "verified local reuse" in installer
+    assert "REUSE_LOCAL_DATASET=0" in installer
+
+
 def synthetic_project(tmp_path: Path, *, user_dir: str = "var/user") -> Path:
     project = tmp_path / "Stock EVA Synthetic"
     shutil.copytree(LAUNCHD, project / "launchd")
@@ -561,6 +570,13 @@ if [[ "$*" == *"market-schema-migrate"* ]]; then
     exit 7
   fi
 fi
+if [[ "$*" == *"--verify-only"* ]]; then
+  if [[ "${FAIL_LOCAL_VERIFY:-0}" == "1" ]]; then
+    echo 'synthetic local dataset verification failure' >&2
+    exit 13
+  fi
+  echo '{"status":"verified_local_reuse","copied_bytes":0}'
+fi
 exit 0
 PY
 chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"
@@ -635,14 +651,22 @@ def run_installer(
     environment: dict[str, str],
     *,
     mode: str = "--install",
+    reuse_local_dataset: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    command = [
+        str(SCRIPTS / "stock_eva_launchagents_install.sh"),
+        mode,
+    ]
+    if reuse_local_dataset:
+        command.append("--reuse-local-dataset")
+    command.extend(
         [
-            str(SCRIPTS / "stock_eva_launchagents_install.sh"),
-            mode,
             "--project-root",
             str(project),
-        ],
+        ]
+    )
+    return subprocess.run(
+        command,
         cwd=ROOT,
         env=environment,
         text=True,
@@ -711,6 +735,91 @@ def test_installer_runs_release_schema_migration_before_current_handoff(
         index for index, item in enumerate(runtime_calls) if "backend.app.storage.mirror" in item
     )
     assert migration_call < mirror_call
+
+
+def test_installer_reuses_verified_local_dataset_without_mirror(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+
+    result = run_installer(project, environment)
+    assert result.returncode == 0, result.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+
+    (project / "uv.lock").write_text("synthetic lock local reuse")
+    runtime_log = Path(environment["RUNTIME_PYTHON_CALL_LOG"])
+    runtime_log.write_text("")
+    reused = run_installer(project, {**environment}, reuse_local_dataset=True)
+    assert reused.returncode == 0, reused.stderr
+    assert "verified local reuse; copied_bytes=0" in reused.stdout
+    runtime_calls = runtime_log.read_text().splitlines()
+    verify_call = next(item for item in runtime_calls if "--verify-only" in item)
+    assert "--source" not in verify_call
+    assert "--execute" not in verify_call
+    assert str(Path(environment["RUNTIME_CURRENT_PATH"]).readlink()) != old_target
+
+
+def test_installer_local_dataset_verification_failure_rolls_back_current(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+
+    (project / "uv.lock").write_text("synthetic lock corrupt local reuse")
+    environment["FAIL_LOCAL_VERIFY"] = "1"
+    failed = subprocess.run(
+        [
+            str(SCRIPTS / "stock_eva_launchagents_install.sh"),
+            "--install",
+            "--reuse-local-dataset",
+            "--project-root",
+            str(project),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert failed.returncode == 13
+    assert current.is_symlink() and str(current.readlink()) == old_target
+    assert "verified local reuse" not in failed.stdout
+
+
+def test_reuse_local_dataset_is_rejected_by_check_mode(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+
+    result = subprocess.run(
+        [
+            str(SCRIPTS / "stock_eva_launchagents_install.sh"),
+            "--check",
+            "--reuse-local-dataset",
+            "--project-root",
+            str(project),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "only with --install" in result.stderr
 
 
 def test_schema_migration_failure_stops_before_handoff_and_restores_install_state(

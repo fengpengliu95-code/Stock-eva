@@ -116,6 +116,11 @@ rename 的发布指针。源不完整、复制中断或目标复核失败时，�
 较旧 NAS 归档也不会覆盖包含更多交易日的本机数据。相同 generation 再次执行返回
 `reused`，不重复复制；历史发生冲突则 fail closed。
 
+LaunchAgent 升级若不希望依赖当前 NAS 挂载，可使用安装器的显式
+`--install --reuse-local-dataset` 模式。新 release 只读复核现有本机镜像的哨兵、manifest、
+每个 Parquet 的 hash/schema/行数；成功结果为 `verified_local_reuse` 且 `copied_bytes=0`。
+该模式不写入 dataset，也不把 symlink 当作镜像；复核失败会在 `current` 切换前回滚。
+
 2026-07-28 已验证的 NAS schema v2 归档包含 260 个交易日、829,494 行，最新日期
 2026-07-24，占用约 38 MB。本机镜像应保持相同 generation、文件数、行数和 hash；
 这些数字描述行情归档，不包含用户持仓、自选、策略或预警数据库。
