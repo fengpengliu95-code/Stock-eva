@@ -468,6 +468,20 @@ def test_checked_send_accepts_exact_valid_crc_trailer() -> None:
     assert observations[0].response_bytes == len(response)
 
 
+def test_checked_send_waits_for_fragmented_marker_after_crc_trailer() -> None:
+    body = b"0\1" + (b"x" * 128)
+    response = _frame_with_crc_trailer(body)
+    connection = FramedSocket([response[:-10], response[-10:]])
+
+    result, error, observations = _invoke_checked_send(connection)
+
+    assert error is None
+    assert result == _sdk_noncompressed_response(response, body)
+    assert observations[0].recv_calls == 2
+    assert observations[0].response_bytes == len(response)
+    assert observations[0].end_marker_seen is True
+
+
 def test_checked_send_rejects_corrupt_crc_trailer() -> None:
     response = _frame_with_crc_trailer(b"0\1ok", corrupt=True)
 

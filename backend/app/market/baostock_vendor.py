@@ -27,6 +27,7 @@ from backend.app.market.provider_transport import (
 EXPECTED_BAOSTOCK_VERSION = "0.9.3"
 EXPECTED_SOCKETUTIL_SHA256 = "248591168ad087fb9c91b64e8c909608082528ecbecf25541dcbce0fe9cfcd25"
 PROTOCOL_MARKER = b"<![CDATA[]]>\n"
+MAX_CRC_TRAILER_BYTES = 11
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_RECV_CALLS = 16_384
 
@@ -388,8 +389,11 @@ def checked_send_msg(message: str) -> str:
                     response_bytes=len(received),
                     end_marker_seen=end_marker_seen,
                 )
-            if body_length > MAX_RESPONSE_BYTES - constants.MESSAGE_HEADER_LENGTH - len(
-                PROTOCOL_MARKER
+            if body_length > (
+                MAX_RESPONSE_BYTES
+                - constants.MESSAGE_HEADER_LENGTH
+                - MAX_CRC_TRAILER_BYTES
+                - len(PROTOCOL_MARKER)
             ):
                 _raise_transport_error(
                     "BaoStock transport response frame is invalid",
@@ -402,7 +406,22 @@ def checked_send_msg(message: str) -> str:
                 )
 
         if not end_marker_seen:
-            if len(received) > constants.MESSAGE_HEADER_LENGTH + body_length + len(PROTOCOL_MARKER):
+            body_end = constants.MESSAGE_HEADER_LENGTH + body_length
+            trailer_prefix = bytes(received[body_end:])
+            trailer_is_possible = not trailer_prefix or PROTOCOL_MARKER.startswith(trailer_prefix)
+            if (
+                not trailer_is_possible
+                and message_type not in constants.COMPRESSED_MESSAGE_TYPE_TUPLE
+            ):
+                declared_body = bytes(received[constants.MESSAGE_HEADER_LENGTH : body_end])
+                expected_crc_trailer = b"\1" + str(
+                    zlib.crc32(bytes(received[: constants.MESSAGE_HEADER_LENGTH]) + declared_body)
+                ).encode("ascii")
+                trailer_is_possible = expected_crc_trailer.startswith(trailer_prefix) or (
+                    trailer_prefix.startswith(expected_crc_trailer)
+                    and PROTOCOL_MARKER.startswith(trailer_prefix[len(expected_crc_trailer) :])
+                )
+            if not trailer_is_possible:
                 _raise_transport_error(
                     "BaoStock transport response marker is invalid",
                     started_at=started_at,
