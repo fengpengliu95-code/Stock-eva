@@ -97,10 +97,7 @@ def _contracts() -> dict[str, Any]:
         return {"digest_contracts": [], "sqlite_catalogs": {}}
 
 
-_X8 = _contracts()
-_DIGESTS = {item["field"]: item for item in _X8.get("digest_contracts", ())}
-_CATALOGS = _X8.get("sqlite_catalogs", {})
-_METRICS = tuple(_X8.get("metric_fields", ())) or (
+_SAFE_METRICS = (
     "continuity",
     "next_morning_availability",
     "same_evening_availability",
@@ -120,12 +117,286 @@ _METRICS = tuple(_X8.get("metric_fields", ())) or (
     "restore",
     "read_boundary",
 )
-_REASONS = tuple(
-    _X8.get("reason_partitions", {}).get("failure", ())
-    + _X8.get("reason_partitions", {}).get("unavailable", ())
+
+# The installed design asset is executable input, not merely documentation.
+# Keep an immutable inventory of every digest contract consumed by this module
+# so a truncated or partially packaged X8 asset cannot execute with a smaller
+# contract and accidentally report a false pass.
+_EXPECTED_DIGEST_FIELDS = frozenset(
+    """
+    ImmutableObservationEnvelopeV1.payload_sha256
+    ImmutableObservationEnvelopeV1.envelope_sha256
+    PreCaptureFailurePayloadV1.semantic_report_sha256
+    CalendarRawFacts.raw_facts_sha256
+    ReadBoundaryRawFacts.probe_schema_digest
+    SessionEvidenceBinding.evidence_sha256
+    SessionEvidenceBinding.candidate_sha256
+    SessionEvidenceBinding.gate_report_sha256
+    SessionEvidenceBinding.manifest_sha256
+    SessionEvidenceBinding.object_sha256
+    SessionEvidenceBinding.selection_sha256
+    SessionEvidenceBinding.binding_sha256
+    PointerReconciliation.pointer_sha256
+    PointerReconciliation.manifest_sha256
+    PointerReconciliation.object_sha256
+    PointerReconciliation.descriptor_sha256
+    ReplicationObservation.source_commit_sha256
+    ReplicationObservation.destination_record_sha256
+    ReplicationObservation.destination_head_sha256
+    ReplicationObservation.observation_sha256
+    RecoveryObservation.duplicate_proof_sha256
+    RecoveryObservation.observation_sha256
+    ErrorHandlingObservation.observation_sha256
+    LocalNasIsolationObservation.observation_sha256
+    SessionObservation.frozen_versions_sha256
+    SessionObservation.schema_policy_digest
+    SessionObservation.observation_sha256
+    WholeSessionFailoverDrill.selection_sha256
+    WholeSessionFailoverDrill.manifest_sha256
+    WholeSessionFailoverDrill.pointer_sha256
+    WholeSessionFailoverDrill.readback_sha256
+    ReplaySampleEvidence.sample_object_sha256
+    ReplaySampleEvidence.candidate_sha256
+    RestoreDrillEvidence.sentinel_sha256
+    RestoreDrillEvidence.destination_head_sha256
+    RestoreDrillEvidence.record_sha256
+    RestoreDrillEvidence.manifest_sha256
+    RestoreDrillEvidence.restore_report_sha256
+    RestoreDrillEvidence.api_readback_sha256
+    SQLitePresentMemberFingerprint.full_sha256
+    SQLiteRollbackJournalAbsenceProof.proof_digest
+    SQLiteSnapshotFingerprint.logical_digest
+    SQLiteSnapshotFingerprint.catalog_digest
+    SnapshotFingerprint.sha256
+    FrozenReliabilityVersions.config_digest
+    RecoveryObservation.after_manifest_sha256
+    RecoveryObservation.after_pointer_sha256
+    RecoveryObservation.after_selection_sha256
+    ErrorHandlingObservation.events.evidence_sha256
+    LocalNasIsolationObservation.local_pointer_sha256
+    CompletedReplicationRestoreSnapshotV1.replication_observation_sha256
+    CompletedReplicationRestoreSnapshotV1.restore_report_sha256
+    CompletedReplicationRestoreSnapshotV1.destination_record_sha256
+    CompletedReplicationRestoreSnapshotV1.destination_head_sha256
+    ReadonlyEvidenceDescriptor.object_sha256
+    ReadonlyEvidenceDescriptor.descriptor_sha256
+    SnapshotIdentity.input_fingerprint_sha256
+    SnapshotIdentity.frozen_version_vector_sha256
+    SnapshotIdentity.snapshot_sha256
+    R2FAcceptanceReport.semantic_report_sha256
+    FrozenReliabilityVersions.installed_release_sha256
+    FrozenReliabilityVersions.calendar_sha256
+    FrozenReliabilityVersions.universe_sha256
+    FrozenReliabilityVersions.destination_head_sha256
+    OfflineReplayContext.implementation_sha256
+    """.split()
 )
-_FAILURE_REASONS = frozenset(_X8.get("reason_partitions", {}).get("failure", ()))
-_UNAVAILABLE_REASONS = frozenset(_X8.get("reason_partitions", {}).get("unavailable", ()))
+_EXPECTED_CATALOG_KEYS = frozenset(
+    {
+        "replication_sidecar",
+        "daily_shadow",
+        "shadow_registry",
+        "calendar_generation",
+        "universe",
+    }
+)
+_EXPECTED_CATALOG_ROLES = {
+    "replication_sidecar": "replication",
+    "daily_shadow": "qualification",
+    "shadow_registry": "qualification",
+    "calendar_generation": "calendar",
+    "universe": "universe",
+}
+_DIGEST_ITEM_FIELDS = frozenset(
+    {
+        "field",
+        "canonicalization_version",
+        "root_object_type",
+        "included_field_paths",
+        "excluded_fields",
+        "ordering",
+        "null_encoding",
+        "domain_separation_prefix",
+    }
+)
+_CATALOG_FIELDS = frozenset(
+    {
+        "role",
+        "user_version",
+        "schema_version_source",
+        "allowed_tables",
+        "system_tables",
+        "sqlite_master_allowlist",
+        "tables",
+        "catalog_digest_source",
+    }
+)
+_TABLE_FIELDS = frozenset({"columns", "primary_key", "order_by"})
+_METRIC_VALUE_KINDS = frozenset({"count", "ratio", "duration_seconds", "bool", "hash"})
+
+
+def _valid_string_list(value: Any, *, nonempty: bool = True) -> bool:
+    return (
+        isinstance(value, list)
+        and (not nonempty or bool(value))
+        and all(isinstance(item, str) and bool(item) for item in value)
+    )
+
+
+def _validate_x8_contract(value: Any) -> bool:
+    """Validate all executable X8 structure before exposing any lookup maps."""
+    if not isinstance(value, dict):
+        return False
+    if not isinstance(value.get("contract_version"), str) or not value["contract_version"]:
+        return False
+    if not isinstance(value.get("digest_contracts"), list):
+        return False
+    seen_fields: set[str] = set()
+    for item in value["digest_contracts"]:
+        if not isinstance(item, dict) or not _DIGEST_ITEM_FIELDS <= item.keys():
+            return False
+        field = item["field"]
+        if (
+            not isinstance(field, str)
+            or not SAFE_ID.fullmatch(field)
+            or field in seen_fields
+            or not isinstance(item["canonicalization_version"], str)
+            or not isinstance(item["root_object_type"], str)
+            or not _valid_string_list(item["included_field_paths"])
+            or len(set(item["included_field_paths"])) != len(item["included_field_paths"])
+            or not _valid_string_list(item["excluded_fields"], nonempty=False)
+            or not isinstance(item["ordering"], str)
+            or not isinstance(item["null_encoding"], str)
+            or not isinstance(item["domain_separation_prefix"], str)
+            or not (
+                (
+                    item["domain_separation_prefix"].startswith("r2f5/")
+                    and item["domain_separation_prefix"].endswith("\\0")
+                )
+                or item["domain_separation_prefix"]
+                == "none; standard SHA-256 of exact full member bytes"
+            )
+        ):
+            return False
+        seen_fields.add(field)
+    if seen_fields != _EXPECTED_DIGEST_FIELDS:
+        return False
+
+    metrics = value.get("metric_fields")
+    if metrics != list(_SAFE_METRICS) or len(set(metrics)) != len(metrics):
+        return False
+    kinds = value.get("metric_value_kinds")
+    if not isinstance(kinds, dict) or set(kinds) != set(_SAFE_METRICS):
+        return False
+    for name in _SAFE_METRICS:
+        spec = kinds.get(name)
+        if (
+            not isinstance(spec, dict)
+            or not {"observed", "target", "unavailable_null", "range"} <= spec.keys()
+            or spec["observed"] not in _METRIC_VALUE_KINDS
+            or spec["target"] not in _METRIC_VALUE_KINDS
+            or spec["unavailable_null"] is not True
+            or not isinstance(spec["range"], str)
+        ):
+            return False
+
+    partitions = value.get("reason_partitions")
+    if not isinstance(partitions, dict) or set(partitions) != {"failure", "unavailable"}:
+        return False
+    failure = partitions["failure"]
+    unavailable = partitions["unavailable"]
+    if (
+        not _valid_string_list(failure)
+        or not _valid_string_list(unavailable)
+        or len(set(failure)) != len(failure)
+        or len(set(unavailable)) != len(unavailable)
+        or set(failure) & set(unavailable)
+    ):
+        return False
+
+    catalogs = value.get("sqlite_catalogs")
+    if not isinstance(catalogs, dict) or set(catalogs) != _EXPECTED_CATALOG_KEYS:
+        return False
+    for key, expected_role in _EXPECTED_CATALOG_ROLES.items():
+        catalog = catalogs.get(key)
+        if not isinstance(catalog, dict) or not _CATALOG_FIELDS <= catalog.keys():
+            return False
+        if catalog["role"] != expected_role or not isinstance(catalog["user_version"], int):
+            return False
+        if catalog["user_version"] < 0 or not isinstance(catalog["schema_version_source"], str):
+            return False
+        if (
+            not _valid_string_list(catalog["allowed_tables"])
+            or len(set(catalog["allowed_tables"])) != len(catalog["allowed_tables"])
+            or not _valid_string_list(catalog["system_tables"], nonempty=False)
+            or len(set(catalog["system_tables"])) != len(catalog["system_tables"])
+            or not _valid_string_list(catalog["sqlite_master_allowlist"])
+            or len(set(catalog["sqlite_master_allowlist"]))
+            != len(catalog["sqlite_master_allowlist"])
+            or not isinstance(catalog["catalog_digest_source"], str)
+        ):
+            return False
+        tables = catalog["tables"]
+        if not isinstance(tables, dict) or set(tables) != set(catalog["allowed_tables"]):
+            return False
+        for table_name, table in tables.items():
+            if not isinstance(table_name, str) or not isinstance(table, dict):
+                return False
+            if set(table) != _TABLE_FIELDS:
+                return False
+            if (
+                not _valid_string_list(table["columns"])
+                or len(set(table["columns"])) != len(table["columns"])
+                or not _valid_string_list(table["primary_key"], nonempty=False)
+                or not _valid_string_list(table["order_by"])
+                or len(set(table["primary_key"])) != len(table["primary_key"])
+                or len(set(table["order_by"])) != len(table["order_by"])
+            ):
+                return False
+            columns = {column.split(":", 1)[0] for column in table["columns"]}
+            if (
+                not columns
+                or not set(table["primary_key"]) <= columns
+                or not set(table["order_by"]) <= columns
+            ):
+                return False
+    return True
+
+
+_X8 = _contracts()
+_CONTRACT_READY = _validate_x8_contract(_X8)
+_RAW_DIGEST_CONTRACTS = _X8.get("digest_contracts", ())
+if not isinstance(_RAW_DIGEST_CONTRACTS, list):
+    _RAW_DIGEST_CONTRACTS = ()
+_DIGESTS = {
+    item["field"]: item
+    for item in _RAW_DIGEST_CONTRACTS
+    if isinstance(item, dict) and isinstance(item.get("field"), str)
+}
+_CATALOGS = _X8.get("sqlite_catalogs", {}) if isinstance(_X8.get("sqlite_catalogs"), dict) else {}
+_METRICS = tuple(_X8.get("metric_fields", ())) if _CONTRACT_READY else _SAFE_METRICS
+_REASON_PARTITIONS = _X8.get("reason_partitions", {})
+if not isinstance(_REASON_PARTITIONS, dict):
+    _REASON_PARTITIONS = {}
+_REASONS = tuple(
+    _REASON_PARTITIONS.get("failure", ())
+    if isinstance(_REASON_PARTITIONS.get("failure"), list)
+    else ()
+) + tuple(
+    _REASON_PARTITIONS.get("unavailable", ())
+    if isinstance(_REASON_PARTITIONS.get("unavailable"), list)
+    else ()
+)
+_FAILURE_REASONS = frozenset(
+    _REASON_PARTITIONS.get("failure", ())
+    if isinstance(_REASON_PARTITIONS.get("failure"), list)
+    else ()
+)
+_UNAVAILABLE_REASONS = frozenset(
+    _REASON_PARTITIONS.get("unavailable", ())
+    if isinstance(_REASON_PARTITIONS.get("unavailable"), list)
+    else ()
+)
 # This is only the minimal typed-error vocabulary needed when the approved
 # design asset itself is absent.  It is not used to evaluate a valid snapshot
 # and does not provide any digest/catalog contract.
@@ -1854,6 +2125,15 @@ class AcceptanceReader:
 
     def evaluate(self, input: AcceptanceInput | dict[str, Any]) -> R2FAcceptanceReport:
         started = datetime.now(UTC)
+        # Contract validation is intentionally before request/path handling.
+        # A broken packaged X8 asset must produce a typed control-state result,
+        # never a path-dependent 422 or an import/HTTP 500.
+        if not _CONTRACT_READY:
+            return self._pre_capture(
+                self._coerce_failure_request(input),
+                "CONTROL_STATE_UNAVAILABLE",
+                ["control_absent"],
+            )
         try:
             request = AcceptanceInput.model_validate(input)
             if request.start > request.end:
@@ -1952,6 +2232,41 @@ class AcceptanceReader:
         finally:
             _ = started
 
+    @staticmethod
+    def _coerce_failure_request(input: AcceptanceInput | dict[str, Any]) -> AcceptanceInput:
+        if isinstance(input, AcceptanceInput):
+            return input
+        if isinstance(input, dict):
+            try:
+                return AcceptanceInput.model_validate(input)
+            except ValidationError:
+                return AcceptanceInput.model_construct(
+                    start=input.get("start", "1970-01-01")
+                    if isinstance(input.get("start", "1970-01-01"), str)
+                    else "1970-01-01",
+                    end=input.get("end", "1970-01-01")
+                    if isinstance(input.get("end", "1970-01-01"), str)
+                    else "1970-01-01",
+                    local_dataset_root=input.get("local_dataset_root", "")
+                    if isinstance(input.get("local_dataset_root", ""), str)
+                    else "",
+                    evidence_root=input.get("evidence_root", "")
+                    if isinstance(input.get("evidence_root", ""), str)
+                    else "",
+                    control_store_roots=(),
+                    now=input.get("now", "1970-01-01T00:00:00Z")
+                    if isinstance(input.get("now", "1970-01-01T00:00:00Z"), str)
+                    else "1970-01-01T00:00:00Z",
+                )
+        return AcceptanceInput.model_construct(
+            start="1970-01-01",
+            end="1970-01-01",
+            local_dataset_root="",
+            evidence_root="",
+            control_store_roots=(),
+            now="1970-01-01T00:00:00Z",
+        )
+
     def _validate_paths(self, request: AcceptanceInput) -> dict[str, Any]:
         roots = [
             Path(request.local_dataset_root),
@@ -2010,8 +2325,16 @@ class AcceptanceReader:
     ) -> R2FAcceptanceReport:
         if reason not in _VALID_UNAVAILABLE_REASONS:
             reason = "CONTROL_STATE_UNAVAILABLE"
-        safe_start = request.start if DATE_RE.fullmatch(request.start) else "1970-01-01"
-        safe_end = request.end if DATE_RE.fullmatch(request.end) else "1970-01-01"
+        safe_start = (
+            request.start
+            if isinstance(request.start, str) and DATE_RE.fullmatch(request.start)
+            else "1970-01-01"
+        )
+        safe_end = (
+            request.end
+            if isinstance(request.end, str) and DATE_RE.fullmatch(request.end)
+            else "1970-01-01"
+        )
         try:
             safe_now = _validate_timestamp(request.now)
         except (TypeError, ValueError):
@@ -2069,7 +2392,8 @@ class AcceptanceReader:
     def _metric(
         self, name: str, status: str, reason: str | None, observed: Any = None, target: Any = None
     ) -> dict[str, Any]:
-        kinds = _X8.get("metric_value_kinds", {}).get(name, {})
+        kind_contracts = _X8.get("metric_value_kinds", {})
+        kinds = kind_contracts.get(name, {}) if isinstance(kind_contracts, dict) else {}
         if status == "unavailable":
             observed_value = target_value = None
         else:
