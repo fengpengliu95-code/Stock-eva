@@ -59,6 +59,7 @@ from backend.app.orchestration.after_close import (
     StrategyWorkItem,
 )
 from backend.app.regime.snapshots import RegimeSnapshotUnavailable
+from backend.app.storage.dataset import NasMarketStore
 from tests.test_baostock_provider import FIXTURE_PATH, ContinueAfterFailureClient, FakeBaoStock
 from tests.test_market_data import fixture_payload
 from tests.test_market_provider_contract import _CompleteSdkClient
@@ -3015,6 +3016,98 @@ def test_auto_refresh_once_defaults_to_network_free_plan(
     assert payload["writes_market_data"] is False
     assert payload["execute_requires"] == "--execute"
     assert "target_session" in payload
+
+
+def test_auto_refresh_repair_wires_inventory_scanner_into_service_and_executor(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """The repair lane must pass the scanner, not the lease coordinator, downstream."""
+    continuity_module = load_module("backend.app.market.continuity")
+    settings = cli.get_settings().model_copy(
+        update={
+            "market_data_dir": tmp_path / "market",
+            "user_data_dir": tmp_path / "user",
+            "local_control_dir": tmp_path / "control",
+            "local_staging_dir": tmp_path / "staging",
+            "local_lock_dir": tmp_path / "locks",
+            "local_temp_dir": tmp_path / "tmp",
+            "nas_market_dataset_root": tmp_path / "nas",
+            "local_market_dataset_root": None,
+            "market_repair_enabled": True,
+            "market_continuity_start_date": date(2026, 7, 1),
+        }
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        cli.StoragePreflight,
+        "inspect",
+        lambda _self: SimpleNamespace(
+            mode="nas",
+            market_data_available=True,
+            status="ready",
+            reason_code=None,
+        ),
+    )
+    monkeypatch.setattr(cli, "get_trading_calendar", synthetic_calendar)
+    monkeypatch.setattr(
+        cli,
+        "get_market_clock",
+        lambda: lambda: datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI),
+    )
+
+    control = MarketStore(tmp_path / "nas-control.duckdb")
+    store = NasMarketStore(control, tmp_path / "nas", tmp_path / "staging")
+    store.validate_readiness = lambda: None
+    store.reconcile_control_pointer = lambda: None
+    store.published_refresh = lambda: None
+    store.scheduler_state = lambda: None
+    monkeypatch.setattr(cli, "build_nas_market_store", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(cli, "BaoStockProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(cli, "build_after_close_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "make_universe_post_success_hook", lambda **_kwargs: None)
+
+    captured: dict[str, object] = {}
+
+    class FakeRepairExecutor:
+        def __init__(self, **kwargs):
+            self.scanner = kwargs["scanner"]
+            captured["executor_scanner"] = self.scanner
+
+        def execute_once(self, **kwargs):
+            scanner = kwargs["scanner"]
+            captured["execute_scanner"] = scanner
+            assert hasattr(scanner, "scan")
+            assert not isinstance(scanner, continuity_module.RepairClaimCoordinator)
+            decision = continuity_module.ContinuityDecision(
+                action="wait",
+                lane="repair",
+                target_session=date(2026, 7, 24),
+                next_run_at=datetime(2026, 7, 24, 18, 20, tzinfo=UTC),
+                reason_code="REPAIR_CONSUMER_FAILED",
+            )
+            return continuity_module.RepairExecutionResult(
+                status="failed",
+                decision=decision,
+                reason_code="REPAIR_CONSUMER_FAILED",
+            )
+
+    monkeypatch.setattr(cli, "ContinuityRepairExecutor", FakeRepairExecutor)
+    original_init = cli.MarketAutomationService.__init__
+
+    def capture_init(service, *args, **kwargs):
+        captured["service_continuity"] = kwargs["continuity"]
+        return original_init(service, *args, **kwargs)
+
+    monkeypatch.setattr(cli.MarketAutomationService, "__init__", capture_init)
+    monkeypatch.setattr(sys, "argv", ["stock-eva", "auto-refresh-once", "--execute"])
+
+    assert cli.main() == 1
+    capsys.readouterr()
+    assert isinstance(captured["service_continuity"], continuity_module.ContinuityInventory)
+    assert isinstance(captured["executor_scanner"], continuity_module.ContinuityInventory)
+    assert isinstance(captured["execute_scanner"], continuity_module.ContinuityInventory)
 
 
 def test_auto_refresh_dry_run_does_not_create_empty_runtime_tree(

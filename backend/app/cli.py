@@ -3419,7 +3419,10 @@ def main() -> int:
                         socket_timeout_seconds=socket_timeout_seconds,
                     )
                 ),
-                continuity=coordinator,
+                # The service owns the read-only continuity inventory.  The coordinator is
+                # only the lease/queue writer used internally by the repair executor; passing
+                # it here leaves the executor path without the required ``scan`` contract.
+                continuity=continuity,
                 repair_enabled=(repair_executor is not None),
                 repair_executor=repair_executor,
                 canonical_refresh=canonical_refresh,
