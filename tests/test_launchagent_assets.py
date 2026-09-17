@@ -569,8 +569,15 @@ if [[ "$*" == *"market-schema-migrate"* ]]; then
     echo 'synthetic migration failure'
     exit 7
   fi
+  if [[ -n "${MIGRATION_MARKER:-}" ]]; then
+    /usr/bin/touch "$MIGRATION_MARKER"
+  fi
 fi
 if [[ "$*" == *"--verify-only"* ]]; then
+  if [[ "${REAL_MIRROR_VERIFY:-0}" == "1" ]]; then
+    PYTHONPATH="${REAL_SOURCE_ROOT:-}" "${REAL_PYTHON:?}" "$@"
+    exit $?
+  fi
   if [[ "${FAIL_LOCAL_VERIFY:-0}" == "1" ]]; then
     echo 'synthetic local dataset verification failure' >&2
     exit 13
@@ -770,6 +777,22 @@ def test_installer_local_dataset_verification_failure_rolls_back_current(
     assert first.returncode == 0, first.stderr
     current = Path(environment["RUNTIME_CURRENT_PATH"])
     old_target = str(current.readlink())
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    config = app_support / "config/.env"
+    data_root = app_support / "data"
+    previous_config = config.read_bytes()
+    previous_data = {
+        path.relative_to(data_root): (
+            path.is_symlink(),
+            path.stat().st_mode if path.exists() else None,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in sorted(data_root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    }
+    migration_marker = tmp_path / "migration-marker"
+    environment["MIGRATION_MARKER"] = str(migration_marker)
+    Path(environment["RUNTIME_PYTHON_CALL_LOG"]).write_text("")
 
     (project / "uv.lock").write_text("synthetic lock corrupt local reuse")
     environment["FAIL_LOCAL_VERIFY"] = "1"
@@ -790,7 +813,77 @@ def test_installer_local_dataset_verification_failure_rolls_back_current(
 
     assert failed.returncode == 13
     assert current.is_symlink() and str(current.readlink()) == old_target
+    assert config.read_bytes() == previous_config
+    assert {
+        path.relative_to(data_root): (
+            path.is_symlink(),
+            path.stat().st_mode if path.exists() else None,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in sorted(data_root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    } == previous_data
+    assert not migration_marker.exists()
+    assert "market-schema-migrate" not in Path(environment["RUNTIME_PYTHON_CALL_LOG"]).read_text()
     assert "verified local reuse" not in failed.stdout
+
+
+def test_installer_real_mirror_verify_rejects_damaged_dataset_before_migration(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    old_target = str(current.readlink())
+    app_support = Path(environment["HOME"]) / "Library/Application Support/Stock EVA"
+    config = app_support / "config/.env"
+    data_root = app_support / "data"
+    dataset = data_root / "market-dataset"
+    dataset.mkdir()
+    (dataset / "manifest.json").write_text("{corrupt", encoding="utf-8")
+    previous_config = config.read_bytes()
+    previous_data = {
+        path.relative_to(data_root): (
+            path.is_symlink(),
+            path.stat().st_mode if path.exists() else None,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in sorted(data_root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    }
+    migration_marker = tmp_path / "real-mirror-migration-marker"
+    environment.update(
+        {
+            "MIGRATION_MARKER": str(migration_marker),
+            "REAL_MIRROR_VERIFY": "1",
+            "REAL_PYTHON": str(ROOT / ".venv/bin/python"),
+            "REAL_SOURCE_ROOT": str(ROOT),
+        }
+    )
+    Path(environment["RUNTIME_PYTHON_CALL_LOG"]).write_text("")
+    (project / "uv.lock").write_text("synthetic lock corrupt real local reuse")
+
+    failed = run_installer(project, environment, reuse_local_dataset=True)
+
+    assert failed.returncode != 0
+    assert current.is_symlink() and str(current.readlink()) == old_target
+    assert config.read_bytes() == previous_config
+    assert {
+        path.relative_to(data_root): (
+            path.is_symlink(),
+            path.stat().st_mode if path.exists() else None,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in sorted(data_root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    } == previous_data
+    assert not migration_marker.exists()
+    runtime_calls = Path(environment["RUNTIME_PYTHON_CALL_LOG"]).read_text()
+    assert "backend.app.storage.mirror" in runtime_calls
+    assert "--verify-only" in runtime_calls
+    assert "market-schema-migrate" not in runtime_calls
 
 
 def test_reuse_local_dataset_is_rejected_by_check_mode(

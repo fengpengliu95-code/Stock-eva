@@ -268,6 +268,7 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 MUTATION_STARTED=0
+AGENT_STATE_MUTATED=0
 CURRENT_SWAPPED=0
 PREVIOUS_CURRENT_TARGET=""
 RELEASE_CREATED=0
@@ -279,20 +280,22 @@ rollback() {
   trap - ERR
   set +e
   if [[ "$MUTATION_STARTED" == "1" ]]; then
-    for label in "${LABELS[@]}"; do
-      "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
-    done
-    for label in "${LABELS[@]}"; do
-      wait_for_unloaded "$label" || true
-    done
-    for label in "${LABELS[@]}"; do
-      installed="$LAUNCH_AGENT_ROOT/$label.plist"
-      if [[ -f "$PREVIOUS_ROOT/existed.$label" ]]; then
-        /bin/cp "$PREVIOUS_ROOT/$label.plist" "$installed"
-      else
-        /bin/rm -f "$installed"
-      fi
-    done
+    if [[ "$AGENT_STATE_MUTATED" == "1" || "$CURRENT_SWAPPED" == "1" ]]; then
+      for label in "${LABELS[@]}"; do
+        "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
+      done
+      for label in "${LABELS[@]}"; do
+        wait_for_unloaded "$label" || true
+      done
+      for label in "${LABELS[@]}"; do
+        installed="$LAUNCH_AGENT_ROOT/$label.plist"
+        if [[ -f "$PREVIOUS_ROOT/existed.$label" ]]; then
+          /bin/cp "$PREVIOUS_ROOT/$label.plist" "$installed"
+        else
+          /bin/rm -f "$installed"
+        fi
+      done
+    fi
     if [[ "$CURRENT_SWAPPED" == "1" ]]; then
       /bin/rm -f "$RUNTIME_CURRENT"
       if [[ -n "$PREVIOUS_CURRENT_TARGET" ]]; then
@@ -333,22 +336,13 @@ trap rollback ERR
 
 MUTATION_STARTED=1
 /bin/mkdir -p \
-  "$LAUNCH_AGENT_ROOT" \
-  "$LOG_ROOT" \
-  "$BACKUP_ROOT" \
   "$APP_SUPPORT_ROOT" \
   "$RUNTIME_ROOT" \
-  "$RELEASES_ROOT" \
-  "$CONFIG_ROOT" \
-  "$DATA_ROOT"
+  "$RELEASES_ROOT"
 /bin/chmod 0700 \
-  "$LOG_ROOT" \
-  "$BACKUP_ROOT" \
   "$APP_SUPPORT_ROOT" \
   "$RUNTIME_ROOT" \
-  "$RELEASES_ROOT" \
-  "$CONFIG_ROOT" \
-  "$DATA_ROOT"
+  "$RELEASES_ROOT"
 
 if [[ ! -f "$RELEASE_ROOT/.ready" ]]; then
   /bin/rm -rf "$RELEASE_ROOT"
@@ -415,6 +409,30 @@ if [[ ! -f "$RELEASE_ROOT/.ready" ]]; then
   RELEASE_CREATED=1
 fi
 
+if [[ "$REUSE_LOCAL_DATASET" == "1" ]]; then
+  # Prove the existing local immutable copy with the candidate runtime before
+  # writing config/data/control state or stopping any LaunchAgent.  This is a
+  # read-only gate: a failed proof only removes a newly-built candidate
+  # release in rollback and must leave the installed runtime untouched.
+  "$RELEASE_ROOT/.venv/bin/python" \
+    -m backend.app.storage.mirror \
+    --destination "$DATA_ROOT/market-dataset" \
+    --verify-only
+  echo "dataset: verified local reuse; copied_bytes=0"
+fi
+
+/bin/mkdir -p \
+  "$LAUNCH_AGENT_ROOT" \
+  "$LOG_ROOT" \
+  "$BACKUP_ROOT" \
+  "$CONFIG_ROOT" \
+  "$DATA_ROOT"
+/bin/chmod 0700 \
+  "$LOG_ROOT" \
+  "$BACKUP_ROOT" \
+  "$CONFIG_ROOT" \
+  "$DATA_ROOT"
+
 DATA_ROOT_ESCAPED="$(escape_sed "$DATA_ROOT")"
 /usr/bin/sed \
   -e "s|^STOCK_EVA_MARKET_DATA_DIR=.*$|STOCK_EVA_MARKET_DATA_DIR=$DATA_ROOT_ESCAPED/market|" \
@@ -466,6 +484,7 @@ for name in market user control staging locks tmp; do
 done
 /bin/chmod 0700 "$DATA_ROOT"
 
+AGENT_STATE_MUTATED=1
 for label in "${MARKET_CONTROL_LABELS[@]}"; do
   if [[ -f "$PREVIOUS_ROOT/loaded.$label" ]]; then
     "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
@@ -497,17 +516,7 @@ if [[ "$SCHEMA_MIGRATION_STATUS" -ne 0 ]]; then
   rollback "$SCHEMA_MIGRATION_STATUS"
 fi
 
-if [[ "$REUSE_LOCAL_DATASET" == "1" ]]; then
-  # This is a strict, read-only proof of the existing local immutable copy.
-  # It intentionally does not pass a NAS source and cannot create a symlink
-  # or copy any object.  A failed proof trips the existing ERR rollback before
-  # the runtime/current pointer is changed.
-  "$RELEASE_ROOT/.venv/bin/python" \
-    -m backend.app.storage.mirror \
-    --destination "$DATA_ROOT/market-dataset" \
-    --verify-only
-  echo "dataset: verified local reuse; copied_bytes=0"
-else
+if [[ "$REUSE_LOCAL_DATASET" != "1" ]]; then
   "$RELEASE_ROOT/.venv/bin/python" \
     -m backend.app.storage.mirror \
     --source /Volumes/Stock/stock-eva-market \
@@ -523,6 +532,7 @@ elif [[ -e "$RUNTIME_CURRENT" ]]; then
 fi
 
 if [[ -f "$PREVIOUS_ROOT/loaded.$WEB_LABEL" ]]; then
+  AGENT_STATE_MUTATED=1
   "$LAUNCHCTL" bootout "$DOMAIN/$WEB_LABEL" >/dev/null
   if ! wait_for_unloaded "$WEB_LABEL"; then
     echo "error: $WEB_LABEL remained loaded before runtime handoff" >&2
@@ -562,6 +572,7 @@ for label in "${LABELS[@]}"; do
     "$LAUNCHCTL" bootout "$DOMAIN/$label" >/dev/null
   fi
 done
+AGENT_STATE_MUTATED=1
 for label in "${LABELS[@]}"; do
   if [[ "$label" != "$WEB_LABEL" \
     && "$label" != "com.finlay.stock-eva.api" \
