@@ -37,7 +37,7 @@ _observation_sink: ContextVar[ObservationSink | None] = ContextVar(
 )
 _patch_lock = threading.Lock()
 _safe_provider_code = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-_compatible_protocol_version = re.compile(r"^00\.9\.\d{2}$")
+_compatible_protocol_version = re.compile(r"^00\.\d\.\d{2}$")
 
 
 class BaoStockTransportPatchError(OSError):

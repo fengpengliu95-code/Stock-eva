@@ -406,6 +406,18 @@ def test_checked_send_accepts_compatible_server_patch_version() -> None:
     assert observations[0].outcome == TransportOutcome.SUCCESS
 
 
+def test_checked_send_accepts_compatible_server_minor_version() -> None:
+    response = _frame(b"0\1ok")
+    response = b"00.8.80" + response[7:]
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result == response.decode()
+    assert observations[0].provider_code == "0"
+    assert observations[0].outcome == TransportOutcome.SUCCESS
+
+
 def test_checked_send_rejects_incompatible_server_protocol_family() -> None:
     response = _frame(b"0\1ok")
     response = b"01.0.00" + response[7:]
