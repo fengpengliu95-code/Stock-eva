@@ -37,6 +37,7 @@ _observation_sink: ContextVar[ObservationSink | None] = ContextVar(
 )
 _patch_lock = threading.Lock()
 _safe_provider_code = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_compatible_protocol_version = re.compile(r"^00\.9\.\d{2}$")
 
 
 class BaoStockTransportPatchError(OSError):
@@ -217,7 +218,7 @@ def _parse_header(header: bytes) -> tuple[str, int]:
         raise ValueError("invalid BaoStock frame header") from None
     if (
         len(parts) != 3
-        or parts[0] != constants.BAOSTOCK_CLIENT_VERSION
+        or _compatible_protocol_version.fullmatch(parts[0]) is None
         or len(parts[1]) != 2
         or not parts[1].isalnum()
         or len(parts[2]) != constants.MESSAGE_HEADER_BODYLENGTH
