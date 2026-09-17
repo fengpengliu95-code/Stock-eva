@@ -154,6 +154,15 @@ def test_missing_reason_partition_is_typed_unavailable_before_path_validation(
     _assert_malformed_contract_is_typed_unavailable(tmp_path, mutate)
 
 
+def test_incomplete_unavailable_reasons_are_typed_unavailable_before_path_validation(
+    tmp_path: Path,
+) -> None:
+    def mutate(contract: dict) -> None:
+        contract["reason_partitions"]["unavailable"] = ["PATH_INVALID"]
+
+    _assert_malformed_contract_is_typed_unavailable(tmp_path, mutate)
+
+
 def test_duplicate_digest_field_is_typed_unavailable_before_path_validation(tmp_path: Path) -> None:
     def mutate(contract: dict) -> None:
         contract["digest_contracts"][1]["field"] = contract["digest_contracts"][0]["field"]

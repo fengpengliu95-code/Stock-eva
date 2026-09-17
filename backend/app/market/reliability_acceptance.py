@@ -233,6 +233,9 @@ _CATALOG_FIELDS = frozenset(
 )
 _TABLE_FIELDS = frozenset({"columns", "primary_key", "order_by"})
 _METRIC_VALUE_KINDS = frozenset({"count", "ratio", "duration_seconds", "bool", "hash"})
+_SAFE_PRE_CAPTURE_REASONS = frozenset(
+    {"INVALID_ARGUMENTS", "PATH_INVALID", "CONTROL_STATE_UNAVAILABLE"}
+)
 
 
 def _valid_string_list(value: Any, *, nonempty: bool = True) -> bool:
@@ -311,6 +314,7 @@ def _validate_x8_contract(value: Any) -> bool:
         or len(set(failure)) != len(failure)
         or len(set(unavailable)) != len(unavailable)
         or set(failure) & set(unavailable)
+        or not _SAFE_PRE_CAPTURE_REASONS <= set(unavailable)
     ):
         return False
 
@@ -398,12 +402,8 @@ _UNAVAILABLE_REASONS = frozenset(
     else ()
 )
 # This is only the minimal typed-error vocabulary needed when the approved
-# design asset itself is absent.  It is not used to evaluate a valid snapshot
-# and does not provide any digest/catalog contract.
-_SAFE_PRE_CAPTURE_REASONS = frozenset(
-    {"INVALID_ARGUMENTS", "PATH_INVALID", "CONTROL_STATE_UNAVAILABLE"}
-)
-_VALID_UNAVAILABLE_REASONS = _UNAVAILABLE_REASONS or _SAFE_PRE_CAPTURE_REASONS
+# design asset is absent or invalid. It does not provide digest/catalog contracts.
+_VALID_UNAVAILABLE_REASONS = _UNAVAILABLE_REASONS if _CONTRACT_READY else _SAFE_PRE_CAPTURE_REASONS
 _REASON_ORDER = (
     "INVALID_ARGUMENTS",
     "PATH_INVALID",
