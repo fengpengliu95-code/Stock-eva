@@ -278,6 +278,14 @@ def _frame_with_marker_in_declared_length(body: bytes, *, message_type: str = "3
     return header + body + PROTOCOL_MARKER
 
 
+def _frame_with_crc_trailer(body: bytes, *, corrupt: bool = False) -> bytes:
+    import baostock.data.messageheader as messageheader
+
+    header = messageheader.to_message_header("34", len(body)).encode()
+    crc = zlib.crc32(header + body) + (1 if corrupt else 0)
+    return header + body + b"\1" + str(crc).encode() + PROTOCOL_MARKER
+
+
 class FramedSocket:
     def __init__(
         self,
@@ -424,6 +432,36 @@ def test_checked_send_rejects_unrecognized_declared_length_difference() -> None:
 
     header = messageheader.to_message_header("34", len(body) + 1).encode()
     response = header + body + PROTOCOL_MARKER
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert result is None
+    assert error is not None
+    _assert_sanitized_terminal(
+        error,
+        observations,
+        normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
+        protocol_stage=ProtocolStage.FRAME,
+        recv_calls=1,
+        response_bytes=len(response),
+        end_marker_seen=True,
+    )
+
+
+def test_checked_send_accepts_exact_valid_crc_trailer() -> None:
+    response = _frame_with_crc_trailer(b"0\1ok")
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result is not None
+    assert result[21:] == "0\1ok" + PROTOCOL_MARKER.decode()
+    assert observations[0].provider_code == "0"
+    assert observations[0].response_bytes == len(response)
+
+
+def test_checked_send_rejects_corrupt_crc_trailer() -> None:
+    response = _frame_with_crc_trailer(b"0\1ok", corrupt=True)
 
     result, error, observations = _invoke_checked_send(FramedSocket([response]))
 

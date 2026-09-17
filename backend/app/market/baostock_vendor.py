@@ -287,6 +287,7 @@ def checked_send_msg(message: str) -> str:
     recv_calls = 0
     message_type: str | None = None
     body_length: int | None = None
+    raw_body: bytes | None = None
     while True:
         if recv_calls >= MAX_RECV_CALLS:
             _raise_transport_error(
@@ -412,11 +413,18 @@ def checked_send_msg(message: str) -> str:
                     end_marker_seen=False,
                 )
             continue
-        wire_body_length = len(received) - constants.MESSAGE_HEADER_LENGTH - len(PROTOCOL_MARKER)
-        if body_length not in {
-            wire_body_length,
-            wire_body_length + len(PROTOCOL_MARKER),
-        }:
+        wire_body = bytes(received[constants.MESSAGE_HEADER_LENGTH : -len(PROTOCOL_MARKER)])
+        if body_length in {len(wire_body), len(wire_body) + len(PROTOCOL_MARKER)}:
+            raw_body = wire_body
+        elif message_type not in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
+            declared_body = wire_body[:body_length]
+            crc_trailer = wire_body[body_length:]
+            expected_crc = zlib.crc32(
+                bytes(received[: constants.MESSAGE_HEADER_LENGTH]) + declared_body
+            )
+            if crc_trailer == b"\1" + str(expected_crc).encode("ascii"):
+                raw_body = declared_body
+        if raw_body is None:
             _raise_transport_error(
                 "BaoStock transport response frame length is invalid",
                 started_at=started_at,
@@ -429,7 +437,7 @@ def checked_send_msg(message: str) -> str:
         break
 
     body_start = constants.MESSAGE_HEADER_LENGTH
-    raw_body = bytes(received[body_start : -len(PROTOCOL_MARKER)])
+    assert raw_body is not None
     if message_type in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
         try:
             body = _decompress_body(raw_body)
@@ -448,7 +456,11 @@ def checked_send_msg(message: str) -> str:
         provider_code = _provider_code(body)
     else:
         try:
-            result = bytes(received).decode("utf-8")
+            result = (
+                bytes(received[:body_start]).decode("ascii")
+                + raw_body.decode("utf-8")
+                + PROTOCOL_MARKER.decode("ascii")
+            )
         except UnicodeDecodeError:
             _raise_transport_error(
                 "BaoStock transport response encoding is invalid",
