@@ -698,6 +698,23 @@ def test_installer_check_does_not_run_market_schema_migration(tmp_path: Path) ->
     assert not runtime_log.exists() or "market-schema-migrate" not in runtime_log.read_text()
 
 
+def test_installer_moves_r2f5_design_asset_into_public_runtime_layout(tmp_path: Path) -> None:
+    project = synthetic_project(tmp_path)
+    design = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
+    packaged_source = project / "docs/plans" / design.name
+    packaged_source.parent.mkdir(parents=True)
+    shutil.copy2(design, packaged_source)
+    environment = stateful_install_environment(tmp_path)
+
+    result = run_installer(project, environment)
+
+    assert result.returncode == 0, result.stderr
+    current = Path(environment["RUNTIME_CURRENT_PATH"])
+    release = current.resolve()
+    assert (release / "public/docs/plans" / design.name).is_file()
+    assert not (release / "docs").exists()
+
+
 def test_installer_runs_release_schema_migration_before_current_handoff(
     tmp_path: Path,
 ) -> None:

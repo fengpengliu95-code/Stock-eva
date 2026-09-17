@@ -32,7 +32,30 @@ from pydantic import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
-DESIGN = ROOT / "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
+DESIGN_RELATIVE = Path(
+    "docs/plans/2026-09-14-stock-eva-r2f5-0-read-only-acceptance-harness-design.md"
+)
+
+
+def _resolve_design_asset() -> Path:
+    """Resolve the immutable X8 design asset in either runtime layout.
+
+    Development checkouts retain ``docs`` at the release root.  The installer
+    moves all documentation under ``public`` so the installed runtime does not
+    expose the source-tree layout.  The first existing path is authoritative;
+    a malformed asset is never replaced with a guessed or duplicated contract.
+    """
+    candidates = (ROOT / DESIGN_RELATIVE, ROOT / "public" / DESIGN_RELATIVE)
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return candidates[0]
+
+
+DESIGN = _resolve_design_asset()
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -56,11 +79,22 @@ def _canonical_json(value: Any) -> bytes:
 
 
 def _contracts() -> dict[str, Any]:
-    if not DESIGN.is_file():
+    try:
+        text = DESIGN.read_text(encoding="utf-8")
+        match = re.search(
+            r"<!-- R2F5_X8_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```",
+            text,
+            re.S,
+        )
+        if match is None:
+            return {"digest_contracts": [], "sqlite_catalogs": {}}
+        value = json.loads(match.group(1))
+        return value if isinstance(value, dict) else {"digest_contracts": [], "sqlite_catalogs": {}}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        # Asset loading is deliberately fail-closed and import-safe.  The
+        # reader will return a typed unavailable report if the contract cannot
+        # be loaded; it must never leak a parser/packaging exception to HTTP.
         return {"digest_contracts": [], "sqlite_catalogs": {}}
-    text = DESIGN.read_text(encoding="utf-8")
-    match = re.search(r"<!-- R2F5_X8_CONTRACTS_JSON -->\s*```json\s*(\{.*?\})\s*```", text, re.S)
-    return json.loads(match.group(1)) if match else {"digest_contracts": [], "sqlite_catalogs": {}}
 
 
 _X8 = _contracts()
@@ -92,6 +126,13 @@ _REASONS = tuple(
 )
 _FAILURE_REASONS = frozenset(_X8.get("reason_partitions", {}).get("failure", ()))
 _UNAVAILABLE_REASONS = frozenset(_X8.get("reason_partitions", {}).get("unavailable", ()))
+# This is only the minimal typed-error vocabulary needed when the approved
+# design asset itself is absent.  It is not used to evaluate a valid snapshot
+# and does not provide any digest/catalog contract.
+_SAFE_PRE_CAPTURE_REASONS = frozenset(
+    {"INVALID_ARGUMENTS", "PATH_INVALID", "CONTROL_STATE_UNAVAILABLE"}
+)
+_VALID_UNAVAILABLE_REASONS = _UNAVAILABLE_REASONS or _SAFE_PRE_CAPTURE_REASONS
 _REASON_ORDER = (
     "INVALID_ARGUMENTS",
     "PATH_INVALID",
@@ -174,7 +215,9 @@ def _projection(root: dict[str, Any], paths: list[str]) -> Any:
 
 
 def _digest(field_path: str, root: dict[str, Any]) -> str:
-    contract = _DIGESTS[field_path]
+    contract = _DIGESTS.get(field_path)
+    if contract is None:
+        raise ValueError("R2-F5 contract asset unavailable")
     if field_path == "ReadonlyEvidenceDescriptor.object_sha256":
         raw = root["immutable_object_bytes"]
         raw = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
@@ -965,7 +1008,7 @@ class MetricResult(StrictModel):
             if (
                 self.observed is not None
                 or self.target is not None
-                or self.reason_code not in _UNAVAILABLE_REASONS
+                or self.reason_code not in _VALID_UNAVAILABLE_REASONS
             ):
                 raise ValueError("invalid unavailable metric")
         elif (
@@ -1965,7 +2008,7 @@ class AcceptanceReader:
     def _pre_capture(
         self, request: AcceptanceInput, reason: str, states: list[str]
     ) -> R2FAcceptanceReport:
-        if reason not in _UNAVAILABLE_REASONS:
+        if reason not in _VALID_UNAVAILABLE_REASONS:
             reason = "CONTROL_STATE_UNAVAILABLE"
         safe_start = request.start if DATE_RE.fullmatch(request.start) else "1970-01-01"
         safe_end = request.end if DATE_RE.fullmatch(request.end) else "1970-01-01"
@@ -1982,9 +2025,15 @@ class AcceptanceReader:
             "descriptor_states": states,
             "semantic_report_sha256": "0" * 64,
         }
-        payload["semantic_report_sha256"] = _digest(
-            "PreCaptureFailurePayloadV1.semantic_report_sha256", payload
-        )
+        try:
+            payload["semantic_report_sha256"] = _digest(
+                "PreCaptureFailurePayloadV1.semantic_report_sha256", payload
+            )
+        except ValueError:
+            # A missing/malformed installed contract is itself unavailable.
+            # Keep the public failure envelope typed and deterministic without
+            # manufacturing a digest contract at request time.
+            payload["semantic_report_sha256"] = "0" * 64
         metrics = {name: self._metric(name, "unavailable", reason) for name in _METRICS}
         report = {
             "status": "unavailable",
