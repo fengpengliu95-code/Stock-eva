@@ -102,6 +102,7 @@ from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
 from backend.app.market.providers.shadow_contracts import ShadowProviderId
 from backend.app.market.refresh import MarketRefreshService
+from backend.app.market.reliability_acceptance import AcceptanceReader
 from backend.app.market.store import MarketStore
 from backend.app.market.universe import UniverseSidecarStore
 from backend.app.market.universe_status import (
@@ -375,6 +376,14 @@ def _probe_timeout(seconds: int):
 def build_parser() -> argparse.ArgumentParser:
     parser = _SanitizedArgumentParser(description="Stock EVA after-close data tasks")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    acceptance = subparsers.add_parser(
+        "r2f-acceptance",
+        help="evaluate one frozen R2-F acceptance window without writes or provider requests",
+    )
+    acceptance.add_argument("--start", required=True)
+    acceptance.add_argument("--end", required=True)
+    acceptance.add_argument("--local-dataset-root", type=Path)
+    acceptance.add_argument("--evidence-root", type=Path)
     refresh = subparsers.add_parser(
         "refresh",
         help="refresh one completed trading date",
@@ -757,6 +766,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact point-in-time date in YYYY-MM-DD format",
     )
     return parser
+
+
+def _validate_r2f_acceptance_cli_arguments(args: argparse.Namespace) -> None:
+    """Validate the acceptance command's lexical arguments before loading settings."""
+    date_pattern = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+    if not date_pattern.fullmatch(args.start) or not date_pattern.fullmatch(args.end):
+        raise _CliArgumentError("invalid acceptance dates")
+    try:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    except (TypeError, ValueError) as exc:
+        raise _CliArgumentError("invalid acceptance dates") from exc
+    if start > end:
+        raise _CliArgumentError("invalid acceptance date range")
+    for value in (args.local_dataset_root, args.evidence_root):
+        if value is None:
+            continue
+        candidate = Path(os.fspath(value))
+        if not candidate.is_absolute() or candidate == Path("/") or ".." in candidate.parts:
+            raise _CliArgumentError("invalid acceptance path")
 
 
 def _continuity_cli_payload(
@@ -1643,6 +1672,47 @@ def main() -> int:
             )
         )
         return 2
+    if args.command == "r2f-acceptance":
+        try:
+            _validate_r2f_acceptance_cli_arguments(args)
+        except _CliArgumentError:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "invalid_cli_arguments",
+                        "writes_data": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        settings = get_settings()
+        control = settings.local_control_dir
+        trusted_now = _calendar_runtime_now()
+        result = AcceptanceReader(now=trusted_now).evaluate(
+            {
+                "start": args.start,
+                "end": args.end,
+                "local_dataset_root": str(
+                    args.local_dataset_root or settings.local_market_dataset_root or ""
+                ),
+                "evidence_root": str(args.evidence_root or settings.provider_evidence_root),
+                "control_store_roots": (
+                    str(control / settings.replication_database_name),
+                    str(control / settings.daily_bar_shadow_database_name),
+                    str(control / settings.provider_registry_database_name),
+                    str(control / settings.calendar_generation_database_name),
+                    str(control / settings.universe_contract_database_name),
+                ),
+                "now": trusted_now.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
+        if set(result.quality_issues) & {"INVALID_ARGUMENTS", "PATH_INVALID"}:
+            return 2
+        return 0 if result.status == "ready" else 1
     if args.command == "calendar-sync":
         if (args.start is None) != (args.end is None):
             print(

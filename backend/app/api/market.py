@@ -1,11 +1,12 @@
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import SettingsError
+from starlette.responses import JSONResponse
 
 from backend.app.api.storage import get_storage_readiness
 from backend.app.config import (
@@ -51,6 +52,7 @@ from backend.app.market.models import (
 from backend.app.market.provider_health import SQLiteProviderHealthStore
 from backend.app.market.providers.registry import RegistryUnavailable, ShadowRegistry
 from backend.app.market.providers.shadow_contracts import AdmissionState, ShadowProviderId
+from backend.app.market.reliability_acceptance import AcceptanceReader, R2FAcceptanceReport
 from backend.app.market.series import DataQualityError, PriceSeriesService
 from backend.app.market.service import MarketSummaryService
 from backend.app.market.store import MarketStore
@@ -76,6 +78,43 @@ from backend.app.storage.models import StorageReadiness
 from backend.app.storage.preflight import StoragePreflight, configured_market_dataset_root
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+@router.get(
+    "/reliability-acceptance",
+    response_model=R2FAcceptanceReport,
+    responses={422: {"model": R2FAcceptanceReport}, 503: {"model": R2FAcceptanceReport}},
+)
+def market_reliability_acceptance(
+    start: str,
+    end: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Callable[[], datetime], Depends(get_market_clock)],
+) -> Response:
+    """Evaluate the frozen R2-F window without provider calls or persistent writes."""
+    control = settings.local_control_dir
+    trusted_now = clock()
+    request = {
+        "start": start,
+        "end": end,
+        "local_dataset_root": str(settings.local_market_dataset_root or ""),
+        "evidence_root": str(settings.provider_evidence_root),
+        "control_store_roots": (
+            str(control / settings.replication_database_name),
+            str(control / settings.daily_bar_shadow_database_name),
+            str(control / settings.provider_registry_database_name),
+            str(control / settings.calendar_generation_database_name),
+            str(control / settings.universe_contract_database_name),
+        ),
+        "now": trusted_now.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    result = AcceptanceReader(now=trusted_now).evaluate(request)
+    status_code = 200
+    if result.status == "unavailable":
+        status_code = (
+            422 if set(result.quality_issues) & {"INVALID_ARGUMENTS", "PATH_INVALID"} else 503
+        )
+    return JSONResponse(result.model_dump(mode="json"), status_code=status_code)
 
 
 @router.get("/universe", response_model=UniverseStatusSnapshotV1)
