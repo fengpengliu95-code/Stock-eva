@@ -132,6 +132,26 @@ def test_pointer_identity_distinguishes_valid_absent_from_invalid_partial(tmp_pa
     assert invalid.reason_code == "CONTROL_STATE_UNAVAILABLE"
 
 
+def test_pointer_identity_accepts_only_valid_optional_continuity_schema(tmp_path) -> None:
+    root = _dataset(tmp_path)
+    control = MarketStore(tmp_path / "control" / "market.duckdb")
+    connection = control._connect()
+    control._initialize_continuity_schema_on_connection(connection)
+    connection.close()
+    store = NasMarketStore(control, root, tmp_path / "staging")
+
+    assert store._pointer_identity().kind == "ABSENT"
+
+    connection = control._connect()
+    connection.execute("UPDATE continuity_schema_meta SET schema_hash = ?", ["0" * 64])
+    connection.close()
+
+    assert store._pointer_identity().as_dict() == {
+        "kind": "INVALID",
+        "reason_code": "CONTROL_STATE_UNAVAILABLE",
+    }
+
+
 def test_modern_lineage_requires_retained_success_evidence_reader() -> None:
     modern = {
         "mode": "modern",

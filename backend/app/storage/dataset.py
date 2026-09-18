@@ -901,11 +901,17 @@ class ManifestPublicationCoordinator:
         )
 
 
-def _control_schema_rows(connection) -> tuple[tuple[object, ...], ...]:
+def _control_schema_rows(
+    connection,
+    *,
+    included_tables: set[str] | None = None,
+) -> tuple[tuple[object, ...], ...]:
     """Build a descriptor-stable canonical control schema projection."""
     rows: list[tuple[object, ...]] = []
     tables = sorted(str(row[0]) for row in connection.execute("SHOW TABLES").fetchall())
     for table in tables:
+        if included_tables is not None and table not in included_tables:
+            continue
         for row in connection.execute(f'DESCRIBE "{table}"').fetchall():
             rows.append(
                 (
@@ -919,6 +925,8 @@ def _control_schema_rows(connection) -> tuple[tuple[object, ...], ...]:
                 )
             )
     for row in connection.execute("SELECT * FROM duckdb_constraints()").fetchall():
+        if included_tables is not None and str(row[4]) not in included_tables:
+            continue
         rows.append(
             (
                 "constraint",
@@ -933,6 +941,8 @@ def _control_schema_rows(connection) -> tuple[tuple[object, ...], ...]:
             )
         )
     for row in connection.execute("SELECT * FROM duckdb_indexes()").fetchall():
+        if included_tables is not None and str(row[4]) not in included_tables:
+            continue
         rows.append(
             (
                 "index",
@@ -1047,10 +1057,22 @@ class NasMarketStore:
                     "published_daily_bars",
                     "market_automation_state",
                 }
+                continuity_tables = {
+                    "continuity_schema_meta",
+                    "repair_attempts",
+                    "repair_jobs",
+                }
                 # The control reader accepts exactly the schema emitted by the
                 # canonical MarketStore factory.  Unknown tables/columns are
                 # invalid state, never an absent pointer.
-                if tables != required_tables:
+                if frozenset(tables) not in {
+                    frozenset(required_tables),
+                    frozenset(required_tables | continuity_tables),
+                }:
+                    return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
+                if continuity_tables.issubset(
+                    tables
+                ) and not MarketStore._continuity_schema_is_valid(connection):
                     return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
                 rows = connection.execute(
                     "SELECT singleton, run_id, trade_date, published_at FROM published_snapshots"
@@ -1075,7 +1097,8 @@ class NasMarketStore:
                 ):
                     return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
                 schema = domain_sha256(
-                    "stock-eva/r2f4.3/pointer-db-schema/v2", _control_schema_rows(connection)
+                    "stock-eva/r2f4.3/pointer-db-schema/v2",
+                    _control_schema_rows(connection, included_tables=required_tables),
                 )
                 if schema != canonical_control_schema_digest():
                     return PointerIdentity("INVALID", reason_code="CONTROL_STATE_UNAVAILABLE")
