@@ -45,7 +45,7 @@ the remaining unproven controls stay `UNKNOWN`. State-specific reason codes pres
 while canonical failover and effective auto-failover remain disabled. No provider module is imported,
 no client is constructed and no production evidence is written.
 
-## Task 4 — Build the full-session qualification harness offline
+## Task 4 — Build the full-session qualification harness offline — COMPLETE
 
 Define the future 20-session version vector and one-session candidate requirements. Use injected fake
 providers only. Test complete universe, required indexes, suspension placeholders, factor continuity,
@@ -54,6 +54,14 @@ production window.
 
 Gate: blocking/timeout/partial/duplicate/missing-factor/missing-suspension/bad-universe/bad-index and
 mixed-source scenarios all fail closed.
+
+The offline harness invokes an injected provider exactly once, converts declared lots and
+thousand-CNY units exactly once, and hashes the complete session candidate. Incomplete responses,
+identity/universe/index divergence, duplicate or mixed-source bars, suspension gaps and factor gaps
+are rejected without writes. The window evaluator requires exactly 20 caller-supplied expected
+sessions, one frozen version vector, qualified per-session outcomes and immutable
+evidence/candidate/gate/selection lineage. Passing the offline window still leaves canonical and
+automatic failover disabled.
 
 ## Task 5 — Independent review and installed read-only projection
 
